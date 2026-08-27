@@ -106,6 +106,13 @@ task, no ssh, no process, until something is opened again or an action finishes.
 moon when a machine is unreachable, a warning triangle when it is awake but the agent is
 missing, a turning arrow while a reboot is expected.
 
+It updates itself, the way the phone does. It checks the releases of the repository in
+`appUpdates.githubRepo` when the window or the panel opens, at most every six hours, and never on
+a timer while nothing is open. Install downloads the zip, unpacks it, checks that what came out is
+this app at the version the release claimed, swaps the bundle and relaunches. Everything that can
+fail happens in a temporary directory first, so a bad download never leaves half an app in
+`/Applications`. The panel says nothing at all until there is something to install.
+
 ### 3. The Android app (`android/`)
 
 The phone version of the Mac app. It is a port, not a second system: the same agent over ssh,
@@ -244,6 +251,25 @@ printed and the ssh session can close before the machine goes down.
 `docs/operations.md` has the recovery paths: a machine that will not wake, a failed update, the
 logs, what lives where.
 
+## Releasing
+
+    ./scripts/release.sh 1.1.0            # bump, build, tag, publish
+    ./scripts/release.sh 1.1.0 --dry-run  # everything except commit, tag, push and publish
+
+One command, because a release is one thing: both apps at one version, one tag, one set of notes.
+It refuses to start on a dirty tree, off main, or on a version that already has a tag. Then it
+bumps `CFBundleShortVersionString` and `CFBundleVersion` in the plist and `versionName` and
+`versionCode` in the gradle file, in step with each other, builds the Mac app and the APK, and asks
+both finished artifacts what version they think they are before anything is committed. A tag
+pointing at a build that says something else is the one mistake here that cannot be taken back, so
+the bump is put back if any of it fails.
+
+The notes come from `--notes <file>`, from `--notes-from-stdin`, or from `$EDITOR` on a template
+listing the commits since the last tag. The tag is `vX.Y.Z`, the release is "Legion Control X.Y.Z",
+and the two assets are `Legion-Control-macos-arm64.zip` and `Legion-Control-android-arm64.apk`.
+Both apps read those conventions back at runtime to find their own updates, which is why they are
+conventions and not preferences. `dist/` holds the artifacts on the way out and is gitignored.
+
 ## Layout
 
     agent/
@@ -265,6 +291,8 @@ logs, what lives where.
       install/                 install-mac-agent.sh, the launchd job template
       build.sh, install-mac.sh
     android/                   the phone app, see android/README.md
+    scripts/
+      release.sh               one command from a version number to a published release
     examples/                  a config for each side
     docs/
       configuration.md         every key of both config files, and the agent contract

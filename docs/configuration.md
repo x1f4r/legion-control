@@ -341,13 +341,21 @@ missing ports to 22, an unknown `platform` to `linux`.
   // The device the app runs on, looked after by a local agent. Mac only.
   "local": { "enabled": true, "name": "This Mac", "agent": "~/.legion-control/agent/src/index.mjs" },
 
-  // Where the Android app looks for its own updates. Default: this project's releases.
+  // Where both apps look for their own updates. Default: this project's releases.
   "appUpdates": { "githubRepo": "x1f4r/legion-control" }
 }
 ```
 
 `platform` is `linux`, `windows` or `mac` and picks the icon and the wording. A `symbol` on a
 system overrides the icon on the Mac with any SF Symbol name.
+
+`appUpdates.githubRepo` is read by both apps now, not just the phone, and both read the same
+releases: tag `vX.Y.Z`, the version taken off the tag, and one asset per platform, the first
+ending in `.zip` for the Mac and the first ending in `.apk` for Android. The Mac app looks when
+the window or the menu bar panel opens and at most once every six hours; Install downloads the
+zip, checks the bundle in it is this app at that version, swaps `/Applications/Legion Control.app`
+and relaunches. The key is optional on both sides and defaults to this project's own releases; a
+fork names itself here instead. `scripts/release.sh` is what produces releases in that shape.
 
 With no config file the Mac app opens its window on a setup page showing the path, with
 **Write example config** (refuses to overwrite an existing file) and **Open in editor**; the

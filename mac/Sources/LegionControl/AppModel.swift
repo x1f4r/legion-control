@@ -21,6 +21,10 @@ final class AppModel {
 
     let config: ConfigStore
 
+    /// Legion Control's own updates. Owned here rather than by the section that draws it, so the
+    /// window and the panel read the same answer and one look serves both.
+    let appUpdates = AppUpdateModel()
+
     private var pollTask: Task<Void, Never>?
 
     /// Called whenever something the menu bar draws has changed. The status item redraws from this
@@ -30,6 +34,7 @@ final class AppModel {
     init(config: ConfigStore = ConfigStore()) {
         self.config = config
         config.onChange = { [weak self] in self?.rebuild() }
+        appUpdates.repo = { [weak self] in self?.config.config?.updateRepo ?? ControllerConfig.AppUpdatesConfig.defaultRepo }
         rebuild()
     }
 
@@ -188,6 +193,10 @@ final class AppModel {
     /// reading.
     func viewerAppeared() {
         config.reloadIfChanged()
+        // One HTTPS request every six hours at the most, and only ever while something is looking.
+        // This is the only place it is asked for, because opening a viewer is the only moment at
+        // which anyone could read the answer.
+        appUpdates.checkIfStale()
         startPolling()
     }
 

@@ -15,3 +15,8 @@ mac/Resources/AppIcon.iconset/
 *.idsig
 android/local.properties
 android/.kotlin/
+
+# What scripts/release.sh builds on its way to a GitHub release. The artifacts belong on the
+# release, not in the history: they are two large binaries per version and every one of them can be
+# rebuilt from the tag it was cut from.
+dist/

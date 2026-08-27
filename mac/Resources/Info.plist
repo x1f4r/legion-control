@@ -18,9 +18,10 @@
 	<string>Legion Control</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
-	<!-- Mirrors the Android versionName and versionCode in android/app/build.gradle.kts. The Mac
-	     app has no self-update that reads these, but the settings screen shows them, and a number
-	     that never moves reads as an app that never changed. Bump both apps together per release. -->
+	<!-- Mirrors the Android versionName and versionCode in android/app/build.gradle.kts. The self
+	     update reads the short version string and compares it against the newest release's tag, so
+	     a number left behind here is an app that offers to install itself. scripts/release.sh moves
+	     both apps together and refuses to run when they have drifted apart. -->
 	<key>CFBundleShortVersionString</key>
 	<string>1.0.6</string>
 	<key>CFBundleVersion</key>
