@@ -8,24 +8,20 @@
 	<string>Legion Control</string>
 	<key>CFBundleExecutable</key>
 	<string>LegionControl</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.x1f4r.legion-control</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.x1f4r.legion-control</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>Legion Control</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
-	<!-- Mirrors the Android versionName and versionCode in android/app/build.gradle.kts. The self
-	     update reads the short version string and compares it against the newest release's tag, so
-	     a number left behind here is an app that offers to install itself. scripts/release.sh moves
-	     both apps together and refuses to run when they have drifted apart. -->
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.6</string>
+	<string>1.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>7</string>
+	<string>8</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
