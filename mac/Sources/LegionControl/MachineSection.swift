@@ -21,6 +21,7 @@ struct MachineSection: View {
                 DetailRow(label: "Control agent") {
                     VersionText(value: model.status?.agentVersion, placeholder: "not reachable")
                 }
+                DetailRow(label: "Setup") { setupVerdict }
                 DetailRow(label: "On the network") {
                     Text(network)
                         .font(.system(.callout, design: .monospaced))
@@ -92,6 +93,25 @@ struct MachineSection: View {
             StatusText(symbol: "moon.zzz", text: "Asleep or unreachable", tint: .orange)
         } else {
             StatusText(symbol: "ellipsis", text: "Checking")
+        }
+    }
+
+    /// Whether this machine is holding the same setup this Mac is. It is given a copy whenever it
+    /// is not, without being asked and without anyone being told, so the only news here is that it
+    /// could not be.
+    @ViewBuilder
+    private var setupVerdict: some View {
+        switch model.setupSharing {
+        case .upToDate:
+            StatusText(symbol: "checkmark.circle", text: "shared, up to date", tint: .green)
+        case .justShared:
+            StatusText(symbol: "checkmark.circle", text: "shared just now", tint: .green)
+        case .unsupported:
+            Text("not shared: agent too old").foregroundStyle(.secondary)
+        case .failed(let sentence):
+            StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
+        case .unknown:
+            Text("not known").foregroundStyle(.secondary)
         }
     }
 

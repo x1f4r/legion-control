@@ -5,10 +5,13 @@ import com.x1f4r.legioncontrol.agent.AgentActionResult
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.AgentReply
 import com.x1f4r.legioncontrol.agent.AgentStatus
+import com.x1f4r.legioncontrol.agent.ControllerFetch
 import com.x1f4r.legioncontrol.agent.LegionControl
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.MachineControl
+import com.x1f4r.legioncontrol.agent.readControllerReply
 import com.x1f4r.legioncontrol.data.ControllerConfig
+import com.x1f4r.legioncontrol.data.SetupSource
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
@@ -30,7 +33,35 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override val configText: StateFlow<String> get() = control.config.text
 
+    override val configHash: StateFlow<String?> get() = control.config.hash
+
+    override val setupSource: StateFlow<SetupSource?> get() = control.config.source
+
     override fun applyConfig(text: String): String? = control.config.apply(text)
+
+    override fun applyFetchedConfig(text: String, hash: String?): String? =
+        control.config.applyFetched(text, hash)
+
+    /**
+     * The address is remembered as soon as a machine serves a document, not once that document has
+     * been accepted. It answered and it had the setup, which is everything this field is for; a
+     * document that then fails validation is a fault on the far side, and making the user type the
+     * address again is no part of fixing it.
+     */
+    override suspend fun fetchSetupFrom(source: SetupSource): Result<ControllerFetch> = try {
+        val fetched = control.fetchSetup(source)
+        if (fetched is ControllerFetch.Document) control.config.rememberSource(source)
+        Result.success(fetched)
+    } catch (failure: AgentFailure) {
+        Result.failure(failure)
+    }
+
+    /**
+     * One key for an address given by hand. It is one system until a configuration says otherwise,
+     * and the configuration that is about to arrive sets the capacity for every address it names.
+     */
+    override suspend fun trustHostKey(address: String, keyBlobBase64: String) =
+        control.hostKeys.trust(address, keyBlobBase64, keep = 1)
 
     override fun clients(configuration: ControllerConfig?): List<MachineClient> =
         control.controls(configuration).map { WiredMachineClient(control, it) }
@@ -72,6 +103,9 @@ private class WiredMachineClient(
 
     override suspend fun run(actionId: String, force: Boolean): Result<AgentActionResult> =
         attempt { wiring.agent.run(actionId, force) }
+
+    override suspend fun fetchSetup(): Result<ControllerFetch> =
+        attempt { wiring.agent.config() }.map { readControllerReply(it) }
 
     override suspend fun wake(): Result<Unit> {
         val wake = wiring.wake

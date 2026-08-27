@@ -108,15 +108,19 @@ Uninstall first. That wipes the app's ssh key, so see the next section.
 
 ## What the app needs before it works
 
-**A configuration.** Open **This device → Configuration**, paste the controller config
-described in `docs/configuration.md` (the same document the Mac app reads; `ssh` and `local`
-are ignored on the phone) or press **Insert example** and edit it, then **Apply**. The app
-validates it and says what is wrong in one sentence, and nothing is stored until it passes, so
-a bad paste cannot cost a working configuration. The example is a template: its hardware
-address is a placeholder and Apply refuses it until it is replaced. The machines' endpoints are
-dialled directly by the app's own ssh client, in the order listed: a tunnel address first works
-from anywhere, a LAN address as the fallback works from home. Until a configuration is applied
-the app is one page saying so, plus **This device**.
+**A configuration, fetched from a machine.** The machines carry the setup (see "Sharing the
+setup between devices" in `docs/configuration.md`): the Mac pushes its controller config to
+every agent it reaches, and the phone only needs one address to get all of it. On first launch
+the Machines page asks for a host, a port and a user; **Fetch** runs `config` there with the
+phone's key and applies what comes back. From then on the phone refetches by itself whenever a
+machine reports a newer copy, so an edit on the Mac reaches the phone with nothing to do.
+
+The same block lives under **This device → Configuration**, next to the JSON field for pasting
+a config by hand (`ssh` and `local` are ignored on the phone; **Insert example** drops in a
+template whose hardware address is a placeholder). Either way the document is validated first
+and nothing is stored until it passes. The machines' endpoints are dialled directly by the
+app's own ssh client, in the order listed: a tunnel address first works from anywhere, a LAN
+address as the fallback works from home.
 
 **The public key has to be authorised on every system.** The app generates its own ed25519
 keypair on the phone on first run and keeps the private half in app-private storage, wrapped by
@@ -142,11 +146,9 @@ names are dropped when it changes.
 a tunnel. When the phone has no address under the machine's `lanPrefix` the wake action is
 disabled with a sentence saying why.
 
-**A GitHub token is optional.** The app checks the releases of the repository in
-`appUpdates.githubRepo` for a newer build of itself. That works without credentials for a
-public repository; for a private fork, paste a fine grained personal access token with
-read-only access to that repository's contents into **This device → GitHub access**. It is
-stored like the ssh key, masked once saved, and never appears in a log line.
+**Updates need nothing.** The app checks the releases of the repository in
+`appUpdates.githubRepo` for a newer build of itself and installs it through the system
+installer. No account, no token.
 
 ## The pages
 
@@ -157,7 +159,7 @@ same state, so neither can be out of step with the other.
 | --- | --- |
 | One per machine | Which system is running, the machine name, the agent version, which address answered ("over Home LAN"), and Refresh, Wake, Sleep, Boot into each other system, plus a button per configured action |
 | One per service on it | Versions, health, what it is doing now, the relay, the last update, Update now, Restart, and the per system automatic update switches |
-| This device | The app's own version and self update, the GitHub token, this phone's ssh key, and the configuration |
+| This device | The app's own version and self update, this phone's ssh key, and the configuration: fetch it from a machine, or paste it |
 
 Two things about the actions are worth knowing. **Update now is dead unless a newer version was
 actually found**: an agent that could not reach the registry does not know, and an update

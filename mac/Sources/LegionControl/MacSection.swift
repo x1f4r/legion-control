@@ -79,6 +79,9 @@ struct MacSection: View {
             }
             .padding(.bottom, 14)
 
+            DetailRow(label: "Setup") { setupVerdict }
+                .padding(.bottom, 14)
+
             if let problem = model.config.problem {
                 QuietNote(text: "The config file was edited into something that could not be read, so the machines above are the ones from before it. \(problem)")
                     .padding(.bottom, 14)
@@ -174,6 +177,25 @@ struct MacSection: View {
             default:
                 Text("not checked yet").foregroundStyle(.secondary)
             }
+        }
+    }
+
+    /// Whether the agent on this Mac is holding the same file the app is running on. It is handed a
+    /// copy whenever it is not, exactly as the machines over ssh are, so this row only ever has news
+    /// when it could not be.
+    @ViewBuilder
+    private var setupVerdict: some View {
+        switch mac.setupSharing {
+        case .upToDate:
+            StatusText(symbol: "checkmark.circle", text: "shared, up to date", tint: .green)
+        case .justShared:
+            StatusText(symbol: "checkmark.circle", text: "shared just now", tint: .green)
+        case .unsupported:
+            Text("not shared: agent too old").foregroundStyle(.secondary)
+        case .failed(let sentence):
+            StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
+        case .unknown:
+            Text("not known").foregroundStyle(.secondary)
         }
     }
 

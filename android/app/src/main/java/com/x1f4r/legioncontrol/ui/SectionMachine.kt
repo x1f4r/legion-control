@@ -34,6 +34,11 @@ fun MachineSection(model: MachineModel) {
     DetailRow("Control agent") { VersionText(model.status?.agentVersion, "not reachable") }
     DetailRow("Reached") { ValueText(model.route?.label, "no address has answered") }
 
+    // Only after this machine has actually handed the setup over, and only while that is still
+    // news. The document arrives on a poll nobody asked for, so the one thing owed here is a line
+    // saying where it came from.
+    model.setupNote?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
+
     SectionHeading("Power")
     Actions {
         // Greyed out only while the user's own refresh is running. A background poll no longer

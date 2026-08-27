@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const AGENT_VERSION = '2.0.0';
+export const AGENT_VERSION = '2.1.0';
 
 // Anything semver-shaped. Used when a service does not pin a stricter pattern:
 // the point of the check is to refuse garbage that would otherwise be handed

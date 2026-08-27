@@ -142,6 +142,16 @@ struct AgentActionInfo: Decodable, Sendable, Identifiable {
     var displayName: String { name ?? id }
 }
 
+/// What the machine is holding of the controller config. The agent never reads the document, it only
+/// stores the bytes it was given, so the hash is the whole of what it has to say about it.
+///
+/// The key being absent altogether is the thing that matters: an agent from before the setup was
+/// shared has nothing to hold, and such a machine is left alone rather than told about a document it
+/// would reject. A hash of nothing means it is ready for one and has none yet.
+struct ControllerCopy: Decodable, Sendable {
+    var hash: String?
+}
+
 /// Something on a system that has a version, can be running or not, can be busy, and can be updated
 /// and restarted.
 struct ServiceStatus: Decodable, Sendable, Identifiable {
@@ -224,6 +234,7 @@ struct AgentStatus: Decodable, Sendable {
     var actions: [AgentActionInfo]?
     var autoUpdate: Bool?
     var notes: [String]?
+    var controller: ControllerCopy?
 
     // The first version of the agent's shape. Read only to build a service out of when `services`
     // is absent; nothing else in the app touches these.
@@ -283,6 +294,17 @@ struct AgentStatus: Decodable, Sendable {
     /// same time, so this is also the test for whether it is safe to pass one.
     var reportsServices: Bool { services != nil }
 
+    /// Whether the far side keeps a copy of the controller config at all. The command line grew
+    /// `config set` at the same time, so this is also the test for whether there is anything to
+    /// push the document to.
+    var reportsControllerCopy: Bool { controller != nil }
+
+    /// The sha256 the machine reports for the copy it holds, or nil when it holds none.
+    var controllerHash: String? {
+        guard let hash = controller?.hash, !hash.isEmpty else { return nil }
+        return hash
+    }
+
     func service(id: String) -> ServiceStatus? { resolvedServices.first { $0.id == id } }
 }
 
@@ -297,6 +319,13 @@ struct AgentActionResult: Decodable, Sendable {
     var message: String?
     var autoUpdate: Bool?
     var exitCode: Int?
+}
+
+/// The reply to `config set`: the hash the machine now holds, or why it kept what it had.
+struct AgentConfigResult: Decodable, Sendable {
+    var ok: Bool?
+    var hash: String?
+    var error: String?
 }
 
 // MARK: - Systems as the app draws them

@@ -51,6 +51,9 @@ final class MachineModel: @MainActor Identifiable {
     /// How a question reaches the screen. The app owns the one place a question is shown, because
     /// only one of them can be answered at a time whichever machine raised it.
     var ask: (@MainActor (PendingDialog) -> Void)?
+    /// The setup this Mac is running on, for the machines to be given a copy of. Read through the
+    /// app rather than held here, so an edit to the file is picked up without rebuilding anything.
+    var controllerConfig: (@MainActor () -> ControllerDocument?)?
 
     private var agent: RemoteAgent
     /// Set right after a reboot is handed off, so a dead connection reads as "restarting", not "gone".
@@ -62,11 +65,23 @@ final class MachineModel: @MainActor Identifiable {
     /// stops being explained away.
     private var sleepExpectation: Date?
     private var lastRefreshFinished: Date?
+    /// The document last sent to this machine, when it went, and what it ended in. What it is for is
+    /// the machine that keeps reporting a stale hash after a push it accepted: without a memory of
+    /// the attempt the same bytes would go over every fifteen seconds forever.
+    private var lastShare: (hash: String, at: Date, failure: String?)?
+    /// True while a push is in flight. Deliberately not `activity`: this is not something the user
+    /// asked for, and it must not take the buttons away while it runs.
+    private var isSharing = false
 
     init(machine: Machine) {
         self.machine = machine
         self.agent = RemoteAgent(machine: machine)
     }
+
+    /// How long a machine that will not take the setup is left alone before it is offered again.
+    /// Long enough that a machine which cannot store it is not asked every poll, short enough that
+    /// whatever was in the way gets another chance without anyone having to do anything.
+    private static let shareRetry: TimeInterval = 600
 
     /// How long an unreachable machine still reads as "asleep" rather than as a problem. The phone
     /// uses the same ten minutes, and the two apps have to say the same thing about the same machine.
@@ -133,6 +148,19 @@ final class MachineModel: @MainActor Identifiable {
         guard let reported = status?.bootTargets else { return others }
         let ids = Set(reported.map(\.id))
         return others.filter { ids.contains($0.id) }
+    }
+
+    /// What the Setup row says. Everything it needs is in the last status and the last push, so
+    /// nothing here has to be kept in step by hand: a machine that goes away stops claiming to be
+    /// holding anything the moment its status does.
+    var setupSharing: SetupSharing {
+        guard let status else { return .unknown }
+        guard status.reportsControllerCopy else { return .unsupported }
+        guard let local = controllerConfig?() else { return .unknown }
+        if status.controllerHash == local.hash { return .upToDate }
+        guard let lastShare, lastShare.hash == local.hash else { return .unknown }
+        if let failure = lastShare.failure { return .failed(failure) }
+        return .justShared
     }
 
     func autoUpdateValue(for system: SystemConfig) -> Bool? {
@@ -229,6 +257,7 @@ final class MachineModel: @MainActor Identifiable {
             if userInitiated {
                 setStatus("Status refreshed.")
             }
+            shareSetupIfNeeded()
         } catch let error as AgentError {
             handleStatusFailure(error)
             lastChecked = Date()
@@ -283,6 +312,54 @@ final class MachineModel: @MainActor Identifiable {
             status = nil
             link = .offline(error.message(machine: machine.name))
             setStatus(error.message(machine: machine.name), isError: true, detail: error.detail)
+        }
+    }
+
+    // MARK: - Sharing the setup
+
+    /// The Mac is the source of truth for the setup, so a machine holding a different copy is given
+    /// this one. Nobody asks for this and nobody is told it happened: it is a consequence of having
+    /// edited the file, and the only thing worth a sentence is a failure.
+    ///
+    /// Runs on its own rather than inside the reading that noticed, so a poll is never held up by a
+    /// push, and never while an action is in flight: the machine is doing something the user asked
+    /// for and this can wait fifteen seconds.
+    private func shareSetupIfNeeded() {
+        guard activity == nil, !isSharing else { return }
+        // An agent that reports no `controller` key predates the whole idea and would reject the
+        // command. Nothing is said about it here; the Setup row says it once, quietly.
+        guard let status, status.reportsControllerCopy else { return }
+        guard let local = controllerConfig?(), status.controllerHash != local.hash else { return }
+        if let lastShare, lastShare.hash == local.hash,
+           Date().timeIntervalSince(lastShare.at) < Self.shareRetry { return }
+
+        isSharing = true
+        Task { @MainActor in
+            var failure: String?
+            do {
+                let reply = try await self.agent.pushControllerConfig(local.bytes, preferring: self.commandableSystem)
+                if reply.value.ok == false {
+                    failure = reply.value.error ?? "the machine kept the copy it had."
+                } else if let stored = reply.value.hash, stored != local.hash {
+                    // It took a document that is not the one we sent, so something went wrong on the
+                    // way over rather than at either end. Saying it went fine would be a lie the next
+                    // status would contradict anyway.
+                    failure = "the machine stored something other than the file on this Mac."
+                }
+            } catch let error as AgentError {
+                failure = error.detail ?? error.message(machine: self.machine.name)
+            } catch {
+                failure = error.localizedDescription
+            }
+
+            // Remembered whatever happened, not only after a success. A push that fails the same way
+            // every fifteen seconds is as much of a hammering as one the machine never acknowledges,
+            // and it would write the same red sentence over the status line each time.
+            let sentence = failure.map { "The setup could not be shared with \(self.machine.name): \($0)" }
+            self.lastShare = (hash: local.hash, at: Date(), failure: sentence)
+            if let sentence { self.setStatus(sentence, isError: true) }
+            self.isSharing = false
+            self.onStateChange?()
         }
     }
 

@@ -91,7 +91,9 @@ The window exists for the detail and for setup, and nothing ever forces you into
 
 Its configuration is `~/.config/legion-control/config.json`: the machines, how to reach them
 over ssh, how to wake them, and which systems each one has. With no config the window opens on
-a setup page that writes an example for you. The app reloads the file when it changes.
+a setup page that writes an example for you. The app reloads the file when it changes, and
+pushes it to every agent it reaches, so the machines carry the setup and a phone can fetch it
+from any one of them instead of being configured by hand.
 
 Three things about how it behaves:
 
@@ -118,8 +120,9 @@ fail happens in a temporary directory first, so a bad download never leaves half
 The phone version of the Mac app. It is a port, not a second system: the same agent over ssh,
 the same commands, the same JSON. It carries its own ssh client and generates its own ed25519
 key on first run, so the phone's access can be revoked by deleting one line from
-`authorized_keys`. It takes the same controller config as the Mac, pasted into its settings,
-and dials the machine's endpoints directly, remote address first and LAN as the fallback. Wake
+`authorized_keys`. It fetches the controller config from any one machine (host and user,
+once) and keeps it in sync from there, and dials the machine's endpoints directly, remote
+address first and LAN as the fallback. Wake
 on LAN is offered only when the phone is on the machine's own network, because a magic packet
 is a broadcast and a tunnel cannot carry one. `android/README.md` covers building and
 installing it.

@@ -6,6 +6,7 @@ import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.SshTransport
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.json.JsonObject
 
 /** An answer, plus how it was obtained, because the UI is expected to show the route it used. */
 data class AgentReply<T>(
@@ -106,6 +107,17 @@ class AgentClient(
 
     suspend fun version(): AgentReply<AgentVersion> =
         call(listOf("version"), SHORT_TIMEOUT_MILLIS, AgentVersion.serializer())
+
+    /**
+     * The setup this machine carries, as the raw reply.
+     *
+     * Raw rather than decoded, because the three things this reply can say are told apart by which
+     * keys are there rather than by their values: an agent too old to know the command answers with
+     * an object of its own, and a class with a nullable field cannot tell that apart from a machine
+     * that is carrying nothing. [readControllerReply] does the reading.
+     */
+    suspend fun config(): AgentReply<JsonObject> =
+        call(listOf("config"), SHORT_TIMEOUT_MILLIS, JsonObject.serializer())
 
     private fun command(name: String, serviceId: String?, force: Boolean): List<String> = buildList {
         add(name)

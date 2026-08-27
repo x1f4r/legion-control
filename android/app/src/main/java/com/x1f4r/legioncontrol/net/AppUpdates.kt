@@ -22,10 +22,11 @@ import java.net.URL
  * Deliberately built on HttpURLConnection rather than pulling in an http client: two requests, no
  * streaming API worth the dependency, and the rest of this project has stayed free of them.
  *
- * The download uses the asset API url with `Accept: application/octet-stream` rather than
- * browser_download_url. Both work for a public repository, but only the asset url can carry an
- * Authorization header, so this one path works for public and private repositories alike; a token
- * is only needed for a private one.
+ * Nothing here authenticates. The releases of a public repository are readable by anyone, which is
+ * what this app is built on and what a fork that wants self updating has to provide; a repository
+ * that will not show its releases to an anonymous request simply has none to show, and that is the
+ * whole of the failure. The download uses the asset API url with `Accept: application/octet-stream`
+ * rather than browser_download_url, because that url is the one the API documents.
  */
 object AppUpdates {
 
@@ -44,32 +45,38 @@ object AppUpdates {
     )
 
     sealed interface Check {
-        data object UpToDate : Check
+        /**
+         * Nothing to install. [noReleaseYet] when the repository has published none at all, which
+         * is a different sentence on screen and the same outcome: there is nothing to press.
+         */
+        data class UpToDate(val noReleaseYet: Boolean = false) : Check
         data class Available(val release: Release) : Check
-        /** The repository is private and there is no token, so releases cannot be read at all. */
-        data object NeedsAuthorisation : Check
         data class Failed(val reason: String) : Check
     }
 
+    /**
+     * What an HTTP status from the releases endpoint means on its own. Null when the body decides.
+     *
+     * A 404 is not a failure worth raising. GitHub answers it both for a repository with no
+     * releases and for one it will not show to an anonymous request, and in both cases the honest
+     * thing to say is that there is no release to install, not that something went wrong.
+     */
+    internal fun outcomeOf(responseCode: Int): Check? = when (responseCode) {
+        200 -> null
+        404 -> Check.UpToDate(noReleaseYet = true)
+        else -> Check.Failed("GitHub answered $responseCode")
+    }
+
     /** Ask GitHub what the newest release is, and whether it is newer than what is installed. */
-    suspend fun check(repo: String, token: String? = null): Check = withContext(Dispatchers.IO) {
+    suspend fun check(repo: String): Check = withContext(Dispatchers.IO) {
         try {
             val connection = (URL(releasesUrl(repo)).openConnection() as HttpURLConnection).apply {
                 setRequestProperty("Accept", "application/vnd.github+json")
                 setRequestProperty("User-Agent", "legion-control")
-                token?.takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
                 connectTimeout = 10_000
                 readTimeout = 15_000
             }
-            // 404 on a private repository is indistinguishable from a repository that does not
-            // exist, which is GitHub being deliberately unhelpful to scanners. Read it as "we are
-            // not allowed to look" rather than as a hard failure, because that is what it means here.
-            if (connection.responseCode == 404 || connection.responseCode == 401) {
-                return@withContext Check.NeedsAuthorisation
-            }
-            if (connection.responseCode != 200) {
-                return@withContext Check.Failed("GitHub answered ${connection.responseCode}")
-            }
+            outcomeOf(connection.responseCode)?.let { return@withContext it }
 
             val body = connection.inputStream.bufferedReader().use { it.readText() }
             val root = json.parseToJsonElement(body).jsonObject
@@ -81,7 +88,7 @@ object AppUpdates {
                 ?: return@withContext Check.Failed("that release has no apk attached")
 
             val latest = tag.removePrefix("v")
-            if (!isNewer(latest, BuildConfig.VERSION_NAME)) return@withContext Check.UpToDate
+            if (!isNewer(latest, BuildConfig.VERSION_NAME)) return@withContext Check.UpToDate()
 
             Check.Available(
                 Release(
@@ -117,7 +124,6 @@ object AppUpdates {
     suspend fun download(
         context: Context,
         release: Release,
-        token: String? = null,
         onProgress: (Int) -> Unit,
     ): Result<File> = withContext(Dispatchers.IO) {
         try {
@@ -129,7 +135,6 @@ object AppUpdates {
             val connection = (URL(release.assetUrl).openConnection() as HttpURLConnection).apply {
                 setRequestProperty("Accept", "application/octet-stream")
                 setRequestProperty("User-Agent", "legion-control")
-                token?.takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
                 instanceFollowRedirects = true
                 connectTimeout = 15_000
                 readTimeout = 60_000

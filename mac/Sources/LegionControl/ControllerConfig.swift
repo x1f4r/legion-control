@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 
@@ -310,6 +311,34 @@ extension ControllerConfig {
     }
 }
 
+/// The controller config as a machine gets it: the bytes of the file, and the sha256 the two sides
+/// compare. The bytes are the file exactly as it was read and never a re-encoding of it, because a
+/// document that was re-serialised on the way out would hash differently every time the app was
+/// updated and every machine would be handed it again for nothing.
+struct ControllerDocument: Sendable, Equatable {
+    var bytes: Data
+    var hash: String
+}
+
+/// How far the setup has got to one machine, as its section draws it.
+///
+/// The push itself is never something the user asked for, so this is the only place it is ever
+/// mentioned unless it fails: a row that says the machine is holding the same file this Mac is.
+enum SetupSharing: Sendable, Equatable {
+    /// The machine reports the hash this Mac's file has. Nothing to do.
+    case upToDate
+    /// The document went over and was accepted, and the machine has not been read since. The next
+    /// status turns this into `upToDate`.
+    case justShared
+    /// An agent from before the setup was shared. It has nowhere to put the document and would
+    /// reject the command, so it is left alone.
+    case unsupported
+    /// The whole sentence to show, ready to read.
+    case failed(String)
+    /// Nothing to say: the machine has not been read, or this Mac has no usable config to share.
+    case unknown
+}
+
 // MARK: - Loading and watching
 
 /// Holds whatever the config file last said, and notices when it changes.
@@ -328,6 +357,11 @@ final class ConfigStore {
     /// True when there is simply nothing at the path. Told apart from a broken file because the
     /// setup page offers to write an example only into empty space.
     private(set) var isMissing = false
+    /// The bytes the config that is in force was read from, and their sha256. Recomputed on every
+    /// load, and the only thing the machines are ever given: they hold the document, not this app's
+    /// idea of it.
+    private(set) var bytes: Data?
+    private(set) var hash: String?
 
     let url: URL
 
@@ -371,6 +405,14 @@ final class ConfigStore {
     /// Whether the window has anything at all to show besides the setup page.
     var hasAnything: Bool { !machines.isEmpty || local != nil }
 
+    /// What there is to share, or nil while nothing usable has been read. A file that was edited
+    /// into something broken leaves the previous document here, which is the same rule the machines
+    /// list follows: the last thing that made sense is what the app is running on.
+    var document: ControllerDocument? {
+        guard config != nil, let bytes, let hash else { return nil }
+        return ControllerDocument(bytes: bytes, hash: hash)
+    }
+
     // MARK: - Reading
 
     /// A cheap "did it change" check, called from the poll and whenever a viewer comes back. The
@@ -394,6 +436,8 @@ final class ConfigStore {
             if config != nil, FileManager.default.fileExists(atPath: path) { return }
             if config != nil {
                 config = nil
+                bytes = nil
+                hash = nil
                 onChange?()
             }
             return
@@ -404,6 +448,10 @@ final class ConfigStore {
             let decoded = try JSONDecoder().decode(ControllerConfig.self, from: data)
             let checked = try decoded.validated()
             problem = nil
+            // Before the equality check below: a file that was reformatted without changing anything
+            // this app reads is still a different document to the machines, and they compare bytes.
+            bytes = data
+            hash = Self.sha256(of: data)
             guard checked != config else { return }
             config = checked
             onChange?()
@@ -414,6 +462,11 @@ final class ConfigStore {
         } catch {
             problem = error.localizedDescription
         }
+    }
+
+    /// The same sha256, in the same lower case hex, that the agent prints for the copy it holds.
+    private static func sha256(of data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Decoding errors read as one long sentence about coding paths. Cut them down to the two things

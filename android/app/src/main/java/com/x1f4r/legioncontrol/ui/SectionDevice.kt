@@ -7,8 +7,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -16,7 +14,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.BuildConfig
 import com.x1f4r.legioncontrol.agent.MachineSystem
@@ -24,18 +22,17 @@ import com.x1f4r.legioncontrol.net.AppUpdates
 import java.io.File
 
 /**
- * The phone's own business: the app's version and how it updates itself, the token that makes that
- * possible, the ssh key that gets this phone through the front door, and the configuration that
- * decides which doors there are.
+ * The phone's own business: the app's version and how it updates itself, the ssh key that gets this
+ * phone through the front door, and the configuration that decides which doors there are.
  *
- * Nothing on this page talks to a machine, which is the whole reason it is a page of its own. It
- * used to be the tail of one long scroll, under everything anyone actually opens the app to see.
+ * Nothing on this page talks to a machine except the one thing that has to: fetching the setup off
+ * one, which is how the configuration gets here in the first place. It used to be the tail of one
+ * long scroll, under everything anyone actually opens the app to see.
  */
 @Composable
 fun ThisDeviceSection(app: AppModel, updates: AppUpdateModel) {
     Spacer(Modifier.height(6.dp))
     AppUpdateBlock(updates)
-    GitHubTokenBlock(updates)
     DeviceKeyBlock(app)
     ConfigurationBlock(app)
 }
@@ -107,87 +104,14 @@ private fun AppUpdateBlock(updates: AppUpdateModel) {
 private fun appUpdateReason(updates: AppUpdateModel): String? = when (val check = updates.check) {
     null -> if (updates.checking) "Looking for a newer release." else "The release list has not been read yet."
     is AppUpdates.Check.Available -> if (updates.downloaded != null) "Downloaded and ready to install." else null
-    is AppUpdates.Check.UpToDate -> "This is the newest release."
-    is AppUpdates.Check.NeedsAuthorisation ->
-        if (updates.hasToken) {
-            "GitHub would not show the release list to the saved token. A fine grained token expires " +
-                "on its own, so the likeliest reason is that this one has run out. Paste a new one below."
+    is AppUpdates.Check.UpToDate ->
+        if (check.noReleaseYet) {
+            "That repository has published no release yet, so there is nothing to install."
         } else {
-            "The release list cannot be read. A private repository needs a token below."
+            "This is the newest release."
         }
 
     is AppUpdates.Check.Failed -> "The release list could not be read: ${check.reason}"
-}
-
-// MARK: - The token
-
-@Composable
-private fun GitHubTokenBlock(updates: AppUpdateModel) {
-    // A saved token that GitHub then refuses is the one state a masked row cannot answer on its own.
-    // The token is write only once it is stored, which is the point, but with no field on screen the
-    // only way out of an expired one is to work out that it has to be removed before a replacement
-    // can be typed. That is a dead end wearing the clothes of a settled state, so the field comes
-    // back the moment the far side says the token no longer works.
-    val refused = updates.check is AppUpdates.Check.NeedsAuthorisation
-
-    SectionHeading("GitHub access")
-
-    if (updates.hasToken) {
-        DetailRow("Token") {
-            Text(
-                text = "\u2022".repeat(16),
-                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-        }
-        QuietText(
-            if (refused) {
-                "Saved on this phone, and GitHub will not accept it."
-            } else {
-                "Saved on this phone, wrapped by a key that never leaves it."
-            },
-        )
-        if (refused) {
-            Spacer(Modifier.height(8.dp))
-            SecretField(
-                value = updates.draft,
-                onValueChange = { updates.draft = it },
-                placeholder = "Paste a new token",
-            )
-        }
-        Actions {
-            if (refused) {
-                PlainAction(
-                    label = "Replace the token",
-                    enabled = updates.draft.isNotBlank(),
-                    emphasis = updates.draft.isNotBlank(),
-                ) { updates.saveToken() }
-            }
-            PlainAction("Remove the token", enabled = true, destructive = true) {
-                updates.clearToken()
-            }
-        }
-    } else {
-        ExplanationText(
-            "The app looks for its own updates in the releases of the repository the configuration " +
-                "names. A public repository needs nothing here. A private one will not show its " +
-                "releases to anyone without a token: paste a fine grained personal access token " +
-                "with read only access to the contents of that one repository.",
-        )
-        Spacer(Modifier.height(8.dp))
-        SecretField(
-            value = updates.draft,
-            onValueChange = { updates.draft = it },
-            placeholder = "Paste the token",
-        )
-        Actions {
-            PlainAction(
-                label = "Save the token",
-                enabled = updates.draft.isNotBlank(),
-                emphasis = updates.draft.isNotBlank(),
-            ) { updates.saveToken() }
-        }
-    }
 }
 
 // MARK: - The key
@@ -261,7 +185,16 @@ private fun ConfigurationBlock(app: AppModel) {
     )
     ExplanationText(
         "The same document the Mac keeps in ~/.config/legion-control/config.json: which machines " +
-            "exist, how to reach them, how to wake them, and which systems each one can boot into.",
+            "exist, how to reach them, how to wake them, and which systems each one can boot into. " +
+            "Every machine carries a copy of it, so one address is enough to get all of it.",
+    )
+    Spacer(Modifier.height(14.dp))
+    FetchSetupBlock(app)
+    Spacer(Modifier.height(20.dp))
+    SectionHeading("Or paste it", showsRule = false)
+    ExplanationText(
+        "A document typed in here is never quietly replaced by an older one: what a machine offers " +
+            "is only taken when it is a different document, and only when it holds up.",
     )
     Spacer(Modifier.height(10.dp))
     DocumentField(
@@ -280,6 +213,51 @@ private fun ConfigurationBlock(app: AppModel) {
     }
     app.configError?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
     app.configNote?.takeIf { app.configError == null }?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
+}
+
+/**
+ * Three fields and a button, which is the whole of setting this app up.
+ *
+ * It is the first thing on the Machines page when there is nothing configured, and it sits above
+ * the document field here, because it is the way in: the Mac writes the setup once and pushes it to
+ * the machines, and the phone only has to know where one machine is. The key is the phone's own and
+ * has to be authorised on that system already, exactly as for every other command this app runs.
+ */
+@Composable
+fun FetchSetupBlock(app: AppModel) {
+    SectionHeading("Fetch from a machine", showsRule = false)
+    DetailRow("Address") {
+        PlainField(
+            value = app.fetchHost,
+            onValueChange = { app.fetchHost = it },
+            placeholder = "a tailnet or LAN address",
+            keyboardType = KeyboardType.Uri,
+        )
+    }
+    DetailRow("Port") {
+        PlainField(
+            value = app.fetchPort,
+            onValueChange = { app.fetchPort = it },
+            placeholder = "22",
+            keyboardType = KeyboardType.Number,
+        )
+    }
+    DetailRow("User") {
+        PlainField(
+            value = app.fetchUser,
+            onValueChange = { app.fetchUser = it },
+            placeholder = "the account to log in as",
+        )
+    }
+    Actions {
+        PlainAction(
+            label = "Fetch",
+            enabled = app.canFetch,
+            emphasis = app.canFetch,
+            working = app.fetching,
+        ) { app.fetchSetup() }
+    }
+    app.fetchOutcome?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
 }
 
 /** The systems by name, or a general word for them when there is no configuration yet. */
