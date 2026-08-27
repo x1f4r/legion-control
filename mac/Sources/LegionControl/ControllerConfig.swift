@@ -15,12 +15,26 @@ struct ControllerConfig: Decodable, Sendable, Equatable {
     var machines: [Machine]
     var local: LocalConfig?
 
-    /// Where the Android app looks for its own updates. Decoded so a config that carries it is not
-    /// reported as having an unknown key, and ignored here: this app has no self-update.
-    var appUpdates: AppUpdates?
+    /// Where both apps look for their own updates. One key, one repository, and the same releases
+    /// on the phone and on the Mac.
+    var appUpdates: AppUpdatesConfig?
 
-    struct AppUpdates: Decodable, Sendable, Equatable {
+    struct AppUpdatesConfig: Decodable, Sendable, Equatable {
+        /// This project's own releases, which is where an unmodified build should look. A fork
+        /// names itself here instead.
+        static let defaultRepo = "x1f4r/legion-control"
+
         var githubRepo: String?
+    }
+
+    /// The repository to read releases from, with the default filled in. A config that leaves the
+    /// key out, or leaves it empty, is not asking for updates to be turned off; it is not asking
+    /// for anything, and the answer to that is this project.
+    var updateRepo: String {
+        guard let named = appUpdates?.githubRepo, !named.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return AppUpdatesConfig.defaultRepo
+        }
+        return named
     }
 
     /// The machines the app can actually drive, in the order the file lists them.

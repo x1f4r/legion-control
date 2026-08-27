@@ -66,6 +66,9 @@ struct MacSection: View {
             }
             .padding(.bottom, 14)
 
+            updateBlock
+                .padding(.bottom, 14)
+
             DetailRow(label: "Config file") {
                 Text(model.config.path)
                     .font(.system(.callout, design: .monospaced))
@@ -109,6 +112,68 @@ struct MacSection: View {
             // section is shown rather than trusted from launch.
             startsAtLogin = LoginItem.isEnabled
             needsLoginApproval = LoginItem.needsApproval
+        }
+    }
+
+    // MARK: - Legion Control's own update
+
+    /// The same shape as a service block one section up, because it is the same question: what is
+    /// installed, what is newer, and one button that closes the gap.
+    private var updateBlock: some View {
+        let updates = model.appUpdates
+        return VStack(alignment: .leading, spacing: 12) {
+            DetailRow(label: "Update") { updateVerdict }
+
+            HStack(spacing: 10) {
+                if let version = updates.availableVersion {
+                    PrimaryActionButton(
+                        title: updates.phase == .idle ? "Install \(version)" : updates.summary,
+                        isHighlighted: true,
+                        isEnabled: !updates.phase.isWorking
+                    ) { updates.install() }
+                }
+
+                Button("Check now") { updates.checkNow() }
+                    .disabled(updates.phase.isWorking)
+
+                if updates.phase.isWorking {
+                    ProgressView().controlSize(.small)
+                }
+            }
+
+            if let note = updates.note {
+                QuietNote(text: note)
+            }
+
+            QuietNote(text: cadenceNote)
+        }
+    }
+
+    /// Where it looks, how often, and how old the answer on screen is. All three belong together:
+    /// nothing polls while the app is closed, so a version row that says nothing about its own age
+    /// is a row that quietly claims to be live.
+    private var cadenceNote: String {
+        let repo = model.config.config?.updateRepo ?? ControllerConfig.AppUpdatesConfig.defaultRepo
+        let age = AppModel.freshness(of: model.appUpdates.lastChecked)
+        return "The releases of \(repo) are read when this window or the panel opens, at most once every six hours. The list was \(age)."
+    }
+
+    @ViewBuilder
+    private var updateVerdict: some View {
+        let updates = model.appUpdates
+        if updates.phase.isWorking {
+            StatusText(symbol: "arrow.down.circle", text: updates.summary, tint: .orange)
+        } else if let version = updates.availableVersion {
+            StatusText(symbol: "arrow.down.circle", text: "Version \(version) is available", tint: .orange)
+        } else {
+            switch updates.check {
+            case .upToDate:
+                StatusText(symbol: "checkmark.circle", text: "Up to date", tint: .green)
+            case .failed:
+                StatusText(symbol: "wifi.exclamationmark", text: "Not checked", tint: .orange)
+            default:
+                Text("not checked yet").foregroundStyle(.secondary)
+            }
         }
     }
 
