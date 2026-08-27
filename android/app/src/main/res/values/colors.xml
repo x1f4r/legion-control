@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches the light background in the Compose theme, so the window behind the first frame is
+         already the right colour and the app never opens on a white flash. -->
+    <color name="window_background">#FFFBFAF8</color>
+    <color name="launcher_background">#FF111B2E</color>
+    <color name="launcher_frame">#FFD8E2EA</color>
+</resources>

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "machines": [
+    {
+      "id": "workstation",
+      "name": "Workstation",
+      "ssh": { "host": "workstation" },
+      "endpoints": [
+        { "id": "tailnet-linux", "kind": "remote", "host": "100.64.0.10", "port": 22, "user": "me", "system": "linux", "label": "Tailnet, Linux" },
+        { "id": "tailnet-windows", "kind": "remote", "host": "100.64.0.11", "port": 22, "user": "me", "system": "windows", "label": "Tailnet, Windows" },
+        { "id": "lan", "kind": "lan", "host": "192.168.1.40", "port": 22, "user": "me", "label": "Home LAN" }
+      ],
+      "wake": {
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "broadcast": ["192.168.1.255"],
+        "ports": [9, 7],
+        "probe": { "host": "192.168.1.40", "port": 22 },
+        "lanPrefix": "192.168.1."
+      },
+      "systems": [
+        { "id": "linux", "name": "Linux", "platform": "linux", "agent": ["/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs"] },
+        { "id": "windows", "name": "Windows 11", "platform": "windows", "agent": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"] }
+      ]
+    }
+  ],
+  "local": { "enabled": true, "name": "This Mac", "agent": "~/.legion-control/agent/src/index.mjs" },
+  "appUpdates": { "githubRepo": "x1f4r/legion-control" }
+}

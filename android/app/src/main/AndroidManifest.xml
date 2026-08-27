@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ssh to the configured machines, and the wake-on-LAN broadcast. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Installing an update that this app downloaded itself. Android still shows its own
+         confirmation, and the user has to allow this source once in settings. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Reads the attached networks' link addresses. That is how the app knows whether it shares a
+         subnet with a machine, which is the only place a wake-on-LAN broadcast can go. No location
+         permission: the subnet of the interface answers the question without asking who the
+         network is. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LegionControl">
+
+        <activity
+            android:name="com.x1f4r.legioncontrol.ui.MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.LegionControl"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    
+        <!-- Handing the downloaded apk to the system installer. Scoped to the updates directory
+             only, so nothing else this app stores is exposed by it. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
+        </provider>
+    </application>
+
+</manifest>

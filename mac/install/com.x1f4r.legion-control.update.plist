@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Legion Control: run one update cycle on this Mac every 15 minutes.
+
+    This is a TEMPLATE, the same way the systemd units on the Linux side are.
+    install-mac-agent.sh substitutes the placeholders and writes the result to
+    ~/Library/LaunchAgents/com.x1f4r.legion-control.update.plist. Editing the
+    installed copy by hand is wasted work, the next install overwrites it.
+
+    It is a USER agent, not a daemon in /Library/LaunchDaemons. Everything it
+    touches belongs to the logged in user: the agent tree in ~/.legion-control,
+    whatever state the services it looks after keep under ~, and any app that
+    runs in this login session. A root daemon would need no privileges it does
+    not already have and could not talk to the GUI session at all, so nothing
+    here ever wants sudo.
+
+    Same division of labour as on every other machine: this job provides a clean
+    environment and a cadence, the agent makes every decision. Whether auto
+    update is on, whether an update is actually available, and above all whether
+    a service is mid work and must be left alone, are all its call.
+
+    Which services exist and what updating one means are the agent config's
+    business, not this file's. On this Mac an update can be as small as asking a
+    desktop app that has already downloaded its own build to quit and start
+    again, so the whole job of the cycle is deciding when that is safe. That is
+    precisely the decision the agent's busy rule exists to make, and it fails
+    closed: a state it cannot read counts as busy.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.x1f4r.legion-control.update</string>
+
+    <!--
+        An absolute node path, resolved at install time and baked in rather than
+        assumed. There is no /usr/bin/node on this Mac at all, node comes from
+        Homebrew, and a launchd agent starts with a minimal PATH that does not
+        include /opt/homebrew/bin, so "node" alone would simply not be found.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>@NODE@</string>
+        <string>@AGENT_DIR@/src/index.mjs</string>
+        <string>update</string>
+    </array>
+
+    <!--
+        Every 15 minutes, the same cadence the timer on the Linux side uses, and
+        for the same second reason more than the first. Yes, it means a new build
+        gets picked up the same quarter hour. But the cycle refuses to touch a
+        busy machine and reports "deferred", so the retry interval IS the
+        recovery time: at 15 minutes a machine that finishes its last piece of
+        work updates within the quarter hour, at an hour it could sit on a stale
+        build all evening for no reason at all.
+
+        launchd counts the interval from load, and it does not stack missed runs
+        while the Mac is asleep: it fires once on wake if the interval elapsed,
+        which is exactly the behaviour wanted here.
+    -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!--
+        Deliberately not run at load. Load happens at login, which is the single
+        busiest minute this machine has, and an app being quit in the middle of
+        the login stampede is the worst possible moment for it. There is nothing
+        urgent about an update. Waiting out the first interval costs 15 minutes
+        and buys a quiet login.
+    -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!--
+        The agent prints exactly one JSON object per run on stdout, so this file
+        is a readable history of what was decided and when. launchd appends and
+        never truncates, but at one line per run it grows by a few kilobytes a
+        day, which is not worth rotating.
+    -->
+    <key>StandardOutPath</key>
+    <string>@BASE@/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>@BASE@/launchd.log</string>
+
+    <!--
+        Background says to the scheduler that nothing here is ever more important
+        than what is on screen: it puts the job in the background QoS class, with
+        throttled CPU and disk. The other two are belt and braces on top of that.
+        A maintenance job that makes the machine feel slow while it works would
+        get turned off, and then it would never run at all.
+    -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <key>WorkingDirectory</key>
+    <string>@BASE@</string>
+
+    <!--
+        launchd hands a job a bare PATH of /usr/bin:/bin:/usr/sbin:/sbin. node
+        itself is invoked by absolute path above so it does not depend on this,
+        but anything the agent shells out to does, and the Homebrew prefix is
+        where node's own neighbours live.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>@NODE_DIR@:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

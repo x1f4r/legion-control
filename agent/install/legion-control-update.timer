@@ -1,0 +1,35 @@
+# Fire one update cycle every 15 minutes.
+#
+# This is a template for symmetry with the other units, it happens to carry no
+# placeholders at all. install-linux.sh copies it to
+# ~/.config/systemd/user/legion-control-update.timer.
+#
+# Why 15 minutes and not hourly: two reasons, and the second one matters more.
+# First, a new release gets picked up the same quarter hour it lands. Second,
+# the update cycle refuses to touch a busy machine and reports "deferred", so
+# the retry cadence IS the recovery time. At 15 minutes a machine that finishes
+# its last piece of work updates within the quarter hour. At an hour it could
+# sit on a stale build most of an evening for no reason.
+
+[Unit]
+Description=Legion Control: check for an update every 15 minutes
+
+[Timer]
+Unit=legion-control-update.service
+
+# Do not race the boot. The services need to be up and the network settled
+# before the first check is worth anything.
+#
+# These are both monotonic triggers, which is deliberate. OnBootSec already
+# covers the "machine was off, or was over on the other system" case: the clock
+# restarts from zero every boot, so coming back always produces a check 5 minutes
+# later. Persistent= is not set here because it only ever applies to OnCalendar
+# timers and would be silently ignored on these two.
+OnBootSec=5min
+OnUnitActiveSec=15min
+
+# No reason to wake anything up for this, let systemd batch it.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

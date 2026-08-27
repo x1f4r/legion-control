@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Legion Control</string>
+	<key>CFBundleExecutable</key>
+	<string>LegionControl</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.x1f4r.legion-control</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Legion Control</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<!-- Mirrors the Android versionName and versionCode in android/app/build.gradle.kts. The Mac
+	     app has no self-update that reads these, but the settings screen shows them, and a number
+	     that never moves reads as an app that never changed. Bump both apps together per release. -->
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.6</string>
+	<key>CFBundleVersion</key>
+	<string>7</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>x1f4r</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Legion Control sends wake packets to the machines in your config and checks whether they are answering on the local network.</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>

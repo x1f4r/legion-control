@@ -1,0 +1,47 @@
+# T3 Code server, systemd user unit.
+#
+# This is the REFERENCE EXAMPLE of a service unit the agent looks after, and it
+# is only installed when install-linux.sh is run with --with-t3. Any other
+# service is described the same way: a unit here, and a matching entry under
+# "services" in ~/.legion-control/config.json naming this unit.
+#
+# This is also a TEMPLATE. install-linux.sh fills in the placeholders and writes
+# the result to ~/.config/systemd/user/t3-code.service. Do not install this file
+# by hand, the unsubstituted placeholders would end up in the live unit.
+#
+# Restart=always is why a Linux service needs no separate watchdog: if it dies
+# or wedges and gets killed, systemd brings it straight back. A Windows machine
+# needs a watchdog task for the same job, because a scheduled task cannot
+# supervise a process the way a unit can.
+
+[Unit]
+Description=T3 Code server (web mode, loopback only)
+After=network-online.target
+Wants=network-online.target
+
+# The update cycle stops this unit, swaps the package and starts it again. If a
+# crash loop ever develops, do not let systemd give up and leave the box dark.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+
+# systemd never reads a login shell, so nothing about PATH can be assumed.
+# Spell it out. This is not decoration: the launcher npm drops in the global bin
+# starts with "#!/usr/bin/env node", so without /usr/bin on PATH the unit fails
+# at exec with a bare "no such file or directory" that points at nothing useful.
+Environment=PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=@NPM_BIN@/t3 start --mode web --host 127.0.0.1 --port @PORT@ --no-browser
+
+# Bind to loopback only. Anything outside the box reaches the server through a
+# VPN or a relay, never by listening on the LAN.
+Restart=always
+RestartSec=5
+
+# Give the server a chance to flush its sqlite WAL before it gets the KILL.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

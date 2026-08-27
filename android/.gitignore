@@ -1,0 +1,11 @@
+# Machine local: names the Android SDK on this particular Mac and must never be committed.
+local.properties
+
+.gradle/
+build/
+app/build/
+captures/
+.cxx/
+*.iml
+.idea/
+.kotlin/

@@ -1,0 +1,18 @@
+{
+  "system": { "id": "mac", "name": "macOS" },
+  "autoUpdate": true,
+  "services": [
+    {
+      "id": "t3",
+      "name": "T3 Code",
+      "kind": "app",
+      "path": "/Applications/T3 Code (Nightly).app",
+      "bundleId": "com.t3tools.t3code",
+      "updaterCacheDir": "~/Library/Caches/t3code-updater",
+      "stagedFilePattern": "^T3-Code-(.+)-(?:arm64|x64|universal)\\.(?:zip|dmg)$",
+      "latest": { "type": "github-releases", "repo": "pingdotgg/t3code", "prerelease": true },
+      "health": { "type": "http", "port": 3773, "path": "/" },
+      "busy": { "type": "t3-sqlite", "staleHours": 6 }
+    }
+  ]
+}

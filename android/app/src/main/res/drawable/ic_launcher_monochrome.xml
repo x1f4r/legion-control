@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The same machine as one silhouette, for launchers that tint the icon to the wallpaper. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M34,35 L74,35 A3,3 0 0 1 77,38 L77,64 L31,64 L31,38 A3,3 0 0 1 34,35 Z M34.5,38.5 L34.5,60.5 L73.5,60.5 L73.5,38.5 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M26,66 L82,66 L84,71 A1.5,1.5 0 0 1 82.5,73 L25.5,73 A1.5,1.5 0 0 1 24,71 Z" />
+</vector>

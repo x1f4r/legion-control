@@ -1,0 +1,17 @@
+.DS_Store
+.build/
+build/
+*.app/
+node_modules/
+mac/Resources/AppIcon.iconset/
+
+# Signing keys, anywhere in the tree. The Android release key and its password live outside the
+# repository in ~/.legion-control and there is no reason for either to be in here, but a stray copy
+# is exactly the kind of thing that gets committed by accident, so it is refused repository wide.
+# See android/keystore.md. The Android build noise is handled by android/.gitignore.
+*.jks
+*.keystore
+*.pw
+*.idsig
+android/local.properties
+android/.kotlin/

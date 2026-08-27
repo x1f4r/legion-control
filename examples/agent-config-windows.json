@@ -1,0 +1,27 @@
+{
+  "system": { "id": "windows", "name": "Windows 11" },
+  "autoUpdate": true,
+  "services": [
+    {
+      "id": "t3",
+      "name": "T3 Code",
+      "kind": "npm",
+      "package": "t3",
+      "channel": "nightly",
+      "versionPattern": "^\\d+\\.\\d+\\.\\d+-nightly\\.\\d+\\.\\d+$",
+      "process": { "type": "scheduled-task", "task": "T3 Code Connect" },
+      "health": { "type": "http", "port": 3773, "path": "/" },
+      "busy": { "type": "t3-sqlite", "staleHours": 6 }
+    }
+  ],
+  "boot": {
+    "targets": {
+      "linux": { "method": "clear-bootsequence", "name": "Linux" }
+    }
+  },
+  "sleep": {
+    "before": [],
+    "settle": 2,
+    "tools": ["C:\\Tools\\PSTools\\psshutdown64.exe"]
+  }
+}

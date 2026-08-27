@@ -1,0 +1,39 @@
+# One update cycle. Driven by legion-control-update.timer, not enabled itself.
+#
+# This is a TEMPLATE. install-linux.sh fills in the placeholders and writes the
+# result to ~/.config/systemd/user/legion-control-update.service.
+#
+# The agent decides everything: whether auto update is on, which service the
+# cycle is for, whether a newer version exists, whether the machine is busy.
+# This unit only provides a clean environment to run it in.
+
+[Unit]
+Description=Legion Control: run one update cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# A login shell is never sourced by systemd, so nothing about PATH can be
+# assumed here. Spell it out, including the npm bin directory, so a service
+# installed with npm can be found and driven.
+Environment=PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin
+
+# The update cycle drives services with "systemctl --user stop/start", which
+# needs a session bus to talk to. When a unit is started by the timer there is
+# no login session around to inherit these from, so pin them to the linger
+# session for uid @UID@.
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+
+ExecStart=@NODE@ @AGENT_DIR@/src/index.mjs update
+
+# Worst case is a cold package cache plus the 120 s health wait plus a rollback,
+# so leave real headroom. A cycle that has not finished in 15 minutes is stuck.
+TimeoutStartSec=900
+
+# The agent prints one JSON object to stdout, which lands in the journal.
+# Read it back with: journalctl --user -u legion-control-update.service -n 50
+StandardOutput=journal
+StandardError=journal
