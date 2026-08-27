@@ -102,13 +102,24 @@ struct RemoteAgent: Sendable {
         return try await call(arguments, decoding: AgentActionResult.self, timeout: 300, preferring: system)
     }
 
+    /// Hands this machine the controller config the Mac is running on.
+    ///
+    /// The only command that sends a document rather than asking for one: the bytes go in on stdin,
+    /// exactly as they were read from the file, because the hash the two sides compare is a hash of
+    /// those bytes and nothing else.
+    func pushControllerConfig(_ bytes: Data, preferring system: SystemConfig?) async throws -> Reply<AgentConfigResult> {
+        try await call(["config", "set"], decoding: AgentConfigResult.self, timeout: 40,
+                       preferring: system, input: bytes)
+    }
+
     // MARK: - Transport
 
     private func call<Value: Decodable & Sendable>(
         _ arguments: [String],
         decoding: Value.Type,
         timeout: TimeInterval,
-        preferring preferred: SystemConfig?
+        preferring preferred: SystemConfig?,
+        input: Data? = nil
     ) async throws -> Reply<Value> {
         guard let target = machine.sshTarget else {
             throw AgentError.unreachable("There is no ssh host configured for \(machine.name).")
@@ -132,7 +143,8 @@ struct RemoteAgent: Sendable {
                 executable: Self.sshPath,
                 arguments: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=\(connectTimeout)"]
                     + target.sshOptions + [target.destination] + system.agent + arguments,
-                timeout: timeout
+                timeout: timeout,
+                input: input
             )
 
             if let launchFailure = result.launchFailure {

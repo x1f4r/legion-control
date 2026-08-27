@@ -105,6 +105,18 @@ data class ServiceStatus(
     val displayName: String get() = name?.takeIf { it.isNotBlank() } ?: id.orEmpty().ifBlank { "Service" }
 }
 
+/**
+ * What the machine says about the setup it carries.
+ *
+ * The hash and nothing else: the document itself is asked for separately, and only when this hash
+ * says the phone is holding something older. Absent on any agent that predates the arrangement,
+ * which is exactly the case where there is nothing to fetch.
+ */
+@Serializable
+data class ControllerMark(
+    val hash: String? = null,
+)
+
 /** A system this one can arm the next boot for. */
 @Serializable
 data class BootTarget(
@@ -135,6 +147,7 @@ data class AgentStatus(
     val bootTargets: List<BootTarget>? = null,
     val actions: List<AgentAction>? = null,
     val busy: BusyStatus? = null,
+    val controller: ControllerMark? = null,
     val autoUpdate: Boolean? = null,
     val notes: List<String>? = null,
     /** Set when the agent is reporting its own failure rather than a machine state. */

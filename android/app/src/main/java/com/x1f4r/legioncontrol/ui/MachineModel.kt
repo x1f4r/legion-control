@@ -6,10 +6,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentAction
 import com.x1f4r.legioncontrol.agent.AgentStatus
+import com.x1f4r.legioncontrol.agent.ControllerFetch
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.MachineSystem
 import com.x1f4r.legioncontrol.agent.ServiceStatus
 import com.x1f4r.legioncontrol.agent.resolveSystem
+import com.x1f4r.legioncontrol.agent.shouldFetchSetup
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -29,6 +31,8 @@ class MachineModel(
     private val client: MachineClient,
     private val settings: RememberedSettings,
     private val scope: CoroutineScope,
+    /** The phone's copy of the setup, which this machine is one of the carriers of. */
+    private val setup: SetupSync,
 ) {
     val machine: Machine get() = client.machine
 
@@ -150,6 +154,9 @@ class MachineModel(
     private var pollJob: Job? = null
     private var networkJob: Job? = null
 
+    /** The last setup hash this machine reported, so one that leads nowhere is only followed once. */
+    private var lastSetupHash: String? = null
+
     var link: LinkState by mutableStateOf(LinkState.Unknown)
         private set
     var status: AgentStatus? by mutableStateOf(null)
@@ -250,6 +257,9 @@ class MachineModel(
 
     /** Whether waking is on offer at all: a machine the configuration cannot wake never shows it. */
     val canWake: Boolean get() = machine.wake != null
+
+    /** What this machine's last handover of the setup did, while that is still news. */
+    val setupNote: String? get() = setup.noteFor(machine.id, now)
 
     /** The actions the agent offered. An older agent offers none and the block is not drawn. */
     val actions: List<AgentAction> get() = status?.actions.orEmpty().filter { !it.id.isNullOrBlank() }
@@ -361,6 +371,7 @@ class MachineModel(
                         statusDetail = reply.message ?: reply.error
                     } else {
                         applyReading(reply)
+                        syncSetup(reply.controller?.hash)
                         if (userInitiated) {
                             statusLine = "Status refreshed."
                             statusIsError = false
@@ -400,6 +411,40 @@ class MachineModel(
             System.currentTimeMillis(),
         )
         remembered = settings.load(machine.id, machine.systems.map { it.id })
+    }
+
+    /**
+     * Takes the setup from this machine when it is carrying one the phone has not got.
+     *
+     * Every machine carries the document, so the one that has just answered is also the cheapest
+     * place to read it from: the link is up, the route is remembered, and this is one more command
+     * over it. It is the whole of what keeps an edit made on the Mac reaching the phone without
+     * anybody pasting anything.
+     *
+     * The hash is written down before the fetch and only forgotten again when nothing came back,
+     * which is what keeps a document that will not validate from being fetched every fifteen
+     * seconds for as long as it stays wrong: it is asked for once and refused once. A round trip
+     * that failed taught us nothing about the document, so that one is worth repeating.
+     */
+    private suspend fun syncSetup(reported: String?) {
+        if (!shouldFetchSetup(reported, setup.appliedHash, lastSetupHash)) return
+        lastSetupHash = reported
+        val reply = client.fetchSetup().getOrNull()
+        if (reply == null) {
+            // The document was not read at all: a link that went away between two commands, or one
+            // that did not finish in time. Nothing was learned about the document, so the hash is
+            // forgotten again and the next poll asks once more. Only a document that did arrive and
+            // was refused stays remembered, because asking for it again gets it refused again.
+            lastSetupHash = null
+            return
+        }
+        val fetched = reply as? ControllerFetch.Document ?: return
+        val refused = setup.applyFromMachine(fetched.text, fetched.hash)
+        setup.remember(
+            machine.id,
+            refused?.let { "${machine.name} carries a setup this app cannot use. $it" }
+                ?: "Setup updated from ${machine.name} just now.",
+        )
     }
 
     /**

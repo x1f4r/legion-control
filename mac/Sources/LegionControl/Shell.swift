@@ -42,14 +42,23 @@ struct CommandResult: Sendable {
 /// Small wrapper around Process. Everything runs on a background queue so the UI never blocks, and
 /// both output streams are drained on their own queues so a chatty command cannot deadlock the pipe.
 enum Shell {
+    /// `input` is the standard input to hand the command, for the one thing that sends a document
+    /// rather than asking for one. Without it the command gets /dev/null, which is what everything
+    /// else here wants: nothing should ever sit waiting on a terminal that is not there.
     static func run(
         executable: String,
         arguments: [String],
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        input: Data? = nil
     ) async -> CommandResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: runBlocking(executable: executable, arguments: arguments, timeout: timeout))
+                continuation.resume(returning: runBlocking(
+                    executable: executable,
+                    arguments: arguments,
+                    timeout: timeout,
+                    input: input
+                ))
             }
         }
     }
@@ -57,12 +66,15 @@ enum Shell {
     private static func runBlocking(
         executable: String,
         arguments: [String],
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        input: Data?
     ) -> CommandResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.standardInput = FileHandle.nullDevice
+
+        let inPipe = input.map { _ in Pipe() }
+        process.standardInput = inPipe ?? FileHandle.nullDevice
 
         // Never wake a machine just by looking at it.
         //
@@ -94,6 +106,22 @@ enum Shell {
                 timedOut: false,
                 launchFailure: "Could not run \(executable): \(error.localizedDescription)"
             )
+        }
+
+        // Written from its own queue, and never from this one. A document larger than the pipe buffer
+        // only goes through as fast as the command reads it, and writing it here would mean nobody is
+        // draining the output pipes in the meantime: the two halves would wait on each other forever.
+        if let inPipe, let input {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let handle = inPipe.fileHandleForWriting
+                // A command that exits without reading its input leaves this writing into a broken
+                // pipe, which is a normal end to the exchange rather than a failure to report. Asking
+                // for the error instead of the signal keeps it that way: the default disposition of
+                // SIGPIPE would take the whole app down with it.
+                _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
+                try? handle.write(contentsOf: input)
+                try? handle.close()
+            }
         }
 
         // Read in chunks rather than waiting for end of file, so whatever the command wrote is already

@@ -18,6 +18,7 @@ import {
 } from './config.mjs';
 import { listActions, runAction } from './actions.mjs';
 import { armNextBoot, bootTargets, findBootTarget, scheduleReboot, suspendMachine } from './boot.mjs';
+import { MAX_CONTROLLER_BYTES, readController, storeController } from './controller.mjs';
 import { checkAllBusy } from './probes/busy.mjs';
 import { checkHealth } from './probes/health.mjs';
 import * as appProvider from './providers/app.mjs';
@@ -36,6 +37,11 @@ const COMMANDS = {
   boot: { flags: ['force', 'no-reboot'], options: [], summary: 'arm a boot target and reboot into it' },
   sleep: { flags: ['force'], options: [], summary: 'suspend this machine (refuses while busy without --force)' },
   run: { flags: ['force'], options: [], summary: 'run a configured action' },
+  config: {
+    flags: [],
+    options: [],
+    summary: 'print the stored controller config; "config set" reads a new one from stdin',
+  },
   version: { flags: [], options: [], summary: 'print the agent version' },
   help: { flags: [], options: [], summary: 'print this list' },
 };
@@ -210,6 +216,10 @@ async function commandStatus() {
       bootTargets: bootTargets(config),
       actions: listActions(config),
       autoUpdate: config.autoUpdate === true,
+      // Only the hash: the document itself can be hundreds of lines and status is
+      // polled. A device compares this against what it holds and asks for the
+      // document with `config` only when the two differ.
+      controller: { hash: readController().hash },
       notes,
       t3,
       pendingRestart: first ? first.pendingRestart : false,
@@ -455,6 +465,79 @@ async function commandRun(positional, flags) {
   };
 }
 
+/**
+ * Everything on stdin, as text. Resolves to null when there is nothing to read.
+ *
+ * A terminal with nothing piped into it would block here forever, and the
+ * contract is one JSON object and out, so an interactive `config set` is
+ * answered immediately rather than waited on. The read is also capped: the
+ * document is refused above 1 MB anyway, so there is no reason to buffer more
+ * than it takes to know that.
+ */
+function readStdin() {
+  if (process.stdin.isTTY) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    process.stdin.on('data', (chunk) => {
+      chunks.push(chunk);
+      size += chunk.length;
+      if (size > MAX_CONTROLLER_BYTES) {
+        process.stdin.destroy();
+        finish(Buffer.concat(chunks).toString('utf8'));
+      }
+    });
+    process.stdin.on('end', () => finish(Buffer.concat(chunks).toString('utf8')));
+    process.stdin.on('error', () => finish(null));
+  });
+}
+
+/**
+ * The controller config the machines carry for the apps. `config` hands back
+ * what is stored, `config set` replaces it with what is on stdin. The agent has
+ * no opinion about the document beyond it being a controller config at all.
+ */
+async function commandConfig(positional) {
+  const sub = positional[0];
+
+  if (sub === undefined) {
+    const stored = readController();
+    const payload = { ok: true, controller: stored.document, hash: stored.hash };
+    // A file that is there but unreadable is worth saying out loud: the hash is
+    // still reported, so the Mac will push over it, and until then the apps
+    // should not be left guessing why there are no machines.
+    if (stored.error) payload.error = stored.error;
+    return { payload, exitCode: 0 };
+  }
+
+  if (sub !== 'set') {
+    return {
+      payload: { ok: false, error: `config takes no argument, or "set"; got "${sub}"` },
+      exitCode: 1,
+    };
+  }
+
+  const text = await readStdin();
+  if (text === null || text.trim().length === 0) {
+    return { payload: { ok: false, hash: null, bytes: 0, error: 'no document on stdin' }, exitCode: 1 };
+  }
+
+  const stored = storeController(text);
+  if (!stored.ok) {
+    log(`config set refused: ${stored.error}`, 'config');
+    return { payload: { ok: false, hash: null, bytes: 0, error: stored.error }, exitCode: 1 };
+  }
+
+  log(`config set: ${stored.bytes} bytes, ${stored.hash.slice(0, 12)}`, 'config');
+  return { payload: { ok: true, hash: stored.hash, bytes: stored.bytes }, exitCode: 0 };
+}
+
 async function dispatch(command, positional, flags, options) {
   switch (command) {
     case 'status':
@@ -473,6 +556,8 @@ async function dispatch(command, positional, flags, options) {
       return commandSleep(flags);
     case 'run':
       return commandRun(positional, flags);
+    case 'config':
+      return commandConfig(positional);
     case 'version':
       return { payload: { ok: true, agentVersion: AGENT_VERSION }, exitCode: 0 };
     case 'help':

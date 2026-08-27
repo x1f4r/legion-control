@@ -98,12 +98,12 @@ sealed interface Page {
     /** What the app is before it has been told about anything. */
     data object NoMachines : Page {
         override val title get() = "Machines"
-        override val summary get() = "Nothing is configured yet"
+        override val summary get() = "Fetch the setup from one of them to begin"
     }
 
     data object Device : Page {
         override val title get() = "This device"
-        override val summary get() = "The app, its token, this phone's key, and the configuration"
+        override val summary get() = "The app, this phone's key, and the configuration"
     }
 }
 
@@ -237,13 +237,27 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                         when (val page = pages.getOrNull(index)) {
                             is Page.OneMachine -> MachineSection(page.model)
                             is Page.OneService -> ServiceSection(page.model, page.service)
-                            Page.NoMachines -> NoMachinesSection()
+                            Page.NoMachines -> NoMachinesSection(app)
                             Page.Device, null -> ThisDeviceSection(app, updates)
                         }
                     }
                 }
             }
         }
+    }
+
+    // The one question this app asks that belongs to no machine, because it is asked about an
+    // address that is not in any configuration yet. Same words, same shape, same trust store.
+    app.fetchDialog?.let { dialog ->
+        ConfirmationDialog(
+            dialog = dialog,
+            onDismiss = { app.fetchDialog = null },
+            onConfirm = {
+                app.fetchDialog = null
+                haptics.confirm()
+                app.trustFetchHostKey(dialog.address, dialog.keyBlob)
+            },
+        )
     }
 
     app.dialogOwner?.let { model ->
@@ -285,13 +299,22 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
     }
 }
 
-/** What there is to say before anything has been configured. */
+/**
+ * What there is to say, and to do, before anything has been configured.
+ *
+ * The way in rather than a sign pointing at one. The machines carry the setup, so the first launch
+ * needs one address and not a document, and asking for it here is asking for it where the user
+ * already is. Pasting a document by hand is still there, one page along, under This device.
+ */
 @Composable
-private fun NoMachinesSection() {
+private fun NoMachinesSection(app: AppModel) {
     Spacer(Modifier.height(6.dp))
     ExplanationText(
-        "No machines configured. Open This device to paste a configuration.",
+        "No machines yet. Each of them carries the setup, so one address, its port and the user to " +
+            "log in as is enough to fetch all of it.",
     )
+    Spacer(Modifier.height(14.dp))
+    FetchSetupBlock(app)
 }
 
 // MARK: - Chrome

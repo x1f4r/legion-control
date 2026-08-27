@@ -5,8 +5,11 @@ import com.x1f4r.legioncontrol.data.ConfigStore
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.DeviceIdentity
 import com.x1f4r.legioncontrol.data.HostKeyStore
+import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.data.Settings
+import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.HomeNetwork
+import com.x1f4r.legioncontrol.net.RouteKind
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.SshTransport
 import com.x1f4r.legioncontrol.net.WakeOnLan
@@ -56,6 +59,29 @@ class LegionControl(context: Context) {
      * forgotten from any screen, so their host keys and route hints would sit in storage forever.
      * They are dropped here, at the one moment the app learns which ones still exist.
      */
+    /**
+     * Reads the setup off a machine that is not in the configuration, because there is none yet.
+     *
+     * The one call in this app that talks to an address nobody has been told about, and it is what
+     * makes the first launch a host, a port and a user instead of a document. Everything else about
+     * it is ordinary: this phone's own key, the same host key pinning as any other address, and the
+     * same agent on the far side. One key, because an address given by hand is one system.
+     */
+    suspend fun fetchSetup(source: SetupSource): ControllerFetch {
+        val endpoint = Endpoint(
+            id = "setup",
+            kind = RouteKind.REMOTE,
+            host = source.host,
+            port = source.port,
+            user = source.user,
+            systemHint = null,
+            label = source.host,
+            trustedKeyCapacity = 1,
+        )
+        val transport = SshTransport(identity, hostKeys, source.host)
+        return fetchController(transport, endpoint)
+    }
+
     fun controls(configuration: ControllerConfig?): List<MachineControl> {
         val machines = configuration?.toMachines().orEmpty()
         hostKeys.retainOnly(machines.flatMap { it.addresses }.toSet())

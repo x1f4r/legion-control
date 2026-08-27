@@ -35,7 +35,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.ui.theme.LocalStatusColors
 import java.time.Instant
@@ -283,26 +282,28 @@ fun Actions(content: @Composable () -> Unit) {
 }
 
 /**
- * A field for something that must not be read over a shoulder.
+ * A field for a word rather than for a document or a secret: an address, a port, a user name.
  *
- * A hairline under the text rather than an outlined box, because an outlined text field is a rounded
- * container and this page does not have any. What it keeps from the Material control is the part
- * that matters: the characters are never drawn, and the keyboard is told not to learn them.
+ * The same hairline as the two below it, and the same reason for it. What is different is only what
+ * goes in: one line, a fixed width face because these are addresses and names that are compared
+ * character by character, and no autocorrect, which on a phone would otherwise turn a hostname into
+ * a word.
  */
 @Composable
-fun SecretField(
+fun PlainField(
     value: String,
     onValueChange: (String) -> Unit,
     placeholder: String,
     modifier: Modifier = Modifier,
+    keyboardType: KeyboardType = KeyboardType.Ascii,
 ) {
     val cursor = MaterialTheme.colorScheme.primary
     Column(modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .defaultMinSize(minHeight = 48.dp)
-                .padding(vertical = 8.dp),
+                .defaultMinSize(minHeight = 40.dp)
+                .padding(vertical = 6.dp),
             contentAlignment = Alignment.CenterStart,
         ) {
             if (value.isEmpty()) {
@@ -320,11 +321,11 @@ fun SecretField(
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurface,
                 ),
-                visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Password,
+                    keyboardType = keyboardType,
                     autoCorrectEnabled = false,
-                    imeAction = ImeAction.Done,
+                    capitalization = KeyboardCapitalization.None,
+                    imeAction = ImeAction.Next,
                 ),
                 cursorBrush = SolidColor(cursor),
                 modifier = Modifier.fillMaxWidth(),
@@ -337,9 +338,9 @@ fun SecretField(
 /**
  * A field for a document rather than for a word.
  *
- * The same hairline as [SecretField] and for the same reason, but it grows with what is in it and
- * keeps a fixed width face, because what goes in here is JSON: proportional type turns an aligned
- * document into a ragged one, and a single line box turns it into something nobody can read back.
+ * The same hairline as [PlainField] and for the same reason, but it grows with what is in it,
+ * because what goes in here is JSON: a single line box turns a document into something nobody can
+ * read back.
  */
 @Composable
 fun DocumentField(

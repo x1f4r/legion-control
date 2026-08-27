@@ -1,6 +1,6 @@
 {
   "name": "legionctl",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "Legion Control agent: service lifecycle, busy detection, boot switching and sleep for one system",
@@ -12,7 +12,7 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "check": "node --check src/index.mjs && node --check src/config.mjs && node --check src/service.mjs && node --check src/boot.mjs && node --check src/update.mjs && node --check src/actions.mjs && node --check src/http.mjs && node --check src/log.mjs && node --check src/probes/busy.mjs && node --check src/probes/health.mjs && node --check src/probes/process.mjs && node --check src/probes/relay.mjs && node --check src/probes/t3-sqlite.mjs && node --check src/providers/npm.mjs && node --check src/providers/app.mjs && node --check src/providers/command.mjs",
+    "check": "node --check src/index.mjs && node --check src/config.mjs && node --check src/service.mjs && node --check src/boot.mjs && node --check src/update.mjs && node --check src/actions.mjs && node --check src/controller.mjs && node --check src/http.mjs && node --check src/log.mjs && node --check src/probes/busy.mjs && node --check src/probes/health.mjs && node --check src/probes/process.mjs && node --check src/probes/relay.mjs && node --check src/probes/t3-sqlite.mjs && node --check src/providers/npm.mjs && node --check src/providers/app.mjs && node --check src/providers/command.mjs",
     "test": "node --test test/",
     "status": "node src/index.mjs status"
   },

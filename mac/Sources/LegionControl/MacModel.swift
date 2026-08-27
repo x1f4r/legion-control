@@ -22,11 +22,20 @@ final class MacModel {
 
     private var agent: MacAgent
     private var lastRefreshFinished: Date?
+    /// The document last handed to the local agent, when, and what it ended in. Same memory and same
+    /// reason as the remote side: see MachineModel.shareSetupIfNeeded.
+    private var lastShare: (hash: String, at: Date, failure: String?)?
+    private var isSharing = false
+
+    private static let shareRetry: TimeInterval = 600
 
     /// Called whenever anything a viewer would draw has changed.
     var onStateChange: (@MainActor () -> Void)?
     /// How a question reaches the screen.
     var ask: (@MainActor (PendingDialog) -> Void)?
+    /// The setup this Mac is running on. The local agent gets a copy of it exactly as the machines
+    /// over ssh do: the file is the source of truth, and this Mac is not an exception to that.
+    var controllerConfig: (@MainActor () -> ControllerDocument?)?
 
     init(config: LocalConfig) {
         self.config = config
@@ -49,6 +58,17 @@ final class MacModel {
     }
 
     var autoUpdate: Bool? { status?.autoUpdate }
+
+    /// What the Setup row says about the copy this Mac's own agent is holding.
+    var setupSharing: SetupSharing {
+        guard let status else { return .unknown }
+        guard status.reportsControllerCopy else { return .unsupported }
+        guard let local = controllerConfig?() else { return .unknown }
+        if status.controllerHash == local.hash { return .upToDate }
+        guard let lastShare, lastShare.hash == local.hash else { return .unknown }
+        if let failure = lastShare.failure { return .failed(failure) }
+        return .justShared
+    }
 
     /// Why the update button for one service on this Mac can do nothing, or nil when there really is
     /// something to do. A build already downloaded and waiting for a quit counts, and so does a
@@ -104,6 +124,7 @@ final class MacModel {
             status = reply
             failure = nil
             lastChecked = Date()
+            shareSetupIfNeeded()
         } catch let error as MacAgentError {
             status = nil
             failure = error
@@ -112,6 +133,42 @@ final class MacModel {
             status = nil
             failure = .unreadableOutput(error.localizedDescription)
             lastChecked = Date()
+        }
+    }
+
+    // MARK: - Sharing the setup
+
+    /// The local agent is given the same document the machines over ssh are, for the same reason and
+    /// under the same rules: never asked for, never a dialog, never counted as an action, and only
+    /// mentioned when it did not work.
+    private func shareSetupIfNeeded() {
+        guard activity == nil, !isSharing else { return }
+        guard let status, status.reportsControllerCopy else { return }
+        guard let local = controllerConfig?(), status.controllerHash != local.hash else { return }
+        if let lastShare, lastShare.hash == local.hash,
+           Date().timeIntervalSince(lastShare.at) < Self.shareRetry { return }
+
+        isSharing = true
+        Task { @MainActor in
+            var failure: String?
+            do {
+                let result = try await self.agent.pushControllerConfig(local.bytes)
+                if result.ok == false {
+                    failure = result.error ?? "the agent kept the copy it had."
+                } else if let stored = result.hash, stored != local.hash {
+                    failure = "the agent stored something other than the file it was given."
+                }
+            } catch let error as MacAgentError {
+                failure = error.detail ?? error.message
+            } catch {
+                failure = error.localizedDescription
+            }
+
+            let sentence = failure.map { "The setup could not be shared with \(self.config.name): \($0)" }
+            self.lastShare = (hash: local.hash, at: Date(), failure: sentence)
+            if let sentence { self.setNote(sentence, isError: true) }
+            self.isSharing = false
+            self.onStateChange?()
         }
     }
 

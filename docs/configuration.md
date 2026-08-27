@@ -374,6 +374,38 @@ The apps accept an agent that predates `services`: a status without `services` i
 service built from its `t3` block, and a status without `system` takes the platform name as the
 system id. That is what lets the apps be updated before the machines are.
 
+## Sharing the setup between devices
+
+Writing the controller config once on the Mac and once on every phone is one time too many,
+so the machines carry it. Every agent keeps a copy of the controller config at
+`<base>/controller.json`, opaque to it: the agent never reads the document, it only stores and
+serves the bytes it was given.
+
+- `legionctl config` prints `{ "ok": true, "controller": <the document or null>, "hash": "<sha256 of its bytes or null>" }`.
+- `legionctl config set` reads a JSON document from stdin (up to 1 MB), checks it parses as an
+  object with a `version` and a `machines` array, writes it atomically, and prints the new hash.
+- `status` carries `controller: { "hash": ... }` (null when nothing is stored).
+
+The Mac is the source of truth. Whenever a machine reports a `controller.hash` that differs from
+the sha256 of the Mac's own config file, the Mac app pushes the file with `config set`, to the
+machine and to its own local agent. Editing the file on the Mac therefore reaches every machine
+the next time it is up, with nothing to do by hand.
+
+The phone bootstraps from any one machine: **This device → Configuration → Fetch from a
+machine** takes a host (a tailnet or LAN address), a port and a user, runs `config` there with
+the phone's own key (which has to be authorised on that system already, exactly as for any
+other command), and applies what comes back. It tries the standard install layouts in turn:
+`/usr/bin/node /home/<user>/.legion-control/agent/src/index.mjs`,
+`node C:\Users\<user>\.legion-control\agent\src\index.mjs`, and `node` / `/opt/homebrew/bin/node`
+with `~/.legion-control/agent/src/index.mjs`. From then on, whenever a status reply reports a
+`controller.hash` different from the hash of the document the phone applied, the phone fetches
+the document again from that machine and applies it, so an edit on the Mac reaches the phone
+by itself. Pasting the JSON by hand still works and is never overwritten by an older copy: a
+document that fails validation is refused, and the phone remembers the hash of what it applied.
+
+An agent that predates `config` (any 1.x) has nothing to serve; the apps say so and fall back
+to the manual paste.
+
 ## The agent contract
 
 `legionctl` is `node <base>/agent/src/index.mjs <command> [flags]`. Every invocation prints

@@ -52,6 +52,7 @@ final class AppModel {
             let model = MachineModel(machine: machine)
             model.onStateChange = { [weak self] in self?.onStateChange?() }
             model.ask = { [weak self] dialog in self?.dialog = dialog }
+            model.controllerConfig = { [weak self] in self?.config.document }
             return model
         }
 
@@ -60,6 +61,7 @@ final class AppModel {
                 let model = MacModel(config: local)
                 model.onStateChange = { [weak self] in self?.onStateChange?() }
                 model.ask = { [weak self] dialog in self?.dialog = dialog }
+                model.controllerConfig = { [weak self] in self?.config.document }
                 mac = model
             }
         } else {

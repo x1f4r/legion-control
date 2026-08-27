@@ -69,12 +69,19 @@ actor MacAgent {
         try await call(["auto-update", enabled ? "on" : "off"], decoding: AgentActionResult.self, timeout: 30)
     }
 
+    /// Hands the agent on this Mac the controller config the app is running on. The same command the
+    /// other machines get, minus the ssh in front of it.
+    func pushControllerConfig(_ bytes: Data) async throws -> AgentConfigResult {
+        try await call(["config", "set"], decoding: AgentConfigResult.self, timeout: 40, input: bytes)
+    }
+
     // MARK: - Transport
 
     private func call<Value: Decodable & Sendable>(
         _ arguments: [String],
         decoding: Value.Type,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        input: Data? = nil
     ) async throws -> Value {
         let node = try await resolveNode()
 
@@ -82,7 +89,8 @@ actor MacAgent {
             throw MacAgentError.agentMissing("Nothing to run at \(scriptPath).")
         }
 
-        let result = await Shell.run(executable: node, arguments: [scriptPath] + arguments, timeout: timeout)
+        let result = await Shell.run(executable: node, arguments: [scriptPath] + arguments,
+                                     timeout: timeout, input: input)
 
         if let launchFailure = result.launchFailure {
             throw MacAgentError.nodeMissing(launchFailure)

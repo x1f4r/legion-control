@@ -3,9 +3,11 @@ package com.x1f4r.legioncontrol.ui
 import com.x1f4r.legioncontrol.agent.AgentActionResult
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.AgentStatus
+import com.x1f4r.legioncontrol.agent.ControllerFetch
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.MachineSystem
 import com.x1f4r.legioncontrol.data.ControllerConfig
+import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.net.RouteKind
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
@@ -101,6 +103,14 @@ interface MachineClient {
     /** Runs one of the actions the agent offered. */
     suspend fun run(actionId: String, force: Boolean): Result<AgentActionResult>
 
+    /**
+     * The setup this machine carries, read over the route that just answered.
+     *
+     * Asked for only when the machine's status said it is holding a document the phone has not got,
+     * because every reply carries the hash and only a difference is worth a second round trip.
+     */
+    suspend fun fetchSetup(): Result<ControllerFetch>
+
     /** Sends the magic packet and waits for the probe address. Fails with a sentence if it does not. */
     suspend fun wake(): Result<Unit>
 
@@ -125,11 +135,53 @@ interface ControlServices {
     /** Exactly the text that was applied, so the field on screen starts where the user left it. */
     val configText: StateFlow<String>
 
+    /** The hash of the document in force, which is what a machine's own hash is compared against. */
+    val configHash: StateFlow<String?>
+
+    /** The machine the setup was last fetched from, so the fields start where they were left. */
+    val setupSource: StateFlow<SetupSource?>
+
     /** Checks, stores and puts a document in force. Returns null, or the reason nothing changed. */
     fun applyConfig(text: String): String?
 
+    /** The same, for a document a machine served, keeping the hash that machine gave it. */
+    fun applyFetchedConfig(text: String, hash: String?): String?
+
+    /**
+     * Runs `config` on an address the app has been told nothing else about.
+     *
+     * The bootstrap, and the one call that goes somewhere the configuration does not name: the
+     * phone has nothing and any one machine has all of it.
+     */
+    suspend fun fetchSetupFrom(source: SetupSource): Result<ControllerFetch>
+
+    /** Adds an offered host key to the ones trusted for an address. The keys already there stay. */
+    suspend fun trustHostKey(address: String, keyBlobBase64: String)
+
     /** One client per machine the configuration describes, in the order it lists them. */
     fun clients(configuration: ControllerConfig?): List<MachineClient>
+}
+
+/**
+ * The phone's copy of the setup, from the point of view of one machine's poll.
+ *
+ * A machine that reports a document the phone has not got hands it over on the spot, and applying
+ * it rebuilds every machine model there is, including the one that is in the middle of doing it.
+ * That is why the note lives out here rather than on the model: the model that earned the line is
+ * thrown away by the very change it made, and the line still has to be on the page afterwards.
+ */
+interface SetupSync {
+    /** The hash of the document in force, or null when there is none. */
+    val appliedHash: String?
+
+    /** Applies a document a machine served. Returns null, or the sentence saying why it was not. */
+    fun applyFromMachine(document: String, hash: String?): String?
+
+    /** Remembers one line about what a machine's handover did. */
+    fun remember(machineId: String, line: String)
+
+    /** That line, while it is still news. Null once it has stopped being true. */
+    fun noteFor(machineId: String, now: Long): String?
 }
 
 // MARK: - Reading a failure
