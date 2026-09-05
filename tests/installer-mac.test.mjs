@@ -30,6 +30,16 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
   assert.equal(version.status, 0, version.stderr);
   assert.equal(JSON.parse(version.stdout).selfTest.ok, true);
 
+  const sshPath = path.join(root, 'ssh-path');
+  fs.mkdirSync(sshPath);
+  fs.symlinkSync('/usr/bin/dirname', path.join(sshPath, 'dirname'));
+  const sshEnvironment = { HOME: home, PATH: sshPath };
+  const missingNode = spawnSync('/bin/sh', ['-c', 'command -v node'], { encoding: 'utf8', env: sshEnvironment });
+  assert.notEqual(missingNode.status, 0);
+  const discovery = spawnSync('/bin/sh', ['-c', '~/.legion-control/bin/legionctl config'], { encoding: 'utf8', env: sshEnvironment });
+  assert.equal(discovery.status, 0, discovery.stderr);
+  assert.equal(JSON.parse(discovery.stdout).ok, true);
+
   fs.writeFileSync(path.join(source, 'src', 'index.mjs'), "process.stdout.write(JSON.stringify({ok:true,agentVersion:'3.0.0',contract:3,selfTest:{ok:false}})+'\\n');\n");
   const failed = spawnSync('bash', args, { encoding: 'utf8', env });
   assert.equal(failed.status, 1);

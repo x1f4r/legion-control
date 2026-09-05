@@ -1,13 +1,16 @@
 package com.x1f4r.legioncontrol.agent
 
+import com.x1f4r.legioncontrol.net.CommandOutcome
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.SshTransport
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.longOrNull
+import java.util.Base64
 
 /**
  * The setup, as the machines carry it.
@@ -51,6 +54,17 @@ sealed interface ControllerFetch {
  * outside.
  */
 fun setupCommands(user: String): List<SetupCommand> = listOf(
+    // Installed wrappers retain the runtime selected by the installer, even without Node on PATH.
+    SetupCommand(RemoteShell.POSIX, listOf("~/.legion-control/bin/legionctl", "config")),
+    SetupCommand(
+        RemoteShell.CMD,
+        listOf(
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-EncodedCommand", Base64.getEncoder().encodeToString(
+                WINDOWS_SETUP_SCRIPT.toByteArray(Charsets.UTF_16LE),
+            ),
+        ),
+    ),
     SetupCommand(
         RemoteShell.POSIX,
         listOf("/usr/bin/node", "/home/$user/.legion-control/agent/src/index.mjs", "config"),
@@ -73,6 +87,13 @@ fun setupCommands(user: String): List<SetupCommand> = listOf(
     ),
 )
 
+// Fixed script only: HOME is resolved by PowerShell, never interpolated from the SSH user name.
+// Encoding keeps the invocation identical under cmd.exe and PowerShell default SSH shells.
+internal const val WINDOWS_SETUP_SCRIPT =
+    "\$ErrorActionPreference = 'Stop'; try { " +
+        "& (Join-Path \$HOME '.legion-control/bin/legionctl.ps1') config; exit \$LASTEXITCODE " +
+        "} catch { [Console]::Error.WriteLine(\$_.Exception.Message); exit 1 }"
+
 /** One layout to try: which shell to write it for, and the argv to write. */
 data class SetupCommand(val shell: RemoteShell, val arguments: List<String>) {
     /** Null when the user name cannot be written for that shell, which is a reason to skip it. */
@@ -91,16 +112,22 @@ data class SetupCommand(val shell: RemoteShell, val arguments: List<String>) {
  * fault. Only a shape that produced no reply moves on to the next one, and a shape that produced one
  * ends the search whatever the reply says.
  */
-suspend fun fetchController(transport: SshTransport, endpoint: Endpoint): ControllerFetch {
+suspend fun fetchController(transport: SshTransport, endpoint: Endpoint): ControllerFetch =
+    fetchController(endpoint.user) { line -> transport.run(endpoint, line, FETCH_TIMEOUT_MILLIS) }
+
+internal suspend fun fetchController(
+    user: String,
+    run: suspend (String) -> CommandOutcome,
+): ControllerFetch {
     var detail: String? = null
     // Two shapes can produce the same line: when nothing in a command needs quoting, the cmd.exe and
     // the PowerShell forms are byte for byte the same, and running it twice would only cost a round
     // trip against a machine that has already said no once.
     val tried = mutableSetOf<String>()
-    for (command in setupCommands(endpoint.user)) {
+    for (command in setupCommands(user)) {
         val line = command.line() ?: continue
         if (!tried.add(line)) continue
-        val outcome = transport.run(endpoint, line, FETCH_TIMEOUT_MILLIS)
+        val outcome = run(line)
         val reply = readControllerReply(outcome.stdout)
         if (reply != ControllerFetch.Unreadable) return reply
         if (detail == null) {
@@ -111,10 +138,8 @@ suspend fun fetchController(transport: SshTransport, endpoint: Endpoint): Contro
             detail = if (text.length <= 400) text else text.take(400) + "..."
         }
     }
-    // Every shape ran and none of them was the agent. That is the one failure this can end in that
-    // is not the transport's, and it means the same thing here as everywhere else: whatever is on
-    // the far side, the control agent is not part of it.
-    throw AgentFailure.AgentMissing(null, detail)
+    // Exhausting known layouts cannot distinguish an absent agent from one that cannot start.
+    throw AgentFailure.DiscoveryFailed(detail)
 }
 
 /** One `config` reply, out of whatever else the shell put around it. */
@@ -137,6 +162,13 @@ fun readControllerReply(stdout: String): ControllerFetch {
  * old to have anything to say, the other is a current agent saying it holds nothing.
  */
 fun readControllerReply(reply: JsonObject, source: String? = null): ControllerFetch {
+    if ((reply["ok"] as? JsonPrimitive)?.booleanOrNull == false) {
+        val error = (reply["error"] as? JsonPrimitive)?.contentOrNull
+        if (error?.trim()?.equals("unknown command: config", ignoreCase = true) == true) {
+            return ControllerFetch.TooOld
+        }
+        throw AgentFailure.Reported(error?.take(400) ?: "The setup request was refused.")
+    }
     val document = reply["controller"] ?: return ControllerFetch.TooOld
     if (document is JsonNull) return ControllerFetch.NothingStored
     if (document !is JsonObject) return ControllerFetch.Unreadable

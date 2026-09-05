@@ -348,7 +348,7 @@ private struct NewMachineEditor: View {
     @State private var name = ""
     @State private var host = ""
     @State private var user = ""
-    @State private var agentPath = CommandArguments.text(["/usr/bin/node", "/home/me/.legion-control/bin/launcher.mjs"])
+    @State private var agentPath = CommandArguments.text(CommandArguments.installedAgent(platform: .linux, user: ""))
     @State private var platform = Platform.linux
 
     var body: some View {
@@ -373,7 +373,7 @@ private struct NewMachineEditor: View {
                 .fixedSize()
             }
 
-            LabelledField("Agent arguments", text: $agentPath, placeholder: "[\"/usr/bin/node\", \"/absolute/base/bin/launcher.mjs\"]")
+            LabelledField("Agent arguments", text: $agentPath, placeholder: "[\"/absolute/base/bin/legionctl\"]")
 
             QuietNote(text: platform == .windows
                       ? "Windows systems are quoted for PowerShell by default. A machine still on the stock OpenSSH shell needs \"shell\": \"cmd\" adding by hand."
@@ -382,6 +382,16 @@ private struct NewMachineEditor: View {
             Button("Add the machine") { add() }
                 .buttonStyle(.borderedProminent)
                 .disabled(!canAdd)
+        }
+        .onChange(of: user) { oldUser, newUser in
+            if agentArgv == CommandArguments.installedAgent(platform: platform, user: oldUser) {
+                agentPath = CommandArguments.text(CommandArguments.installedAgent(platform: platform, user: newUser))
+            }
+        }
+        .onChange(of: platform) { oldPlatform, newPlatform in
+            if agentArgv == CommandArguments.installedAgent(platform: oldPlatform, user: user) {
+                agentPath = CommandArguments.text(CommandArguments.installedAgent(platform: newPlatform, user: user))
+            }
         }
     }
 

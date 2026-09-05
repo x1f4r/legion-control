@@ -54,6 +54,28 @@ test('linux installer handles spaces and apostrophes, preserves config, and copi
   assert.equal(JSON.parse(launched.stdout).command, 'status');
 });
 
+test('first setup can fetch through the installed wrapper without Node on the SSH PATH', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion setup discovery '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "home with ' spaces");
+  const base = path.join(home, '.legion-control');
+  const source = sourceFixture(root);
+  const commands = path.join(root, 'ssh-path');
+  fs.mkdirSync(commands);
+  fs.symlinkSync('/usr/bin/dirname', path.join(commands, 'dirname'));
+  const result = install(source, base, home, { LEGION_NODE_BIN: process.execPath });
+  assert.equal(result.status, 0, result.stderr);
+
+  // A clean noninteractive connection has neither a login profile nor the
+  // installer's Node directory. The wrapper must use its recorded runtime.
+  const env = { HOME: home, PATH: commands };
+  const missing = spawnSync('/bin/sh', ['-c', 'command -v node'], { encoding: 'utf8', env });
+  assert.notEqual(missing.status, 0);
+  const fetched = spawnSync('/bin/sh', ['-c', '~/.legion-control/bin/legionctl config'], { encoding: 'utf8', env });
+  assert.equal(fetched.status, 0, fetched.stderr);
+  assert.equal(JSON.parse(fetched.stdout).command, 'config');
+});
+
 test('linux installer rejects a failed staged self-check without replacing the live tree', { skip: process.platform === 'win32' }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion installer rollback '));
   const home = path.join(root, 'home');

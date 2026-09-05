@@ -139,6 +139,12 @@ sealed class AgentFailure(
         override val dispatch: DispatchStage get() = DispatchStage.AMBIGUOUS
     }
 
+    /** Bootstrap layouts were exhausted; installation state is still unknown. */
+    class DiscoveryFailed(detail: String?) : AgentFailure(
+        "Could not locate or start the control agent on that machine.",
+        detail,
+    )
+
     /** A shell came up, and the interpreter or the agent script was not on the far side. */
     class AgentMissing(val system: MachineSystem?, detail: String?) : AgentFailure(
         if (system == null) {
