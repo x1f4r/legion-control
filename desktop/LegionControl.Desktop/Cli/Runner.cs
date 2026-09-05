@@ -658,11 +658,21 @@ public static class Runner
         output.WriteLine(availability.Sentence_);
         if (availability is UpdateAvailability.Ready ready && line.Has("yes"))
         {
+            var review = app.BeginAppUpdateReview(ready);
+            bool StillCurrent()
+            {
+                if (review is not null && app.IsCurrentAppUpdateReview(review)) return true;
+                output.WriteLine("The release repository changed. Check for an update again before continuing.");
+                return false;
+            }
+            if (!StillCurrent()) return Failed;
             var (bytes, downloadProblem) = await new AppUpdates().DownloadAsync(ready, token);
+            if (!StillCurrent()) return Failed;
             if (bytes is null) { output.WriteLine(downloadProblem); return Failed; }
             var installer = new AppInstaller();
             var (staged, stageProblem) = installer.Stage(bytes, ready.Artifact.Name);
             if (staged is null) { output.WriteLine(stageProblem); return Failed; }
+            if (!StillCurrent()) return Failed;
             var (started, failure) = installer.Apply();
             output.WriteLine(started ? "Verified update staged; the helper will replace and launch the app after this command exits. Completion is pending." : failure);
             return started ? NotKnown : Failed;

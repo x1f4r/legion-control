@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Menu
         // back after forty-five seconds, which is exactly what should happen to a build that crashes
         // on launch and exactly what must not happen to one that does not.
         model.appUpdates.confirmLaunch()
+        model.appUpdates.startAutomaticChecks()
 
         model.onStateChange = { [weak self] in
             guard let self else { return }
@@ -95,7 +96,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Menu
         Task { @MainActor in await model.refreshIfNeeded() }
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        model.appUpdates.checkIfStale()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        model.appUpdates.stopAutomaticChecks()
         model.stopPolling()
     }
 

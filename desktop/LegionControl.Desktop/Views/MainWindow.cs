@@ -28,6 +28,10 @@ public sealed class MainWindow : Window
     private readonly TextBlock _footer = new() { Foreground = Ui.Muted, FontSize = 12 };
     private bool _rebuildQueued;
     private readonly HashSet<string> _recentExpanded = new(StringComparer.Ordinal);
+    private readonly StackPanel _updateNotice = Ui.Column(0);
+    private readonly CancellationTokenSource _updateLifetime = new();
+    private readonly DispatcherTimer _updateTimer = new() { Interval = AppUpdateSuggestions.PeriodicInterval };
+    private bool _reviewingUpdate;
 
     public MainWindow(AppModel app)
     {
@@ -54,6 +58,9 @@ public sealed class MainWindow : Window
         toolbar.Margin = new Thickness(18, 10, 18, 4);
         DockPanel.SetDock(toolbar, Dock.Top);
         root.Children.Add(toolbar);
+        _updateNotice.Margin = new Thickness(24, 0, 24, 4);
+        DockPanel.SetDock(_updateNotice, Dock.Top);
+        root.Children.Add(_updateNotice);
         var panes = new Grid { ColumnDefinitions = new ColumnDefinitions("190,*") };
         var navigation = new DockPanel { Margin = new Thickness(10, 0, 0, 0) };
         var heading = Ui.SectionHeading("Machines"); heading.Margin = new Thickness(8, 12, 0, 10);
@@ -74,10 +81,16 @@ public sealed class MainWindow : Window
         Opened += (_, _) =>
         {
             _app.StartPolling();
+            SuggestAppUpdate();
+            _updateTimer.Start();
             Rebuild();
         };
+        Activated += (_, _) => SuggestAppUpdate();
+        _updateTimer.Tick += (_, _) => { if (IsActive) SuggestAppUpdate(); };
         Closed += (_, _) =>
         {
+            _updateTimer.Stop();
+            _updateLifetime.Cancel();
             _app.Changed -= QueueRebuild;
             _app.StopPolling();
         };
@@ -96,6 +109,11 @@ public sealed class MainWindow : Window
 
     private void Rebuild()
     {
+        _updateNotice.Children.Clear();
+        if (_app.AppUpdate is UpdateAvailability.Ready ready)
+            _updateNotice.Children.Add(Ui.Actions(
+                Ui.Note($"Legion Control {ready.Manifest.Version} available"),
+                Ui.Action("Review update", () => ReviewAvailableUpdate(ready))));
         UpdateNavigation();
         _content.Children.Clear();
         BuildHeader();
@@ -491,6 +509,8 @@ public sealed class MainWindow : Window
                     NotifyOnOperationFinished = !_app.Settings.NotifyOnOperationFinished,
                 })),
             Ui.Action("Check for an update to this app", CheckForUpdate)));
+        if (_app.UpdateSuggestions.LastResult is { } updateResult)
+            _content.Children.Add(Ui.Note(updateResult.Sentence_));
     }
 
     // MARK: the things the buttons do
@@ -711,17 +731,56 @@ public sealed class MainWindow : Window
 
     private async void CheckForUpdate()
     {
-        var availability = await _app.CheckForAppUpdateAsync();
-        if (availability is not UpdateAvailability.Ready ready)
-        { Sheets.Text(this, "This app", availability.Sentence_); return; }
-        if (!await Sheets.AskAsync(this, "App update available", availability.Sentence_, "Download and verify")) return;
-        var (bytes, downloadProblem) = await new AppUpdates().DownloadAsync(ready);
+        if (_reviewingUpdate) return;
+        _reviewingUpdate = true;
+        try
+        {
+            var availability = await _app.CheckForAppUpdateAsync(_updateLifetime.Token);
+            if (_updateLifetime.IsCancellationRequested) return;
+            if (availability is not UpdateAvailability.Ready ready)
+            { Sheets.Text(this, "This app", availability.Sentence_); return; }
+            await ReviewUpdateAsync(ready);
+        }
+        finally { _reviewingUpdate = false; }
+    }
+
+    private async void SuggestAppUpdate()
+    {
+        if (!_app.Settings.CheckForAppUpdates || _updateLifetime.IsCancellationRequested) return;
+        await _app.CheckForAppUpdateAsync(_updateLifetime.Token, force: false);
+    }
+
+    private async void ReviewAvailableUpdate(UpdateAvailability.Ready ready)
+    {
+        if (_reviewingUpdate) return;
+        _reviewingUpdate = true;
+        try { await ReviewUpdateAsync(ready); }
+        finally { _reviewingUpdate = false; }
+    }
+
+    private async Task ReviewUpdateAsync(UpdateAvailability.Ready ready)
+    {
+        var review = _app.BeginAppUpdateReview(ready);
+        bool StillCurrent()
+        {
+            if (_updateLifetime.IsCancellationRequested) return false;
+            if (review is not null && _app.IsCurrentAppUpdateReview(review)) return true;
+            Sheets.Text(this, "App update", "The release repository changed. Check for an update again before continuing.");
+            return false;
+        }
+        if (!StillCurrent()) return;
+        if (!await Sheets.AskAsync(this, "App update available", ready.Sentence_, "Download and verify")) return;
+        if (!StillCurrent()) return;
+        var (bytes, downloadProblem) = await new AppUpdates().DownloadAsync(ready, _updateLifetime.Token);
+        if (!StillCurrent()) return;
         if (bytes is null) { Sheets.Text(this, "App update", downloadProblem ?? "Download failed."); return; }
         var installer = new AppInstaller();
         var (staged, stageProblem) = installer.Stage(bytes, ready.Artifact.Name);
         if (staged is null) { Sheets.Text(this, "App update", stageProblem ?? "Staging failed."); return; }
+        if (!StillCurrent()) return;
         if (!await Sheets.AskAsync(this, "Verified update ready",
             $"Version {ready.Manifest.Version} matches the signed manifest. The app will quit, install it and reopen. The previous build is restored if the replacement cannot render its window.", "Install and restart")) return;
+        if (!StillCurrent()) return;
         var (started, failure) = installer.Apply();
         if (!started) { Sheets.Text(this, "App update", failure ?? "The update helper did not start."); return; }
         if (Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime lifetime)

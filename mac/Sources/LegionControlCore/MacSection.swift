@@ -615,7 +615,7 @@ struct MacSection: View {
             if let note = updates.note {
                 QuietNote(text: note)
             }
-            QuietNote(text: cadenceNote)
+            DisclosureGroup("Update details") { QuietNote(text: cadenceNote) }
         }
     }
 
@@ -623,12 +623,8 @@ struct MacSection: View {
     private var cadenceNote: String {
         let repo = model.config.config?.updateRepo ?? ControllerConfig.AppUpdatesConfig.defaultRepo
         let age = AppModel.freshness(of: model.appUpdates.lastChecked)
-        return """
-            The releases of \(repo) are read when this window or the panel opens, at most once every \
-            six hours. The list was \(age). An update is only installed when its signed manifest \
-            verifies against the release key built into this build, and the previous version is kept \
-            beside the new one so a build that will not start can be put back.
-            """
+        return "Releases of \(repo) are checked at startup, on foreground entry after 15 minutes, and every six hours while the app runs. Last check: \(age). Installation verifies the signed release and retains the previous version."
+
     }
 
     @ViewBuilder

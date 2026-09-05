@@ -79,7 +79,12 @@ struct ContentView: View {
     }
 
     var body: some View {
-        Group {
+        VStack(spacing: 0) {
+            if model.appUpdates.availableVersion != nil {
+                AppUpdateNotice(updates: model.appUpdates)
+                    .padding(.horizontal, 20).padding(.vertical, 10)
+                Divider()
+            }
             if model.isConfigured {
                 configured
             } else {

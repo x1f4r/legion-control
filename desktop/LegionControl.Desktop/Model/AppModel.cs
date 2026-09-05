@@ -22,7 +22,8 @@ public sealed class AppModel : IDisposable
         OperationTracker? tracker = null,
         DesktopSettings? settings = null,
         INotificationSink? notifications = null,
-        Bindings? bindings = null)
+        Bindings? bindings = null,
+        AppUpdateSuggestions? updateSuggestions = null)
     {
         _runner = runner ?? new ProcessRunner();
         Bindings = bindings ?? Bindings.Load();
@@ -30,6 +31,9 @@ public sealed class AppModel : IDisposable
         Tracker = tracker ?? new OperationTracker();
         Settings = settings ?? DesktopSettings.Load();
         Notifications = notifications ?? Model.Notifications.ForThisSystem();
+        UpdateSuggestions = updateSuggestions ?? new AppUpdateSuggestions((repo, token) =>
+            new AppUpdates().CheckAsync(repo, AgentContract.ClientVersion, token));
+        UpdateSuggestions.Changed += () => Changed?.Invoke();
         Reconciler = new Reconciler(Config, Bindings);
         Config.Changed += Rebuild;
         Rebuild();
@@ -51,8 +55,8 @@ public sealed class AppModel : IDisposable
         get { lock (_machines) return _machines.ToList(); }
     }
 
-    /// What the last app update check said, or null when none has run.
-    public UpdateAvailability? AppUpdate { get; private set; }
+    public AppUpdateSuggestions UpdateSuggestions { get; }
+    public UpdateAvailability? AppUpdate => UpdateSuggestions.Availability;
 
     public event Action? Changed;
 
@@ -66,6 +70,7 @@ public sealed class AppModel : IDisposable
     /// throwing that away on every edit would make the window blink through "not read yet".
     private void Rebuild()
     {
+        UpdateSuggestions.SelectRepository(UpdateRepository);
         Presence = SitePresence.Decide(Config.Config, Bindings);
         lock (_machines)
         {
@@ -255,12 +260,24 @@ public sealed class AppModel : IDisposable
 
     // MARK: this app's own updates
 
-    public async Task<UpdateAvailability> CheckForAppUpdateAsync(CancellationToken cancellationToken = default)
+    private string UpdateRepository => Config.Config?.Repo ?? ControllerConfig.DefaultUpdateRepo;
+
+    public Task<UpdateAvailability> CheckForAppUpdateAsync(CancellationToken cancellationToken = default, bool force = true)
     {
-        var repo = Config.Config?.Repo ?? ControllerConfig.DefaultUpdateRepo;
-        AppUpdate = await new AppUpdates().CheckAsync(repo, AgentContract.ClientVersion, cancellationToken);
-        Changed?.Invoke();
-        return AppUpdate;
+        Config.ReloadIfChanged();
+        return UpdateSuggestions.CheckAsync(UpdateRepository, force, cancellationToken);
+    }
+
+    public AppUpdateReview? BeginAppUpdateReview(UpdateAvailability.Ready ready)
+    {
+        Config.ReloadIfChanged();
+        return UpdateSuggestions.BeginReview(UpdateRepository, ready);
+    }
+
+    public bool IsCurrentAppUpdateReview(AppUpdateReview review)
+    {
+        Config.ReloadIfChanged();
+        return UpdateSuggestions.IsCurrent(review, UpdateRepository);
     }
 
     public void Dispose()

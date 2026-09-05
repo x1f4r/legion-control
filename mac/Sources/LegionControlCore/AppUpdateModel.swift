@@ -10,10 +10,8 @@ import Observation
 /// is rebuilt every time it opens. State held in either of them would mean a fresh request to GitHub
 /// on every click, and an install losing track of itself by being navigated away from.
 ///
-/// The cadence is the same rule the rest of the app lives by: nothing runs while nothing is open.
-/// There is no timer here. A check is asked for when a viewer appears, it is skipped when the last
-/// one is still fresh, and the answer is written down so a relaunch inside the same window costs
-/// nothing at all.
+/// Release checks run at startup, on foreground entry and periodically while the app runs.
+/// Fleet status polling remains separate and stops when no viewer is open.
 @MainActor
 @Observable
 final class AppUpdateModel {
@@ -34,6 +32,16 @@ final class AppUpdateModel {
     /// Why the last install stopped, as a sentence. Separate from the check: a failed install says
     /// nothing about whether the release is still there to try again.
     private(set) var failure: String?
+    private(set) var checkFailure: String?
+    private var checkedRepo: String?
+    private var observedRepo: String?
+    private var repositoryEpoch: UInt64 = 0
+    @ObservationIgnored private var automaticCheckTask: Task<Void, Never>?
+    @ObservationIgnored var onStateChange: (@MainActor () -> Void)?
+    @ObservationIgnored var now: @MainActor () -> Date = { Date() }
+    @ObservationIgnored var fetchRelease: @MainActor (String, String) async -> AppUpdates.Check = { await AppUpdates.check(repo: $0, installedVersion: $1) }
+    @ObservationIgnored private let preferences: FilePreferences?
+    @ObservationIgnored private let versionOverride: String?
 
     /// Where to look. Read on every check rather than once, because the config file that names it
     /// is edited while the app is open and the next check has to go to the new address.
@@ -49,23 +57,30 @@ final class AppUpdateModel {
     @ObservationIgnored var performSwap: @MainActor (AppUpdates.Staged, URL, URL) throws -> Void = {
         try AppUpdates.startSwap(staged: $0, current: $1, marker: $2)
     }
+    @ObservationIgnored var downloadRelease: @MainActor (AppUpdates.Release) async throws -> AppUpdates.Download = { try await AppUpdates.download($0) }
+    @ObservationIgnored var stageRelease: @MainActor (AppUpdates.Download, String, URL) async throws -> AppUpdates.Staged = { try await AppUpdates.stage($0, version: $1, replacing: $2) }
     @ObservationIgnored var quit: @MainActor () -> Void = { NSApp.terminate(nil) }
 
-    /// How long an answer stays good for. Releases are cut by hand, a few times a year; asking more
-    /// often than this would be asking a question whose answer cannot have changed.
-    private static let freshFor: TimeInterval = 6 * 60 * 60
+    /// Foreground checks are throttled independently from the periodic background check.
+    private static let freshFor: TimeInterval = 15 * 60
+    private static let periodicFreshFor: TimeInterval = 6 * 60 * 60
     /// How long a failed look stays good for. Much shorter, because the usual reason for one is that
     /// the laptop had no network a moment ago, and that does change.
     private static let retryFailureAfter: TimeInterval = 10 * 60
 
     private static let storageKey = "appUpdateLastCheck"
 
-    init() { restore() }
+    init(preferences: FilePreferences? = nil, installedVersion: String? = nil) {
+        self.preferences = preferences
+        self.versionOverride = installedVersion
+        restore()
+        observedRepo = checkedRepo ?? repo()
+    }
 
     // MARK: - What the screen reads
 
     var installedVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+        versionOverride ?? (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0")
     }
 
     /// The version waiting to be installed, or nil when there is none.
@@ -100,6 +115,7 @@ final class AppUpdateModel {
     /// there is a release, and the reason there is nothing when the answer was a quiet no.
     var note: String? {
         if let failure { return failure }
+        if let checkFailure { return "The release check could not finish. \(checkFailure)" }
         switch check {
         case .available(let release): return release.notes.isEmpty ? nil : release.notes
         case .upToDate(let note): return note
@@ -110,30 +126,89 @@ final class AppUpdateModel {
 
     // MARK: - Looking
 
-    /// Called when the window or the panel comes on screen. Cheap by design: almost every call
-    /// returns here without doing anything.
-    func checkIfStale() {
+    /// Every configured origin transition revokes cached and in-flight work, including A → B → A.
+    func repositoryDidChange() {
+        let current = repo()
+        guard observedRepo != current else { return }
+        observedRepo = current
+        repositoryEpoch &+= 1
+        checkedRepo = nil
+        check = nil
+        lastChecked = nil
+        checkFailure = nil
+        failure = nil
+        if let preferences { preferences.removeObject(forKey: Self.storageKey) }
+        else { AppPreferences.removeObject(forKey: Self.storageKey) }
+        onStateChange?()
+    }
+
+    private func isCurrent(repository: String, epoch: UInt64) -> Bool {
+        epoch == repositoryEpoch && repository == repo()
+    }
+
+    private struct RepositoryChanged: Error {
+        let message = "The update repository changed. This installation was cancelled before replacing the app."
+    }
+
+    private func requireCurrent(repository: String, epoch: UInt64) throws {
+        guard isCurrent(repository: repository, epoch: epoch) else { throw RepositoryChanged() }
+    }
+
+    /// Called on foreground entry; a recent answer avoids a duplicate request.
+    func checkIfStale(minimumAge: TimeInterval? = nil) {
+        repositoryDidChange()
         guard phase == .idle else { return }
-        if let lastChecked, check != nil {
-            let age = Date().timeIntervalSince(lastChecked)
-            let window = isFailed ? Self.retryFailureAfter : Self.freshFor
-            if age < window { return }
+        let repositoryChanged = checkedRepo != repo()
+        if !repositoryChanged, let lastChecked, check != nil {
+            let age = now().timeIntervalSince(lastChecked)
+            let window = isFailed ? Self.retryFailureAfter : (minimumAge ?? Self.freshFor)
+            if age >= 0 && age < window { return }
         }
         checkNow()
     }
 
-    /// The Check now button, and the only way to ask again inside the fresh window.
+    func startAutomaticChecks(interval: Duration = .seconds(60)) {
+        guard automaticCheckTask == nil else { return }
+        checkIfStale()
+        automaticCheckTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: interval) } catch { return }
+                self?.checkIfStale(minimumAge: Self.periodicFreshFor)
+            }
+        }
+    }
+
+    func stopAutomaticChecks() {
+        automaticCheckTask?.cancel()
+        automaticCheckTask = nil
+    }
+
+    /// A manual check bypasses the foreground throttle.
     func checkNow() {
+        repositoryDidChange()
         guard phase == .idle else { return }
         phase = .checking
-        failure = nil
-        let repo = repo()
+        let repository = repo()
+        let epoch = repositoryEpoch
+        if checkedRepo != repository { check = nil; checkFailure = nil }
         let installed = installedVersion
         Task { @MainActor in
-            let result = await AppUpdates.check(repo: repo, installedVersion: installed)
-            self.check = result
-            self.lastChecked = Date()
+            defer { self.onStateChange?() }
+            let result = await fetchRelease(repository, installed)
             self.phase = .idle
+            guard self.isCurrent(repository: repository, epoch: epoch) else {
+                self.checkIfStale()
+                return
+            }
+            self.checkedRepo = repository
+            self.lastChecked = self.now()
+            if case .failed(let reason) = result {
+                self.checkFailure = reason
+                if case .available = self.check { return }
+            } else {
+                self.checkFailure = nil
+            }
+            self.check = result
             self.remember(result)
         }
     }
@@ -168,11 +243,15 @@ final class AppUpdateModel {
     /// sibling directory, and the only thing that moves anything is the helper, after this process
     /// has exited.
     func install() {
+        repositoryDidChange()
+        guard checkedRepo == repo() else { checkIfStale(); return }
         guard case .available(let release) = check, phase == .idle else { return }
         if let blocked = installBlockedReason {
             failure = blocked
             return
         }
+        let repository = repo()
+        let epoch = repositoryEpoch
         let bundleURL = self.bundleURL
         let marker = AppUpdates.launchMarkerURL(support: supportDirectory)
         phase = .downloading
@@ -190,18 +269,18 @@ final class AppUpdateModel {
         operations?.begin(record)
 
         Task { @MainActor in
+            var prepared: AppUpdates.Staged?
+            defer { self.onStateChange?() }
             do {
-                let download = try await AppUpdates.download(release)
+                try self.requireCurrent(repository: repository, epoch: epoch)
+                let download = try await self.downloadRelease(release)
+                defer { AppUpdates.discard(download) }
+                try self.requireCurrent(repository: repository, epoch: epoch)
                 self.operations?.addPhase(record.id, name: "verified", detail: "signature and sha256 checked against the release key")
                 self.phase = .installing
-                let staged: AppUpdates.Staged
-                do {
-                    staged = try await AppUpdates.stage(download, version: release.version, replacing: bundleURL)
-                } catch {
-                    AppUpdates.discard(download)
-                    throw error
-                }
-                AppUpdates.discard(download)
+                let staged = try await self.stageRelease(download, release.version, bundleURL)
+                prepared = staged
+                try self.requireCurrent(repository: repository, epoch: epoch)
                 self.operations?.addPhase(record.id, name: "staged", detail: staged.bundle.lastPathComponent)
 
                 // Written down before the swap, so the new copy comes up knowing it is current rather
@@ -213,6 +292,7 @@ final class AppUpdateModel {
                 // The marker is removed by the helper before it launches the new build, and written
                 // again by the new build once it is up. Its absence is what triggers the recovery.
                 try? FileManager.default.removeItem(at: marker)
+                try self.requireCurrent(repository: repository, epoch: epoch)
                 try self.performSwap(staged, bundleURL, marker)
                 self.operations?.finish(
                     record.id,
@@ -221,6 +301,12 @@ final class AppUpdateModel {
                     detail: "The previous build is kept beside it. If the new one does not come up within 45 seconds the helper puts the old one back."
                 )
                 self.quit()
+            } catch let changed as RepositoryChanged {
+                if let prepared { try? FileManager.default.removeItem(at: prepared.bundle) }
+                self.failure = changed.message
+                self.phase = .idle
+                self.operations?.finish(record.id, state: .cancelled, summary: changed.message)
+                self.checkIfStale()
             } catch let problem as AppUpdates.InstallFailure {
                 self.failure = problem.message
                 self.phase = .idle
@@ -265,6 +351,9 @@ final class AppUpdateModel {
     /// not become a second copy of the release list.
     private struct Stored: Codable {
         var checkedAt: Date
+        var repository: String?
+        var manifestURL: URL?
+        var signatureURL: URL?
         var version: String?
         var notes: String?
         var assetURL: URL?
@@ -273,36 +362,45 @@ final class AppUpdateModel {
     }
 
     private var isFailed: Bool {
+        if checkFailure != nil { return true }
         if case .failed = check { return true }
         return false
     }
 
     private func remember(_ result: AppUpdates.Check) {
-        var stored = Stored(checkedAt: Date())
+        var stored = Stored(checkedAt: lastChecked ?? now(), repository: checkedRepo)
         switch result {
         case .available(let release):
             stored.version = release.version
             stored.notes = release.notes
             stored.assetURL = release.assetURL
             stored.sizeBytes = release.sizeBytes
+            stored.manifestURL = release.manifestURL
+            stored.signatureURL = release.signatureURL
         case .upToDate(let note):
             stored.note = note
         case .failed:
             // A failure is not an answer, so it is not written down. The next launch looks again
             // rather than coming up repeating a network error from hours ago.
-            AppPreferences.removeObject(forKey: Self.storageKey)
+            if let preferences { preferences.removeObject(forKey: Self.storageKey) }
+            else { AppPreferences.removeObject(forKey: Self.storageKey) }
             return
         }
         guard let data = try? JSONEncoder().encode(stored) else { return }
-        AppPreferences.set(data, forKey: Self.storageKey)
+        if let preferences { preferences.set(data, forKey: Self.storageKey) }
+        else { AppPreferences.set(data, forKey: Self.storageKey) }
     }
 
     private func restore() {
-        guard let data = AppPreferences.data(forKey: Self.storageKey),
+        let saved: Data?
+        if let preferences { saved = preferences.data(forKey: Self.storageKey) }
+        else { saved = AppPreferences.data(forKey: Self.storageKey) }
+        guard let data = saved,
               let stored = try? JSONDecoder().decode(Stored.self, from: data)
         else { return }
 
         lastChecked = stored.checkedAt
+        checkedRepo = stored.repository
         if let version = stored.version, let assetURL = stored.assetURL {
             // The version that was waiting last time may be the version running now, because
             // installing it is what ended the last run. Compare again rather than trusting the file.
@@ -314,7 +412,9 @@ final class AppUpdateModel {
                 version: version,
                 notes: stored.notes ?? "",
                 assetURL: assetURL,
-                sizeBytes: stored.sizeBytes ?? 0
+                sizeBytes: stored.sizeBytes ?? 0,
+                manifestURL: stored.manifestURL,
+                signatureURL: stored.signatureURL
             ))
         } else {
             check = .upToDate(note: stored.note)

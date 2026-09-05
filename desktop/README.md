@@ -4,13 +4,21 @@ The same app as the Mac one and the phone one, for the two desktops. It reads th
 document, talks to the same agent over the same ssh, and follows the same rules about what it will
 and will not claim.
 
-Built with Avalonia 11 on .NET 10, published self-contained so no .NET installation is required. OpenSSH and the platform
-graphics libraries must be available. The window and the headless mode are the same objects: `--smoke` and `--command` drive
+Built with Avalonia 11 on .NET 10, published self-contained for Linux x64, Linux ARM64 and Windows x64
+so no .NET installation is required. Keep every file from the archive in the installation directory.
+OpenSSH is required for remote connections; the window also needs the platform graphics libraries.
+The window and the headless mode are the same objects: `--smoke` and `--command` drive
 the models the window draws, so a check that passes over ssh is a check of the thing that ships.
 
 ## Running it
 
 A bare invocation opens the window. Command flags run without a window and exit.
+
+Choose `Legion-Control-linux-x64.tar.gz`, `Legion-Control-linux-arm64.tar.gz`, or
+`Legion-Control-windows-x64.zip` from [the latest release](https://github.com/x1f4r/legion-control/releases/latest).
+The ARM64 build supports a Raspberry Pi running a 64-bit Linux OS. Its headless commands do not
+initialize Avalonia and need no display session, so the Pi can be a controller over SSH as well as
+an agent target. A graphical session is required only for the window and screenshot mode.
 
 ```
 legion-control                                   the window
@@ -41,6 +49,9 @@ sending it again.
 | this device's own settings | `bindings.json` beside it | the same |
 | earlier setups, by hash | `revisions/` beside it | the same |
 | operations this app started | `operations.json` beside it | the same |
+| desktop preferences | `desktop-settings.json` beside it | the same |
+
+Linux uses `$XDG_CONFIG_HOME/legion-control/` instead when `XDG_CONFIG_HOME` is set.
 
 Three environment variables move all of it, which is how a test run touches nothing that matters:
 
@@ -146,23 +157,50 @@ unavailable, and keeping telemetry history is a separate opt-in setting.
 
 Use `--local-agent-json '["node","C:\\Program Files\\Legion\\bin\\launcher.mjs"]'` with
 the `bindings` command when argv contains spaces. The complete array is preserved.
-App updates verify the signed manifest and artifact before staging an explicit install and restart.
-The new window must render before its update health marker is written. Agent installs require
-authenticated status and confirm the installed version afterward; legacy bootstrap is limited to
-recognized layouts or an explicitly supplied `--base` directory.
+Agent installs require authenticated status and confirm the installed version afterward; legacy
+bootstrap is limited to recognized layouts or an explicitly supplied `--base` directory.
+
+## App updates
+
+The window checks at startup and when it becomes active, with a fifteen-minute throttle. A timer
+also checks every six hours while the window is active; an unfocused window catches up when
+activated. Closing the window stops this timer. The local `checkForAppUpdates` preference in
+`desktop-settings.json` defaults to `true`; a manual check is always available in **This device**.
+
+An available release appears above machine navigation as **Review update**, so it remains reachable
+while scrolling or switching machines. A transient failure keeps the previous verified offer
+visible. Changing the configured release repository clears it immediately and invalidates an open
+review, even if the repository is then changed back.
+
+**Review update → Download and verify** downloads the exact artifact for this OS and architecture
+and checks its size and hash against the signed manifest. **Install and restart** explicitly starts
+the replacement helper. The previous build is retained and restored if the new window cannot
+render. Checks do not download or install an app automatically.
+
+Headless invocations do not run an update-check timer. Check or explicitly install from the CLI:
+
+```
+legion-control --command app-update
+legion-control --command app-update --yes
+```
+
+The second command verifies and stages the update, then starts the helper. It reports completion
+as pending until the replacement launches; the helper opens the graphical app. On a Pi without a
+desktop session, verify the signed manifest and archive, then replace the complete installation
+directory instead of using the restart helper, whose health check requires a rendered window.
 
 ## Building
 
 ```
-./build.sh              test, then publish both platforms into ../dist
+./build.sh              test, then publish all three runtime targets into ../dist
 ./build.sh test         just the tests
-./build.sh linux        just Legion-Control-linux-x64.tar.gz
+./build.sh linux        Legion-Control-linux-x64.tar.gz and Legion-Control-linux-arm64.tar.gz
 ./build.sh windows      just Legion-Control-windows-x64.zip
 ```
 
 It uses `$LEGION_DOTNET` when set, the pinned toolchain under
 `~/.local/share/legion-control-toolchains/dotnet10` when it is there, and `dotnet` from the path
-otherwise. Both archives are self-contained and are named exactly as the signed release manifest
+otherwise. All three archives are self-contained and are named exactly as the signed release manifest
 names them, because the update path picks its own artifact by exact name and never by shape.
 
 ## Checking a real window from somewhere else
