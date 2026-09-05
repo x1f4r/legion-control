@@ -13,8 +13,8 @@ android {
         applicationId = "com.x1f4r.legioncontrol"
         minSdk = 30
         targetSdk = 36
-        versionCode = 12
-        versionName = "1.3.2"
+        versionCode = 13
+        versionName = "1.3.3"
 
         // The label lives here rather than in res/values/strings.xml so that the one string the
         // manifest needs cannot collide with the string table the UI owns.
@@ -118,7 +118,7 @@ android {
  */
 val copyAgentBundle by tasks.registering(Sync::class) {
     val dist = rootProject.layout.projectDirectory.dir("../dist")
-    val version = providers.gradleProperty("legion.agentVersion").getOrElse("3.0.0")
+    val version = providers.gradleProperty("legion.agentVersion").getOrElse("3.0.1")
     from(dist) {
         include("legionctl-agent-$version.tgz")
         include("Legion-Control-agent-manifest.json")

@@ -21,7 +21,7 @@ object Contract {
      * Kept beside the required contract because the two move together: an app that needs contract 3
      * has to be able to put a contract 3 agent on a machine that has an older one.
      */
-    const val BUNDLED_AGENT_VERSION = "3.0.0"
+    const val BUNDLED_AGENT_VERSION = "3.0.1"
 
     /**
      * The argv grammar from rule 4.

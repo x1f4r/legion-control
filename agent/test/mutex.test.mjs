@@ -283,6 +283,6 @@ test('a mutating command refuses cleanly when node:sqlite is missing', async () 
     // running cannot be diagnosed remotely.
     const payload = JSON.parse(result.stdout);
     assert.equal(payload.ok, true);
-    assert.equal(payload.agentVersion, '3.0.0');
+    assert.equal(payload.agentVersion, '3.0.1');
   });
 });

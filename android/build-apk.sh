@@ -90,7 +90,7 @@ ZIPALIGN="$SDK_DIR/build-tools/$BUILD_TOOLS_DIR/zipalign"
 # ---------------------------------------------------------------------------
 
 # Signing a distributable build requires the complete signed agent bundle.
-for artifact in legionctl-agent-3.0.0.tgz Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig; do
+for artifact in legionctl-agent-3.0.1.tgz Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig; do
     if [ ! -s "$HERE/../dist/$artifact" ]; then
         printf 'ERROR: missing signed agent artifact: %s. Run scripts/package-agent.mjs first.\n' "$artifact" >&2
         exit 1

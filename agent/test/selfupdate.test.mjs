@@ -12,6 +12,7 @@ import { readBundle, resolveBootstrapLayout, selfTest } from '../src/selfupdate.
 import { acquireOperationLock } from '../src/lock.mjs';
 
 const AGENT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const CURRENT_VERSION = JSON.parse(fs.readFileSync(path.join(AGENT, 'package.json'), 'utf8')).version;
 
 function signingPair() { return crypto.generateKeyPairSync('ed25519'); }
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -37,7 +38,8 @@ function signTree(dir, privateKey) {
     files.push({ path: relative, sha256: sha(bytes), size: bytes.length });
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
-  const manifest = Buffer.from(`${JSON.stringify({ schema: 1, version: '3.0.0', contract: 3, files }, null, 2)}\n`);
+  const version = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
+  const manifest = Buffer.from(`${JSON.stringify({ schema: 1, version, contract: 3, files }, null, 2)}\n`);
   fs.writeFileSync(path.join(dir, 'MANIFEST.json'), manifest);
   fs.writeFileSync(path.join(dir, 'MANIFEST.json.sig'), `${crypto.sign(null, manifest, privateKey).toString('base64')}\n`);
 }
@@ -232,7 +234,7 @@ for (const worker of ['status-probe-worker.mjs', 'service-profile-probe.mjs']) {
           fs.writeFileSync(entry, "import './worker-only-dependency.mjs';\n");
           fs.writeFileSync(path.join(root, 'src', 'worker-only-dependency.mjs'), "import './missing-nested-module.mjs';\n");
         }
-        const result = selfTest(root, { expectedVersion: '3.0.0', expectedContract: 3 });
+        const result = selfTest(root, { expectedVersion: CURRENT_VERSION, expectedContract: 3 });
         assert.equal(result.ok, false, result.output);
         assert.match(result.output, /worker modules/);
         assert.ok(result.output.includes(worker), result.output);
@@ -257,7 +259,7 @@ test('staged self-test parses worker entry points and dependencies without execu
       fs.writeFileSync(path.join(root, 'src', worker), `import './worker-only-dependency.mjs';\n${sentinel}`);
     }
     fs.writeFileSync(path.join(root, 'src', 'worker-only-dependency.mjs'), sentinel);
-    const result = selfTest(root, { expectedVersion: '3.0.0', expectedContract: 3 });
+    const result = selfTest(root, { expectedVersion: CURRENT_VERSION, expectedContract: 3 });
     assert.equal(result.ok, true, result.output);
     assert.equal(fs.existsSync(marker), false);
   } finally {
@@ -333,7 +335,7 @@ test('staged signed bootstrap installs the intended base, replays, and conflicts
     assert.equal(first.status, 0, first.stderr || first.stdout);
     const installed = JSON.parse(first.stdout);
     assert.equal(installed.action, 'installed');
-    assert.equal(installed.current.version, '3.0.0');
+    assert.equal(installed.current.version, CURRENT_VERSION);
     assert.equal(fs.readFileSync(path.join(base, 'bin', 'launcher.mjs'), 'utf8'), fs.readFileSync(path.join(incoming, 'install', 'launcher.mjs'), 'utf8'));
     const wrapper = path.join(base, 'bin', process.platform === 'win32' ? 'legionctl.ps1' : 'legionctl');
     assert.equal(fs.readFileSync(wrapper, 'utf8').includes('@NODE_'), false);
