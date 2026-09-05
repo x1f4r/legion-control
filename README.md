@@ -289,6 +289,13 @@ and install the APK. Or take it from a release. On first run it shows the public
 `authorized_keys` on each machine, then **This device → Configuration → Fetch from a machine**
 pulls the setup from any one of them.
 
+First connection uses the installed launcher, which remembers the Node runtime selected during
+installation. Node does not need to be on the remote SSH session's `PATH`. Standard installations
+use `~/.legion-control/bin/legionctl` on Linux and macOS, or
+`~/.legion-control/bin/legionctl.ps1` through PowerShell on Windows. Older installation paths remain
+fallbacks. If none can start, the app reports a discovery failure rather than assuming the agent
+is absent; authentication and host-identity errors remain separate.
+
 ### The Linux or Windows desktop
 
 Download the matching archive from [the latest release](https://github.com/x1f4r/legion-control/releases/latest):

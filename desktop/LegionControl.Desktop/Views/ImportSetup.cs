@@ -27,7 +27,24 @@ public sealed class ImportSetup : Window
         body.Children.Add(Ui.Note("Remote shell"));
         var shell = new ComboBox { ItemsSource = new[] { "posix", "powershell", "cmd" }, SelectedIndex = 0 }; body.Children.Add(shell);
         var restricted = new CheckBox { Content = "This key uses the restricted agent dispatcher" }; body.Children.Add(restricted);
-        var argv = Field("Agent argv as a JSON array", "[\"node\",\"/home/me/.legion-control/agent/src/index.mjs\"]");
+        var suggestedAgent = JsonSerializer.Serialize(ImportAgentDefaults.For(RemoteShell.Posix, user.Text, false));
+        var argv = Field("Agent argv as a JSON array", suggestedAgent);
+        var agentWasEdited = false;
+        var settingSuggestion = false;
+        argv.TextChanged += (_, _) => { if (!settingSuggestion && argv.Text != suggestedAgent) agentWasEdited = true; };
+        void SuggestAgent()
+        {
+            if (agentWasEdited) return;
+            suggestedAgent = JsonSerializer.Serialize(ImportAgentDefaults.For(
+                RemoteShells.Parse(shell.SelectedItem as string) ?? RemoteShell.Posix, user.Text, restricted.IsChecked == true));
+            settingSuggestion = true;
+            try { argv.Text = suggestedAgent; }
+            finally { settingSuggestion = false; }
+        }
+        user.TextChanged += (_, _) => SuggestAgent();
+        shell.SelectionChanged += (_, _) => SuggestAgent();
+        restricted.IsCheckedChanged += (_, _) => SuggestAgent();
+        body.Children.Add(Ui.Note("Uses the installed launcher. For Windows or a restricted key, check the suggested account path; custom install locations need their exact argv."));
         var preview = new TextBox { AcceptsReturn = true, IsReadOnly = true, MinHeight = 100, MaxHeight = 200 };
         var problem = new TextBlock { Foreground = Ui.Bad, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
         ControllerDocument? fetched = null;

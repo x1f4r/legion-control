@@ -1,6 +1,13 @@
 package com.x1f4r.legioncontrol.agent
 
 import com.x1f4r.legioncontrol.data.readControllerConfig
+import com.x1f4r.legioncontrol.net.CommandOutcome
+import com.x1f4r.legioncontrol.net.Endpoint
+import com.x1f4r.legioncontrol.net.RouteKind
+import kotlinx.coroutines.runBlocking
+import java.nio.file.Files
+import java.util.Base64
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -106,7 +113,7 @@ class ControllerSetupTest {
             ),
             // Distinct lines: nothing here needs quoting, so the cmd.exe and PowerShell forms are
             // the same string, and the fetch runs it once rather than twice.
-            commands.mapNotNull { it.line() }.distinct(),
+            commands.drop(2).mapNotNull { it.line() }.distinct(),
         )
     }
 
@@ -126,7 +133,7 @@ class ControllerSetupTest {
         assertTrue(posix.any { it.contains(" ~/.legion-control/agent/src/index.mjs ") })
 
         // The Windows shapes carry it in the two forms those shells actually read.
-        val cmd = commands.first { it.shell == RemoteShell.CMD }.line()
+        val cmd = commands.last { it.shell == RemoteShell.CMD }.line()
         assertTrue(cmd!!.contains("\"C:\\Users\\first last\\.legion-control\\agent\\src\\index.mjs\""))
         val powershell = commands.first { it.shell == RemoteShell.POWERSHELL }.line()
         assertTrue(powershell!!.startsWith("& 'node' '"))
@@ -134,6 +141,116 @@ class ControllerSetupTest {
 
         // Nothing that would run a second command can be produced from it.
         assertTrue(commands.mapNotNull { it.line() }.none { it.contains(";") })
+    }
+
+    @Test
+    fun `stable wrappers precede all runtime guesses and ignore the login user`() {
+        val commands = setupCommands("me")
+        assertEquals("~/.legion-control/bin/legionctl config", commands[0].line())
+        val windows = commands[1]
+        assertEquals("powershell.exe", windows.arguments.first())
+        assertEquals("-EncodedCommand", windows.arguments[5])
+        val script = String(Base64.getDecoder().decode(windows.arguments.last()), Charsets.UTF_16LE)
+        assertTrue(script.startsWith("\$ErrorActionPreference = 'Stop'; try {"))
+        assertTrue(script.contains("& (Join-Path \$HOME '.legion-control/bin/legionctl.ps1') config"))
+        assertTrue(script.contains("exit \$LASTEXITCODE"))
+        assertTrue(script.endsWith("exit 1 }"))
+        assertEquals(windows.line(), buildRemoteCommand(RemoteShell.POWERSHELL, windows.arguments))
+        assertEquals(commands.take(2), setupCommands("';$(touch injected);%USERPROFILE%!&").take(2))
+    }
+
+    @Test
+    fun `POSIX bootstrap runs a wrapper with its pinned runtime and an empty PATH`() {
+        val home = Files.createTempDirectory("setup home ").toFile()
+        try {
+            val runtime = home.resolve("pinned runtime").apply {
+                writeText("#!/bin/sh\n[ \"\$1\" = config ] || exit 9\nprintf '%s' '{\"ok\":true,\"controller\":null}'\n")
+                setExecutable(true)
+            }
+            home.resolve(".legion-control/bin").mkdirs()
+            home.resolve(".legion-control/bin/legionctl").apply {
+                writeText("#!/bin/sh\nexec " + quotePosix(runtime.absolutePath) + " \"\$@\"\n")
+                setExecutable(true)
+            }
+            val process = ProcessBuilder("/bin/sh", "-c", setupCommands("unused").first().line()!!)
+                .apply { environment()["HOME"] = home.absolutePath; environment()["PATH"] = "/missing" }
+                .start()
+            val stdout = process.inputStream.bufferedReader().readText()
+            val stderr = process.errorStream.bufferedReader().readText()
+            assertEquals(stderr, 0, process.waitFor())
+            assertEquals(ControllerFetch.NothingStored, readControllerReply(stdout))
+        } finally {
+            home.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `bootstrap stops at the first reply and retains legacy fallback`() = runBlocking {
+        val tried = mutableListOf<String>()
+        val expectedLegacy = setupCommands("me")[2].line()
+        val result = fetchController("me") { line ->
+            tried += line
+            if (line == expectedLegacy) CommandOutcome(0, document, "")
+            else CommandOutcome(127, "", "command not found")
+        }
+        assertTrue(result is ControllerFetch.Document)
+        assertEquals(setupCommands("me").take(3).map { it.line() }, tried)
+        var count = 0
+        assertEquals(ControllerFetch.NothingStored, fetchController("me") {
+            count++
+            CommandOutcome(0, "{\"controller\":null}", "")
+        })
+        assertEquals(1, count)
+    }
+
+    @Test
+    fun `explicit agent refusal ends discovery without claiming an old or absent agent`() = runBlocking {
+        var attempts = 0
+        val failure = try {
+            fetchController("me") {
+                attempts++
+                CommandOutcome(1, "{\"ok\":false,\"error\":\"restricted command refused\",\"controller\":null}", "")
+            }
+            error("Expected reported failure")
+        } catch (failure: AgentFailure.Reported) { failure }
+        assertEquals("restricted command refused", failure.detail)
+        assertEquals(1, attempts)
+    }
+
+    @Test
+    fun `exhausted bootstrap reports discovery uncertainty with bounded diagnostics`() = runBlocking {
+        var attempts = 0
+        val failure = try {
+            fetchController("me") {
+                attempts++
+                CommandOutcome(127, "", "runtime unavailable " + "x".repeat(500))
+            }
+            error("Expected discovery failure")
+        } catch (failure: AgentFailure.DiscoveryFailed) { failure }
+        assertEquals(setupCommands("me").mapNotNull { it.line() }.distinct().size, attempts)
+        assertEquals("Could not locate or start the control agent on that machine.", failure.summary)
+        assertFalse(failure.summary.contains("not installed"))
+        assertEquals(403, failure.detail!!.length)
+    }
+
+    @Test
+    fun `bootstrap preserves transport authorization and trust failures without fallback`() = runBlocking {
+        val endpoint = Endpoint("test", RouteKind.LAN, "example.test", 22, "me", null, "Test")
+        val failures = listOf(
+            AgentFailure.Unreachable(null, "socket refused"),
+            AgentFailure.NotAuthorised(endpoint, null, "key refused"),
+            AgentFailure.HostKeyChanged(endpoint.address, emptyList(), "SHA256:test", "public"),
+            AgentFailure.TimedOut(40, "timeout"),
+        )
+        for (expected in failures) {
+            var count = 0
+            val actual = try {
+                fetchController("me") { count++; throw expected }
+                error("Expected transport failure")
+            } catch (failure: AgentFailure) { failure }
+            assertSame(expected, actual)
+            assertEquals(1, count)
+        }
     }
 
     /**

@@ -1452,9 +1452,9 @@ final class ConfigStore {
           },
           "systems": [
             { "id": "linux", "name": "Linux", "platform": "linux",
-              "agent": ["/usr/bin/node", "/home/me/.legion-control/bin/launcher.mjs"] },
+              "agent": ["/home/me/.legion-control/bin/legionctl"] },
             { "id": "windows", "name": "Windows 11", "platform": "windows", "shell": "powershell",
-              "agent": ["node", "C:\\\\Users\\\\me\\\\.legion-control\\\\bin\\\\launcher.mjs"] }
+              "agent": ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "C:\\\\Users\\\\me\\\\.legion-control\\\\bin\\\\legionctl.ps1"] }
           ]
         },
         {
@@ -1467,7 +1467,7 @@ final class ConfigStore {
           ],
           "systems": [
             { "id": "linux", "name": "Linux", "platform": "linux",
-              "agent": ["/usr/bin/node", "/home/me/.legion-control/bin/launcher.mjs"] }
+              "agent": ["/home/me/.legion-control/bin/legionctl"] }
           ]
         }
       ],
