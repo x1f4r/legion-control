@@ -83,3 +83,50 @@ test('Windows process failures remain unknown and never disclose query output or
   assert.equal(result.unknown, false);
   assert.doesNotMatch(JSON.stringify(result), /opaque-secret/);
 });
+
+
+test('Windows Hello and Software Protection require their specific service identities', () => {
+  const ngc = { pid: 200, parentPid: 100, sessionId: 0, name: 'NgcIso.exe', command: null, ownerSid: 'S-1-5-19' };
+  const ngcParent = { pid: 100, parentPid: 50, sessionId: 0, name: 'svchost.exe', command: 'C:\\Windows\\System32\\svchost.exe', executablePath: 'C:\\Windows\\system32\\svchost.exe' };
+  const spp = { pid: 300, parentPid: 50, sessionId: 0, name: 'sppsvc.exe', command: null, ownerSid: 'S-1-5-20' };
+  const sppParent = { pid: 50, parentPid: 40, sessionId: 0, name: 'services.exe', command: null, ownerSid: 'S-1-5-18' };
+  for (const profile of ['claude-code', 'codex-cli', 'opencode']) {
+    assert.equal(processExitVerdict(profile, [ngc, ngcParent, spp, sppParent], 99999, windows).busy, false);
+  }
+  for (const [child, parent] of [[ngc, ngcParent], [spp, sppParent]]) {
+    for (const ownerSid of [null, 'S-1-5-21-1-2-3-1001', 'S-1-5-18', child.ownerSid === 'S-1-5-19' ? 'S-1-5-20' : 'S-1-5-19']) {
+      assert.equal(verdict([{ ...child, ownerSid }, parent]).unknown, true, 'a familiar name needs the exact service account');
+    }
+    for (const change of [{ sessionId: 1 }, { parentPid: 999 }, { name: 'unknown-user.exe' }]) {
+      assert.equal(verdict([{ ...child, ...change }, parent]).unknown, true);
+    }
+    for (const change of [{ name: 'user-host.exe' }, { sessionId: 1 }, { executablePath: 'C:\\Users\\someone\\' + parent.name }]) {
+      assert.equal(verdict([child, { ...parent, ...change }]).unknown, true, 'a mismatched parent cannot establish identity');
+    }
+    assert.equal(verdict([child]).unknown, true);
+    assert.equal(verdict([child, parent], { platform: 'linux' }).unknown, true);
+  }
+  assert.equal(verdict([ngc, { ...ngcParent, executablePath: null }]).unknown, true);
+  assert.equal(verdict([spp, { ...sppParent, ownerSid: null }]).unknown, true);
+  assert.equal(verdict([spp, { ...sppParent, ownerSid: 'S-1-5-19' }]).unknown, true);
+  assert.equal(verdict([ngc, ngcParent, { pid: 700, name: 'node.exe', command: null, ownerSid: 'S-1-5-19' }]).unknown, true);
+  const product = verdict([ngc, ngcParent, { pid: 700, name: 'codex.exe', command: null, ownerSid: 'S-1-5-19' }]);
+  assert.equal(product.busy, true);
+  assert.equal(product.unknown, false);
+});
+
+test('CIM queries include owner lookup for protected Hello and licensing processes', () => {
+  let calls = 0;
+  const result = inspectProfileProcesses('codex-cli', { platform: 'win32', run: (_file, args, options) => {
+    calls++;
+    assert.equal(options.timeout, 4000);
+    assert.match(args.at(-1), /'ngciso\.exe'/);
+    assert.match(args.at(-1), /'sppsvc\.exe'/);
+    return { status: 0, stdout: JSON.stringify([
+      { ProcessId: 300, ParentProcessId: 50, SessionId: 0, Name: 'sppsvc.exe', CommandLine: null, OwnerSid: 'S-1-5-20' },
+      { ProcessId: 50, ParentProcessId: 40, SessionId: 0, Name: 'services.exe', CommandLine: null, OwnerSid: 'S-1-5-18' },
+    ]) };
+  } });
+  assert.equal(calls, 1);
+  assert.equal(result.busy, false);
+});

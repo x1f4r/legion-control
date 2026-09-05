@@ -21,7 +21,7 @@ test('status describes the service, its process, health and busy evidence apart'
     const { payload, exitCode } = cli(['status'], { home });
     assert.equal(exitCode, 0);
     assert.equal(payload.contract, 3);
-    assert.equal(payload.agentVersion, '3.0.0');
+    assert.equal(payload.agentVersion, '3.0.1');
 
     const service = payload.services[0];
     assert.equal(service.installed, '1.0.0');

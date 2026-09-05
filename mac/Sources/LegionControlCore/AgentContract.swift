@@ -12,7 +12,7 @@ import Foundation
 let requiredContract = 3
 
 /// The agent version bundled with this build, for the trusted deployment action.
-let bundledAgentVersion = "3.0.0"
+let bundledAgentVersion = "3.0.1"
 
 // MARK: - Reason codes
 

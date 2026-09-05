@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { CONTRACT_VERSION } from './contract.mjs';
 import { acquireFileLock, stateLockPath, writeJsonAtomic } from './state.mjs';
 
-export const AGENT_VERSION = '3.0.0';
+export const AGENT_VERSION = '3.0.1';
 
 /** The config schema this agent understands. Bumped only for a breaking change. */
 export const CONFIG_VERSION = 3;

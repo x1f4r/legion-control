@@ -75,7 +75,7 @@ public static class AgentContract
     public const int RequiredContract = 3;
 
     /// The agent version this build carries a bundle of, when it carries one.
-    public const string BundledAgentVersion = "3.0.0";
+    public const string BundledAgentVersion = "3.0.1";
 
     public static string ClientVersion { get; } =
         (typeof(AgentContract).Assembly.GetName().Version

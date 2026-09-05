@@ -21,6 +21,10 @@ const WINDOWS_SYSTEM_NAMES = new Set([
   'mpdefendercoreservice.exe', 'msmpeng.exe', 'nissrv.exe', 'securityhealthservice.exe', 'svchost.exe',
 ]);
 const WINDOWS_KERNEL_NAMES = new Set(['secure system', 'registry', 'memory compression']);
+const WINDOWS_ISOLATED_SERVICE_IDENTITIES = new Map([
+  ['ngciso.exe', { ownerSid: 'S-1-5-19', parentName: 'svchost.exe' }],
+  ['sppsvc.exe', { ownerSid: 'S-1-5-20', parentName: 'services.exe' }],
+]);
 
 function identifiedWindowsSystemProcess(row, rows, systemRoot) {
   if (row.command !== null && row.command !== '') return false;
@@ -33,6 +37,18 @@ function identifiedWindowsSystemProcess(row, rows, systemRoot) {
   if (['S-1-5-18', 'S-1-5-19', 'S-1-5-20'].includes(row.ownerSid)) {
     if (row.sessionId === 0 && row.parentPid === 4 && WINDOWS_KERNEL_NAMES.has(name)) return row.ownerSid === 'S-1-5-18';
     if (WINDOWS_SYSTEM_NAMES.has(name) && (row.sessionId === 0 || (name === 'csrss.exe' && Number.isInteger(row.sessionId) && row.sessionId > 0))) return true;
+  }
+  const serviceIdentity = WINDOWS_ISOLATED_SERVICE_IDENTITIES.get(name);
+  if (serviceIdentity && row.sessionId === 0 && row.ownerSid === serviceIdentity.ownerSid) {
+    const parent = rows.find((candidate) => candidate.pid === row.parentPid);
+    if (parent?.sessionId !== 0 || parent?.name?.toLowerCase() !== serviceIdentity.parentName) return false;
+    const systemParentPath = typeof systemRoot === 'string' && path.win32.isAbsolute(systemRoot) &&
+      typeof parent.executablePath === 'string' && path.win32.normalize(parent.executablePath).toLowerCase() ===
+      path.win32.join(systemRoot, 'System32', serviceIdentity.parentName).toLowerCase();
+    // Hello has a visible service host. The protected service manager can hide
+    // its path, so licensing also requires that parent's verified SYSTEM SID.
+    if (name === 'ngciso.exe') return systemParentPath;
+    return parent.ownerSid === 'S-1-5-18' && (parent.executablePath == null || systemParentPath);
   }
   // Hyper-V memory accounting is represented by a VM-owned pseudo-process.
   // Confirm its owner namespace and the system VM worker in the same snapshot.
@@ -88,7 +104,7 @@ export function inspectProfileProcesses(profile, { platform = process.platform, 
   try {
     let rows;
     if (platform === 'win32') {
-      const ownerCandidates = [...WINDOWS_SYSTEM_NAMES, ...WINDOWS_KERNEL_NAMES, 'vmmem', 'vmmemwsl'];
+      const ownerCandidates = [...WINDOWS_SYSTEM_NAMES, ...WINDOWS_KERNEL_NAMES, ...WINDOWS_ISOLATED_SERVICE_IDENTITIES.keys(), 'vmmem', 'vmmemwsl'];
       const script = `$ErrorActionPreference='Stop'; $names=@(${ownerCandidates.map((name) => `'${name}'`).join(',')}); ` +
         `@(Get-CimInstance Win32_Process | ForEach-Object { $sid=$null; ` +
         `if ([string]::IsNullOrEmpty($_.CommandLine) -and $names -contains $_.Name) { ` +
