@@ -444,6 +444,7 @@ enum AppUpdates {
         previous: URL,
         marker: URL,
         pid: Int32,
+        exitTimeout: Int = 10,
         launchTimeout: Int = 45
     ) -> String {
         func quoted(_ url: URL) -> String { RemoteShell.posixQuoted(url.path(percentEncoded: false)) }
@@ -458,11 +459,18 @@ enum AppUpdates {
 
         # Wait for the app to actually be gone. Moving a bundle out from under a running process is
         # survivable on macOS but leaves the old code running against the new resources.
+        app_is_running() {
+            kill -0 "$PID" 2>/dev/null || /bin/ps -p "$PID" -o pid= >/dev/null 2>&1
+        }
         i=0
-        while [ $i -lt 100 ] && kill -0 "$PID" 2>/dev/null; do
+        while [ $i -lt \(exitTimeout * 10) ] && app_is_running; do
             sleep 0.1
             i=$((i + 1))
         done
+        if app_is_running; then
+            echo "The current app did not exit. No update files were changed." >&2
+            exit 3
+        fi
 
         rm -f "$MARKER"
         rm -rf "$PREVIOUS"
@@ -561,15 +569,17 @@ enum AppUpdates {
 
     /// Put the kept bundle back, deliberately, because the user asked. The same helper does it, so
     /// the failure paths are the ones that have already been thought about.
-    static func rollBack(to previous: URL, current: URL, marker: URL) throws {
+    static func rollBack(
+        to previous: URL, current: URL, marker: URL,
+        start: (Staged, URL, URL) throws -> Void = { try startSwap(staged: $0, current: $1, marker: $2) }
+    ) throws {
         let staged = current.deletingLastPathComponent().appending(path: "Legion Control.new.app")
-        try? FileManager.default.removeItem(at: staged)
         // The helper's own vocabulary: "staged" is what goes in, "previous" is what comes out. Rolling
         // back is the same two renames with the roles swapped.
-        try startSwap(
-            staged: Staged(bundle: previous, previous: staged, version: version(ofBundleAt: previous) ?? "the previous build"),
-            current: current,
-            marker: marker
+        try start(
+            Staged(bundle: previous, previous: staged, version: version(ofBundleAt: previous) ?? "the previous build"),
+            current,
+            marker
         )
     }
 

@@ -169,7 +169,7 @@ struct AppUpdateTests {
         // The marker is written straight away, standing in for a new build that came up.
         try Data("ok".utf8).write(to: marker)
         let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: 1, launchTimeout: 2)
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 2)
         // The marker is removed by the helper before it launches, so it has to be recreated by
         // something. A background writer stands in for the new build's own launch.
         let scriptURL = root.appending(path: "swap.sh")
@@ -202,7 +202,7 @@ struct AppUpdateTests {
 
         // Nothing ever writes the marker: the new build crashed on the way up.
         let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: 1, launchTimeout: 1)
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1)
         let scriptURL = root.appending(path: "swap.sh")
         try Data(script.utf8).write(to: scriptURL)
 
@@ -226,7 +226,7 @@ struct AppUpdateTests {
         try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
 
         let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: 1, launchTimeout: 1)
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1)
         let scriptURL = root.appending(path: "swap.sh")
         try Data(script.utf8).write(to: scriptURL)
 
@@ -235,6 +235,91 @@ struct AppUpdateTests {
         // The one window where the real path could hold nothing is closed by putting the old bundle
         // straight back.
         #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
+    }
+
+    @Test("a live old app aborts the helper without changing bundles, backups, marker or launching")
+    func swapHelperRefusesLiveApp() async throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let current = root.appending(path: "Legion Control.app")
+        let staged = root.appending(path: "Legion Control.new.app")
+        let previous = root.appending(path: "Legion Control.previous.app")
+        let marker = root.appending(path: "launched-ok")
+        for (bundle, version) in [(current, "1.3.0"), (staged, "1.4.0"), (previous, "1.2.0")] {
+            try Self.makeBundle(at: bundle, identifier: "id", executable: "LegionControl", version: version)
+        }
+        try Data("existing launch proof".utf8).write(to: marker)
+        let snapshot = try Self.fileSnapshot(root)
+
+        let oldApp = Process()
+        oldApp.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        oldApp.arguments = ["30"]
+        let exited = AsyncStream<Void> { continuation in
+            oldApp.terminationHandler = { _ in continuation.yield(()); continuation.finish() }
+        }
+        try oldApp.run()
+        defer { if oldApp.isRunning { oldApp.terminate() } }
+        let launched = root.appending(path: "unexpected-launch")
+        // A shell function captures every attempted launch without opening any real application.
+        let intercept = "open() { printf launched > " + RemoteShell.posixQuoted(launched.path) + "; }\n"
+        let script = intercept + AppUpdates.swapScript(
+            current: current, staged: staged, previous: previous, marker: marker,
+            pid: oldApp.processIdentifier, exitTimeout: 1, launchTimeout: 1
+        )
+        let run = await Shell.run(executable: "/bin/sh", arguments: ["-c", script], timeout: 10)
+        #expect(run.exitCode == 3)
+        #expect(oldApp.isRunning)
+        #expect(!FileManager.default.fileExists(atPath: launched.path))
+        #expect(try Self.fileSnapshot(root) == snapshot)
+        oldApp.terminate()
+        for await _ in exited { break }
+    }
+
+    @Test("rollback hands reversed bundles to the helper without deleting existing staging or launch proof")
+    func rollbackPreservesFilesUntilHandoff() throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let current = root.appending(path: "Legion Control.app")
+        let retained = root.appending(path: "Legion Control.previous.app")
+        let new = root.appending(path: "Legion Control.new.app")
+        let marker = root.appending(path: "launched-ok")
+        for (bundle, version) in [(current, "1.4.0"), (retained, "1.3.0"), (new, "1.5.0")] {
+            try Self.makeBundle(at: bundle, identifier: "id", executable: "LegionControl", version: version)
+        }
+        try Data("existing launch proof".utf8).write(to: marker)
+        let snapshot = try Self.fileSnapshot(root)
+        var starts = 0
+        try AppUpdates.rollBack(to: retained, current: current, marker: marker) { staged, actualCurrent, actualMarker in
+            starts += 1
+            #expect(staged.bundle == retained)
+            #expect(staged.previous == new)
+            #expect(staged.version == "1.3.0")
+            #expect(actualCurrent == current)
+            #expect(actualMarker == marker)
+            let observed = try Self.fileSnapshot(root)
+            #expect(observed == snapshot)
+        }
+        #expect(starts == 1)
+        #expect(try Self.fileSnapshot(root) == snapshot)
+    }
+
+    private static func exitedProcessID() throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try process.run()
+        process.waitUntilExit()
+        return process.processIdentifier
+    }
+
+    private static func fileSnapshot(_ root: URL) throws -> [String: Data] {
+        let entries = try #require(FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey]))
+        var result: [String: Data] = [:]
+        for case let file as URL in entries {
+            if try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
+                result[file.path.replacingOccurrences(of: root.path, with: "")] = try Data(contentsOf: file)
+            }
+        }
+        return result
     }
 
     @Test("the kept bundle is found and named for the roll-back action")

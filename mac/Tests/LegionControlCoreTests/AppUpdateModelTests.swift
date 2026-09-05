@@ -267,6 +267,46 @@ struct AppUpdateModelTests {
         #expect(try String(contentsOf: previous.appending(path: "proof"), encoding: .utf8) == "previous")
     }
 
+    @Test("install retains the current launch marker through helper handoff when quit does not exit")
+    func installRetainsMarkerUntilExit() async throws {
+        let (model, _, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.supportDirectory = directory.appending(path: "support")
+        try FileManager.default.createDirectory(at: model.supportDirectory, withIntermediateDirectories: true)
+        let marker = AppUpdates.launchMarkerURL(support: model.supportDirectory)
+        let proof = Data("old app launch proof".utf8)
+        try proof.write(to: marker)
+        model.fetchRelease = { _, _ in .available(Self.release) }
+        model.checkNow()
+        await settle(model)
+        let downloadDirectory = directory.appending(path: "download")
+        model.downloadRelease = { _ in
+            try FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: true)
+            let artifact = ReleaseTrust.Manifest.Artifact(name: "app.zip", sha256: String(repeating: "a", count: 64), size: 0)
+            return .init(directory: downloadDirectory, archive: downloadDirectory.appending(path: "app.zip"),
+                         manifest: .init(schema: 1, version: "3.1.0", artifacts: [artifact]), artifact: artifact)
+        }
+        model.stageRelease = { _, version, _ in
+            .init(bundle: directory.appending(path: "Legion Control.new.app"),
+                  previous: directory.appending(path: "Legion Control.previous.app"), version: version)
+        }
+        var handedOff = false
+        var quitRequested = false
+        model.performSwap = { _, _, actualMarker in
+            #expect(actualMarker == marker)
+            let observed = try Data(contentsOf: marker)
+            #expect(observed == proof)
+            handedOff = true
+        }
+        model.quit = { quitRequested = true }
+        model.install()
+        let deadline = Date().addingTimeInterval(2)
+        while !quitRequested, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+        #expect(handedOff)
+        #expect(quitRequested)
+        #expect(try Data(contentsOf: marker) == proof)
+    }
+
     @Test("legacy cached releases refresh their missing signature metadata immediately")
     func legacyCacheRefresh() async throws {
         let (_, preferences, directory) = fixture()

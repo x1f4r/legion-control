@@ -645,14 +645,14 @@ struct MacSection: View {
                         title: updates.phase == .idle ? "Install \(version)" : updates.summary,
                         isHighlighted: updates.installBlockedReason == nil,
                         isEnabled: !updates.phase.isWorking && updates.installBlockedReason == nil
-                    ) { updates.install() }
+                    ) { afterSheet { updates.install() } }
                 }
 
                 Button("Check now") { updates.checkNow() }
                     .disabled(updates.phase.isWorking)
 
                 if let rollback = updates.rollbackVersion {
-                    Button("Go back to \(rollback)") { updates.rollBack() }
+                    Button("Go back to \(rollback)") { afterSheet { updates.rollBack() } }
                         .disabled(updates.phase.isWorking)
                 }
 
