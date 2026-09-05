@@ -293,8 +293,8 @@ public static class Sheets
         var dialog = new Window
         {
             Title = title,
-            Width = 720,
-            Height = 520,
+            Width = Math.Min(720, Math.Max(360, owner.Bounds.Width)),
+            Height = Math.Min(520, Math.Max(300, owner.Bounds.Height)),
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
         };
         dialog.Content = new ScrollViewer

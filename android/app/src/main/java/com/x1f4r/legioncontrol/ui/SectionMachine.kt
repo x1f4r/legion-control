@@ -34,148 +34,125 @@ import com.x1f4r.legioncontrol.ui.theme.LocalStatusColors
  */
 @Composable
 fun MachineSection(model: MachineModel, app: AppModel) {
-    var showAgentDetails by remember { mutableStateOf(false) }
-    var showActionDetails by remember { mutableStateOf(false) }
-    if (showActionDetails) androidx.compose.material3.AlertDialog(
-        onDismissRequest = { showActionDetails = false },
-        title = { Text("Action details") },
-        text = {
-            Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
-                model.actions.forEach { action ->
-                    Text(action.displayName, style = MaterialTheme.typography.bodyMedium)
-                    QuietText(if (action.isIdempotent) "Sends a wake packet. Repeating the packet is safe." else "Runs a configured command.")
-                    if (action.busyGated == true) QuietText("Waits while work is running.")
-                    action.confirm?.takeIf { it.isNotBlank() }?.let { QuietText(it) }
-                    Spacer(Modifier.height(8.dp))
+    var sheet by remember(model.machine.id) { mutableStateOf<String?>(null) }
+    var servicePage by remember(model.machine.id) { mutableStateOf<RememberedService?>(null) }
+    var agentDetails by remember { mutableStateOf(false) }
+
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(model.machine.name, style = MaterialTheme.typography.titleLarge)
+            Text(compactMachineState(model), style = MaterialTheme.typography.bodyMedium,
+                color = if (model.link is LinkState.Online) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error)
+        }
+        MoreMenu("Device actions") { close ->
+            MenuAction("Device details", close = close) { sheet = "Device details" }
+            MenuAction("Control agent", close = close) { agentDetails = true }
+            MenuAction("Activity", close = close) { sheet = "Activity" }
+            MenuAction("Diagnostics", close = close) { sheet = "Diagnostics" }
+            MenuAction("Service setup", model.speaksV3 && !model.isWorking, close) {
+                if (model.serviceSetupUnavailable == null) model.serviceSetup.open() else agentDetails = true
+            }
+        }
+    }
+    Actions {
+        if (model.canWake && !model.isAwake) PlainAction("Wake", !model.isWorking, working = model.isBusyWith(MachineModel.Task.WAKE)) { model.wake() }
+        PlainAction("Sleep", !model.isWorking && model.currentSystem != null, working = model.isBusyWith(MachineModel.Task.SLEEP)) { model.requestSleep() }
+        if (model.bootChoices.isNotEmpty() || (model.canWake && !model.isAwake)) PlainAction("Power options", !model.isWorking) { sheet = "Power options" }
+    }
+    if (model.needsKeyAuthorisation) PlainAction("Authorize device", true, emphasis = true) { sheet = "Authorize this device" }
+    if (model.hostKeyChanged != null) Actions {
+        if (model.hostKeyChanged?.canApprove == true) PlainAction("Check host key", !model.isWorking, emphasis = true) { model.requestTrustHostKey() }
+        PlainAction("Manage host identities", !model.isWorking) { model.manageHostIdentities(model.hostKeyChanged!!.address) }
+    }
+    if (model.status?.configBroken == true) {
+        Text("Agent configuration needs attention", color = MaterialTheme.colorScheme.error)
+        PlainAction("Details", true) { sheet = "Device details" }
+    }
+    model.wakeableHelper?.let { PlainAction("Wake helper first", !model.isWorking) { model.requestWakeHelper() } }
+
+    OperationsBlock(model, showHistory = false)
+    SectionHeading("Services")
+    if (model.knownServices.isEmpty()) {
+        QuietText(if (model.isAwake) "No services configured" else "Services unavailable")
+        PlainAction("Service setup", model.speaksV3 && !model.isWorking) {
+            if (model.serviceSetupUnavailable == null) model.serviceSetup.open() else agentDetails = true
+        }
+    }
+    model.knownServices.forEach { service -> CompactServiceRow(model, service) { servicePage = service } }
+
+    if (model.actions.isNotEmpty()) {
+        Spacer(Modifier.height(12.dp))
+        SectionHeading("Actions", showsRule = false)
+        Actions {
+            model.actions.forEach { action ->
+                PlainAction(action.displayName, !model.isWorking && model.currentSystem != null,
+                    destructive = action.confirm?.isNotBlank() == true, working = model.isBusyWith(MachineModel.Task.RUN, action.id)) { model.requestRun(action) }
+            }
+        }
+    }
+    if (!model.status?.metrics.isNullOrEmpty()) {
+        PlainAction("Telemetry", true) { sheet = "Telemetry" }
+    }
+    servicePage?.let { page -> DetailSheet(page.name, { servicePage = null }) { ServiceSection(model, page) } }
+    sheet?.let { title -> DetailSheet(title, { sheet = null }) {
+        when (title) {
+            "Authorize this device" -> AuthorisationScreen(app.publicKey, model.machine.systems, model.statusDetail) { model.refreshNow() }
+            "Activity" -> OperationsBlock(model)
+            "Diagnostics" -> DiagnosticsBlock(model)
+            "Telemetry" -> ConfiguredMetricsBlock(model.status?.metrics.orEmpty())
+            "Power options" -> {
+                model.bootChoices.forEach { target ->
+                    SettingsEntry("Boot into ${target.name}") { sheet = null; model.requestBoot(target) }
+                }
+                if (!model.isAwake && model.canWake) model.machine.systems.forEach { target ->
+                    SettingsEntry("Wake for ${target.name}") { sheet = null; model.wake(target) }
+                }
+                WakeExplanation(model, app)
+            }
+            else -> {
+                DetailRow("Hostname") { ValueText(model.status?.hostname, "not known") }
+                DetailRow("System") { ValueText(model.currentSystem?.name, "not known") }
+                DetailRow("Agent") { VersionText(model.abilities.agentVersion, "not known") }
+                DetailRow("Address") { ValueText(model.route?.label, "not known") }
+                model.lastChecked?.let { checked -> DetailRow("Checked") { QuietText(localTime(checked)) } }
+                DetailRow("Setup") { SetupRow(model, app) }
+                model.setupNote?.let { QuietText(it) }
+                model.status?.config?.problems.orEmpty().forEach { QuietText(listOfNotNull(it.path, it.message).joinToString(": ")) }
+                model.status?.notes.orEmpty().forEach { QuietText(it) }
+                WakeExplanation(model, app)
+                if (model.actions.isNotEmpty()) {
+                    SectionHeading("Action details")
+                    model.actions.forEach { action ->
+                        Text(action.displayName, style = MaterialTheme.typography.bodyMedium)
+                        QuietText(if (action.isIdempotent) "Sends a wake packet. Repeating the packet is safe." else "Runs a configured command.")
+                        if (action.busyGated == true) QuietText("Waits while work is running.")
+                        action.confirm?.let { QuietText(it) }
+                    }
                 }
             }
-        },
-        confirmButton = { androidx.compose.material3.TextButton(onClick = { showActionDetails = false }) { Text("Close") } },
-    )
-    if (showAgentDetails) AgentDetailsDialog(model, app) { showAgentDetails = false }
-    Spacer(Modifier.height(6.dp))
-    RunningNow(model)
-
-    Spacer(Modifier.height(14.dp))
-    DetailRow("Machine") { ValueText(model.status?.hostname, "not known") }
-    DetailRow("Control agent") { AgentRow(model) { showAgentDetails = true } }
-    DetailRow("Reached") { ValueText(model.route?.label, "no address has answered") }
-    DetailRow("Setup") { SetupRow(model, app) }
-    if (model.speaksV3) DetailRow("Services") {
-        Actions {
-            PlainAction("Service setup", enabled = !model.isWorking && model.serviceSetupUnavailable == null) { model.serviceSetup.open() }
-            if (model.serviceSetupUnavailable != null) PlainAction("Info", enabled = true) { showAgentDetails = true }
         }
-    }
+    } }
+    if (agentDetails) AgentDetailsDialog(model, app) { agentDetails = false }
     ServiceSetupDialog(model.serviceSetup)
-
-    model.setupNote?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
-
-    // A machine whose own configuration will not load refuses every change, so it is worth saying
-    // once at the top rather than once per failed button.
-    if (model.status?.configBroken == true) {
-        Spacer(Modifier.height(8.dp))
-        StatusLine(
-            Mark.Bad,
-            "This machine's agent cannot read its own configuration, so it will refuse every change.",
-        )
-        model.status?.config?.problems.orEmpty().take(3).forEach { problem ->
-            QuietText(
-                listOfNotNull(problem.path, problem.message).joinToString(": "),
-                Modifier.padding(top = 2.dp),
-            )
-        }
-    }
-
-    model.status?.notes.orEmpty().forEach { note ->
-        QuietText(note, Modifier.padding(top = 2.dp))
-    }
-
-    ConfiguredMetricsBlock(model.status?.metrics.orEmpty())
-    OperationsBlock(model)
     model.trustSettingsSnapshot?.let { snapshot ->
         HostIdentitySettingsDialog(model.trustSettingsAddress.orEmpty(), snapshot,
             model.machine.systems.map { com.x1f4r.legioncontrol.data.HostIdentitySystem(it.id, it.name) },
             model::closeHostIdentities, model::saveHostIdentities)
     }
-    model.operationDetails?.let { details ->
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = model::dismissOperationDetails,
-            title = { Text("Change details") },
-            text = { Text(details, Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState()), style = MaterialTheme.typography.bodySmall) },
-            confirmButton = { androidx.compose.material3.TextButton(onClick = model::dismissOperationDetails) { Text("Close") } },
-        )
-    }
+    model.operationDetails?.let { details -> DetailSheet("Change details", model::dismissOperationDetails) {
+        androidx.compose.foundation.text.selection.SelectionContainer { Text(details, style = MaterialTheme.typography.bodySmall) }
+    } }
+}
 
-    SectionHeading("Power")
-    Actions {
-        PlainAction(
-            label = "Refresh",
-            enabled = !model.isWorking,
-            working = model.isRefreshingVisibly,
-        ) { model.refreshNow() }
-
-        if (model.canWake) {
-            PlainAction(
-                label = "Wake",
-                enabled = !model.isWorking && !model.isAwake,
-                working = model.isBusyWith(MachineModel.Task.WAKE),
-            ) { model.wake() }
-            if (!model.isAwake) model.machine.systems.forEach { target ->
-                PlainAction("Wake for ${target.name}", enabled = !model.isWorking) { model.wake(target) }
-            }
-        }
-
-        PlainAction(
-            label = "Sleep",
-            enabled = !model.isWorking && model.currentSystem != null,
-            working = model.isBusyWith(MachineModel.Task.SLEEP),
-        ) { model.requestSleep() }
-
-        model.bootChoices.forEach { target ->
-            PlainAction(
-                label = "Boot into ${target.name}",
-                enabled = !model.isWorking && model.currentSystem != null,
-                destructive = true,
-                working = model.isBusyWith(MachineModel.Task.BOOT, target.id),
-            ) { model.requestBoot(target) }
-        }
-
-        model.hostKeyChanged?.let { changed ->
-            PlainAction("Manage local host identities", enabled = !model.isWorking) { model.manageHostIdentities(changed.address) }
-        }
-
-        if (model.hostKeyChanged?.canApprove == true) {
-            PlainAction(
-                label = "Check the host key",
-                enabled = !model.isWorking,
-                destructive = true,
-                emphasis = true,
-                working = model.isBusyWith(MachineModel.Task.TRUST_KEY),
-            ) { model.requestTrustHostKey() }
-        }
-    }
-
-    WakeExplanation(model, app)
-
-    // Whatever else the agent's own configuration decided to offer.
-    val actions = model.actions
-    if (actions.isNotEmpty()) {
-        SectionHeading("Actions", note = model.currentSystem?.let { "on ${it.name}" })
-        Actions {
-            actions.forEach { action ->
-                PlainAction(
-                    label = action.displayName,
-                    enabled = !model.isWorking && model.currentSystem != null,
-                    destructive = action.confirm?.isNotBlank() == true,
-                    working = model.isBusyWith(MachineModel.Task.RUN, action.id),
-                ) { model.requestRun(action) }
-            }
-        }
-        PlainAction("Action details", enabled = true) { showActionDetails = true }
-    }
-
-    DiagnosticsBlock(model)
+private fun compactMachineState(model: MachineModel): String = when (val state = model.link) {
+    is LinkState.Online -> listOfNotNull(state.system.name, compactActivityState(model.status?.busy)).joinToString(" · ")
+    is LinkState.AgentMissing -> "Agent not installed"
+    is LinkState.HostKeyChanged -> "Host key needs approval"
+    is LinkState.NeedsKeyAuthorisation -> "SSH key needs authorization"
+    is LinkState.Unsettled -> "Outcome unconfirmed"
+    is LinkState.Misconfigured -> "Setup needs attention"
+    is LinkState.Offline -> "Not reachable"
+    LinkState.Unknown -> "Checking…"
 }
 
 /**
@@ -254,7 +231,7 @@ private fun SetupRow(model: MachineModel, app: AppModel) {
  * one that is queued shows when it gives up and can be cancelled.
  */
 @Composable
-private fun OperationsBlock(model: MachineModel) {
+internal fun OperationsBlock(model: MachineModel, showHistory: Boolean = true) {
     val pending = model.pending
     val history = model.history.filter { it.isOver }.take(5)
     val server = (model.agentOperations + model.recentAgentOperations).distinctBy { it.id }
@@ -270,7 +247,7 @@ private fun OperationsBlock(model: MachineModel) {
         activeServer.forEach { summary -> OperationRow(model, summary) }
     }
 
-    if (history.isNotEmpty() || finishedServer.isNotEmpty()) {
+    if (showHistory && (history.isNotEmpty() || finishedServer.isNotEmpty())) {
         PlainAction(if (recentExpanded) "Recent changes ▾" else "Recent changes ▸", enabled = true) {
             recentExpanded = !recentExpanded
         }

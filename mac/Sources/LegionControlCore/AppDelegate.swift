@@ -109,8 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Menu
 
     private func makeWindow() {
         let window = NSWindow(
-            // Wide enough for the sidebar and a detail pane that does not wrap the button rows.
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 960, height: 640),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -122,7 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Menu
         window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
         window.isRestorable = AppPaths.homeOverride == nil
-        window.contentMinSize = NSSize(width: 700, height: 520)
+        window.contentMinSize = NSSize(width: 420, height: 420)
         window.contentView = NSHostingView(rootView: ContentView(model: model))
         window.delegate = self
         // setFrameAutosaveName restores the saved frame as soon as it is set, so centring

@@ -1,7 +1,6 @@
 import SwiftUI
 
-/// What the sidebar can be pointing at. One row per machine, one per service that machine reports,
-/// and one for the device the app runs on when the config asks for it.
+/// Stable navigation identifiers, including service links saved by earlier releases.
 enum SidebarItem: Hashable, Identifiable {
     case machine(String)
     case service(machine: String, service: String)
@@ -49,9 +48,6 @@ struct ContentView: View {
         var items: [SidebarItem] = []
         for machine in model.machines {
             items.append(.machine(machine.id))
-            for service in machine.services {
-                items.append(.service(machine: machine.id, service: service.id))
-            }
         }
         if model.mac != nil { items.append(.local) }
         items.append(.setup)
@@ -64,6 +60,9 @@ struct ContentView: View {
     private var section: SidebarItem? {
         let all = items
         if let stored = SidebarItem(id: storedSection), all.contains(stored) { return stored }
+        if case .service(let machine, _) = SidebarItem(id: storedSection), all.contains(.machine(machine)) {
+            return .machine(machine)
+        }
         return all.first
     }
 
@@ -90,6 +89,11 @@ struct ContentView: View {
             } else {
                 SetupView(model: model)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .legionNavigate)) { notification in
+            guard let id = notification.object as? String, SidebarItem(id: id) != nil else { return }
+            storedSection = id
+            AppPreferences.set(id, forKey: "selectedSection")
         }
         .alert(
             Text(model.dialog?.title ?? ""),
@@ -123,14 +127,50 @@ struct ContentView: View {
     }
 
     private var configured: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            Sidebar(model: model, items: items, selection: selection)
-                .navigationSplitViewColumnWidth(min: 176, ideal: 196, max: 260)
-        } detail: {
-            detail
+        GeometryReader { geometry in
+            Group {
+            if geometry.size.width < 700 {
+                VStack(spacing: 0) {
+                    HStack {
+                        Picker("Device", selection: selection) {
+                            ForEach(items) { item in
+                                Text(title(for: item)).tag(Optional(item))
+                            }
+                        }.labelsHidden().frame(maxWidth: 240)
+                        Spacer()
+                        refreshButton
+                    }.padding(.horizontal, 16).padding(.vertical, 8)
+                    Divider()
+                    detail
+                }
+            } else {
+                NavigationSplitView(columnVisibility: $columnVisibility) {
+                    Sidebar(model: model, items: items, selection: selection)
+                        .navigationSplitViewColumnWidth(min: 150, ideal: 180, max: 230)
+                } detail: { detail }
+                .toolbar { ToolbarItem(placement: .primaryAction) { refreshButton } }
+            }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if model.isWorking || model.statusIsError || !["Ready.", "Status refreshed."].contains(model.statusLine) {
+                    StatusBar(model: model)
+                }
+            }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            StatusBar(model: model)
+    }
+
+    private var refreshButton: some View {
+        Button { Task { await model.refreshEverything(userInitiated: true) } } label: {
+            Label("Refresh", systemImage: "arrow.clockwise")
+        }.disabled(model.isWorking).keyboardShortcut("r", modifiers: .command)
+    }
+
+    private func title(for item: SidebarItem) -> String {
+        switch item {
+        case .machine(let id): model.machine(id: id)?.name ?? id
+        case .local: model.mac?.name ?? "This device"
+        case .setup: "Setup"
+        case .service(_, let id): id
         }
     }
 
@@ -139,9 +179,7 @@ struct ContentView: View {
     private var detail: some View {
         ScrollView {
             sectionBody
-                .padding(.horizontal, 32)
-                .padding(.top, 30)
-                .padding(.bottom, 30)
+                .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .id(section?.id ?? "")
@@ -173,9 +211,7 @@ struct ContentView: View {
 
 // MARK: - Sidebar
 
-/// A row per machine and per service, each with a live second line. The second line is the whole
-/// point: it means the sidebar answers the easy questions on its own, and you only go into a
-/// section when you want the detail behind an answer you have already read.
+/// Device navigation; service controls live beside their device.
 private struct Sidebar: View {
     let model: AppModel
     let items: [SidebarItem]
@@ -228,15 +264,6 @@ private struct Sidebar: View {
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                Text(summary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    // The line changes under the pointer every fifteen seconds. A fade reads as an
-                    // update; a hard swap reads as a flicker.
-                    .contentTransition(.opacity)
-                    .animation(.easeOut(duration: 0.2), value: summary)
             }
             Spacer(minLength: 0)
         }
@@ -251,6 +278,7 @@ private struct Sidebar: View {
 /// any one section: read everything again.
 private struct StatusBar: View {
     let model: AppModel
+    @State private var showingDetails = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -260,36 +288,34 @@ private struct StatusBar: View {
                     ProgressView()
                         .controlSize(.small)
                         .padding(.horizontal, 2)
-                } else {
-                    Image(systemName: model.statusIsError ? "exclamationmark.triangle" : "info.circle")
-                        .foregroundStyle(model.statusIsError ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
                 }
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(model.statusLine)
+                        .lineLimit(1)
                         .textSelection(.enabled)
                         .contentTransition(.opacity)
                         .animation(.easeOut(duration: 0.15), value: model.statusLine)
-                    if let detail = model.statusDetail, !detail.isEmpty {
-                        Text(detail)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .lineLimit(4)
+                    if model.statusDetail?.isEmpty == false {
+                        Button("Details") { showingDetails = true }.buttonStyle(.link)
                     }
                 }
 
                 Spacer(minLength: 12)
 
-                Button("Refresh") {
-                    Task { await model.refreshEverything(userInitiated: true) }
-                }
-                .keyboardShortcut("r", modifiers: .command)
-                .disabled(model.isWorking)
+
             }
             .font(.callout)
             .padding(.horizontal, 20)
-            .padding(.vertical, 10)
+            .padding(.vertical, 7)
+        }
+        .sheet(isPresented: $showingDetails) {
+            ControlSheet(title: "Activity") {
+                Text(model.statusLine).textSelection(.enabled)
+                if let detail = model.statusDetail {
+                    Text(detail).font(.callout.monospaced()).textSelection(.enabled)
+                }
+            }
         }
         .background(.background)
     }

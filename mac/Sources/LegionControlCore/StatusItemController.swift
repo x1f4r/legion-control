@@ -51,6 +51,10 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         super.init()
 
         panel.openWindow = { [weak self] in self?.openWindow() }
+        panel.openSection = { [weak self] section in
+            self?.openWindow()
+            NotificationCenter.default.post(name: .legionNavigate, object: section)
+        }
         panel.quit = { NSApp.terminate(nil) }
 
         configurePopover()
@@ -68,6 +72,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         // click never reaches the action at all.
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.imagePosition = .imageOnly
+        button.setAccessibilityLabel("Legion Control quick actions")
     }
 
     /// Any click opens the panel. Option-click is the one shortcut kept for the window, for the
@@ -144,6 +149,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         // Read from launchd now rather than on every draw; System Settings can change it behind us.
         panel.rereadLogin()
         panel.isWindowVisible = host?.isWindowVisible == true
+        panel.maximumHeight = min(560, max(240, (bar.screen?.visibleFrame.height ?? 600) - 40))
         // Activate first, then show. A transient popover only notices clicks outside itself while
         // its app is active, and activating after the show closes it again on the spot.
         NSApp.activate()

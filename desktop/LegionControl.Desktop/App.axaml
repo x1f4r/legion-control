@@ -6,21 +6,21 @@
     <ResourceDictionary>
       <ResourceDictionary.ThemeDictionaries>
         <ResourceDictionary x:Key="Light">
-          <SolidColorBrush x:Key="PageBackground">#FBFAF8</SolidColorBrush>
-          <SolidColorBrush x:Key="PageInk">#1B1A18</SolidColorBrush>
-          <SolidColorBrush x:Key="PageSecondary">#6A665F</SolidColorBrush>
-          <SolidColorBrush x:Key="PageAccent">#2F5A87</SolidColorBrush>
-          <SolidColorBrush x:Key="PageSeparator">#E0DCD5</SolidColorBrush>
+          <SolidColorBrush x:Key="PageBackground">#FFFFFF</SolidColorBrush>
+          <SolidColorBrush x:Key="PageInk">#202124</SolidColorBrush>
+          <SolidColorBrush x:Key="PageSecondary">#61656B</SolidColorBrush>
+          <SolidColorBrush x:Key="PageAccent">#2166D1</SolidColorBrush>
+          <SolidColorBrush x:Key="PageSeparator">#E1E3E6</SolidColorBrush>
           <SolidColorBrush x:Key="StatusGood">#2E7D32</SolidColorBrush>
           <SolidColorBrush x:Key="StatusAttention">#91620A</SolidColorBrush>
           <SolidColorBrush x:Key="StatusBad">#B43B31</SolidColorBrush>
         </ResourceDictionary>
         <ResourceDictionary x:Key="Dark">
-          <SolidColorBrush x:Key="PageBackground">#131211</SolidColorBrush>
-          <SolidColorBrush x:Key="PageInk">#EDEAE4</SolidColorBrush>
-          <SolidColorBrush x:Key="PageSecondary">#9C968D</SolidColorBrush>
+          <SolidColorBrush x:Key="PageBackground">#1C1D1F</SolidColorBrush>
+          <SolidColorBrush x:Key="PageInk">#F0F1F2</SolidColorBrush>
+          <SolidColorBrush x:Key="PageSecondary">#AAADB2</SolidColorBrush>
           <SolidColorBrush x:Key="PageAccent">#9CC2EC</SolidColorBrush>
-          <SolidColorBrush x:Key="PageSeparator">#2F2D2A</SolidColorBrush>
+          <SolidColorBrush x:Key="PageSeparator">#383A3E</SolidColorBrush>
           <SolidColorBrush x:Key="StatusGood">#74BE8F</SolidColorBrush>
           <SolidColorBrush x:Key="StatusAttention">#D8A251</SolidColorBrush>
           <SolidColorBrush x:Key="StatusBad">#E58C82</SolidColorBrush>
@@ -33,7 +33,8 @@
     <Style Selector="Window">
       <Setter Property="Background" Value="{DynamicResource PageBackground}" />
       <Setter Property="Foreground" Value="{DynamicResource PageInk}" />
-      <Setter Property="FontSize" Value="14" />
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="FontFamily" Value="{DynamicResource NativeFontFamily}" />
     </Style>
     <Style Selector="Button.primary">
       <Setter Property="Foreground" Value="{DynamicResource PageAccent}" />

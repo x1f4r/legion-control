@@ -26,11 +26,6 @@ struct SetupEditorView: View {
         VStack(alignment: .leading, spacing: 0) {
             PageHeading(title: "Setup", note: model.config.config?.identity.name)
 
-            DisclosureGroup("Details") {
-                Text("Changes create a new shared revision. Previous versions remain available, and concurrent edits are reviewed before merging.")
-                    .font(.callout).foregroundStyle(.secondary)
-            }.padding(.bottom, 18)
-
             Picker("", selection: $selection) {
                 Text("Sites").tag(Selection.sites)
                 Text("This device").tag(Selection.bindings)
@@ -41,8 +36,8 @@ struct SetupEditorView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .fixedSize()
-            .padding(.bottom, 18)
+            .frame(maxWidth: 320, alignment: .leading)
+            .padding(.bottom, 16)
 
             switch selection {
             case .bindings:
@@ -563,15 +558,10 @@ struct LabelledField: View {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 18) {
-            Text(label)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .frame(width: 140, alignment: .leading)
+        DetailRow(label: label) {
             TextField(placeholder, text: $text)
                 .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 360)
-            Spacer(minLength: 0)
+                .frame(minWidth: 160, maxWidth: 360)
         }
     }
 }

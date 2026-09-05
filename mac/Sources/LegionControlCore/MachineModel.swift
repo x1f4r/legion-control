@@ -1050,8 +1050,8 @@ final class MachineModel: @MainActor Identifiable {
             id: "sleep-\(machine.id)",
             title: "Put \(machine.name) to sleep?",
             body: {
-                if let reason = busyReason {
-                    return "\(machine.name) is working right now (\(reason)). Sleeping interrupts it and loses the work in progress."
+                if let _ = busyReason {
+                    return "Activity is busy or unconfirmed. Sleeping now can interrupt work."
                 }
                 return canWake
                     ? "\(machine.name) suspends to memory now. Wake on LAN stays armed, so the Wake button brings it back."
@@ -1113,8 +1113,8 @@ final class MachineModel: @MainActor Identifiable {
             id: "boot-\(machine.id)-\(target.id)",
             title: "Boot into \(target.name)?",
             body: {
-                if let reason = busyReason {
-                    return "\(machine.name) is working right now (\(reason)). Rebooting into \(target.name) interrupts it and loses the work in progress."
+                if let _ = busyReason {
+                    return "Activity is busy or unconfirmed. Rebooting into \(target.name) now can lose work."
                 }
                 return "\(machine.name) will reboot now and come back up in \(target.name). This takes about a minute."
             }(),
@@ -1174,8 +1174,8 @@ final class MachineModel: @MainActor Identifiable {
             id: "restart-\(machine.id)-\(service.id)",
             title: "Restart \(name)?",
             body: {
-                if let reason = busyReason {
-                    return "\(name) stops and starts again. \(machine.name) looked busy at the last reading (\(reason)), so the restart is checked against the machine as it is now and held back if something is still running."
+                if let _ = busyReason {
+                    return "\(name) stops and starts again. The agent checks activity first and holds the restart if work is busy or unconfirmed."
                 }
                 return "\(name) stops and starts again. Anything in flight is dropped."
             }(),
@@ -1284,7 +1284,7 @@ final class MachineModel: @MainActor Identifiable {
         ask?(PendingDialog(
             id: "cycle-\(machine.id)",
             title: "Run the maintenance cycle on \(machine.name)?",
-            message: "This is the same cycle the schedule runs: every eligible service is offered an update in turn, and any that is busy or outside its window is left alone rather than interrupted.",
+            message: "Update eligible services. Busy services and those outside their schedule are skipped.",
             confirmTitle: "Run the cycle",
             perform: { [weak self] in self?.runCycle() }
         ))
@@ -1745,7 +1745,7 @@ final class MachineModel: @MainActor Identifiable {
             ask?(PendingDialog(
                 id: "force-\(machine.id)-\(subject)",
                 title: "\(verb) \(subject) anyway?",
-                message: "\(sentence)\n\nGoing ahead interrupts that work and what is in progress is lost.",
+                message: "Activity is busy or unconfirmed. Continuing skips the busy check and may lose work in progress.",
                 confirmTitle: "Do it anyway",
                 perform: forceAgain
             ))
@@ -1830,7 +1830,7 @@ final class MachineModel: @MainActor Identifiable {
             id: id,
             title: title,
             message: body + ((bindings?().isSelf(machine.id) == true && (id.hasPrefix("boot-") || id.hasPrefix("sleep-")))
-                ? "\n\nThis device is the controller; the outcome is read from the operation record after it comes back." : ""),
+                ? "\n\nThis controller reconnects after the device returns." : ""),
             confirmTitle: confirmTitle,
             perform: now,
             alternativeTitle: dialect.supportsQueue ? "When idle" : nil,

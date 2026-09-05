@@ -493,8 +493,8 @@ final class MacModel {
         offerDisruptive(
             id: "sleep-self-\(historyMachineId)",
             title: "Put this device to sleep?",
-            body: (reason.map { "This device is working right now (\($0)). Sleeping interrupts it and loses the work in progress.\n\n" } ?? "")
-                + "This device is the controller; the outcome is read from the operation record after it comes back.",
+            body: (reason.map { _ in "Activity is busy or unconfirmed. Sleeping now can interrupt work.\n\n" } ?? "")
+                + "This controller reconnects after the device returns.",
             confirmTitle: reason == nil ? "Sleep now" : "Sleep anyway",
             now: { [weak self] in self?.sleep(force: reason != nil, whenIdle: false) },
             whenIdle: { [weak self] in self?.sleep(force: false, whenIdle: true) }
@@ -535,8 +535,8 @@ final class MacModel {
         offerDisruptive(
             id: "boot-self-\(historyMachineId)-\(target.id)",
             title: "Boot this device into \(target.name)?",
-            body: (reason.map { "This device is working right now (\($0)). Rebooting interrupts it and loses the work in progress.\n\n" } ?? "")
-                + "This device is the controller; the outcome is read from the operation record after it comes back.",
+            body: (reason.map { _ in "Activity is busy or unconfirmed. Rebooting now can lose work.\n\n" } ?? "")
+                + "This controller reconnects after the device returns.",
             confirmTitle: reason == nil ? "Reboot now" : "Switch anyway",
             now: { [weak self] in self?.boot(into: target, force: reason != nil, whenIdle: false) },
             whenIdle: { [weak self] in self?.boot(into: target, force: false, whenIdle: true) }
@@ -590,8 +590,8 @@ final class MacModel {
             id: "local-update-\(service.id)",
             title: "Update \(name) on \(config.name)?",
             body: (staged.map { "Build \($0) is downloaded and waiting. " } ?? "")
-                + "\(name) quits and starts again to apply it, so anything open in it goes with it. "
-                + "If something is running, this Mac holds the update back instead and nothing is interrupted.",
+                + "\(name) quits and restarts to apply the update. Unsaved work may be lost. "
+                + "The agent holds the update if activity is busy or unconfirmed.",
             confirmTitle: "Quit and update",
             now: { [weak self] in self?.update(service, force: false, whenIdle: false) },
             whenIdle: { [weak self] in self?.update(service, force: false, whenIdle: true) }
@@ -649,7 +649,7 @@ final class MacModel {
         ask?(PendingDialog(
             id: "local-cycle",
             title: "Run the maintenance cycle on \(config.name)?",
-            message: "Every service this Mac looks after is offered an update in turn. Anything that is busy or outside its window is left alone rather than interrupted.",
+            message: "Update eligible services. Busy services and those outside their schedule are skipped.",
             confirmTitle: "Run the cycle",
             perform: { [weak self] in self?.runCycle() }
         ))
@@ -690,8 +690,8 @@ final class MacModel {
             id: "local-restart-\(service.id)",
             title: "Restart \(name) on \(config.name)?",
             body: {
-                if let reason = busyReason {
-                    return "\(name) stops and starts again. This Mac looked busy at the last reading (\(reason)), so the restart is checked against it as it is now and held back if something is still running."
+                if let _ = busyReason {
+                    return "\(name) stops and starts again. The agent checks activity first and holds the restart if work is busy or unconfirmed."
                 }
                 return "\(name) stops and starts again. Anything in flight is dropped."
             }(),
@@ -1096,7 +1096,7 @@ final class MacModel {
             ask?(PendingDialog(
                 id: "force-local-\(subject)",
                 title: "\(verb) \(subject) anyway?",
-                message: "\(sentence)\n\nGoing ahead interrupts that work and what is in progress is lost.",
+                message: "Activity is busy or unconfirmed. Continuing skips the busy check and may lose work in progress.",
                 confirmTitle: "Do it anyway",
                 perform: forceAgain
             ))

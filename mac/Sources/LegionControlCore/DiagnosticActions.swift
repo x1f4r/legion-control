@@ -39,7 +39,7 @@ struct DiagnosticActions: View {
                     Spacer()
                     Button("Close") { output = nil }
                 }
-            }.padding(24).frame(width: 760, height: 580)
+            }.padding(16).frame(minWidth: 360, idealWidth: 640, maxWidth: 760, minHeight: 300, idealHeight: 500, maxHeight: 580)
         }
     }
 
