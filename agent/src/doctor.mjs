@@ -272,14 +272,57 @@ function environmentChecks() {
   return checks;
 }
 
-/**
- * Whether the scheduler on this machine actually runs a cycle, and when it last
- * did. This is the check that catches the single most common silent failure: a
- * timer still pointing at the 2.x `update` command, which updates one service.
- */
+/** Recognize the installed unit's direct invocation, without interpreting a shell. */
+export function linuxSchedulerCommand(unit, { base = basePath(), node = process.execPath, home = os.homedir() } = {}) {
+  let section = null;
+  let legacyEnvironmentKnown = true;
+  const commands = [];
+  for (const raw of String(unit).split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue;
+    const heading = /^\[([^\]]+)\]$/.exec(line);
+    if (heading) { section = heading[1]; continue; }
+    if (section !== 'Service') continue;
+    // Direct Node uses its environment to find the agent home. The stable
+    // wrapper instead sets LEGIONCTL_HOME from its own installation path.
+    const environment = /^(Environment|EnvironmentFile|PassEnvironment|UnsetEnvironment)\s*=(.*)$/.exec(line);
+    if (environment && environment[2].trim()) {
+      if (environment[1] !== 'Environment' || /\\|\b(?:HOME|LEGIONCTL_HOME)\s*=/.test(environment[2])) legacyEnvironmentKnown = false;
+    }
+    const assignment = /^ExecStart\s*=(.*)$/.exec(line);
+    if (!assignment) continue;
+    const value = assignment[1].trim();
+    if (!value) commands.length = 0;
+    else commands.push(value);
+  }
+  const execLine = commands.map((command) => `ExecStart=${command}`).join('\n');
+  if (commands.length !== 1) return { ok: false, execLine };
+
+  // Installers quote paths and escape backslashes, quotes and literal percent
+  // signs. Refuse expansion, command prefixes and other unrecognized forms.
+  let rest = commands[0];
+  const argv = [];
+  while (rest) {
+    const word = /^(?:"((?:\\[\\"]|[^"\\])*)"|([^\s"'\\]+))(?:\s+|$)/.exec(rest);
+    if (!word) return { ok: false, execLine };
+    const value = (word[1] ?? word[2]).replace(/\\([\\"])/g, '$1');
+    if (/[$%]/.test(value.replaceAll('%%', ''))) return { ok: false, execLine };
+    argv.push(value.replaceAll('%%', '%'));
+    rest = rest.slice(word[0].length);
+  }
+  const stable = argv.length === 2 && argv[0] === path.posix.join(base, 'bin', 'legionctl') && argv[1] === 'cycle';
+  let sameNode = argv[0] === node;
+  if (!sameNode && path.posix.isAbsolute(argv[0] ?? '')) {
+    try { sameNode = fs.realpathSync(argv[0]) === fs.realpathSync(node); } catch { /* unrelated executable */ }
+  }
+  const legacy = legacyEnvironmentKnown && base === path.posix.join(home, '.legion-control') &&
+    argv.length === 3 && sameNode && argv[1] === path.posix.join(base, 'agent', 'src', 'index.mjs') && argv[2] === 'cycle';
+  return { ok: stable || legacy, execLine };
+}
+
+/** Check the scheduler's cycle command and when it last ran. */
 function schedulerChecks(config) {
   const checks = [];
-  const entry = path.join(basePath(), 'agent', 'src', 'index.mjs');
 
   if (process.platform === 'linux') {
     const listed = runCommand('systemctl', ['--user', 'is-enabled', 'legion-control-update.timer'], { timeoutMs: 10000 });
@@ -297,20 +340,17 @@ function schedulerChecks(config) {
     );
 
     const unit = runCommand('systemctl', ['--user', 'cat', 'legion-control-update.service'], { timeoutMs: 10000 });
-    const execLine = unit.stdout.split('\n').find((line) => line.startsWith('ExecStart=')) ?? '';
-    const runsCycle = /\bcycle\b/.test(execLine);
-    const runsThisAgent = execLine.includes(entry);
+    const scheduled = linuxSchedulerCommand(unit.stdout);
+    const execLine = scheduled.execLine;
     checks.push(
-      runsCycle && runsThisAgent
+      unit.ok && scheduled.ok
         ? check('scheduler.command', 'ok', 'the timer runs this agent\'s cycle', execLine.trim(), null)
         : check(
             'scheduler.command',
             'warn',
-            runsCycle ? 'the timer runs a different agent' : 'the timer still runs the 2.x "update" command',
+            'the timer does not run this agent\'s cycle',
             execLine.trim() || 'ExecStart could not be read',
-            runsCycle
-              ? `point ExecStart at ${entry}`
-              : '"update" only touches the first service and never runs recovery or the queue; re-run agent/install/install-linux.sh to switch it to "cycle"',
+            `re-run agent/install/install-linux.sh to set ExecStart to "${path.join(basePath(), 'bin', 'legionctl')}" cycle`,
           ),
     );
   } else if (process.platform === 'win32') {

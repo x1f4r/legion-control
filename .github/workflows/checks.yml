@@ -59,3 +59,6 @@ jobs:
       - name: Publish Windows
         if: runner.os == 'Windows'
         run: dotnet publish desktop/LegionControl.Desktop -c Release -r win-x64 --self-contained true -o desktop/artifacts/win-x64
+      - name: Publish Linux ARM64
+        if: runner.os == 'Linux'
+        run: dotnet publish desktop/LegionControl.Desktop -c Release -r linux-arm64 --self-contained true -o desktop/artifacts/linux-arm64

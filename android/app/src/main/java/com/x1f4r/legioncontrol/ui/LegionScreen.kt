@@ -193,8 +193,6 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
             }
     }
 
-    LaunchedEffect(updates) { updates.start() }
-
     val currentPage = { pager.currentPage }
 
     ModalNavigationDrawer(
@@ -221,7 +219,21 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                     onMenu = { scope.launch { drawer.open() } },
                 )
             },
-            bottomBar = { StatusFooter(app) },
+            bottomBar = {
+                Column {
+                    val available = updates.check as? com.x1f4r.legioncontrol.net.AppUpdates.Check.Available
+                    if (available != null && pages.getOrNull(pager.currentPage) != Page.Device) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Legion Control ${available.release.version} available", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                            PlainAction("Review", enabled = true) {
+                                scope.launch { pager.animateScrollToPage(pages.indexOf(Page.Device)) }
+                            }
+                        }
+                    }
+                    StatusFooter(app)
+                }
+            },
         ) { insets ->
             Refreshable(
                 isRefreshing = app.footerMachine?.isRefreshingVisibly == true,

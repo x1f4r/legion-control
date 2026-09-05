@@ -19,9 +19,11 @@ public sealed class AppUpdates(HttpClient? http = null)
     public const string ManifestAsset = "Legion-Control-manifest.json";
     public const string SignatureAsset = "Legion-Control-manifest.json.sig";
     public const string LinuxAsset = "Legion-Control-linux-x64.tar.gz";
+    public const string LinuxArm64Asset = "Legion-Control-linux-arm64.tar.gz";
     public const string WindowsAsset = "Legion-Control-windows-x64.zip";
 
-    private readonly HttpClient _http = http ?? DefaultClient();
+    private static readonly HttpClient SharedClient = DefaultClient();
+    private readonly HttpClient _http = http ?? SharedClient;
 
     private static HttpClient DefaultClient()
     {
@@ -35,11 +37,20 @@ public sealed class AppUpdates(HttpClient? http = null)
 
     /// The asset this platform runs. Never the first archive in the release: picking by shape
     /// rather than by name is how a Linux build ends up on a Windows machine.
-    public static string AssetForThisPlatform() =>
-        RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? WindowsAsset : LinuxAsset;
+    public static string? AssetForPlatform(OSPlatform platform, Architecture architecture) =>
+        platform == OSPlatform.Linux && architecture == Architecture.Arm64 ? LinuxArm64Asset
+            : architecture != Architecture.X64 ? null : platform == OSPlatform.Windows ? WindowsAsset
+                : platform == OSPlatform.Linux ? LinuxAsset : null;
+
+    public static string? AssetForThisPlatform() => AssetForPlatform(
+        OperatingSystem.IsWindows() ? OSPlatform.Windows : OperatingSystem.IsLinux() ? OSPlatform.Linux : OSPlatform.OSX,
+        RuntimeInformation.ProcessArchitecture);
 
     public async Task<UpdateAvailability> CheckAsync(string repo, string currentVersion, CancellationToken cancellationToken = default)
     {
+        var wanted = AssetForThisPlatform();
+        if (wanted is null)
+            return new UpdateAvailability.Unavailable("There is no desktop app update for this operating system and architecture.");
         if (!Trust.HasKey)
         {
             return new UpdateAvailability.Unavailable(
@@ -85,7 +96,6 @@ public sealed class AppUpdates(HttpClient? http = null)
         var verdict = TrustVerdict.Check(manifestBytes, signature);
         if (verdict is not TrustVerdict.Trusted trusted) return new UpdateAvailability.Unavailable(verdict.Sentence_);
 
-        var wanted = AssetForThisPlatform();
         var artifact = trusted.Manifest.Artifact(wanted);
         if (artifact is null || !assets.TryGetValue(wanted, out var assetUrl))
         {

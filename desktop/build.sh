@@ -49,13 +49,13 @@ case "${1:-all}" in
     targets=""
     ;;
   linux)
-    targets="linux-x64"
+    targets="linux-x64 linux-arm64"
     ;;
   windows)
     targets="win-x64"
     ;;
   all)
-    targets="linux-x64 win-x64"
+    targets="linux-x64 linux-arm64 win-x64"
     ;;
   *)
     echo "usage: build.sh [all|linux|windows|test]" >&2
@@ -87,8 +87,8 @@ for runtime in $targets; do
   chmod -R u=rwX,go=rX "$staging"
 
   case "$runtime" in
-    linux-x64)
-      archive="$out/Legion-Control-linux-x64.tar.gz"
+    linux-x64|linux-arm64)
+      archive="$out/Legion-Control-$runtime.tar.gz"
       rm -f "$archive"
       # GNU tar and the BSD tar shipped by macOS spell ownership and recursion controls
       # differently. Explicitly list sorted entries, suppress Apple metadata, and let gzip omit

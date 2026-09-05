@@ -163,25 +163,11 @@ struct MenuBarPanel: View {
     /// One line, and only when there is a newer build. An app that says "up to date" every time you
     /// open the panel is telling you something you never asked, in the place where the panel is
     /// meant to be at its quietest.
-    @ViewBuilder
     private var appUpdate: some View {
-        if let version = model.appUpdates.availableVersion {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("Legion Control \(version) is available")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                Button(model.appUpdates.phase == .idle ? "Install" : model.appUpdates.summary) {
-                    model.appUpdates.install()
-                }
-                .buttonStyle(.accessoryBar)
-                .font(.callout)
-                .disabled(model.appUpdates.phase.isWorking)
-            }
+        AppUpdateNotice(updates: model.appUpdates)
             .padding(.bottom, 2)
-        }
     }
+
 }
 
 // MARK: - One machine

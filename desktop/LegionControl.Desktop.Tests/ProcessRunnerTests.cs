@@ -30,13 +30,20 @@ public class ProcessRunnerTests
         Assert.True(result.TimedOut);
     }
 
-    [Fact]
-    public async Task AnEmptyInputClosesStdinBeforeWaitingForTheChild()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnEmptyInputClosesStdinBeforeWaitingForTheChild(bool explicitEmptyInput)
     {
-        var script = "process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('EOF received');process.exit(0);});";
-        var result = await new ProcessRunner().RunAsync("node", new[] { "-e", script }, TimeSpan.FromSeconds(8));
-        Assert.True(result.Succeeded, result.FailureText);
-        Assert.Equal("EOF received", result.StandardOutput);
+        // A blocking descriptor read tests the parent's EOF directly, without a child stream's
+        // end-event scheduling or process.exit racing an asynchronous stdout write on Windows.
+        var script = "const fs=require('node:fs');fs.writeSync(2,'reading stdin '+process.version+'\\n');" +
+                     "const input=fs.readFileSync(0);fs.writeSync(1,'EOF received:'+input.length);";
+        var result = await new ProcessRunner().RunAsync("node", new[] { "-e", script }, TimeSpan.FromSeconds(8),
+            explicitEmptyInput ? Array.Empty<byte>() : null);
+        Assert.True(result.Succeeded, $"{result.FailureText}\nstdout: {result.StandardOutput}\nstderr: {result.StandardError}");
+        Assert.Equal("EOF received:0", result.StandardOutput);
+        Assert.Contains("reading stdin v", result.StandardError);
     }
 
     [Fact]

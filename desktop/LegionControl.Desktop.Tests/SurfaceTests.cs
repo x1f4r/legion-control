@@ -246,8 +246,12 @@ public class AppUpdateTests
     [Fact]
     public void ThePlatformAssetIsChosenByNameAndNotByShape()
     {
-        var asset = AppUpdates.AssetForThisPlatform();
-        Assert.True(asset is AppUpdates.LinuxAsset or AppUpdates.WindowsAsset);
+        Assert.Equal(AppUpdates.LinuxAsset, AppUpdates.AssetForPlatform(System.Runtime.InteropServices.OSPlatform.Linux, System.Runtime.InteropServices.Architecture.X64));
+        Assert.Equal(AppUpdates.WindowsAsset, AppUpdates.AssetForPlatform(System.Runtime.InteropServices.OSPlatform.Windows, System.Runtime.InteropServices.Architecture.X64));
+        Assert.Null(AppUpdates.AssetForPlatform(System.Runtime.InteropServices.OSPlatform.OSX, System.Runtime.InteropServices.Architecture.X64));
+        Assert.Equal("Legion-Control-linux-arm64.tar.gz", AppUpdates.AssetForPlatform(System.Runtime.InteropServices.OSPlatform.Linux, System.Runtime.InteropServices.Architecture.Arm64));
+        Assert.Null(AppUpdates.AssetForPlatform(System.Runtime.InteropServices.OSPlatform.Linux, System.Runtime.InteropServices.Architecture.Arm));
+        Assert.Null(AppUpdates.AssetForPlatform(System.Runtime.InteropServices.OSPlatform.Windows, System.Runtime.InteropServices.Architecture.Arm64));
         Assert.Equal("Legion-Control-linux-x64.tar.gz", AppUpdates.LinuxAsset);
         Assert.Equal("Legion-Control-windows-x64.zip", AppUpdates.WindowsAsset);
     }
@@ -382,7 +386,7 @@ public class CliTests
         var output = new StringWriter();
         var code = await Runner.RunAsync(new[] { "--smoke" }, output);
         var text = output.ToString();
-        Assert.Contains("Legion Control 1.3.0", text);
+        Assert.Contains($"Legion Control {typeof(AgentContract).Assembly.GetName().Version!.ToString(3)}", text);
         Assert.Contains("no machines", text);
         Assert.Contains("Trust key", text);
         Assert.Equal(Runner.Failed, code);

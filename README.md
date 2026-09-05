@@ -31,10 +31,11 @@ Four clients, one agent, one contract, and the only thing between them is ssh:
 
 There is no daemon, no open port, no credential store and no polling service. Every action is one
 `ssh <host> <interpreter> <path to index.mjs> <command>` round trip that prints one JSON object and
-exits; every action against the device the app runs on is the same thing without the ssh. If the
-window and the panel are closed, nothing runs. If ssh works, Legion Control works.
+exits; every action against the device the app runs on is the same thing without the ssh. Machine
+polling stops when its interface closes. App release checks have a separate schedule, described
+below. If ssh works, Legion Control works.
 
-The one background thing is a scheduled maintenance cycle on each machine — a systemd timer, a Task
+Each machine also has a scheduled maintenance cycle — a systemd timer, a Task
 Scheduler task, a launchd job — that runs every fifteen minutes whether the apps are open or not.
 The agent decides everything about it: whether the schedule is allowed to act, whether there is
 anything to install, and above all whether the machine is busy and must be left alone.
@@ -162,9 +163,9 @@ Three things about how it behaves:
 **Closing the window puts it away, it does not quit.** The menu bar icon is the app. The only way
 out is Quit in the panel or Command-Q.
 
-**With nothing open it costs nothing.** The poll belongs to whatever is looking, the window or the
-panel, and stops when the last of them closes. There is no timer anywhere else until something is
-opened again or an operation finishes.
+**Machine polling stops when nothing is open.** The poll belongs to whatever is looking, the window
+or the panel, and stops when the last of them closes. App release checks continue periodically while
+the menu bar app is running.
 
 **The icon is the state.** A symbol per platform for the running system, a sleeping moon when a
 machine is unreachable, a warning triangle when it is awake but the agent is missing, a turning
@@ -183,9 +184,10 @@ the fallback. `android/README.md` covers building and installing it.
 
 ### Linux and Windows desktop (`desktop/`)
 
-Avalonia 11 on .NET 10, one project, a native window and a tray icon. Both targets are
-cross-published from a Mac as self-contained single files, so no Windows toolchain is needed to
-build the Windows binary.
+Avalonia 11 on .NET 10, one project, a native window and a tray icon. Linux x64, Linux ARM64 and
+Windows x64 are cross-published as self-contained directories, so no .NET installation is needed
+on the target and no Windows toolchain is needed to build the Windows binary. Keep all extracted
+files together.
 
 It shells out to the system `ssh` exactly as the Mac client does, which means it reuses your ssh
 config, aliases and keys; Windows 10 and later ship `ssh.exe`, and Linux has openssh-client. Direct
@@ -196,8 +198,32 @@ It can edit and publish the shared setup, or follow one published elsewhere, exa
 clients do. No device has a privileged position.
 
 It also has a headless smoke mode that drives the same client models and the same transport as the
-window, which is what lets the published binaries be tested over ssh on a real Linux or Windows
-host without a display.
+window, which is what lets the published binaries be used over ssh on a real Linux or Windows
+host without a display. The Linux ARM64 archive also runs the headless controller on a Raspberry Pi
+with a 64-bit operating system. See [desktop usage](desktop/README.md).
+
+### App update suggestions
+
+The apps check for their own releases at startup and on return to the foreground, normally no more
+than once every fifteen minutes. An available update stays visible without opening a dialog on its
+own. Periodic checks depend on the platform:
+
+| Client | Periodic checks | After a failed check |
+| --- | --- | --- |
+| Mac | every six hours while the app runs, including with its window and panel closed | retry after ten minutes |
+| Android | every six hours while visible; resume checks on foreground return | retry after fifteen minutes while visible |
+| Linux / Windows | every six hours while the window is active; check on activation | next eligible activation or periodic check |
+
+The desktop's local `checkForAppUpdates` preference defaults to `true`. Manual checks bypass the
+foreground throttle. A failed check keeps a previously discovered update visible; changing the release
+repository clears that offer and invalidates an open installation review.
+
+Installation always starts with an explicit action. On Mac, **Install** downloads, verifies, replaces
+and restarts the app. On Android, **Review** leads to separate **Download** and **Install** actions,
+then Android's package installer. On Linux and Windows, **Review update** offers **Download and
+verify**, followed by **Install and restart**. Every client verifies the signed manifest and its own
+platform's artifact before installation. These app suggestions are separate from the agent's
+scheduled service updates.
 
 ## Installing
 
@@ -265,15 +291,27 @@ pulls the setup from any one of them.
 
 ### The Linux or Windows desktop
 
-From a Mac or from the machine itself:
+Download the matching archive from [the latest release](https://github.com/x1f4r/legion-control/releases/latest):
+
+| System | Archive |
+| --- | --- |
+| Linux x64 | `Legion-Control-linux-x64.tar.gz` |
+| Linux ARM64, including Raspberry Pi with a 64-bit OS | `Legion-Control-linux-arm64.tar.gz` |
+| Windows x64 | `Legion-Control-windows-x64.zip` |
+
+Extract the complete archive into an installation directory and run `legion-control` on Linux or
+`legion-control.exe` on Windows. To build from a Mac or from the machine itself:
 
     dotnet publish desktop/LegionControl.Desktop -c Release -r linux-x64 --self-contained true -o dist/linux-x64
+    dotnet publish desktop/LegionControl.Desktop -c Release -r linux-arm64 --self-contained true -o dist/linux-arm64
     dotnet publish desktop/LegionControl.Desktop -c Release -r win-x64  --self-contained true -o dist/win-x64
 
-Copy the resulting `legion-control` binary wherever you keep such things and run it. Its config is
+Copy the whole publish directory, including the executable and its adjacent libraries. Its config is
 `~/.config/legion-control/config.json` on Linux and `%APPDATA%\legion-control\config.json` on
 Windows, with `bindings.json` beside it; on first run it offers the same fetch-from-a-machine
-bootstrap as the phone.
+bootstrap as the phone. Linux honors `XDG_CONFIG_HOME` when set. Without a display, use
+`./legion-control --smoke` or `./legion-control --command status --machine pi`; these commands run
+without initializing the graphical interface.
 
 ### Restricting what a key can do
 
@@ -383,13 +421,14 @@ were actually run.
 One command, because a release is one thing: every client at one version, one tag, one set of
 notes, one signed manifest. It refuses to start on a dirty tree, off the main branch, or on a
 version that already has a tag, and it refuses to publish unless the checks pass. Then it bumps
-every version in step, builds the four client artifacts and the agent tarball, asks each finished
+every version in step, builds the five client artifacts and the agent tarball, asks each finished
 artifact what version it thinks it is, and signs the manifest over all of them. A tag pointing at a
 build that says something else is the one mistake here that cannot be taken back, so the bump is
 put back if any of it fails.
 
 The assets are `Legion-Control-macos-arm64.zip`, `Legion-Control-android-arm64.apk`,
-`Legion-Control-linux-x64.tar.gz`, `Legion-Control-windows-x64.zip`, the agent tarball, and the
+`Legion-Control-linux-x64.tar.gz`, `Legion-Control-linux-arm64.tar.gz`,
+`Legion-Control-windows-x64.zip`, the agent tarball, and the
 signed manifest. Each client selects its own asset by exact name. `dist/` holds them on the way out
 and is gitignored.
 

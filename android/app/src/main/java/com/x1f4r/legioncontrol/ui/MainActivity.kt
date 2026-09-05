@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.ui
 
 import android.os.Bundle
+import kotlinx.coroutines.flow.map
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -46,6 +47,9 @@ class MainActivity : ComponentActivity() {
             services.config.value?.appUpdates?.githubRepo?.takeIf { it.isNotBlank() }
                 ?: DEFAULT_GITHUB_REPO
         }
+        updates.observeRepositories(services.config.map { config ->
+            config?.appUpdates?.githubRepo?.takeIf { it.isNotBlank() } ?: DEFAULT_GITHUB_REPO
+        })
         setContent {
             LegionTheme {
                 LegionApp(model, updates)
@@ -56,11 +60,13 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         model.startPolling()
+        updates.start()
     }
 
     override fun onPause() {
         super.onPause()
         model.stopPolling()
+        updates.stop()
     }
 
     override fun onDestroy() {

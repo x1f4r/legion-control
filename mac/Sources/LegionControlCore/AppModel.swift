@@ -30,7 +30,7 @@ final class AppModel {
     let bindings: BindingsStore
 
     /// Legion Control's own updates.
-    let appUpdates = AppUpdateModel()
+    let appUpdates: AppUpdateModel
 
     /// Everything anyone has asked for, kept across launches.
     let operations: OperationStore
@@ -43,11 +43,14 @@ final class AppModel {
     init(
         config: ConfigStore = ConfigStore(),
         bindings: BindingsStore = BindingsStore(),
-        operations: OperationStore = OperationStore()
+        operations: OperationStore = OperationStore(),
+        appUpdates: AppUpdateModel = AppUpdateModel()
     ) {
         self.config = config
         self.bindings = bindings
         self.operations = operations
+        self.appUpdates = appUpdates
+        appUpdates.onStateChange = { [weak self] in self?.onStateChange?() }
         config.onChange = { [weak self] in
             guard let self else { return }
             _ = self.config.reconcileExternalEdit(deviceName: self.bindings.bindings.effectiveDeviceName)
@@ -93,6 +96,7 @@ final class AppModel {
     /// reading and anything in flight, and the config file is written by hand while the app is open.
     /// An edit to one machine must not reset the others.
     private func rebuild() {
+        appUpdates.repositoryDidChange()
         let binding = bindings.bindings
         let selfMachineId = binding.canControlSelfLocally ? binding.selfBinding?.machine : nil
 
@@ -375,6 +379,7 @@ final class AppModel {
     /// The symbol the menu bar draws.
     var menuBarSymbol: String {
         if !operations.unresolved.isEmpty { return "questionmark.circle" }
+        if appUpdates.availableVersion != nil { return "arrow.down.circle" }
         guard let first = machines.first else { return mac == nil ? "circle.dotted" : "laptopcomputer" }
         if machines.count == 1 { return first.symbolName }
         if machines.contains(where: { $0.rebootInProgress != nil && !$0.isAwake }) {
@@ -386,6 +391,11 @@ final class AppModel {
     }
 
     var menuBarDescription: String {
+        if let version = appUpdates.availableVersion { return "Version \(version) is available. \(fleetMenuBarDescription)" }
+        return fleetMenuBarDescription
+    }
+
+    private var fleetMenuBarDescription: String {
         guard let first = machines.first else { return mac == nil ? "No machines configured" : "This device only" }
         if machines.count == 1 { return first.stateDescription }
         let awake = machines.filter(\.isAwake).count
@@ -428,7 +438,7 @@ final class AppModel {
     //
     // Only a viewer polls, and there are two of them: the window and the panel under the menu bar
     // icon. Every reading costs a process, so when neither is on screen there is no timer, no task
-    // and no work of any kind.
+    // and no fleet polling. Release checks use their own infrequent HTTPS cadence.
 
     var isPolling: Bool { pollTask != nil }
 
@@ -452,12 +462,12 @@ final class AppModel {
     func viewerAppeared() {
         config.reloadIfChanged()
         refreshPlacement()
-        // One HTTPS request every six hours at the most, and only ever while something is looking.
+        // Foreground entry rechecks stale release metadata independently of fleet polling.
         appUpdates.checkIfStale()
         startPolling()
     }
 
-    /// The last viewer went away. Everything stops here.
+    /// The last viewer went away. Fleet polling stops here.
     func viewerDisappeared() {
         stopPolling()
     }

@@ -27,6 +27,7 @@ DIST="$ROOT/dist"
 DESKTOP_REL="desktop/LegionControl.Desktop/LegionControl.Desktop.csproj"
 DESKTOP_PROJECT="$ROOT/$DESKTOP_REL"
 LINUX_ARCHIVE="$DIST/Legion-Control-linux-x64.tar.gz"
+LINUX_ARM_ARCHIVE="$DIST/Legion-Control-linux-arm64.tar.gz"
 WINDOWS_ARCHIVE="$DIST/Legion-Control-windows-x64.zip"
 MAC_ZIP="$DIST/Legion-Control-macos-arm64.zip"
 ANDROID_APK="$DIST/Legion-Control-android-arm64.apk"
@@ -236,6 +237,7 @@ say "Wrote $(basename "$ANDROID_APK") ($(du -h "$ANDROID_APK" | cut -f1))"
 step "Building Linux and Windows desktop apps"
 "$ROOT/desktop/build.sh"
 [ -f "$LINUX_ARCHIVE" ] || die "desktop/build.sh left no Linux archive."
+[ -f "$LINUX_ARM_ARCHIVE" ] || die "desktop/build.sh left no Linux ARM64 archive."
 [ -f "$WINDOWS_ARCHIVE" ] || die "desktop/build.sh left no Windows archive."
 
 # ---------------------------------------------------------------------------
@@ -314,8 +316,9 @@ step "Publishing the release"
 URL="$(gh release create "v$VERSION" \
 	--title "Legion Control $VERSION" \
 	--notes-file "$NOTES" \
-	"$MAC_ZIP" "$ANDROID_APK" "$LINUX_ARCHIVE" "$WINDOWS_ARCHIVE" "$AGENT_ARCHIVE" \
-	"$DIST/Legion-Control-manifest.json" "$DIST/Legion-Control-manifest.json.sig")"
+	"$MAC_ZIP" "$ANDROID_APK" "$LINUX_ARCHIVE" "$LINUX_ARM_ARCHIVE" "$WINDOWS_ARCHIVE" "$AGENT_ARCHIVE" \
+	"$DIST/Legion-Control-manifest.json" "$DIST/Legion-Control-manifest.json.sig" \
+	"$DIST/Legion-Control-agent-manifest.json" "$DIST/Legion-Control-agent-manifest.json.sig")"
 
 say ""
 say "Legion Control $VERSION is out."

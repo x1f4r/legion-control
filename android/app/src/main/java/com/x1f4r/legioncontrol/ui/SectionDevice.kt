@@ -77,18 +77,19 @@ private fun AppUpdateBlock(updates: AppUpdateModel) {
 
     val downloaded = updates.downloaded
     Actions {
+        PlainAction("Check for updates", enabled = !updates.checking && !updates.downloading, working = updates.checking) { updates.recheck() }
         if (downloaded != null) {
             PlainAction(
-                label = "Install ${available?.release?.version ?: "the download"}",
+                label = "Install ${updates.downloadedVersion ?: "the download"}",
                 enabled = true,
                 emphasis = true,
-            ) { startInstall(context, downloaded, updates::reportInstallProblem) }
+            ) { updates.install { file -> startInstall(context, file, updates::reportInstallProblem) } }
 
             PlainAction(label = "Discard", enabled = true) { updates.discardDownload() }
         } else {
             PlainAction(
                 label = if (available != null) "Download ${available.release.version}" else "Update the app",
-                enabled = available != null,
+                enabled = available != null && !updates.checking && !updates.downloading,
                 emphasis = available != null,
                 working = updates.downloading,
             ) { updates.download() }

@@ -77,7 +77,9 @@ public static class AgentContract
     /// The agent version this build carries a bundle of, when it carries one.
     public const string BundledAgentVersion = "3.0.0";
 
-    public const string ClientVersion = "1.3.0";
+    public static string ClientVersion { get; } =
+        (typeof(AgentContract).Assembly.GetName().Version
+            ?? throw new InvalidOperationException("The desktop assembly has no version.")).ToString(3);
 
     /// What this client calls itself on the wire. Fixed by the contract; never a platform name.
     public const string ClientKind = "desktop";
