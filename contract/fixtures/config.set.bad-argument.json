@@ -1,0 +1,29 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "bad-argument",
+  "message": "--revision 13 does not match controller.revision 12 in the document on stdin; nothing was written",
+  "hash": null,
+  "bytes": 0,
+  "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+  "revision": 13,
+  "divergent": false,
+  "current": {
+    "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+    "revision": 12,
+    "updatedAt": "2026-09-02T16:00:00.000Z",
+    "source": "mac",
+    "lineage": [
+      "1c680fab2ecc79f4b1c2a06e4e3ed2f8a1d54c6f0b93e7a25c8d0f416b2e93a7",
+      "1a5ee25ee34b2f9c07d61a8b45e0c3f27d9b8140a6532e7fc019d84b6a3e5027"
+    ],
+    "device": "Robert's MacBook Pro",
+    "hash": "668a9a05d7eabf59835baea274c89cd5a1275e1e4978929faeffe68dcc487c1c",
+    "bytes": 5120
+  }
+}

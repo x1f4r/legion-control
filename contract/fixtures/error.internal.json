@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "internal",
+  "message": "the agent failed while writing the operation record: ENOSPC: no space left on device, write",
+  "command": "update",
+  "argument": null,
+  "error": "ENOSPC: no space left on device, write"
+}

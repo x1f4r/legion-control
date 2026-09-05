@@ -40,7 +40,7 @@ class ControllerSetupTest {
     @Test
     fun `a machine carrying a document hands over its text and its hash`() {
         val fetched = readControllerReply(document) as ControllerFetch.Document
-        assertEquals("9f2c1b0a", fetched.hash)
+        assertEquals("9f2c1b0a", fetched.provenance.hash)
 
         // Written back out to be read and edited, so it is not the one line it arrived as.
         assertTrue(fetched.text.lines().size > 1)
@@ -91,37 +91,71 @@ class ControllerSetupTest {
     }
 
     @Test
-    fun `the command shapes are the standard installs, in order`() {
+    fun `the command shapes are the standard installs, written for their own shells`() {
+        val commands = setupCommands("me")
+
+        // The layouts the installers write, and nothing else. This list exists for the one machine
+        // that is not in any configuration yet, because it is the machine the configuration is
+        // about to come from; everything else is dialled with the argv the document names.
         assertEquals(
             listOf(
                 "/usr/bin/node /home/me/.legion-control/agent/src/index.mjs config",
-                "node C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs config",
                 "node ~/.legion-control/agent/src/index.mjs config",
                 "/opt/homebrew/bin/node ~/.legion-control/agent/src/index.mjs config",
+                "node C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs config",
             ),
-            setupCommands("me"),
+            // Distinct lines: nothing here needs quoting, so the cmd.exe and PowerShell forms are
+            // the same string, and the fetch runs it once rather than twice.
+            commands.mapNotNull { it.line() }.distinct(),
         )
     }
 
+    @Test
+    fun `a user name that needs quoting is written correctly, or the shape is skipped`() {
+        // Unusual and not impossible, and the one value in these commands that comes from outside.
+        val commands = setupCommands("first last")
+
+        // The one POSIX shape that carries the user name quotes it rather than producing two
+        // arguments. The other two use ~, which does not contain the name at all.
+        val posix = commands.filter { it.shell == RemoteShell.POSIX }.mapNotNull { it.line() }
+        assertTrue(
+            posix.any { it.contains("'/home/first last/.legion-control/agent/src/index.mjs'") },
+        )
+
+        // A tilde is never quoted, because a quoted tilde is a directory literally called "~".
+        assertTrue(posix.any { it.contains(" ~/.legion-control/agent/src/index.mjs ") })
+
+        // The Windows shapes carry it in the two forms those shells actually read.
+        val cmd = commands.first { it.shell == RemoteShell.CMD }.line()
+        assertTrue(cmd!!.contains("\"C:\\Users\\first last\\.legion-control\\agent\\src\\index.mjs\""))
+        val powershell = commands.first { it.shell == RemoteShell.POWERSHELL }.line()
+        assertTrue(powershell!!.startsWith("& 'node' '"))
+        assertTrue(powershell.contains("C:\\Users\\first last\\"))
+
+        // Nothing that would run a second command can be produced from it.
+        assertTrue(commands.mapNotNull { it.line() }.none { it.contains(";") })
+    }
+
     /**
-     * The rule that keeps the phone in step with the Mac without asking a machine the same question
-     * every fifteen seconds.
+     * The rule that keeps a machine from being interrogated about the same copy on every poll.
      */
     @Test
-    fun `a hash is followed once, and only when it is news`() {
-        // An agent that says nothing about a setup has nothing to fetch.
-        assertFalse(shouldFetchSetup(reported = null, applied = "a", lastSeen = null))
-        assertFalse(shouldFetchSetup(reported = "", applied = null, lastSeen = null))
+    fun `a machine is asked about its ancestry once per distinct copy`() {
+        // An agent that says nothing about a setup has nothing to ask about.
+        assertFalse(shouldAskForMeta(reportedHash = null, applied = "a", asked = emptySet()))
+        assertFalse(shouldAskForMeta(reportedHash = "", applied = null, asked = emptySet()))
 
-        // The phone is already running the document this machine is carrying.
-        assertFalse(shouldFetchSetup(reported = "a", applied = "a", lastSeen = null))
+        // This device already has the copy that machine is carrying.
+        assertFalse(shouldAskForMeta(reportedHash = "a", applied = "a", asked = emptySet()))
 
-        // It is carrying something else, and nothing has been fetched from it yet.
-        assertTrue(shouldFetchSetup(reported = "b", applied = "a", lastSeen = null))
-        assertTrue(shouldFetchSetup(reported = "b", applied = null, lastSeen = "a"))
+        // A different copy, and nothing has been asked about it yet.
+        assertTrue(shouldAskForMeta(reportedHash = "b", applied = "a", asked = emptySet()))
 
-        // The same document that was fetched a moment ago and did not hold up. Asking again would
-        // be refused the same way, once every poll, for as long as it stays wrong.
-        assertFalse(shouldFetchSetup(reported = "b", applied = "a", lastSeen = "b"))
+        // The same copy that was asked about a moment ago. A copy that is genuinely diverged gives
+        // the same answer every time, so asking again is a round trip for nothing.
+        assertFalse(shouldAskForMeta(reportedHash = "b", applied = "a", asked = setOf("b")))
+
+        // A copy that has moved on since is a new question.
+        assertTrue(shouldAskForMeta(reportedHash = "c", applied = "a", asked = setOf("b")))
     }
 }

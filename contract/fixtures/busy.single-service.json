@@ -1,0 +1,47 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "busy": true,
+  "unknown": false,
+  "monitored": true,
+  "reason": "1 turn running",
+  "evidence": "t3-sqlite",
+  "checkedAt": "2026-09-05T14:00:00.000Z",
+  "elapsedMs": 118,
+  "error": null,
+  "runningTurns": 1,
+  "pendingTurns": 0,
+  "pendingApprovals": 0,
+  "staleTurns": 1,
+  "staleApprovals": 0,
+  "threads": [
+    {
+      "threadId": "thr_01JT8Q4V2M",
+      "turnId": "trn_01JT8Q7C9X",
+      "title": "Rework the busy gate",
+      "state": "running",
+      "at": "2026-09-05T13:54:00.000Z",
+      "blocking": true,
+      "disposition": "running",
+      "stale": false
+    },
+    {
+      "threadId": "thr_01JQ2H9B4K",
+      "turnId": "trn_01JQ2H9B7P",
+      "title": "Import the old exports",
+      "state": "pending",
+      "at": "2026-09-02T14:00:00.000Z",
+      "blocking": false,
+      "disposition": "stale",
+      "stale": true
+    }
+  ],
+  "threadsTruncated": 0,
+  "monitoredServices": 1,
+  "unmonitoredServices": 0
+}

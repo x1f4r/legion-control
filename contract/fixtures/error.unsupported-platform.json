@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "freebsd",
+    "name": "FreeBSD"
+  },
+  "reasonCode": "unsupported-platform",
+  "message": "legionctl runs on linux, windows and mac only; this host reports \"freebsd\"",
+  "command": "status",
+  "argument": null,
+  "error": "legionctl runs on linux, windows and mac only; this host reports \"freebsd\""
+}

@@ -1,0 +1,17 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "unknown-target",
+  "message": "this machine has no boot target called \"macos\"; it can boot into windows",
+  "command": "boot",
+  "argument": "macos",
+  "accepts": [
+    "windows"
+  ],
+  "error": "unknown boot target: macos"
+}

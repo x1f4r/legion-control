@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mutation.schema.json",
+  "title": "Rules shared by every mutating reply",
+  "description": "Nothing validates against this file directly. update, restart, boot, sleep, run and cycle each pull these rules in, so the three things that must be true of every mutation are written once.",
+  "$defs": {
+    "opOrNull": {
+      "description": "The operation this reply belongs to. Null only when no record was ever written: a conflict that never got the lock, or a refusal that happened before the record was created.",
+      "anyOf": [{ "$ref": "common.schema.json#/$defs/opRecord" }, { "type": "null" }]
+    },
+    "conflictRule": {
+      "description": "A conflict names what is in the way. Without this a client can only say \"busy\", which is the thing the operation lock exists to stop.",
+      "if": { "properties": { "action": { "const": "conflict" } }, "required": ["action"] },
+      "then": {
+        "required": ["conflict", "reasonCode"],
+        "properties": {
+          "ok": { "const": true },
+          "reasonCode": { "enum": ["operation-in-progress", "lock-held"] }
+        }
+      }
+    },
+    "queueRule": {
+      "description": "A queued request has a record, that record is queued, and it has an expiry. A queue with no expiry is a queue that never empties.",
+      "if": { "properties": { "action": { "const": "queued" } }, "required": ["action"] },
+      "then": {
+        "properties": {
+          "ok": { "const": true },
+          "op": {
+            "type": "object",
+            "properties": { "state": { "const": "queued" }, "expiresAt": { "$ref": "common.schema.json#/$defs/iso" } },
+            "required": ["state", "expiresAt"]
+          }
+        },
+        "required": ["op"]
+      }
+    },
+    "acceptedRule": {
+      "description": "`accepted` is the immediate answer to --detach: the work is running, and the client polls `op ID --wait`. It is never a claim that the work finished.",
+      "if": { "properties": { "action": { "const": "accepted" } }, "required": ["action"] },
+      "then": {
+        "properties": {
+          "ok": { "const": true },
+          "detached": { "type": "boolean" },
+          "op": {
+            "type": "object",
+            "properties": { "state": { "const": "running" }, "result": { "type": "null" } },
+            "required": ["state"]
+          }
+        },
+        "required": ["op", "detached"]
+      }
+    }
+  }
+}

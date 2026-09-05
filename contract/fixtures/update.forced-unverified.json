@@ -1,0 +1,59 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "the update command for demo exited 0; there is no version to read back and no verify command, so nothing was checked",
+  "action": "updated",
+  "service": "demo",
+  "from": null,
+  "to": null,
+  "verified": false,
+  "op": {
+    "id": "7a4c1b58-3e90-4d27-8f61-2c9b5a03e746",
+    "kind": "update",
+    "service": "demo",
+    "target": null,
+    "actionId": null,
+    "mode": "force",
+    "initiator": {
+      "client": "desktop",
+      "device": "legion-cachy",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:45:00.000Z",
+    "startedAt": "2026-09-05T13:45:00.000Z",
+    "updatedAt": "2026-09-05T13:46:00.000Z",
+    "finishedAt": "2026-09-05T13:46:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": true,
+      "action": "updated",
+      "reasonCode": null,
+      "message": "the update command exited 0; nothing was verified",
+      "from": null,
+      "to": null,
+      "exitCode": 0,
+      "output": "pulled 3 objects\n",
+      "verified": false
+    },
+    "log": [
+      {
+        "at": "2026-09-05T13:45:00.000Z",
+        "line": "no latestVersion and no verify command configured; --force given"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux",
+    "from": null,
+    "to": null
+  }
+}

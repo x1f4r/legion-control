@@ -1,0 +1,24 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "signature-invalid",
+  "message": "The previous agent is retained, but it is not a complete tree signed by the release key; restore it manually after independent verification.",
+  "action": "failed",
+  "current": {
+    "version": "3.0.0",
+    "contract": 3
+  },
+  "staged": null,
+  "previous": {
+    "version": "2.1.0",
+    "path": "/home/x1f4r/.legion-control/agent.prev"
+  },
+  "manifest": null,
+  "selfTest": null,
+  "op": null
+}

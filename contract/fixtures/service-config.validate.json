@@ -1,0 +1,21 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "valid": true,
+  "hash": "597c136c5c4631ded389fc52e239a16d8f7048a190a6e472d1142ef1249cd2c1",
+  "proposedHash": "8fd3164dc4a38cbbf59b3bab5fed952f0e8f2bcf087a38ef573e0cea7b5805f3",
+  "changes": {
+    "added": [
+      "demo"
+    ],
+    "removed": [],
+    "changed": [],
+    "otherSettingsChanged": false
+  },
+  "warnings": []
+}

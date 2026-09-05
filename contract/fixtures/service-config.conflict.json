@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "stale-revision",
+  "message": "Agent configuration changed; reload and review your edits before saving.",
+  "valid": false,
+  "conflict": true,
+  "hash": "8fd3164dc4a38cbbf59b3bab5fed952f0e8f2bcf087a38ef573e0cea7b5805f3"
+}

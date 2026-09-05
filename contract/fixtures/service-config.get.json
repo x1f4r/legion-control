@@ -1,0 +1,92 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "hash": "597c136c5c4631ded389fc52e239a16d8f7048a190a6e472d1142ef1249cd2c1",
+  "document": {
+    "configVersion": 3,
+    "services": [],
+    "updates": {
+      "automatic": false
+    },
+    "boot": {
+      "targets": {}
+    }
+  },
+  "templates": [
+    {
+      "id": "command",
+      "name": "Command service",
+      "description": "Supply version, update and verification commands. Choose a busy probe, or explicitly declare busy.type none.",
+      "service": {
+        "id": "",
+        "name": "",
+        "health": {
+          "type": "none"
+        },
+        "updates": {
+          "automatic": false
+        },
+        "kind": "command",
+        "installedVersion": [],
+        "latestVersion": [],
+        "update": [],
+        "verify": [],
+        "process": {
+          "type": "none"
+        }
+      }
+    },
+    {
+      "id": "systemd-user",
+      "name": "Systemd user service",
+      "description": "Reference an existing user unit and supply its update and verification commands. Choose a busy probe or explicitly declare none.",
+      "service": {
+        "id": "",
+        "name": "",
+        "health": {
+          "type": "none"
+        },
+        "updates": {
+          "automatic": false
+        },
+        "kind": "command",
+        "update": [],
+        "verify": [],
+        "process": {
+          "type": "systemd-user",
+          "unit": ""
+        }
+      }
+    },
+    {
+      "id": "npm",
+      "name": "npm service",
+      "description": "Choose a package and its process adapter. Supply a busy probe or explicitly declare none. No package is installed when saving.",
+      "service": {
+        "id": "",
+        "name": "",
+        "health": {
+          "type": "none"
+        },
+        "updates": {
+          "automatic": false
+        },
+        "kind": "npm",
+        "package": "",
+        "channel": "latest",
+        "allowScripts": [],
+        "process": {
+          "type": "none"
+        }
+      }
+    }
+  ],
+  "limits": {
+    "maxBytes": 1048576
+  }
+}

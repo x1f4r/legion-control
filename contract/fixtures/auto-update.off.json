@@ -1,0 +1,81 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "automatic updates are off for this machine; a manual update still runs",
+  "service": null,
+  "updates": {
+    "automatic": false,
+    "pauseUntil": null,
+    "maintenanceWindows": [
+      {
+        "days": [
+          "mon",
+          "tue",
+          "wed",
+          "thu",
+          "fri",
+          "sat",
+          "sun"
+        ],
+        "from": "02:00",
+        "to": "06:00"
+      }
+    ],
+    "inWindowNow": false,
+    "nextWindow": "2026-09-06T02:00:00.000Z",
+    "lastCycle": {
+      "opId": "7c5b3d92-4e18-4a6f-b273-9d0e1f8a5c46",
+      "at": "2026-09-05T02:02:00.000Z",
+      "action": "cycled"
+    }
+  },
+  "services": [
+    {
+      "id": "t3",
+      "name": "T3 Code",
+      "updates": {
+        "automatic": false,
+        "inherited": true,
+        "pauseUntil": null,
+        "maintenanceWindows": null,
+        "eligibleNow": false,
+        "deferredReason": "policy-off",
+        "inheritedKeys": {
+          "automatic": true,
+          "pauseUntil": true,
+          "maintenanceWindows": true
+        },
+        "inWindowNow": false,
+        "nextWindow": "2026-09-06T02:00:00.000Z"
+      }
+    },
+    {
+      "id": "demo",
+      "name": "Demo",
+      "updates": {
+        "automatic": false,
+        "inherited": false,
+        "pauseUntil": null,
+        "maintenanceWindows": null,
+        "eligibleNow": false,
+        "deferredReason": "policy-off",
+        "inheritedKeys": {
+          "automatic": false,
+          "pauseUntil": true,
+          "maintenanceWindows": true
+        },
+        "inWindowNow": false,
+        "nextWindow": "2026-09-06T02:00:00.000Z"
+      }
+    }
+  ],
+  "autoUpdate": false,
+  "changed": [
+    "automatic"
+  ]
+}

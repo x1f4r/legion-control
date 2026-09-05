@@ -4,15 +4,15 @@
 // Everything here takes a normalized service object. Nothing in this file knows
 // which product it is looking after.
 
-import { describeFailure, detectPlatform, runCommand, sleep } from './config.mjs';
+import { describeFailure, detectPlatform, runArgv, runCommand, sleep } from './config.mjs';
 import { checkHealth, healthPort } from './probes/health.mjs';
-import { isRunning, probeProcess, startProcess, stopProcess } from './probes/process.mjs';
+import { isRunning, probeProcess, processStartedAt, startProcess, stopProcess } from './probes/process.mjs';
 import { NO_RELAY, probeRelay } from './probes/relay.mjs';
 import * as appProvider from './providers/app.mjs';
 
 const BIND_GRACE_MS = 2000;
 
-export { isRunning, healthPort };
+export { isRunning, healthPort, processStartedAt };
 
 /** Find the service the command should act on. */
 export function selectService(config, id) {
@@ -23,7 +23,7 @@ export function selectService(config, id) {
 /**
  * One call that answers "is the process there" and "is the relay up". They are
  * probed together because on Windows each PowerShell start costs about half a
- * second and `status` has a three second budget.
+ * second and `status` has a budget.
  */
 export function probeService(service) {
   const wantsRelay = service.relay?.type === 'cloudflared';
@@ -40,15 +40,32 @@ export function probeService(service) {
 }
 
 /**
+ * What the busy probes are allowed to use as outside evidence about a service.
+ *
+ * Gathered once and passed down rather than looked up inside each probe, because
+ * on Windows every one of these is a PowerShell start and the busy check would
+ * otherwise pay for it again per service.
+ */
+export function livenessOf(service) {
+  let serviceRunning = null;
+  try {
+    serviceRunning = isRunning(service);
+  } catch {
+    /* no evidence is a valid answer; the probe keeps its protection */
+  }
+  return { serviceRunning, startedAt: serviceRunning === true ? processStartedAt(service) : null };
+}
+
+/**
  * The health check, with "none" resolved against the process probe. The process
  * is only probed when the answer actually depends on it: on Windows that probe
  * is a PowerShell start, and paying for one before every http health check would
  * be half a second thrown away each time.
  */
-export async function serviceHealth(service, { running, timeoutMs = 5000 } = {}) {
+export async function serviceHealth(service, { running, timeoutMs = null, useAsync = false } = {}) {
   const dependsOnProcess = (service.health?.type ?? 'none') === 'none';
   const up = running ?? (dependsOnProcess ? isRunning(service) : true);
-  return checkHealth(service, { running: up, timeoutMs });
+  return checkHealth(service, { running: up, timeoutMs, useAsync });
 }
 
 /**
@@ -61,7 +78,7 @@ export async function waitForServiceHealth(service, timeoutMs, { intervalMs = 20
   let last = { ok: false, status: 0, error: 'not checked' };
   for (;;) {
     const running = service.health?.type === 'none' ? isRunning(service) : true;
-    last = await checkHealth(service, { running, timeoutMs: 5000 });
+    last = await checkHealth(service, { running });
     if (last.ok) return last;
     if (Date.now() >= deadline) return last;
     await sleep(intervalMs);
@@ -74,6 +91,35 @@ export function startService(service) {
 
 export function stopService(service) {
   return stopProcess(service);
+}
+
+/** Whether this service knows how to stop taking new work. */
+export function canDrain(service) {
+  return Boolean(service.drain?.command);
+}
+
+/**
+ * Ask a service to stop accepting new work and finish what it has, before it is
+ * stopped.
+ *
+ * There is no generic way to do this — a systemd unit has no notion of it and an
+ * app certainly does not — so it happens only where the config names a command
+ * for it. Where one exists it closes the window the busy check cannot: between
+ * "nothing is running" and the stop, new work can start, and a drain is the only
+ * thing that prevents that rather than merely noticing it afterwards.
+ *
+ * A drain that fails stops the update. The alternative is to stop a service that
+ * has just told us it is not ready, which is the thing the drain existed to
+ * avoid.
+ */
+export function drainService(service) {
+  if (!canDrain(service)) return { ok: true, drained: false, message: null };
+  const result = runArgv(service.drain.command, { timeoutMs: service.drain.timeoutSeconds * 1000 });
+  return {
+    ok: result.ok,
+    drained: result.ok,
+    message: result.ok ? `${service.name} was drained` : `the drain command failed: ${describeFailure(result)}`,
+  };
 }
 
 /**

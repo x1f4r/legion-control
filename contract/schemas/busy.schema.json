@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "busy.schema.json",
+  "title": "legionctl busy",
+  "description": "The aggregate, plus per-service evidence. A machine with exactly one service answers in the 2.x shape: that service's own busy object spread across the top level, with the aggregate's three keys on top of it. A machine with several answers with the aggregate and a `services` array.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    }
+  ],
+  "oneOf": [
+    {
+      "title": "one service",
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/busyFields"
+        }
+      ],
+      "properties": {
+        "monitoredServices": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "unmonitoredServices": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "services": false
+      },
+      "required": [
+        "monitoredServices",
+        "unmonitoredServices"
+      ]
+    },
+    {
+      "title": "several services",
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/busyAggregateFields"
+        }
+      ],
+      "properties": {
+        "services": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/busyService"
+          },
+          "minItems": 1,
+          "maxItems": 50
+        }
+      },
+      "required": [
+        "services"
+      ]
+    }
+  ],
+  "unevaluatedProperties": false,
+  "$defs": {
+    "busyService": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/busyFields"
+        }
+      ],
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/token"
+        },
+        "name": {
+          "$ref": "common.schema.json#/$defs/text"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

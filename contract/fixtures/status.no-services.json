@@ -1,0 +1,76 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "os": "linux",
+  "hostname": "newpi",
+  "timing": {
+    "budgetMs": 20000,
+    "elapsedMs": 42,
+    "partial": false
+  },
+  "agent": {
+    "version": "3.0.0",
+    "contract": 3,
+    "base": "/home/x1f4r/.legion-control",
+    "node": "24.9.0",
+    "restrictedSession": false,
+    "capabilities": [
+      "setup-lineage",
+      "wol-action",
+      "configured-telemetry",
+      "service-config-admin"
+    ]
+  },
+  "config": {
+    "ok": true,
+    "source": "defaults",
+    "problems": []
+  },
+  "services": [],
+  "busy": {
+    "busy": false,
+    "unknown": false,
+    "reason": "idle",
+    "monitoredServices": 0,
+    "unmonitoredServices": 0
+  },
+  "bootTargets": [],
+  "actions": [],
+  "autoUpdate": false,
+  "updates": {
+    "automatic": false,
+    "pauseUntil": null,
+    "maintenanceWindows": [],
+    "inWindowNow": true,
+    "nextWindow": null,
+    "lastCycle": null
+  },
+  "operations": {
+    "running": [],
+    "queued": [],
+    "recent": []
+  },
+  "controller": {
+    "hash": null,
+    "id": null,
+    "revision": 0,
+    "updatedAt": null,
+    "source": null
+  },
+  "t3": null,
+  "pendingRestart": false,
+  "lastUpdate": null,
+  "connect": {
+    "configured": false,
+    "running": false
+  },
+  "notes": [
+    "No configuration file was found, so this agent is running on inert defaults: no services, and automatic updates off.",
+    "Write /home/x1f4r/.legion-control/config.json to describe what this machine runs."
+  ]
+}

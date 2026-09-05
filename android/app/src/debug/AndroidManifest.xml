@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug only. This file is not merged into a release build, so the receiver below does not exist in
+  a published APK at all: there is no flag to set and no code path to reach it. A release APK built
+  from this tree contains no reference to the class, which the build verifies.
+
+  It has to be exported, because a component that is not exported cannot be reached by
+  `adb shell am broadcast` at all: the shell runs as uid 2000 and modern Android refuses a broadcast
+  to a component another uid has not exported. Reaching it any other way would mean instrumentation,
+  which is a heavier thing to ship than this.
+
+  So it is exported and locked to android.permission.DUMP instead. That permission is held by the
+  adb shell and is signature|privileged|development, so an ordinary app installed alongside a debug
+  build cannot get it. Between "not exported and unusable" and "exported to everything", this is the
+  third option, and it is the one that matches what the permission is for.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name="com.x1f4r.legioncontrol.debug.TestBridgeReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.x1f4r.legioncontrol.debug.SHOW_KEY" />
+                <action android:name="com.x1f4r.legioncontrol.debug.APPLY_CONFIG" />
+                <action android:name="com.x1f4r.legioncontrol.debug.SHOW_SETUP" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

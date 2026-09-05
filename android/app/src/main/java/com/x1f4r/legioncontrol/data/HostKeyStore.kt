@@ -5,66 +5,63 @@ import android.content.SharedPreferences
 import java.security.MessageDigest
 import java.util.Base64
 
-/**
- * Trust on first use for ssh host keys, kept per address.
- *
- * Per address rather than per machine, and each address holds the last few keys it was trusted
- * with, not just the last one. A machine that dual boots presents a different host key per system
- * and answers on the same LAN address for all of them, so that one address legitimately alternates
- * between keys with every boot switch. Holding all of them means each system is a question once and
- * never again, while a key nobody has seen before is still reported.
- *
- * The caller says how many keys an address may hold, because that is knowledge about the address:
- * a remote address is one system, a LAN address is one per system on the machine. Trusting a key
- * beyond that evicts the oldest, so a reinstalled system's stale key cleans itself up instead of
- * sitting in the store as one more key an attacker would be allowed to present.
- */
+/** Private OS identities and retained legacy pins. Shared setup edits never change this store. */
 class HostKeyStore(context: Context) {
-    private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences("legion-host-keys", Context.MODE_PRIVATE)
+    private val prefs: SharedPreferences = context.applicationContext.getSharedPreferences("legion-host-keys", Context.MODE_PRIVATE)
+    private val groups: SharedPreferences = context.applicationContext.getSharedPreferences("legion-host-identities", Context.MODE_PRIVATE)
 
-    /**
-     * Every trusted key blob for [address], base64 of the wire encoding, oldest first. Empty if the
-     * address has never been seen. Entries written by a build that kept one key per address are a
-     * plain blob, which reads as a list of one, so nothing has to be migrated.
-     */
-    fun trusted(address: String): List<String> =
-        (prefs.all[address] as? String)?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()
-
-    /**
-     * Adds [keyBlobBase64] as the newest key trusted for [address], keeping at most [keep] keys and
-     * dropping the oldest beyond that. Trusting a key that is already there refreshes its age.
-     */
-    fun trust(address: String, keyBlobBase64: String, keep: Int) {
-        val keys = trusted(address) - keyBlobBase64 + keyBlobBase64
-        prefs.edit().putString(address, keys.takeLast(keep).joinToString("\n")).apply()
+    private fun identities(): HostIdentities {
+        check(!writeFailed) { "Host trust could not be saved. Restart the app before reviewing it again." }
+        return groups.getString("document", null)?.let {
+            kotlinx.serialization.json.Json.decodeFromString<HostIdentities>(it).also { document ->
+                check(document.version == 1) { "Unsupported host identity store." }
+            }
+        } ?: HostIdentities()
     }
 
-    /** Drops every key for [address], so the next connection trusts whatever is offered instead. */
-    fun forget(address: String) {
-        prefs.edit().remove(address).apply()
+    private fun commit(editor: SharedPreferences.Editor) {
+        if (!editor.commit()) {
+            writeFailed = true
+            error("Could not save host trust. Restart the app before reviewing it again.")
+        }
     }
 
-    fun forgetAll() {
-        prefs.edit().clear().apply()
+    private fun legacy(address: String): List<String> =
+        (prefs.all[address] as? String)?.split('\n')?.filter { it.isNotBlank() }.orEmpty()
+
+    fun snapshot(address: String): HostTrustSnapshot = synchronized(LOCK) { identities().snapshot(address, legacy(address)) }
+    fun trusted(address: String): List<String> = snapshot(address).trusted
+
+    fun approve(address: String, blob: String, approval: HostTrustApproval) = synchronized(LOCK) {
+        val updated = identities().approve(address, blob, legacy(address), approval)
+        commit(groups.edit().putString("document", kotlinx.serialization.json.Json.encodeToString(HostIdentities.serializer(), updated)))
     }
 
-    /**
-     * Drops every address that is not in [addresses]. Called whenever the configuration changes,
-     * with the addresses it still names, so keys for addresses that no longer exist do not sit in
-     * the store forever.
-     */
-    fun retainOnly(addresses: Set<String>) {
-        val editor = prefs.edit()
-        prefs.all.keys.filterNot { it in addresses }.forEach(editor::remove)
-        editor.apply()
+    fun configureSystems(address: String, systems: List<HostIdentitySystem>, revision: Long) = synchronized(LOCK) {
+        val updated = identities().configureSystems(address, systems, revision)
+        commit(groups.edit().putString("document", kotlinx.serialization.json.Json.encodeToString(HostIdentities.serializer(), updated)))
+    }
+
+    /** Explicit removal from the trust settings; never called during configuration reconciliation. */
+    fun forget(address: String) = synchronized(LOCK) {
+        val old = identities()
+        commit(groups.edit().putString("document", kotlinx.serialization.json.Json.encodeToString(HostIdentities.serializer(), old.copy(revision = old.revision + 1, endpoints = old.endpoints.filterNot { it.address == address }))))
+        commit(prefs.edit().remove(address))
+    }
+
+    fun forgetAll() = synchronized(LOCK) {
+        val old = identities()
+        commit(groups.edit().putString("document", kotlinx.serialization.json.Json.encodeToString(HostIdentities.serializer(), HostIdentities(revision = old.revision + 1))))
+        commit(prefs.edit().clear())
     }
 
     /** Every trusted key, as address to fingerprints, for a screen that shows what the app trusts. */
     fun fingerprints(): Map<String, List<String>> =
-        prefs.all.keys.associateWith { address -> trusted(address).map(::fingerprintOf) }
+        (prefs.all.keys + identities().endpoints.map { it.address }).associateWith { address -> trusted(address).map(::fingerprintOf) }
 
     companion object {
+        private val LOCK = Any()
+        @Volatile private var writeFailed = false
         /** The OpenSSH style fingerprint of a base64 key blob: SHA256 and no padding. */
         fun fingerprintOf(keyBlobBase64: String): String = try {
             val digest = MessageDigest.getInstance("SHA-256")

@@ -1,18 +1,47 @@
 {
+  "configVersion": 3,
   "system": { "id": "mac", "name": "macOS" },
-  "autoUpdate": true,
+  "updates": {
+    "automatic": true,
+    "pauseUntil": null,
+    "maintenanceWindows": [{ "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "from": "04:00", "to": "07:00" }]
+  },
   "services": [
     {
-      "id": "t3",
-      "name": "T3 Code",
+      "id": "editor",
+      "name": "Example Editor",
       "kind": "app",
-      "path": "/Applications/T3 Code (Nightly).app",
-      "bundleId": "com.t3tools.t3code",
-      "updaterCacheDir": "~/Library/Caches/t3code-updater",
-      "stagedFilePattern": "^T3-Code-(.+)-(?:arm64|x64|universal)\\.(?:zip|dmg)$",
-      "latest": { "type": "github-releases", "repo": "pingdotgg/t3code", "prerelease": true },
-      "health": { "type": "http", "port": 3773, "path": "/" },
-      "busy": { "type": "t3-sqlite", "staleHours": 6 }
+      "path": "/Applications/Example Editor.app",
+      "bundleId": "com.example.editor",
+      "updaterCacheDir": "~/Library/Caches/example-editor-updater",
+      "stagedFilePattern": "^Example-Editor-(.+)-(?:arm64|x64|universal)\\.(?:zip|dmg)$",
+      "latest": { "type": "github-releases", "repo": "example/editor", "prerelease": false },
+      "health": { "type": "http", "port": 8080, "path": "/healthz" },
+      "busy": { "type": "http", "port": 8080, "path": "/status", "busyWhen": "busy" },
+      "updates": { "automatic": true }
+    },
+    {
+      "id": "sync",
+      "name": "Backup Sync",
+      "kind": "command",
+      "installedVersion": ["/opt/homebrew/bin/syncd", "--version"],
+      "process": {
+        "type": "command",
+        "start": ["launchctl", "kickstart", "-k", "gui/501/com.example.syncd"],
+        "stop": ["launchctl", "kill", "SIGTERM", "gui/501/com.example.syncd"],
+        "running": ["launchctl", "print", "gui/501/com.example.syncd"]
+      },
+      "health": { "type": "none" },
+      "busy": { "type": "command", "command": ["/opt/homebrew/bin/syncd", "status", "--quiet"] }
+    }
+  ],
+  "actions": [
+    {
+      "id": "sync-now",
+      "name": "Sync Now",
+      "command": ["/opt/homebrew/bin/syncd", "run", "--once"],
+      "busyGated": false,
+      "timeoutSeconds": 300
     }
   ]
 }

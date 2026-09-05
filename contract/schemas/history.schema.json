@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "history.schema.json",
+  "title": "legionctl history",
+  "description": "Operation summaries, newest first. Never more than 200, whatever was asked for.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    }
+  ],
+  "properties": {
+    "operations": {
+      "description": "Newest first. The canonical key is `operations` and the canonical item is an opSummary; an agent that finds it cheaper to send whole records may, and a client reads the summary fields out of either.",
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "$ref": "common.schema.json#/$defs/opSummary"
+          },
+          {
+            "$ref": "common.schema.json#/$defs/opRecord"
+          }
+        ]
+      },
+      "maxItems": 200
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 200
+    },
+    "returned": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 200
+    },
+    "retained": {
+      "description": "How many records the machine is holding in total, before the limit and the filter were applied.",
+      "$ref": "common.schema.json#/$defs/count"
+    },
+    "filter": {
+      "type": "object",
+      "properties": {
+        "service": {
+          "$ref": "common.schema.json#/$defs/tokenOrNull"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "common.schema.json#/$defs/opKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "service",
+        "kind"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "operations",
+    "limit",
+    "returned",
+    "retained",
+    "filter"
+  ],
+  "unevaluatedProperties": false
+}

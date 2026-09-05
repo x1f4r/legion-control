@@ -31,6 +31,15 @@ data class MachineSystem(
     val name: String,
     val platform: Platform,
     val agent: List<String>,
+    /**
+     * Which shell this system's account logs in to, for writing the command line.
+     *
+     * [RemoteShell.AUTO] until the configuration says, and that is not a gap: while every argument
+     * means the same thing in all three shells the command is written exactly as it always was.
+     * Only a path or an id that actually needs quoting makes the answer matter, and then it is asked
+     * for rather than guessed at.
+     */
+    val shell: RemoteShell = RemoteShell.AUTO,
 ) {
     /**
      * A system the agent named that the configuration does not have. It can still be reported and
@@ -48,6 +57,25 @@ data class WakeTarget(
     val probePort: Int,
     /** The phone counts as at home when one of its addresses starts with this. */
     val lanPrefix: String?,
+    /** The site this machine's network is, when the document names sites. */
+    val siteId: String?,
+    /**
+     * Machines that sit on this one's network and can be asked to send the packet, in order.
+     *
+     * The one thing a phone genuinely cannot do from outside the house: a magic packet is a link
+     * local broadcast and a tunnel has no broadcast domain to put one on. A machine that is already
+     * there does not have that problem, and neither does a router with a command on it.
+     *
+     * A list rather than one, because one machine cannot wake two different broadcast domains and
+     * because a helper can itself be asleep. They are tried in order and never woken automatically.
+     */
+    val helpers: List<WakeHelper>,
+)
+
+/** One machine that can be asked to wake another, and the action on it that does the waking. */
+data class WakeHelper(
+    val machineId: String,
+    val actionId: String,
 )
 
 /**
@@ -63,6 +91,10 @@ data class Machine(
     val endpoints: List<Endpoint>,
     val systems: List<MachineSystem>,
     val wake: WakeTarget?,
+    /** Which site this machine is at, when the document names sites. */
+    val siteId: String? = null,
+    /** A hint that this machine is always powered. Changes what a warning says, nothing else. */
+    val alwaysOn: Boolean = false,
 ) {
     fun system(id: String?): MachineSystem? = systems.firstOrNull { it.id == id }
 
@@ -82,6 +114,7 @@ private fun MachineConfig.toMachine(): Machine {
             name = system.name?.takeIf { it.isNotBlank() } ?: system.id,
             platform = Platform.fromWire(system.platform),
             agent = system.agent,
+            shell = RemoteShell.fromWire(system.shell),
         )
     }
     val endpoints = endpoints.map { endpoint ->
@@ -94,10 +127,6 @@ private fun MachineConfig.toMachine(): Machine {
             user = endpoint.user,
             systemHint = endpoint.system,
             label = endpoint.label?.takeIf { it.isNotBlank() } ?: endpoint.host,
-            trustedKeyCapacity = when (kind) {
-                RouteKind.LAN -> systems.size.coerceAtLeast(1)
-                RouteKind.REMOTE -> 1
-            },
         )
     }
     // The address the wake waits on. The config's own probe if it named one, otherwise the LAN
@@ -110,6 +139,8 @@ private fun MachineConfig.toMachine(): Machine {
         name = name?.takeIf { it.isNotBlank() } ?: id,
         endpoints = endpoints,
         systems = systems,
+        siteId = site?.takeIf { it.isNotBlank() },
+        alwaysOn = alwaysOn,
         wake = wake?.let { wake ->
             WakeTarget(
                 mac = wake.mac,
@@ -120,6 +151,12 @@ private fun MachineConfig.toMachine(): Machine {
                 probePort = wake.probe?.port?.takeIf { it in 1..65535 }
                     ?: fallbackProbe?.port ?: 22,
                 lanPrefix = wake.lanPrefix?.takeIf { it.isNotBlank() },
+                siteId = site?.takeIf { it.isNotBlank() },
+                helpers = wake.effectiveHelpers.mapNotNull { helper ->
+                    val machineId = helper.machine.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val actionId = helper.action.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    WakeHelper(machineId, actionId)
+                },
             )
         },
     )

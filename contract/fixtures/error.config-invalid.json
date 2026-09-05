@@ -1,0 +1,22 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "config-invalid",
+  "message": "config.json does not parse, so nothing on this machine will be changed until it does; status still works and reads from config.last-good.json",
+  "command": "update",
+  "argument": null,
+  "problems": [
+    {
+      "level": "error",
+      "path": "config.json",
+      "message": "the file does not parse: Unexpected token } in JSON at position 812",
+      "fix": "fix the trailing comma at line 34, or delete config.json to start from defaults"
+    }
+  ],
+  "error": "config.json does not parse"
+}

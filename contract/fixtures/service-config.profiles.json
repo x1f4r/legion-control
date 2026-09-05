@@ -1,0 +1,151 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "mac",
+    "name": "macOS"
+  },
+  "hash": "597c136c5c4631ded389fc52e239a16d8f7048a190a6e472d1142ef1249cd2c1",
+  "document": {
+    "configVersion": 3,
+    "services": [],
+    "updates": {
+      "automatic": false
+    },
+    "boot": {
+      "targets": {}
+    }
+  },
+  "templates": [
+    {
+      "id": "command",
+      "name": "Command service",
+      "description": "Supply version, update and verification commands. Choose a busy probe, or explicitly declare busy.type none.",
+      "service": {
+        "id": "",
+        "name": "",
+        "health": {
+          "type": "none"
+        },
+        "updates": {
+          "automatic": false
+        },
+        "kind": "command",
+        "installedVersion": [],
+        "latestVersion": [],
+        "update": [],
+        "verify": [],
+        "process": {
+          "type": "none"
+        }
+      }
+    },
+    {
+      "id": "systemd-user",
+      "name": "Systemd user service",
+      "description": "Reference an existing user unit and supply its update and verification commands. Choose a busy probe or explicitly declare none.",
+      "service": {
+        "id": "",
+        "name": "",
+        "health": {
+          "type": "none"
+        },
+        "updates": {
+          "automatic": false
+        },
+        "kind": "command",
+        "update": [],
+        "verify": [],
+        "process": {
+          "type": "systemd-user",
+          "unit": ""
+        }
+      }
+    },
+    {
+      "id": "npm",
+      "name": "npm service",
+      "description": "Choose a package and its process adapter. Supply a busy probe or explicitly declare none. No package is installed when saving.",
+      "service": {
+        "id": "",
+        "name": "",
+        "health": {
+          "type": "none"
+        },
+        "updates": {
+          "automatic": false
+        },
+        "kind": "npm",
+        "package": "",
+        "channel": "latest",
+        "allowScripts": [],
+        "process": {
+          "type": "none"
+        }
+      }
+    }
+  ],
+  "limits": {
+    "maxBytes": 1048576
+  },
+  "profiles": [
+    {
+      "id": "codex-cli",
+      "name": "Codex CLI",
+      "platform": "mac",
+      "detected": true,
+      "availability": "available",
+      "message": "A matching npm installation was detected. Review the draft before saving; automatic maintenance is off and every related process must exit before an update.",
+      "updateMethod": "npm",
+      "service": {
+        "id": "codex-cli",
+        "name": "Codex CLI",
+        "kind": "npm",
+        "package": "@openai/codex",
+        "npmPrefix": "/opt/homebrew",
+        "channel": "latest",
+        "allowScripts": [],
+        "process": {
+          "type": "none"
+        },
+        "health": {
+          "type": "none"
+        },
+        "busy": {
+          "type": "command",
+          "command": [
+            "/opt/homebrew/bin/node",
+            "/example/base/agent/src/service-profile-probe.mjs",
+            "busy",
+            "codex-cli"
+          ],
+          "timeoutSeconds": 6
+        },
+        "updates": {
+          "automatic": false
+        }
+      }
+    },
+    {
+      "id": "codex-desktop",
+      "name": "Codex / ChatGPT desktop",
+      "platform": "mac",
+      "detected": true,
+      "availability": "manual",
+      "message": "The application is installed. Its built-in updater has no verified unattended command for this install; update through the application.",
+      "updateMethod": "application-updater",
+      "service": null
+    },
+    {
+      "id": "grok-cli",
+      "name": "GrokCLI",
+      "platform": "mac",
+      "detected": false,
+      "availability": "unavailable",
+      "message": "Several unrelated tools use this name. Select the exact project and distribution before provisioning an updater.",
+      "updateMethod": null,
+      "service": null
+    }
+  ]
+}

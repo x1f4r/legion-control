@@ -8,13 +8,13 @@
 #
 #   ssh <machine> 'bash ~/legion-control/agent/install/install-linux.sh'
 #
-# Safe to re-run. It reinstalls the agent tree, re-renders the units and only
-# restarts a service when its unit definition actually changed.
+# Safe to re-run. It stages and self-checks a complete replacement before the
+# live tree moves, retains the prior tree, and re-renders the units.
 #
 # The agent alone looks after nothing in particular: what it manages comes from
-# ~/.legion-control/config.json, which this script never writes. Pass --with-t3
-# to also install the reference example, a T3 Code server as a systemd user unit
-# that the legacy configuration (no "services" key at all) already describes.
+# config.json, which this script never writes. With no config it is inert: no
+# services, no boot targets and automatic maintenance off. Pass --with-t3 to
+# install the optional reference service unit; configuration stays explicit.
 #
 # systemd user linger has to be on for this account, so the units keep running
 # after logout and come up on boot without anyone signing in:
@@ -26,10 +26,13 @@ set -euo pipefail
 # Settings
 # ---------------------------------------------------------------------------
 
-# The install layout is part of the frozen agent contract: the controller apps
-# invoke these paths over SSH unquoted, so none of them may ever contain a space.
-BASE="$HOME/.legion-control"
+# LEGIONCTL_HOME is also what isolated installations and tests use. Resolve it
+# before it reaches a unit or launcher; relative install bases are ambiguous to
+# schedulers and are refused.
+BASE="${LEGIONCTL_HOME:-$HOME/.legion-control}"
 AGENT_DIR="$BASE/agent"
+BIN_DIR="$BASE/bin"
+LAUNCHER="$BIN_DIR/legionctl"
 NPM_PREFIX="${LEGION_NPM_PREFIX:-$HOME/.npm-global}"
 NPM_BIN="$NPM_PREFIX/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -51,7 +54,8 @@ OLD_UNITS=(legion-t3-update.timer legion-t3-update.service)
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SRC_AGENT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 
-MIN_NODE_MAJOR=22
+MIN_NODE_MAJOR=24
+SKIP_SCHEDULER=0
 
 # Collected for the summary at the end.
 SUMMARY=()
@@ -62,9 +66,11 @@ die()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
 for arg in "$@"; do
   case "$arg" in
     --with-t3) WITH_T3=1 ;;
+    --skip-scheduler) SKIP_SCHEDULER=1 ;;
     -h|--help)
-      printf 'usage: install-linux.sh [--with-t3]\n\n' >&2
+      printf 'usage: install-linux.sh [--with-t3] [--skip-scheduler]\n\n' >&2
       printf '  --with-t3   also install the reference example service (T3 Code)\n' >&2
+      printf '  --skip-scheduler   install and verify files without changing systemd\n' >&2
       exit 0
       ;;
     *) die "unknown argument: $arg" ;;
@@ -77,18 +83,24 @@ done
 
 step "Preflight"
 
-if [ "$(id -u)" -eq 0 ]; then
+if [ "$(id -u)" -eq 0 ] && [ "$SKIP_SCHEDULER" -ne 1 ]; then
   die "run this as your own user without sudo. It installs systemd USER units and writes into \$HOME."
 fi
 
 case "$BASE" in
-  *[[:space:]]*) die "\$HOME contains a space ($HOME). The agent contract requires space free paths." ;;
+  /*) ;;
+  *) die "LEGIONCTL_HOME must be an absolute path, got '$BASE'." ;;
+esac
+case "$BASE$NPM_PREFIX$UNIT_DIR" in
+  *$'\n'*|*$'\r'*) die "install paths containing a line break are unsupported." ;;
 esac
 
-# The units hardcode an absolute node path, so prefer the system one and fall
-# back to whatever is on PATH only if it is missing.
-if [ -x /usr/bin/node ]; then
-  NODE_BIN=/usr/bin/node
+# Pin the explicitly selected Node, or the executable available in this setup
+# session. The scheduler later uses that absolute path without searching PATH.
+if [ -n "${LEGION_NODE_BIN:-}" ]; then
+  NODE_BIN="$LEGION_NODE_BIN"
+  case "$NODE_BIN" in /*) ;; *) die "LEGION_NODE_BIN must be an absolute path." ;; esac
+  [ -x "$NODE_BIN" ] || die "LEGION_NODE_BIN is not executable: $NODE_BIN"
 else
   NODE_BIN="$(command -v node || true)"
   [ -n "$NODE_BIN" ] || die "node is not on PATH and /usr/bin/node does not exist."
@@ -114,8 +126,11 @@ else
 fi
 
 [ -f "$SRC_AGENT/src/index.mjs" ] || die "no agent source at $SRC_AGENT/src/index.mjs. Copy the repo across first."
+[ -f "$SRC_AGENT/package.json" ] || die "no package metadata at $SRC_AGENT/package.json."
+[ -f "$SCRIPT_DIR/launcher.mjs" ] || die "stable launcher helper missing at $SCRIPT_DIR/launcher.mjs."
+[ -f "$SCRIPT_DIR/launcher.sh" ] || die "stable launcher template missing at $SCRIPT_DIR/launcher.sh."
 
-if ! systemctl --user show-environment >/dev/null 2>&1; then
+if [ "$SKIP_SCHEDULER" -ne 1 ] && ! systemctl --user show-environment >/dev/null 2>&1; then
   die "no systemd user manager for this session. Check 'loginctl show-user $(id -un) -p Linger'."
 fi
 
@@ -169,25 +184,85 @@ fi
 
 step "Agent"
 
-mkdir -p "$BASE"
+mkdir -p "$BASE" "$BIN_DIR"
+
+verify_tree() {
+  LEGIONCTL_HOME="$BASE" LEGIONCTL_LAUNCHER_LIBRARY=1 "$NODE_BIN" --input-type=module - "$SCRIPT_DIR/launcher.mjs" "$1" <<'NODE'
+import { pathToFileURL } from 'node:url';
+const verifier = await import(pathToFileURL(process.argv[2]));
+const result = verifier.verifyInstalledTree(process.argv[3]);
+if (!result.ok) {
+  process.stderr.write(`${result.error}\n`);
+  process.exit(1);
+}
+process.stdout.write(result.signed ? `signed ${result.manifest.version}\n` : 'unsigned source checkout\n');
+NODE
+}
+
+tree_selfcheck() {
+  local tree="$1"
+  local output
+  output="$(LEGIONCTL_HOME="$BASE" "$NODE_BIN" "$tree/src/index.mjs" version --check)" || return 1
+  printf '%s' "$output" | "$NODE_BIN" -e '
+    let input=""; process.stdin.on("data", c => input += c).on("end", () => {
+      const value=JSON.parse(input); const expected=require(process.argv[1]).version;
+      if(value.ok!==true || value.agentVersion!==expected || value.contract<3 || value.selfTest?.ok!==true) process.exit(1);
+    });
+  ' "$tree/package.json"
+}
+
+SOURCE_TRUST="$(verify_tree "$SRC_AGENT")" || die "source tree verification failed. Nothing was installed."
+note "source verification: $SOURCE_TRUST"
+
+# Install the recovery code and wrapper atomically. The wrapper embeds the Node
+# selected above, with shell quoting that also handles spaces and apostrophes.
+cp -p "$SCRIPT_DIR/launcher.mjs" "$BIN_DIR/launcher.mjs.new.$$"
+mv "$BIN_DIR/launcher.mjs.new.$$" "$BIN_DIR/launcher.mjs"
+"$NODE_BIN" --input-type=module - "$SCRIPT_DIR/launcher.sh" "$LAUNCHER.new.$$" "$NODE_BIN" <<'NODE'
+import fs from 'node:fs';
+const [template, output, node] = process.argv.slice(2);
+const literal = "'" + node.replace(/'/g, "'\\''") + "'";
+fs.writeFileSync(output, fs.readFileSync(template, 'utf8').replace('@NODE_SHELL@', () => literal));
+NODE
+chmod 755 "$LAUNCHER.new.$$"
+mv "$LAUNCHER.new.$$" "$LAUNCHER"
+cp -p "$SCRIPT_DIR/dispatch.sh" "$BIN_DIR/dispatch.sh.new.$$"
+chmod 755 "$BIN_DIR/dispatch.sh.new.$$"
+mv "$BIN_DIR/dispatch.sh.new.$$" "$BIN_DIR/dispatch.sh"
+
 
 if [ "$SRC_AGENT" = "$AGENT_DIR" ]; then
   # Running the installer out of the deployed copy. Nothing to copy, and
   # wiping the destination would delete the script under its own feet.
   note "agent source is already $AGENT_DIR, skipping the copy"
 else
-  rm -rf "$AGENT_DIR"
-  mkdir -p "$AGENT_DIR"
-  cp -R "$SRC_AGENT/src" "$AGENT_DIR/src"
-  if [ -d "$SRC_AGENT/install" ]; then
-    # Ship the installer along so the box can be re-provisioned from itself.
-    cp -R "$SRC_AGENT/install" "$AGENT_DIR/install"
+  STAGE="$BASE/agent.install.new.$$"
+  [ ! -e "$STAGE" ] || die "staging path already exists: $STAGE"
+  mkdir "$STAGE"
+  cp -Rp "$SRC_AGENT/src" "$STAGE/src"
+  cp -Rp "$SRC_AGENT/install" "$STAGE/install"
+  cp -p "$SRC_AGENT/package.json" "$STAGE/package.json"
+  if [ -e "$SRC_AGENT/MANIFEST.json" ] || [ -e "$SRC_AGENT/MANIFEST.json.sig" ]; then
+    [ -f "$SRC_AGENT/MANIFEST.json" ] && [ -f "$SRC_AGENT/MANIFEST.json.sig" ] || die "source must carry both MANIFEST.json and MANIFEST.json.sig."
+    cp -p "$SRC_AGENT/MANIFEST.json" "$SRC_AGENT/MANIFEST.json.sig" "$STAGE/"
   fi
-  note "agent copied to $AGENT_DIR"
+  verify_tree "$STAGE" >/dev/null || die "staged copy failed verification; the live agent was not changed. Staging remains at $STAGE."
+  tree_selfcheck "$STAGE" || die "staged agent failed version --check; the live agent was not changed. Staging remains at $STAGE."
+
+  BACKUP="$BASE/agent.prev"
+  "$NODE_BIN" "$SCRIPT_DIR/promote.mjs" "$BASE" "$STAGE" || die "agent promotion failed; all retained trees remain available for recovery."
+  note "agent promoted to $AGENT_DIR"
+  [ ! -d "$BACKUP" ] || note "previous agent retained at $BACKUP"
 fi
 
 AGENT_ENTRY="$AGENT_DIR/src/index.mjs"
 [ -f "$AGENT_ENTRY" ] || die "agent entry point missing at $AGENT_ENTRY."
+
+
+if ! "$LAUNCHER" version --check >/dev/null; then
+  die "installed agent failed its final self-check; the current tree and previous backup are retained for inspection."
+fi
+note "stable launcher installed at $LAUNCHER and passed version --check"
 
 # config.json and state.json are deliberately NOT written here. The agent falls
 # back to its own defaults when they are absent, and an installer that stamped a
@@ -196,13 +271,16 @@ AGENT_ENTRY="$AGENT_DIR/src/index.mjs"
 if [ -f "$BASE/config.json" ]; then
   note "config.json is already there and was left untouched"
 else
-  note "no config.json; the agent falls back to its defaults until you write one"
+  note "no config.json; inert defaults apply (no services, no boot targets, automatic maintenance off)"
 fi
 
 # ---------------------------------------------------------------------------
 # systemd user units
 # ---------------------------------------------------------------------------
 
+if [ "$SKIP_SCHEDULER" -eq 1 ]; then
+  note "systemd scheduler left untouched by --skip-scheduler"
+else
 step "Units"
 
 mkdir -p "$UNIT_DIR"
@@ -218,10 +296,11 @@ render_unit() {
 
   [ -f "$src" ] || die "missing unit template $src."
 
+  local launcher_unit
+  launcher_unit="$("$NODE_BIN" -e 'process.stdout.write(process.argv[1].replace(/\\/g,"\\\\").replace(/"/g,"\\\"").replace(/%/g,"%%"))' "$LAUNCHER")"
   sed \
     -e "s|@NPM_BIN@|$NPM_BIN|g" \
-    -e "s|@NODE@|$NODE_BIN|g" \
-    -e "s|@AGENT_DIR@|$AGENT_DIR|g" \
+    -e "s|@LAUNCHER@|$(printf '%s' "$launcher_unit" | sed 's/[&|]/\\&/g')|g" \
     -e "s|@PORT@|$PORT|g" \
     -e "s|@UID@|$(id -u)|g" \
     "$src" > "$tmp"
@@ -276,6 +355,7 @@ if [ "$WITH_T3" -eq 1 ]; then
 fi
 systemctl --user enable --now legion-control-update.timer >&2
 note "legion-control-update.timer enabled"
+fi
 
 # ---------------------------------------------------------------------------
 # Restart only when the definition really moved
@@ -299,7 +379,7 @@ agent_is_busy() {
   printf '%s' "$out" | grep -Eq '"busy"[[:space:]]*:[[:space:]]*true'
 }
 
-if [ "$T3_UNIT_CHANGED" -eq 1 ]; then
+if [ "$SKIP_SCHEDULER" -ne 1 ] && [ "$T3_UNIT_CHANGED" -eq 1 ]; then
   if agent_is_busy; then
     note "t3-code.service definition changed but the machine is busy (or its state could not be read), NOT restarting."
     note "run this once the machine is idle:  systemctl --user restart t3-code.service"
@@ -361,22 +441,30 @@ unit_state() {
   value="$(systemctl --user "$1" "$2" 2>/dev/null | head -1 || true)"
   printf '%s' "${value:-unknown}"
 }
-UNITS=(legion-control-update.timer legion-control-update.service)
-if [ "$WITH_T3" -eq 1 ]; then
-  UNITS=(t3-code.service "${UNITS[@]}")
+if [ "$SKIP_SCHEDULER" -ne 1 ]; then
+  UNITS=(legion-control-update.timer legion-control-update.service)
+  if [ "$WITH_T3" -eq 1 ]; then
+    UNITS=(t3-code.service "${UNITS[@]}")
+  fi
+  for unit in "${UNITS[@]}"; do
+    printf '    %-32s enabled=%-10s active=%s\n' \
+      "$unit" \
+      "$(unit_state is-enabled "$unit")" \
+      "$(unit_state is-active "$unit")"
+  done
+  printf '    %s\n' "legion-control-update.service is inactive between runs by design, the timer starts it."
+else
+  printf '    scheduler was not changed\n'
 fi
-for unit in "${UNITS[@]}"; do
-  printf '    %-32s enabled=%-10s active=%s\n' \
-    "$unit" \
-    "$(unit_state is-enabled "$unit")" \
-    "$(unit_state is-active "$unit")"
-done
-printf '    %s\n' "legion-control-update.service is inactive between runs by design, the timer starts it."
 
 printf '\n  Next update run\n'
-systemctl --user list-timers legion-control-update.timer --no-pager 2>/dev/null | sed 's/^/    /' || true
+if [ "$SKIP_SCHEDULER" -ne 1 ]; then
+  systemctl --user list-timers legion-control-update.timer --no-pager 2>/dev/null | sed 's/^/    /' || true
+else
+  printf '    scheduler was not changed\n'
+fi
 
-printf '\n  Agent:   %s %s status\n' "$NODE_BIN" "$AGENT_ENTRY"
+printf '\n  Agent:   %s status\n' "$LAUNCHER"
 printf '  Config:  %s\n' "$BASE/config.json"
 printf '  Logs:    journalctl --user -u legion-control-update.service -n 50\n'
 printf '           %s\n' "$BASE/legionctl.log"

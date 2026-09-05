@@ -1,0 +1,105 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "3 services walked: 1 updated, 2 deferred",
+  "action": "cycled",
+  "dryRun": false,
+  "op": {
+    "id": "7c5b3d92-4e18-4a6f-b273-9d0e1f8a5c46",
+    "kind": "cycle",
+    "service": null,
+    "target": null,
+    "actionId": null,
+    "mode": "scheduled",
+    "initiator": {
+      "client": "cli",
+      "device": null,
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T02:00:00.000Z",
+    "startedAt": "2026-09-05T02:00:00.000Z",
+    "updatedAt": "2026-09-05T02:02:00.000Z",
+    "finishedAt": "2026-09-05T02:02:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": true,
+      "action": "cycled",
+      "reasonCode": null,
+      "message": "3 services walked: 1 updated, 2 deferred",
+      "exitCode": 0,
+      "output": null
+    },
+    "log": [
+      {
+        "at": "2026-09-05T02:00:00.000Z",
+        "line": "lock taken for cycle"
+      },
+      {
+        "at": "2026-09-05T02:00:01.000Z",
+        "line": "recovery: nothing to recover"
+      },
+      {
+        "at": "2026-09-05T02:00:02.000Z",
+        "line": "queue: nothing to run"
+      },
+      {
+        "at": "2026-09-05T02:02:00.000Z",
+        "line": "cycle done"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux",
+    "children": [
+      {
+        "opId": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
+        "service": "t3",
+        "action": "updated",
+        "reasonCode": null
+      },
+      {
+        "opId": "d35b8e04-7c91-4a26-b5f8-0e3a7d192c64",
+        "service": "demo",
+        "action": "deferred",
+        "reasonCode": "policy-off"
+      },
+      {
+        "opId": "1e9f4b73-8d02-4c65-a397-6b5e0d8c214a7",
+        "service": "edge",
+        "action": "deferred",
+        "reasonCode": "busy-unknown"
+      }
+    ]
+  },
+  "children": [
+    {
+      "opId": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
+      "service": "t3",
+      "action": "updated",
+      "reasonCode": null
+    },
+    {
+      "opId": "d35b8e04-7c91-4a26-b5f8-0e3a7d192c64",
+      "service": "demo",
+      "action": "deferred",
+      "reasonCode": "policy-off"
+    },
+    {
+      "opId": "1e9f4b73-8d02-4c65-a397-6b5e0d8c214a7",
+      "service": "edge",
+      "action": "deferred",
+      "reasonCode": "busy-unknown"
+    }
+  ],
+  "queued": [],
+  "recovered": []
+}

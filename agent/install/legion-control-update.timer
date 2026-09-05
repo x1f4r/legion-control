@@ -1,15 +1,15 @@
-# Fire one update cycle every 15 minutes.
+# Fire one maintenance cycle every 15 minutes.
 #
 # This is a template for symmetry with the other units, it happens to carry no
 # placeholders at all. install-linux.sh copies it to
 # ~/.config/systemd/user/legion-control-update.timer.
 #
-# Why 15 minutes and not hourly: two reasons, and the second one matters more.
-# First, a new release gets picked up the same quarter hour it lands. Second,
-# the update cycle refuses to touch a busy machine and reports "deferred", so
-# the retry cadence IS the recovery time. At 15 minutes a machine that finishes
-# its last piece of work updates within the quarter hour. At an hour it could
-# sit on a stale build most of an evening for no reason.
+# Why 15 minutes and not hourly: three reasons, and the first two matter more
+# than the third. The cycle is what takes up "restart when idle" and "update when
+# idle" requests, so the cadence is how long a person waits after finishing their
+# work. It is also what recovers an operation whose process was killed, and a
+# service left stopped by one should not stay down for an hour. Third, a new
+# release gets picked up the same quarter hour it lands.
 
 [Unit]
 Description=Legion Control: check for an update every 15 minutes

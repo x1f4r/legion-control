@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "action": "deferred",
+  "service": "t3",
+  "from": "0.0.36-nightly.20260904",
+  "to": null,
+  "message": "the machine is busy (1 turn running); pass --force to update anyway"
+}

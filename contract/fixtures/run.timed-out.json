@@ -1,0 +1,54 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "timed-out",
+  "message": "flush-cache did not finish within 120 s and was killed; whether it changed anything before that is not known",
+  "action": "failed",
+  "id": "flush-cache",
+  "exitCode": null,
+  "output": "clearing 41 GB\n",
+  "op": {
+    "id": "6e0d95c4-2b71-4f38-a9d6-15c8e30b7f42",
+    "kind": "run",
+    "service": null,
+    "target": null,
+    "actionId": "flush-cache",
+    "mode": "manual",
+    "initiator": {
+      "client": "phone",
+      "device": "pixel-8",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:52:00.000Z",
+    "startedAt": "2026-09-05T13:52:00.000Z",
+    "updatedAt": "2026-09-05T13:54:00.000Z",
+    "finishedAt": "2026-09-05T13:54:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": false,
+      "action": "failed",
+      "reasonCode": "timed-out",
+      "message": "flush-cache did not finish within 120 s and was killed",
+      "exitCode": null,
+      "output": "clearing 41 GB\n"
+    },
+    "log": [
+      {
+        "at": "2026-09-05T13:52:00.000Z",
+        "line": "run flush-cache, timeout 120 s"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

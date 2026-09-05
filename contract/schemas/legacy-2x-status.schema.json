@@ -1,0 +1,271 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "legacy-2x-status.schema.json",
+  "title": "status from an agent 2.x",
+  "description": "What a machine that has not been upgraded yet still answers. There is no `contract` key at all, and that absence is the test: a client that finds no `contract` uses the key-sniffing paths it has always used and offers the agent install action. Nothing here is required of a 3.x agent beyond the keys it keeps, and no client may require a 3.x key of a reply shaped like this.",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "os": {
+      "enum": [
+        "linux",
+        "windows",
+        "mac"
+      ]
+    },
+    "system": {
+      "$ref": "common.schema.json#/$defs/systemIdentity"
+    },
+    "hostname": {
+      "$ref": "common.schema.json#/$defs/text"
+    },
+    "agentVersion": {
+      "type": "string",
+      "pattern": "^2\\."
+    },
+    "services": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/legacyService"
+      },
+      "maxItems": 50
+    },
+    "busy": {
+      "$ref": "#/$defs/legacyBusy"
+    },
+    "bootTargets": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/bootTarget"
+      },
+      "maxItems": 20
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/legacyAction"
+      },
+      "maxItems": 50
+    },
+    "autoUpdate": {
+      "type": "boolean"
+    },
+    "controller": {
+      "description": "2.x reports the hash and nothing else. No identity, no revision: a push from a 2.x Mac lands with id null and revision 0.",
+      "type": "object",
+      "properties": {
+        "hash": {
+          "$ref": "common.schema.json#/$defs/sha256OrNull"
+        }
+      },
+      "required": [
+        "hash"
+      ],
+      "additionalProperties": false
+    },
+    "notes": {
+      "$ref": "common.schema.json#/$defs/notes"
+    },
+    "t3": {
+      "$ref": "common.schema.json#/$defs/t3Legacy"
+    },
+    "pendingRestart": {
+      "type": "boolean"
+    },
+    "lastUpdate": {
+      "$ref": "common.schema.json#/$defs/lastUpdate"
+    },
+    "connect": {
+      "$ref": "common.schema.json#/$defs/relay"
+    },
+    "contract": false
+  },
+  "required": [
+    "ok",
+    "os",
+    "system",
+    "hostname",
+    "agentVersion",
+    "services",
+    "busy",
+    "bootTargets",
+    "actions",
+    "autoUpdate",
+    "controller",
+    "notes",
+    "t3",
+    "pendingRestart",
+    "lastUpdate",
+    "connect"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "legacyBusy": {
+      "description": "2.x busy: one boolean, one unknown flag, a reason, and the T3 counters. No `monitored`, no `evidence`, which is exactly why a 2.x reply cannot tell an unmonitored service from an idle one.",
+      "type": "object",
+      "properties": {
+        "busy": {
+          "type": "boolean"
+        },
+        "unknown": {
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "common.schema.json#/$defs/text"
+        },
+        "checkedAt": {
+          "$ref": "common.schema.json#/$defs/iso"
+        },
+        "error": {
+          "$ref": "common.schema.json#/$defs/textOrNull"
+        },
+        "runningTurns": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "pendingTurns": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "pendingApprovals": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "staleTurns": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "staleApprovals": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "threads": {
+          "type": "array",
+          "maxItems": 50
+        },
+        "threadsTruncated": {
+          "$ref": "common.schema.json#/$defs/count"
+        }
+      },
+      "required": [
+        "busy",
+        "unknown",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "legacyService": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/token"
+        },
+        "name": {
+          "$ref": "common.schema.json#/$defs/text"
+        },
+        "kind": {
+          "enum": [
+            "app",
+            "npm",
+            "command"
+          ]
+        },
+        "installed": {
+          "$ref": "common.schema.json#/$defs/version"
+        },
+        "latest": {
+          "$ref": "common.schema.json#/$defs/version"
+        },
+        "channel": {
+          "$ref": "common.schema.json#/$defs/textOrNull"
+        },
+        "upToDate": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "running": {
+          "type": "boolean"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "port": {
+          "$ref": "common.schema.json#/$defs/portOrNull"
+        },
+        "staged": {
+          "$ref": "common.schema.json#/$defs/version"
+        },
+        "appPath": {
+          "$ref": "common.schema.json#/$defs/textOrNull"
+        },
+        "busy": {
+          "$ref": "#/$defs/legacyBusy"
+        },
+        "relay": {
+          "$ref": "common.schema.json#/$defs/relay"
+        },
+        "pendingRestart": {
+          "type": "boolean"
+        },
+        "lastUpdate": {
+          "$ref": "common.schema.json#/$defs/lastUpdate"
+        },
+        "canUpdate": {
+          "type": "boolean"
+        },
+        "canRestart": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "installed",
+        "latest",
+        "channel",
+        "upToDate",
+        "running",
+        "healthy",
+        "port",
+        "staged",
+        "appPath",
+        "busy",
+        "relay",
+        "pendingRestart",
+        "lastUpdate",
+        "canUpdate",
+        "canRestart"
+      ],
+      "additionalProperties": false
+    },
+    "legacyAction": {
+      "description": "A 2.x action. No `kind`: 2.x had only configured commands, and the wol action arrived with contract 3.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/token"
+        },
+        "name": {
+          "$ref": "common.schema.json#/$defs/text"
+        },
+        "confirm": {
+          "$ref": "common.schema.json#/$defs/textOrNull"
+        },
+        "busyGated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "confirm",
+        "busyGated"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

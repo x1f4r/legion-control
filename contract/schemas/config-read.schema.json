@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "config-read.schema.json",
+  "title": "legionctl config",
+  "description": "The controller document this machine is holding, its hash, and who wrote it. The agent stores bytes and never interprets them, so `controller` is returned as it was given.",
+  "type": "object",
+  "allOf": [{ "$ref": "common.schema.json#/$defs/envelope" }],
+  "properties": {
+    "controller": { "$ref": "common.schema.json#/$defs/controllerDocument" },
+    "hash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+    "bytes": { "$ref": "common.schema.json#/$defs/count" },
+    "meta": { "$ref": "common.schema.json#/$defs/controllerMeta" },
+    "error": {
+      "description": "Set when a file is there and could not be read. The hash is still reported, so the authority pushes over it instead of leaving it to sit there.",
+      "$ref": "common.schema.json#/$defs/text"
+    }
+  },
+  "required": ["controller", "hash", "bytes", "meta"],
+  "unevaluatedProperties": false
+}

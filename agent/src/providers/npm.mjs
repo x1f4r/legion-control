@@ -13,10 +13,9 @@ import {
   defaultNpmPrefix,
   describeFailure,
   globalModulesDir,
-  loadState,
   runCommand,
-  saveState,
 } from '../config.mjs';
+import { loadCache, saveCache } from '../state.mjs';
 
 const LATEST_CACHE_MS = 10 * 60 * 1000;
 const PREFIX_PROBE_INTERVAL_MS = 10 * 60 * 1000;
@@ -42,8 +41,8 @@ export function installedVersionAt(service, prefix) {
  * npm's own JS entry point with the running Node binary. That also guarantees
  * npm runs on the same Node we are running on.
  */
-export function npmInvocation(prefix) {
-  const nodeDir = path.dirname(process.execPath);
+export function npmInvocation(prefix, { platform = process.platform, nodePath = process.execPath, searchPath = process.env.PATH ?? '' } = {}) {
+  const nodeDir = path.dirname(nodePath);
   const candidates = [
     // Windows layout: C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js
     path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
@@ -52,22 +51,44 @@ export function npmInvocation(prefix) {
   ];
   if (prefix) candidates.push(path.join(globalModulesDir(prefix), 'npm', 'bin', 'npm-cli.js'));
 
+  if (platform === 'win32') {
+    // npm may belong to a different Node installation on PATH. Resolve its
+    // launcher as a file, then inspect the standard adjacent JavaScript entry;
+    // never ask cmd.exe to interpret package names or --prefix arguments.
+    for (const raw of searchPath.split(';')) {
+      const directory = raw.replace(/^"(.*)"$/, '$1');
+      if (!path.isAbsolute(directory)) continue;
+      const launcher = path.join(directory, 'npm.cmd');
+      try {
+        if (!fs.statSync(launcher).isFile()) continue;
+        for (const location of [launcher, fs.realpathSync(launcher)]) {
+          candidates.push(path.join(path.dirname(location), 'node_modules', 'npm', 'bin', 'npm-cli.js'));
+        }
+      } catch { /* this PATH entry does not contain an accessible launcher */ }
+    }
+  }
+
   for (const candidate of candidates) {
     try {
-      if (fs.existsSync(candidate)) return { file: process.execPath, lead: [candidate], shell: false };
+      if (fs.statSync(candidate).isFile()) return { file: nodePath, lead: [candidate], shell: false };
     } catch {
       /* try the next candidate */
     }
   }
 
-  // Last resort. On Windows this needs a shell because npm.cmd is a batch file;
-  // every path we pass is space-free by design, so the quoting stays intact.
-  if (process.platform === 'win32') return { file: 'npm.cmd', lead: [], shell: true };
+  if (platform === 'win32') return {
+    file: null, lead: [], shell: false,
+    error: 'npm-cli.js could not be located beside Node, the npm prefix, or an npm.cmd launcher on PATH; install npm with Node before retrying',
+  };
   return { file: 'npm', lead: [], shell: false };
 }
 
 export function runNpm(args, options = {}) {
   const invocation = npmInvocation(options.prefix);
+  if (invocation.error) return {
+    ok: false, code: null, signal: null, stdout: '', stderr: '', timedOut: false,
+    error: invocation.error, command: 'npm',
+  };
   return runCommand(invocation.file, [...invocation.lead, ...args], {
     timeoutMs: options.timeoutMs ?? 60000,
     shell: invocation.shell,
@@ -80,13 +101,13 @@ export function runNpm(args, options = {}) {
  * silently make us report "not installed". Probe results are cached in
  * state.json, and a failed probe is rate limited so `status` stays fast.
  */
-export function resolveNpmPrefix(service, { allowProbe = true } = {}) {
+export function resolveNpmPrefix(service, { allowProbe = true, readOnly = false } = {}) {
   if (typeof service.npmPrefix === 'string' && service.npmPrefix.length > 0) return service.npmPrefix;
 
   const fallback = defaultNpmPrefix();
   if (installedVersionAt(service, fallback) !== null) return fallback;
 
-  const state = loadState();
+  const state = loadCache({ readOnly });
   // The first version of the agent kept one prefix at the top level, because it
   // only ever looked after one package. Both are read; only the keyed form is
   // written from here on.
@@ -99,10 +120,10 @@ export function resolveNpmPrefix(service, { allowProbe = true } = {}) {
 
   const result = runNpm(['prefix', '--global'], { timeoutMs: 15000 });
   const probed = result.ok ? result.stdout.trim().split('\n').pop()?.trim() : '';
-  saveState({
+  saveCache((current) => ({
     npmPrefixProbedAt: new Date().toISOString(),
-    npmPrefixes: { ...(state.npmPrefixes ?? {}), [service.id]: probed && probed.length > 0 ? probed : cached ?? null },
-  });
+    npmPrefixes: { ...(current.npmPrefixes ?? {}), [service.id]: probed && probed.length > 0 ? probed : cached ?? null },
+  }));
   return probed && probed.length > 0 ? probed : fallback;
 }
 
@@ -112,8 +133,8 @@ export function installedVersion(service, options = {}) {
 }
 
 /** Where npm installed the package; a running server's command line contains it. */
-export function packageRoot(service, { allowProbe = false } = {}) {
-  return path.join(globalModulesDir(resolveNpmPrefix(service, { allowProbe })), service.package);
+export function packageRoot(service, { allowProbe = false, readOnly = false } = {}) {
+  return path.join(globalModulesDir(resolveNpmPrefix(service, { allowProbe, readOnly })), service.package);
 }
 
 /** The pattern a resolved version has to match before it is handed to npm install. */
@@ -155,8 +176,8 @@ export function channelCacheKey(service, source) {
   return `${source}:${service.id}:${service.channel || 'latest'}`;
 }
 
-function readChannelCache(key, maxAgeMs) {
-  const cache = loadState().channelCache;
+function readChannelCache(key, maxAgeMs, readOnly = false) {
+  const cache = loadCache({ readOnly }).channelCache;
   const entry = cache?.[key];
   const cachedAt = Date.parse(entry?.at ?? '');
   if (entry && typeof entry.version === 'string' && !Number.isNaN(cachedAt) && Date.now() - cachedAt < maxAgeMs) {
@@ -165,31 +186,35 @@ function readChannelCache(key, maxAgeMs) {
   return null;
 }
 
-export function writeChannelCache(key, version) {
-  const cache = loadState().channelCache;
-  const kept = {};
-  // The first version of the agent kept one flat entry here rather than a map,
-  // because it only ever looked up one thing. Its leftover keys are dropped on
-  // the first write instead of being carried around forever.
-  if (cache && typeof cache === 'object' && !Array.isArray(cache)) {
-    for (const [name, entry] of Object.entries(cache)) {
-      if (entry && typeof entry === 'object' && typeof entry.version === 'string') kept[name] = entry;
+export function writeChannelCache(key, version, options = {}) {
+  // Computed inside the transaction, so two services caching a lookup at the
+  // same moment cannot drop each other's entry.
+  saveCache((current) => {
+    const cache = current.channelCache;
+    const kept = {};
+    // The first version of the agent kept one flat entry here rather than a map,
+    // because it only ever looked up one thing. Its leftover keys are dropped on
+    // the first write instead of being carried around forever.
+    if (cache && typeof cache === 'object' && !Array.isArray(cache)) {
+      for (const [name, entry] of Object.entries(cache)) {
+        if (entry && typeof entry === 'object' && typeof entry.version === 'string') kept[name] = entry;
+      }
     }
-  }
-  saveState({ channelCache: { ...kept, [key]: { version, at: new Date().toISOString() } } });
+    return { channelCache: { ...kept, [key]: { version, at: new Date().toISOString() } } };
+  }, options);
 }
 
-export function cachedLookup(key, { maxAgeMs = LATEST_CACHE_MS } = {}, fetcher) {
-  const hit = readChannelCache(key, maxAgeMs);
+export function cachedLookup(key, { maxAgeMs = LATEST_CACHE_MS, readOnly = false, cacheWaitMs } = {}, fetcher) {
+  const hit = readChannelCache(key, maxAgeMs, readOnly);
   if (hit) return { version: hit, cached: true, error: null };
   const fresh = fetcher();
   if (fresh && typeof fresh.then === 'function') {
     return fresh.then((value) => {
-      if (value.version) writeChannelCache(key, value.version);
+      if (value.version) writeChannelCache(key, value.version, { skipMigration: readOnly, waitMs: cacheWaitMs });
       return { ...value, cached: false };
     });
   }
-  if (fresh.version) writeChannelCache(key, fresh.version);
+  if (fresh.version) writeChannelCache(key, fresh.version, { skipMigration: readOnly, waitMs: cacheWaitMs });
   return { ...fresh, cached: false };
 }
 

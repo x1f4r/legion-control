@@ -1,17 +1,38 @@
 {
+  "configVersion": 3,
   "system": { "id": "windows", "name": "Windows 11" },
-  "autoUpdate": true,
+  "updates": {
+    "automatic": true,
+    "pauseUntil": null,
+    "maintenanceWindows": [{ "days": ["sat", "sun"], "from": "02:00", "to": "06:00" }]
+  },
   "services": [
     {
-      "id": "t3",
-      "name": "T3 Code",
+      "id": "dashboard",
+      "name": "Home Dashboard",
       "kind": "npm",
-      "package": "t3",
-      "channel": "nightly",
-      "versionPattern": "^\\d+\\.\\d+\\.\\d+-nightly\\.\\d+\\.\\d+$",
-      "process": { "type": "scheduled-task", "task": "T3 Code Connect" },
-      "health": { "type": "http", "port": 3773, "path": "/" },
-      "busy": { "type": "t3-sqlite", "staleHours": 6 }
+      "package": "@example/dashboard",
+      "channel": "latest",
+      "versionPattern": "^\\d+\\.\\d+\\.\\d+$",
+      "process": { "type": "scheduled-task", "task": "Home Dashboard" },
+      "health": { "type": "http", "port": 8080, "path": "/healthz" },
+      "busy": { "type": "http", "port": 8080, "path": "/status", "busyWhen": "jobs.running" },
+      "lockFile": "C:\\Users\\me\\.legion-control\\update.lock"
+    },
+    {
+      "id": "stream",
+      "name": "Stream Host",
+      "kind": "command",
+      "installedVersion": ["powershell", "-NoProfile", "-Command", "(Get-Item 'C:\\Program Files\\StreamHost\\stream.exe').VersionInfo.ProductVersion"],
+      "process": {
+        "type": "command",
+        "start": ["powershell", "-NoProfile", "-Command", "Start-Service", "StreamHost"],
+        "stop": ["powershell", "-NoProfile", "-Command", "Stop-Service", "StreamHost"],
+        "running": ["powershell", "-NoProfile", "-Command", "if ((Get-Service StreamHost).Status -ne 'Running') { exit 1 }"]
+      },
+      "health": { "type": "http", "port": 47990, "path": "/" },
+      "busy": { "type": "none" },
+      "updates": { "automatic": false }
     }
   ],
   "boot": {
@@ -23,5 +44,6 @@
     "before": [],
     "settle": 2,
     "tools": ["C:\\Tools\\PSTools\\psshutdown64.exe"]
-  }
+  },
+  "actions": []
 }

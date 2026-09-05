@@ -7,6 +7,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.longOrNull
 
 /**
  * The setup, as the machines carry it.
@@ -18,11 +19,12 @@ import kotlinx.serialization.json.contentOrNull
  *
  * The document itself is never interpreted here. It is handed on as text and validated by the same
  * code that validates a paste, because a document that came off a machine deserves exactly as much
- * suspicion as one that came off a clipboard.
+ * suspicion as one that came off a clipboard. What is read here beside the text is its provenance:
+ * who wrote it and which revision it is, because a copy that differs is not a copy that is newer.
  */
 sealed interface ControllerFetch {
-    /** A document, and the hash the machine that served it gave it. */
-    data class Document(val text: String, val hash: String?) : ControllerFetch
+    /** A document, and everything the machine that served it said about where it came from. */
+    data class Document(val text: String, val provenance: SetupProvenance) : ControllerFetch
 
     /** The agent knows what a setup is and has none. Nothing has been shared with it yet. */
     data object NothingStored : ControllerFetch
@@ -43,13 +45,43 @@ sealed interface ControllerFetch {
  * These are the paths the installers write and nothing else. A machine in the configuration is
  * reached with the argv the configuration names; this list exists for the one machine that is not
  * in any configuration yet, because it is the machine the configuration is about to come from.
+ *
+ * Built through the quoting rules rather than by pasting a user name into a string. A user name with
+ * a space in it is unusual and it is not impossible, and it is the one value here that comes from
+ * outside.
  */
-fun setupCommands(user: String): List<String> = listOf(
-    "/usr/bin/node /home/$user/.legion-control/agent/src/index.mjs config",
-    "node C:\\Users\\$user\\.legion-control\\agent\\src\\index.mjs config",
-    "node ~/.legion-control/agent/src/index.mjs config",
-    "/opt/homebrew/bin/node ~/.legion-control/agent/src/index.mjs config",
+fun setupCommands(user: String): List<SetupCommand> = listOf(
+    SetupCommand(
+        RemoteShell.POSIX,
+        listOf("/usr/bin/node", "/home/$user/.legion-control/agent/src/index.mjs", "config"),
+    ),
+    SetupCommand(
+        RemoteShell.POSIX,
+        listOf("node", "~/.legion-control/agent/src/index.mjs", "config"),
+    ),
+    SetupCommand(
+        RemoteShell.POSIX,
+        listOf("/opt/homebrew/bin/node", "~/.legion-control/agent/src/index.mjs", "config"),
+    ),
+    SetupCommand(
+        RemoteShell.CMD,
+        listOf("node", "C:\\Users\\$user\\.legion-control\\agent\\src\\index.mjs", "config"),
+    ),
+    SetupCommand(
+        RemoteShell.POWERSHELL,
+        listOf("node", "C:\\Users\\$user\\.legion-control\\agent\\src\\index.mjs", "config"),
+    ),
 )
+
+/** One layout to try: which shell to write it for, and the argv to write. */
+data class SetupCommand(val shell: RemoteShell, val arguments: List<String>) {
+    /** Null when the user name cannot be written for that shell, which is a reason to skip it. */
+    fun line(): String? = try {
+        buildRemoteCommand(shell, arguments)
+    } catch (_: UnquotableArgument) {
+        null
+    }
+}
 
 /**
  * Runs `config` on one address, with this phone's own key, and reads what came back.
@@ -61,8 +93,14 @@ fun setupCommands(user: String): List<String> = listOf(
  */
 suspend fun fetchController(transport: SshTransport, endpoint: Endpoint): ControllerFetch {
     var detail: String? = null
+    // Two shapes can produce the same line: when nothing in a command needs quoting, the cmd.exe and
+    // the PowerShell forms are byte for byte the same, and running it twice would only cost a round
+    // trip against a machine that has already said no once.
+    val tried = mutableSetOf<String>()
     for (command in setupCommands(endpoint.user)) {
-        val outcome = transport.run(endpoint, command, FETCH_TIMEOUT_MILLIS)
+        val line = command.line() ?: continue
+        if (!tried.add(line)) continue
+        val outcome = transport.run(endpoint, line, FETCH_TIMEOUT_MILLIS)
         val reply = readControllerReply(outcome.stdout)
         if (reply != ControllerFetch.Unreadable) return reply
         if (detail == null) {
@@ -98,27 +136,83 @@ fun readControllerReply(stdout: String): ControllerFetch {
  * `controller` of null decode to the same null, and they mean opposite things: one is an agent too
  * old to have anything to say, the other is a current agent saying it holds nothing.
  */
-fun readControllerReply(reply: JsonObject): ControllerFetch {
+fun readControllerReply(reply: JsonObject, source: String? = null): ControllerFetch {
     val document = reply["controller"] ?: return ControllerFetch.TooOld
     if (document is JsonNull) return ControllerFetch.NothingStored
     if (document !is JsonObject) return ControllerFetch.Unreadable
-    val hash = (reply["hash"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
     return ControllerFetch.Document(
         text = SetupJson.encodeToString(JsonObject.serializer(), document),
-        hash = hash,
+        provenance = provenanceOf(envelope = reply, document = document, readFrom = source),
     )
 }
 
 /**
- * Whether a status that reported [reported] is a reason to go and read the document.
+ * The identity a machine reports in `status`, without fetching the document.
  *
- * [applied] is the hash of what the phone is running on, so a machine that agrees with it is
- * carrying nothing new. [lastSeen] is the last hash this machine reported, and it is what keeps a
- * document that will not validate from being fetched again every fifteen seconds: it is refused
- * once, and asking the same machine for the same bytes again would only be refused the same way.
+ * This is the cheap half of the freshness check: every status carries the mark, and only a mark that
+ * says something genuinely newer is worth a second round trip for the bytes.
  */
-fun shouldFetchSetup(reported: String?, applied: String?, lastSeen: String?): Boolean =
-    !reported.isNullOrBlank() && reported != applied && reported != lastSeen
+fun provenanceOf(mark: ControllerMark?, readFrom: String?): SetupProvenance? {
+    if (mark == null) return null
+    if (mark.hash.isNullOrBlank() && mark.id.isNullOrBlank()) return null
+    return SetupProvenance(
+        authority = mark.id?.takeIf { it.isNotBlank() },
+        revision = mark.revision,
+        hash = mark.hash?.takeIf { it.isNotBlank() },
+        updatedAt = mark.updatedAt,
+        sourceKind = mark.source,
+        readFrom = readFrom,
+    )
+}
+
+/**
+ * Who wrote this document and which revision it is, from the envelope first and the document second.
+ *
+ * The envelope is the agent's own statement about the copy it holds and is preferred. The document
+ * carries the same two fields for the case the envelope does not, which is every agent that predates
+ * the idea, and for a document pasted in by hand where there is no envelope at all.
+ */
+fun provenanceOf(
+    envelope: JsonObject?,
+    document: JsonObject?,
+    readFrom: String? = null,
+    hashOverride: String? = null,
+): SetupProvenance {
+    // `config` returns { controller, hash, meta } and `status` returns a controllerMark under
+    // `controller`. Both are read, meta first, because meta is what the agent writes in the same
+    // transaction as the document itself and is therefore the one that cannot be half true.
+    val meta = envelope?.get("meta") as? JsonObject
+    val mark = envelope?.get("controller") as? JsonObject
+
+    fun text(vararg keys: String): String? = keys.firstNotNullOfOrNull { key ->
+        listOfNotNull(meta, envelope).firstNotNullOfOrNull { holder ->
+            (holder[key] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    fun revision(): Long? = listOfNotNull(meta, envelope, mark).firstNotNullOfOrNull { holder ->
+        (holder["revision"] as? JsonPrimitive)?.let { it.longOrNull ?: it.contentOrNull?.toLongOrNull() }
+    }
+
+    // A document may also carry its own identity, which is how a hand-pasted one gets ordered at
+    // all. The agent's metadata is preferred: it is a statement about the copy this machine holds.
+    val inner = document?.get("controller") as? JsonObject
+
+    fun documentText(key: String): String? =
+        (inner?.get(key) as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+
+    fun documentRevision(): Long? = (inner?.get("revision") as? JsonPrimitive)
+        ?.let { it.longOrNull ?: it.contentOrNull?.toLongOrNull() }
+
+    return SetupProvenance(
+        authority = text("id", "controllerId", "authority") ?: documentText("id"),
+        revision = revision() ?: documentRevision(),
+        hash = hashOverride ?: text("hash"),
+        updatedAt = text("updatedAt") ?: documentText("updatedAt"),
+        sourceKind = text("source"),
+        readFrom = readFrom,
+    )
+}
 
 /**
  * Written back out rather than passed through, because the bytes on the far side are one line of

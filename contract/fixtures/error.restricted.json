@@ -1,0 +1,33 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "restricted",
+  "message": "this key may run status, busy, update, restart, boot, sleep, run, cycle, op, cancel, history, logs, doctor, bundle, config, policy and version on this agent, and nothing else; \"ls\" was refused",
+  "command": null,
+  "argument": "ls",
+  "accepts": [
+    "status",
+    "busy",
+    "update",
+    "restart",
+    "boot",
+    "sleep",
+    "run",
+    "cycle",
+    "op",
+    "cancel",
+    "history",
+    "logs",
+    "doctor",
+    "bundle",
+    "config",
+    "policy",
+    "version"
+  ],
+  "error": "restricted session: \"ls\" is not an allowed command"
+}

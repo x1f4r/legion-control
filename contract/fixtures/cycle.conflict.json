@@ -1,0 +1,22 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "lock-held",
+  "message": "an update of t3 has held the lock since 2026-09-05T14:00:01.000Z; this cycle did nothing",
+  "action": "conflict",
+  "dryRun": false,
+  "op": null,
+  "children": [],
+  "conflict": {
+    "opId": "6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3",
+    "kind": "update",
+    "service": "t3",
+    "phase": "installing",
+    "startedAt": "2026-09-05T14:00:01.000Z"
+  }
+}

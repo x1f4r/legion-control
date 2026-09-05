@@ -1,0 +1,107 @@
+{
+  "ok": true,
+  "os": "linux",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "hostname": "atlas",
+  "agentVersion": "2.1.0",
+  "services": [
+    {
+      "id": "t3",
+      "name": "T3 Code",
+      "kind": "npm",
+      "installed": "0.0.36-nightly.20260904",
+      "latest": "0.0.37-nightly.20260905",
+      "channel": "nightly",
+      "upToDate": false,
+      "running": true,
+      "healthy": true,
+      "port": 8081,
+      "staged": null,
+      "appPath": null,
+      "busy": {
+        "busy": true,
+        "unknown": false,
+        "reason": "1 turn running",
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "error": null,
+        "runningTurns": 1,
+        "pendingTurns": 0,
+        "pendingApprovals": 0,
+        "staleTurns": 0,
+        "staleApprovals": 0,
+        "threads": [],
+        "threadsTruncated": 0
+      },
+      "relay": {
+        "configured": true,
+        "running": true
+      },
+      "pendingRestart": false,
+      "lastUpdate": {
+        "at": "2026-09-04T14:00:00.000Z",
+        "from": "0.0.35-nightly.20260903",
+        "to": "0.0.36-nightly.20260904",
+        "result": "updated",
+        "message": "updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904"
+      },
+      "canUpdate": true,
+      "canRestart": true
+    }
+  ],
+  "busy": {
+    "busy": true,
+    "unknown": false,
+    "reason": "1 turn running",
+    "checkedAt": "2026-09-05T14:00:00.000Z",
+    "error": null,
+    "runningTurns": 1,
+    "pendingTurns": 0,
+    "pendingApprovals": 0,
+    "staleTurns": 0,
+    "staleApprovals": 0,
+    "threads": [],
+    "threadsTruncated": 0
+  },
+  "bootTargets": [
+    {
+      "id": "windows",
+      "name": "Windows 11"
+    }
+  ],
+  "actions": [
+    {
+      "id": "sunshine-restart",
+      "name": "Restart Sunshine",
+      "confirm": null,
+      "busyGated": true
+    }
+  ],
+  "autoUpdate": true,
+  "controller": {
+    "hash": "3d7251f8764668f6dd9be0e0dcae3ea2ba4a6ecbf07cd0b21f6f66a35bcae6ee"
+  },
+  "notes": [],
+  "t3": {
+    "installed": "0.0.36-nightly.20260904",
+    "nightly": "0.0.37-nightly.20260905",
+    "upToDate": false,
+    "serverRunning": true,
+    "healthy": true,
+    "port": 8081
+  },
+  "pendingRestart": false,
+  "lastUpdate": {
+    "at": "2026-09-04T14:00:00.000Z",
+    "from": "0.0.35-nightly.20260903",
+    "to": "0.0.36-nightly.20260904",
+    "result": "updated",
+    "message": "updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904"
+  },
+  "connect": {
+    "configured": true,
+    "running": true
+  }
+}

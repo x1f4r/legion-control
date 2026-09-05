@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "config-set.schema.json",
+  "title": "legionctl config set",
+  "description": "Replace the stored controller document with what is on stdin. Acceptance is decided by ANCESTRY, not by revision order: the push is taken when the hash the machine holds is the pushed hash (noop) or appears in the pushed document's lineage (fast-forward). A pushed hash that appears in the HELD lineage means the pusher is behind (stale-revision); anything else is real divergence (controller-conflict, divergent true) and stops at a person. A different setup id needs --replace, which is a human decision and is never sent automatically.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "description": "A push that landed says which of the three things it did.",
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        },
+        "required": [
+          "ok"
+        ]
+      },
+      "then": {
+        "required": [
+          "action"
+        ]
+      },
+      "else": {
+        "properties": {
+          "action": false
+        }
+      }
+    },
+    {
+      "description": "Every refusal says what the machine is still holding, in the terms that decide what the client does next. A document refusal names the held copy and its lineage; a lock refusal names the operation in the way.",
+      "if": {
+        "properties": {
+          "ok": {
+            "const": false
+          }
+        },
+        "required": [
+          "ok"
+        ]
+      },
+      "then": {
+        "required": [
+          "reasonCode"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "reasonCode": {
+                  "enum": [
+                    "stale-revision",
+                    "controller-conflict"
+                  ]
+                }
+              },
+              "required": [
+                "reasonCode"
+              ]
+            },
+            "then": {
+              "required": [
+                "current"
+              ]
+            }
+          },
+          {
+            "description": "Divergence is the one thing the client cannot infer from the code alone: a controller-conflict is either two setups or two branches of one, and only the second is a merge.",
+            "if": {
+              "properties": {
+                "reasonCode": {
+                  "const": "controller-conflict"
+                }
+              },
+              "required": [
+                "reasonCode"
+              ]
+            },
+            "then": {
+              "required": [
+                "divergent"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "reasonCode": {
+                  "const": "operation-in-progress"
+                }
+              },
+              "required": [
+                "reasonCode"
+              ]
+            },
+            "then": {
+              "required": [
+                "conflict"
+              ],
+              "properties": {
+                "current": false,
+                "divergent": false
+              }
+            }
+          }
+        ],
+        "properties": {
+          "reasonCode": {
+            "enum": [
+              "stale-revision",
+              "controller-conflict",
+              "bad-argument",
+              "config-invalid",
+              "operation-in-progress"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "divergent": false,
+          "conflict": false,
+          "current": false
+        }
+      }
+    },
+    {
+      "description": "noop means nothing was written, so the hash the machine holds is the hash that was pushed.",
+      "if": {
+        "properties": {
+          "action": {
+            "const": "noop"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "hash": {
+            "$ref": "common.schema.json#/$defs/sha256"
+          }
+        }
+      }
+    },
+    {
+      "description": "replaced is only ever the answer to an explicit --replace.",
+      "if": {
+        "properties": {
+          "action": {
+            "const": "replaced"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "replaced"
+        ],
+        "properties": {
+          "replaced": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "hash": {
+      "$ref": "common.schema.json#/$defs/sha256OrNull"
+    },
+    "bytes": {
+      "$ref": "common.schema.json#/$defs/count"
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/tokenOrNull"
+    },
+    "revision": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "source": {
+      "$ref": "common.schema.json#/$defs/controllerSource"
+    },
+    "replaced": {
+      "description": "True when --replace was given and an existing copy under a different identity was overwritten.",
+      "type": "boolean"
+    },
+    "current": {
+      "description": "What the machine is still holding after a refusal.",
+      "$ref": "common.schema.json#/$defs/controllerMeta"
+    },
+    "error": {
+      "$ref": "common.schema.json#/$defs/text"
+    },
+    "action": {
+      "description": "stored: the document was written (a first copy or a fast-forward). noop: the machine already holds exactly these bytes, so nothing was written and a retried push is safe. replaced: --replace was given and a copy under a different setup id was overwritten. Present only on success: a refusal wrote nothing and has no outcome to name.",
+      "enum": [
+        "stored",
+        "noop",
+        "replaced"
+      ]
+    },
+    "divergent": {
+      "description": "Set on a refusal. True when neither side descends from the other, which is the case a person has to merge; false when the pusher is simply behind, which the pusher fixes by fetching.",
+      "type": "boolean"
+    },
+    "lineage": {
+      "description": "The lineage of the document now stored, echoed back so a client can confirm what it published without another read.",
+      "$ref": "common.schema.json#/$defs/lineage"
+    },
+    "device": {
+      "$ref": "common.schema.json#/$defs/textOrNull"
+    },
+    "conflict": {
+      "description": "Set when the refusal is the machine-wide operation lock rather than anything about the document: a setup change during a running update could be read half-written by that update.",
+      "$ref": "common.schema.json#/$defs/opConflict"
+    }
+  },
+  "required": [
+    "hash",
+    "bytes",
+    "id",
+    "revision"
+  ],
+  "unevaluatedProperties": false
+}

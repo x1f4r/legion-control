@@ -1,0 +1,260 @@
+{
+  "$schema": "./schemas/hash-vectors.schema.json",
+  "contract": 3,
+  "algorithm": "sha256",
+  "encoding": "lowercase hex of the sha256 of the canonical UTF-8 bytes",
+  "steps": [
+    "Decode the bytes as UTF-8. Refuse anything that is not valid UTF-8; it has no hash.",
+    "Strip one leading U+FEFF, if and only if it is the very first code point.",
+    "Replace every CRLF with LF, then every remaining lone CR with LF.",
+    "Remove code points U+0009, U+000A, U+000B, U+000C, U+000D and U+0020 from both ends, and nothing else. Do not use the language runtime’s own trim.",
+    "Append exactly one LF.",
+    "Encode as UTF-8. The hash is the lowercase hex sha256 of those bytes, and those bytes are what is stored on disk."
+  ],
+  "trimCodePoints": [
+    "U+0009",
+    "U+000A",
+    "U+000B",
+    "U+000C",
+    "U+000D",
+    "U+0020"
+  ],
+  "notes": [
+    "inputBase64 is base64 of the raw input bytes; canonicalBase64 is base64 of the bytes after the steps above. Both are base64 because a JSON string cannot carry a lone CR or an invalid byte.",
+    "accepted is whether the agent stores the document at all. A vector with accepted false still has a hash when its bytes are valid UTF-8, because canonicalisation happens before the document is inspected; the store then refuses it and the hash is never published.",
+    "A client that implements this rule correctly reproduces canonicalBase64 and sha256 for every vector, and refuses every vector whose sha256 is null."
+  ],
+  "vectors": [
+    {
+      "name": "plain-no-trailing-newline",
+      "purpose": "The baseline. Every other vector that ends in the same document must produce this same hash.",
+      "inputBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQ==",
+      "inputBytes": 172,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "plain-one-trailing-newline",
+      "purpose": "A file the editor ended properly. Same document, so the same hash as plain-no-trailing-newline.",
+      "inputBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "inputBytes": 173,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "many-trailing-newlines",
+      "purpose": "Three blank lines at the end collapse to exactly one newline, not to three and not to none.",
+      "inputBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQoKCgo=",
+      "inputBytes": 176,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "crlf",
+      "purpose": "The same document after a Windows editor. Every CRLF becomes one LF; the hash does not change.",
+      "inputBase64": "ew0KICAidmVyc2lvbiI6IDEsDQogICJtYWNoaW5lcyI6IFsNCiAgICB7DQogICAgICAiaWQiOiAiYXRsYXMiLA0KICAgICAgIm5hbWUiOiAiQXRsYXMiLA0KICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQ0KICAgIH0NCiAgXQ0KfQ==",
+      "inputBytes": 181,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "crlf-and-trailing-crlf",
+      "purpose": "CRLF throughout and a CRLF at the end. Catches an implementation that converts endings after trimming.",
+      "inputBase64": "ew0KICAidmVyc2lvbiI6IDEsDQogICJtYWNoaW5lcyI6IFsNCiAgICB7DQogICAgICAiaWQiOiAiYXRsYXMiLA0KICAgICAgIm5hbWUiOiAiQXRsYXMiLA0KICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQ0KICAgIH0NCiAgXQ0KfQ0K",
+      "inputBytes": 183,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "cr-only",
+      "purpose": "Lone carriage returns, as a classic Mac editor or a mangled transfer leaves them. Each becomes one LF.",
+      "inputBase64": "ew0gICJ2ZXJzaW9uIjogMSwNICAibWFjaGluZXMiOiBbDSAgICB7DSAgICAgICJpZCI6ICJhdGxhcyIsDSAgICAgICJuYW1lIjogIkF0bGFzIiwNICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQ0gICAgfQ0gIF0NfQ==",
+      "inputBytes": 172,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "bom",
+      "purpose": "A byte order mark from a Windows text editor. Stripped, so the hash matches the plain document.",
+      "inputBase64": "77u/ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQ==",
+      "inputBytes": 175,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "bom-crlf-trailing-blank-lines",
+      "purpose": "The full Windows treatment at once: BOM, CRLF, and blank lines at the end. Still the same hash.",
+      "inputBase64": "77u/ew0KICAidmVyc2lvbiI6IDEsDQogICJtYWNoaW5lcyI6IFsNCiAgICB7DQogICAgICAiaWQiOiAiYXRsYXMiLA0KICAgICAgIm5hbWUiOiAiQXRsYXMiLA0KICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQ0KICAgIH0NCiAgXQ0KfQ0KDQo=",
+      "inputBytes": 188,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "leading-blank-lines-and-spaces",
+      "purpose": "A document pasted into a text field that added a blank line and some indentation in front of it.",
+      "inputBase64": "CgogICAJewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQ==",
+      "inputBytes": 178,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "surrounded-by-whitespace",
+      "purpose": "Whitespace of every kind in the trim set on both ends: tab, vertical tab, form feed, space, newline.",
+      "inputBase64": "CwwgCQp7CiAgInZlcnNpb24iOiAxLAogICJtYWNoaW5lcyI6IFsKICAgIHsKICAgICAgImlkIjogImF0bGFzIiwKICAgICAgIm5hbWUiOiAiQXRsYXMiLAogICAgICAiZW5kcG9pbnRzIjogW3sgImhvc3QiOiAiMTAwLjExMy42NS4yIiwgInVzZXIiOiAieDFmNHIiLCAicG9ydCI6IDIyIH1dCiAgICB9CiAgXQp9CiAJCww=",
+      "inputBytes": 182,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJhdGxhcyIsCiAgICAgICJuYW1lIjogIkF0bGFzIiwKICAgICAgImVuZHBvaW50cyI6IFt7ICJob3N0IjogIjEwMC4xMTMuNjUuMiIsICJ1c2VyIjogIngxZjRyIiwgInBvcnQiOiAyMiB9XQogICAgfQogIF0KfQo=",
+      "canonicalBytes": 173,
+      "sha256": "3d7251f876466500efb7bf14e6fc318b94529855d247dd8b24aee9c09c7f08b3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "non-ascii",
+      "purpose": "Umlauts, an em dash, CJK and an emoji with a variation selector. Hashed as UTF-8 bytes, not as UTF-16 units.",
+      "inputBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7ICJpZCI6ICJidXJvIiwgIm5hbWUiOiAiQsO8cm8g4oCUIOWkp+WggiDimIDvuI8iLCAiZW5kcG9pbnRzIjogW10gfQogIF0KfQ==",
+      "inputBytes": 112,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7ICJpZCI6ICJidXJvIiwgIm5hbWUiOiAiQsO8cm8g4oCUIOWkp+WggiDimIDvuI8iLCAiZW5kcG9pbnRzIjogW10gfQogIF0KfQo=",
+      "canonicalBytes": 113,
+      "sha256": "1a5ee25ee34b222cc5cf4ef066a2e1ae17a68b91e37db3bfd40e1020cf9683db",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "non-ascii-bom-crlf",
+      "purpose": "The non-ASCII document after a round trip through a Windows editor. Same hash as non-ascii.",
+      "inputBase64": "77u/ew0KICAidmVyc2lvbiI6IDEsDQogICJtYWNoaW5lcyI6IFsNCiAgICB7ICJpZCI6ICJidXJvIiwgIm5hbWUiOiAiQsO8cm8g4oCUIOWkp+WggiDimIDvuI8iLCAiZW5kcG9pbnRzIjogW10gfQ0KICBdDQp9DQo=",
+      "inputBytes": 122,
+      "canonicalBase64": "ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7ICJpZCI6ICJidXJvIiwgIm5hbWUiOiAiQsO8cm8g4oCUIOWkp+WggiDimIDvuI8iLCAiZW5kcG9pbnRzIjogW10gfQogIF0KfQo=",
+      "canonicalBytes": 113,
+      "sha256": "1a5ee25ee34b222cc5cf4ef066a2e1ae17a68b91e37db3bfd40e1020cf9683db",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "escaped-crlf-inside-string",
+      "purpose": "A backslash-r backslash-n pair inside a JSON string is two characters of content and must survive untouched. An implementation that unescapes before normalising fails here.",
+      "inputBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W10sIm5vdGUiOiJsaW5lIG9uZVxyXG5saW5lIHR3byJ9",
+      "inputBytes": 57,
+      "canonicalBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W10sIm5vdGUiOiJsaW5lIG9uZVxyXG5saW5lIHR3byJ9Cg==",
+      "canonicalBytes": 58,
+      "sha256": "1ea8bb709cdd1c71951124aea165e91ccba82daa2e4501da572c4a2b633e873d",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "literal-cr-inside-string-is-not-json",
+      "purpose": "A raw carriage return inside a JSON string. Normalisation turns it into a raw newline, and both are illegal in JSON, so the document is refused rather than repaired.",
+      "inputBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W10sIm5vdGUiOiJsaW5lIG9uZQ1saW5lIHR3byJ9",
+      "inputBytes": 54,
+      "canonicalBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W10sIm5vdGUiOiJsaW5lIG9uZQpsaW5lIHR3byJ9Cg==",
+      "canonicalBytes": 55,
+      "sha256": "852e75690e47442d42c1fd26a68e7c1054c69a7d4693fcc99b504ab5798493cf",
+      "accepted": false,
+      "reject": "not-a-json-object"
+    },
+    {
+      "name": "bom-inside-document",
+      "purpose": "A byte order mark that is not the first code point is a zero width no-break space inside the document. It stays, so this hash differs from the plain one.",
+      "inputBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W10sIm5vdGUiOiJh77u/YiJ9",
+      "inputBytes": 42,
+      "canonicalBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W10sIm5vdGUiOiJh77u/YiJ9Cg==",
+      "canonicalBytes": 43,
+      "sha256": "4a88b8efec150b34a85424406b4263c65ee2343bc27da1636e3f0a38131ea2f4",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "leading-nbsp-is-not-trimmed",
+      "purpose": "A non-breaking space in front of the document. It is NOT in the trim set, so it stays and the document is refused as unparseable. An implementation that used JavaScript String.trim, Java String.strip or .NET Trim would strip it and produce the plain hash instead.",
+      "inputBase64": "wqB7CiAgInZlcnNpb24iOiAxLAogICJtYWNoaW5lcyI6IFsKICAgIHsKICAgICAgImlkIjogImF0bGFzIiwKICAgICAgIm5hbWUiOiAiQXRsYXMiLAogICAgICAiZW5kcG9pbnRzIjogW3sgImhvc3QiOiAiMTAwLjExMy42NS4yIiwgInVzZXIiOiAieDFmNHIiLCAicG9ydCI6IDIyIH1dCiAgICB9CiAgXQp9",
+      "inputBytes": 174,
+      "canonicalBase64": "wqB7CiAgInZlcnNpb24iOiAxLAogICJtYWNoaW5lcyI6IFsKICAgIHsKICAgICAgImlkIjogImF0bGFzIiwKICAgICAgIm5hbWUiOiAiQXRsYXMiLAogICAgICAiZW5kcG9pbnRzIjogW3sgImhvc3QiOiAiMTAwLjExMy42NS4yIiwgInVzZXIiOiAieDFmNHIiLCAicG9ydCI6IDIyIH1dCiAgICB9CiAgXQp9Cg==",
+      "canonicalBytes": 175,
+      "sha256": "2c72fe4610114627cdb2df1624a70f588922f18221ab65fa94f3413ad47db08d",
+      "accepted": false,
+      "reject": "not-a-json-object"
+    },
+    {
+      "name": "line-separator-is-not-a-line-ending",
+      "purpose": "U+2028 is a line separator to some editors and is not touched here: only CRLF and CR become LF.",
+      "inputBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W10sIm5vdGUiOiJhXHUyMDI4YiJ9",
+      "inputBytes": 45,
+      "canonicalBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W10sIm5vdGUiOiJhXHUyMDI4YiJ9Cg==",
+      "canonicalBytes": 46,
+      "sha256": "501b4809018ab05f89d80cfe17be20e591d75256c26872366d58fd34e575ced3",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "internal-whitespace-is-significant",
+      "purpose": "The baseline document with its indentation removed. A different byte string is a different document, so this hash differs from plain-no-trailing-newline. Reformatting a config is a real change and pushes.",
+      "inputBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W3siaWQiOiJhdGxhcyIsIm5hbWUiOiJBdGxhcyIsImVuZHBvaW50cyI6W3siaG9zdCI6IjEwMC4xMTMuNjUuMiIsInVzZXIiOiJ4MWY0ciIsInBvcnQiOjIyfV19XX0=",
+      "inputBytes": 119,
+      "canonicalBase64": "eyJ2ZXJzaW9uIjoxLCJtYWNoaW5lcyI6W3siaWQiOiJhdGxhcyIsIm5hbWUiOiJBdGxhcyIsImVuZHBvaW50cyI6W3siaG9zdCI6IjEwMC4xMTMuNjUuMiIsInVzZXIiOiJ4MWY0ciIsInBvcnQiOjIyfV19XX0K",
+      "canonicalBytes": 120,
+      "sha256": "1c680fab2eccf364f4f0a5c7ad12e9bae1897edf296e1f87b947f443bebc88f0",
+      "accepted": true,
+      "reject": null
+    },
+    {
+      "name": "single-newline-only",
+      "purpose": "A file containing nothing but a newline. Canonicalises to one newline, which is not a JSON object, so it is refused before it is ever stored.",
+      "inputBase64": "Cg==",
+      "inputBytes": 1,
+      "canonicalBase64": "Cg==",
+      "canonicalBytes": 1,
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "accepted": false,
+      "reject": "empty"
+    },
+    {
+      "name": "empty",
+      "purpose": "No bytes at all, which is what a failed upload leaves behind. Refused, never stored as an empty document.",
+      "inputBase64": "",
+      "inputBytes": 0,
+      "canonicalBase64": "Cg==",
+      "canonicalBytes": 1,
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "accepted": false,
+      "reject": "empty"
+    },
+    {
+      "name": "invalid-utf8",
+      "purpose": "A lone 0x80 continuation byte, as a truncated multi-byte transfer produces. Not valid UTF-8: the document is refused, and no hash exists for it. An implementation that decodes lossily would hash a document full of U+FFFD and agree with nobody.",
+      "inputBase64": "eyJ2gCJ9",
+      "inputBytes": 6,
+      "canonicalBase64": null,
+      "canonicalBytes": null,
+      "sha256": null,
+      "accepted": false,
+      "reject": "invalid-utf8"
+    }
+  ]
+}

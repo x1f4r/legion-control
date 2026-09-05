@@ -13,8 +13,8 @@ android {
         applicationId = "com.x1f4r.legioncontrol"
         minSdk = 30
         targetSdk = 36
-        versionCode = 9
-        versionName = "1.2.0"
+        versionCode = 10
+        versionName = "1.3.0"
 
         // The label lives here rather than in res/values/strings.xml so that the one string the
         // manifest needs cannot collide with the string table the UI owns.
@@ -93,12 +93,42 @@ android {
         }
     }
 
+    // The signed agent bundle, copied out of the repository's dist/ directory at build time.
+    //
+    // Copied rather than committed: it is a build output of scripts/package-agent.mjs, it is signed
+    // by the release key, and a client that carried its own copy in source control would be one more
+    // place for the two to drift apart. A build without it is normal and expected: every test and
+    // every debug build works, and the "install the control agent" action explains that this build
+    // carries nothing to install rather than offering something unverified.
+    sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/agentAssets"))
+
     lint {
         // The manifest names an activity the UI module supplies, so the class-existence check has
         // nothing to look at during a transport-only build.
         disable += "MissingClass"
     }
 }
+
+/**
+ * Puts the signed agent bundle where the app reads it, when there is one.
+ *
+ * The three names are the contract's exact basenames. Nothing here verifies the signature: that
+ * happens in the app, at run time, against the key pinned in Trust.kt, because a check performed by
+ * the thing doing the copying proves nothing about the thing doing the installing.
+ */
+val copyAgentBundle by tasks.registering(Sync::class) {
+    val dist = rootProject.layout.projectDirectory.dir("../dist")
+    val version = providers.gradleProperty("legion.agentVersion").getOrElse("3.0.0")
+    from(dist) {
+        include("legionctl-agent-$version.tgz")
+        include("Legion-Control-agent-manifest.json")
+        include("Legion-Control-agent-manifest.json.sig")
+    }
+    into(layout.buildDirectory.dir("generated/agentAssets/agent"))
+    // Sync also removes a previously bundled artifact when dist no longer supplies it.
+}
+
+tasks.named("preBuild") { dependsOn(copyAgentBundle) }
 
 dependencies {
     coreLibraryDesugaring(libs.desugar.jdk.libs)
@@ -129,4 +159,12 @@ dependencies {
     // sshj logs through slf4j. Without a binding, slf4j 2 falls back to a no-op and prints a warning
     // on first use; this sends the same lines to logcat instead, which is where they are useful.
     runtimeOnly(libs.slf4j.android)
+}
+
+// Shared contract and signature fixtures are test inputs even though they live outside Android.
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    inputs.files(rootProject.fileTree("../contract/fixtures") { include("*.json") })
+    inputs.files(rootProject.file("../contract/hash-vectors.json"))
+    inputs.files(rootProject.file("../contract/release-public-key.pem"))
+    inputs.files(rootProject.fileTree("../tests/fixtures/trust") { include("*") })
 }

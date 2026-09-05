@@ -1,222 +1,216 @@
-// Config normalization, including the legacy synthesis a machine that predates
-// "services" still relies on.
+// Configuration loading, and the rule that shapes all of it:
+// no file at all is INERT; a file that is present and wrong is FATAL.
 
 import assert from 'node:assert/strict';
-import os from 'node:os';
+import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import {
-  compilePattern,
-  DEFAULT_VERSION_PATTERN,
-  LEGACY_DEFAULTS,
-  normalizeConfig,
-} from '../src/config.mjs';
+import { DEFAULT_VERSION_PATTERN, LEGACY_DEFAULTS, normalizeConfig } from '../src/config.mjs';
+import { fresh, withHome } from './helpers.mjs';
 
 const BASE = '/tmp/legionctl-test-base';
+const load = (raw, platform, present = true) => normalizeConfig(raw, { platform, base: BASE, present });
 
-function load(raw, platform) {
-  return normalizeConfig(raw, { platform, base: BASE });
-}
-
-test('an empty config on Linux is one T3 Code npm service', () => {
-  const config = load({}, 'linux');
-  assert.equal(config.legacyServices, true);
-  assert.deepEqual(config.system, { id: 'linux', name: 'Linux' });
-  assert.equal(config.autoUpdate, true);
-  assert.equal(config.services.length, 1);
-
-  const [service] = config.services;
-  assert.equal(service.id, 't3');
-  assert.equal(service.name, 'T3 Code');
-  assert.equal(service.kind, 'npm');
-  assert.equal(service.package, 't3');
-  assert.equal(service.channel, 'nightly');
-  assert.deepEqual(service.process, { type: 'systemd-user', unit: 't3-code.service' });
-  assert.deepEqual(service.health, { type: 'http', host: '127.0.0.1', port: 3773, path: '/' });
-  assert.equal(service.busy.type, 't3-sqlite');
-  assert.equal(service.busy.staleHours, 6);
-  assert.deepEqual(service.relay, { type: 'cloudflared' });
-  assert.deepEqual(service.allowScripts, LEGACY_DEFAULTS.allowScripts);
-  assert.equal(service.lockFile, path.join(BASE, 'update.lock'));
-});
-
-test('an empty config on Windows uses the scheduled task and the watchdog lock', () => {
-  const config = load({}, 'windows');
-  const [service] = config.services;
-  assert.deepEqual(config.system, { id: 'windows', name: 'Windows' });
-  assert.deepEqual(service.process, { type: 'scheduled-task', task: 'T3 Code Connect', match: null });
-  assert.match(service.lockFile, /T3Code[\\/]update\.lock$/);
-});
-
-test('an empty config on the Mac is the app, with no relay', () => {
-  const config = load({}, 'mac');
-  const [service] = config.services;
-  assert.deepEqual(config.system, { id: 'mac', name: 'macOS' });
-  assert.equal(service.kind, 'app');
-  assert.equal(service.path, LEGACY_DEFAULTS.t3AppPath);
-  assert.equal(service.bundleId, LEGACY_DEFAULTS.t3AppBundleId);
-  assert.equal(service.updaterCacheDir, path.join(os.homedir(), 'Library', 'Caches', 't3code-updater'));
-  assert.deepEqual(service.process, { type: 'app' });
-  assert.deepEqual(service.latest, { type: 'github-releases', repo: 'pingdotgg/t3code', prerelease: true });
-  assert.equal(service.relay, null);
-});
-
-test('the legacy top-level keys still describe the service', () => {
-  const config = load(
-    {
-      port: 4000,
-      channel: 'stable',
-      staleTurnHours: 2,
-      allowScripts: ['just-this-one'],
-      npmPrefix: '/opt/npm',
-      autoUpdate: false,
-    },
-    'linux',
-  );
-  const [service] = config.services;
+test('a machine with no config looks after nothing and does not update itself', () => {
+  const { ok, config } = load({}, 'linux', false);
+  assert.equal(ok, true);
+  assert.equal(config.inert, true);
+  assert.deepEqual(config.services, [], 'an unconfigured machine must not invent a service to look after');
+  assert.equal(config.updates.automatic, false, 'an unconfigured machine must not enable its own scheduler');
   assert.equal(config.autoUpdate, false);
-  assert.equal(service.health.port, 4000);
-  assert.equal(service.channel, 'stable');
-  assert.equal(service.busy.staleHours, 2);
-  assert.deepEqual(service.allowScripts, ['just-this-one']);
-  assert.equal(service.npmPrefix, '/opt/npm');
+  assert.deepEqual(config.boot.targets, {}, 'a boot target is never guessed from the platform');
 });
 
-test('a legacy nightly config keeps the stricter nightly version pattern', () => {
-  const nightly = compilePattern(load({}, 'linux').services[0].versionPattern, null);
-  assert.ok(nightly.test('0.0.36-nightly.20260827.1206'));
-  assert.ok(!nightly.test('0.0.36'));
-  assert.ok(!nightly.test('; rm -rf /'));
-
-  // Any other channel gets the ordinary semver shape instead.
-  const stable = compilePattern(load({ channel: 'stable' }, 'linux').services[0].versionPattern, null);
-  assert.ok(stable.test('1.2.3'));
-  assert.ok(stable.test('1.2.3-rc.1'));
-  assert.ok(!stable.test('not a version'));
+test('a modern config with no boot block gets no boot targets', () => {
+  const { config } = load({ services: [], boot: undefined }, 'linux');
+  assert.deepEqual(config.boot.targets, {}, 'only a legacy config may inherit the old platform assumptions');
 });
 
-test('an unusable version pattern falls back instead of throwing', () => {
-  const compiled = compilePattern('([unclosed', DEFAULT_VERSION_PATTERN);
-  assert.ok(compiled.test('1.0.0'));
-  assert.equal(compilePattern('([unclosed', null), null);
-});
-
-test('nonsense values fall back to their defaults rather than propagating', () => {
-  const config = load({ port: 'ninety', staleTurnHours: -4, autoUpdate: 'yes', system: { id: '' } }, 'linux');
-  const [service] = config.services;
-  assert.equal(service.health.port, 3773);
-  assert.equal(service.busy.staleHours, 6);
-  assert.equal(config.autoUpdate, true);
-  assert.equal(config.system.id, 'linux');
-});
-
-test('a services array replaces the legacy synthesis entirely', () => {
-  const config = load(
-    {
-      system: { id: 'cachyos', name: 'CachyOS' },
-      services: [
-        {
-          id: 'sunshine',
-          name: 'Sunshine',
-          kind: 'command',
-          installedVersion: ['sunshine', '--version'],
-          update: ['paru', '-S', 'sunshine'],
-          process: { type: 'systemd-user', unit: 'sunshine.service' },
-          health: { type: 'http', port: 47990 },
-          busy: { type: 'none' },
-        },
-        { id: 'broken', kind: 'nonsense' },
-        { id: 'sunshine', name: 'A duplicate id', kind: 'command' },
-      ],
-    },
-    'linux',
-  );
-  assert.equal(config.legacyServices, false);
+test('a config still using the pre-services keys keeps working, with a migration note', () => {
+  const { ok, config, migrations } = load({ port: 3773, channel: 'nightly' }, 'linux');
+  assert.equal(ok, true);
+  assert.equal(config.legacyServices, true);
   assert.equal(config.services.length, 1);
-  const [service] = config.services;
-  assert.equal(service.kind, 'command');
-  assert.deepEqual(service.installedVersion, ['sunshine', '--version']);
-  assert.equal(service.latestVersion, null);
-  assert.deepEqual(service.health, { type: 'http', host: '127.0.0.1', port: 47990, path: '/' });
-  assert.deepEqual(config.system, { id: 'cachyos', name: 'CachyOS' });
+  assert.equal(config.services[0].package, 't3');
+  assert.equal(config.services[0].versionPattern, LEGACY_DEFAULTS.nightlyPattern);
+  // ...and only a legacy config gets the old boot assumption.
+  assert.equal(config.boot.targets.windows.method, 'efi-bootnext');
+  assert.match(migrations.map((entry) => entry.message).join(' '), /predates the "services" list/);
 });
 
-test('a command given as a shell string is refused rather than split', () => {
-  const config = load(
-    { services: [{ id: 'x', kind: 'command', installedVersion: 'x --version', update: ['x', 'up'] }] },
+test('a service that does not say how to tell it is busy is not treated as idle', () => {
+  const { config, migrations } = load(
+    { services: [{ id: 'x', kind: 'command', update: ['/bin/true'], process: { type: 'command', running: ['/bin/true'] } }] },
     'linux',
   );
-  assert.equal(config.services[0].installedVersion, null);
-  assert.deepEqual(config.services[0].update, ['x', 'up']);
+  assert.equal(config.services[0].busy.type, 'unmonitored');
+  assert.match(migrations.map((entry) => entry.message).join(' '), /does not say how to tell whether it is busy/);
 });
 
-test('boot targets default per platform and validate their own fields', () => {
-  assert.deepEqual(load({}, 'linux').boot.targets, {
-    windows: { id: 'windows', name: null, method: 'efi-bootnext', match: '^Windows Boot Manager\\b' },
-  });
-  assert.deepEqual(load({}, 'windows').boot.targets, {
-    linux: { id: 'linux', name: null, method: 'clear-bootsequence' },
-  });
-  assert.deepEqual(load({}, 'mac').boot.targets, {});
-
-  const configured = load(
+test('an explicit busy type of none is a decision, and is not warned about', () => {
+  const { config, migrations, warnings } = load(
     {
-      boot: {
-        reboot: ['sudo', 'reboot'],
-        targets: {
-          good: { method: 'grub-reboot', entry: 'CachyOS', name: 'Cachy' },
-          missingEntry: { method: 'grub-reboot' },
-          unknownMethod: { method: 'wishful-thinking' },
-        },
-      },
-    },
-    'linux',
-  );
-  assert.deepEqual(Object.keys(configured.boot.targets), ['good']);
-  assert.deepEqual(configured.boot.reboot, ['sudo', 'reboot']);
-
-  // A targets block with nothing usable in it is the same as none at all, so the
-  // system is not left with no way back to the other side.
-  const empty = load({ boot: { targets: { bad: { method: 'nope' } } } }, 'linux');
-  assert.deepEqual(Object.keys(empty.boot.targets), ['windows']);
-});
-
-test('sleep defaults name tools rather than one assumed path', () => {
-  const config = load({}, 'windows');
-  assert.deepEqual(config.sleep.before, []);
-  assert.equal(config.sleep.settle, 2);
-  assert.equal(config.sleep.command, null);
-  assert.ok(config.sleep.tools.includes('psshutdown64.exe'));
-  assert.ok(config.sleep.tools.every((tool) => !tool.toLowerCase().includes('setup')));
-
-  const custom = load(
-    { sleep: { before: [['a', 'b'], 'not an argv'], settle: 5, command: ['zzz'], tools: ['D:\\psshutdown.exe'] } },
-    'windows',
-  );
-  assert.deepEqual(custom.sleep.before, [['a', 'b']]);
-  assert.equal(custom.sleep.settle, 5);
-  assert.deepEqual(custom.sleep.command, ['zzz']);
-  assert.deepEqual(custom.sleep.tools, ['D:\\psshutdown.exe']);
-});
-
-test('actions need an id and an argv array, and get a default timeout', () => {
-  const config = load(
-    {
-      actions: [
-        { id: 'one', name: 'One', command: ['echo', 'hi'] },
-        { id: 'two', command: ['echo'], confirm: 'Sure?', busyGated: true, timeoutSeconds: 5 },
-        { id: 'three' },
-        { command: ['echo'] },
-        { id: 'one', command: ['echo', 'again'] },
+      services: [
+        { id: 'x', kind: 'command', update: ['/bin/true'], verify: ['/bin/true'], busy: { type: 'none' }, process: { type: 'command', running: ['/bin/true'] } },
       ],
     },
     'linux',
   );
-  assert.deepEqual(config.actions.map((action) => action.id), ['one', 'two']);
-  assert.equal(config.actions[0].timeoutSeconds, 60);
-  assert.equal(config.actions[0].busyGated, false);
-  assert.equal(config.actions[0].confirm, null);
-  assert.equal(config.actions[1].name, 'two');
-  assert.equal(config.actions[1].timeoutSeconds, 5);
-  assert.equal(config.actions[1].busyGated, true);
+  assert.equal(config.services[0].busy.type, 'none');
+  assert.equal([...migrations, ...warnings].some((entry) => /busy/.test(entry.message)), false);
+});
+
+test('an unknown probe type is a configuration error, never a silent fallback', () => {
+  for (const [block, where] of [
+    [{ busy: { type: 'comand' } }, 'busy'],
+    [{ health: { type: 'htp' } }, 'health'],
+    [{ process: { type: 'systemd' } }, 'process'],
+  ]) {
+    const { ok, errors } = load({ services: [{ id: 'x', kind: 'command', ...block }] }, 'linux');
+    assert.equal(ok, false, `${where} should have been rejected`);
+    assert.match(errors.map((entry) => entry.path).join(' '), new RegExp(where));
+  }
+});
+
+test('a command given as a string says how to write it as an array', () => {
+  const { ok, errors } = load({ services: [{ id: 'x', kind: 'command', update: 'systemctl restart x' }] }, 'linux');
+  assert.equal(ok, false);
+  const problem = errors.find((entry) => entry.path.endsWith('.update'));
+  assert.match(problem.message, /must be an array/);
+  assert.match(problem.fix, /\["systemctl", "restart", "x"\]/);
+});
+
+test('a typo in a key is refused rather than ignored', () => {
+  const { ok, errors } = load({ services: [{ id: 'x', kind: 'npm', pakage: 't3' }] }, 'linux');
+  assert.equal(ok, false);
+  assert.match(errors.map((entry) => entry.message).join(' '), /unknown setting "pakage"/);
+});
+
+test('autoUpdate and updates.automatic cannot disagree', () => {
+  const conflicting = load({ autoUpdate: false, updates: { automatic: true }, services: [] }, 'linux');
+  assert.equal(conflicting.ok, false);
+  assert.match(conflicting.errors.map((entry) => entry.message).join(' '), /same setting/);
+
+  // The 2.x spelling on its own still works, and sets the same thing.
+  const legacy = load({ autoUpdate: false, services: [] }, 'linux');
+  assert.equal(legacy.ok, true);
+  assert.equal(legacy.config.updates.automatic, false);
+});
+
+test('a maintenance window is validated, including its days and times', () => {
+  const good = load({ updates: { maintenanceWindows: [{ days: ['Mon', 'tue'], from: '02:00', to: '06:00' }] }, services: [] }, 'linux');
+  assert.equal(good.ok, true);
+  assert.deepEqual(good.config.updates.maintenanceWindows[0], { days: ['mon', 'tue'], from: '02:00', to: '06:00' });
+
+  for (const window of [{ days: ['funday'] }, { from: '25:00' }, { to: 'noon' }]) {
+    const bad = load({ updates: { maintenanceWindows: [window] }, services: [] }, 'linux');
+    assert.equal(bad.ok, false, `${JSON.stringify(window)} should have been rejected`);
+  }
+});
+
+test('a wake action is validated, and cannot also be a command', () => {
+  const good = load({ actions: [{ id: 'wake', wol: { mac: 'aa-bb-cc-dd-ee-ff', broadcast: ['10.0.0.255'] } }], services: [] }, 'linux');
+  assert.equal(good.ok, true);
+  assert.equal(good.config.actions[0].kind, 'wol');
+  assert.equal(good.config.actions[0].wol.mac, 'AA:BB:CC:DD:EE:FF');
+  assert.deepEqual(good.config.actions[0].wol.ports, [9, 7]);
+
+  for (const action of [
+    { id: 'a', wol: { mac: 'nope', broadcast: ['10.0.0.255'] } },
+    { id: 'a', wol: { mac: 'aa:bb:cc:dd:ee:ff' } },
+    { id: 'a', wol: { mac: 'aa:bb:cc:dd:ee:ff', broadcast: ['10.0.0.255'] }, command: ['/bin/true'] },
+    { id: 'a' },
+  ]) {
+    assert.equal(load({ actions: [action], services: [] }, 'linux').ok, false, `${JSON.stringify(action)} should have been rejected`);
+  }
+});
+
+test('an id that could not travel over ssh is refused', () => {
+  const { ok, errors } = load({ services: [{ id: 'a b; rm -rf ~', kind: 'command', update: ['/bin/true'] }] }, 'linux');
+  assert.equal(ok, false);
+  assert.match(errors.map((entry) => entry.message).join(' '), /cannot be passed safely over SSH/);
+});
+
+test('a command service whose update cannot be confirmed is warned about', () => {
+  const { warnings } = load(
+    { services: [{ id: 'x', kind: 'command', update: ['/bin/true'], busy: { type: 'none' }, process: { type: 'command', running: ['/bin/true'] } }] },
+    'linux',
+  );
+  assert.match(warnings.map((entry) => entry.message).join(' '), /cannot be checked/);
+});
+
+test('requireVersionMatch defaults on only when both versions can be read', () => {
+  const both = load(
+    { services: [{ id: 'x', kind: 'command', installedVersion: ['/bin/true'], latestVersion: ['/bin/true'], update: ['/bin/true'] }] },
+    'linux',
+  );
+  assert.equal(both.config.services[0].requireVersionMatch, true);
+  const neither = load({ services: [{ id: 'x', kind: 'command', update: ['/bin/true'], verify: ['/bin/true'] }] }, 'linux');
+  assert.equal(neither.config.services[0].requireVersionMatch, false);
+});
+
+test('a config from a newer agent is refused rather than half understood', () => {
+  const { ok, errors } = load({ configVersion: 99, services: [] }, 'linux');
+  assert.equal(ok, false);
+  assert.match(errors[0].fix, /update the agent/);
+});
+
+test('a truncated config does not load as the enabled defaults', async () => {
+  await withHome(async (home) => {
+    fs.writeFileSync(path.join(home, 'config.json'), '{"autoUpdate":false');
+    const config = await fresh('config.mjs');
+    const loaded = config.loadConfig();
+    assert.equal(loaded.ok, false);
+    assert.equal(loaded.config, null, 'a broken config must not become a working one');
+    assert.match(loaded.error, /does not parse/);
+  });
+});
+
+test('a config that loads cleanly is kept as the last good copy, but not by a read-only load', async () => {
+  await withHome(async (home) => {
+    const document = { configVersion: 3, updates: { automatic: false }, services: [], boot: { targets: {} } };
+    fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(document));
+    const config = await fresh('config.mjs');
+
+    config.loadConfig({ readOnly: true });
+    assert.equal(fs.existsSync(config.lastGoodConfigPath()), false, 'a read-only load must change nothing');
+
+    config.loadConfig();
+    assert.equal(fs.existsSync(config.lastGoodConfigPath()), true);
+
+    // ...and a later broken edit points at it rather than guessing.
+    fs.writeFileSync(path.join(home, 'config.json'), '{ broken');
+    const broken = config.loadConfig();
+    assert.equal(broken.ok, false);
+    assert.equal(broken.source, 'last-known-good');
+    assert.match(broken.errors[0].fix, /loaded cleanly/);
+  });
+});
+
+test('saveConfig refuses to write over a file it could not read', async () => {
+  await withHome(async (home) => {
+    fs.writeFileSync(path.join(home, 'config.json'), '{ broken');
+    const config = await fresh('config.mjs');
+    const saved = config.saveConfig({ autoUpdate: true });
+    assert.equal(saved.ok, false);
+    assert.match(saved.error, /refusing to overwrite/);
+    assert.match(fs.readFileSync(path.join(home, 'config.json'), 'utf8'), /broken/);
+  });
+});
+
+test('saveConfig refuses a change that would make the config unusable', async () => {
+  await withHome(async (home) => {
+    fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ services: [], boot: { targets: {} } }));
+    const config = await fresh('config.mjs');
+    const saved = config.saveConfig({ updates: { automatic: 'yes please' } });
+    assert.equal(saved.ok, false);
+    assert.match(saved.error, /nothing was written/);
+  });
+});
+
+test('the platform defaults still describe each system when a legacy config asks for them', () => {
+  assert.equal(load({ port: 3773 }, 'windows').config.services[0].process.type, 'scheduled-task');
+  assert.equal(load({ port: 3773 }, 'mac').config.services[0].kind, 'app');
+  assert.equal(load({ port: 3773 }, 'mac').config.services[0].versionPattern, DEFAULT_VERSION_PATTERN);
+  assert.match(load({ port: 3773 }, 'windows').config.services[0].lockFile, /T3Code[\\/]update\.lock$/);
 });

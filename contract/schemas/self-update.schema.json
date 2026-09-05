@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "self-update.schema.json",
+  "title": "legionctl self-update",
+  "description": "Replace the agent tree with a signed one, keeping the previous tree. Nothing is staged, let alone swapped, before the manifest signature and every file hash have been checked against the trust key this running agent was built with.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "description": "Every install or rollback requires a verified complete tree and a passing self-test.",
+      "if": {
+        "properties": {
+          "action": {
+            "enum": [
+              "installed",
+              "rolled-back"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "manifest",
+          "selfTest",
+          "previous"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "manifest": {
+            "properties": {
+              "signatureVerified": {
+                "const": true
+              }
+            },
+            "required": [
+              "signatureVerified"
+            ],
+            "type": "object"
+          },
+          "selfTest": {
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "ok"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "enum": [
+        "checked",
+        "installed",
+        "rolled-back",
+        "failed",
+        "noop",
+        "conflict",
+        "accepted"
+      ]
+    },
+    "current": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "anyOf": [
+            {
+              "$ref": "common.schema.json#/$defs/semver"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "contract"
+      ],
+      "additionalProperties": false
+    },
+    "staged": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "$ref": "common.schema.json#/$defs/semver"
+            },
+            "contract": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "path": {
+              "$ref": "common.schema.json#/$defs/text"
+            }
+          },
+          "required": [
+            "version",
+            "contract",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "previous": {
+      "description": "Retained outgoing tree; --rollback requires a complete publisher-signed tree. An unsigned legacy tree is retained only for independently verified manual recovery.",
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "anyOf": [
+                {
+                  "$ref": "common.schema.json#/$defs/semver"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "path": {
+              "$ref": "common.schema.json#/$defs/text"
+            }
+          },
+          "required": [
+            "version",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "manifest": {
+      "anyOf": [
+        {
+          "$ref": "common.schema.json#/$defs/releaseManifest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "selfTest": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "exitCode": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "output": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "exitCode",
+            "output"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "available": {
+      "description": "--check only: whether the provided bundle passes signature and file verification; not a version comparison.",
+      "type": "boolean"
+    },
+    "op": {
+      "$ref": "mutation.schema.json#/$defs/opOrNull"
+    },
+    "opId": {
+      "description": "The operation id, echoed beside the record. Additive: the canonical place to read it is op.id.",
+      "$ref": "common.schema.json#/$defs/opId"
+    },
+    "replayed": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "action",
+    "staged",
+    "previous",
+    "manifest",
+    "selfTest",
+    "op"
+  ],
+  "unevaluatedProperties": false
+}

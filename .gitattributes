@@ -1,0 +1,4 @@
+# Signed fixture bytes must not be rewritten by checkout line-ending conversion.
+tests/fixtures/trust/manifest.json -text
+# The read-reply fixture reports the exact byte count of this setup document.
+contract/fixtures/controller-document.sites-helpers.json -text

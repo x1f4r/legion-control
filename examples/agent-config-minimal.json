@@ -1,0 +1,17 @@
+{
+  "configVersion": 3,
+  "system": { "id": "server", "name": "Backup Server" },
+  "updates": { "automatic": false, "pauseUntil": null, "maintenanceWindows": [] },
+  "services": [],
+  "boot": { "targets": {} },
+  "actions": [
+    {
+      "id": "snapshot",
+      "name": "Take a snapshot",
+      "command": ["/usr/local/bin/snapshot", "--now"],
+      "confirm": "Writes a new snapshot and can take several minutes.",
+      "busyGated": false,
+      "timeoutSeconds": 900
+    }
+  ]
+}

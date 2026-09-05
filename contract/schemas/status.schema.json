@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "status.schema.json",
+  "title": "legionctl status",
+  "description": "The bounded read-only snapshot. Every 2.x key is still here and still means what it meant; everything else is additive. A status is allowed to be incomplete, and says so in `timing.partial` rather than taking longer.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    }
+  ],
+  "properties": {
+    "os": {
+      "enum": [
+        "linux",
+        "windows",
+        "mac"
+      ]
+    },
+    "hostname": {
+      "$ref": "common.schema.json#/$defs/text"
+    },
+    "timing": {
+      "type": "object",
+      "properties": {
+        "budgetMs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "elapsedMs": {
+          "$ref": "common.schema.json#/$defs/millis"
+        },
+        "partial": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "budgetMs",
+        "elapsedMs",
+        "partial"
+      ],
+      "additionalProperties": false
+    },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "$ref": "common.schema.json#/$defs/semver"
+        },
+        "contract": {
+          "const": 3
+        },
+        "base": {
+          "$ref": "common.schema.json#/$defs/text"
+        },
+        "node": {
+          "$ref": "common.schema.json#/$defs/text"
+        },
+        "restrictedSession": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "description": "Optional behavior documentation; contract >= 3 remains the feature gate. Absence of a capability list is not a refusal.",
+          "type": "array",
+          "items": {
+            "enum": [
+              "setup-lineage",
+              "wol-action",
+              "configured-telemetry",
+              "service-config-admin"
+            ]
+          },
+          "maxItems": 8,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "version",
+        "contract",
+        "base",
+        "node",
+        "restrictedSession"
+      ],
+      "additionalProperties": false
+    },
+    "config": {
+      "$ref": "common.schema.json#/$defs/configReport"
+    },
+    "services": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/serviceStatus"
+      },
+      "maxItems": 50
+    },
+    "busy": {
+      "$ref": "common.schema.json#/$defs/busyAggregate"
+    },
+    "bootTargets": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/bootTarget"
+      },
+      "maxItems": 20
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/agentAction"
+      },
+      "maxItems": 50
+    },
+    "autoUpdate": {
+      "description": "The machine-wide `updates.automatic`, repeated as the plain boolean a 2.x client reads.",
+      "type": "boolean"
+    },
+    "updates": {
+      "$ref": "common.schema.json#/$defs/systemUpdates"
+    },
+    "operations": {
+      "type": "object",
+      "properties": {
+        "running": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/opSummary"
+          },
+          "maxItems": 10
+        },
+        "queued": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/opSummary"
+          },
+          "maxItems": 50
+        },
+        "recent": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/opSummary"
+          },
+          "maxItems": 5
+        }
+      },
+      "required": [
+        "running",
+        "queued",
+        "recent"
+      ],
+      "additionalProperties": false
+    },
+    "controller": {
+      "$ref": "common.schema.json#/$defs/controllerMark"
+    },
+    "t3": {
+      "$ref": "common.schema.json#/$defs/t3Legacy"
+    },
+    "pendingRestart": {
+      "type": "boolean"
+    },
+    "lastUpdate": {
+      "$ref": "common.schema.json#/$defs/lastUpdate"
+    },
+    "connect": {
+      "$ref": "common.schema.json#/$defs/relay"
+    },
+    "metrics": {
+      "description": "Present only when explicit agent-local telemetry probes are configured. Missing readings stay null; collection shares the status deadline.",
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "allOf": [
+              {
+                "$ref": "common.schema.json#/$defs/configuredId"
+              }
+            ],
+            "maxLength": 64
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unit": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "checkedAt": {
+            "$ref": "common.schema.json#/$defs/isoOrNull"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "value",
+          "unit",
+          "checkedAt",
+          "error"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "os",
+    "hostname",
+    "timing",
+    "agent",
+    "config",
+    "services",
+    "busy",
+    "bootTargets",
+    "actions",
+    "autoUpdate",
+    "updates",
+    "operations",
+    "controller",
+    "t3",
+    "pendingRestart",
+    "lastUpdate",
+    "connect"
+  ],
+  "unevaluatedProperties": false
+}

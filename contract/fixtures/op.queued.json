@@ -1,0 +1,42 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "id": "3a7f18b0-92c6-4d51-b0ea-6f2c8d47e915",
+  "op": {
+    "id": "3a7f18b0-92c6-4d51-b0ea-6f2c8d47e915",
+    "kind": "restart",
+    "service": "t3",
+    "target": null,
+    "actionId": null,
+    "mode": "queued",
+    "initiator": {
+      "client": "phone",
+      "device": "pixel-8",
+      "user": "x1f4r"
+    },
+    "state": "queued",
+    "phase": "queued",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:57:00.000Z",
+    "startedAt": null,
+    "updatedAt": "2026-09-05T13:57:00.000Z",
+    "finishedAt": null,
+    "expiresAt": "2026-09-05T17:57:00.000Z",
+    "pid": null,
+    "detached": false,
+    "result": null,
+    "log": [
+      {
+        "at": "2026-09-05T13:57:00.000Z",
+        "line": "queued until idle, expires in 4h"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "postcondition-failed",
+  "message": "the update command exited 0 and demo is still on 1.4.2, not the 1.5.1 that was expected",
+  "action": "failed",
+  "service": "demo",
+  "from": "1.4.2",
+  "to": "1.4.2",
+  "verified": false,
+  "op": {
+    "id": "f60d2c85-4a17-4b39-92e1-7c8b03d5f4a6",
+    "kind": "update",
+    "service": "demo",
+    "target": null,
+    "actionId": null,
+    "mode": "manual",
+    "initiator": {
+      "client": "desktop",
+      "device": "legion-cachy",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T12:30:00.000Z",
+    "startedAt": "2026-09-05T12:30:00.000Z",
+    "updatedAt": "2026-09-05T12:31:00.000Z",
+    "finishedAt": "2026-09-05T12:31:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": false,
+      "action": "failed",
+      "reasonCode": "postcondition-failed",
+      "message": "the update command exited 0 and demo is still on 1.4.2, not the 1.5.1 that was expected",
+      "from": "1.4.2",
+      "to": "1.4.2",
+      "exitCode": 0,
+      "output": "nothing to do\n",
+      "verified": false
+    },
+    "log": [
+      {
+        "at": "2026-09-05T12:30:00.000Z",
+        "line": "installed version before: 1.4.2"
+      },
+      {
+        "at": "2026-09-05T12:31:00.000Z",
+        "line": "installed version after: 1.4.2, expected 1.5.1"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux",
+    "from": "1.4.2",
+    "to": "1.4.2"
+  }
+}

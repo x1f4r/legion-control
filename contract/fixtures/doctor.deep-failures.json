@@ -1,0 +1,145 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "3 checks failed and 2 warned",
+  "deep": true,
+  "checks": [
+    {
+      "id": "config.parse",
+      "level": "ok",
+      "summary": "config.json parses",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "config.validate",
+      "level": "warn",
+      "summary": "edge has no busy probe",
+      "detail": "a service with no busy key counts as unmonitored, which blocks every disruptive action on this machine",
+      "fix": "add a busy probe for edge, or set its busy.type to \"none\" if it is never busy"
+    },
+    {
+      "id": "base.writable",
+      "level": "ok",
+      "summary": "/home/x1f4r/.legion-control is writable",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "node.version",
+      "level": "ok",
+      "summary": "node 24.9.0",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "node.sqlite",
+      "level": "fail",
+      "summary": "node:sqlite is not available in this node build",
+      "detail": "the t3 busy probe is type t3-sqlite and cannot run, so t3 counts as busy and nothing will update",
+      "fix": "install node 22.5 or newer from NodeSource, or change the t3 busy probe to a command probe"
+    },
+    {
+      "id": "npm.available",
+      "level": "ok",
+      "summary": "npm 11.6.0",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "npm.prefix",
+      "level": "ok",
+      "summary": "global prefix /home/x1f4r/.local",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "service.t3.process",
+      "level": "ok",
+      "summary": "t3-code.service is active",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "service.t3.health",
+      "level": "warn",
+      "summary": "t3 answered 503 on 8081",
+      "detail": "the process is up and the service is not ready",
+      "fix": "look at journalctl --user -u t3-code.service for what it is waiting on"
+    },
+    {
+      "id": "service.demo.latest",
+      "level": "fail",
+      "summary": "the latest version of demo cannot be read",
+      "detail": "the configured latestVersion command reads ~/demo/latest, which does not exist",
+      "fix": "create ~/demo/latest, or remove latestVersion and configure a verify command instead"
+    },
+    {
+      "id": "service.t3.endpoint",
+      "level": "ok",
+      "summary": "t3 answered 200 through its public endpoint in 214 ms",
+      "detail": "https://t3.example.net",
+      "fix": null
+    },
+    {
+      "id": "scheduler.present",
+      "level": "fail",
+      "summary": "no scheduler entry runs this agent",
+      "detail": "legion-control-cycle.timer is not enabled, so nothing updates on its own",
+      "fix": "run the installer again, or: systemctl --user enable --now legion-control-cycle.timer"
+    },
+    {
+      "id": "scheduler.command",
+      "level": "warn",
+      "summary": "the timer that exists still runs \"update\", not \"cycle\"",
+      "detail": "a 2.x scheduler updates only the first service and ignores the queue",
+      "fix": "run the installer again to rewrite the timer to \"cycle\""
+    },
+    {
+      "id": "locks",
+      "level": "ok",
+      "summary": "no stale locks",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "ops.dir",
+      "level": "ok",
+      "summary": "68 operation records",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "controller.copy",
+      "level": "ok",
+      "summary": "revision 12 from mac",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "session.restricted",
+      "level": "ok",
+      "summary": "this session is not restricted",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "clock",
+      "level": "ok",
+      "summary": "the clock is within 0.4 s of the client",
+      "detail": null,
+      "fix": null
+    }
+  ],
+  "counts": {
+    "ok": 12,
+    "warn": 3,
+    "fail": 3
+  },
+  "elapsedMs": 5210
+}

@@ -1,28 +1,101 @@
 {
   "version": 1,
+  "controller": {
+    "id": "setup-3f9c2a17-8d41-4e6b-b0c9-5a2e7f14d803",
+    "name": "Home setup",
+    "revision": 12,
+    "updatedAt": "2026-09-05T09:00:00Z",
+    "source": "mac",
+    "device": "Robert's MacBook",
+    "lineage": [
+      "9b1e4c7d2a5f8031e6b4c90d7f2a18e35c6d4b09a7f13e820c5d6a94b3f70e21",
+      "c7123ad4e4625ed945a0dc4783d007720eff55e0ed4d8bb23de14a47baea9478"
+    ]
+  },
+  "sites": [
+    {
+      "id": "attic",
+      "name": "Attic house",
+      "lanPrefixes": ["192.168.178."],
+      "broadcast": ["192.168.178.255"]
+    },
+    {
+      "id": "flat",
+      "name": "The flat",
+      "lanPrefixes": ["192.168.178."],
+      "broadcast": ["192.168.178.255"]
+    }
+  ],
   "machines": [
     {
-      "id": "workstation",
-      "name": "Workstation",
-      "ssh": { "host": "workstation" },
+      "id": "tower",
+      "name": "Tower",
+      "site": "flat",
+      "alwaysOn": false,
       "endpoints": [
         { "id": "tailnet-linux", "kind": "remote", "host": "100.64.0.10", "port": 22, "user": "me", "system": "linux", "label": "Tailnet, Linux" },
         { "id": "tailnet-windows", "kind": "remote", "host": "100.64.0.11", "port": 22, "user": "me", "system": "windows", "label": "Tailnet, Windows" },
-        { "id": "lan", "kind": "lan", "host": "192.168.1.40", "port": 22, "user": "me", "label": "Home LAN" }
+        { "id": "lan", "kind": "lan", "host": "192.168.178.40", "port": 22, "user": "me", "label": "Flat LAN" }
       ],
       "wake": {
         "mac": "AA:BB:CC:DD:EE:FF",
-        "broadcast": ["192.168.1.255"],
+        "broadcast": ["192.168.178.255"],
         "ports": [9, 7],
-        "probe": { "host": "192.168.1.40", "port": 22 },
-        "lanPrefix": "192.168.1."
+        "probe": { "host": "192.168.178.40", "port": 22 },
+        "helper": { "machine": "pi-flat", "action": "wake-tower" },
+        "helpers": [
+          { "machine": "pi-flat", "action": "wake-tower" },
+          { "machine": "router-flat", "action": "wake-tower" }
+        ]
       },
       "systems": [
-        { "id": "linux", "name": "Linux", "platform": "linux", "agent": ["/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs"] },
-        { "id": "windows", "name": "Windows 11", "platform": "windows", "agent": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"] }
+        { "id": "linux", "name": "Linux", "platform": "linux", "shell": "posix", "restricted": true, "agent": ["/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs"] },
+        { "id": "windows", "name": "Windows 11", "platform": "windows", "shell": "powershell", "agent": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"] }
+      ]
+    },
+    {
+      "id": "pi-flat",
+      "name": "Flat helper",
+      "site": "flat",
+      "alwaysOn": true,
+      "endpoints": [
+        { "id": "tailnet", "kind": "remote", "host": "100.64.0.20", "port": 22, "user": "me", "system": "helper", "label": "Tailnet" },
+        { "id": "lan", "kind": "lan", "host": "192.168.178.20", "port": 22, "user": "me", "label": "Flat LAN" }
+      ],
+      "systems": [
+        { "id": "helper", "name": "Flat helper", "platform": "linux", "shell": "posix", "agent": ["/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs"] }
+      ]
+    },
+    {
+      "id": "router-flat",
+      "name": "Flat router",
+      "site": "flat",
+      "alwaysOn": true,
+      "endpoints": [
+        { "id": "lan", "kind": "lan", "host": "192.168.178.1", "port": 22, "user": "admin", "system": "router", "label": "Flat LAN" }
+      ],
+      "systems": [
+        { "id": "router", "name": "Flat router", "platform": "linux", "shell": "posix", "agent": ["/usr/bin/node", "/opt/legion-control/agent/src/index.mjs"] }
+      ]
+    },
+    {
+      "id": "attic-box",
+      "name": "Attic laptop",
+      "site": "attic",
+      "alwaysOn": false,
+      "endpoints": [
+        { "id": "tailnet", "kind": "remote", "host": "100.64.0.30", "port": 22, "user": "me", "system": "windows", "label": "Tailnet" },
+        { "id": "lan", "kind": "lan", "host": "192.168.178.30", "port": 22, "user": "me", "label": "Attic LAN" }
+      ],
+      "wake": {
+        "mac": "11:22:33:44:55:66",
+        "broadcast": ["192.168.178.255"],
+        "ports": [9, 7]
+      },
+      "systems": [
+        { "id": "windows", "name": "Windows 11", "platform": "windows", "shell": "cmd", "agent": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"] }
       ]
     }
   ],
-  "local": { "enabled": true, "name": "This Mac", "agent": "~/.legion-control/agent/src/index.mjs" },
   "appUpdates": { "githubRepo": "x1f4r/legion-control" }
 }

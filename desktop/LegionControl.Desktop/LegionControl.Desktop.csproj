@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <AssemblyName>legion-control</AssemblyName>
+    <RootNamespace>LegionControl.Desktop</RootNamespace>
+    <Version>1.3.0</Version>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.3.20" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.20" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.20" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.20" />
+    <!-- This compatible release posts D-Bus callbacks instead of synchronously sending them to
+         a dispatcher that may already be stopping during Linux session cleanup. -->
+    <PackageReference Include="Tmds.DBus.Protocol" Version="0.92.0" />
+    <PackageReference Include="Avalonia.Diagnostics" Version="11.3.20" Condition="'$(Configuration)' == 'Debug'" />
+    <!-- The managed Ed25519 verifier cross-publishes without a per-platform native library. -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The release trust key travels with the binary. Read at runtime from the assembly, never
+         from disk, so a key on the machine can never stand in for the one this build trusts. -->
+    <EmbeddedResource Include="../../contract/release-public-key.pem" LogicalName="release-public-key.pem" />
+  </ItemGroup>
+
+  <!-- The signed agent bundle, when the release build put one there. A normal build has none and
+       the agent install action says so rather than pretending it can install something. -->
+  <ItemGroup>
+    <EmbeddedResource Include="../../dist/legionctl-agent-*.tgz">
+      <LogicalName>%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+  <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/../../dist/Legion-Control-agent-manifest.json')">
+    <EmbeddedResource Include="../../dist/Legion-Control-agent-manifest.json" LogicalName="Legion-Control-agent-manifest.json" />
+    <EmbeddedResource Include="../../dist/Legion-Control-agent-manifest.json.sig" LogicalName="Legion-Control-agent-manifest.json.sig" />
+  </ItemGroup>
+
+</Project>

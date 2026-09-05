@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "op.schema.json",
+  "title": "legionctl op ID [--wait SECONDS]",
+  "description": "One operation record, read back. This is how a client that lost its link finds out what happened; it never mutates anything. `--wait` long-polls until the record is finished or the deadline passes, and a deadline that passes is not a failure.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "description": "An id with no record on this machine is not an error about the machine; it is a `not-configured` answer with a null record, so a client can tell \"never arrived\" from \"arrived and failed\".",
+      "if": {
+        "properties": {
+          "op": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "op"
+        ]
+      },
+      "then": {
+        "properties": {
+          "ok": {
+            "const": false
+          }
+        },
+        "required": [
+          "reasonCode"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "id": {
+      "$ref": "common.schema.json#/$defs/opId",
+      "description": "The id that was asked for, echoed. Additive: the canonical place to read the record is `op`."
+    },
+    "op": {
+      "anyOf": [
+        {
+          "$ref": "common.schema.json#/$defs/opRecord"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "waited": {
+      "description": "Set when --wait was given: how long this call actually waited, and whether it came back because the operation finished or because the deadline did.",
+      "type": "object",
+      "properties": {
+        "requestedSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "elapsedMs": {
+          "$ref": "common.schema.json#/$defs/millis"
+        },
+        "finished": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "requestedSeconds",
+        "elapsedMs",
+        "finished"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "op"
+  ],
+  "unevaluatedProperties": false
+}

@@ -1,0 +1,43 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="LegionControl.Desktop.App"
+             RequestedThemeVariant="Default">
+  <Application.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Light">
+          <SolidColorBrush x:Key="PageBackground">#FBFAF8</SolidColorBrush>
+          <SolidColorBrush x:Key="PageInk">#1B1A18</SolidColorBrush>
+          <SolidColorBrush x:Key="PageSecondary">#6A665F</SolidColorBrush>
+          <SolidColorBrush x:Key="PageAccent">#2F5A87</SolidColorBrush>
+          <SolidColorBrush x:Key="PageSeparator">#E0DCD5</SolidColorBrush>
+          <SolidColorBrush x:Key="StatusGood">#2E7D32</SolidColorBrush>
+          <SolidColorBrush x:Key="StatusAttention">#91620A</SolidColorBrush>
+          <SolidColorBrush x:Key="StatusBad">#B43B31</SolidColorBrush>
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Dark">
+          <SolidColorBrush x:Key="PageBackground">#131211</SolidColorBrush>
+          <SolidColorBrush x:Key="PageInk">#EDEAE4</SolidColorBrush>
+          <SolidColorBrush x:Key="PageSecondary">#9C968D</SolidColorBrush>
+          <SolidColorBrush x:Key="PageAccent">#9CC2EC</SolidColorBrush>
+          <SolidColorBrush x:Key="PageSeparator">#2F2D2A</SolidColorBrush>
+          <SolidColorBrush x:Key="StatusGood">#74BE8F</SolidColorBrush>
+          <SolidColorBrush x:Key="StatusAttention">#D8A251</SolidColorBrush>
+          <SolidColorBrush x:Key="StatusBad">#E58C82</SolidColorBrush>
+        </ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+    </ResourceDictionary>
+  </Application.Resources>
+  <Application.Styles>
+    <FluentTheme />
+    <Style Selector="Window">
+      <Setter Property="Background" Value="{DynamicResource PageBackground}" />
+      <Setter Property="Foreground" Value="{DynamicResource PageInk}" />
+      <Setter Property="FontSize" Value="14" />
+    </Style>
+    <Style Selector="Button.primary">
+      <Setter Property="Foreground" Value="{DynamicResource PageAccent}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PageAccent}" />
+    </Style>
+  </Application.Styles>
+</Application>

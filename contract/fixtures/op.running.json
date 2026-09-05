@@ -1,0 +1,65 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "id": "6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3",
+  "op": {
+    "id": "6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3",
+    "kind": "update",
+    "service": "t3",
+    "target": null,
+    "actionId": null,
+    "mode": "force",
+    "initiator": {
+      "client": "mac",
+      "device": "roberts-macbook-pro",
+      "user": "x1f4r"
+    },
+    "state": "running",
+    "phase": "installing",
+    "progress": {
+      "step": 4,
+      "of": 8,
+      "note": "npm install -g t3@0.0.37-nightly.20260905"
+    },
+    "requestedAt": "2026-09-05T14:00:00.000Z",
+    "startedAt": "2026-09-05T14:00:01.000Z",
+    "updatedAt": "2026-09-05T14:00:47.000Z",
+    "finishedAt": null,
+    "expiresAt": null,
+    "pid": 24817,
+    "detached": true,
+    "result": null,
+    "log": [
+      {
+        "at": "2026-09-05T14:00:01.000Z",
+        "line": "lock taken for update t3"
+      },
+      {
+        "at": "2026-09-05T14:00:02.000Z",
+        "line": "busy gate forced past: 1 turn running"
+      },
+      {
+        "at": "2026-09-05T14:00:09.000Z",
+        "line": "stopped t3-code.service"
+      },
+      {
+        "at": "2026-09-05T14:00:11.000Z",
+        "line": "npm install -g t3@0.0.37-nightly.20260905"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux",
+    "from": "0.0.36-nightly.20260904",
+    "to": "0.0.37-nightly.20260905"
+  },
+  "waited": {
+    "requestedSeconds": 20,
+    "elapsedMs": 20004,
+    "finished": false
+  }
+}

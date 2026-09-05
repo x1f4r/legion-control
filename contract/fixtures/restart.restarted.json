@@ -1,0 +1,60 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "t3 restarted and answered on 8081",
+  "action": "restarted",
+  "service": "t3",
+  "detached": false,
+  "op": {
+    "id": "c92e6b41-5a08-4f37-b6d9-0e34c7a1825d3",
+    "kind": "restart",
+    "service": "t3",
+    "target": null,
+    "actionId": null,
+    "mode": "manual",
+    "initiator": {
+      "client": "mac",
+      "device": "roberts-macbook-pro",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:50:00.000Z",
+    "startedAt": "2026-09-05T13:50:00.000Z",
+    "updatedAt": "2026-09-05T13:51:00.000Z",
+    "finishedAt": "2026-09-05T13:51:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": true,
+      "action": "restarted",
+      "reasonCode": null,
+      "message": "t3 restarted and answered on 8081",
+      "exitCode": 0,
+      "output": null
+    },
+    "log": [
+      {
+        "at": "2026-09-05T13:50:00.000Z",
+        "line": "lock taken for restart t3"
+      },
+      {
+        "at": "2026-09-05T13:50:02.000Z",
+        "line": "stopped t3-code.service"
+      },
+      {
+        "at": "2026-09-05T13:51:00.000Z",
+        "line": "started t3-code.service, health 200"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

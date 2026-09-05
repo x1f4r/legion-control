@@ -9,3 +9,7 @@ captures/
 *.iml
 .idea/
 .kotlin/
+
+# The signed control agent bundle, copied in from dist/ at release time by the build. It is a build
+# output of another part of the repository and never a source file here.
+app/src/main/assets/agent/

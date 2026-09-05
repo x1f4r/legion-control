@@ -1,0 +1,32 @@
+{
+  "configVersion": 3,
+  "system": { "id": "linux", "name": "Linux" },
+  "updates": {
+    "automatic": true,
+    "pauseUntil": null,
+    "maintenanceWindows": [{ "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "from": "02:00", "to": "06:00" }]
+  },
+  "services": [
+    {
+      "id": "t3",
+      "name": "T3 Code",
+      "kind": "npm",
+      "package": "t3",
+      "channel": "nightly",
+      "versionPattern": "^\\d+\\.\\d+\\.\\d+-nightly\\.\\d+\\.\\d+$",
+      "allowScripts": ["node-pty", "msgpackr-extract"],
+      "process": { "type": "systemd-user", "unit": "t3-code.service" },
+      "health": { "type": "http", "port": 3773, "path": "/" },
+      "busy": { "type": "t3-sqlite", "staleHours": 6, "allowMissing": false },
+      "relay": { "type": "cloudflared" },
+      "updates": { "automatic": true }
+    }
+  ],
+  "boot": {
+    "targets": {
+      "windows": { "method": "efi-bootnext", "match": "^Windows Boot Manager\\b", "name": "Windows 11" }
+    }
+  },
+  "sleep": {},
+  "actions": []
+}

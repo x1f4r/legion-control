@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sleep.schema.json",
+  "title": "legionctl sleep",
+  "description": "`sleeping` means the suspend was accepted, which is all a process that is about to be frozen can honestly report. `slept` is only ever written by the recovery pass after the machine came back.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "$ref": "mutation.schema.json#/$defs/conflictRule"
+    },
+    {
+      "$ref": "mutation.schema.json#/$defs/queueRule"
+    }
+  ],
+  "properties": {
+    "action": {
+      "enum": [
+        "sleeping",
+        "slept",
+        "deferred",
+        "queued",
+        "failed",
+        "conflict",
+        "cancelled",
+        "expired",
+        "already-running"
+      ]
+    },
+    "op": {
+      "$ref": "mutation.schema.json#/$defs/opOrNull"
+    },
+    "replayed": {
+      "type": "boolean"
+    },
+    "replaced": {
+      "$ref": "common.schema.json#/$defs/opIdOrNull"
+    },
+    "conflict": {
+      "$ref": "common.schema.json#/$defs/opConflict"
+    },
+    "opId": {
+      "description": "The operation id, echoed beside the record. Additive: the canonical place to read it is op.id.",
+      "$ref": "common.schema.json#/$defs/opId"
+    }
+  },
+  "required": [
+    "action",
+    "op"
+  ],
+  "unevaluatedProperties": false
+}

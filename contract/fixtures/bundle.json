@@ -1,0 +1,758 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "generatedAt": "2026-09-05T14:01:00.000Z",
+  "doctor": {
+    "ok": true,
+    "contract": 3,
+    "agentVersion": "3.0.0",
+    "system": {
+      "id": "linux",
+      "name": "Raspberry Pi OS"
+    },
+    "deep": false,
+    "checks": [
+      {
+        "id": "config.parse",
+        "level": "ok",
+        "summary": "config.json parses",
+        "detail": "4.1 kB, read at 2026-09-05T14:00:00.000Z",
+        "fix": null
+      },
+      {
+        "id": "config.validate",
+        "level": "ok",
+        "summary": "3 services, 1 boot target, 2 actions",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "base.writable",
+        "level": "ok",
+        "summary": "/home/x1f4r/.legion-control is writable",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "node.version",
+        "level": "ok",
+        "summary": "node 24.9.0",
+        "detail": "the agent needs 22 or newer",
+        "fix": null
+      },
+      {
+        "id": "node.sqlite",
+        "level": "ok",
+        "summary": "node:sqlite is available",
+        "detail": "needed by the t3-sqlite busy probe",
+        "fix": null
+      },
+      {
+        "id": "npm.available",
+        "level": "ok",
+        "summary": "npm 11.6.0",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "npm.prefix",
+        "level": "ok",
+        "summary": "global prefix /home/x1f4r/.local",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "service.t3.process",
+        "level": "ok",
+        "summary": "t3-code.service is active since 2026-09-03T14:10:00.000Z",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "service.t3.health",
+        "level": "ok",
+        "summary": "t3 answered 200 on 8081 in 8 ms",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "service.t3.busy",
+        "level": "ok",
+        "summary": "the t3-sqlite probe read the state database",
+        "detail": "1 turn running",
+        "fix": null
+      },
+      {
+        "id": "service.t3.relay",
+        "level": "ok",
+        "summary": "cloudflared is running",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "scheduler.present",
+        "level": "ok",
+        "summary": "legion-control-cycle.timer is enabled",
+        "detail": "next run 2026-09-06T02:00:00.000Z",
+        "fix": null
+      },
+      {
+        "id": "scheduler.command",
+        "level": "ok",
+        "summary": "the timer runs this agent with \"cycle\"",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "scheduler.lastRun",
+        "level": "ok",
+        "summary": "last run 2026-09-05T02:02:00.000Z, action cycled",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "privileges.sudo",
+        "level": "ok",
+        "summary": "passwordless sudo for the four narrowed commands",
+        "detail": "systemctl reboot, systemctl suspend, efibootmgr, grub-reboot",
+        "fix": null
+      },
+      {
+        "id": "privileges.boot",
+        "level": "ok",
+        "summary": "efibootmgr can read and set BootNext",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "sleep.tool",
+        "level": "ok",
+        "summary": "systemctl suspend is available",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "locks",
+        "level": "ok",
+        "summary": "no stale locks",
+        "detail": "op.lock is held by pid 24817, which is alive",
+        "fix": null
+      },
+      {
+        "id": "ops.dir",
+        "level": "ok",
+        "summary": "68 operation records, oldest 2026-08-22T09:14:00.000Z",
+        "detail": "pruned at 200 records or 30 days",
+        "fix": null
+      },
+      {
+        "id": "controller.copy",
+        "level": "ok",
+        "summary": "revision 12 from mac, 3d7251f8",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "session.restricted",
+        "level": "ok",
+        "summary": "this session is not restricted",
+        "detail": null,
+        "fix": null
+      },
+      {
+        "id": "clock",
+        "level": "ok",
+        "summary": "the clock is within 0.4 s of the client",
+        "detail": null,
+        "fix": null
+      }
+    ],
+    "counts": {
+      "ok": 22,
+      "warn": 0,
+      "fail": 0
+    },
+    "elapsedMs": 1840
+  },
+  "status": {
+    "ok": true,
+    "contract": 3,
+    "agentVersion": "3.0.0",
+    "system": {
+      "id": "linux",
+      "name": "Raspberry Pi OS"
+    },
+    "os": "linux",
+    "hostname": "atlas",
+    "timing": {
+      "budgetMs": 20000,
+      "elapsedMs": 2310,
+      "partial": false
+    },
+    "agent": {
+      "version": "3.0.0",
+      "contract": 3,
+      "base": "/home/x1f4r/.legion-control",
+      "node": "24.9.0",
+      "restrictedSession": false,
+      "capabilities": [
+        "setup-lineage",
+        "wol-action",
+        "configured-telemetry",
+        "service-config-admin"
+      ]
+    },
+    "config": {
+      "ok": true,
+      "source": "file",
+      "problems": []
+    },
+    "services": [
+      {
+        "id": "t3",
+        "name": "T3 Code",
+        "kind": "npm",
+        "installed": "0.0.36-nightly.20260904",
+        "latest": "0.0.37-nightly.20260905",
+        "channel": "nightly",
+        "upToDate": false,
+        "running": true,
+        "healthy": true,
+        "port": 8081,
+        "staged": null,
+        "appPath": null,
+        "busy": {
+          "busy": true,
+          "unknown": false,
+          "monitored": true,
+          "reason": "1 turn running",
+          "evidence": "t3-sqlite",
+          "checkedAt": "2026-09-05T14:00:00.000Z",
+          "elapsedMs": 118,
+          "error": null,
+          "runningTurns": 1,
+          "pendingTurns": 0,
+          "pendingApprovals": 0,
+          "staleTurns": 1,
+          "staleApprovals": 0,
+          "threads": [
+            {
+              "threadId": "thr_01JT8Q4V2M",
+              "turnId": "trn_01JT8Q7C9X",
+              "title": "Rework the busy gate",
+              "state": "running",
+              "at": "2026-09-05T13:54:00.000Z",
+              "blocking": true,
+              "disposition": "running",
+              "stale": false
+            },
+            {
+              "threadId": "thr_01JQ2H9B4K",
+              "turnId": "trn_01JQ2H9B7P",
+              "title": "Import the old exports",
+              "state": "pending",
+              "at": "2026-09-02T14:00:00.000Z",
+              "blocking": false,
+              "disposition": "stale",
+              "stale": true
+            }
+          ],
+          "threadsTruncated": 0
+        },
+        "relay": {
+          "configured": true,
+          "running": true
+        },
+        "pendingRestart": false,
+        "lastUpdate": {
+          "at": "2026-09-04T14:00:00.000Z",
+          "from": "0.0.35-nightly.20260903",
+          "to": "0.0.36-nightly.20260904",
+          "result": "updated",
+          "message": "updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904"
+        },
+        "canUpdate": true,
+        "canRestart": true,
+        "process": {
+          "running": true,
+          "state": "active",
+          "startedAt": "2026-09-03T14:10:00.000Z",
+          "error": null
+        },
+        "health": {
+          "ok": true,
+          "status": 200,
+          "checkedAt": "2026-09-05T14:00:00.000Z",
+          "elapsedMs": 8,
+          "error": null
+        },
+        "endpoint": {
+          "configured": true,
+          "reachable": null
+        },
+        "updates": {
+          "automatic": true,
+          "inherited": true,
+          "pauseUntil": null,
+          "eligibleNow": false,
+          "deferredReason": "busy"
+        },
+        "pendingVersion": null,
+        "drain": true,
+        "lastOperation": {
+          "opId": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
+          "kind": "update",
+          "action": "updated",
+          "at": "2026-09-04T14:00:00.000Z"
+        }
+      },
+      {
+        "id": "demo",
+        "name": "Demo",
+        "kind": "command",
+        "installed": "1.4.2",
+        "latest": "1.4.2",
+        "channel": null,
+        "upToDate": true,
+        "running": true,
+        "healthy": true,
+        "port": 8765,
+        "staged": null,
+        "appPath": null,
+        "busy": {
+          "busy": false,
+          "unknown": false,
+          "monitored": true,
+          "reason": "idle",
+          "evidence": "command",
+          "checkedAt": "2026-09-05T14:00:00.000Z",
+          "elapsedMs": 41,
+          "error": null
+        },
+        "relay": {
+          "configured": false,
+          "running": false
+        },
+        "pendingRestart": false,
+        "lastUpdate": null,
+        "canUpdate": true,
+        "canRestart": true,
+        "process": {
+          "running": true,
+          "state": "active",
+          "startedAt": "2026-09-03T14:15:00.000Z",
+          "error": null
+        },
+        "health": {
+          "ok": true,
+          "status": 200,
+          "checkedAt": "2026-09-05T14:00:00.000Z",
+          "elapsedMs": 3,
+          "error": null
+        },
+        "endpoint": {
+          "configured": false,
+          "reachable": null
+        },
+        "updates": {
+          "automatic": false,
+          "inherited": false,
+          "pauseUntil": null,
+          "eligibleNow": false,
+          "deferredReason": "policy-off"
+        },
+        "pendingVersion": null,
+        "drain": false,
+        "lastOperation": {
+          "opId": "9b6d0e54-1f83-4c27-8a95-4e2b7d13f6a0",
+          "kind": "update",
+          "action": "rolled-back",
+          "at": "2026-09-03T14:00:00.000Z"
+        }
+      },
+      {
+        "id": "edge",
+        "name": "Edge Proxy",
+        "kind": "command",
+        "installed": "2.9.0",
+        "latest": null,
+        "channel": null,
+        "upToDate": null,
+        "running": true,
+        "healthy": true,
+        "port": 8443,
+        "staged": null,
+        "appPath": null,
+        "busy": {
+          "busy": true,
+          "unknown": true,
+          "monitored": false,
+          "reason": "not monitored",
+          "evidence": "unmonitored",
+          "checkedAt": "2026-09-05T14:00:00.000Z",
+          "elapsedMs": 0,
+          "error": "no busy probe is configured for edge; disruptive work waits until one is, or until busy.type is set to \"none\""
+        },
+        "relay": {
+          "configured": false,
+          "running": false
+        },
+        "pendingRestart": false,
+        "lastUpdate": null,
+        "canUpdate": false,
+        "canRestart": true,
+        "process": {
+          "running": true,
+          "state": "active",
+          "startedAt": "2026-09-03T14:20:00.000Z",
+          "error": null
+        },
+        "health": {
+          "ok": true,
+          "status": 200,
+          "checkedAt": "2026-09-05T14:00:00.000Z",
+          "elapsedMs": 5,
+          "error": null
+        },
+        "endpoint": {
+          "configured": false,
+          "reachable": null
+        },
+        "updates": {
+          "automatic": true,
+          "inherited": true,
+          "pauseUntil": null,
+          "eligibleNow": false,
+          "deferredReason": "busy-unknown"
+        },
+        "pendingVersion": null,
+        "drain": false,
+        "lastOperation": null
+      }
+    ],
+    "busy": {
+      "busy": true,
+      "unknown": true,
+      "reason": "T3 Code: 1 turn running; Edge Proxy: not monitored",
+      "monitoredServices": 2,
+      "unmonitoredServices": 1
+    },
+    "bootTargets": [
+      {
+        "id": "windows",
+        "name": "Windows 11"
+      }
+    ],
+    "actions": [
+      {
+        "id": "sunshine-restart",
+        "name": "Restart Sunshine",
+        "confirm": null,
+        "busyGated": true,
+        "kind": "command"
+      },
+      {
+        "id": "flush-cache",
+        "name": "Flush the build cache",
+        "confirm": "This throws away every cached build.",
+        "busyGated": false,
+        "kind": "command"
+      },
+      {
+        "id": "wake-tower",
+        "name": "Wake the tower",
+        "confirm": null,
+        "busyGated": false,
+        "kind": "wol"
+      }
+    ],
+    "autoUpdate": true,
+    "updates": {
+      "automatic": true,
+      "pauseUntil": null,
+      "maintenanceWindows": [
+        {
+          "days": [
+            "mon",
+            "tue",
+            "wed",
+            "thu",
+            "fri",
+            "sat",
+            "sun"
+          ],
+          "from": "02:00",
+          "to": "06:00"
+        }
+      ],
+      "inWindowNow": false,
+      "nextWindow": "2026-09-06T02:00:00.000Z",
+      "lastCycle": {
+        "opId": "7c5b3d92-4e18-4a6f-b273-9d0e1f8a5c46",
+        "at": "2026-09-05T02:02:00.000Z",
+        "action": "cycled"
+      }
+    },
+    "operations": {
+      "running": [
+        {
+          "id": "6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3",
+          "kind": "update",
+          "service": "t3",
+          "target": null,
+          "actionId": null,
+          "mode": "force",
+          "state": "running",
+          "phase": "installing",
+          "action": null,
+          "reasonCode": null,
+          "requestedAt": "2026-09-05T14:00:00.000Z",
+          "updatedAt": "2026-09-05T14:00:47.000Z",
+          "expiresAt": null
+        }
+      ],
+      "queued": [
+        {
+          "id": "3a7f18b0-92c6-4d51-b0ea-6f2c8d47e915",
+          "kind": "restart",
+          "service": "t3",
+          "target": null,
+          "actionId": null,
+          "mode": "queued",
+          "state": "queued",
+          "phase": "queued",
+          "action": null,
+          "reasonCode": null,
+          "requestedAt": "2026-09-05T13:57:00.000Z",
+          "updatedAt": "2026-09-05T13:57:00.000Z",
+          "expiresAt": "2026-09-05T17:57:00.000Z"
+        }
+      ],
+      "recent": [
+        {
+          "id": "a1f8c3d7-2b46-4e58-90ca-7d1b4f62e830",
+          "kind": "run",
+          "service": null,
+          "target": null,
+          "actionId": "sunshine-restart",
+          "mode": "manual",
+          "state": "finished",
+          "phase": "done",
+          "action": "ran",
+          "reasonCode": null,
+          "requestedAt": "2026-09-05T13:30:00.000Z",
+          "updatedAt": "2026-09-05T13:30:02.000Z",
+          "expiresAt": null
+        },
+        {
+          "id": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
+          "kind": "update",
+          "service": "t3",
+          "target": null,
+          "actionId": null,
+          "mode": "scheduled",
+          "state": "finished",
+          "phase": "done",
+          "action": "updated",
+          "reasonCode": null,
+          "requestedAt": "2026-09-04T13:59:00.000Z",
+          "updatedAt": "2026-09-04T14:00:00.000Z",
+          "expiresAt": null
+        },
+        {
+          "id": "7c5b3d92-4e18-4a6f-b273-9d0e1f8a5c46",
+          "kind": "cycle",
+          "service": null,
+          "target": null,
+          "actionId": null,
+          "mode": "scheduled",
+          "state": "finished",
+          "phase": "done",
+          "action": "cycled",
+          "reasonCode": null,
+          "requestedAt": "2026-09-05T02:00:00.000Z",
+          "updatedAt": "2026-09-05T02:02:00.000Z",
+          "expiresAt": null
+        }
+      ]
+    },
+    "controller": {
+      "hash": "668a9a05d7eabf59835baea274c89cd5a1275e1e4978929faeffe68dcc487c1c",
+      "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+      "revision": 12,
+      "updatedAt": "2026-09-02T16:00:00.000Z",
+      "source": "mac"
+    },
+    "t3": {
+      "installed": "0.0.36-nightly.20260904",
+      "nightly": "0.0.37-nightly.20260905",
+      "upToDate": false,
+      "serverRunning": true,
+      "healthy": true,
+      "port": 8081
+    },
+    "pendingRestart": false,
+    "lastUpdate": {
+      "at": "2026-09-04T14:00:00.000Z",
+      "from": "0.0.35-nightly.20260903",
+      "to": "0.0.36-nightly.20260904",
+      "result": "updated",
+      "message": "updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904"
+    },
+    "connect": {
+      "configured": true,
+      "running": true
+    }
+  },
+  "history": {
+    "ok": true,
+    "contract": 3,
+    "agentVersion": "3.0.0",
+    "system": {
+      "id": "linux",
+      "name": "Raspberry Pi OS"
+    },
+    "operations": [
+      {
+        "id": "6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3",
+        "kind": "update",
+        "service": "t3",
+        "target": null,
+        "actionId": null,
+        "mode": "force",
+        "state": "running",
+        "phase": "installing",
+        "action": null,
+        "reasonCode": null,
+        "requestedAt": "2026-09-05T14:00:00.000Z",
+        "updatedAt": "2026-09-05T14:00:47.000Z",
+        "expiresAt": null
+      },
+      {
+        "id": "a1f8c3d7-2b46-4e58-90ca-7d1b4f62e830",
+        "kind": "run",
+        "service": null,
+        "target": null,
+        "actionId": "sunshine-restart",
+        "mode": "manual",
+        "state": "finished",
+        "phase": "done",
+        "action": "ran",
+        "reasonCode": null,
+        "requestedAt": "2026-09-05T13:30:00.000Z",
+        "updatedAt": "2026-09-05T13:30:02.000Z",
+        "expiresAt": null
+      },
+      {
+        "id": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
+        "kind": "update",
+        "service": "t3",
+        "target": null,
+        "actionId": null,
+        "mode": "scheduled",
+        "state": "finished",
+        "phase": "done",
+        "action": "updated",
+        "reasonCode": null,
+        "requestedAt": "2026-09-04T13:59:00.000Z",
+        "updatedAt": "2026-09-04T14:00:00.000Z",
+        "expiresAt": null
+      }
+    ],
+    "limit": 200,
+    "returned": 3,
+    "retained": 68,
+    "filter": {
+      "service": null,
+      "kind": null
+    }
+  },
+  "logs": {
+    "ok": true,
+    "contract": 3,
+    "agentVersion": "3.0.0",
+    "system": {
+      "id": "linux",
+      "name": "Raspberry Pi OS"
+    },
+    "source": "agent",
+    "opId": null,
+    "path": "/home/x1f4r/.legion-control/legionctl.log",
+    "requested": 200,
+    "returned": 2,
+    "truncated": true,
+    "lines": [
+      {
+        "at": "2026-09-05T02:02:00.000Z",
+        "line": "cycle done: 1 updated, 2 deferred",
+        "command": "cycle"
+      },
+      {
+        "at": "2026-09-05T14:00:00.000Z",
+        "line": "lock taken for update t3",
+        "command": "update"
+      }
+    ]
+  },
+  "config": {
+    "system": {
+      "id": "linux",
+      "name": "Raspberry Pi OS"
+    },
+    "autoUpdate": true,
+    "updates": {
+      "automatic": true,
+      "pauseUntil": null,
+      "maintenanceWindows": [
+        {
+          "days": [
+            "mon",
+            "tue",
+            "wed",
+            "thu",
+            "fri",
+            "sat",
+            "sun"
+          ],
+          "from": "02:00",
+          "to": "06:00"
+        }
+      ]
+    },
+    "services": [
+      {
+        "id": "t3",
+        "name": "T3 Code",
+        "kind": "npm",
+        "package": "t3",
+        "channel": "nightly",
+        "process": {
+          "type": "systemd-user",
+          "unit": "t3-code.service"
+        },
+        "busy": {
+          "type": "t3-sqlite",
+          "home": "/home/x1f4r/.t3",
+          "staleHours": 12
+        },
+        "health": {
+          "type": "http",
+          "port": 8081,
+          "path": "/health"
+        },
+        "deploy": {
+          "identityFile": "<redacted>",
+          "host": "atlas"
+        }
+      }
+    ]
+  },
+  "redacted": [
+    "services[0].deploy.identityFile"
+  ]
+}

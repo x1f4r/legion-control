@@ -1,0 +1,58 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "id": "0d4c6e21-5a83-4b7f-9c10-2e8b3f5a6d94",
+  "op": {
+    "id": "0d4c6e21-5a83-4b7f-9c10-2e8b3f5a6d94",
+    "kind": "boot",
+    "service": null,
+    "target": "windows",
+    "actionId": null,
+    "mode": "manual",
+    "initiator": {
+      "client": "phone",
+      "device": "pixel-8",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-03T14:00:00.000Z",
+    "startedAt": "2026-09-03T14:00:00.000Z",
+    "updatedAt": "2026-09-03T14:06:00.000Z",
+    "finishedAt": "2026-09-03T14:06:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": true,
+      "action": "rebooted",
+      "reasonCode": null,
+      "message": "the machine came back on Windows 11, booted at 2026-09-03T14:07:00.000Z, which is after the reboot was ordered",
+      "exitCode": 0,
+      "output": null,
+      "verified": true
+    },
+    "log": [
+      {
+        "at": "2026-09-03T14:00:00.000Z",
+        "line": "BootNext set to 0002 and read back"
+      },
+      {
+        "at": "2026-09-03T14:00:03.000Z",
+        "line": "reboot scheduled"
+      },
+      {
+        "at": "2026-09-03T14:06:00.000Z",
+        "line": "recovery: uptime 42s and the running system is windows, so the transition happened"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

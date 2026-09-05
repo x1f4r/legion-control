@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "restricted",
+  "message": "Service provisioning requires an unrestricted administrative session."
+}

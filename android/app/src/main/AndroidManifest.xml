@@ -11,6 +11,10 @@
          permission: the subnet of the interface answers the question without asking who the
          network is. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Saying how a change you asked for ended, when the app is not in front. Requested only when
+         the setting is turned on, because a permission prompt for a feature nobody asked for is how
+         people learn to refuse everything. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="false"
@@ -35,8 +39,8 @@
             </intent-filter>
         </activity>
     
-        <!-- Handing the downloaded apk to the system installer. Scoped to the updates directory
-             only, so nothing else this app stores is exposed by it. -->
+        <!-- The installer and explicit diagnostic sharing can read only their dedicated cache
+             directories; application keys and private configuration are never exposed. -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.updates"

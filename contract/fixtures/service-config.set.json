@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "valid": true,
+  "hash": "8fd3164dc4a38cbbf59b3bab5fed952f0e8f2bcf087a38ef573e0cea7b5805f3",
+  "proposedHash": "8fd3164dc4a38cbbf59b3bab5fed952f0e8f2bcf087a38ef573e0cea7b5805f3",
+  "changes": {
+    "added": [
+      "demo"
+    ],
+    "removed": [],
+    "changed": [],
+    "otherSettingsChanged": false
+  },
+  "warnings": [],
+  "saved": true,
+  "message": "Agent configuration saved. No setup or service command was executed."
+}

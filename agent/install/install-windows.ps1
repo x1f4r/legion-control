@@ -8,7 +8,7 @@
         ssh <machine> "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\<you>\legion-control\agent\install\install-windows.ps1"
 
     What it does:
-      1. Copies the agent tree to C:\Users\<you>\.legion-control\agent
+      1. Stages and self-checks the complete agent tree before replacing it.
       2. Points a scheduled task at the agent's update cycle, every 15 minutes.
          If the task named by -TaskName does not exist it is created, running as
          the account this script runs under. If it does exist, its action and
@@ -45,7 +45,10 @@ param(
     [string] $TaskName = 'Legion Control Update',
 
     # Skip the file copy. Useful when only the scheduled task needs fixing.
-    [switch] $SkipCopy
+    [switch] $SkipCopy,
+
+    # Install and verify files without creating or changing a scheduled task.
+    [switch] $SkipScheduler
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,12 +60,20 @@ $ErrorActionPreference = 'Stop'
 $TaskNamespace = 'http://schemas.microsoft.com/windows/2004/02/mit/task'
 $Interval      = 'PT15M'
 $IntervalSpan  = New-TimeSpan -Minutes 15
-$MinNodeMajor  = 22
+$MinNodeMajor  = 24
 
 $UserProfile = $env:USERPROFILE
-$Base        = Join-Path $UserProfile '.legion-control'
+$Base        = if ($env:LEGIONCTL_HOME) { $env:LEGIONCTL_HOME } else { Join-Path $UserProfile '.legion-control' }
+if (-not [IO.Path]::IsPathRooted($Base)) {
+    throw "LEGIONCTL_HOME must be an absolute path, got '$Base'."
+}
+$Base        = [IO.Path]::GetFullPath($Base).TrimEnd([IO.Path]::DirectorySeparatorChar)
+$env:LEGIONCTL_HOME = $Base
 $AgentDir    = Join-Path $Base 'agent'
 $AgentEntry  = Join-Path $AgentDir 'src\index.mjs'
+$BinDir      = Join-Path $Base 'bin'
+$LauncherModule = Join-Path $BinDir 'launcher.mjs'
+$LauncherScript = Join-Path $BinDir 'legionctl.ps1'
 $XmlPath     = Join-Path $Base (($TaskName -replace '[^\w\-]', '-') + '.xml')
 
 # Where the superseded PowerShell updater used to live, if this machine ever ran
@@ -97,11 +108,8 @@ $principal  = New-Object Security.Principal.WindowsPrincipal($identity)
 $IsElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Note ("running as " + $identity.Name + ", elevated=" + $IsElevated)
 
-# The controller apps invoke the agent over SSH without quoting, which is only
-# safe while the install paths stay free of spaces. Fail loudly rather than
-# produce a layout that breaks in a way nobody would connect back to this script.
-if ($Base -match '\s') {
-    throw "The install path '$Base' contains a space. The agent contract requires space free paths."
+if ($Base.Contains("`n") -or $Base.Contains("`r")) {
+    throw 'Install paths containing a line break are unsupported.'
 }
 
 $nodeCmd = Get-Command 'node.exe' -ErrorAction SilentlyContinue
@@ -147,6 +155,45 @@ $SrcAgent = Split-Path -Parent $PSScriptRoot
 if (-not (Test-Path (Join-Path $SrcAgent 'src\index.mjs'))) {
     throw "No agent source at $SrcAgent\src\index.mjs. Copy the repo across first."
 }
+if (-not (Test-Path (Join-Path $SrcAgent 'package.json') -PathType Leaf)) {
+    throw "No package metadata at $SrcAgent\package.json."
+}
+if (-not (Test-Path (Join-Path $PSScriptRoot 'launcher.mjs') -PathType Leaf)) {
+    throw "Stable launcher helper missing at $PSScriptRoot\launcher.mjs."
+}
+
+function Test-AgentTree([string] $Tree) {
+    $verifyCode = @'
+import { pathToFileURL } from "node:url";
+const verifier = await import(pathToFileURL(process.argv[2]));
+const result = verifier.verifyInstalledTree(process.argv[3]);
+if (!result.ok) { process.stderr.write(result.error + "\n"); process.exit(1); }
+process.stdout.write(result.signed ? `signed ${result.manifest.version}` : "unsigned source checkout");
+'@
+    $oldLibraryMode = $env:LEGIONCTL_LAUNCHER_LIBRARY
+    $env:LEGIONCTL_LAUNCHER_LIBRARY = '1'
+    try {
+        $result = ($verifyCode | & $NodeExe --input-type=module - (Join-Path $PSScriptRoot 'launcher.mjs') $Tree) -join ' '
+    } finally {
+        $env:LEGIONCTL_LAUNCHER_LIBRARY = $oldLibraryMode
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Agent tree verification failed for '$Tree'." }
+    return $result
+}
+
+function Test-AgentSelfCheck([string] $Tree) {
+    $entry = Join-Path $Tree 'src\index.mjs'
+    $output = (& $NodeExe $entry version --check) -join ' '
+    if ($LASTEXITCODE -ne 0) { throw "The staged agent exited with $LASTEXITCODE during version --check." }
+    try { $reply = $output | ConvertFrom-Json } catch { throw "The staged agent returned invalid JSON during version --check: $output" }
+    $expected = (Get-Content -LiteralPath (Join-Path $Tree 'package.json') -Raw | ConvertFrom-Json).version
+    if ($reply.ok -ne $true -or $reply.agentVersion -ne $expected -or $reply.contract -lt 3 -or $reply.selfTest.ok -ne $true) {
+        throw "The staged agent did not pass version --check: $output"
+    }
+}
+
+$sourceTrust = Test-AgentTree $SrcAgent
+Note ("source verification: " + $sourceTrust)
 
 $sameTree = $false
 if (Test-Path $AgentDir) {
@@ -155,6 +202,20 @@ if (Test-Path $AgentDir) {
     $sameTree = $a.Equals($b, [StringComparison]::OrdinalIgnoreCase)
 }
 
+if (-not (Test-Path $BinDir)) { New-Item -ItemType Directory -Path $BinDir -Force | Out-Null }
+$moduleTemporary = $LauncherModule + '.new.' + [Guid]::NewGuid().ToString('N')
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'launcher.mjs') -Destination $moduleTemporary -Force
+Move-Item -LiteralPath $moduleTemporary -Destination $LauncherModule -Force
+
+$nodeLiteral = "'" + $NodeExe.Replace("'", "''") + "'"
+$launcherText = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'launcher.ps1') -Raw).Replace('@NODE_POWERSHELL@', $nodeLiteral)
+$launcherTemporary = $LauncherScript + '.new.' + [Guid]::NewGuid().ToString('N')
+[IO.File]::WriteAllText($launcherTemporary, $launcherText, (New-Object Text.UTF8Encoding($false)))
+Move-Item -LiteralPath $launcherTemporary -Destination $LauncherScript -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'dispatch.ps1') -Destination (Join-Path $BinDir 'dispatch.ps1') -Force
+
+
+$Backup = $null
 if ($SkipCopy) {
     Note 'copy skipped by request'
 } elseif ($sameTree) {
@@ -165,21 +226,44 @@ if ($SkipCopy) {
     if (-not (Test-Path $Base)) {
         New-Item -ItemType Directory -Path $Base -Force | Out-Null
     }
-    if (Test-Path $AgentDir) {
-        Remove-Item -Path $AgentDir -Recurse -Force
+    $Stage = Join-Path $Base ('agent.install.new.' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $Stage | Out-Null
+    Copy-Item -LiteralPath (Join-Path $SrcAgent 'src') -Destination (Join-Path $Stage 'src') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $SrcAgent 'install') -Destination (Join-Path $Stage 'install') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $SrcAgent 'package.json') -Destination (Join-Path $Stage 'package.json') -Force
+    $hasManifest = Test-Path (Join-Path $SrcAgent 'MANIFEST.json') -PathType Leaf
+    $hasSignature = Test-Path (Join-Path $SrcAgent 'MANIFEST.json.sig') -PathType Leaf
+    if ($hasManifest -ne $hasSignature) {
+        throw 'Source must carry both MANIFEST.json and MANIFEST.json.sig.'
     }
-    New-Item -ItemType Directory -Path $AgentDir -Force | Out-Null
-    Copy-Item -Path (Join-Path $SrcAgent 'src') -Destination (Join-Path $AgentDir 'src') -Recurse -Force
-    if (Test-Path (Join-Path $SrcAgent 'install')) {
-        # Ship the installer along so the box can be re-provisioned from itself.
-        Copy-Item -Path (Join-Path $SrcAgent 'install') -Destination (Join-Path $AgentDir 'install') -Recurse -Force
+    if ($hasManifest) {
+        Copy-Item -LiteralPath (Join-Path $SrcAgent 'MANIFEST.json') -Destination (Join-Path $Stage 'MANIFEST.json') -Force
+        Copy-Item -LiteralPath (Join-Path $SrcAgent 'MANIFEST.json.sig') -Destination (Join-Path $Stage 'MANIFEST.json.sig') -Force
     }
-    Note "agent copied to $AgentDir"
+    Test-AgentTree $Stage | Out-Null
+    Test-AgentSelfCheck $Stage
+
+    $Backup = Join-Path $Base 'agent.prev'
+    & $NodeExe (Join-Path $PSScriptRoot 'promote.mjs') $Base $Stage
+    if ($LASTEXITCODE -ne 0) { throw 'Agent promotion failed; all retained trees remain available for recovery.' }
+    Note "agent promoted to $AgentDir"
+    if (Test-Path -LiteralPath $Backup -PathType Container) { Note "previous agent retained at $Backup" }
 }
 
-if (-not (Test-Path $AgentEntry)) {
+if (-not (Test-Path $AgentEntry -PathType Leaf)) {
     throw "Agent entry point missing at $AgentEntry."
 }
+
+
+try {
+    $finalOutput = (& $LauncherScript version --check) -join ' '
+    if ($LASTEXITCODE -ne 0) { throw "launcher exited with $LASTEXITCODE" }
+    $finalReply = $finalOutput | ConvertFrom-Json
+    if ($finalReply.ok -ne $true -or $finalReply.selfTest.ok -ne $true) { throw 'launcher self-check reply was not successful' }
+} catch {
+    throw "Installed agent failed its final self-check; the current tree and previous backup are retained for inspection: $($_.Exception.Message)"
+}
+Note "stable launcher installed at $LauncherScript and passed version --check"
 
 # config.json and state.json are deliberately not written here. The agent falls
 # back to its own defaults when they are absent, and stamping a fresh config
@@ -187,7 +271,7 @@ if (-not (Test-Path $AgentEntry)) {
 if (Test-Path (Join-Path $Base 'config.json')) {
     Note 'config.json is already there and was left untouched'
 } else {
-    Note 'no config.json; the agent falls back to its defaults until you write one'
+    Note 'no config.json; inert defaults apply (no services, no boot targets, automatic maintenance off)'
 }
 
 # Smoke test the agent. Only stdout is captured, deliberately: the agent puts
@@ -209,12 +293,18 @@ try {
 # Scheduled task
 # ---------------------------------------------------------------------------
 
-Step 'Scheduled task'
-
-$existing       = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $TaskRegistered = $false
 $RegisterCommand = $null
 $taskPath       = '\'
+$existing       = $null
+
+if ($SkipScheduler) {
+    Note 'scheduled task left untouched by -SkipScheduler'
+} else {
+Step 'Scheduled task'
+
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$LauncherArguments = '"' + $LauncherModule.Replace('"', '\"') + '" cycle'
 
 if (-not $existing) {
 
@@ -225,7 +315,7 @@ if (-not $existing) {
     # services this account owns.
     Note "'$TaskName' does not exist, creating it"
 
-    $action = New-ScheduledTaskAction -Execute $NodeExe -Argument "$AgentEntry update" -WorkingDirectory $Base
+    $action = New-ScheduledTaskAction -Execute $NodeExe -Argument $LauncherArguments -WorkingDirectory $Base
 
     # A one-off trigger in the past with a repetition and no duration repeats
     # forever, and StartWhenAvailable makes a run the machine slept through
@@ -241,8 +331,8 @@ if (-not $existing) {
     # If the task were allowed to run in parallel, two installs would fight over
     # the same files and wreck the install. IgnoreNew is the only sane policy
     # here, and the time limit matches: a run that has not finished in 15
-    # minutes is stuck, and the agent's lock is written with a pid so the next
-    # run can take it over.
+    # minutes is stuck. The agent's OS-backed mutex is released when that
+    # process exits, and the next cycle recovers its interrupted operation.
     $settings = New-ScheduledTaskSettingsSet `
         -MultipleInstances IgnoreNew `
         -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
@@ -263,7 +353,7 @@ if (-not $existing) {
     $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     if ($existing.TaskPath) { $taskPath = $existing.TaskPath }
     $TaskRegistered = $true
-    Note ("created '$TaskName': " + $NodeExe + " " + $AgentEntry + " update, every 15 minutes as " + $identity.Name)
+    Note ("created '$TaskName': " + $NodeExe + " " + $LauncherArguments + ", every 15 minutes as " + $identity.Name)
 
 } else {
 
@@ -330,10 +420,8 @@ if (-not $existing) {
     $commandNode.InnerText = $NodeExe
     $execNode.AppendChild($commandNode) | Out-Null
 
-    # The path carries no spaces (checked in preflight), so it needs no quoting.
-    # Keeping it unquoted matches how the controller invokes the agent over SSH.
     $argumentsNode = $doc.CreateElement('Arguments', $TaskNamespace)
-    $argumentsNode.InnerText = "$AgentEntry update"
+    $argumentsNode.InnerText = $LauncherArguments
     $execNode.AppendChild($argumentsNode) | Out-Null
 
     # A task running as SYSTEM starts in C:\Windows\system32. Point it somewhere
@@ -344,7 +432,7 @@ if (-not $existing) {
     $execNode.AppendChild($workingNode) | Out-Null
 
     $actions.AppendChild($execNode) | Out-Null
-    Note ("new action:   " + $NodeExe + " " + $AgentEntry + " update")
+    Note ("new action:   " + $NodeExe + " " + $LauncherArguments)
 
     # --- triggers -----------------------------------------------------------
 
@@ -529,6 +617,7 @@ if ($TaskRegistered) {
     if ($liveUser)     { Note ("live principal: " + $liveUser.InnerText) }
     if ($liveLimit)    { Note ("live limit:     " + $liveLimit.InnerText) }
 }
+}
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -555,7 +644,7 @@ if (-not $TaskRegistered -and $RegisterCommand) {
 }
 
 Say ''
-Say ('  Agent:  ' + $NodeExe + ' ' + $AgentEntry + ' status')
+Say ('  Agent:  ' + $NodeExe + ' ' + $LauncherModule + ' status')
 Say ('  Config: ' + (Join-Path $Base 'config.json'))
 Say ('  Task:   Get-ScheduledTaskInfo -TaskName "' + $TaskName + '"')
 Say ('  Logs:   ' + (Join-Path $Base 'legionctl.log'))
@@ -566,7 +655,7 @@ Say ''
 #   0  fully installed, the task now runs the agent
 #   2  agent installed, but the task still needs the elevated command above
 #   1  something threw, see the message
-if (-not $TaskRegistered) {
+if (-not $TaskRegistered -and -not $SkipScheduler) {
     exit 2
 }
 exit 0

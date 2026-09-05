@@ -1,0 +1,45 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "the machine will boot into Windows 11 on the next idle cycle, or the request is dropped at 2026-09-05T14:40:00.000Z",
+  "action": "queued",
+  "target": "windows",
+  "replaced": null,
+  "op": {
+    "id": "8c3a5f60-1d29-4b74-a8e3-5f0c7b91d642",
+    "kind": "boot",
+    "service": null,
+    "target": "windows",
+    "actionId": null,
+    "mode": "queued",
+    "initiator": {
+      "client": "phone",
+      "device": "pixel-8",
+      "user": "x1f4r"
+    },
+    "state": "queued",
+    "phase": "queued",
+    "progress": null,
+    "requestedAt": "2026-09-05T10:40:00.000Z",
+    "startedAt": null,
+    "updatedAt": "2026-09-05T10:40:00.000Z",
+    "finishedAt": null,
+    "expiresAt": "2026-09-05T14:40:00.000Z",
+    "pid": null,
+    "detached": false,
+    "result": null,
+    "log": [
+      {
+        "at": "2026-09-05T10:40:00.000Z",
+        "line": "queued until idle, expires in 4h"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

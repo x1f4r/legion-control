@@ -1,0 +1,18 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "config-invalid",
+  "message": "The configuration is incomplete or invalid; nothing was saved.",
+  "valid": false,
+  "errors": [
+    {
+      "path": "services[0].busy",
+      "message": "Choose a busy probe, or explicitly set type none to allow work without busy protection."
+    }
+  ]
+}

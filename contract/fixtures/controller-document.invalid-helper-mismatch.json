@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "machines": [
+    {
+      "id": "pi",
+      "name": "Atlas"
+    },
+    {
+      "id": "legion",
+      "name": "Legion 7"
+    },
+    {
+      "id": "tower",
+      "name": "Tower",
+      "wake": {
+        "mac": "11:22:33:44:55:66",
+        "helper": {
+          "machine": "legion",
+          "action": "wake-tower"
+        },
+        "helpers": [
+          {
+            "machine": "pi",
+            "action": "wake-tower"
+          }
+        ]
+      }
+    }
+  ]
+}

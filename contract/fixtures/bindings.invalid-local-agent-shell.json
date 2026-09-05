@@ -1,0 +1,13 @@
+{
+  "deviceName": "Robert's tower",
+  "self": {
+    "machine": "tower"
+  },
+  "localAgent": {
+    "argv": [
+      "node",
+      "C:/Users/x1f4r/.legion-control/agent/src/index.mjs"
+    ],
+    "shell": "cmd"
+  }
+}

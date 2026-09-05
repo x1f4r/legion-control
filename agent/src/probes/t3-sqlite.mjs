@@ -4,9 +4,30 @@
 //
 // This feeds the gate in front of every disruptive action (update, restart,
 // boot, sleep), so it is deliberately conservative. THE RULE IS FAIL CLOSED: if
-// we cannot read the state database we report busy:true. Restarting mid-turn
-// throws away the user's work; deferring only costs a delay, and the next cycle
-// tries again.
+// we cannot read the state database we report busy. Restarting mid-turn throws
+// away the user's work; deferring only costs a delay, and the next cycle tries
+// again.
+//
+// Two things the first version got wrong, both in the same direction:
+//
+//   A turn still marked "running" was aged out by its requested_at, so after six
+//   hours it stopped blocking. But requested_at is when the turn STARTED, not
+//   when it was last alive. A long agent run is exactly the work this gate
+//   exists to protect, and it was the first thing to lose the protection. A
+//   running row now blocks regardless of age. Only evidence from OUTSIDE the
+//   database retires one, and there are exactly two kinds:
+//
+//     the service process is not running — nothing can be executing the turn;
+//     the service process started AFTER the row's requested_at — a turn cannot
+//       survive the restart of the server that was running it.
+//
+//   Pending rows and approvals still age out on staleHours, because those are
+//   queued work with nothing executing.
+//
+//   A database that was not there counted as idle. That is right for a machine
+//   where the product has never run and indistinguishable from a wrong path,
+//   which is the far more likely mistake. Absent now blocks and names the path,
+//   unless the config says allowMissing.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -44,53 +65,57 @@ function plural(n, word) {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
-function buildReason({ runningTurns, pendingTurns, pendingApprovals, staleTurns, staleApprovals }) {
+function buildReason({ runningTurns, pendingTurns, pendingApprovals, staleTurns, staleApprovals, abandonedTurns }) {
   const parts = [];
   if (runningTurns > 0) parts.push(`${plural(runningTurns, 'turn')} running`);
   if (pendingTurns > 0) parts.push(`${plural(pendingTurns, 'turn')} pending`);
   if (pendingApprovals > 0) parts.push(`${plural(pendingApprovals, 'approval')} waiting`);
   if (parts.length > 0) return parts.join(', ');
 
-  const stale = staleTurns + staleApprovals;
-  if (stale > 0) return `idle (${plural(stale, 'stale row')} ignored)`;
+  const ignored = staleTurns + staleApprovals + abandonedTurns;
+  if (abandonedTurns > 0) {
+    return `idle (${plural(abandonedTurns, 'running row')} left behind by a service that is not running)`;
+  }
+  if (ignored > 0) return `idle (${plural(ignored, 'stale row')} ignored)`;
   return 'idle';
 }
 
-function idleResult(reason) {
-  return {
-    busy: false,
-    runningTurns: 0,
-    pendingTurns: 0,
-    pendingApprovals: 0,
-    staleTurns: 0,
-    staleApprovals: 0,
-    reason,
-    threads: [],
-    threadsTruncated: 0,
-    unknown: false,
-  };
-}
+const EMPTY_COUNTS = {
+  runningTurns: 0,
+  pendingTurns: 0,
+  pendingApprovals: 0,
+  staleTurns: 0,
+  staleApprovals: 0,
+  abandonedTurns: 0,
+};
 
-function unknownResult(detail) {
+/**
+ * The shared reply shape. `monitored` is true whenever a probe was configured at
+ * all, even when it could not be read: "you asked me to watch this and I could
+ * not" is a different statement from "nobody asked me to watch it".
+ */
+function answer(state, reason, { evidence = 't3-sqlite', startedAt, ...extra } = {}) {
+  const blocking = state !== 'idle';
   return {
-    busy: true,
-    runningTurns: 0,
-    pendingTurns: 0,
-    pendingApprovals: 0,
-    staleTurns: 0,
-    staleApprovals: 0,
-    reason: 'busy state unknown',
+    busy: blocking,
+    unknown: state !== 'idle' && state !== 'busy',
+    monitored: true,
+    reason,
+    evidence,
+    checkedAt: new Date().toISOString(),
+    elapsedMs: startedAt === undefined ? 0 : Math.max(0, Date.now() - startedAt),
+    error: null,
+    ...EMPTY_COUNTS,
     threads: [],
     threadsTruncated: 0,
-    unknown: true,
-    error: detail,
+    ...extra,
   };
 }
 
 /**
- * A row counts as fresh (and therefore blocking) when its timestamp is inside the
- * staleness window. A missing or unparseable timestamp is treated as fresh, again
- * because the safe direction is to block.
+ * A pending row counts as fresh (and therefore blocking) when its timestamp is
+ * inside the staleness window. A missing or unparseable timestamp is treated as
+ * fresh, again because the safe direction is to block.
  */
 function isFresh(timestamp, now, windowMs) {
   if (!timestamp) return true;
@@ -115,7 +140,25 @@ function fetchTitles(db, threadIds) {
   return titles;
 }
 
-function readSnapshot(db, windowMs) {
+/**
+ * Whether outside evidence retires a running row. Returns null when there is no
+ * such evidence, which is the case that keeps the row blocking.
+ */
+function abandonedReason(requestedAt, { serviceIsRunning, serviceStartedAt }) {
+  if (serviceIsRunning === false) return 'the service is not running';
+  if (serviceIsRunning === true && serviceStartedAt) {
+    const started = Date.parse(serviceStartedAt);
+    const requested = Date.parse(requestedAt ?? '');
+    // A missing or unreadable requested_at gives no ordering to compare, so it
+    // keeps its protection.
+    if (!Number.isNaN(started) && !Number.isNaN(requested) && started > requested) {
+      return 'the service restarted after this turn began';
+    }
+  }
+  return null;
+}
+
+function readSnapshot(db, windowMs, { serviceIsRunning, serviceStartedAt, startedAt }) {
   const now = Date.now();
 
   const turnRows = db
@@ -139,41 +182,63 @@ function readSnapshot(db, windowMs) {
   ];
   const titles = fetchTitles(db, threadIds);
 
-  let runningTurns = 0;
-  let pendingTurns = 0;
-  let pendingApprovals = 0;
-  let staleTurns = 0;
-  let staleApprovals = 0;
+  const counts = { ...EMPTY_COUNTS };
   const threads = [];
 
   for (const row of turnRows) {
-    const fresh = isFresh(row.requested_at, now, windowMs);
-    if (fresh) {
-      if (row.state === 'running') runningTurns += 1;
-      else pendingTurns += 1;
+    const running = row.state === 'running';
+    let blocking;
+    let disposition;
+
+    if (running) {
+      // The only thing that retires a running row is evidence from outside the
+      // database that nothing could be running it. Age is not that evidence: a
+      // turn that has been going for seven hours is a long agent run, and it is
+      // precisely the work this gate exists to protect.
+      const abandoned = abandonedReason(row.requested_at, { serviceIsRunning, serviceStartedAt });
+      if (abandoned) {
+        blocking = false;
+        disposition = 'abandoned';
+        counts.abandonedTurns += 1;
+      } else {
+        blocking = true;
+        disposition = 'running';
+        counts.runningTurns += 1;
+      }
+    } else if (isFresh(row.requested_at, now, windowMs)) {
+      blocking = true;
+      disposition = 'pending';
+      counts.pendingTurns += 1;
     } else {
-      staleTurns += 1;
+      blocking = false;
+      disposition = 'stale';
+      counts.staleTurns += 1;
     }
+
     threads.push({
       threadId: row.thread_id ?? null,
       turnId: row.turn_id ?? null,
       title: titles.get(row.thread_id) ?? null,
       state: row.state,
       at: row.requested_at ?? null,
-      stale: !fresh,
+      blocking,
+      disposition,
+      stale: disposition === 'stale',
     });
   }
 
   for (const row of approvalRows) {
     const fresh = isFresh(row.created_at, now, windowMs);
-    if (fresh) pendingApprovals += 1;
-    else staleApprovals += 1;
+    if (fresh) counts.pendingApprovals += 1;
+    else counts.staleApprovals += 1;
     threads.push({
       threadId: row.thread_id ?? null,
       turnId: row.turn_id ?? null,
       title: titles.get(row.thread_id) ?? null,
       state: 'awaiting-approval',
       at: row.created_at ?? null,
+      blocking: fresh,
+      disposition: fresh ? 'pending-approval' : 'stale',
       stale: !fresh,
     });
   }
@@ -181,26 +246,24 @@ function readSnapshot(db, windowMs) {
   // Blocking rows first, newest first, and capped: a database with months of
   // abandoned pending rows must not produce a megabyte of status JSON.
   threads.sort((a, b) => {
-    if (a.stale !== b.stale) return a.stale ? 1 : -1;
+    if (a.blocking !== b.blocking) return a.blocking ? -1 : 1;
     return String(b.at ?? '').localeCompare(String(a.at ?? ''));
   });
   const shown = threads.slice(0, MAX_REPORTED_THREADS);
 
-  const counts = { runningTurns, pendingTurns, pendingApprovals, staleTurns, staleApprovals };
-  return {
-    busy: runningTurns + pendingTurns + pendingApprovals > 0,
+  const busy = counts.runningTurns + counts.pendingTurns + counts.pendingApprovals > 0;
+  return answer(busy ? 'busy' : 'idle', buildReason(counts), {
+    startedAt,
     ...counts,
-    reason: buildReason(counts),
     threads: shown,
     threadsTruncated: threads.length - shown.length,
-    unknown: false,
-  };
+  });
 }
 
-function openAndRead(sqlite, file, windowMs, options) {
+function openAndRead(sqlite, file, windowMs, options, context) {
   const db = new sqlite.DatabaseSync(file, options);
   try {
-    return readSnapshot(db, windowMs);
+    return readSnapshot(db, windowMs, context);
   } finally {
     try {
       db.close();
@@ -218,7 +281,7 @@ function openAndRead(sqlite, file, windowMs, options) {
  * refuses because it needs to recover the WAL, we open the throwaway copy
  * writable, which is harmless because it is a copy.
  */
-function readViaCopy(sqlite, file, windowMs) {
+function readViaCopy(sqlite, file, windowMs, context) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'legionctl-busy-'));
   try {
     const target = path.join(tmpDir, 'state.sqlite');
@@ -228,9 +291,9 @@ function readViaCopy(sqlite, file, windowMs) {
       if (fs.existsSync(sibling)) fs.copyFileSync(sibling, `${target}${suffix}`);
     }
     try {
-      return openAndRead(sqlite, target, windowMs, { readOnly: true });
+      return openAndRead(sqlite, target, windowMs, { readOnly: true }, context);
     } catch {
-      return openAndRead(sqlite, target, windowMs, { readOnly: false });
+      return openAndRead(sqlite, target, windowMs, { readOnly: false }, context);
     }
   } finally {
     try {
@@ -241,36 +304,68 @@ function readViaCopy(sqlite, file, windowMs) {
   }
 }
 
-/** Read the T3 state database and say whether it is busy. Never throws. */
-export function checkT3Sqlite(probe = {}) {
+/**
+ * Read the T3 state database and say whether it is busy. Never throws.
+ *
+ * `liveness.serviceRunning` is the outside evidence described at the top of the
+ * file. Pass it whenever it is already known; leave it null when it is not,
+ * since guessing at it would defeat the point.
+ */
+export function checkT3Sqlite(probe = {}, { liveness = null, serviceName = 'the service', startedAt = Date.now() } = {}) {
   const hours = Number(probe.staleHours);
   const windowMs = (Number.isFinite(hours) && hours > 0 ? hours : DEFAULT_STALE_HOURS) * 60 * 60 * 1000;
   const file = t3StateDbPath(probe);
+  const serviceIsRunning = typeof liveness?.serviceRunning === 'boolean' ? liveness.serviceRunning : null;
+  const serviceStartedAt = typeof liveness?.startedAt === 'string' ? liveness.startedAt : null;
 
   let exists = false;
   try {
     exists = fs.existsSync(file);
   } catch (err) {
-    return unknownResult(`cannot stat ${file}: ${err.message}`);
+    return answer('unknown', 'busy state unknown', { evidence: 'probe-error', error: `cannot stat ${file}: ${err.message}`, path: file, startedAt });
   }
-  // No database means T3 has never run here, which is genuinely idle.
-  if (!exists) return idleResult('idle (no T3 state database)');
+
+  if (!exists) {
+    if (probe.allowMissing === true) {
+      return answer('idle', 'idle (no state database, and the config says that is expected)', { path: file, startedAt });
+    }
+    return answer('unknown', 'busy state unknown', {
+      evidence: 'probe-error',
+      path: file,
+      startedAt,
+      error:
+        `there is no state database at ${file}, so there is no way to tell whether ${serviceName} is in the middle of something. ` +
+        'A machine where the product has never run looks exactly like a wrong path from here. ' +
+        'Set busy.home to the right directory, or busy.allowMissing to true if this machine really has never run it.',
+    });
+  }
 
   const sqlite = loadSqlite();
   if (!sqlite || typeof sqlite.DatabaseSync !== 'function') {
-    return unknownResult('node:sqlite is not available in this Node build');
+    return answer('unknown', 'busy state unknown', {
+      evidence: 'probe-error',
+      path: file,
+      startedAt,
+      error: 'node:sqlite is not available in this Node build',
+    });
   }
 
+  const context = { serviceIsRunning, serviceStartedAt, startedAt };
   let firstError;
   try {
-    return openAndRead(sqlite, file, windowMs, { readOnly: true });
+    return openAndRead(sqlite, file, windowMs, { readOnly: true }, context);
   } catch (err) {
     firstError = err;
   }
 
   try {
-    return readViaCopy(sqlite, file, windowMs);
+    return readViaCopy(sqlite, file, windowMs, context);
   } catch (err) {
-    return unknownResult(`direct read failed (${firstError.message}); copy read failed (${err.message})`);
+    return answer('unknown', 'busy state unknown', {
+      evidence: 'probe-error',
+      path: file,
+      startedAt,
+      error: `direct read failed (${firstError.message}); copy read failed (${err.message})`,
+    });
   }
 }

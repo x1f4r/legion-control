@@ -1,0 +1,30 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "updates for t3 are paused until 2026-09-08T02:00:00.000Z",
+  "service": "t3",
+  "updates": {
+    "automatic": true,
+    "inherited": true,
+    "pauseUntil": "2026-09-08T02:00:00.000Z",
+    "maintenanceWindows": null,
+    "eligibleNow": false,
+    "deferredReason": "policy-paused",
+    "inheritedKeys": {
+      "automatic": true,
+      "pauseUntil": false,
+      "maintenanceWindows": true
+    },
+    "inWindowNow": false,
+    "nextWindow": "2026-09-06T02:00:00.000Z"
+  },
+  "autoUpdate": true,
+  "changed": [
+    "pauseUntil"
+  ]
+}

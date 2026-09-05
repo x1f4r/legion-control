@@ -172,17 +172,43 @@ function armGrubReboot(target) {
 // Arming
 // ---------------------------------------------------------------------------
 
-function armCommand(target) {
+/**
+ * A boot target described entirely by commands.
+ *
+ * Every other method reads the firmware back after arming it. This one can only
+ * read back what the config gives it, so a target with no `verify` command
+ * CANNOT be armed for a reboot at all — and --force does not change that. The
+ * whole reason arming is verified is that rebooting an unarmed machine returns
+ * to the system it was already on while the controller waits for one that never
+ * appears; a force flag that skipped the check would be a flag whose only effect
+ * is to make that outcome more likely.
+ *
+ * `boot --no-reboot` still arms it, because nothing is lost by trying when
+ * nobody is about to close the session on the strength of it.
+ */
+function armCommand(target, { requireVerification }) {
+  if (!target.verify && requireVerification) {
+    return {
+      ok: false,
+      verified: false,
+      message:
+        `the boot target ${target.id} has no verify command, so there is no way to confirm it was armed. ` +
+        'Add "verify" (a command that fails unless the target really is armed), or use --no-reboot and check it yourself. ' +
+        '--force overrides the busy gate, not the evidence',
+    };
+  }
+
   const armed = runArgv(target.arm, { timeoutMs: 60000 });
-  if (!armed.ok) return { ok: false, message: `the arm command failed: ${describeFailure(armed)}` };
+  if (!armed.ok) return { ok: false, verified: false, message: `the arm command failed: ${describeFailure(armed)}` };
+
   if (!target.verify) {
-    // The only unverified path there is, and it is unverified because the config
-    // said so: a target with no verify command has nothing to read back.
-    return { ok: true, message: `${target.id} armed (no verify command is configured, so this is not read back)` };
+    return { ok: true, verified: false, message: `${target.id} armed (no verify command is configured, so this was not read back)` };
   }
   const verified = runArgv(target.verify, { timeoutMs: 30000 });
-  if (!verified.ok) return { ok: false, message: `the arm command ran but verification failed: ${describeFailure(verified)}` };
-  return { ok: true, message: `${target.id} armed and verified` };
+  if (!verified.ok) {
+    return { ok: false, verified: false, message: `the arm command ran but verification failed: ${describeFailure(verified)}` };
+  }
+  return { ok: true, verified: true, message: `${target.id} armed and verified` };
 }
 
 /** The boot targets this system can offer, in config order. */
@@ -194,25 +220,50 @@ export function findBootTarget(config, id) {
   return config.boot?.targets?.[id] ?? null;
 }
 
-/** Arm the next boot. The reboot itself is the caller's decision. */
-export function armNextBoot(config, id) {
+/**
+ * Arm the next boot. The reboot itself is the caller's decision.
+ *
+ * `requireVerification` is true whenever a reboot is going to follow, which is
+ * every path except `--no-reboot`. Every firmware method reads itself back
+ * regardless; it only changes what a command-described target is allowed to do.
+ */
+export function armNextBoot(config, id, { requireVerification = true } = {}) {
   const target = findBootTarget(config, id);
-  if (!target) return { ok: false, message: `unknown boot target: ${id}` };
+  if (!target) return { ok: false, verified: false, message: `unknown boot target: ${id}` };
 
   switch (target.method) {
     case 'efi-bootnext':
-      return armEfiBootNext(target);
+      return { verified: true, ...armEfiBootNext(target) };
     case 'clear-bootsequence':
-      return armClearBootSequence();
+      return { verified: true, ...armClearBootSequence() };
     case 'bootsequence':
-      return armBootSequence(target);
+      return { verified: true, ...armBootSequence(target) };
     case 'grub-reboot':
-      return armGrubReboot(target);
+      return { verified: true, ...armGrubReboot(target) };
     case 'command':
-      return armCommand(target);
+      return armCommand(target, { requireVerification });
     default:
-      return { ok: false, message: `unknown boot method: ${target.method}` };
+      return { ok: false, verified: false, message: `unknown boot method: ${target.method}` };
   }
+}
+
+/**
+ * Whether non-interactive sudo will actually allow one exact command.
+ *
+ * `sudo -l <cmd>` asks the policy without running anything, and with -n it never
+ * prompts. This is the preflight the first version was missing: the reboot
+ * itself is detached and cannot report back, so without asking first a machine
+ * that is never going to go down gets reported as rebooting.
+ */
+function sudoAllows(args) {
+  const listed = runCommand('sudo', ['-n', '-l', ...args], { timeoutMs: 10000 });
+  if (listed.ok) return { ok: true, message: null };
+  // Some sudo builds do not support -l for a specific command by an unprivileged
+  // caller. Fall back to proving that non-interactive sudo works at all, and let
+  // the real command report its own failure if the rule is narrower than that.
+  const any = runCommand('sudo', ['-n', '-v'], { timeoutMs: 10000 });
+  if (any.ok) return { ok: true, message: null };
+  return { ok: false, message: describeFailure(listed) };
 }
 
 /**
@@ -220,39 +271,81 @@ export function armNextBoot(config, id) {
  * and let an ssh session close cleanly before the machine goes down.
  *
  * Only ever called after arming has been verified.
+ *
+ * The Linux path is deliberately arranged so that NOTHING PRIVILEGED IS A SHELL.
+ * The first version ran `sudo -n sh -c 'sleep 3; systemctl reboot'`, which asks
+ * for a root shell — far more authority than "reboot this machine" needs, and
+ * more than the documented sudoers entry grants. The delay now lives in an
+ * ordinary unprivileged shell owned by this user, and the only thing sudo ever
+ * sees is `systemctl reboot` with no arguments of its own:
+ *
+ *   sh -c 'sleep 3; sudo -n systemctl reboot'      <- unprivileged
+ *                   ^^^^^^^^^^^^^^^^^^^^^^^^      <- the only privileged part
+ *
+ * so the sudoers rule can be exactly:
+ *
+ *   <user> ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
  */
 export function scheduleReboot(config) {
+  // A helper the machine's owner wrote, given the narrowest possible privilege.
+  // Tried before anything else, because a machine that has one has said how it
+  // wants this done.
+  const helper = config.boot?.rebootHelper;
+  if (helper) {
+    const result = runArgv(helper, { timeoutMs: 20000 });
+    return {
+      ok: result.ok,
+      via: 'rebootHelper',
+      message: result.ok ? 'the configured reboot helper accepted the request' : describeFailure(result),
+    };
+  }
+
   const override = config.boot?.reboot;
   if (override) {
     const result = runArgv(override, { timeoutMs: 20000 });
-    return { ok: result.ok, message: result.ok ? 'the configured reboot command was accepted' : describeFailure(result) };
+    return {
+      ok: result.ok,
+      via: 'boot.reboot',
+      message: result.ok ? 'the configured reboot command was accepted' : describeFailure(result),
+    };
   }
 
   const current = detectPlatform();
   if (current === 'windows') {
     const result = runCommand('shutdown', ['/r', '/t', '3'], { timeoutMs: 20000 });
-    return { ok: result.ok, message: result.ok ? 'reboot scheduled in 3 s' : describeFailure(result) };
+    return { ok: result.ok, via: 'shutdown', message: result.ok ? 'reboot scheduled in 3 s' : describeFailure(result) };
+  }
+  if (current === 'mac') {
+    const allowed = sudoAllows(['/sbin/shutdown', '-r', '+1']);
+    if (!allowed.ok) {
+      return { ok: false, via: null, message: `passwordless sudo will not run shutdown: ${allowed.message}` };
+    }
+    const result = runCommand('sudo', ['-n', 'shutdown', '-r', '+1'], { timeoutMs: 20000 });
+    return { ok: result.ok, via: 'shutdown', message: result.ok ? 'reboot scheduled in 1 minute' : describeFailure(result) };
   }
   if (current === 'linux') {
-    // The reboot itself is detached and fire-and-forget, so it cannot report back.
-    // Check up front that non-interactive sudo actually works, otherwise a machine
-    // that is never going to go down gets reported as rebooting.
-    const sudoWorks = runCommand('sudo', ['-n', 'true'], { timeoutMs: 10000 });
-    if (!sudoWorks.ok) {
-      return { ok: false, message: `passwordless sudo is not available: ${describeFailure(sudoWorks)}` };
+    const allowed = sudoAllows(['/usr/bin/systemctl', 'reboot']);
+    if (!allowed.ok) {
+      return {
+        ok: false,
+        via: null,
+        message:
+          `passwordless sudo will not run "systemctl reboot": ${allowed.message}. ` +
+          'Add exactly that one command to sudoers, or set boot.rebootHelper to a program of your own',
+      };
     }
     try {
-      const child = spawn('sudo', ['-n', 'sh', '-c', 'sleep 3; systemctl reboot'], {
-        detached: true,
-        stdio: 'ignore',
-      });
+      // Unprivileged: this shell belongs to the invoking user and only holds the
+      // delay. It is detached so the ssh session can close before the machine
+      // goes down, which is the whole reason for the delay.
+      const child = spawn('sh', ['-c', 'sleep 3; sudo -n systemctl reboot'], { detached: true, stdio: 'ignore' });
       child.unref();
-      return { ok: true, message: 'reboot scheduled in 3 s' };
+      return { ok: true, via: 'systemctl', message: 'reboot scheduled in 3 s' };
     } catch (err) {
-      return { ok: false, message: `could not schedule the reboot: ${err.message}` };
+      return { ok: false, via: null, message: `could not schedule the reboot: ${err.message}` };
     }
   }
-  return { ok: false, message: `no reboot command is configured for ${process.platform}` };
+  return { ok: false, via: null, message: `no reboot command is configured for ${process.platform}` };
 }
 
 // ---------------------------------------------------------------------------

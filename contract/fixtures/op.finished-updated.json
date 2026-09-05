@@ -1,0 +1,78 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "id": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
+  "op": {
+    "id": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
+    "kind": "update",
+    "service": "t3",
+    "target": null,
+    "actionId": null,
+    "mode": "scheduled",
+    "initiator": {
+      "client": "cli",
+      "device": null,
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": {
+      "step": 8,
+      "of": 8,
+      "note": "t3 answered on 8081"
+    },
+    "requestedAt": "2026-09-04T13:59:00.000Z",
+    "startedAt": "2026-09-04T13:59:01.000Z",
+    "updatedAt": "2026-09-04T14:00:00.000Z",
+    "finishedAt": "2026-09-04T14:00:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": true,
+      "action": "updated",
+      "reasonCode": null,
+      "message": "updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904",
+      "from": "0.0.35-nightly.20260903",
+      "to": "0.0.36-nightly.20260904",
+      "exitCode": 0,
+      "output": null
+    },
+    "log": [
+      {
+        "at": "2026-09-04T13:59:01.000Z",
+        "line": "lock taken for update t3"
+      },
+      {
+        "at": "2026-09-04T13:59:04.000Z",
+        "line": "idle: 0 turns running"
+      },
+      {
+        "at": "2026-09-04T13:59:09.000Z",
+        "line": "stopped t3-code.service"
+      },
+      {
+        "at": "2026-09-04T13:59:20.000Z",
+        "line": "installed 0.0.36-nightly.20260904"
+      },
+      {
+        "at": "2026-09-04T14:00:00.000Z",
+        "line": "started t3-code.service, health 200"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux",
+    "from": "0.0.35-nightly.20260903",
+    "to": "0.0.36-nightly.20260904"
+  },
+  "waited": {
+    "requestedSeconds": 20,
+    "elapsedMs": 62,
+    "finished": true
+  }
+}

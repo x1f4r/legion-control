@@ -26,12 +26,7 @@ data class Endpoint(
     val user: String,
     val systemHint: String?,
     val label: String,
-    /**
-     * How many host keys this address may accumulate before the oldest is dropped. A remote address
-     * is one system, so one key. A LAN address is shared by every system on the machine, each with
-     * its own key, so exactly as many keys as the machine has systems.
-     */
-    val trustedKeyCapacity: Int,
+
 ) {
     val address: String get() = "$host:$port"
 }

@@ -1,0 +1,347 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "controller-document.schema.json",
+  "title": "The shared setup document",
+  "description": "The one document every peer edits and every machine carries a copy of. The agent stores its bytes and reads only the `controller` block; everything else is for the clients. Unknown keys are allowed ANYWHERE and MUST be preserved when a client edits the document: a client that round-trips through a typed model and drops a key it did not know silently deletes another peer's newer setting, and the canonical hash then makes that deletion look like a legitimate edit. Edit the parsed JSON, not the model.\n\nThis file is not a reply. It is validated by contract/validate.mjs so that the client editors and the example configs agree about a shape none of them owns alone.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "description": "Stays 1. A bump would make every 1.2 client refuse a document for keys it can safely ignore, and every addition below is additive.",
+      "const": 1
+    },
+    "controller": {
+      "$ref": "#/$defs/controllerBlock"
+    },
+    "sites": {
+      "description": "Where the LANs are. Optional: a setup with one network does not need them.",
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "$ref": "#/$defs/site"
+      }
+    },
+    "machines": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/machine"
+      }
+    },
+    "appUpdates": {
+      "type": "object",
+      "properties": {
+        "githubRepo": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"
+        }
+      },
+      "required": [
+        "githubRepo"
+      ]
+    },
+    "local": {
+      "description": "DEPRECATED. Local control is a private per-device binding now; see bindings.schema.json. Read for compatibility and never written by a 1.3 editor. It is not stripped automatically: removing it would change the bytes, and therefore the hash, on whichever device happened to open the document first.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "ssh": {
+      "description": "DEPRECATED at the top level for the same reason as `local`.",
+      "type": [
+        "object",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "version",
+    "machines"
+  ],
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/\\\\~=+-]*$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "controllerBlock": {
+      "description": "Who this setup is and where this copy sits in its history. `id` is the SETUP id, shared by every peer and stable for the life of the setup; it identified a device before the peer amendment and no longer does.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/setupId"
+        },
+        "name": {
+          "description": "Display only. The name of the setup, not of a device.",
+          "$ref": "#/$defs/text"
+        },
+        "revision": {
+          "description": "Monotonic within one id: 1 + the highest revision of every parent. It orders documents from one writer and CANNOT detect divergence, which is what `lineage` is for. The agent never decides acceptance from it.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "updatedAt": {
+          "description": "Display only. Never compared: peers have no shared clock.",
+          "type": "string"
+        },
+        "source": {
+          "description": "The kind of client that wrote this revision. Not a device identity and not a privilege.",
+          "enum": [
+            "mac",
+            "desktop",
+            "phone",
+            "cli",
+            "legacy"
+          ]
+        },
+        "device": {
+          "description": "Free text name of the device that wrote it, so a divergence screen can say who made each side.",
+          "$ref": "#/$defs/text"
+        },
+        "lineage": {
+          "$ref": "common.schema.json#/$defs/lineage"
+        }
+      },
+      "required": [
+        "id",
+        "revision"
+      ]
+    },
+    "site": {
+      "description": "One network. Two sites may have IDENTICAL private subnets, because home routers ship the same defaults, so a prefix match is a HINT and never proof of location: a client that matches more than one site must treat its location as unconfirmed rather than picking the first. What authenticates a machine is its pinned ssh host key, never its address.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "lanPrefixes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "broadcast": {
+          "description": "Default broadcast addresses for machines at this site.",
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "machine": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "site": {
+          "description": "Which site this machine is on. Must name an entry in sites[] when sites[] is present. A machine with no site is unplaced: direct wake falls back to wake.lanPrefix and helpers still work.",
+          "$ref": "#/$defs/token"
+        },
+        "alwaysOn": {
+          "description": "A hint, used only for text. A wake path whose only helpers are not alwaysOn is worth warning about, because the user's whole reason for this design was not leaving a tower running.",
+          "type": "boolean"
+        },
+        "endpoints": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/endpoint"
+          }
+        },
+        "wake": {
+          "$ref": "#/$defs/wake"
+        },
+        "systems": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/system"
+          }
+        },
+        "ssh": {
+          "description": "DEPRECATED in the shared document: an identityFile is an absolute path on one device and means nothing on the others. Read for compatibility, never written by a 1.3 editor, never stripped automatically.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "endpoint": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "kind": {
+          "description": "lan is dialled first when the controller is on the machine's site; remote otherwise.",
+          "enum": [
+            "lan",
+            "remote"
+          ]
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "user": {
+          "type": "string",
+          "minLength": 1
+        },
+        "system": {
+          "description": "Which system answers here on a dual-boot machine. A ROUTING HINT only: a status reporting a different system.id is still accepted, and the route is then re-remembered.",
+          "$ref": "#/$defs/token"
+        },
+        "label": {
+          "$ref": "#/$defs/text"
+        }
+      },
+      "required": [
+        "host"
+      ]
+    },
+    "wake": {
+      "type": "object",
+      "properties": {
+        "mac": {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}$"
+        },
+        "broadcast": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "ports": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        "probe": {
+          "type": "object",
+          "properties": {
+            "host": {
+              "type": "string",
+              "minLength": 1
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          },
+          "required": [
+            "host"
+          ]
+        },
+        "lanPrefix": {
+          "description": "DEPRECATED alias, used only when the machine has no site.",
+          "type": "string",
+          "minLength": 1
+        },
+        "helper": {
+          "description": "Compatibility alias for helpers[0]. An editor that writes `helpers` MUST also write this, so a 1.2 client keeps the one helper it understands. A 1.2 client does not do failover and must not be described as if it did.",
+          "$ref": "#/$defs/helper"
+        },
+        "helpers": {
+          "description": "Ordered failover. Walked in order; the first helper whose wake action reports `ran` wins. Helpers are never woken automatically: a cascade would quietly turn the always-off tower into an always-on one, which is the thing this design exists to avoid.",
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/helper"
+          }
+        }
+      }
+    },
+    "helper": {
+      "description": "A machine that can wake this one, and the configured agent action on it that does the waking. No new wire verb: the client runs `run <action>` on the helper.",
+      "type": "object",
+      "properties": {
+        "machine": {
+          "$ref": "#/$defs/token"
+        },
+        "action": {
+          "$ref": "common.schema.json#/$defs/configuredId"
+        }
+      },
+      "required": [
+        "machine",
+        "action"
+      ]
+    },
+    "system": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows",
+            "mac"
+          ]
+        },
+        "shell": {
+          "description": "The remote login shell, so a client quotes for the right one. Stock Windows OpenSSH defaults to cmd; a machine configured with PowerShell as its ssh shell needs powershell. A client that cannot quote for the configured shell says so rather than guessing.",
+          "enum": [
+            "posix",
+            "powershell",
+            "cmd"
+          ]
+        },
+        "restricted": {
+          "description": "This system's key is bound to the restricted forced-command dispatcher. The dispatcher is not a shell: it parses a limited quoted argv grammar and never expands anything, so a client MUST serialise POSIX argv for it whatever `shell` says. Default false.",
+          "type": "boolean"
+        },
+        "agent": {
+          "description": "The argv that runs the agent on this system.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "id"
+      ]
+    }
+  }
+}
