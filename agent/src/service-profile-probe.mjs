@@ -16,7 +16,36 @@ const NAMES = {
   antigravity: ['Antigravity', 'antigravity'],
 };
 
-export function processExitVerdict(profile, rows, ownPid = process.pid) {
+const WINDOWS_SYSTEM_NAMES = new Set([
+  'smss.exe', 'csrss.exe', 'wininit.exe', 'services.exe', 'lsaiso.exe', 'lsass.exe',
+  'mpdefendercoreservice.exe', 'msmpeng.exe', 'nissrv.exe', 'securityhealthservice.exe', 'svchost.exe',
+]);
+const WINDOWS_KERNEL_NAMES = new Set(['secure system', 'registry', 'memory compression']);
+
+function identifiedWindowsSystemProcess(row, rows, systemRoot) {
+  if (row.command !== null && row.command !== '') return false;
+  const name = typeof row.name === 'string' ? row.name.toLowerCase() : '';
+  if (row.parentPid === 0 && row.sessionId === 0 &&
+      ((row.pid === 0 && name === 'system idle process') || (row.pid === 4 && name === 'system'))) return true;
+  if (!Number.isInteger(row.pid) || row.pid <= 4 || !Number.isInteger(row.parentPid) || row.parentPid <= 0) return false;
+  // A familiar executable name alone cannot establish the identity of a
+  // process whose command line is protected. Require an OS service owner too.
+  if (['S-1-5-18', 'S-1-5-19', 'S-1-5-20'].includes(row.ownerSid)) {
+    if (row.sessionId === 0 && row.parentPid === 4 && WINDOWS_KERNEL_NAMES.has(name)) return row.ownerSid === 'S-1-5-18';
+    if (WINDOWS_SYSTEM_NAMES.has(name) && (row.sessionId === 0 || (name === 'csrss.exe' && Number.isInteger(row.sessionId) && row.sessionId > 0))) return true;
+  }
+  // Hyper-V memory accounting is represented by a VM-owned pseudo-process.
+  // Confirm its owner namespace and the system VM worker in the same snapshot.
+  if (row.sessionId === 0 && ['vmmem', 'vmmemwsl'].includes(name) && /^S-1-5-83-(?:\d+-){4}\d+$/.test(row.ownerSid ?? '') &&
+      typeof systemRoot === 'string' && path.win32.isAbsolute(systemRoot)) {
+    const parent = rows.find((candidate) => candidate.pid === row.parentPid);
+    return parent?.name?.toLowerCase() === 'vmwp.exe' && typeof parent.executablePath === 'string' &&
+      path.win32.normalize(parent.executablePath).toLowerCase() === path.win32.join(systemRoot, 'System32', 'vmwp.exe').toLowerCase();
+  }
+  return false;
+}
+
+export function processExitVerdict(profile, rows, ownPid = process.pid, { platform = process.platform, systemRoot = process.env.SystemRoot } = {}) {
   const names = NAMES[profile];
   if (!names || !Array.isArray(rows)) return { busy: true, unknown: true, reason: 'Process inspection is unavailable for this profile.' };
   const patterns = names.map((name) => new RegExp(`(?:^|[\\s/\\\\"'])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.exe|\\.app)?(?:$|[\\s/\\\\"'])`, 'i'));
@@ -26,6 +55,7 @@ export function processExitVerdict(profile, rows, ownPid = process.pid) {
   };
   let uncertain = false;
   for (const row of rows) {
+    if (platform === 'win32' && identifiedWindowsSystemProcess(row, rows, systemRoot)) continue;
     if (!Number.isInteger(row.pid) || row.pid <= 0) { uncertain = true; continue; }
     if (row.pid === ownPid) continue;
     const name = String(row.name ?? '');
@@ -58,11 +88,17 @@ export function inspectProfileProcesses(profile, { platform = process.platform, 
   try {
     let rows;
     if (platform === 'win32') {
-      const result = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine) | ConvertTo-Json -Compress"], { encoding: 'utf8', timeout: 4000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+      const ownerCandidates = [...WINDOWS_SYSTEM_NAMES, ...WINDOWS_KERNEL_NAMES, 'vmmem', 'vmmemwsl'];
+      const script = `$ErrorActionPreference='Stop'; $names=@(${ownerCandidates.map((name) => `'${name}'`).join(',')}); ` +
+        `@(Get-CimInstance Win32_Process | ForEach-Object { $sid=$null; ` +
+        `if ([string]::IsNullOrEmpty($_.CommandLine) -and $names -contains $_.Name) { ` +
+        `try { $owner=Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid; if ($owner.ReturnValue -eq 0) { $sid=$owner.Sid } } catch {} }; ` +
+        `[PSCustomObject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;SessionId=$_.SessionId;Name=$_.Name;CommandLine=$_.CommandLine;ExecutablePath=$_.ExecutablePath;OwnerSid=$sid} }) | ConvertTo-Json -Compress`;
+      const result = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 4000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
       if (result.status !== 0 || result.error) return processExitVerdict(profile, null);
       const entries = JSON.parse(result.stdout);
       if (!Array.isArray(entries)) return processExitVerdict(profile, null);
-      rows = entries.map((row) => ({ pid: Number(row.ProcessId), name: row.Name, command: row.CommandLine }));
+      rows = entries.map((row) => ({ pid: row.ProcessId, parentPid: row.ParentProcessId, sessionId: row.SessionId, name: row.Name, command: row.CommandLine, executablePath: row.ExecutablePath, ownerSid: row.OwnerSid }));
     } else if (platform === 'darwin' || platform === 'linux') {
       // ps does not quote fields. Separate PID-prefixed reads preserve spaces
       // in comm instead of guessing where one column ends and another begins.
@@ -84,7 +120,7 @@ export function inspectProfileProcesses(profile, { platform = process.platform, 
       if (!names || !commands) return processExitVerdict(profile, null);
       rows = [...new Set([...names.keys(), ...commands.keys()])].map((pid) => ({ pid, name: names.get(pid), command: commands.get(pid) }));
     } else return processExitVerdict(profile, null);
-    return processExitVerdict(profile, rows);
+    return processExitVerdict(profile, rows, process.pid, { platform });
   } catch { return processExitVerdict(profile, null); }
 }
 

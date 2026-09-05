@@ -173,6 +173,8 @@ final class AppUpdateModel {
         automaticCheckTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 do { try await Task.sleep(for: interval) } catch { return }
+                // A completed sleep can still be queued on the main actor when stop cancels it.
+                guard !Task.isCancelled else { return }
                 self?.checkIfStale(minimumAge: Self.periodicFreshFor)
             }
         }

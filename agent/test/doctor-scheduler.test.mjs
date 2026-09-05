@@ -75,7 +75,9 @@ test('legacy Node cannot be approved with a redirected or unproven home', () => 
   assert.equal(linuxSchedulerCommand(`[Service]\nExecStart="${node}" "${custom}/agent/src/index.mjs" cycle`, { base: custom, node, home }).ok, false);
 });
 
-test('Linux doctor reports the installed launcher correctly through the scheduler check', async () => withHome(async (home) => {
+test('Linux doctor reports the installed launcher correctly through the scheduler check', {
+  skip: process.platform === 'win32' ? 'The mocked Linux doctor requires a POSIX filesystem home.' : false,
+}, async () => withHome(async (home) => {
   writeConfig(home, { configVersion: 3, services: [], actions: [], updates: { automatic: false } });
   const platform = Object.getOwnPropertyDescriptor(process, 'platform');
   const originalSpawn = childProcess.spawnSync;

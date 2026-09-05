@@ -310,13 +310,13 @@ export function linuxSchedulerCommand(unit, { base = basePath(), node = process.
     argv.push(value.replaceAll('%%', '%'));
     rest = rest.slice(word[0].length);
   }
-  const stable = argv.length === 2 && argv[0] === path.join(base, 'bin', 'legionctl') && argv[1] === 'cycle';
+  const stable = argv.length === 2 && argv[0] === path.posix.join(base, 'bin', 'legionctl') && argv[1] === 'cycle';
   let sameNode = argv[0] === node;
-  if (!sameNode && path.isAbsolute(argv[0] ?? '')) {
+  if (!sameNode && path.posix.isAbsolute(argv[0] ?? '')) {
     try { sameNode = fs.realpathSync(argv[0]) === fs.realpathSync(node); } catch { /* unrelated executable */ }
   }
-  const legacy = legacyEnvironmentKnown && base === path.join(home, '.legion-control') &&
-    argv.length === 3 && sameNode && argv[1] === path.join(base, 'agent', 'src', 'index.mjs') && argv[2] === 'cycle';
+  const legacy = legacyEnvironmentKnown && base === path.posix.join(home, '.legion-control') &&
+    argv.length === 3 && sameNode && argv[1] === path.posix.join(base, 'agent', 'src', 'index.mjs') && argv[2] === 'cycle';
   return { ok: stable || legacy, execLine };
 }
 
