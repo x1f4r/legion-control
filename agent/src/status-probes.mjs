@@ -28,10 +28,30 @@ export async function statusBusy(service, { clock, liveness }) {
   // A SQLite WAL fallback writes only a temporary copy. Keep every copy under
   // one parent-owned directory, which can be removed even if the worker is killed.
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'legionctl-status-probe-'));
+  let exited = false;
+  let deferCleanup = false;
+  let cleanupAttempted = false;
+  let cleanupError = null;
+  const cleanup = () => {
+    cleanupAttempted = true;
+    try { fs.rmSync(scratch, { recursive: true, force: true }); cleanupError = null; }
+    catch (error) { cleanupError = `temporary busy-probe files could not be removed: ${error.message}`; }
+  };
   try {
     const result = await runCommandAsync(process.execPath,
       [worker, 'sqlite-busy', JSON.stringify({ service: { name: service.name, busy: service.busy }, liveness })],
-      { timeoutMs, env: { ...process.env, TMPDIR: scratch, TMP: scratch, TEMP: scratch }, maxBuffer: 1024 * 1024 });
+      // This worker only opens SQLite and reads files; it never spawns a child.
+      // Confirm its exit before removing scratch or releasing source handles.
+      { timeoutMs, terminateTree: false, onExit: () => { exited = true; cleanup(); },
+        env: { ...process.env, TMPDIR: scratch, TMP: scratch, TEMP: scratch }, maxBuffer: 1024 * 1024 });
+    if (process.platform === 'win32' && result.timedOut && result.terminationConfirmed !== true && !exited) {
+      // Failed termination is unknown, not a reason to delete files a live
+      // worker may still own. Its eventual exit callback completes cleanup.
+      deferCleanup = true;
+      return unreadable('timed-out', `${describeFailure(result)}; worker exit is unconfirmed, so temporary files are retained until it exits`);
+    }
+    if (!cleanupAttempted) cleanup();
+    if (cleanupError) return unreadable(result.timedOut ? 'timed-out' : 'probe-error', cleanupError);
     if (!result.ok) return unreadable(result.timedOut ? 'timed-out' : 'probe-error', describeFailure(result));
     try {
       const value = JSON.parse(result.stdout);
@@ -39,6 +59,6 @@ export async function statusBusy(service, { clock, liveness }) {
     } catch { /* A malformed or cut-off answer must retain protection. */ }
     return unreadable('probe-error', 'the busy database probe returned an unreadable answer');
   } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
+    if (!deferCleanup && !cleanupAttempted) cleanup();
   }
 }

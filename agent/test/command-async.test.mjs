@@ -66,3 +66,34 @@ test('successful asynchronous commands retain their result and bounded output', 
   assert.equal(result.stdout, 'abc');
   assert.equal(result.stderr, 'ghi');
 });
+
+test('Windows disposable SQLite worker has exited and released its database when timeout resolves', { skip: posix }, async () => {
+  await withHome(async (home) => {
+    const database = path.join(home, 'worker.sqlite');
+    const script = `const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.argv[1]);
+      db.exec('CREATE TABLE fixture(value)');process.stdout.write(String(process.pid));
+      db.prepare('WITH RECURSIVE counts(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM counts WHERE n < 1000000000) SELECT sum(n) FROM counts').get();`;
+    const started = Date.now();
+    const result = await runCommandAsync(process.execPath, ['-e', script, database], { timeoutMs: 1500, terminateTree: false });
+    assert.equal(result.timedOut, true);
+    assert.equal(result.terminationConfirmed, true, result.error);
+    const pid = Number(result.stdout);
+    assert.ok(pid > 0, 'the worker must have opened SQLite before its deadline');
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'the owned worker must already have exited');
+    fs.rmSync(database);
+    assert.equal(fs.existsSync(database), false, 'database cleanup must work immediately without retrying around a live process');
+    assert.ok(Date.now() - started < 2300, 'exit confirmation remains bounded');
+  });
+});
+
+test('Windows tree timeout lets taskkill finish stopping descendants', { skip: posix }, async () => {
+  await withHome(async (home) => {
+    const marker = path.join(home, 'descendant-ran');
+    const descendant = `setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'unwanted work'),1800)`;
+    const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});setInterval(()=>{},1000)`;
+    const result = await runCommandAsync(process.execPath, ['-e', parent], { timeoutMs: 400 });
+    assert.equal(result.timedOut, true);
+    await new Promise((resolve) => setTimeout(resolve, 2200));
+    assert.equal(fs.existsSync(marker), false, 'tree cleanup must finish instead of being killed after 250 ms');
+  });
+});

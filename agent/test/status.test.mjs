@@ -18,6 +18,20 @@ import { buildStatus } from '../src/status.mjs';
 import { cli, fixtureConfig, fixtureData, withHome, writeConfig } from './helpers.mjs';
 
 const pause = (ms) => [process.execPath, '-e', `setTimeout(() => process.exit(0), ${ms})`];
+async function withProbeScratch(home, body) {
+  const directory = path.join(home, 'probe-temp');
+  fs.mkdirSync(directory);
+  const names = ['TMPDIR', 'TMP', 'TEMP'];
+  const previous = names.map((name) => process.env[name]);
+  for (const name of names) process.env[name] = directory;
+  try { return await body(); }
+  finally {
+    names.forEach((name, index) => {
+      if (previous[index] === undefined) delete process.env[name];
+      else process.env[name] = previous[index];
+    });
+  }
+}
 function servicesConfig(dir, overrides, count = 3) {
   const fixture = fixtureConfig(dir);
   fixture.services = Array.from({ length: count }, (_, i) => ({
@@ -181,7 +195,7 @@ test('health and busy HTTP probes have an absolute timeout despite continuous re
 });
 
 test('a synchronous SQLite query cannot block status and worker scratch is removed', async () => {
-  await withHome(async (home) => {
+  await withHome(async (home) => withProbeScratch(home, async () => {
     const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
     const t3 = path.join(home, 't3');
     fs.mkdirSync(path.join(t3, 'userdata'), { recursive: true });
@@ -202,7 +216,7 @@ test('a synchronous SQLite query cannot block status and worker scratch is remov
     assert.equal(result.services[0].busy.evidence, 'timed-out');
     assert.deepEqual(fs.readFileSync(database), before);
     assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('legionctl-status-probe-')), scratchBefore);
-  });
+  }));
 });
 
 test('status and history observe the configured boot target without changing the record', async () => {

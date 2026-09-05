@@ -105,17 +105,19 @@ For physical wake/boot tests, retain target-side evidence and the authenticated 
 
 ## Recorded integration evidence
 
-The following observations were read from the local integration outputs during this change. They refer to intermediate snapshots, not a final certification of the current PR head. Raw files are in `/tmp/legion-implementation` on the validation machine; they are not portable repository assets and may be removed. Retain the needed logs with the final review evidence.
+Validation for the fleet-control change used a Mac, an Android emulator, a Raspberry Pi with Node 24, and the same Legion laptop booted into Windows and CachyOS. The Pi target used an isolated installation and file-backed test service. Its production gateway and the installed AI tools were not updated.
 
-| Evidence | Observed result and scope |
+| Area | Observed result and scope |
 | --- | --- |
-| Swift, desktop and Android unit-test output | Swift and desktop suites report zero failures; Android debug/release unit tasks finish successfully. Additional integration edits and final artifact rebuilds still require their own rerun. |
-| `pi-agent-tests.log` | Agent suite passes on the isolated Raspberry Pi using Node 24. |
-| `windows-agent-tests-fixed.log` | Agent suite finishes with zero failures and two platform skips. It is an earlier snapshot, not evidence for every later profile change. |
-| `pi-scenarios-layout-corrected.json` | Eleven isolated SSH scenarios pass, with raw replies retained. |
-| `pi-signed-bootstrap.json`, `pi-signed-upgrade.json`, `pi-signed-rollback.json` | Recorded installed/rolled-back outcomes include verified manifests and passing nested self-tests on the isolated Pi tree. These used intermediate signed bundles. |
-| `pi-restricted-signed-update.json`, `pi-dispatch-denials.json` | Signed update works through the restricted path; arbitrary shell requests are refused. |
-| `pi-installer-test.log`, `windows-installer-test.log` | Install/reinstall and stable-launcher checks work in test paths containing spaces; the Windows path also contains an apostrophe. Schedulers are explicitly skipped. These source-checkout installer tests do not prove signed release installation. |
-| `linux-desktop-test.log`, `windows-qa-test.log` | Native headless clients complete isolated service updates. The initial Linux log also contains a GUI display-authorization failure; later window evidence must be assessed separately. |
+| Client suites | 206 Swift tests, 191 Android tests per build variant, and 379 desktop tests passed. Android debug/release builds and lint passed; macOS signature checks and Android release-signature verification passed. |
+| Agent and tooling | The shared suite passed on macOS and the Pi. CachyOS passed the shared suite and the later worker-validation regressions. Windows checks cover process-tree cancellation, SQLite-worker exit and immediate database deletion, literal npm arguments, install paths with spaces/apostrophes, and packaging through Git Bash GNU tar. The workflow records the full Windows Node 24/26 matrix. |
+| SSH workflows | All 11 isolated scenarios passed: bounded status, manual updates with scheduling off, same-id replay, intent conflicts, busy deferral, queue cancellation/execution, invalid configuration, failed postconditions, wake packets, divergent setup edits and diagnostics. |
+| Agent installation | The isolated Pi accepted a signed bootstrap over 2.1.0, retained recovery material, and completed signed install and rollback. Android installed the bundled 3.0.0 agent through its restricted key and displayed the confirmed installed outcome. Broken worker files and tampered bundles fail before promotion. |
+| Native Windows and Linux | Both distribution builds authenticated to the Pi. Actions and service-update round trips succeeded. The windows rendered in their actual graphical sessions. Linux tray registration was observed on D-Bus and repeated exits were clean. |
+| Mac and Android UI | The Mac completed a configured action and validated/saved an administrative service preview. Android displayed the current agent version, updated the fixture, queued a restart while busy, and cancelled it with matching server history and footer. |
+| AI-tool profiles | Read-only discovery on the Mac identified native Claude Code and npm Codex CLI/OpenCode. An isolated automatic-off configuration reported their actual versions and available updates. Claude desktop, Codex/ChatGPT desktop and Antigravity reported installed versions with `canUpdate=false`. No real product updater was run. |
+| Secret scan | Source scanning found no credentials after excluding the embedded public verification key and a synthetic fixture fingerprint. Export tests cover short configured secrets echoed through diagnostics, without altering ordinary action/log output. |
 
-Still open for final integration: exact-head CI, final signed artifact hashes and installation checks after rebuilding with the final agent, and the final native UI/device pass. Physical cross-site wake has not been exercised. Native desktop applications without a verified unattended updater remain monitor-only with updates managed by the application; installing a monitor does not test or enable their vendor updater. Native Claude updater policy/authentication resolution remains under integration review, so no successful real-tool update is claimed here.
+Check the [PR checks](https://github.com/x1f4r/legion-control/pull/3/checks) for the exact reviewed revision. Locally recorded screenshots, raw replies and artifact hashes distinguish runtime evidence from unit coverage; a later source or bundle change requires the affected checks to run again.
+
+Physical wake between the future sites has not been exercised. Vendor desktop applications without a verified unattended updater remain monitor-only; monitoring does not enable their vendor updater. Grok requires an identified installation before an updater can be provisioned. Native Claude policy and version discovery were verified read-only, so no successful real-tool update is claimed. Android runtime UI checks used an emulator, not a physical phone.

@@ -44,7 +44,9 @@ export async function packageAgent({ source = path.join(repository, 'agent'), de
     fs.mkdirSync(destination, { recursive: true });
     const name = `legionctl-agent-${version}.tgz`;
     const temporaryArchive = path.join(scratch, name);
-    const tar = spawnSync('tar', [...(process.platform === 'darwin' ? ['--no-xattrs', '--no-mac-metadata'] : []), '-czf', temporaryArchive, '-C', scratch, 'agent'], { encoding: 'utf8', env: { ...process.env, COPYFILE_DISABLE: '1' } });
+    // GNU tar treats a colon in an archive argument as a remote host. Keep
+    // Windows drive letters out of that argument by using the staging cwd.
+    const tar = spawnSync('tar', [...(process.platform === 'darwin' ? ['--no-xattrs', '--no-mac-metadata'] : []), '-czf', name, 'agent'], { cwd: scratch, encoding: 'utf8', env: { ...process.env, COPYFILE_DISABLE: '1' } });
     if (tar.status !== 0) throw new Error(`Agent packaging failed: ${tar.stderr || tar.error}`);
     const artifact = { name, ...await artifactDigest(temporaryArchive) };
     const releaseManifest = path.join(scratch, 'Legion-Control-agent-manifest.json');

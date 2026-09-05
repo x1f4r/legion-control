@@ -1630,6 +1630,9 @@ export function runCommandAsync(file, args = [], options = {}) {
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    // Internal disposable workers can release parent-owned scratch only after
+    // Windows confirms the process has released its native file handles.
+    if (typeof options.onExit === 'function') child.once('exit', options.onExit);
     const closePipes = () => {
       child.stdin?.destroy();
       child.stdout?.destroy();
@@ -1665,20 +1668,49 @@ export function runCommandAsync(file, args = [], options = {}) {
     const timer = setTimeout(() => {
       timedOut = true;
       let cancellationRequested = false;
+      const timeoutResult = (terminationConfirmed = false) => ({
+        ok: false, code: null, signal: null, stdout, stderr, timedOut: true, terminationConfirmed,
+        error: terminationConfirmed
+          ? 'command deadline expired; the process exited and the command outcome is unknown'
+          : cancellationRequested
+            ? 'command deadline expired; process-tree termination was requested and the command outcome is unknown'
+            : 'command deadline expired; process-tree termination could not be confirmed and the command outcome is unknown',
+        command,
+      });
       if (process.platform !== 'win32') {
         cancellationRequested = killPosixGroup();
+      } else if (child.pid && options.terminateTree === false) {
+        // Disposable workers that cannot spawn children need no taskkill tree
+        // traversal. Terminate their owned handle directly, then await the exit
+        // notification: Windows keeps SQLite files locked until that happens.
+        // Only trusted internal workers may opt out of process-tree cleanup.
+        closePipes();
+        let terminationWait;
+        const exited = () => {
+          clearTimeout(terminationWait);
+          child.unref();
+          finish(timeoutResult(true));
+        };
+        child.once('exit', exited);
+        try { cancellationRequested = child.kill('SIGKILL'); } catch { /* return an unconfirmed timeout */ }
+        if (child.exitCode !== null || child.signalCode !== null) exited();
+        else terminationWait = setTimeout(() => {
+          child.removeListener('exit', exited);
+          child.unref();
+          finish(timeoutResult(false));
+        }, 500);
+        return;
       } else if (child.pid) {
         // Windows has no POSIX process group signal. Ask its tree-aware tool to
         // terminate the command and descendants, without waiting on its pipes.
         // The result below remains unknown even if taskkill later succeeds.
         try {
           const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-          const cleanup = setTimeout(() => {
-            try { killer.kill(); } catch { /* it may already have exited */ }
-            killer.unref();
-          }, 250);
-          killer.once('error', () => { clearTimeout(cleanup); killer.unref(); });
-          killer.once('exit', () => clearTimeout(cleanup));
+          // Do not abort traversal after an arbitrary 250 ms: on a loaded
+          // machine that can leave the command alive. The cleanup helper has
+          // no inherited pipes and may finish independently of this deadline.
+          killer.once('error', () => {});
+          killer.unref();
           cancellationRequested = true;
         } catch { /* report unconfirmed cancellation below */ }
       }
@@ -1686,13 +1718,7 @@ export function runCommandAsync(file, args = [], options = {}) {
       // pipes open indefinitely, even after their immediate parent is killed.
       closePipes();
       child.unref();
-      finish({
-        ok: false, code: null, signal: null, stdout, stderr, timedOut: true,
-        error: cancellationRequested
-          ? 'command deadline expired; process-tree termination was requested and the command outcome is unknown'
-          : 'command deadline expired; process-tree termination could not be confirmed and the command outcome is unknown',
-        command,
-      });
+      finish(timeoutResult());
     }, timeoutMs);
 
     const collect = (stream, append) => {
