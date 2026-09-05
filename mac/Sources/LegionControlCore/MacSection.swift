@@ -14,97 +14,147 @@ struct MacSection: View {
     @State private var editProblem: String?
     @State private var exportingDiagnostics = false
     @State private var exportProblem: String?
+    @State private var panel: String?
+    @State private var selectedService: ServiceStatus?
+    @State private var sheetActions = SheetActionRelay()
+
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            PageHeading(title: mac.name, note: AppModel.freshness(of: mac.lastChecked))
-
-            if let failure = mac.failure {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(failure.localMessage)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if let detail = failure.detailText, !detail.isEmpty {
-                        Text(detail)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .lineLimit(3)
-                    }
-                }
-            } else if mac.services.isEmpty {
-                Text("Reading \(mac.name).")
-                    .foregroundStyle(.secondary)
-            } else {
-                localServices
+        VStack(alignment: .leading, spacing: 16) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: 16) { heading; Spacer(); deviceActions }
+                VStack(alignment: .leading, spacing: 12) { heading; deviceActions }
             }
-
+            if mac.failure != nil {
+                HStack {
+                    Text("Unable to read this device").foregroundStyle(.orange)
+                    Button("Details") { panel = "Diagnostics" }
+                }
+            }
+            if case .conflict = mac.setupSharing { setupVerdict }
             unresolvedBlock
             queueBlock
-            boundPowerSection
-            actionsSection
+            if mac.services.isEmpty {
+                Text(mac.isReachable ? "No services configured" : "Waiting for this device…")
+                    .foregroundStyle(.secondary)
+            } else { localServices }
             MetricsRows(metrics: mac.status?.metrics)
-            notesSection
-            deviceSection
-            appSection
+            if let note = mac.note, !note.isEmpty {
+                Text(note).font(.callout).foregroundStyle(mac.noteIsError ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                    .lineLimit(2).textSelection(.enabled)
+            }
+        }
+        .onChange(of: model.dialog?.id) { _, id in
+            if id != nil { selectedService = nil; panel = nil }
+        }
+        .sheet(item: $selectedService, onDismiss: { sheetActions.didDismiss() }) { service in
+            ControlSheet(title: service.displayName) { serviceBlock(mac.services.first { $0.id == service.id } ?? service) }
+        }
+        .sheet(isPresented: Binding(get: { panel != nil }, set: { if !$0 { panel = nil } }), onDismiss: { sheetActions.didDismiss() }) {
+            ControlSheet(title: panel ?? "Details") {
+                switch panel {
+                case "Settings": deviceSection; appSettings
+                case "Schedule": schedule
+                case "Activity":
+                    Text(model.operations.exportText()).font(.callout.monospaced()).textSelection(.enabled)
+                    Button("Export operation history") { exportHistory() }
+                    Button("Clear history") { model.operations.clearHistory() }
+                default:
+                    if let failure = mac.failure {
+                        Text(failure.localMessage).foregroundStyle(.orange)
+                        if let detail = failure.detailText { Text(detail).font(.callout.monospaced()).textSelection(.enabled) }
+                    }
+                    notesSection
+                    appDiagnostics
+                }
+            }
         }
         .onAppear {
-            // System Settings can turn this off behind our back, so it is read again every time the
-            // section is shown rather than trusted from launch.
             startsAtLogin = LoginItem.isEnabled
             needsLoginApproval = LoginItem.needsApproval
+        }
+    }
+
+    private func afterSheet(_ action: @escaping @MainActor () -> Void) {
+        guard selectedService != nil || panel != nil else { action(); return }
+        sheetActions.queue(action)
+        selectedService = nil
+        panel = nil
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(mac.name).font(.system(size: 22, weight: .semibold))
+            Text(mac.isReachable ? "This device" : "Unavailable").font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
+    private var deviceActions: some View {
+        FlowRow(spacing: 8) {
+            if mac.boundMachineId != nil, mac.isReachable {
+                Button("Sleep") { mac.requestSleep() }.disabled(mac.isWorking)
+                if !mac.bootTargets.isEmpty {
+                    Menu("Restart") {
+                        ForEach(mac.bootTargets) { target in
+                            Button("Boot into \(target.name)") { mac.requestBoot(into: target) }.disabled(mac.isWorking)
+                        }
+                    }.fixedSize()
+                }
+            }
+            Menu("Actions") {
+                ForEach(mac.actions) { action in
+                    Button(action.displayName) { mac.requestAction(action) }.disabled(mac.isWorking || !mac.isReachable)
+                }
+                Divider()
+                Button("Activity…") { panel = "Activity" }
+                Button("Schedule…") { panel = "Schedule" }
+                Button("Diagnostics…") { panel = "Diagnostics" }
+                Button("Settings…") { panel = "Settings" }
+            }.fixedSize()
+            ServiceSetupButton(enabled: !mac.isWorking && mac.dialect.supportsDoctor,
+                               restricted: mac.status?.isRestrictedSession == true,
+                               send: { try await mac.serviceConfig($0) })
         }
     }
 
     // MARK: - Services here
 
     private var localServices: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            QuietNote(text: """
-                Applying an update quits the service on this device and starts it again, so anything \
-                open in it goes with it. While work is running the update is held back on purpose: \
-                that refusal is the point rather than a failure, and there is a "when idle" option \
-                for exactly that case.
-                """)
-                .padding(.bottom, 14)
-
+        VStack(spacing: 0) {
             ForEach(mac.services) { service in
-                serviceBlock(service)
+                CompactServiceRow(service: service,
+                                  updateEnabled: !mac.isWorking && mac.updateUnavailableReason(service) == nil,
+                                  update: { mac.requestUpdate(service) }, details: { selectedService = service }) {
+                    if service.canUpdate != false, mac.dialect.supportsQueue {
+                        Button("Update when idle") { mac.requestUpdateWhenIdle(service) }
+                            .disabled(mac.isWorking || mac.updateUnavailableReason(service) != nil)
+                    }
+                    Button("Restart") { mac.requestRestart(service) }
+                        .disabled(mac.isWorking || mac.restartUnavailableReason(service) != nil)
+                    if mac.dialect.supportsQueue {
+                        Button("Restart when idle") { mac.restart(service, force: false, whenIdle: true) }
+                            .disabled(mac.isWorking || mac.restartUnavailableReason(service) != nil)
+                    }
+                    ForEach(mac.actions(for: service)) { action in
+                        Button(action.displayName) { mac.requestAction(action) }.disabled(mac.isWorking || !mac.isReachable)
+                    }
+                }
             }
+        }
+    }
 
+    private var schedule: some View {
+        VStack(alignment: .leading, spacing: 12) {
             MaintenanceRows(
-                policy: mac.policy,
-                systemPolicy: mac.policy,
-                subject: mac.name,
+                policy: mac.policy, systemPolicy: mac.policy, subject: mac.name,
                 isEnabled: mac.isReachable && !mac.isWorking,
                 supportsPolicy: mac.dialect.supportsPolicy && mac.services.contains { $0.canUpdate != false },
-                setAutomatic: { mac.setAutoUpdate($0) },
-                pause: { mac.pause(for: $0, service: nil) },
-                resume: { mac.resume(service: nil) },
-                setWindows: { mac.setWindows($0, service: nil) },
-                inherit: { }
+                setAutomatic: { mac.setAutoUpdate($0) }, pause: { mac.pause(for: $0, service: nil) },
+                resume: { mac.resume(service: nil) }, setWindows: { mac.setWindows($0, service: nil) }, inherit: { }
             )
-
             if !mac.dialect.supportsPolicy {
-                // The 2.x switch, for an agent that has nothing better.
-                Toggle(isOn: Binding(
-                    get: { mac.autoUpdate ?? false },
-                    set: { mac.setAutoUpdate($0) }
-                )) {
-                    Text("Apply a waiting update on its own")
-                }
-                .toggleStyle(.switch)
-                .disabled(!mac.isReachable || mac.isWorking)
-                .padding(.top, 12)
-            }
-
-            if let note = mac.note, !note.isEmpty {
-                Text(note)
-                    .font(.callout)
-                    .foregroundStyle(mac.noteIsError ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 14)
+                Toggle("Automatic updates", isOn: Binding(get: { mac.autoUpdate ?? false }, set: { mac.setAutoUpdate($0) }))
+                    .disabled(!mac.isReachable || mac.isWorking)
             }
         }
     }
@@ -150,25 +200,25 @@ struct MacSection: View {
                     title: "Update \(service.displayName) now",
                     isHighlighted: mac.updateUnavailableReason(service) == nil,
                     isEnabled: !mac.isWorking && mac.updateUnavailableReason(service) == nil
-                ) { mac.requestUpdate(service) }
+                ) { afterSheet { mac.requestUpdate(service) } }
 
                 if mac.dialect.supportsQueue {
-                    Button("Update when idle") { mac.requestUpdateWhenIdle(service) }
+                    Button("Update when idle") { afterSheet { mac.requestUpdateWhenIdle(service) } }
                         .disabled(mac.isWorking || mac.updateUnavailableReason(service) != nil)
                 }
 
                 }
-                Button("Restart") { mac.requestRestart(service) }
+                Button("Restart") { afterSheet { mac.requestRestart(service) } }
                     .disabled(mac.isWorking || mac.restartUnavailableReason(service) != nil)
                     .help(mac.restartUnavailableReason(service) ?? "Stops and starts \(service.displayName). Held back while work is running.")
 
                 if mac.dialect.supportsQueue {
-                    Button("Restart when idle") { mac.restart(service, force: false, whenIdle: true) }
+                    Button("Restart when idle") { afterSheet { mac.restart(service, force: false, whenIdle: true) } }
                         .disabled(mac.isWorking || mac.restartUnavailableReason(service) != nil)
                 }
 
                 ForEach(mac.actions(for: service)) { action in
-                    Button(action.displayName) { mac.requestAction(action) }
+                    Button(action.displayName) { afterSheet { mac.requestAction(action) } }
                         .disabled(mac.isWorking || !mac.isReachable)
                 }
 
@@ -196,7 +246,7 @@ struct MacSection: View {
     @ViewBuilder
     private func activityVerdict(_ service: ServiceStatus) -> some View {
         if let busy = service.busy {
-            switch busy.verdict {
+            switch busy.isUnknown ? .unknown : !busy.isMonitored ? .unmonitored : busy.verdict {
             case .busy:
                 StatusText(symbol: "circle.dotted", text: busy.summary, tint: .orange)
             case .idle:
@@ -423,7 +473,7 @@ struct MacSection: View {
             VStack(alignment: .leading, spacing: 8) {
                 StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
                 HStack(spacing: 10) {
-                    Button("Review the differences") { mac.openSetupDivergence() }.controlSize(.small)
+                    Button("Review the differences") { afterSheet { mac.openSetupDivergence() } }.controlSize(.small)
                 }
             }
         case .unknown:
@@ -494,7 +544,7 @@ struct MacSection: View {
 
     // MARK: - Legion Control itself
 
-    private var appSection: some View {
+    private var appSettings: some View {
         VStack(alignment: .leading, spacing: 0) {
             SectionHeading(title: "Legion Control")
 
@@ -505,9 +555,6 @@ struct MacSection: View {
 
             updateBlock
                 .padding(.bottom, 14)
-
-            QuietNote(text: "Closing the window puts Legion Control back in the menu bar. It keeps running there and asks the machines nothing at all until you open it again.")
-                .padding(.bottom, 16)
 
             Toggle(isOn: Binding(
                 get: { startsAtLogin },
@@ -528,6 +575,11 @@ struct MacSection: View {
                     .padding(.top, 8)
             }
 
+        }
+    }
+
+    private var appDiagnostics: some View {
+        VStack(alignment: .leading, spacing: 12) {
             SectionHeading(title: "Diagnostics")
             DiagnosticActions(enabled: !mac.isWorking && mac.dialect.supportsDoctor,
                               check: { mac.runDoctor() }, deepCheck: { mac.runDoctor(deep: true) },
@@ -538,7 +590,7 @@ struct MacSection: View {
                 ServiceSetupButton(enabled: !mac.isWorking && mac.dialect.supportsDoctor,
                                    restricted: mac.status?.isRestrictedSession == true,
                                    send: { try await mac.serviceConfig($0) })
-                Button("Install agent\(AgentBundle.shared.map { " " + $0.version } ?? "")") { mac.installBundledAgent() }
+                Button("Install agent\(AgentBundle.shared.map { " " + $0.version } ?? "")") { afterSheet { mac.installBundledAgent() } }
                     .disabled(AgentBundle.shared == nil || mac.isWorking || mac.status?.ok != true || mac.status?.isRestrictedSession == true)
                     .help(AgentBundle.shared == nil ? AgentBundle.unavailableReason : "Upgrade the authenticated local agent.")
                 Button("Export all diagnostics") { exportDiagnostics() }.disabled(exportingDiagnostics)

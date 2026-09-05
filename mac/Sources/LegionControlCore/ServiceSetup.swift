@@ -193,10 +193,13 @@ private struct ServiceSetupView: View {
     @State private var serviceName = ""
     @State private var profile = ""
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 14) {
             Text("Service setup").font(.title2)
-            Text("Administrator configuration on this machine. Validate the preview, then save. Saving runs no service commands.")
-                .foregroundStyle(.secondary)
+            DisclosureGroup("About service setup") {
+                Text("Administrator configuration on this machine. Validate the preview, then save. Saving runs no service commands.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             if model.expectedHash != nil {
                 if !model.profiles.isEmpty {
                     DisclosureGroup("Add AI tool") {
@@ -213,7 +216,7 @@ private struct ServiceSetupView: View {
                         }.padding(.top, 8)
                     }
                 }
-                HStack {
+                VStack(alignment: .leading, spacing: 8) {
                     Picker("Service", selection: $selectedService) {
                         Text("Choose a service").tag("")
                         ForEach(model.services, id: \.id) { Text($0.name).tag($0.id) }
@@ -232,7 +235,7 @@ private struct ServiceSetupView: View {
                         if let selected = model.templates.first(where: { $0.id == template }) {
                             Text(selected.description).font(.caption).foregroundStyle(.secondary)
                         }
-                        HStack {
+                        VStack(alignment: .leading, spacing: 8) {
                             TextField("Service id", text: $newId)
                             TextField("Name", text: $newName)
                             Button("Add draft") { model.addTemplate(template, id: newId, name: newName) }
@@ -250,15 +253,15 @@ private struct ServiceSetupView: View {
             }
             if let problem = model.problem { Text(problem).foregroundStyle(.orange).textSelection(.enabled) }
             if model.saved { Text("Saved. No service commands were run.").foregroundStyle(.secondary) }
-            HStack {
+            FlowRow(spacing: 8) {
                 Button("Reload") { Task { await model.load() } }.disabled(model.busy)
                 Button("Validate preview") { Task { await model.validate() } }.disabled(model.busy || model.expectedHash == nil || model.restricted)
                 Button("Save") { Task { await model.save() } }.disabled(!model.canSave)
                 if model.busy { ProgressView().controlSize(.small) }
-                Spacer()
                 Button("Close") { dismiss() }
             }
-        }.padding(24).frame(width: 820, height: 700)
+        }.padding(16)
+        }.frame(minWidth: 360, idealWidth: 720, maxWidth: 820, minHeight: 360, idealHeight: 600, maxHeight: 700)
             .task { await model.load() }
     }
 }

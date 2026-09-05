@@ -6,6 +6,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
@@ -45,6 +47,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -118,7 +123,7 @@ sealed interface Page {
     }
 
     data object Device : Page {
-        override val title get() = "This device"
+        override val title get() = "Settings"
         override val summary get() = "The app, this phone's key, and the setup it shares"
     }
 }
@@ -134,9 +139,6 @@ private fun pagesOf(app: AppModel): List<Page> {
         if (machines.isEmpty()) add(Page.NoMachines)
         machines.forEach { model ->
             add(Page.OneMachine(model))
-            model.knownServices.forEach { service ->
-                add(Page.OneService(model, service, showsMachine = machines.size > 1))
-            }
         }
         if (app.editorOpen) add(Page.Editor)
         add(Page.Device)
@@ -149,16 +151,7 @@ fun LegionApp(app: AppModel, updates: AppUpdateModel) {
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background,
     ) {
-        if (app.needsKeyAuthorisation) {
-            AuthorisationScreen(
-                publicKey = app.publicKey,
-                systems = app.machines.flatMap { it.machine.systems },
-                detail = app.keyAuthorisationDetail,
-                onRetry = { app.refreshAll() },
-            )
-        } else {
-            LegionScreen(app, updates)
-        }
+        LegionScreen(app, updates)
     }
 }
 
@@ -170,6 +163,7 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
     val scope = rememberCoroutineScope()
     val haptics = rememberHaptics()
     val bindings by app.deviceBindings.collectAsState()
+    var reviewUpdate by remember { mutableStateOf(false) }
 
     LaunchedEffect(pager, haptics) {
         snapshotFlow { pager.settledPage }
@@ -217,6 +211,7 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                     pages = pages,
                     current = currentPage,
                     onMenu = { scope.launch { drawer.open() } },
+                    onRefresh = { app.refreshAll(); updates.recheck() },
                 )
             },
             bottomBar = {
@@ -227,7 +222,7 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text("Legion Control ${available.release.version} available", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
                             PlainAction("Review", enabled = true) {
-                                scope.launch { pager.animateScrollToPage(pages.indexOf(Page.Device)) }
+                                reviewUpdate = true
                             }
                         }
                     }
@@ -245,13 +240,24 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                     .fillMaxSize()
                     .padding(insets),
             ) {
-                HorizontalPager(state = pager, modifier = Modifier.fillMaxSize()) { index ->
+                BoxWithConstraints(Modifier.fillMaxSize()) {
+                    val wide = maxWidth >= 840.dp
+                    Row(Modifier.fillMaxSize()) {
+                        if (wide) {
+                            Column(Modifier.width(208.dp).fillMaxHeight().verticalScroll(rememberScrollState()).padding(horizontal = 12.dp)) {
+                                pages.forEachIndexed { index, page ->
+                                    DrawerRow(page, index == pager.currentPage) { scope.launch { pager.animateScrollToPage(index) } }
+                                }
+                            }
+                            Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outlineVariant))
+                        }
+                HorizontalPager(state = pager, modifier = Modifier.weight(1f).fillMaxHeight()) { index ->
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
                             .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 20.dp)
-                            .padding(top = 6.dp, bottom = 28.dp),
+                            .padding(horizontal = 16.dp)
+                            .padding(top = 8.dp, bottom = 16.dp),
                     ) {
                         when (val page = pages.getOrNull(index)) {
                             is Page.OneMachine -> MachineSection(page.model, app)
@@ -265,9 +271,13 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                         }
                     }
                 }
+                    }
+                }
             }
         }
     }
+
+    if (reviewUpdate) DetailSheet("App updates", { reviewUpdate = false }) { AppUpdateBlock(updates) }
 
     app.fetchDialog?.let { dialog ->
         HostTrustDialog(
@@ -357,26 +367,13 @@ private fun NoMachinesSection(app: AppModel) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PageBar(pages: List<Page>, current: () -> Int, onMenu: () -> Unit) {
-    Column {
-        TopAppBar(
-            title = {
-                Crossfade(
-                    targetState = pages.getOrNull(current())?.title.orEmpty(),
-                    animationSpec = tween(180),
-                    label = "title",
-                ) { title ->
-                    Text(title, style = MaterialTheme.typography.titleSmall)
-                }
-            },
-            navigationIcon = { HamburgerButton(onMenu) },
-            colors = TopAppBarDefaults.topAppBarColors(
-                containerColor = MaterialTheme.colorScheme.background,
-                titleContentColor = MaterialTheme.colorScheme.onSurface,
-            ),
-        )
-        PageRule(pages.size, current)
+private fun PageBar(pages: List<Page>, current: () -> Int, onMenu: () -> Unit, onRefresh: () -> Unit) {
+    Row(Modifier.fillMaxWidth().statusBarsPadding().height(56.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        PlainAction("Devices", true, onClick = onMenu)
+        Text("Legion Control", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+        PlainAction("Refresh", true, onClick = onRefresh)
     }
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 }
 
 /**
@@ -466,7 +463,6 @@ private fun PageDrawer(
             Spacer(Modifier.height(22.dp))
             Text("Legion Control", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(4.dp))
-            QuietText("Your machines, what runs on them, and this phone.")
             Spacer(Modifier.height(20.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             pages.forEachIndexed { index, page ->
@@ -495,9 +491,9 @@ private fun DrawerRow(page: Page, isSelected: Boolean, onSelect: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .defaultMinSize(minHeight = 68.dp)
+            .defaultMinSize(minHeight = 48.dp)
             .clickable { onSelect() }
-            .padding(vertical = 14.dp),
+            .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
@@ -518,7 +514,6 @@ private fun DrawerRow(page: Page, isSelected: Boolean, onSelect: () -> Unit) {
                     MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )
-            QuietText(page.summary, Modifier.padding(top = 2.dp))
         }
     }
 }
@@ -531,58 +526,21 @@ private fun DrawerRow(page: Page, isSelected: Boolean, onSelect: () -> Unit) {
  */
 @Composable
 private fun StatusFooter(app: AppModel) {
-    val palette = LocalStatusColors.current
-    val model = app.footerMachine
+    val model = app.footerMachine ?: return
+    if (!model.isWorking && !model.statusIsError && !model.isUnsettled) return
+    var details by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth()) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(horizontal = 20.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.Top,
-        ) {
-            Box(Modifier.padding(top = 5.dp).size(11.dp), contentAlignment = Alignment.Center) {
-                if (model != null && (model.isWorking || model.isRefreshingVisibly)) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(11.dp),
-                        strokeWidth = 1.5.dp,
-                        color = palette.quiet,
-                    )
-                } else {
-                    StatusMark(
-                        when {
-                            model?.statusIsError == true -> Mark.Attention
-                            model?.isUnsettled == true -> Mark.Unknown
-                            else -> Mark.Idle
-                        },
-                    )
-                }
-            }
-            Spacer(Modifier.width(9.dp))
-            Column(Modifier.weight(1f)) {
-                Crossfade(
-                    targetState = model?.statusLine ?: "Nothing is configured yet.",
-                    animationSpec = tween(190),
-                    label = "statusLine",
-                ) { line ->
-                    Text(line, style = MaterialTheme.typography.bodyMedium)
-                }
-                if (model != null) {
-                    QuietText(routeAndAge(model, app.now), Modifier.padding(top = 2.dp))
-                }
-                model?.statusDetail?.takeIf { it.isNotBlank() }?.let { detail ->
-                    Text(
-                        text = detail,
-                        style = MaterialTheme.typography.bodySmall
-                            .copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 4,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                }
-            }
+        Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(model.statusLine, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 2,
+                color = if (model.statusIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+            PlainAction("Details", true) { details = true }
         }
+    }
+    if (details) DetailSheet("Status details", { details = false }) {
+        Text(model.statusLine, style = MaterialTheme.typography.bodyMedium)
+        QuietText(routeAndAge(model, app.now))
+        model.statusDetail?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
     }
 }
 

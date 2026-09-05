@@ -1,18 +1,102 @@
 import SwiftUI
 
-/// The machine itself: which system is running on it, what can be done to the box rather than to the
-/// software on it, what is happening there now, and what is wrong with it.
-///
-/// This is the landing section because it answers the question the window exists for. Nothing about
-/// any one service appears here.
+/// Device controls and services, with operational detail available on demand.
 struct MachineSection: View {
     let app: AppModel
     let model: MachineModel
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            PageHeading(title: model.name, note: AppModel.freshness(of: model.lastChecked))
+    @State private var panel: String?
+    @State private var selectedService: ServiceStatus?
+    @State private var sheetActions = SheetActionRelay()
 
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 16) { heading; Spacer(); deviceActions }
+                VStack(alignment: .leading, spacing: 12) { heading; deviceActions }
+            }
+            hostKeyBlock
+            if case .conflict = model.setupSharing { setupVerdict }
+            unresolvedBlock
+            operationsBlock
+            VStack(spacing: 0) {
+                ForEach(model.services) { service in
+                    CompactServiceRow(service: service,
+                                      updateEnabled: !model.isWorking && model.commandableSystem != nil && service.canBeUpdated,
+                                      update: { model.requestUpdate(service) }, details: { selectedService = service }) {
+                        if service.canUpdate != false, model.dialect.supportsQueue {
+                            Button("Update when idle") { model.requestUpdateWhenIdle(service) }
+                                .disabled(model.isWorking || model.commandableSystem == nil || !service.canBeUpdated)
+                        }
+                        Button("Restart") { model.requestRestart(service) }
+                            .disabled(model.isWorking || model.commandableSystem == nil || service.canRestart == false)
+                        if model.dialect.supportsQueue {
+                            Button("Restart when idle") { model.restart(service, force: false, whenIdle: true) }
+                                .disabled(model.isWorking || model.commandableSystem == nil || service.canRestart == false)
+                        }
+                        ForEach(model.actions(for: service)) { action in
+                            Button(action.displayName) { model.requestAction(action) }
+                                .disabled(model.isWorking || model.commandableSystem == nil)
+                        }
+                    }
+                }
+            }
+            if model.services.isEmpty {
+                Text(model.isAwake ? "No services available" : "Services appear when this device answers")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            MetricsRows(metrics: model.status?.metrics)
+            if !model.notes.isEmpty {
+                HStack {
+                    Text("Some readings are unavailable").font(.callout).foregroundStyle(.orange)
+                    Button("Details") { panel = "Diagnostics" }
+                }
+            }
+        }
+        .onChange(of: app.dialog?.id) { _, id in
+            if id != nil { selectedService = nil; panel = nil }
+        }
+        .sheet(item: $selectedService, onDismiss: { sheetActions.didDismiss() }) { service in
+            ControlSheet(title: service.displayName) { ServiceSection(model: model, serviceId: service.id, performAction: { action in afterSheet(action) }) }
+        }
+        .sheet(isPresented: Binding(get: { panel != nil }, set: { if !$0 { panel = nil } }), onDismiss: { sheetActions.didDismiss() }) {
+            ControlSheet(title: panel ?? "Details") {
+                switch panel {
+                case "Activity": operationsBlock
+                case "Details": machineDetails; wakePathBlock
+                case "Schedule": machineSchedule
+                default: diagnosticsSection; notesSection
+                }
+            }
+        }
+    }
+
+    private func afterSheet(_ action: @escaping @MainActor () -> Void) {
+        guard selectedService != nil || panel != nil else { action(); return }
+        sheetActions.queue(action)
+        selectedService = nil
+        panel = nil
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(model.name).font(.system(size: 22, weight: .semibold))
+            Text(deviceState)
+                .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
+    private var deviceState: String {
+        if let reboot = model.rebootInProgress, !model.isAwake { return "Restarting into \(reboot.target.name)" }
+        switch model.link {
+        case .unknown: return "Checking…"
+        case .online(let system): return system.name
+        case .reachableWithoutAgent: return "Agent unavailable"
+        case .offline(let failure): return failure.meansAsleepOrOff ? "Asleep or unreachable" : "Connection needs attention"
+        }
+    }
+
+    private var machineDetails: some View {
             VStack(alignment: .leading, spacing: 12) {
                 DetailRow(label: "Running now") { runningNow }
                 DetailRow(label: "Machine") {
@@ -36,16 +120,53 @@ struct MachineSection: View {
                     }
                 }
             }
+    }
 
-            hostKeyBlock
-            unresolvedBlock
-            operationsBlock
-            powerSection
-            actionsSection
-            notesSection
-            diagnosticsSection
-            MetricsRows(metrics: model.status?.metrics)
+    private var deviceActions: some View {
+        FlowRow(spacing: 8) {
+            if model.isAwake {
+                Button("Sleep") { model.requestSleep() }.disabled(model.isWorking || model.commandableSystem == nil)
+            } else if model.canWake {
+                Button(model.isWaking ? "Waking…" : "Wake") { model.wake() }
+                    .disabled(model.isWorking || model.wakePlan.isEmpty)
+            }
+            if !model.bootTargets.isEmpty || (!model.isAwake && model.canWake) {
+                Menu(model.isAwake ? "Restart" : "Wake into") {
+                    if model.isAwake {
+                        ForEach(model.bootTargets) { target in
+                            Button(target.name) { model.requestBoot(into: target) }
+                                .disabled(model.isWorking || model.commandableSystem == nil)
+                        }
+                    } else {
+                        ForEach(model.machine.systems) { system in
+                            Button(system.name) { model.wake(into: system) }.disabled(model.isWorking || model.wakePlan.isEmpty)
+                        }
+                    }
+                }.fixedSize()
+            }
+            Menu("Actions") {
+                ForEach(model.actions) { action in
+                    Button(action.displayName) { model.requestAction(action) }.disabled(model.isWorking || model.commandableSystem == nil)
+                }
+                Divider()
+                Button("Activity…") { panel = "Activity" }
+                Button("Schedule…") { panel = "Schedule" }
+                Button("Diagnostics…") { panel = "Diagnostics" }
+                Button("Device details…") { panel = "Details" }
+            }.fixedSize()
+            ServiceSetupButton(enabled: !model.isWorking && model.dialect.supportsDoctor,
+                               restricted: model.commandableSystem?.isRestricted == true || model.status?.isRestrictedSession == true,
+                               send: { try await model.serviceConfig($0) })
         }
+    }
+
+    private var machineSchedule: some View {
+        MaintenanceRows(policy: model.policy, systemPolicy: model.policy, subject: model.name,
+                        isEnabled: !model.isWorking && model.commandableSystem != nil,
+                        supportsPolicy: model.dialect.supportsPolicy && model.services.contains { $0.canUpdate != false },
+                        setAutomatic: { model.setPolicy(automatic: .some($0), service: nil, describedAs: "Saving schedule") },
+                        pause: { model.pause(for: $0, service: nil) }, resume: { model.resume(service: nil) },
+                        setWindows: { model.setWindows($0, service: nil) }, inherit: { })
     }
 
     // MARK: - What is running
@@ -116,7 +237,7 @@ struct MachineSection: View {
         case .conflict(let sentence):
             VStack(alignment: .leading, spacing: 8) {
                 StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
-                Button("Compare and merge") { model.openSetupDivergence() }
+                Button("Compare and merge") { afterSheet { model.openSetupDivergence() } }
                     .controlSize(.small)
             }
         case .unknown:
@@ -260,7 +381,7 @@ struct MachineSection: View {
     private var operationsBlock: some View {
         let running = model.runningOperations
         let queued = model.queuedOperations
-        let recent = model.recentOperations
+        let recent = panel == "Activity" ? model.recentOperations : []
         if !running.isEmpty || !queued.isEmpty || !recent.isEmpty || model.watchedRecord != nil {
             if !running.isEmpty || !queued.isEmpty || model.watchedRecord?.state == .running {
                 SectionHeading(title: "Operations")
@@ -520,7 +641,7 @@ struct MachineSection: View {
                                restricted: model.commandableSystem?.isRestricted == true || model.status?.isRestrictedSession == true,
                                send: { try await model.serviceConfig($0) })
             if AgentBundle.shared != nil {
-                Button("Install agent \(AgentBundle.shared?.version ?? "")") { model.installBundledAgent() }
+                Button("Install agent \(AgentBundle.shared?.version ?? "")") { afterSheet { model.installBundledAgent() } }
                     .disabled(model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true || model.status?.isRestrictedSession == true)
             } else {
                 Button("Install agent") { }

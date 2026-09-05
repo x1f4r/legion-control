@@ -3,6 +3,7 @@ package com.x1f4r.legioncontrol.ui
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -66,11 +67,11 @@ fun SectionHeading(
 ) {
     Column(Modifier.fillMaxWidth()) {
         if (showsRule) {
-            Spacer(Modifier.height(26.dp))
+            Spacer(Modifier.height(12.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         }
         Row(
-            modifier = Modifier.padding(top = if (showsRule) 18.dp else 0.dp, bottom = 8.dp),
+            modifier = Modifier.padding(top = if (showsRule) 10.dp else 0.dp, bottom = 4.dp),
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
@@ -87,34 +88,31 @@ fun SectionHeading(
     }
 }
 
-/**
- * A label and a value, on a row a thumb can land on.
- *
- * The minimum height is not there because the row is pressable. It is there because these rows are
- * read on a phone held at arm's length, and seven point padding put six of them inside one thumb's
- * width of each other.
- */
+/** Compact read-only label/value rows; interactive controls retain their own touch target. */
 @Composable
 fun DetailRow(
     label: String,
     alignment: Alignment.Vertical = Alignment.CenterVertically,
     content: @Composable () -> Unit,
 ) {
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+    val labelSize = if (maxWidth < 340.dp) 92.dp else LabelWidth
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .defaultMinSize(minHeight = 48.dp)
-            .padding(vertical = 6.dp),
+            .defaultMinSize(minHeight = 36.dp)
+            .padding(vertical = 4.dp),
         verticalAlignment = alignment,
     ) {
         Text(
             text = label,
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.width(LabelWidth),
+            modifier = Modifier.width(labelSize),
         )
         Spacer(Modifier.width(LabelGap))
         Column(Modifier.weight(1f)) { content() }
+    }
     }
 }
 

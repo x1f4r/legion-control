@@ -20,55 +20,77 @@ public sealed class MainWindow : Window
     private readonly StackPanel _content = Ui.Column(0);
     private readonly ListBox _machineList = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly FleetSelection _selection = new();
-    private readonly Dictionary<string, bool> _serviceExpanded = new(StringComparer.Ordinal);
     private string[] _machineIds = Array.Empty<string>();
     private string[] _machineLabels = Array.Empty<string>();
     private bool _updatingNavigation;
     private string _page = "machine";
-    private readonly TextBlock _footer = new() { Foreground = Ui.Muted, FontSize = 12 };
     private bool _rebuildQueued;
-    private readonly HashSet<string> _recentExpanded = new(StringComparer.Ordinal);
     private readonly StackPanel _updateNotice = Ui.Column(0);
     private readonly CancellationTokenSource _updateLifetime = new();
     private readonly DispatcherTimer _updateTimer = new() { Interval = AppUpdateSuggestions.PeriodicInterval };
     private bool _reviewingUpdate;
+    private readonly Grid _panes = new();
+    private readonly Border _navigation = new();
+    private readonly ComboBox _devicePicker = new() { MinWidth = 120, MaxWidth = 220, HorizontalAlignment = HorizontalAlignment.Stretch };
+    private bool _navigationExpanded = true;
+    private double _lastLayoutWidth;
+    private double ContentWidth => Math.Max(280, Bounds.Width - (CompactPresentation.ShowNavigation(Bounds.Width, _navigationExpanded) ? CompactPresentation.NavigationWidth : 0) - 32);
 
     public MainWindow(AppModel app)
     {
         _app = app;
         Title = "Legion Control";
         Width = 1000;
-        Height = 760;
-        MinWidth = 800;
+        Height = 680;
+        MinWidth = 420;
+        MinHeight = 320;
+        FontFamily = Ui.NativeFont;
+        if (Application.Current is { } application) application.Resources["NativeFontFamily"] = Ui.NativeFont;
 
-        _content.Margin = new Thickness(24, 20, 24, 24);
+        _content.Margin = new Thickness(16, 8, 16, 16);
         var root = new DockPanel();
-        var footerPanel = new Border
+        var toolbar = new Grid { ColumnDefinitions = new ColumnDefinitions("auto,*,auto"), Margin = new Thickness(12, 8, 12, 0) };
+        var devices = Ui.Action("Devices", () =>
         {
-            Child = _footer,
-            Padding = new Thickness(24, 8, 24, 10),
-            BorderBrush = Ui.Hairline,
-            BorderThickness = new Thickness(0, 1, 0, 0),
+            if (Bounds.Width < CompactPresentation.NavigationBreakpoint) _devicePicker.IsDropDownOpen = true;
+            else { _navigationExpanded = !_navigationExpanded; Rebuild(); }
+        });
+        toolbar.Children.Add(devices);
+        Grid.SetColumn(_devicePicker, 1); toolbar.Children.Add(_devicePicker);
+        var appMenu = Ui.MenuButton("App ▾", new[]
+        {
+            Ui.MenuAction("Setup", () => { _page = "setup"; Rebuild(); }),
+            Ui.MenuAction("This device", () => { _page = "device"; Rebuild(); }),
+            Ui.MenuAction("Site details", () => Sheets.Text(this, "Site", _app.Presence.Sentence)),
+            Ui.MenuAction("Check for app updates", CheckForUpdate),
+            Ui.MenuAction("About", () => Sheets.Text(this, "Legion Control", $"Version {AgentContract.ClientVersion}")),
+        }, "Application menu");
+        var toolbarActions = Ui.Actions(Ui.Action("Refresh", () => { _ = _app.RefreshAllAsync(); }), appMenu);
+        toolbarActions.Margin = new Thickness(8, 0, 0, 0);
+        Grid.SetColumn(toolbarActions, 2); toolbar.Children.Add(toolbarActions);
+        DockPanel.SetDock(toolbar, Dock.Top); root.Children.Add(toolbar);
+        _updateNotice.Margin = new Thickness(16, 0, 16, 0);
+        DockPanel.SetDock(_updateNotice, Dock.Top); root.Children.Add(_updateNotice);
+        var navigationContent = new DockPanel { Margin = new Thickness(8, 0, 8, 0) };
+        var heading = Ui.SectionHeading("Devices"); heading.Margin = new Thickness(8, 8, 0, 8);
+        DockPanel.SetDock(heading, Dock.Top); navigationContent.Children.Add(heading);
+        navigationContent.Children.Add(_machineList);
+        _navigation.Child = navigationContent; _navigation.BorderBrush = Ui.Hairline;
+        _navigation.BorderThickness = new Thickness(0, 0, 1, 0);
+        _panes.Children.Add(_navigation);
+        var scroll = new ScrollViewer { Content = _content, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+        Grid.SetColumn(scroll, 1); _panes.Children.Add(scroll);
+        root.Children.Add(_panes);
+        _devicePicker.SelectionChanged += (_, _) =>
+        {
+            if (_updatingNavigation || _devicePicker.SelectedIndex < 0 || _devicePicker.SelectedIndex >= _machineIds.Length) return;
+            _selection.Select(_machineIds[_devicePicker.SelectedIndex]); _page = "machine"; Rebuild();
         };
-        DockPanel.SetDock(footerPanel, Dock.Bottom);
-        root.Children.Add(footerPanel);
-        var toolbar = Ui.Actions(
-            Ui.Action("Setup", () => { _page = "setup"; Rebuild(); }),
-            Ui.Action("This device", () => { _page = "device"; Rebuild(); }));
-        toolbar.Margin = new Thickness(18, 10, 18, 4);
-        DockPanel.SetDock(toolbar, Dock.Top);
-        root.Children.Add(toolbar);
-        _updateNotice.Margin = new Thickness(24, 0, 24, 4);
-        DockPanel.SetDock(_updateNotice, Dock.Top);
-        root.Children.Add(_updateNotice);
-        var panes = new Grid { ColumnDefinitions = new ColumnDefinitions("190,*") };
-        var navigation = new DockPanel { Margin = new Thickness(10, 0, 0, 0) };
-        var heading = Ui.SectionHeading("Machines"); heading.Margin = new Thickness(8, 12, 0, 10);
-        DockPanel.SetDock(heading, Dock.Top); navigation.Children.Add(heading);
-        navigation.Children.Add(_machineList);
-        panes.Children.Add(new Border { Child = navigation, BorderBrush = Ui.Hairline, BorderThickness = new Thickness(0, 0, 1, 0) });
-        var scroll = new ScrollViewer { Content = _content }; Grid.SetColumn(scroll, 1); panes.Children.Add(scroll);
-        root.Children.Add(panes);
+        SizeChanged += (_, _) =>
+        {
+            if (Math.Abs(Bounds.Width - _lastLayoutWidth) < 8) return;
+            _lastLayoutWidth = Bounds.Width; QueueRebuild();
+        };
         _machineList.SelectionChanged += (_, _) =>
         {
             if (_updatingNavigation || _machineList.SelectedIndex < 0 || _machineList.SelectedIndex >= _machineIds.Length) return;
@@ -114,6 +136,10 @@ public sealed class MainWindow : Window
             _updateNotice.Children.Add(Ui.Actions(
                 Ui.Note($"Legion Control {ready.Manifest.Version} available"),
                 Ui.Action("Review update", () => ReviewAvailableUpdate(ready))));
+        var showNavigation = CompactPresentation.ShowNavigation(Bounds.Width, _navigationExpanded);
+        _navigation.IsVisible = showNavigation;
+        _panes.ColumnDefinitions = new ColumnDefinitions(showNavigation ? $"{CompactPresentation.NavigationWidth},*" : "0,*");
+        _devicePicker.IsVisible = !showNavigation;
         UpdateNavigation();
         _content.Children.Clear();
         BuildHeader();
@@ -126,7 +152,6 @@ public sealed class MainWindow : Window
         else if (_selection.SelectedId is { } id && _app.Machine(id) is { } selected) BuildMachine(selected);
         else BuildEmpty();
 
-        _footer.Text = $"Legion Control {AgentContract.ClientVersion}";
     }
 
     private void UpdateNavigation()
@@ -141,20 +166,25 @@ public sealed class MainWindow : Window
             {
                 _machineIds = ids; _machineLabels = labels;
                 _machineList.ItemsSource = labels;
+                _devicePicker.ItemsSource = labels;
             }
             _machineList.SelectedIndex = _page == "machine" ? Array.IndexOf(_machineIds, _selection.SelectedId) : -1;
+            _devicePicker.SelectedIndex = _machineList.SelectedIndex;
         }
         finally { _updatingNavigation = false; }
     }
 
     private void BuildHeader()
     {
-        if (_page == "device") _content.Children.Add(Ui.Title(_app.Bindings.Device));
-        _content.Children.Add(Ui.Actions(
-            Ui.Note(_app.Presence.Confirmed ? $"Site: {_app.Presence.SiteId}" : "Site unconfirmed"),
-            Ui.Action("Site details", () => Sheets.Text(this, "Site", _app.Presence.Sentence))));
-        if (_app.Config.Problem is { } problem) _content.Children.Add(Ui.Note(problem, Ui.Bad));
-        foreach (var warning in _app.Config.Warnings) _content.Children.Add(Ui.Note(warning, Ui.Unknown));
+        if (_app.Config.Problem is { } problem)
+            _content.Children.Add(Ui.Actions(Ui.Note("Setup needs attention", Ui.Bad),
+                Ui.Action("Details", () => Sheets.Text(this, "Setup", problem))));
+        if (_app.Config.Warnings.Count > 0)
+            _content.Children.Add(Ui.Actions(Ui.Action("Setup warnings", () => Sheets.Text(this, "Setup", string.Join("\n", _app.Config.Warnings)))));
+        var unresolved = _app.Reconciler.Outcomes.Count(entry => entry.Value is ReconcileOutcome.NeedsDecision);
+        if (unresolved > 0 && _page != "setup")
+            _content.Children.Add(Ui.Actions(Ui.Note("Setup changes need review", Ui.Unknown),
+                Ui.Action("Review", () => { _page = "setup"; Rebuild(); })));
     }
 
     private void BuildEmpty()
@@ -175,96 +205,141 @@ public sealed class MainWindow : Window
 
     private void BuildMachine(MachineModel machine)
     {
-        _content.Children.Add(Ui.Rule());
-        _content.Children.Add(Ui.Title(machine.Name + (machine.IsSelf ? "  (this device)" : "")));
+        var heading = new Grid { ColumnDefinitions = new ColumnDefinitions("*,auto"), RowDefinitions = new RowDefinitions("auto,auto"), Margin = new Thickness(0, 2, 0, 10) };
+        var identity = Ui.Column(2);
+        identity.Children.Add(Ui.Title(machine.Name));
+        var state = machine.Failure is { } failure
+            ? failure.Kind is FailureKind.HostKeyUnknown or FailureKind.HostKeyChanged ? "Host key needs approval"
+                : failure.MeansAsleepOrOff ? "Offline" : "Connection needs attention"
+            : machine.Transition is { State: not TransitionState.Observed } ? "Changing system"
+            : machine.Status is { Config.BlocksMutations: true } ? "Configuration needs attention"
+            : machine.Status is { Partial: true } ? "Partial reading"
+            : machine.Status is { } status ? (status.SystemName ?? status.SystemId ?? "Online") + (machine.IsSelf ? " · This device" : "")
+            : "Not checked yet";
+        identity.Children.Add(Ui.Note(state, machine.Failure is null ? null : Ui.Unknown));
+        heading.Children.Add(identity);
+        var controls = BuildMachineActions(machine);
+        if (ContentWidth < 650) { Grid.SetRow(controls, 1); Grid.SetColumnSpan(controls, 2); }
+        else Grid.SetColumn(controls, 1);
+        heading.Children.Add(controls); _content.Children.Add(heading);
+        if (machine.Failure?.Kind is FailureKind.HostKeyUnknown or FailureKind.HostKeyChanged)
+            _content.Children.Add(Ui.Actions(Ui.Action("Review host key", () => TrustAsync(machine))));
+        else if (machine.Failure is not null || machine.Status?.Config?.BlocksMutations == true)
+            _content.Children.Add(Ui.Actions(Ui.Action("Details", () => ShowMachineDetails(machine))));
+        BuildOperations(machine);
+        BuildServices(machine);
+    }
+
+    private void ShowMachineDetails(MachineModel machine)
+    {
+        var section = Ui.Column(2);
+        section.Children.Add(Ui.Title(machine.Name + (machine.IsSelf ? "  (this device)" : "")));
 
         if (machine.Status is { } status)
         {
-            _content.Children.Add(Ui.DetailRow("System", status.SystemName ?? status.SystemId ?? "unnamed"));
-            _content.Children.Add(Ui.DetailRow("Reached over",
+            section.Children.Add(Ui.DetailRow("System", status.SystemName ?? status.SystemId ?? "unnamed"));
+            section.Children.Add(Ui.DetailRow("Reached over",
                 machine.IsLocallyControlled ? "run here, no ssh" : machine.Routes.RememberedRouteId ?? "?"));
-            _content.Children.Add(Ui.DetailRow("Control agent",
+            section.Children.Add(Ui.DetailRow("Control agent",
                 $"{status.AgentVersion ?? "?"}, {machine.Capabilities.Summary}",
                 machine.Capabilities.SpeaksV3 ? null : Ui.Unknown));
             if (status.Partial)
             {
-                _content.Children.Add(Ui.Note("This reading is partial: the agent ran out of its time budget and some probes did not finish.", Ui.Unknown));
+                section.Children.Add(Ui.Note("This reading is partial: the agent ran out of its time budget and some probes did not finish.", Ui.Unknown));
             }
             if (status.Config is { BlocksMutations: true } config)
             {
-                _content.Children.Add(Ui.Note(
+                section.Children.Add(Ui.Note(
                     "The agent's own configuration is invalid, so it refuses every change. " +
                     string.Join(" ", config.Problems.Select(problem => problem.Sentence)), Ui.Bad));
             }
             if (status.Envelope.Notes.Count > 0)
-                _content.Children.Add(Ui.Actions(Ui.Action("Agent details", () => Sheets.Text(this, "Agent details", string.Join("\n", status.Envelope.Notes)))));
+                section.Children.Add(Ui.Actions(Ui.Action("Agent details", () => Sheets.Text(this, "Agent details", string.Join("\n", status.Envelope.Notes)))));
         }
         if (machine.Failure is { } failure)
         {
-            _content.Children.Add(Ui.DetailRow("State", failure.Sentence(machine.Name),
+            section.Children.Add(Ui.DetailRow("State", failure.Sentence(machine.Name),
                 failure.MeansAsleepOrOff ? Ui.Muted : Ui.Bad));
             var trustRoute = TrustRoute(machine);
             if (failure.Fix(trustRoute?.Target.Host) is { } fix)
             {
-                _content.Children.Add(Ui.Note(fix));
+                section.Children.Add(Ui.Note(fix));
             }
             if (failure.Kind is FailureKind.HostKeyUnknown or FailureKind.HostKeyChanged)
             {
-                _content.Children.Add(Ui.Actions(Ui.Action("Check this host key", () => TrustAsync(machine))));
+                section.Children.Add(Ui.Actions(Ui.Action("Check this host key", () => TrustAsync(machine))));
             }
         }
         else if (machine.Status is null)
         {
-            _content.Children.Add(Ui.DetailRow("State", "not read yet"));
+            section.Children.Add(Ui.DetailRow("State", "not read yet"));
         }
 
         if (machine.Transition is { } transition && transition.State != TransitionState.Observed)
         {
-            _content.Children.Add(Ui.Note(transition.Sentence, Ui.Unknown));
+            section.Children.Add(Ui.Note(transition.Sentence, Ui.Unknown));
         }
 
         if (machine.Status?.Metrics is { Readings.Count: > 0 } metrics)
         {
-            _content.Children.Add(Ui.SectionHeading("Telemetry"));
+            section.Children.Add(Ui.SectionHeading("Telemetry"));
             foreach (var reading in metrics.Readings)
             {
-                _content.Children.Add(Ui.DetailRow(reading.Name, reading.Value is { } value ? $"{value:g} {reading.Unit}".Trim() : "unavailable"));
-                if (reading.Error is { } error) _content.Children.Add(Ui.Actions(Ui.Action("Details", () => Sheets.Text(this, reading.Name, error))));
+                section.Children.Add(Ui.DetailRow(reading.Name, reading.Value is { } value ? $"{value:g} {reading.Unit}".Trim() : "unavailable"));
+                if (reading.Error is { } error) section.Children.Add(Ui.Actions(Ui.Action("Details", () => Sheets.Text(this, reading.Name, error))));
             }
-            _content.Children.Add(Ui.Actions(Ui.Action(_app.Settings.KeepMetricsHistory ? "Stop keeping telemetry history" : "Keep telemetry history",
+            section.Children.Add(Ui.Actions(Ui.Action(_app.Settings.KeepMetricsHistory ? "Stop keeping telemetry history" : "Keep telemetry history",
                 () => _app.UpdateSettings(_app.Settings with { KeepMetricsHistory = !_app.Settings.KeepMetricsHistory }))));
             if (_app.Settings.KeepMetricsHistory)
-                _content.Children.Add(Ui.Actions(Ui.Action("Telemetry history", () => Sheets.Text(this, "Telemetry history",
+                section.Children.Add(Ui.Actions(Ui.Action("Telemetry history", () => Sheets.Text(this, "Telemetry history",
                     string.Join("\n", machine.Metrics.Readings.SelectMany(snapshot => snapshot.Reading.Readings.Select(reading =>
                         $"{snapshot.At:O} {reading.Name}: {(reading.Value is { } value ? $"{value:g} {reading.Unit}" : "unavailable")}")))))));
         }
-        BuildOperations(machine);
-        BuildMachineActions(machine);
-        BuildServices(machine);
+        Ui.ShowDetails(this, machine.Name + " details", section);
     }
 
     private void BuildServices(MachineModel machine)
     {
         if (machine.Status is not { } status || status.Services.Count == 0) return;
-        _content.Children.Add(Ui.SectionHeading("Services"));
+        var wide = CompactPresentation.ShowServiceColumns(ContentWidth);
+        if (wide)
+        {
+            var labels = new Grid { ColumnDefinitions = new ColumnDefinitions("*,140,190,140"), Margin = new Thickness(0, 4, 0, 6) };
+            foreach (var pair in new[] { (0, "Service"), (1, "State"), (2, "Version") })
+            { var text = Ui.Note(pair.Item2); Grid.SetColumn(text, pair.Item1); labels.Children.Add(text); }
+            _content.Children.Add(labels);
+        }
         foreach (var service in status.Services)
         {
-            var key = machine.Id + "/" + (service.Id ?? service.DisplayName);
-            var active = service.Busy?.Busy == true || status.Operations.Running.Any(operation => operation.Service == service.Id);
-            var updateAvailable = service.CanUpdate != false && service.Latest is not null && service.Installed is not null && service.Latest != service.Installed;
-            var summary = active ? "Working" : updateAvailable ? "Update available" : service.CanUpdate == false ? "Monitoring" : service.Installed ?? "Version unavailable";
-            var section = Ui.Column(); section.Margin = new Thickness(0, 4, 0, 12);
-            BuildService(machine, service, section);
-            var expander = new Expander
+            var active = status.Operations.Running.Any(operation => operation.Service == service.Id);
+            var state = CompactPresentation.ServiceState(service, active);
+            var row = new Grid { ColumnDefinitions = new ColumnDefinitions(wide ? "*,140,190,140" : "*,140"), Margin = new Thickness(0, 6, 0, 0), MinHeight = wide ? 40 : 50 };
+            var identity = Ui.Column(2);
+            identity.Children.Add(new TextBlock { Text = service.DisplayName, FontWeight = Avalonia.Media.FontWeight.SemiBold, TextWrapping = Avalonia.Media.TextWrapping.Wrap });
+            if (!wide) identity.Children.Add(Ui.Note(state + (service.Installed is { } version ? " · " + version : "")));
+            row.Children.Add(identity);
+            if (wide)
             {
-                Header = service.DisplayName + "  ·  " + summary,
-                IsExpanded = active || (_serviceExpanded.TryGetValue(key, out var expanded) && expanded),
-                HorizontalAlignment = HorizontalAlignment.Stretch,
-                Content = section,
-            };
-            expander.Expanded += (_, _) => _serviceExpanded[key] = true;
-            expander.Collapsed += (_, _) => _serviceExpanded[key] = false;
-            _content.Children.Add(expander);
+                var stateText = Ui.Note(state); Grid.SetColumn(stateText, 1); row.Children.Add(stateText);
+                var versionText = Ui.Note(service.Installed ?? "Unknown"); Grid.SetColumn(versionText, 2); row.Children.Add(versionText);
+            }
+            var items = new List<MenuItem> { Ui.MenuAction("Details", () =>
+            { var detail = Ui.Column(2); BuildService(machine, service, detail); Ui.ShowDetails(this, service.DisplayName, detail); }) };
+            if (service.CanUpdate != false)
+            {
+                items.Add(Ui.MenuAction("Update", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id })));
+                items.Add(Ui.MenuAction("Update when idle", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id, WhenIdle = true, Expires = "4h" }), machine.Capabilities.SupportsQueueUntilIdle));
+                items.Add(Ui.MenuAction("Schedule", () => EditPolicy(machine, service.Id), machine.Capabilities.SupportsPolicy));
+                items.Add(Ui.MenuAction("Pause a day", () => Policy(machine, service.Id, PolicyPatch.PauseFor(TimeSpan.FromDays(1))), machine.Capabilities.SupportsPolicy));
+                items.Add(Ui.MenuAction("Resume", () => Policy(machine, service.Id, PolicyPatch.Resume()), machine.Capabilities.SupportsPolicy));
+            }
+            if (service.CanRestart == true || service.CanUpdate != false)
+                items.Insert(1, Ui.MenuAction("Restart", () => Request(machine, new MachineRequest { Kind = RequestKind.Restart, Service = service.Id })));
+            var actions = Ui.Actions(
+                CompactPresentation.HasUpdate(service) ? Ui.Action("Update", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id }), primary: true) : null,
+                Ui.MenuButton("⋯", items, service.DisplayName + " actions"));
+            actions.Margin = new Thickness(0); Grid.SetColumn(actions, wide ? 3 : 1); row.Children.Add(actions);
+            _content.Children.Add(new Border { Child = row, BorderBrush = Ui.Hairline, BorderThickness = new Thickness(0, 1, 0, 0) });
         }
     }
 
@@ -332,134 +407,107 @@ public sealed class MainWindow : Window
             Ui.Action("Resume", () => Policy(machine, id, PolicyPatch.Resume()),
                 machine.Capabilities.SupportsPolicy)));
     }
-    private void BuildOperations(MachineModel machine)
+    private void BuildOperations(MachineModel machine, StackPanel? destination = null, bool includeRecent = false)
     {
-        var tracked = machine.Operations.Take(6).ToList();
-        var running = machine.Status?.Operations.Running ?? Array.Empty<OperationSummary>();
-        var queued = machine.Status?.Operations.Queued ?? Array.Empty<OperationSummary>();
-        var recent = machine.Status?.Operations.Recent ?? Array.Empty<OperationSummary>();
-        if (tracked.Count == 0 && running.Count == 0 && queued.Count == 0 && recent.Count == 0) return;
-
-        if (running.Count > 0 || queued.Count > 0 || tracked.Any(operation => operation.Outcome is OperationOutcome.Pending or OperationOutcome.Queued or OperationOutcome.Unresolved))
-            _content.Children.Add(Ui.SectionHeading("Operations"));
-        var recentChanges = Ui.Column();
-        foreach (var operation in running)
+        var target = destination ?? _content;
+        var seen = new HashSet<string>();
+        var rows = Ui.Column(2);
+        void Add(string? id, string title, string state, bool queued)
         {
-            _content.Children.Add(Ui.DetailRow(operation.Describe(),
-                $"{operation.Phase ?? "running"}"));
+            if (id is not null && !seen.Add(id)) return;
+            var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,auto"), Margin = new Thickness(0, 2, 0, 2) };
+            row.Children.Add(Ui.Note(title + " · " + state));
+            var actions = Ui.Actions(
+                queued ? Ui.Action("Cancel", () => Cancel(machine, id!), id is not null) : null,
+                Ui.Action("Details", () => OperationDetails(machine, id!), id is not null));
+            actions.Margin = new Thickness(8, 0, 0, 0); Grid.SetColumn(actions, 1); row.Children.Add(actions);
+            rows.Children.Add(row);
         }
-        foreach (var operation in queued)
-        {
-            var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,auto") };
-            row.Children.Add(new TextBlock
-            {
-                Text = $"{operation.Describe()} — held until idle"
-                       + (operation.ExpiresAt is { } expires ? $", dropped after {expires.ToLocalTime():g}" : ""),
-                TextWrapping = Avalonia.Media.TextWrapping.Wrap,
-                VerticalAlignment = VerticalAlignment.Center,
-            });
-            var cancel = Ui.Action("Cancel", () => Cancel(machine, operation.Id!), operation.Id is not null);
-            Grid.SetColumn(cancel, 1);
-            row.Children.Add(cancel);
-            _content.Children.Add(row);
-        }
-        foreach (var operation in recent.Where(o => !tracked.Any(t => t.Id == o.Id)))
-        {
-            recentChanges.Children.Add(Ui.DetailRow(operation.Describe(), operation.Message ?? operation.OutcomeText));
-            if (operation.Id is { } id) recentChanges.Children.Add(Ui.Actions(Ui.Action("Details", () => OperationDetails(machine, id))));
-        }
-        foreach (var operation in tracked)
-        {
-            var colour = operation.Outcome switch
-            {
-                OperationOutcome.Succeeded or OperationOutcome.Noop => Ui.Good,
-                OperationOutcome.Failed or OperationOutcome.Interrupted => Ui.Bad,
-                OperationOutcome.Pending when operation.OutcomeUnknown => Ui.Unknown,
-                OperationOutcome.Unresolved => Ui.Unknown,
-                _ => null,
-            };
-            var text = operation.OutcomeUnknown
-                ? "outcome not known yet, checking"
-                : operation.Message ?? operation.Outcome.ToString().ToLowerInvariant();
-            var section = operation.Outcome is OperationOutcome.Pending or OperationOutcome.Queued or OperationOutcome.Unresolved
-                ? _content : recentChanges;
-            section.Children.Add(Ui.DetailRow(operation.Intent.Describe(), text, colour));
-            section.Children.Add(Ui.Actions(Ui.Action("Details", () => OperationDetails(machine, operation.Id))));
-        }
-        if (recentChanges.Children.Count > 0)
-        {
-            var expander = new Expander { Header = "Recent changes", IsExpanded = _recentExpanded.Contains(machine.Id), Content = recentChanges, HorizontalAlignment = HorizontalAlignment.Stretch };
-            expander.Expanded += (_, _) => _recentExpanded.Add(machine.Id);
-            expander.Collapsed += (_, _) => _recentExpanded.Remove(machine.Id);
-            _content.Children.Add(expander);
-        }
+        foreach (var operation in machine.Status?.Operations.Running ?? Array.Empty<OperationSummary>())
+            Add(operation.Id, operation.Describe(), operation.Phase ?? "In progress", false);
+        foreach (var operation in machine.Status?.Operations.Queued ?? Array.Empty<OperationSummary>())
+            Add(operation.Id, operation.Describe(), "Waiting until idle", true);
+        foreach (var operation in machine.Operations.Where(operation => operation.Outcome is OperationOutcome.Pending or OperationOutcome.Queued or OperationOutcome.Unresolved))
+            Add(operation.Id, operation.Intent.Describe(), operation.OutcomeUnknown ? "Outcome unknown" : operation.Outcome.ToString(), operation.Outcome == OperationOutcome.Queued);
+        if (rows.Children.Count > 0) target.Children.Add(rows);
+        if (!includeRecent) return;
+        target.Children.Add(Ui.SectionHeading("Recent changes"));
+        rows = Ui.Column(2);
+        foreach (var operation in machine.Operations.Where(operation => operation.Outcome is not (OperationOutcome.Pending or OperationOutcome.Queued or OperationOutcome.Unresolved)).Take(20))
+            Add(operation.Id, operation.Intent.Describe(), operation.Message ?? operation.Outcome.ToString(), false);
+        foreach (var operation in machine.Status?.Operations.Recent ?? Array.Empty<OperationSummary>())
+            Add(operation.Id, operation.Describe(), operation.Message ?? operation.OutcomeText, false);
+        if (!target.Children.Contains(rows)) target.Children.Add(rows);
     }
 
-    private void BuildMachineActions(MachineModel machine)
+    private void ShowActivity(MachineModel machine)
+    {
+        var section = Ui.Column(2);
+        BuildOperations(machine, section, includeRecent: true);
+        section.Children.Add(Ui.Actions(Ui.Action("Operation history", () => History(machine), machine.Capabilities.SupportsHistory)));
+        Ui.ShowDetails(this, machine.Name + " activity", section);
+    }
+
+    private Panel BuildMachineActions(MachineModel machine)
     {
         var status = machine.Status;
-        var buttons = new List<Control?>();
-        var actions = new List<Control?>();
-        var setup = new List<Control?>();
-        var diagnostics = new List<Control?>();
-
-        foreach (var target in status?.BootTargets ?? Array.Empty<BootTarget>())
+        var live = status is not null && machine.Failure is null;
+        var boot = (status?.BootTargets ?? Array.Empty<BootTarget>()).Select(target => Ui.MenuAction("Boot into " + target.DisplayName,
+            () => Request(machine, new MachineRequest { Kind = RequestKind.Boot, Target = target.Id }), live && target.Id is not null)).ToArray();
+        var items = new List<MenuItem>
         {
-            var id = target.Id;
-            buttons.Add(Ui.Action($"Boot into {target.DisplayName}",
-                () => Request(machine, new MachineRequest { Kind = RequestKind.Boot, Target = id }), id is not null));
-        }
-        if (status is not null)
-        {
-            buttons.Add(Ui.Action("Sleep", () => Request(machine, new MachineRequest { Kind = RequestKind.Sleep })));
-        }
-        foreach (var action in status?.Actions ?? Array.Empty<AgentAction>())
-        {
-            var id = action.Id;
-            actions.Add(Ui.Action(action.DisplayName,
-                () => Request(machine, new MachineRequest { Kind = RequestKind.Run, ActionId = id }), id is not null));
-        }
+            Ui.MenuAction("Device details", () => ShowMachineDetails(machine)),
+            Ui.MenuAction("Activity", () => ShowActivity(machine)),
+        };
+        var configuredActions = (status?.Actions ?? Array.Empty<AgentAction>()).Select(action => Ui.MenuAction(action.DisplayName,
+            () => Request(machine, new MachineRequest { Kind = RequestKind.Run, ActionId = action.Id }), action.Id is not null)).ToList();
+        if (machine.Capabilities.SupportsCycle)
+            configuredActions.Add(Ui.MenuAction("Run the cycle", () => Request(machine, new MachineRequest { Kind = RequestKind.Cycle })));
+        if (configuredActions.Count > 0) items.Add(new MenuItem { Header = "Actions", ItemsSource = configuredActions });
         if (machine.Machine.Wake is not null)
         {
-            buttons.Add(Ui.Action("Wake", () => Wake(machine)));
+            var wake = new List<MenuItem> { Ui.MenuAction("Wake", () => Wake(machine)) };
             foreach (var system in machine.Machine.Systems)
-            {
-                var desired = system.Id;
-                buttons.Add(Ui.Action($"Wake into {system.Name}", () => Wake(machine, desired)));
-            }
-        }
-        if (status is not null && machine.Capabilities.SupportsCycle)
-        {
-            actions.Add(Ui.Action("Run the cycle", () => Request(machine, new MachineRequest { Kind = RequestKind.Cycle })));
-        }
-        var (bundle, bundleProblem) = AgentBundle.Load();
-        if (status is not null && (bundle is null || status.AgentVersion != bundle.Version))
-            setup.Add(Ui.Action($"Install agent {bundle?.Version ?? AgentContract.BundledAgentVersion}", () => InstallAgent(machine), bundle is not null, bundleProblem));
-        var restricted = status?.Agent?.RestrictedSession == true || machine.Machine.Systems.All(system => system.Restricted);
-        setup.Add(Ui.Action("Service setup", () => EditServices(machine), machine.Capabilities.SpeaksV3 && !restricted,
-            restricted ? "This SSH key is restricted. Service configuration requires an administrator key." : null));
-        setup.Add(Ui.Action("Machine schedule", () => EditPolicy(machine, null), machine.Capabilities.SupportsPolicy));
-        diagnostics.Add(Ui.Action("Check agent", () => Doctor(machine), machine.Capabilities.SupportsDoctor));
-        diagnostics.Add(Ui.Action("Deep diagnostics", () => Doctor(machine, true), machine.Capabilities.SupportsDoctor));
-        diagnostics.Add(Ui.Action("Recent log", () => Logs(machine), machine.Capabilities.SupportsLogs));
-        diagnostics.Add(Ui.Action("Export diagnostics", () => Bundle(machine), machine.Capabilities.SupportsBundle));
-        diagnostics.Add(Ui.Action("Operation history", () => History(machine), machine.Capabilities.SupportsHistory));
-
-        if (machine.Machine.Wake is not null)
-        {
+                wake.Add(Ui.MenuAction("Wake into " + system.Name, () => Wake(machine, system.Id)));
             var plan = _app.PlanWake(machine);
-            buttons.Add(Ui.Action("Wake details", () => Sheets.Text(this, "Wake", plan.Sentence(machine.Name) + "\n" + string.Join("\n", plan.Obstacles))));
             foreach (var helperId in plan.OfferToWakeFirst)
                 if (_app.Machine(helperId) is { } helper)
-                    buttons.Add(Ui.Action($"Wake {helper.Name} first", () => Wake(helper)));
+                    wake.Add(Ui.MenuAction("Wake " + helper.Name + " first", () => Wake(helper)));
+            wake.Add(Ui.MenuAction("Wake details", () => Sheets.Text(this, "Wake", plan.Sentence(machine.Name) + "\n" + string.Join("\n", plan.Obstacles))));
+            items.Add(new MenuItem { Header = "Wake options", ItemsSource = wake });
         }
-
-        foreach (var group in new[] { ("Power", buttons), ("Actions", actions), ("Service setup", setup), ("Diagnostics", diagnostics) })
+        var restricted = status?.Agent?.RestrictedSession == true || machine.Machine.Systems.All(system => system.Restricted);
+        items.Add(Ui.MenuAction("Service setup", () => EditServices(machine), machine.Capabilities.SpeaksV3 && !restricted,
+            restricted ? "Requires an administrator SSH key" : null));
+        items.Add(Ui.MenuAction("Machine schedule", () => EditPolicy(machine, null), machine.Capabilities.SupportsPolicy));
+        var (bundle, bundleProblem) = AgentBundle.Load();
+        if (status is not null && (bundle is null || status.AgentVersion != bundle.Version))
+            items.Add(Ui.MenuAction("Install agent " + (bundle?.Version ?? AgentContract.BundledAgentVersion), () => InstallAgent(machine), bundle is not null, bundleProblem));
+        items.Add(new MenuItem { Header = "Diagnostics", ItemsSource = new[]
         {
-            if (group.Item2.Count == 0) continue;
-            _content.Children.Add(Ui.SectionHeading(group.Item1));
-            _content.Children.Add(Ui.Actions(group.Item2.ToArray()));
-        }
+            Ui.MenuAction("Check agent", () => Doctor(machine), machine.Capabilities.SupportsDoctor),
+            Ui.MenuAction("Deep diagnostics", () => Doctor(machine, true), machine.Capabilities.SupportsDoctor),
+            Ui.MenuAction("Recent log", () => Logs(machine), machine.Capabilities.SupportsLogs),
+            Ui.MenuAction("Export diagnostics", () => Bundle(machine), machine.Capabilities.SupportsBundle),
+        }});
+        return Ui.Actions(
+            live ? Ui.Action("Sleep", () => Request(machine, new MachineRequest { Kind = RequestKind.Sleep }))
+                : machine.Machine.Wake is not null ? Ui.Action("Wake", () => Wake(machine)) : null,
+            boot.Length > 0 ? Ui.MenuButton("Restart ▾", boot, "Restart " + machine.Name + " into another system") : null,
+            Ui.MenuButton("⋯", items, machine.Name + " actions and settings"));
+    }
+
+    public void OpenMachine(string id, MachineRequest? request = null, bool wake = false)
+    {
+        if (_app.Machine(id) is not { } machine) return;
+        _selection.Select(id); _page = "machine"; Show(); Activate(); Rebuild();
+        if (request is not null) Request(machine, request);
+        else if (wake) Wake(machine);
+    }
+
+    public void OpenSettings()
+    {
+        _page = "device"; Show(); Activate(); Rebuild();
     }
 
     private void BuildSetup()

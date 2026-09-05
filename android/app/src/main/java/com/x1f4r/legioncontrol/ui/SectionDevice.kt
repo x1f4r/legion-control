@@ -44,13 +44,24 @@ import java.io.File
  */
 @Composable
 fun ThisDeviceSection(app: AppModel, updates: AppUpdateModel, bindings: DeviceBindings, onBindings: BindingsActions) {
-    Spacer(Modifier.height(6.dp))
-    AppUpdateBlock(updates)
-    ThisDeviceBlock(app, bindings, onBindings)
-    DeviceKeyBlock(app)
-    NotificationsBlock(app)
-    SetupBlock(app)
-    HistoryBlock(app)
+    var selected by remember { mutableStateOf<String?>(null) }
+    Text("Settings", style = MaterialTheme.typography.titleLarge)
+    SettingsEntry("App updates", if (updates.newerAppAvailable) "Available" else BuildConfig.VERSION_NAME) { selected = "App updates" }
+    SettingsEntry("This device") { selected = "This device" }
+    SettingsEntry("SSH key") { selected = "SSH key" }
+    SettingsEntry("Notifications") { selected = "Notifications" }
+    SettingsEntry("Shared setup") { selected = "Shared setup" }
+    SettingsEntry("Revision history") { selected = "Revision history" }
+    selected?.let { title -> DetailSheet(title, { selected = null }) {
+        when (title) {
+            "App updates" -> AppUpdateBlock(updates)
+            "This device" -> ThisDeviceBlock(app, bindings, onBindings)
+            "SSH key" -> DeviceKeyBlock(app)
+            "Notifications" -> NotificationsBlock(app)
+            "Shared setup" -> SetupBlock(app) { selected = null; app.openEditor() }
+            "Revision history" -> HistoryBlock(app)
+        }
+    } }
 }
 
 /** The two things a device can be told about itself, neither of which is ever published. */
@@ -62,7 +73,7 @@ interface BindingsActions {
 // MARK: - The app
 
 @Composable
-private fun AppUpdateBlock(updates: AppUpdateModel) {
+internal fun AppUpdateBlock(updates: AppUpdateModel) {
     val context = LocalContext.current
     val available = updates.check as? AppUpdates.Check.Available
 
@@ -301,7 +312,7 @@ private fun DeviceKeyBlock(app: AppModel) {
  * are right here rather than buried.
  */
 @Composable
-private fun SetupBlock(app: AppModel) {
+private fun SetupBlock(app: AppModel, onEdit: () -> Unit = app::openEditor) {
     SectionHeading(
         "Setup",
         note = if (app.hasMachines) {
@@ -341,7 +352,7 @@ private fun SetupBlock(app: AppModel) {
             label = "Edit the setup",
             enabled = true,
             emphasis = app.divergence == null && app.identityClash == null,
-        ) { app.openEditor() }
+        ) { onEdit() }
     }
 
     Spacer(Modifier.height(14.dp))

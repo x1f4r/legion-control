@@ -33,6 +33,7 @@ import com.x1f4r.legioncontrol.data.withText
  */
 @Composable
 fun SetupEditorSection(app: AppModel) {
+    Text("Edit setup", style = MaterialTheme.typography.titleLarge)
     val editor = app.editor
     Spacer(Modifier.height(6.dp))
 
@@ -43,12 +44,6 @@ fun SetupEditorSection(app: AppModel) {
         )
         return
     }
-
-    ExplanationText(
-        "Changes here become this device's setup when you apply them, and are sent to every machine " +
-            "on its next check. Editing with nothing in reach is fine: the changes travel when the " +
-            "machines do.",
-    )
 
     val changes = editor.changes()
 
@@ -75,8 +70,12 @@ fun SetupEditorSection(app: AppModel) {
     editor.error?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
     editor.note?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
 
-    SitesBlock(app)
-    MachinesBlock(app)
+    var section by remember { mutableStateOf<String?>(null) }
+    SettingsEntry("Machines", editor.typed?.machines?.size?.toString()) { section = "Machines" }
+    SettingsEntry("Sites", editor.typed?.sites?.size?.toString()) { section = "Sites" }
+    section?.let { title -> DetailSheet(title, { section = null }) {
+        if (title == "Machines") MachinesBlock(app) else SitesBlock(app)
+    } }
 }
 
 @Composable

@@ -1,6 +1,8 @@
 package com.x1f4r.legioncontrol.ui
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -39,7 +41,76 @@ import com.x1f4r.legioncontrol.agent.ServiceStatus
  * update ignores all three.
  */
 @Composable
+internal fun CompactServiceRow(model: MachineModel, page: RememberedService, onDetails: () -> Unit) {
+    val service = model.service(page.id)
+    val canUpdate = service != null && updateAvailable(model, service)
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val wide = maxWidth >= 560.dp
+        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(page.name, style = MaterialTheme.typography.bodyMedium)
+                QuietText(compactServiceState(model, service))
+            }
+            if (wide) Text(service?.installed ?: "—", Modifier.width(100.dp), style = MaterialTheme.typography.bodySmall)
+            if (canUpdate) PlainAction("Update", !model.isWorking, emphasis = true,
+                working = model.isBusyWith(MachineModel.Task.UPDATE, page.id)) { service?.let(model::requestUpdate) }
+            MoreMenu("${page.name} actions") { close ->
+                MenuAction("Details & schedule", close = close, onClick = onDetails)
+                MenuAction("Restart", !model.isWorking && service != null && service.canRestart != false && model.currentSystem != null, close) { service?.let(model::requestRestart) }
+                if (model.speaksV3) {
+                    MenuAction("Update when idle", !model.isWorking && canUpdate, close) { service?.let { model.update(it, whenIdle = true) } }
+                    MenuAction("Restart when idle", !model.isWorking && service != null && service.canRestart != false && model.currentSystem != null, close) { service?.let { model.restart(it, whenIdle = true) } }
+                }
+            }
+        }
+    }
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+}
+
+private fun compactServiceState(model: MachineModel, service: ServiceStatus?): String = when {
+    model.currentSystem == null || service == null -> "Unavailable"
+    compactActivityState(service.busy) != null -> compactActivityState(service.busy)!!
+    service.healthy == false -> "Needs attention"
+    service.running == false -> "Stopped"
+    service.running == true || service.healthy == true -> "Running"
+    else -> "Status unknown"
+}
+
+@Composable
 fun ServiceSection(model: MachineModel, page: RememberedService) {
+    val service = model.service(page.id)
+    var detail by remember { mutableStateOf<String?>(null) }
+    Text(compactServiceState(model, service), style = MaterialTheme.typography.bodyMedium)
+    val canUpdate = service != null && updateAvailable(model, service)
+    Actions {
+        PlainAction("Update", !model.isWorking && canUpdate, emphasis = canUpdate,
+            working = model.isBusyWith(MachineModel.Task.UPDATE, page.id)) { service?.let(model::requestUpdate) }
+        PlainAction("Restart", !model.isWorking && service != null && model.currentSystem != null && service.canRestart != false,
+            destructive = true, working = model.isBusyWith(MachineModel.Task.RESTART, page.id)) { service?.let(model::requestRestart) }
+        if (model.speaksV3) MoreMenu("Service timing") { close ->
+            MenuAction("Update when idle", !model.isWorking && canUpdate, close) { service?.let { model.update(it, whenIdle = true) } }
+            MenuAction("Restart when idle", !model.isWorking && service != null && model.currentSystem != null && service.canRestart != false, close) { service?.let { model.restart(it, whenIdle = true) } }
+        }
+    }
+    OperationsBlock(model, showHistory = false)
+    SettingsEntry("Versions & status", service?.installed) { detail = "Versions & status" }
+    if (service?.canUpdate != false) SettingsEntry("Update schedule") { detail = "Update schedule" }
+    detail?.let { title -> DetailSheet(title, { detail = null }) {
+        if (title == "Update schedule") {
+            MaintenanceBlock(model, page, service)
+            if (model.statusIsError) {
+                Text(model.statusLine, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                model.statusDetail?.let { QuietText(it) }
+            }
+        } else {
+            ServiceFacts(model, page)
+            updateUnavailableReason(model, service)?.let { QuietText(it) }
+        }
+    } }
+}
+
+@Composable
+private fun ServiceFacts(model: MachineModel, page: RememberedService) {
     val service = model.service(page.id)
 
     Spacer(Modifier.height(6.dp))
@@ -88,46 +159,7 @@ fun ServiceSection(model: MachineModel, page: RememberedService) {
         service.notes.orEmpty().forEach { QuietText(it, Modifier.padding(top = 2.dp)) }
     }
 
-    SectionHeading("Actions", note = model.currentSystem?.let { "on ${it.name}" })
-    Actions {
-        // Live and emphasised when the agent has compared what is installed against what is
-        // published and found it behind. A lookup that failed leaves this dead, because an update
-        // pressed on the strength of an unknown stops the service to install nothing.
-        val canUpdate = service != null && updateAvailable(model, service)
-        PlainAction(
-            label = "Update now",
-            enabled = !model.isWorking && canUpdate,
-            emphasis = canUpdate,
-            working = model.isBusyWith(MachineModel.Task.UPDATE, page.id),
-        ) { service?.let(model::requestUpdate) }
-
-        if (model.speaksV3) {
-            PlainAction(
-                label = "Update when idle",
-                enabled = !model.isWorking && canUpdate,
-            ) { service?.let { model.update(it, whenIdle = true) } }
-        }
-
-        PlainAction(
-            label = "Restart ${page.name}",
-            enabled = !model.isWorking && service != null && model.currentSystem != null &&
-                service.canRestart != false,
-            destructive = true,
-            working = model.isBusyWith(MachineModel.Task.RESTART, page.id),
-        ) { service?.let(model::requestRestart) }
-
-        if (model.speaksV3) {
-            PlainAction(
-                label = "Restart when idle",
-                enabled = !model.isWorking && service != null && service.canRestart != false,
-                destructive = true,
-            ) { service?.let { model.restart(it, whenIdle = true) } }
-        }
-    }
-    updateUnavailableReason(model, service)?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
-
-    MaintenanceBlock(model, page, service)
-}
+ }
 
 /**
  * When the schedule may touch this service, which is three separate things.
@@ -401,10 +433,7 @@ private fun ActivityVerdict(busy: BusyStatus?) {
             "Cannot tell: " + (busy.error ?: "the agent could not read the probe"),
         )
 
-        busy.monitored == false -> StatusLine(
-            Mark.Unknown,
-            "Nothing is watching this service, so nobody can say whether it is working",
-        )
+        busy.monitored == false || busy.evidence == "unmonitored" -> StatusLine(Mark.Unknown, "Not monitored")
 
         busy.isBusy -> StatusLine(Mark.Busy, busy.summary)
         else -> StatusLine(Mark.Idle, "Idle")

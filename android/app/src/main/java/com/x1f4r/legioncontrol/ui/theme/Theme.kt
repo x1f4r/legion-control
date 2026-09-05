@@ -16,24 +16,24 @@ import androidx.compose.ui.unit.sp
  * A fixed, quiet palette rather than the wallpaper-derived one.
  *
  * Dynamic colour would tint a page whose whole job is to say green, amber or red about a machine,
- * and a status the same hue as the background is a status nobody reads. The surfaces here are warm
- * paper in the light and near-black ink in the dark, with one restrained accent for the things you
+ * and a status the same hue as the background is a status nobody reads. The surfaces here are neutral
+ * white in the light and near-black ink in the dark, with one restrained accent for the things you
  * can press.
  */
-private val InkLight = Color(0xFF1B1A18)
+private val InkLight = Color(0xFF202124)
 private val InkDark = Color(0xFFEDEAE4)
 
 private val LightScheme = lightColorScheme(
-    primary = Color(0xFF2F5A87),
+    primary = Color(0xFF2166D1),
     onPrimary = Color(0xFFFFFFFF),
     secondary = Color(0xFF5A6472),
     onSecondary = Color(0xFFFFFFFF),
-    background = Color(0xFFFBFAF8),
+    background = Color(0xFFFFFFFF),
     onBackground = InkLight,
-    surface = Color(0xFFFBFAF8),
+    surface = Color(0xFFFFFFFF),
     onSurface = InkLight,
-    surfaceVariant = Color(0xFFF1EEE9),
-    onSurfaceVariant = Color(0xFF6A665F),
+    surfaceVariant = Color(0xFFF3F4F6),
+    onSurfaceVariant = Color(0xFF61656B),
     outline = Color(0xFF8D887F),
     outlineVariant = Color(0xFFE0DCD5),
     error = Color(0xFF9B2C21),
@@ -100,8 +100,8 @@ private val LegionTypography = Typography().let { base ->
             fontWeight = FontWeight.SemiBold,
             letterSpacing = 0.2.sp,
         ),
-        bodyMedium = base.bodyMedium.copy(lineHeight = 21.sp),
-        bodySmall = base.bodySmall.copy(lineHeight = 19.sp),
+        bodyMedium = base.bodyMedium.copy(fontSize = 14.sp, lineHeight = 20.sp),
+        bodySmall = base.bodySmall.copy(fontSize = 12.sp, lineHeight = 17.sp),
     )
 }
 

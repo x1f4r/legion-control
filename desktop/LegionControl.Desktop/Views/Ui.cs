@@ -13,6 +13,8 @@ namespace LegionControl.Desktop.Views;
 /// hundred pixels of chrome per machine and say nothing at all.
 public static class Ui
 {
+    public static FontFamily NativeFont => new(OperatingSystem.IsWindows() ? "Segoe UI"
+        : OperatingSystem.IsMacOS() ? ".AppleSystemUIFont" : "sans-serif");
     private static IBrush Brush(string key, string fallback) =>
         Application.Current is { } app && app.TryGetResource(key, app.ActualThemeVariant, out var value) && value is IBrush brush
             ? brush : new SolidColorBrush(Color.Parse(fallback));
@@ -25,7 +27,7 @@ public static class Ui
     public static TextBlock Title(string text) => new()
     {
         Text = text,
-        FontSize = 20,
+        FontSize = 22,
         FontWeight = FontWeight.SemiBold,
         Margin = new Thickness(0, 0, 0, 2),
         TextWrapping = TextWrapping.Wrap,
@@ -34,10 +36,10 @@ public static class Ui
     public static TextBlock SectionHeading(string text) => new()
     {
         Text = text,
-        FontSize = 13,
+        FontSize = 15,
         FontWeight = FontWeight.SemiBold,
         Foreground = Muted,
-        Margin = new Thickness(0, 14, 0, 4),
+        Margin = new Thickness(0, 10, 0, 6),
     };
 
     /// One fact: what it is called on the left, what it says on the right.
@@ -116,4 +118,37 @@ public static class Ui
         Orientation = Orientation.Vertical,
         Spacing = spacing,
     };
+
+    public static MenuItem MenuAction(string text, Action handler, bool enabled = true, string? explanation = null)
+    {
+        var item = new MenuItem { Header = text, IsEnabled = enabled };
+        item.Click += (_, _) => handler();
+        if (explanation is not null) ToolTip.SetTip(item, explanation);
+        return item;
+    }
+
+    public static Button MenuButton(string text, IEnumerable<MenuItem> items, string accessibleName)
+    {
+        var menu = new ContextMenu { ItemsSource = items.ToArray() };
+        var button = Action(text, () => { });
+        button.ContextMenu = menu;
+        button.Click += (_, _) => menu.Open(button);
+        Avalonia.Automation.AutomationProperties.SetName(button, accessibleName);
+        ToolTip.SetTip(button, accessibleName);
+        return button;
+    }
+
+    public static void ShowDetails(Window owner, string title, Control content)
+    {
+        content.Margin = new Thickness(16);
+        var window = new Window
+        {
+            Title = title, Width = Math.Min(680, Math.Max(400, owner.Bounds.Width)),
+            Height = Math.Min(600, Math.Max(320, owner.Bounds.Height)),
+            MinWidth = 360, MinHeight = 260, FontFamily = NativeFont,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content = new ScrollViewer { Content = content },
+        };
+        window.Show(owner);
+    }
 }

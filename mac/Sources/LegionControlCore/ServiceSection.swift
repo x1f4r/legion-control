@@ -5,18 +5,21 @@ import SwiftUI
 struct ServiceSection: View {
     let model: MachineModel
     let serviceId: String
+    var performAction: (@escaping @MainActor () -> Void) -> Void = { action in action() }
 
     private var service: ServiceStatus? { model.service(id: serviceId) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            PageHeading(title: service?.displayName ?? serviceId,
-                        note: model.currentSystem.map { "on \($0.name)" })
-
             if let service {
-                state(service)
+                HStack(spacing: 12) {
+                    Text(service.installed ?? "Version unknown").font(.callout.monospaced()).foregroundStyle(.secondary)
+                    if service.canUpdate == false { Text("Updates managed by application").font(.callout).foregroundStyle(.secondary) }
+                }.padding(.bottom, 12)
                 actions(service)
-                if service.canUpdate != false { MaintenanceRows(
+                DisclosureGroup("Service details") { state(service).padding(.vertical, 12) }
+                    .padding(.vertical, 12)
+                if service.canUpdate != false { DisclosureGroup("Schedule") { MaintenanceRows(
                     policy: service.updates,
                     systemPolicy: model.policy,
                     subject: service.displayName,
@@ -28,7 +31,7 @@ struct ServiceSection: View {
                     resume: { model.resume(service: service) },
                     setWindows: { model.setWindows($0, service: service) },
                     inherit: { model.inheritPolicy(service: service) }
-                ) }
+                ) } }
                 notes(service)
             } else {
                 Text("Not available while \(model.name) is unreachable.")
@@ -169,7 +172,7 @@ struct ServiceSection: View {
     @ViewBuilder
     private func activityVerdict(_ service: ServiceStatus) -> some View {
         if let busy = service.busy {
-            switch busy.verdict {
+            switch busy.isUnknown ? .unknown : !busy.isMonitored ? .unmonitored : busy.verdict {
             case .busy:
                 StatusText(symbol: "circle.dotted", text: busy.summary, tint: .orange)
             case .idle:
@@ -265,8 +268,6 @@ struct ServiceSection: View {
 
     private func actions(_ service: ServiceStatus) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            SectionHeading(title: "Actions")
-
             FlowRow(spacing: 10) {
                 // Prominent only when a newer build has actually been detected. The rest of the time
                 // this is a button that would do nothing, so it neither invites a press nor accepts
@@ -275,30 +276,31 @@ struct ServiceSection: View {
                     title: "Update now",
                     isHighlighted: canUpdate(service),
                     isEnabled: !model.isWorking && canUpdate(service)
-                ) { model.requestUpdate(service) }
+                ) { performAction { model.requestUpdate(service) } }
 
                 if model.dialect.supportsQueue {
-                    Button("Update when idle") { model.requestUpdateWhenIdle(service) }
+                    Button("Update when idle") { performAction { model.requestUpdateWhenIdle(service) } }
                         .disabled(model.isWorking || !canUpdate(service))
                 }
 
                 }
-                Button("Restart") { model.requestRestart(service) }
+                Button("Restart") { performAction { model.requestRestart(service) } }
                     .disabled(model.isWorking || model.commandableSystem == nil || service.canRestart == false)
 
                 if model.dialect.supportsQueue {
-                    Button("Restart when idle") { model.restart(service, force: false, whenIdle: true) }
+                    Button("Restart when idle") { performAction { model.restart(service, force: false, whenIdle: true) } }
                         .disabled(model.isWorking || model.commandableSystem == nil || service.canRestart == false)
                 }
 
                 ForEach(model.actions(for: service)) { action in
-                    Button(action.displayName) { model.requestAction(action) }
+                    Button(action.displayName) { performAction { model.requestAction(action) } }
                         .disabled(model.isWorking || model.commandableSystem == nil)
                 }
             }
 
-            QuietNote(text: updateNote(service))
-                .padding(.top, 12)
+            if let reason = service.updateUnavailableReason, service.canUpdate != false {
+                Text(reason).font(.caption).foregroundStyle(.secondary).padding(.top, 8)
+            }
         }
     }
 
@@ -366,9 +368,6 @@ struct MaintenanceRows: View {
         if supportsPolicy {
             VStack(alignment: .leading, spacing: 0) {
                 SectionHeading(title: "Maintenance")
-
-                QuietNote(text: "This is about the schedule only. Asking for an update yourself always works, whatever these say.")
-                    .padding(.bottom, 12)
 
                 VStack(alignment: .leading, spacing: 12) {
                     Toggle(isOn: Binding(

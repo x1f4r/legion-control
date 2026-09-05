@@ -7,14 +7,17 @@ struct DetailRow<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 18) {
-            Text(label)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .frame(width: 140, alignment: .leading)
-            content
-                .font(.body)
-            Spacer(minLength: 0)
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 14) {
+                Text(label).font(.subheadline).foregroundStyle(.secondary)
+                    .frame(width: 120, alignment: .leading)
+                content.font(.body)
+                Spacer(minLength: 0)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(label).font(.caption).foregroundStyle(.secondary)
+                content.font(.body).frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 }
@@ -32,17 +35,17 @@ struct PageHeading: View {
     var note: String?
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(title)
-                .font(.title2.weight(.semibold))
-            if let note {
-                Text(note)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(title).font(.system(size: 22, weight: .semibold))
+                if let note { Text(note).font(.callout).foregroundStyle(.secondary) }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
-        }
-        .padding(.bottom, 18)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(size: 22, weight: .semibold))
+                if let note { Text(note).font(.callout).foregroundStyle(.secondary) }
+            }
+        }.padding(.bottom, 16)
     }
 }
 
