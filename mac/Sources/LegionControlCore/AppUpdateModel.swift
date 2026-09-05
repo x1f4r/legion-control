@@ -293,7 +293,6 @@ final class AppUpdateModel {
 
                 // The marker is removed by the helper before it launches the new build, and written
                 // again by the new build once it is up. Its absence is what triggers the recovery.
-                try? FileManager.default.removeItem(at: marker)
                 try self.requireCurrent(repository: repository, epoch: epoch)
                 try self.performSwap(staged, bundleURL, marker)
                 self.operations?.finish(
@@ -328,7 +327,6 @@ final class AppUpdateModel {
         failure = nil
         let marker = AppUpdates.launchMarkerURL(support: supportDirectory)
         do {
-            try? FileManager.default.removeItem(at: marker)
             try AppUpdates.rollBack(to: previous, current: bundleURL, marker: marker)
             quit()
         } catch let problem as AppUpdates.InstallFailure {
