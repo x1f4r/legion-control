@@ -121,6 +121,29 @@ export function canonicalHash(input) {
 // Crash-consistent commit
 // ---------------------------------------------------------------------------
 
+const publicationWait = new Int32Array(new SharedArrayBuffer(4));
+
+function retryWindowsSharing(operation) {
+  const deadline = performance.now() + 1000;
+  let pauseMs = 10;
+  for (;;) {
+    try { return operation(); }
+    catch (error) {
+      const remaining = deadline - performance.now();
+      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
+      // A reader or antivirus scanner can briefly deny Windows replacement.
+      // Retry the same atomic operation; deleting its destination first would
+      // expose a missing document and destroy the recoverable committed pair.
+      Atomics.wait(publicationWait, 0, 0, Math.min(pauseMs, remaining));
+      pauseMs = Math.min(pauseMs * 2, 100);
+    }
+  }
+}
+
+function replaceAtomic(source, target) {
+  return retryWindowsSharing(() => fs.renameSync(source, target));
+}
+
 function writeFileAtomic(file, contents) {
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
   try {
@@ -131,7 +154,7 @@ function writeFileAtomic(file, contents) {
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmp, file);
+    replaceAtomic(tmp, file);
     syncControllerDirectory();
   } catch (error) {
     try { fs.rmSync(tmp, { force: true }); } catch { /* preserve the original write failure */ }
@@ -267,10 +290,10 @@ function replayCommit() {
   const selected = pendingSnapshot(journal);
   if (!selected.snapshot.consistent) throw new Error(selected.snapshot.error);
   if (!sameSnapshotFile(journal, readSnapshotFile(commitPath()))) throw new Error('controller commit changed during recovery');
-  if (selected.file !== controllerPath()) fs.renameSync(selected.file, controllerPath());
+  if (selected.file !== controllerPath()) replaceAtomic(selected.file, controllerPath());
   syncControllerDirectory();
   writeFileAtomic(controllerMetaPath(), `${JSON.stringify(selected.commit.meta, null, 2)}\n`);
-  fs.rmSync(commitPath(), { force: true });
+  retryWindowsSharing(() => fs.rmSync(commitPath(), { force: true }));
   syncControllerDirectory();
 }
 
