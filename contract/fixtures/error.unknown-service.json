@@ -1,0 +1,19 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "unknown-service",
+  "message": "this machine has no service called \"t3-desktop\"; it has t3, demo and edge",
+  "command": "update",
+  "argument": "--service",
+  "accepts": [
+    "t3",
+    "demo",
+    "edge"
+  ],
+  "error": "unknown service: t3-desktop"
+}

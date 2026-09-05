@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "controller": {
+    "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+    "revision": 1,
+    "lineage": []
+  },
+  "machines": [
+    {
+      "id": "legion",
+      "name": "Legion 7",
+      "wake": {
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "helper": {
+          "machine": "tower",
+          "action": "wake-legion"
+        },
+        "helpers": [
+          {
+            "machine": "tower",
+            "action": "wake-legion"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tower",
+      "name": "Tower",
+      "wake": {
+        "mac": "11:22:33:44:55:66",
+        "helper": {
+          "machine": "legion",
+          "action": "wake-tower"
+        },
+        "helpers": [
+          {
+            "machine": "legion",
+            "action": "wake-tower"
+          }
+        ]
+      }
+    }
+  ]
+}

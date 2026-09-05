@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bindings.schema.json",
+  "title": "Private per-device bindings",
+  "description": "What one device knows about itself and never tells anybody: which machine in the shared setup it IS, where its keys are, which ssh aliases exist in its own ~/.ssh/config, and how to run an agent on itself without ssh. None of this is publishable. An identityFile is an absolute path that means nothing on another device, and a shared document that carried one would make every peer's copy differ for a reason none of them chose.\n\nStored beside the setup file (Mac and desktop: bindings.json, relocated with the rest of the local state when LEGION_CONTROL_HOME is set; Android: DataStore entries). This file MUST NOT be published, MUST NOT be merged, and MUST NOT contain a private key: it names where keys are, never what they are.\n\nEvery key is optional. A device with no bindings behaves exactly as it did before them.",
+  "type": "object",
+  "properties": {
+    "deviceName": {
+      "description": "Free text, written into controller.device on this device's edits so a divergence screen can say who made each side.",
+      "type": "string",
+      "minLength": 1
+    },
+    "self": {
+      "description": "Which machine in the shared document this device is. Setting it makes the machine section for that id the device's own, and lets it be controlled without an ssh loop back to itself. Android never sets it: the phone cannot run a service, which the app says outright rather than showing an empty section.",
+      "type": "object",
+      "properties": {
+        "machine": { "$ref": "#/$defs/token" },
+        "system": { "$ref": "#/$defs/token" }
+      },
+      "required": ["machine"],
+      "additionalProperties": false
+    },
+    "localAgent": {
+      "description": "How to run the agent on THIS device: the binary and its arguments, spawned directly. There is deliberately no shell field. Wrapping the argv in cmd or powershell would put a quoting layer between the client and the agent for no reason at all, since nothing here crosses ssh; the argv is executed as given.",
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "required": ["argv"],
+      "additionalProperties": false
+    },
+    "identityFile": {
+      "description": "The default ssh key for every machine, unless a per-machine binding overrides it. Explicit endpoints inherit it: dropping the identity on an endpoint the user spelled out is how a working machine becomes unreachable for no visible reason.",
+      "type": "string",
+      "minLength": 1
+    },
+    "knownHostsFile": {
+      "description": "Where this device keeps its pinned host keys. Set by the test harness through LEGION_CONTROL_HOME so an isolated run cannot touch the real ~/.ssh/known_hosts. Entries are never removed automatically, in a test run or out of one.",
+      "type": "string",
+      "minLength": 1
+    },
+    "currentSite": {
+      "description": "The site this device says it is on, chosen by a person. It exists because two sites may have identical private subnets: matching 192.168.178. proves nothing when both homes use the router's default range. This is a routing HINT that resolves that ambiguity; it never authenticates a machine, and it must never be used to reject a known remote address whose site merely looks like another one. Unset, or matching more than one site, means the location is unconfirmed and the client says so.",
+      "$ref": "#/$defs/token"
+    },
+    "machines": {
+      "description": "Per-machine overrides, keyed by the machine id in the shared document.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/token" },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "identityFile": { "type": "string", "minLength": 1 },
+          "sshAlias": {
+            "description": "An entry in this device's own ~/.ssh/config, dialled before the document's endpoints. Private by nature: the alias exists only here.",
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "token": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/\\\\~=+-]*$" }
+  }
+}

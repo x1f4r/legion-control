@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "node": "24.9.0",
+  "base": "/home/x1f4r/.legion-control",
+  "os": "linux"
+}

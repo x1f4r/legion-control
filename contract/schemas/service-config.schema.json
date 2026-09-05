@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "service-config.schema.json",
+  "title": "Administrative service-config replies",
+  "description": "Unrestricted machine-local configuration editor. Hashes are opaque structural identities and are separate from canonical shared setup hashes. Only get returns the full document.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        },
+        "required": [
+          "ok"
+        ]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "required": [
+              "hash",
+              "document",
+              "templates",
+              "limits"
+            ]
+          },
+          {
+            "required": [
+              "valid",
+              "hash",
+              "proposedHash",
+              "changes",
+              "warnings"
+            ],
+            "properties": {
+              "valid": {
+                "const": true
+              },
+              "hash": {},
+              "proposedHash": {},
+              "changes": {},
+              "warnings": {}
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "hash": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "document": {
+      "type": "object"
+    },
+    "templates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "service": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "service"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "maxBytes": {
+          "const": 1048576
+        }
+      },
+      "required": [
+        "maxBytes"
+      ],
+      "additionalProperties": false
+    },
+    "valid": {
+      "type": "boolean"
+    },
+    "proposedHash": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "changes": {
+      "type": "object",
+      "properties": {
+        "added": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/configuredId"
+          }
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/configuredId"
+          }
+        },
+        "changed": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/configuredId"
+          }
+        },
+        "otherSettingsChanged": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "added",
+        "removed",
+        "changed",
+        "otherSettingsChanged"
+      ],
+      "additionalProperties": false
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "message"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "message"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "saved": {
+      "const": true
+    },
+    "conflict": {
+      "const": true
+    },
+    "profiles": {
+      "description": "Optional detected application profiles; availability describes supported update methods and never promises universal unattended updating.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "platform": {
+            "enum": [
+              "mac",
+              "windows",
+              "linux"
+            ]
+          },
+          "detected": {
+            "type": "boolean"
+          },
+          "availability": {
+            "enum": [
+              "available",
+              "not-installed",
+              "manual",
+              "unavailable"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "updateMethod": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "service": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "platform",
+          "detected",
+          "availability",
+          "message",
+          "updateMethod",
+          "service"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "unevaluatedProperties": false
+}

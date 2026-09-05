@@ -41,8 +41,16 @@
     <key>ProgramArguments</key>
     <array>
         <string>@NODE@</string>
-        <string>@AGENT_DIR@/src/index.mjs</string>
-        <string>update</string>
+        <string>@LAUNCHER@</string>
+        <!--
+            `cycle`, not `update`. `update` with no service picks the FIRST one
+            and stops, which meant a Mac looking after two things quietly kept
+            the second on a stale build for as long as it existed while the
+            switch above it said automatic updates were on. `cycle` walks every
+            eligible service, records one operation per service under a parent
+            record, and lets one deferred service have no effect on the others.
+        -->
+        <string>cycle</string>
     </array>
 
     <!--
@@ -76,6 +84,11 @@
         is a readable history of what was decided and when. launchd appends and
         never truncates, but at one line per run it grows by a few kilobytes a
         day, which is not worth rotating.
+
+        It is not the only record any more, and no longer the one that matters:
+        every run of the cycle writes an operation record the agent keeps and the
+        apps can read back, which is what makes "did that update actually run"
+        answerable after the fact rather than a question about a log file.
     -->
     <key>StandardOutPath</key>
     <string>@BASE@/launchd.log</string>

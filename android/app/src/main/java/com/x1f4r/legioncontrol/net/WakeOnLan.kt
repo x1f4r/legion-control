@@ -36,10 +36,13 @@ class WakeOnLan(private val target: WakeTarget) {
      * on the machine's behalf: Android drops it on some interfaces, and the directed form is what
      * actually reaches a switch port, so which addresses to send to is the configuration's business.
      */
-    suspend fun send(via: Network? = null): String? = withContext(Dispatchers.IO) {
+    suspend fun send(
+        via: Network? = null,
+        broadcasts: List<String> = target.broadcasts,
+    ): String? = withContext(Dispatchers.IO) {
         val payload = magicPacket(target.mac)
             ?: return@withContext "${target.mac} is not a valid hardware address."
-        if (target.broadcasts.isEmpty()) {
+        if (broadcasts.isEmpty()) {
             return@withContext "No broadcast address is configured for this machine."
         }
 
@@ -51,7 +54,7 @@ class WakeOnLan(private val target: WakeTarget) {
                 socket.broadcast = true
                 var delivered = 0
                 var lastFailure: String? = null
-                for (address in target.broadcasts) {
+                for (address in broadcasts) {
                     val destination = try {
                         InetAddress.getByName(address)
                     } catch (failure: Exception) {
@@ -89,9 +92,21 @@ class WakeOnLan(private val target: WakeTarget) {
     suspend fun waitForSsh(timeout: Duration = 45.seconds): Boolean {
         if (target.probeHost.isBlank()) return true
         val started = TimeSource.Monotonic.markNow()
+        var wait = FIRST_WAIT
+        var probes = 0
         while (started.elapsedNow() < timeout && currentCoroutineContext().isActive) {
+            // The first wait comes before the first probe on purpose. sshd is not listening one
+            // millisecond after a magic packet under any circumstances, and a connection that
+            // arrives before it is up is one more unauthenticated attempt against a source that
+            // OpenSSH counts.
+            delay(wait)
+            if (!currentCoroutineContext().isActive) return false
             if (TcpProbe.reachable(target.probeHost, target.probePort, POLL_TIMEOUT_MILLIS)) return true
-            delay(1.seconds)
+            probes += 1
+            if (probes >= MAX_PROBES) return false
+            // Backing off rather than polling every second. A machine takes tens of seconds to come
+            // out of sleep and the answer does not arrive sooner for being asked more often.
+            wait = (wait * BACKOFF_FACTOR).coerceAtMost(MAX_WAIT)
         }
         return false
     }
@@ -102,6 +117,14 @@ class WakeOnLan(private val target: WakeTarget) {
     private companion object {
         const val REPEATS = 3
         const val POLL_TIMEOUT_MILLIS = 2_000
+
+        /** Nothing is listening before this, so probing earlier only costs the machine an entry. */
+        val FIRST_WAIT: Duration = 3.seconds
+        val MAX_WAIT: Duration = 8.seconds
+        const val BACKOFF_FACTOR = 1.6
+
+        /** A cap in probes as well as in time, so a long timeout cannot become a long knock. */
+        const val MAX_PROBES = 12
     }
 }
 

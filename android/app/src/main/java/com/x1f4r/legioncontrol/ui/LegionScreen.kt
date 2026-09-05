@@ -42,6 +42,8 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
@@ -56,6 +58,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.ui.theme.LocalStatusColors
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
@@ -63,13 +66,10 @@ import kotlinx.coroutines.launch
 /**
  * A page per subject rather than one long scroll.
  *
- * The old page put a machine's power state and a wall of base64 at the same level, one under the
- * other, so the thing you opened the app for had to be scrolled past the thing you needed once. The
- * split is by subject and by who owns it: each machine, each service running on it, and this phone.
- *
- * Both ways of moving between them are real. The drawer is for going somewhere by name; the swipe is
- * for the next page being one gesture away, which is how siblings behave on a phone. They are the
- * same state, so neither can be out of step with the other.
+ * The split is by subject and by who owns it: each machine, each service running on it, the shared
+ * setup, and this phone. Both ways of moving between them are real. The drawer is for going
+ * somewhere by name; the swipe is for the next page being one gesture away, which is how siblings
+ * behave on a phone. They are the same state, so neither can be out of step with the other.
  */
 sealed interface Page {
     val title: String
@@ -77,21 +77,20 @@ sealed interface Page {
 
     data class OneMachine(val model: MachineModel) : Page {
         override val title get() = model.machine.name
-        override val summary get() = "Which system is up, and the power actions"
+        override val summary get() = "Which system is up, what it is doing, and the power actions"
     }
 
     data class OneService(
         val model: MachineModel,
         val service: RememberedService,
-        /** Only worth saying when there is more than one machine to tell apart. */
         val showsMachine: Boolean,
     ) : Page {
         override val title get() = service.name
         override val summary
             get() = if (showsMachine) {
-                "On ${model.machine.name}: versions, health, and what it is doing"
+                "On ${model.machine.name}: versions, health, and when it may update"
             } else {
-                "Versions, health, and what it is doing"
+                "Versions, health, and when it may update"
             }
     }
 
@@ -101,16 +100,37 @@ sealed interface Page {
         override val summary get() = "Fetch the setup from one of them to begin"
     }
 
+    /** Two copies of the same setup, waiting for somebody to settle them. */
+    data object Divergence : Page {
+        override val title get() = "Setup edited twice"
+        override val summary get() = "Two copies that neither made from the other"
+    }
+
+    /** A machine belonging to a different setup entirely. */
+    data object IdentityClash : Page {
+        override val title get() = "A different setup"
+        override val summary get() = "One machine belongs to another setup"
+    }
+
+    data object Editor : Page {
+        override val title get() = "Edit the setup"
+        override val summary get() = "Machines, addresses, systems, sites and wake helpers"
+    }
+
     data object Device : Page {
         override val title get() = "This device"
-        override val summary get() = "The app, this phone's key, and the configuration"
+        override val summary get() = "The app, this phone's key, and the setup it shares"
     }
 }
 
-/** The pages there are right now, which follows the configuration and the services it found. */
+/** The pages there are right now, which follows the setup and the services it found. */
 private fun pagesOf(app: AppModel): List<Page> {
     val machines = app.machines
     return buildList {
+        // A question the app cannot answer on its own goes first, because it is holding everything
+        // else up: nothing is adopted or published while one is outstanding.
+        if (app.divergence != null) add(Page.Divergence)
+        if (app.identityClash != null) add(Page.IdentityClash)
         if (machines.isEmpty()) add(Page.NoMachines)
         machines.forEach { model ->
             add(Page.OneMachine(model))
@@ -118,6 +138,7 @@ private fun pagesOf(app: AppModel): List<Page> {
                 add(Page.OneService(model, service, showsMachine = machines.size > 1))
             }
         }
+        if (app.editorOpen) add(Page.Editor)
         add(Page.Device)
     }
 }
@@ -148,10 +169,8 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val haptics = rememberHaptics()
+    val bindings by app.deviceBindings.collectAsState()
 
-    // The tick belongs to the moment the swipe lands, not to every frame that crosses a boundary,
-    // so this watches the settled page rather than the current one. The first emission is the
-    // initial page and is dropped: arriving at the app is not a page change.
     LaunchedEffect(pager, haptics) {
         snapshotFlow { pager.settledPage }
             .distinctUntilChanged()
@@ -159,8 +178,6 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
             .collect { haptics.tick() }
     }
 
-    // The footer speaks for the machine whose page is in front, and keeps speaking for it on the
-    // pages that belong to no machine.
     LaunchedEffect(pager, pages) {
         snapshotFlow { pager.currentPage }
             .distinctUntilChanged()
@@ -176,13 +193,8 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
             }
     }
 
-    // Once, at launch, rather than when the page that shows it is first swiped to. Releases are
-    // cut by hand every few days at most, so one request per run of the app is the whole budget.
     LaunchedEffect(updates) { updates.start() }
 
-    // Which page is current is read inside the two things that draw it, not out here. Reading it at
-    // this level would put the whole scaffold, the drawer and every page through a recomposition
-    // every time a swipe crosses a boundary, to move one title and one segment of a rule.
     val currentPage = { pager.currentPage }
 
     ModalNavigationDrawer(
@@ -194,8 +206,6 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                 onSelect = { index ->
                     scope.launch {
                         drawer.close()
-                        // Animated rather than snapped, so the drawer and the swipe arrive the same
-                        // way and the app has one way of moving instead of two.
                         pager.animateScrollToPage(index)
                     }
                 },
@@ -223,10 +233,7 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                     .fillMaxSize()
                     .padding(insets),
             ) {
-                HorizontalPager(
-                    state = pager,
-                    modifier = Modifier.fillMaxSize(),
-                ) { index ->
+                HorizontalPager(state = pager, modifier = Modifier.fillMaxSize()) { index ->
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
@@ -235,10 +242,14 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                             .padding(top = 6.dp, bottom = 28.dp),
                     ) {
                         when (val page = pages.getOrNull(index)) {
-                            is Page.OneMachine -> MachineSection(page.model)
+                            is Page.OneMachine -> MachineSection(page.model, app)
                             is Page.OneService -> ServiceSection(page.model, page.service)
                             Page.NoMachines -> NoMachinesSection(app)
-                            Page.Device, null -> ThisDeviceSection(app, updates)
+                            Page.Divergence -> DivergenceSection(app)
+                            Page.IdentityClash -> IdentityClashSection(app)
+                            Page.Editor -> SetupEditorSection(app)
+                            Page.Device, null ->
+                                ThisDeviceSection(app, updates, bindings, app.bindingsActions)
                         }
                     }
                 }
@@ -246,23 +257,26 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
         }
     }
 
-    // The one question this app asks that belongs to no machine, because it is asked about an
-    // address that is not in any configuration yet. Same words, same shape, same trust store.
     app.fetchDialog?.let { dialog ->
-        ConfirmationDialog(
+        HostTrustDialog(
             dialog = dialog,
             onDismiss = { app.fetchDialog = null },
-            onConfirm = {
+            onConfirm = { approval ->
                 app.fetchDialog = null
                 haptics.confirm()
-                app.trustFetchHostKey(dialog.address, dialog.keyBlob)
+                app.trustFetchHostKey(dialog.address, dialog.keyBlob, approval)
             },
         )
     }
 
     app.dialogOwner?.let { model ->
         model.dialog?.let { dialog ->
-            ConfirmationDialog(
+            if (dialog is MachineModel.Dialog.ConfirmTrustHostKey) {
+                HostTrustDialog(dialog, onDismiss = { model.dialog = null }, onConfirm = { approval ->
+                    model.dialog = null
+                    model.trustHostKey(dialog.address, dialog.keyBlob, approval)
+                })
+            } else ConfirmationDialog(
                 dialog = dialog,
                 onDismiss = { model.dialog = null },
                 onConfirm = {
@@ -270,28 +284,13 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                     // The firmer haptic belongs here rather than on the button that opened the
                     // question. This is the press that actually interrupts the machine.
                     haptics.confirm()
-                    when (dialog) {
-                        // Never forced from here, however busy the last reading looked. Force is the
-                        // agent's own check being skipped, and it is only ever offered back after the
-                        // agent has looked at the machine as it is now and said no.
-                        is MachineModel.Dialog.ConfirmBoot -> model.boot(dialog.target, force = false)
-
-                        is MachineModel.Dialog.OfferForceBoot -> model.boot(dialog.target, force = true)
-                        is MachineModel.Dialog.ConfirmSleep -> model.sleep(force = false)
-                        is MachineModel.Dialog.OfferForceSleep -> model.sleep(force = true)
-                        is MachineModel.Dialog.ConfirmRestart ->
-                            model.restart(dialog.service, force = false)
-
-                        is MachineModel.Dialog.OfferForceRestart ->
-                            model.restart(dialog.service, force = true)
-
-                        is MachineModel.Dialog.OfferForceUpdate ->
-                            model.update(dialog.service, force = true)
-
-                        is MachineModel.Dialog.ConfirmRun -> model.runAction(dialog.action, force = false)
-                        is MachineModel.Dialog.OfferForceRun -> model.runAction(dialog.action, force = true)
-                        is MachineModel.Dialog.ConfirmTrustHostKey ->
-                            model.trustHostKey(dialog.address, dialog.keyBlob)
+                    perform(model, dialog, whenIdle = false)
+                },
+                onAlternative = dialog.alternativeLabel?.let {
+                    {
+                        model.dialog = null
+                        haptics.tick()
+                        perform(model, dialog, whenIdle = true)
                     }
                 },
             )
@@ -300,11 +299,36 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
 }
 
 /**
+ * What a confirmed question actually does.
+ *
+ * Never forced from the first question, however busy the last reading looked: force is the agent's
+ * own check being skipped, and it is only ever offered back after the agent has looked at the
+ * machine as it is now and said no. [whenIdle] is the quieter answer to the same question, which
+ * queues the change rather than interrupting anything.
+ */
+private fun perform(model: MachineModel, dialog: MachineModel.Dialog, whenIdle: Boolean) {
+    when (dialog) {
+        is MachineModel.Dialog.ConfirmBoot -> model.boot(dialog.target, whenIdle = whenIdle)
+        is MachineModel.Dialog.OfferForceBoot -> model.boot(dialog.target, force = true)
+        is MachineModel.Dialog.ConfirmSleep -> model.sleep(whenIdle = whenIdle)
+        is MachineModel.Dialog.OfferForceSleep -> model.sleep(force = true)
+        is MachineModel.Dialog.ConfirmRestart -> model.restart(dialog.service, whenIdle = whenIdle)
+        is MachineModel.Dialog.OfferForceRestart -> model.restart(dialog.service, force = true)
+        is MachineModel.Dialog.OfferForceUpdate -> model.update(dialog.service, force = true)
+        is MachineModel.Dialog.ConfirmRun -> model.runAction(dialog.action, whenIdle = whenIdle)
+        is MachineModel.Dialog.OfferForceRun -> model.runAction(dialog.action, force = true)
+        is MachineModel.Dialog.ConfirmTrustHostKey -> Unit
+
+        is MachineModel.Dialog.ConfirmAgentInstall -> model.installAgent()
+        is MachineModel.Dialog.ConfirmWakeHelper -> model.wakeHelper()
+    }
+}
+
+/**
  * What there is to say, and to do, before anything has been configured.
  *
- * The way in rather than a sign pointing at one. The machines carry the setup, so the first launch
- * needs one address and not a document, and asking for it here is asking for it where the user
- * already is. Pasting a document by hand is still there, one page along, under This device.
+ * The way in rather than a sign pointing at one. Every machine carries the setup, so the first
+ * launch needs one address and not a document.
  */
 @Composable
 private fun NoMachinesSection(app: AppModel) {
@@ -460,9 +484,6 @@ private fun DrawerRow(page: Page, isSelected: Boolean, onSelect: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .defaultMinSize(minHeight = 68.dp)
-            // No haptic on the press. The drawer sliding shut is the acknowledgement, and the
-            // page change at the far end of the animation already ticks; two buzzes for one tap
-            // is the app being pleased with itself.
             .clickable { onSelect() }
             .padding(vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -510,9 +531,6 @@ private fun StatusFooter(app: AppModel) {
             verticalAlignment = Alignment.Top,
         ) {
             Box(Modifier.padding(top = 5.dp).size(11.dp), contentAlignment = Alignment.Center) {
-                // The quiet fifteen second poll deliberately does not spin this. A mark that swaps
-                // itself for a spinner four times a minute is movement at the bottom of a page that
-                // is otherwise still, and it says nothing the "checked just now" line does not.
                 if (model != null && (model.isWorking || model.isRefreshingVisibly)) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(11.dp),
@@ -520,7 +538,13 @@ private fun StatusFooter(app: AppModel) {
                         color = palette.quiet,
                     )
                 } else {
-                    StatusMark(if (model?.statusIsError == true) Mark.Attention else Mark.Idle)
+                    StatusMark(
+                        when {
+                            model?.statusIsError == true -> Mark.Attention
+                            model?.isUnsettled == true -> Mark.Unknown
+                            else -> Mark.Idle
+                        },
+                    )
                 }
             }
             Spacer(Modifier.width(9.dp))
@@ -574,18 +598,34 @@ private fun ConfirmationDialog(
     dialog: MachineModel.Dialog,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
+    onAlternative: (() -> Unit)? = null,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(dialog.title) },
         text = { Text(dialog.message) },
         confirmButton = {
-            TextButton(onClick = onConfirm) {
-                Text(dialog.confirmLabel, color = LocalStatusColors.current.bad)
+            Row {
+                // The quieter answer to the same question: do it, but wait until nothing is running.
+                if (onAlternative != null) {
+                    TextButton(onClick = onAlternative) {
+                        Text(dialog.alternativeLabel.orEmpty())
+                    }
+                }
+                TextButton(onClick = onConfirm) {
+                    Text(dialog.confirmLabel, color = LocalStatusColors.current.bad)
+                }
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }
         },
     )
+}
+
+/** Reads a flow into composition without dragging a lifecycle dependency into every call site. */
+@Composable
+internal fun <T> StateFlow<T>.collectAsStateSafely(): T {
+    val state: State<T> = collectAsState()
+    return state.value
 }

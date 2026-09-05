@@ -20,3 +20,9 @@ android/.kotlin/
 # release, not in the history: they are two large binaries per version and every one of them can be
 # rebuilt from the tag it was cut from.
 dist/
+
+# Native desktop build outputs and local signing material.
+**/bin/
+**/obj/
+desktop/artifacts/
+*.key

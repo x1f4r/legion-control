@@ -1,0 +1,70 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "interrupted",
+  "message": "the worker holding this operation is gone and the installed version is 0.0.31-nightly.20260901, so the install did not complete; t3 was started again and left on the version it had",
+  "action": "interrupted",
+  "service": "t3",
+  "from": "0.0.31-nightly.20260901",
+  "to": "0.0.31-nightly.20260901",
+  "op": {
+    "id": "e81a4f37-6c25-4d90-a1b8-53f7c2e6094d",
+    "kind": "update",
+    "service": "t3",
+    "target": null,
+    "actionId": null,
+    "mode": "manual",
+    "initiator": {
+      "client": "desktop",
+      "device": "legion-cachy",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-02T14:00:00.000Z",
+    "startedAt": "2026-09-02T14:00:00.000Z",
+    "updatedAt": "2026-09-02T15:00:00.000Z",
+    "finishedAt": "2026-09-02T15:00:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": true,
+    "result": {
+      "ok": false,
+      "action": "interrupted",
+      "reasonCode": "interrupted",
+      "message": "the worker holding this operation is gone and the installed version is 0.0.31-nightly.20260901, so the install did not complete; t3 was started again and left on the version it had",
+      "from": "0.0.31-nightly.20260901",
+      "to": "0.0.31-nightly.20260901",
+      "exitCode": null,
+      "output": null
+    },
+    "log": [
+      {
+        "at": "2026-09-02T14:00:00.000Z",
+        "line": "lock taken for update t3"
+      },
+      {
+        "at": "2026-09-02T14:00:08.000Z",
+        "line": "stopped t3-code.service"
+      },
+      {
+        "at": "2026-09-02T15:00:00.000Z",
+        "line": "recovery: pid 21044 is gone in phase installing"
+      },
+      {
+        "at": "2026-09-02T15:00:00.000Z",
+        "line": "recovery: ensured t3-code.service is up"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux",
+    "from": "0.0.31-nightly.20260901",
+    "to": "0.0.32-nightly.20260902"
+  }
+}

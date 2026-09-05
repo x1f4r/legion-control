@@ -81,12 +81,15 @@ class AppUpdateModel(
         progress = 0
         failure = null
         scope.launch {
-            val result = AppUpdates.download(app, release) { progress = it }
+            when (val result = AppUpdates.download(app, release) { progress = it }) {
+                is AppUpdates.Download.Ready -> downloaded = result.file
+                // A refusal is not a download that went wrong. It is a file that is not the one the
+                // signed manifest describes, and saying which check it failed is the whole point of
+                // having done the check.
+                is AppUpdates.Download.Refused -> failure = result.problem.sentence
+                is AppUpdates.Download.Failed -> failure = result.reason
+            }
             downloading = false
-            result.fold(
-                onSuccess = { downloaded = it },
-                onFailure = { failure = it.message ?: "the download failed" },
-            )
         }
     }
 

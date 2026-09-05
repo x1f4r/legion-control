@@ -1,0 +1,58 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "busy": false,
+  "unknown": false,
+  "reason": "idle",
+  "monitoredServices": 2,
+  "unmonitoredServices": 0,
+  "services": [
+    {
+      "id": "t3",
+      "name": "T3 Code",
+      "busy": false,
+      "unknown": false,
+      "monitored": true,
+      "reason": "idle",
+      "evidence": "t3-sqlite",
+      "checkedAt": "2026-09-05T14:00:00.000Z",
+      "elapsedMs": 96,
+      "error": null,
+      "runningTurns": 0,
+      "pendingTurns": 0,
+      "pendingApprovals": 0,
+      "staleTurns": 1,
+      "staleApprovals": 0,
+      "threads": [
+        {
+          "threadId": "thr_01JQ2H9B4K",
+          "turnId": "trn_01JQ2H9B7P",
+          "title": "Import the old exports",
+          "state": "pending",
+          "at": "2026-09-02T14:00:00.000Z",
+          "blocking": false,
+          "disposition": "stale",
+          "stale": true
+        }
+      ],
+      "threadsTruncated": 0
+    },
+    {
+      "id": "demo",
+      "name": "Demo",
+      "busy": false,
+      "unknown": false,
+      "monitored": true,
+      "reason": "idle",
+      "evidence": "command",
+      "checkedAt": "2026-09-05T14:00:00.000Z",
+      "elapsedMs": 41,
+      "error": null
+    }
+  ]
+}

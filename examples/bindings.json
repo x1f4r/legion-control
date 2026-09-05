@@ -1,0 +1,18 @@
+{
+  "deviceName": "Robert's tower",
+
+  "self": { "machine": "tower", "system": "windows" },
+
+  "localAgent": {
+    "argv": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"]
+  },
+
+  "currentSite": "flat",
+
+  "identityFile": "~/.ssh/legion-control_ed25519",
+
+  "machines": {
+    "attic-box": { "identityFile": "~/.ssh/id_attic", "sshAlias": "attic-box-lan" },
+    "router-flat": { "identityFile": "~/.ssh/id_router" }
+  }
+}

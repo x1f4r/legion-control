@@ -89,6 +89,14 @@ ZIPALIGN="$SDK_DIR/build-tools/$BUILD_TOOLS_DIR/zipalign"
 # Signing key
 # ---------------------------------------------------------------------------
 
+# Signing a distributable build requires the complete signed agent bundle.
+for artifact in legionctl-agent-3.0.0.tgz Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig; do
+    if [ ! -s "$HERE/../dist/$artifact" ]; then
+        printf 'ERROR: missing signed agent artifact: %s. Run scripts/package-agent.mjs first.\n' "$artifact" >&2
+        exit 1
+    fi
+done
+
 # The directory is shared with the agent tree the Mac installer deploys, so its mode is left alone
 # and the two files are locked down individually instead.
 mkdir -p "$KEY_DIR"

@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "meta": {
+    "id": null,
+    "revision": 0,
+    "updatedAt": null,
+    "source": null,
+    "lineage": [],
+    "device": null,
+    "hash": null,
+    "bytes": 0
+  },
+  "hash": null
+}

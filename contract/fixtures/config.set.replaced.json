@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "setup setup-3f9c2a71 replaced by setup-8b04d193 revision 4, 198 bytes",
+  "action": "replaced",
+  "hash": "4a88b8efec1592c0d3b7615ae820f4c96d1e037b58a2c94f6013e7d58b2a06cf",
+  "bytes": 198,
+  "id": "setup-8b04d193-6c27-4a51-83ef-90b7d2c46e15",
+  "revision": 4,
+  "source": "phone",
+  "lineage": [],
+  "device": "Pixel 9",
+  "replaced": true
+}

@@ -1,0 +1,21 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "signature-invalid",
+  "message": "MANIFEST.json.sig is not a valid signature over MANIFEST.json for the release key 8f2b6d41; nothing was extracted and the running agent is untouched",
+  "action": "failed",
+  "current": {
+    "version": "2.1.0",
+    "contract": 2
+  },
+  "staged": null,
+  "previous": null,
+  "manifest": null,
+  "selfTest": null,
+  "op": null
+}

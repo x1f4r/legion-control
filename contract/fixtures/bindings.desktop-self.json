@@ -1,0 +1,25 @@
+{
+  "deviceName": "Robert's tower",
+  "self": {
+    "machine": "tower",
+    "system": "linux"
+  },
+  "localAgent": {
+    "argv": [
+      "node",
+      "/home/x1f4r/.legion-control/agent/src/index.mjs"
+    ]
+  },
+  "identityFile": "~/.ssh/legion-control_ed25519",
+  "knownHostsFile": "~/.config/legion-control/known_hosts",
+  "currentSite": "flat",
+  "machines": {
+    "legion": {
+      "identityFile": "~/.ssh/id_legion",
+      "sshAlias": "legion-win-lan"
+    },
+    "pi": {
+      "sshAlias": "atlas"
+    }
+  }
+}

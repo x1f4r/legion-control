@@ -1,40 +1,62 @@
 package com.x1f4r.legioncontrol.ui
 
 import android.content.Context
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.BuildConfig
 import com.x1f4r.legioncontrol.agent.MachineSystem
+import com.x1f4r.legioncontrol.data.DeviceBindings
 import com.x1f4r.legioncontrol.net.AppUpdates
 import java.io.File
 
 /**
  * The phone's own business: the app's version and how it updates itself, the ssh key that gets this
- * phone through the front door, and the configuration that decides which doors there are.
+ * phone through the front door, what this device is called, and the shared setup it edits like every
+ * other device does.
  *
- * Nothing on this page talks to a machine except the one thing that has to: fetching the setup off
- * one, which is how the configuration gets here in the first place. It used to be the tail of one
- * long scroll, under everything anyone actually opens the app to see.
+ * The one thing this page is careful to say plainly is what a phone cannot do. It cannot run a
+ * service and it cannot be a machine in the setup, and that is a fact about the platform rather than
+ * a lesser standing: it edits, publishes and controls exactly like the Mac and the desktop.
  */
 @Composable
-fun ThisDeviceSection(app: AppModel, updates: AppUpdateModel) {
+fun ThisDeviceSection(app: AppModel, updates: AppUpdateModel, bindings: DeviceBindings, onBindings: BindingsActions) {
     Spacer(Modifier.height(6.dp))
     AppUpdateBlock(updates)
+    ThisDeviceBlock(app, bindings, onBindings)
     DeviceKeyBlock(app)
-    ConfigurationBlock(app)
+    NotificationsBlock(app)
+    SetupBlock(app)
+    HistoryBlock(app)
+}
+
+/** The two things a device can be told about itself, neither of which is ever published. */
+interface BindingsActions {
+    fun setDeviceName(name: String)
+    fun setCurrentSite(siteId: String?)
 }
 
 // MARK: - The app
@@ -64,9 +86,6 @@ private fun AppUpdateBlock(updates: AppUpdateModel) {
 
             PlainAction(label = "Discard", enabled = true) { updates.discardDownload() }
         } else {
-            // Dead unless a newer release was actually found. Not merely "the check has not failed":
-            // an unreadable release list and an up to date app are both reasons there is nothing to
-            // press, and neither of them should look like there is.
             PlainAction(
                 label = if (available != null) "Download ${available.release.version}" else "Update the app",
                 enabled = available != null,
@@ -103,7 +122,14 @@ private fun AppUpdateBlock(updates: AppUpdateModel) {
 /** Why there is nothing to press, in one line. Null when there is. */
 private fun appUpdateReason(updates: AppUpdateModel): String? = when (val check = updates.check) {
     null -> if (updates.checking) "Looking for a newer release." else "The release list has not been read yet."
-    is AppUpdates.Check.Available -> if (updates.downloaded != null) "Downloaded and ready to install." else null
+    is AppUpdates.Check.Available ->
+        if (updates.downloaded != null) {
+            "Downloaded, and checked against the signed release manifest and this app's own " +
+                "signing key. Ready to install."
+        } else {
+            "The release manifest was signed by the key this app trusts."
+        }
+
     is AppUpdates.Check.UpToDate ->
         if (check.noReleaseYet) {
             "That repository has published no release yet, so there is nothing to install."
@@ -111,17 +137,117 @@ private fun appUpdateReason(updates: AppUpdateModel): String? = when (val check 
             "This is the newest release."
         }
 
-    is AppUpdates.Check.Failed -> "The release list could not be read: ${check.reason}"
+    is AppUpdates.Check.NotForThisBuild -> check.reason
+    is AppUpdates.Check.Failed -> "The release could not be verified: ${check.reason}"
+}
+
+// MARK: - This device
+
+/**
+ * What this device is called and where it is standing.
+ *
+ * Both are private to this phone and neither is published, except the name, which travels inside a
+ * revision so that a divergence screen on another device can say who made the edit.
+ */
+@Composable
+private fun ThisDeviceBlock(app: AppModel, bindings: DeviceBindings, actions: BindingsActions) {
+    SectionHeading("This device")
+    ExplanationText(
+        "A phone cannot run a service, so it is never one of the machines in the setup. It edits " +
+            "the setup, publishes it and controls every machine exactly like the other devices do.",
+    )
+    Spacer(Modifier.height(6.dp))
+
+    DetailRow("Called") {
+        PlainField(
+            value = bindings.deviceName,
+            onValueChange = actions::setDeviceName,
+            placeholder = "this phone",
+        )
+    }
+    QuietText(
+        "Goes with any setup change made here, so other devices can see who made it.",
+        Modifier.padding(top = 2.dp),
+    )
+
+    val sites = app.sites
+    if (sites.isNotEmpty()) {
+        DetailRow("Standing at", alignment = Alignment.Top) {
+            Column {
+                QuietText(app.siteMatch.explain())
+                Spacer(Modifier.height(4.dp))
+                Actions {
+                    PlainAction(
+                        label = "Work it out",
+                        enabled = bindings.currentSite != null,
+                    ) { actions.setCurrentSite(null) }
+                    sites.forEach { site ->
+                        PlainAction(
+                            label = site.displayName,
+                            enabled = bindings.currentSite != site.id,
+                            emphasis = bindings.currentSite == site.id,
+                        ) { actions.setCurrentSite(site.id) }
+                    }
+                }
+            }
+        }
+        QuietText(
+            "Two networks can use the same private addresses, so an address is a hint and never a " +
+                "proof. Saying which site this is only changes where a wake packet is sent from; " +
+                "what proves a machine is the machine is its pinned host key.",
+            Modifier.padding(top = 2.dp),
+        )
+    }
+}
+
+// MARK: - Notifications
+
+@Composable
+private fun NotificationsBlock(app: AppModel) {
+    val context = LocalContext.current
+    var enabled by remember { mutableStateOf(app.notificationsEnabled) }
+    val request = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        enabled = granted
+        app.notificationsEnabled = granted
+    }
+
+    SectionHeading("Telling you when it is done")
+    ExplanationText(
+        "An update, a restart or an action you asked for can take minutes. With this on, the app " +
+            "says how it ended even if you have put the phone away. Nothing else is ever announced.",
+    )
+    Row(
+        Modifier.fillMaxWidth().defaultMinSize(minHeight = 60.dp).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("Finished changes", style = MaterialTheme.typography.bodyLarge)
+            QuietText(
+                if (enabled) "On." else "Off. Turning it on asks Android for permission once.",
+                Modifier.padding(top = 2.dp),
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(
+            checked = enabled,
+            onCheckedChange = { wanted ->
+                if (!wanted) {
+                    enabled = false
+                    app.notificationsEnabled = false
+                } else {
+                    request.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                }
+            },
+        )
+    }
 }
 
 // MARK: - The key
 
 @Composable
 private fun DeviceKeyBlock(app: AppModel) {
-    // Once the phone is authorised this has done its job, so it collapses to one line. It stays
-    // reachable rather than disappearing, because the key is needed again whenever a system is
-    // rebuilt or the phone has to be cut off and let back in. Leaving the whole block open forever
-    // is just a wall of base64 under everything you actually came here to look at.
     var showKey by rememberSaveable { mutableStateOf(false) }
     val systems = app.machines.flatMap { it.machine.systems }
 
@@ -137,14 +263,14 @@ private fun DeviceKeyBlock(app: AppModel) {
         AuthorizedKeysPaths()
         Spacer(Modifier.height(14.dp))
         PublicKeyBlock(app.publicKey)
+        app.keyFingerprint.takeIf { it.isNotBlank() }?.let {
+            Spacer(Modifier.height(6.dp))
+            CommandText(it)
+        }
         Actions {
             PlainAction("Hide the key", enabled = true) { showKey = false }
         }
     } else {
-        // What this page may claim is only what it has seen. A system that is answering has accepted
-        // the key, and one that is not running has said nothing either way: it is checked the first
-        // time this phone reaches it, and until then a line saying every system is done would be a
-        // guess the user only finds out is wrong after a boot switch.
         val answering = app.machines.mapNotNull { model ->
             model.currentSystem?.let { "${it.name} on ${model.machine.name}" }
         }
@@ -163,44 +289,75 @@ private fun DeviceKeyBlock(app: AppModel) {
     }
 }
 
-// MARK: - The configuration
+// MARK: - The setup
 
 /**
- * The document that decides what this app knows.
+ * The document that decides what this app knows, and that every device shares.
  *
- * A text field and not a form. The same JSON is read by the Mac from a file, and one document that
- * can be moved between the two, pasted whole, is worth more than a screen of pickers that can only
- * ever describe part of it. What this side owes the user is the check: Apply says in one sentence
- * why nothing changed, rather than storing something that quietly does not work.
+ * There is no authority any more. This device edits it, publishes it to every machine that will take
+ * it, and takes a newer copy when somebody else made one. What keeps that from losing an edit is
+ * ancestry rather than a rule about who may write, and the two questions it cannot answer on its own
+ * are right here rather than buried.
  */
 @Composable
-private fun ConfigurationBlock(app: AppModel) {
+private fun SetupBlock(app: AppModel) {
     SectionHeading(
-        "Configuration",
+        "Setup",
         note = if (app.hasMachines) {
             "${app.machines.size} machine${if (app.machines.size == 1) "" else "s"}"
         } else {
             "nothing configured"
         },
     )
+
+    val provenance = app.setupProvenance
+    if (provenance != null) {
+        DetailRow("Revision") {
+            ValueText(provenance.revision?.let { "revision $it" }, "no revision")
+        }
+        DetailRow("Setup") { ValueText(provenance.authority, "unnamed") }
+        DetailRow("Last written") {
+            ValueText(
+                listOfNotNull(
+                    provenance.describeAuthor().takeIf { it != "somebody" },
+                    localTime(provenance.updatedAt),
+                ).joinToString(", ").takeIf { it.isNotBlank() },
+                "not known",
+            )
+        }
+    }
+
     ExplanationText(
-        "The same document the Mac keeps in ~/.config/legion-control/config.json: which machines " +
-            "exist, how to reach them, how to wake them, and which systems each one can boot into. " +
-            "Every machine carries a copy of it, so one address is enough to get all of it.",
+        "Every device carries the same document and every machine keeps a copy. A change made here " +
+            "is sent to each machine on its next check, and a change made elsewhere arrives the " +
+            "same way. Neither can quietly undo the other.",
     )
+
+    app.advisories.forEach { QuietText(it, Modifier.padding(top = 4.dp)) }
+
+    Actions {
+        PlainAction(
+            label = "Edit the setup",
+            enabled = true,
+            emphasis = app.divergence == null && app.identityClash == null,
+        ) { app.openEditor() }
+    }
+
     Spacer(Modifier.height(14.dp))
     FetchSetupBlock(app)
+
     Spacer(Modifier.height(20.dp))
-    SectionHeading("Or paste it", showsRule = false)
+    SectionHeading("Or paste one", showsRule = false)
     ExplanationText(
-        "A document typed in here is never quietly replaced by an older one: what a machine offers " +
-            "is only taken when it is a different document, and only when it holds up.",
+        "A document pasted here becomes this device's setup and is offered to every machine. One " +
+            "that names no setup gets a new identity, so it does not quietly take over an existing " +
+            "one.",
     )
     Spacer(Modifier.height(10.dp))
     DocumentField(
         value = app.configDraft,
-        onValueChange = { app.configDraft = it },
-        placeholder = "Paste the configuration here",
+        onValueChange = app::updateDraft,
+        placeholder = "Paste a setup here",
     )
     Actions {
         PlainAction(
@@ -212,16 +369,46 @@ private fun ConfigurationBlock(app: AppModel) {
         PlainAction("Insert example", enabled = true) { app.insertExample() }
     }
     app.configError?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
-    app.configNote?.takeIf { app.configError == null }?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
+    app.configNote?.takeIf { app.configError == null }?.let {
+        QuietText(it, Modifier.padding(top = 2.dp))
+    }
+}
+
+/** Every change this app has asked for, and a way to hand the lot to somebody who can read it. */
+@Composable
+private fun HistoryBlock(app: AppModel) {
+    val context = LocalContext.current
+    val records = app.operations.records.collectAsStateSafely()
+    SectionHeading("Changes made from this phone", note = "${records.size}")
+    if (records.isEmpty()) {
+        ExplanationText("Nothing has been asked for from this device yet.")
+        return
+    }
+    records.take(8).forEach { record ->
+        val mark = when (record.succeeded) {
+            true -> Mark.Good
+            false -> Mark.Bad
+            null -> Mark.Unknown
+        }
+        Column(Modifier.padding(vertical = 2.dp)) {
+            StatusLine(mark, record.summary, style = MaterialTheme.typography.bodySmall)
+            QuietText(
+                "${record.machineName} · ${localTime(record.startedAt)}",
+                Modifier.padding(start = 17.dp, top = 2.dp),
+            )
+        }
+    }
+    Actions {
+        PlainAction("Export", enabled = true) { shareText(context, app.operations.exportText()) }
+        PlainAction("Clear finished", enabled = true) { app.operations.clearHistory() }
+    }
 }
 
 /**
- * Three fields and a button, which is the whole of setting this app up.
+ * Three fields and a button, which is the whole of setting this app up from nothing.
  *
- * It is the first thing on the Machines page when there is nothing configured, and it sits above
- * the document field here, because it is the way in: the Mac writes the setup once and pushes it to
- * the machines, and the phone only has to know where one machine is. The key is the phone's own and
- * has to be authorised on that system already, exactly as for every other command this app runs.
+ * Every machine carries the document, so one address is enough to get all of it. The key is this
+ * phone's own and has to be authorised on that system already, exactly as for every other command.
  */
 @Composable
 fun FetchSetupBlock(app: AppModel) {
@@ -297,4 +484,18 @@ private fun startInstall(context: Context, apk: File, onFailure: (String) -> Uni
     }
     runCatching { AppUpdates.install(context, apk) }
         .onFailure { onFailure(it.message ?: "the installer could not be opened") }
+}
+
+/** Hands text to whatever the user wants to put it in. Nothing leaves the phone on its own. */
+internal fun shareText(context: Context, text: String) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "application/json"
+        putExtra(Intent.EXTRA_TEXT, text)
+        putExtra(Intent.EXTRA_SUBJECT, "Legion Control diagnostics")
+    }
+    runCatching {
+        context.startActivity(
+            Intent.createChooser(intent, "Share diagnostics").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+    }
 }

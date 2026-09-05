@@ -1,0 +1,172 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "deep": false,
+  "checks": [
+    {
+      "id": "config.parse",
+      "level": "ok",
+      "summary": "config.json parses",
+      "detail": "4.1 kB, read at 2026-09-05T14:00:00.000Z",
+      "fix": null
+    },
+    {
+      "id": "config.validate",
+      "level": "ok",
+      "summary": "3 services, 1 boot target, 2 actions",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "base.writable",
+      "level": "ok",
+      "summary": "/home/x1f4r/.legion-control is writable",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "node.version",
+      "level": "ok",
+      "summary": "node 24.9.0",
+      "detail": "the agent needs 22 or newer",
+      "fix": null
+    },
+    {
+      "id": "node.sqlite",
+      "level": "ok",
+      "summary": "node:sqlite is available",
+      "detail": "needed by the t3-sqlite busy probe",
+      "fix": null
+    },
+    {
+      "id": "npm.available",
+      "level": "ok",
+      "summary": "npm 11.6.0",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "npm.prefix",
+      "level": "ok",
+      "summary": "global prefix /home/x1f4r/.local",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "service.t3.process",
+      "level": "ok",
+      "summary": "t3-code.service is active since 2026-09-03T14:10:00.000Z",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "service.t3.health",
+      "level": "ok",
+      "summary": "t3 answered 200 on 8081 in 8 ms",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "service.t3.busy",
+      "level": "ok",
+      "summary": "the t3-sqlite probe read the state database",
+      "detail": "1 turn running",
+      "fix": null
+    },
+    {
+      "id": "service.t3.relay",
+      "level": "ok",
+      "summary": "cloudflared is running",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "scheduler.present",
+      "level": "ok",
+      "summary": "legion-control-cycle.timer is enabled",
+      "detail": "next run 2026-09-06T02:00:00.000Z",
+      "fix": null
+    },
+    {
+      "id": "scheduler.command",
+      "level": "ok",
+      "summary": "the timer runs this agent with \"cycle\"",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "scheduler.lastRun",
+      "level": "ok",
+      "summary": "last run 2026-09-05T02:02:00.000Z, action cycled",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "privileges.sudo",
+      "level": "ok",
+      "summary": "passwordless sudo for the four narrowed commands",
+      "detail": "systemctl reboot, systemctl suspend, efibootmgr, grub-reboot",
+      "fix": null
+    },
+    {
+      "id": "privileges.boot",
+      "level": "ok",
+      "summary": "efibootmgr can read and set BootNext",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "sleep.tool",
+      "level": "ok",
+      "summary": "systemctl suspend is available",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "locks",
+      "level": "ok",
+      "summary": "no stale locks",
+      "detail": "op.lock is held by pid 24817, which is alive",
+      "fix": null
+    },
+    {
+      "id": "ops.dir",
+      "level": "ok",
+      "summary": "68 operation records, oldest 2026-08-22T09:14:00.000Z",
+      "detail": "pruned at 200 records or 30 days",
+      "fix": null
+    },
+    {
+      "id": "controller.copy",
+      "level": "ok",
+      "summary": "revision 12 from mac, 3d7251f8",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "session.restricted",
+      "level": "ok",
+      "summary": "this session is not restricted",
+      "detail": null,
+      "fix": null
+    },
+    {
+      "id": "clock",
+      "level": "ok",
+      "summary": "the clock is within 0.4 s of the client",
+      "detail": null,
+      "fix": null
+    }
+  ],
+  "counts": {
+    "ok": 22,
+    "warn": 0,
+    "fail": 0
+  },
+  "elapsedMs": 1840
+}

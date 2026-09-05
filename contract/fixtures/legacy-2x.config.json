@@ -1,0 +1,237 @@
+{
+  "ok": true,
+  "controller": {
+    "version": 1,
+    "controller": {
+      "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+      "name": "Home setup",
+      "revision": 12,
+      "updatedAt": "2026-09-02T16:00:00.000Z",
+      "source": "mac",
+      "device": "Robert's MacBook Pro",
+      "lineage": [
+        "1c680fab2ecc79f4b1c2a06e4e3ed2f8a1d54c6f0b93e7a25c8d0f416b2e93a7",
+        "1a5ee25ee34b2f9c07d61a8b45e0c3f27d9b8140a6532e7fc019d84b6a3e5027"
+      ]
+    },
+    "sites": [
+      {
+        "id": "attic",
+        "name": "Attic house",
+        "lanPrefixes": [
+          "192.168.178."
+        ],
+        "broadcast": [
+          "192.168.178.255"
+        ]
+      },
+      {
+        "id": "flat",
+        "name": "New flat",
+        "lanPrefixes": [
+          "192.168.178."
+        ],
+        "broadcast": [
+          "192.168.178.255"
+        ]
+      }
+    ],
+    "machines": [
+      {
+        "id": "pi",
+        "name": "Atlas",
+        "site": "attic",
+        "alwaysOn": true,
+        "endpoints": [
+          {
+            "id": "lan",
+            "kind": "lan",
+            "host": "192.168.178.40",
+            "user": "x1f4r",
+            "port": 22
+          },
+          {
+            "id": "remote",
+            "kind": "remote",
+            "host": "atlas.example-tailnet.ts.net",
+            "user": "x1f4r",
+            "port": 22
+          }
+        ],
+        "systems": [
+          {
+            "id": "linux",
+            "name": "Raspberry Pi OS",
+            "platform": "linux",
+            "shell": "posix",
+            "restricted": true,
+            "agent": [
+              "node",
+              "/home/x1f4r/.legion-control/agent/src/index.mjs"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "legion",
+        "name": "Legion 7",
+        "site": "attic",
+        "alwaysOn": false,
+        "endpoints": [
+          {
+            "id": "lan-linux",
+            "kind": "lan",
+            "host": "192.168.178.41",
+            "user": "x1f4r",
+            "port": 22,
+            "system": "linux"
+          },
+          {
+            "id": "remote-linux",
+            "kind": "remote",
+            "host": "legion-cachy.example-tailnet.ts.net",
+            "user": "x1f4r",
+            "port": 22,
+            "system": "linux"
+          },
+          {
+            "id": "remote-windows",
+            "kind": "remote",
+            "host": "legion-win.example-tailnet.ts.net",
+            "user": "x1f4r",
+            "port": 22,
+            "system": "windows"
+          }
+        ],
+        "wake": {
+          "mac": "AA:BB:CC:DD:EE:FF",
+          "broadcast": [
+            "192.168.178.255"
+          ],
+          "ports": [
+            9,
+            7
+          ],
+          "lanPrefix": "192.168.178.",
+          "helper": {
+            "machine": "pi",
+            "action": "wake-legion"
+          },
+          "helpers": [
+            {
+              "machine": "pi",
+              "action": "wake-legion"
+            },
+            {
+              "machine": "nas",
+              "action": "wake-legion"
+            }
+          ]
+        },
+        "systems": [
+          {
+            "id": "linux",
+            "name": "CachyOS",
+            "platform": "linux",
+            "shell": "posix",
+            "agent": [
+              "node",
+              "/home/x1f4r/.legion-control/agent/src/index.mjs"
+            ]
+          },
+          {
+            "id": "windows",
+            "name": "Windows 11",
+            "platform": "windows",
+            "shell": "powershell",
+            "agent": [
+              "node",
+              "C:/Users/x1f4r/.legion-control/agent/src/index.mjs"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "nas",
+        "name": "Attic NAS",
+        "site": "attic",
+        "alwaysOn": true,
+        "endpoints": [
+          {
+            "id": "lan",
+            "kind": "lan",
+            "host": "192.168.178.10",
+            "user": "x1f4r",
+            "port": 22
+          }
+        ],
+        "systems": [
+          {
+            "id": "linux",
+            "name": "Debian",
+            "platform": "linux",
+            "shell": "posix",
+            "agent": [
+              "node",
+              "/home/x1f4r/.legion-control/agent/src/index.mjs"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "tower",
+        "name": "Tower",
+        "site": "flat",
+        "alwaysOn": false,
+        "endpoints": [
+          {
+            "id": "lan",
+            "kind": "lan",
+            "host": "192.168.178.20",
+            "user": "x1f4r",
+            "port": 22
+          },
+          {
+            "id": "remote",
+            "kind": "remote",
+            "host": "tower.example-tailnet.ts.net",
+            "user": "x1f4r",
+            "port": 22
+          }
+        ],
+        "wake": {
+          "mac": "11:22:33:44:55:66",
+          "broadcast": [
+            "192.168.178.255"
+          ]
+        },
+        "systems": [
+          {
+            "id": "linux",
+            "name": "CachyOS",
+            "platform": "linux",
+            "shell": "posix",
+            "agent": [
+              "node",
+              "/home/x1f4r/.legion-control/agent/src/index.mjs"
+            ]
+          },
+          {
+            "id": "windows",
+            "name": "Windows 11",
+            "platform": "windows",
+            "shell": "cmd",
+            "agent": [
+              "node",
+              "C:/Users/x1f4r/.legion-control/agent/src/index.mjs"
+            ]
+          }
+        ]
+      }
+    ],
+    "appUpdates": {
+      "githubRepo": "x1f4r/legion-control"
+    }
+  },
+  "hash": "3d7251f8764668f6dd9be0e0dcae3ea2ba4a6ecbf07cd0b21f6f66a35bcae6ee"
+}

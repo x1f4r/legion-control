@@ -1,0 +1,386 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "os": "linux",
+  "hostname": "atlas",
+  "timing": {
+    "budgetMs": 1000,
+    "elapsedMs": 1000,
+    "partial": true
+  },
+  "agent": {
+    "version": "3.0.0",
+    "contract": 3,
+    "base": "/home/x1f4r/.legion-control",
+    "node": "24.9.0",
+    "restrictedSession": false,
+    "capabilities": [
+      "setup-lineage",
+      "wol-action",
+      "configured-telemetry",
+      "service-config-admin"
+    ]
+  },
+  "config": {
+    "ok": true,
+    "source": "file",
+    "problems": []
+  },
+  "services": [
+    {
+      "id": "t3",
+      "name": "T3 Code",
+      "kind": "npm",
+      "installed": "0.0.36-nightly.20260904",
+      "latest": "0.0.37-nightly.20260905",
+      "channel": "nightly",
+      "upToDate": false,
+      "running": true,
+      "healthy": true,
+      "port": 8081,
+      "staged": null,
+      "appPath": null,
+      "busy": {
+        "busy": true,
+        "unknown": false,
+        "monitored": true,
+        "reason": "1 turn running",
+        "evidence": "t3-sqlite",
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "elapsedMs": 118,
+        "error": null,
+        "runningTurns": 1,
+        "pendingTurns": 0,
+        "pendingApprovals": 0,
+        "staleTurns": 1,
+        "staleApprovals": 0,
+        "threads": [
+          {
+            "threadId": "thr_01JT8Q4V2M",
+            "turnId": "trn_01JT8Q7C9X",
+            "title": "Rework the busy gate",
+            "state": "running",
+            "at": "2026-09-05T13:54:00.000Z",
+            "blocking": true,
+            "disposition": "running",
+            "stale": false
+          },
+          {
+            "threadId": "thr_01JQ2H9B4K",
+            "turnId": "trn_01JQ2H9B7P",
+            "title": "Import the old exports",
+            "state": "pending",
+            "at": "2026-09-02T14:00:00.000Z",
+            "blocking": false,
+            "disposition": "stale",
+            "stale": true
+          }
+        ],
+        "threadsTruncated": 0
+      },
+      "relay": {
+        "configured": true,
+        "running": true
+      },
+      "pendingRestart": false,
+      "lastUpdate": {
+        "at": "2026-09-04T14:00:00.000Z",
+        "from": "0.0.35-nightly.20260903",
+        "to": "0.0.36-nightly.20260904",
+        "result": "updated",
+        "message": "updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904"
+      },
+      "canUpdate": true,
+      "canRestart": true,
+      "process": {
+        "running": true,
+        "state": "active",
+        "startedAt": "2026-09-03T14:10:00.000Z",
+        "error": null
+      },
+      "health": {
+        "ok": true,
+        "status": 200,
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "elapsedMs": 8,
+        "error": null
+      },
+      "endpoint": {
+        "configured": true,
+        "reachable": null
+      },
+      "updates": {
+        "automatic": true,
+        "inherited": true,
+        "pauseUntil": null,
+        "eligibleNow": false,
+        "deferredReason": "busy"
+      },
+      "pendingVersion": null,
+      "drain": true,
+      "lastOperation": {
+        "opId": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
+        "kind": "update",
+        "action": "updated",
+        "at": "2026-09-04T14:00:00.000Z"
+      }
+    },
+    {
+      "id": "demo",
+      "name": "Demo",
+      "kind": "command",
+      "installed": "1.4.2",
+      "latest": "1.4.2",
+      "channel": null,
+      "upToDate": true,
+      "running": true,
+      "healthy": true,
+      "port": 8765,
+      "staged": null,
+      "appPath": null,
+      "busy": {
+        "busy": false,
+        "unknown": false,
+        "monitored": true,
+        "reason": "idle",
+        "evidence": "command",
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "elapsedMs": 41,
+        "error": null
+      },
+      "relay": {
+        "configured": false,
+        "running": false
+      },
+      "pendingRestart": false,
+      "lastUpdate": null,
+      "canUpdate": true,
+      "canRestart": true,
+      "process": {
+        "running": true,
+        "state": "active",
+        "startedAt": "2026-09-03T14:15:00.000Z",
+        "error": null
+      },
+      "health": {
+        "ok": true,
+        "status": 200,
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "elapsedMs": 3,
+        "error": null
+      },
+      "endpoint": {
+        "configured": false,
+        "reachable": null
+      },
+      "updates": {
+        "automatic": false,
+        "inherited": false,
+        "pauseUntil": null,
+        "eligibleNow": false,
+        "deferredReason": "policy-off"
+      },
+      "pendingVersion": null,
+      "drain": false,
+      "lastOperation": {
+        "opId": "9b6d0e54-1f83-4c27-8a95-4e2b7d13f6a0",
+        "kind": "update",
+        "action": "rolled-back",
+        "at": "2026-09-03T14:00:00.000Z"
+      }
+    },
+    {
+      "id": "edge",
+      "name": "Edge Proxy",
+      "kind": "command",
+      "installed": "2.9.0",
+      "latest": null,
+      "channel": null,
+      "upToDate": null,
+      "running": true,
+      "healthy": true,
+      "port": 8443,
+      "staged": null,
+      "appPath": null,
+      "busy": {
+        "busy": true,
+        "unknown": true,
+        "monitored": false,
+        "reason": "not monitored",
+        "evidence": "unmonitored",
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "elapsedMs": 0,
+        "error": "no busy probe is configured for edge; disruptive work waits until one is, or until busy.type is set to \"none\""
+      },
+      "relay": {
+        "configured": false,
+        "running": false
+      },
+      "pendingRestart": false,
+      "lastUpdate": null,
+      "canUpdate": false,
+      "canRestart": true,
+      "process": {
+        "running": true,
+        "state": "active",
+        "startedAt": "2026-09-03T14:20:00.000Z",
+        "error": null
+      },
+      "health": {
+        "ok": true,
+        "status": 200,
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "elapsedMs": 5,
+        "error": null
+      },
+      "endpoint": {
+        "configured": false,
+        "reachable": null
+      },
+      "updates": {
+        "automatic": true,
+        "inherited": true,
+        "pauseUntil": null,
+        "eligibleNow": false,
+        "deferredReason": "busy-unknown"
+      },
+      "pendingVersion": null,
+      "drain": false,
+      "lastOperation": null
+    }
+  ],
+  "busy": {
+    "busy": true,
+    "unknown": true,
+    "reason": "T3 Code: 1 turn running; Edge Proxy: not monitored",
+    "monitoredServices": 2,
+    "unmonitoredServices": 1
+  },
+  "bootTargets": [
+    {
+      "id": "windows",
+      "name": "Windows 11"
+    }
+  ],
+  "actions": [
+    {
+      "id": "sunshine-restart",
+      "name": "Restart Sunshine",
+      "confirm": null,
+      "busyGated": true,
+      "kind": "command"
+    },
+    {
+      "id": "flush-cache",
+      "name": "Flush the build cache",
+      "confirm": "This throws away every cached build.",
+      "busyGated": false,
+      "kind": "command"
+    },
+    {
+      "id": "wake-tower",
+      "name": "Wake the tower",
+      "confirm": null,
+      "busyGated": false,
+      "kind": "wol"
+    }
+  ],
+  "autoUpdate": true,
+  "updates": {
+    "automatic": true,
+    "pauseUntil": null,
+    "maintenanceWindows": [
+      {
+        "days": [
+          "mon",
+          "tue",
+          "wed",
+          "thu",
+          "fri",
+          "sat",
+          "sun"
+        ],
+        "from": "02:00",
+        "to": "06:00"
+      }
+    ],
+    "inWindowNow": false,
+    "nextWindow": "2026-09-06T02:00:00.000Z",
+    "lastCycle": {
+      "opId": "7c5b3d92-4e18-4a6f-b273-9d0e1f8a5c46",
+      "at": "2026-09-05T02:02:00.000Z",
+      "action": "cycled"
+    }
+  },
+  "operations": {
+    "running": [],
+    "queued": [],
+    "recent": []
+  },
+  "controller": {
+    "hash": "668a9a05d7eabf59835baea274c89cd5a1275e1e4978929faeffe68dcc487c1c",
+    "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+    "revision": 12,
+    "updatedAt": "2026-09-02T16:00:00.000Z",
+    "source": "mac"
+  },
+  "t3": {
+    "installed": "0.0.36-nightly.20260904",
+    "nightly": "0.0.37-nightly.20260905",
+    "upToDate": false,
+    "serverRunning": true,
+    "healthy": true,
+    "port": 8081
+  },
+  "pendingRestart": false,
+  "lastUpdate": {
+    "at": "2026-09-04T14:00:00.000Z",
+    "from": "0.0.35-nightly.20260903",
+    "to": "0.0.36-nightly.20260904",
+    "result": "updated",
+    "message": "updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904"
+  },
+  "connect": {
+    "configured": true,
+    "running": true
+  },
+  "metrics": [
+    {
+      "id": "queue-depth",
+      "name": "Queue depth",
+      "value": 0,
+      "unit": "jobs",
+      "checkedAt": "2026-09-05T14:01:00.000Z",
+      "error": null
+    },
+    {
+      "id": "temperature",
+      "name": "Temperature",
+      "value": 43.5,
+      "unit": "°C",
+      "checkedAt": "2026-09-05T14:01:00.000Z",
+      "error": null
+    },
+    {
+      "id": "power",
+      "name": "Power",
+      "value": null,
+      "unit": "W",
+      "checkedAt": "2026-09-05T14:01:00.000Z",
+      "error": "The configured probe failed."
+    },
+    {
+      "id": "storage",
+      "name": "Storage",
+      "value": null,
+      "unit": "GB",
+      "checkedAt": null,
+      "error": "The status deadline left no time to start this probe."
+    }
+  ]
+}

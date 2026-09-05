@@ -1,0 +1,27 @@
+{
+  "configVersion": 3,
+  "system": { "id": "helper", "name": "Flat helper" },
+  "updates": { "automatic": false, "pauseUntil": null, "maintenanceWindows": [] },
+  "services": [],
+  "boot": { "targets": {} },
+  "actions": [
+    {
+      "id": "wake-tower",
+      "name": "Wake the tower",
+      "wol": {
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "broadcast": ["192.168.178.255"],
+        "ports": [9, 7],
+        "repeats": 3
+      }
+    },
+    {
+      "id": "wake-attic-box",
+      "name": "Wake the attic laptop",
+      "wol": {
+        "mac": "11:22:33:44:55:66",
+        "broadcast": ["192.168.178.255"]
+      }
+    }
+  ]
+}

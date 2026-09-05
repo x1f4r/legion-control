@@ -1,0 +1,198 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "usage": "node /home/x1f4r/.legion-control/agent/src/index.mjs <command> [args] [--flags]",
+  "commands": [
+    {
+      "name": "status",
+      "flags": [
+        "--budget-ms <ms>"
+      ],
+      "mutates": false,
+      "summary": "bounded snapshot with timing and partial flags"
+    },
+    {
+      "name": "busy",
+      "flags": [
+        "--budget-ms <ms>"
+      ],
+      "mutates": false,
+      "summary": "aggregate busy plus per-service evidence"
+    },
+    {
+      "name": "update",
+      "flags": [
+        "--service <id>",
+        "--force",
+        "--op <id>",
+        "--detach",
+        "--when-idle",
+        "--expires <dur>"
+      ],
+      "mutates": true,
+      "summary": "manual update of one service"
+    },
+    {
+      "name": "restart",
+      "flags": [
+        "--service <id>",
+        "--force",
+        "--op <id>",
+        "--detach",
+        "--when-idle",
+        "--expires <dur>"
+      ],
+      "mutates": true,
+      "summary": "restart one service"
+    },
+    {
+      "name": "boot",
+      "flags": [
+        "--force",
+        "--no-reboot",
+        "--op <id>",
+        "--when-idle",
+        "--expires <dur>"
+      ],
+      "mutates": true,
+      "summary": "arm a boot target and reboot into it"
+    },
+    {
+      "name": "sleep",
+      "flags": [
+        "--force",
+        "--op <id>",
+        "--when-idle",
+        "--expires <dur>"
+      ],
+      "mutates": true,
+      "summary": "suspend this machine"
+    },
+    {
+      "name": "run",
+      "flags": [
+        "--force",
+        "--op <id>",
+        "--detach",
+        "--when-idle",
+        "--expires <dur>"
+      ],
+      "mutates": true,
+      "summary": "run a configured action"
+    },
+    {
+      "name": "cycle",
+      "flags": [
+        "--op <id>",
+        "--dry-run"
+      ],
+      "mutates": true,
+      "summary": "the scheduled maintenance cycle over every eligible service"
+    },
+    {
+      "name": "policy",
+      "flags": [
+        "--service <id>"
+      ],
+      "mutates": false,
+      "summary": "read the effective update policy; \"policy set\" reads a JSON patch from stdin"
+    },
+    {
+      "name": "auto-update",
+      "flags": [
+        "--service <id>"
+      ],
+      "mutates": true,
+      "summary": "on, off, pause <dur>, resume"
+    },
+    {
+      "name": "op",
+      "flags": [
+        "--wait <seconds>"
+      ],
+      "mutates": false,
+      "summary": "one operation record; --wait long-polls until it finishes"
+    },
+    {
+      "name": "cancel",
+      "flags": [],
+      "mutates": true,
+      "summary": "cancel a queued operation"
+    },
+    {
+      "name": "history",
+      "flags": [
+        "--limit <n>",
+        "--service <id>",
+        "--kind <kind>"
+      ],
+      "mutates": false,
+      "summary": "operation summaries, newest first"
+    },
+    {
+      "name": "logs",
+      "flags": [
+        "--lines <n>",
+        "--op <id>"
+      ],
+      "mutates": false,
+      "summary": "tail of legionctl.log, or one operation log"
+    },
+    {
+      "name": "doctor",
+      "flags": [
+        "--service <id>",
+        "--deep"
+      ],
+      "mutates": false,
+      "summary": "preflight and diagnosis checks"
+    },
+    {
+      "name": "bundle",
+      "flags": [],
+      "mutates": false,
+      "summary": "doctor, status, history, logs and a redacted config in one reply"
+    },
+    {
+      "name": "config",
+      "flags": [
+        "--controller-id <id>",
+        "--revision <n>",
+        "--replace"
+      ],
+      "mutates": true,
+      "summary": "the stored controller document; \"config set\" reads one from stdin, \"config meta\" reads its identity"
+    },
+    {
+      "name": "self-update",
+      "flags": [
+        "--from <path>",
+        "--install",
+        "--rollback",
+        "--check",
+        "--stdin"
+      ],
+      "mutates": true,
+      "summary": "signed agent replacement, keeping the previous tree"
+    },
+    {
+      "name": "version",
+      "flags": [
+        "--check"
+      ],
+      "mutates": false,
+      "summary": "the agent version, and with --check the self-test"
+    },
+    {
+      "name": "help",
+      "flags": [],
+      "mutates": false,
+      "summary": "this list"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "busy",
+  "message": "t3 is busy (1 turn running); pass --force to update anyway",
+  "action": "deferred",
+  "service": "t3",
+  "from": "0.0.36-nightly.20260904",
+  "to": "0.0.37-nightly.20260905",
+  "op": null
+}

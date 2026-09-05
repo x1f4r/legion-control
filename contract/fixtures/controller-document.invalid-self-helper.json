@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "machines": [
+    {
+      "id": "tower",
+      "name": "Tower",
+      "wake": {
+        "mac": "11:22:33:44:55:66",
+        "helper": {
+          "machine": "tower",
+          "action": "wake-tower"
+        },
+        "helpers": [
+          {
+            "machine": "tower",
+            "action": "wake-tower"
+          }
+        ]
+      }
+    }
+  ]
+}

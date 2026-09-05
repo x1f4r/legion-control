@@ -15,7 +15,7 @@
 // command        three argv arrays.
 // none           nothing to start or stop.
 
-import { describeFailure, detectPlatform, runArgv, runCommand } from '../config.mjs';
+import { deadline, describeFailure, detectPlatform, runArgv, runCommand, runCommandAsync } from '../config.mjs';
 import * as appProvider from '../providers/app.mjs';
 import { packageRoot } from '../providers/npm.mjs';
 
@@ -53,9 +53,9 @@ export function parsePowerShellJson(stdout) {
  * wins; without one, an npm service is recognised by the directory npm
  * installed it into, which every invocation of it carries in its command line.
  */
-export function taskMatch(service) {
+export function taskMatch(service, { readOnly = false } = {}) {
   if (service.process?.match) return service.process.match;
-  if (service.kind === 'npm') return packageRoot(service, { allowProbe: false });
+  if (service.kind === 'npm') return packageRoot(service, { allowProbe: false, readOnly });
   return service.name;
 }
 
@@ -82,8 +82,68 @@ function systemdProbe(service) {
   };
 }
 
-function windowsTaskScript(service, { includeRelay }) {
-  const needle = psLiteral(taskMatch(service));
+/**
+ * When the service's process started, as an ISO timestamp, or null when this
+ * platform cannot say.
+ *
+ * This is one of the two pieces of evidence that can retire a state-database row
+ * still marked "running": a turn cannot survive the restart of the server that
+ * was executing it, so a process that started after the turn began proves the
+ * turn is a leftover. Null is not a guess — it means no evidence, and the row
+ * keeps its protection.
+ */
+export function processStartedAt(service) {
+  const type = service.process?.type;
+  try {
+    if (type === 'systemd-user' || type === 'systemd-system') {
+      const unit = service.process.unit;
+      const args = ['show', unit, '--property=ActiveEnterTimestamp', '--value'];
+      const result =
+        type === 'systemd-system'
+          ? runCommand('systemctl', args, { timeoutMs: 10000 })
+          : runCommand('systemctl', ['--user', ...args], { timeoutMs: 10000 });
+      const text = result.stdout.trim();
+      if (!result.ok || !text) return null;
+      // systemd prints "Thu 2026-09-05 10:12:33 CEST"; Date.parse copes once the
+      // leading weekday is dropped. An unparseable answer is no evidence.
+      const parsed = Date.parse(text.replace(/^[A-Za-z]{3}\s+/, ''));
+      return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
+    }
+
+    if (type === 'scheduled-task') {
+      const script = [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        `$needle = ${psLiteral(taskMatch(service))}`,
+        "$procs = @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and " +
+          "$_.CommandLine.ToLower().Replace('\\\\', '\\').Contains($needle.ToLower().Replace('\\\\', '\\')) })",
+        "if ($procs.Count -gt 0) { ($procs | Sort-Object CreationDate | Select-Object -First 1).CreationDate.ToUniversalTime().ToString('o') }",
+      ].join('\n');
+      const result = runPowerShell(script, 30000);
+      const text = result.stdout.trim();
+      if (!result.ok || !text) return null;
+      const parsed = Date.parse(text);
+      return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
+    }
+
+    if (type === 'app') {
+      const { pids } = appProvider.appPids(service);
+      if (pids.length === 0) return null;
+      const result = runCommand('/bin/ps', ['-o', 'lstart=', '-p', String(Math.min(...pids))], { timeoutMs: 10000 });
+      const text = result.stdout.trim();
+      if (!result.ok || !text) return null;
+      const parsed = Date.parse(text);
+      return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
+    }
+  } catch {
+    /* no evidence is a perfectly good answer here */
+  }
+  // A command-described service has no general way to say when it started, and
+  // inventing one would be worse than admitting it.
+  return null;
+}
+
+function windowsTaskScript(service, { includeRelay, readOnly = false }) {
+  const needle = psLiteral(taskMatch(service, { readOnly }));
   const port = service.health?.type === 'http' ? service.health.port : null;
   const portFlag = port ? psLiteral(`--port ${port}`) : null;
   const lines = [
@@ -186,6 +246,90 @@ export function probeProcess(service, { includeRelay = false } = {}) {
       // Nothing to start or stop, so there is nothing that can be down either.
       return { running: true, unitState: 'n/a', pids: [], error: null };
   }
+}
+
+/** Read-only process and start-time evidence under the status snapshot's deadline. */
+export async function probeProcessAsync(service, { clock = deadline(15000), includeRelay = false, runner = runCommandAsync } = {}) {
+  const unknown = (error) => ({ running: false, unitState: 'unknown', pids: [], startedAt: null, error });
+  const run = (file, args, maximum = 15000) => {
+    const timeoutMs = clock.slice(maximum);
+    if (timeoutMs <= 0) return Promise.resolve({ ok: false, code: null, stdout: '', stderr: '', timedOut: true, command: file });
+    return runner(file, args, { timeoutMs });
+  };
+  const timestamp = (text) => {
+    const value = Date.parse(String(text ?? '').trim().replace(/^[A-Za-z]{3}\s+/, ''));
+    return Number.isNaN(value) ? null : new Date(value).toISOString();
+  };
+  const powershell = (script) => run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], 30000);
+  const type = service.process?.type;
+  let probe;
+  if (type === 'systemd-user' || type === 'systemd-system') {
+    // One response supplies both liveness and its timestamp; a second process
+    // query could observe a different service instance and used to double cost.
+    const args = ['show', service.process.unit, '--property=ActiveState', '--property=ActiveEnterTimestamp'];
+    const result = await run('systemctl', type === 'systemd-user' ? ['--user', ...args] : args, 10000);
+    const fields = Object.fromEntries(result.stdout.split('\n').filter((line) => line.includes('=')).map((line) => {
+      const split = line.indexOf('=');
+      return [line.slice(0, split), line.slice(split + 1)];
+    }));
+    probe = result.ok && fields.ActiveState
+      ? { running: fields.ActiveState === 'active', unitState: fields.ActiveState, pids: [],
+          startedAt: fields.ActiveState === 'active' ? timestamp(fields.ActiveEnterTimestamp) : null, error: null }
+      : unknown(describeFailure(result));
+  } else if (type === 'scheduled-task') {
+    const script = windowsTaskScript(service, { includeRelay, readOnly: true }).replace("$ErrorActionPreference = 'SilentlyContinue'", "$ErrorActionPreference = 'Stop'").replace(
+      '[pscustomobject]@{ running =',
+      "$started = if ($procs.Count -gt 0) { ($procs | Sort-Object CreationDate | Select-Object -First 1).CreationDate.ToUniversalTime().ToString('o') } else { $null }\n[pscustomobject]@{ startedAt = $started; running =",
+    );
+    const result = await powershell(script);
+    const parsed = result.ok ? parsePowerShellJson(result.stdout) : null;
+    probe = parsed && typeof parsed.running === 'boolean'
+      ? { running: parsed.running, unitState: parsed.running ? 'running' : 'stopped',
+          pids: String(parsed.pids ?? '').split(',').map(Number).filter((pid) => Number.isInteger(pid) && pid > 0),
+          startedAt: parsed.running ? timestamp(parsed.startedAt) : null, error: null }
+      : unknown(describeFailure(result));
+    if (includeRelay && parsed) probe.relay = { configured: true, running: parsed.relayRunning === true };
+  } else if (type === 'app') {
+    if (!service.path) return unknown('no app path is configured for this service');
+    const result = await run('/bin/ps', ['-Ao', 'pid=,comm=']);
+    if (!result.ok) probe = unknown(describeFailure(result));
+    else {
+      const pids = result.stdout.split('\n').flatMap((line) => {
+        const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+        return match && Number(match[1]) !== process.pid && match[2].startsWith(`${service.path}/Contents/`) ? [Number(match[1])] : [];
+      });
+      probe = { running: pids.length > 0, unitState: pids.length > 0 ? 'running' : 'stopped', pids, startedAt: null, error: null };
+      if (pids.length && !clock.expired()) {
+        const started = await run('/bin/ps', ['-o', 'lstart=', '-p', String(Math.min(...pids))], 10000);
+        if (started.ok) probe.startedAt = timestamp(started.stdout);
+      }
+    }
+  } else if (type === 'command' && service.process.running) {
+    const result = await run(service.process.running[0], service.process.running.slice(1));
+    probe = result.timedOut || result.code === null
+      ? unknown(describeFailure(result))
+      : { running: result.ok, unitState: result.ok ? 'running' : 'stopped', pids: [], startedAt: null, error: null };
+  } else {
+    probe = { running: true, unitState: type === 'command' ? 'unknown' : 'n/a', pids: [], startedAt: null, error: null };
+  }
+  if (includeRelay && !probe.relay) {
+    // A configured relay stays configured when it cannot be measured.
+    let result;
+    if (detectPlatform() === 'windows') {
+      result = await powershell([
+        "$ErrorActionPreference = 'Stop'",
+        "$relay = @(Get-CimInstance -ClassName Win32_Process -Filter 'Name = ''cloudflared.exe''' | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('tunnel') -and $_.CommandLine.Contains('run') })",
+        "if ($relay.Count -gt 0) { exit 0 } else { exit 1 }",
+      ].join('\n'));
+    } else {
+      result = await run('pgrep', ['-f', 'cloudflared.*tunnel[[:space:]]+run'], 5000);
+    }
+    probe.relay = { configured: true, running: result.ok };
+    if (result.timedOut || result.code === null || (result.code !== 0 && result.code !== 1)) {
+      probe.error = [probe.error, `relay: ${describeFailure(result)}`].filter(Boolean).join('; ');
+    }
+  }
+  return probe;
 }
 
 /**

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cancel.schema.json",
+  "title": "legionctl cancel ID",
+  "description": "Cancels a queued operation. A running one is not killable and answers conflict; there is no way to interrupt work that is already stopping a service.",
+  "type": "object",
+  "allOf": [
+    { "$ref": "common.schema.json#/$defs/envelope" },
+    {
+      "if": { "properties": { "action": { "const": "conflict" } }, "required": ["action"] },
+      "then": { "properties": { "reasonCode": { "const": "already-running" } }, "required": ["reasonCode"] }
+    }
+  ],
+  "properties": {
+    "id": { "$ref": "common.schema.json#/$defs/opId" },
+    "action": { "enum": ["cancelled", "conflict", "noop"] },
+    "op": { "anyOf": [{ "$ref": "common.schema.json#/$defs/opRecord" }, { "type": "null" }] }
+  },
+  "required": ["id", "action", "op"],
+  "unevaluatedProperties": false
+}

@@ -1,0 +1,32 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "source": "operation",
+  "opId": "9b6d0e54-1f83-4c27-8a95-4e2b7d13f6a0",
+  "path": null,
+  "requested": 100,
+  "returned": 3,
+  "truncated": false,
+  "lines": [
+    {
+      "at": "2026-09-03T13:59:00.000Z",
+      "line": "installed 1.5.0",
+      "command": "update"
+    },
+    {
+      "at": "2026-09-03T13:59:30.000Z",
+      "line": "health check failed 4 times: connection refused",
+      "command": "update"
+    },
+    {
+      "at": "2026-09-03T14:00:00.000Z",
+      "line": "rolled back to 1.4.2, health 200",
+      "command": "update"
+    }
+  ]
+}

@@ -1,0 +1,1990 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.schema.json",
+  "title": "Shared definitions for the Legion Control agent contract, version 3",
+  "description": "Nothing validates against this file directly. Every reply schema refs into it, so a type is written once and every command agrees about it.",
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?$"
+    },
+    "iso": {
+      "type": "string",
+      "description": "ISO 8601 with an explicit zone. The agent always writes UTC with milliseconds; clients must accept any offset.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "isoOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/iso"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sha256OrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "token": {
+      "description": "Generic non-path command argument grammar. Semantic identifiers have narrower definitions; interpreter/script/path arguments use the configured shell quoting rules.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/\\\\~=+-]*$"
+    },
+    "tokenOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/token"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "opId": {
+      "description": "A lowercase UUIDv4, or any lowercase id of 8 to 64 characters from [a-z0-9-].",
+      "type": "string",
+      "pattern": "^[a-z0-9-]{8,64}$"
+    },
+    "opIdOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/opId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[0-9]+(m|h|d)$"
+    },
+    "clockTime": {
+      "type": "string",
+      "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"
+    },
+    "weekday": {
+      "enum": [
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "fri",
+        "sat",
+        "sun"
+      ]
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "portOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/port"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "millis": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "millisOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/millis"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "textOrNull": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reasonCode": {
+      "description": "The closed enum from v3.md section 2.2. Codes may be added in a later 3.x; a client that meets one it does not know renders the message and treats the reply as failed.",
+      "enum": [
+        "busy",
+        "busy-unknown",
+        "policy-off",
+        "policy-paused",
+        "outside-window",
+        "operation-in-progress",
+        "lock-held",
+        "no-update",
+        "latest-unknown",
+        "not-installed",
+        "not-running",
+        "app-closed",
+        "apply-attempts-exhausted",
+        "apply-failed",
+        "postcondition-failed",
+        "rolled-back",
+        "not-configured",
+        "unsupported-platform",
+        "unknown-service",
+        "unknown-target",
+        "unknown-action",
+        "bad-argument",
+        "config-invalid",
+        "config-missing",
+        "interrupted",
+        "expired",
+        "cancelled",
+        "already-running",
+        "already-on-target",
+        "stale-revision",
+        "controller-conflict",
+        "signature-invalid",
+        "restricted",
+        "timed-out",
+        "internal"
+      ]
+    },
+    "reasonCodeOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/reasonCode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "systemIdentity": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "name": {
+          "$ref": "#/$defs/text"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "notes": {
+      "description": "Warnings worth showing, in the agent's own words. Rendered as written.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/text"
+      },
+      "maxItems": 50
+    },
+    "envelope": {
+      "description": "On every reply from a 3.x agent, whatever the command and whatever went wrong.",
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "contract": {
+          "const": 3
+        },
+        "agentVersion": {
+          "$ref": "#/$defs/semver"
+        },
+        "system": {
+          "$ref": "#/$defs/systemIdentity"
+        },
+        "reasonCode": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "message": {
+          "$ref": "#/$defs/text"
+        },
+        "notes": {
+          "$ref": "#/$defs/notes"
+        }
+      },
+      "required": [
+        "ok",
+        "contract",
+        "agentVersion",
+        "system"
+      ]
+    },
+    "busyEvidence": {
+      "description": "What the busy answer was read from. `unmonitored` is a service with no busy key at all; `none` is a service that declared it is never busy.",
+      "enum": [
+        "t3-sqlite",
+        "command",
+        "http",
+        "none",
+        "unmonitored",
+        "probe-error",
+        "timed-out"
+      ]
+    },
+    "busyThread": {
+      "type": "object",
+      "properties": {
+        "threadId": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "turnId": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "title": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "state": {
+          "$ref": "#/$defs/text"
+        },
+        "at": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "disposition": {
+          "enum": [
+            "running",
+            "pending",
+            "pending-approval",
+            "stale"
+          ]
+        },
+        "stale": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "threadId",
+        "turnId",
+        "title",
+        "state",
+        "at",
+        "blocking",
+        "disposition",
+        "stale"
+      ],
+      "additionalProperties": false
+    },
+    "busy": {
+      "description": "One service's busy state. `busy` and `unknown` are the two 2.x keys and keep their meaning; `unknown` true means the probe could not be read and the gate fails closed.",
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/busyFields"
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "busyAggregate": {
+      "description": "The machine-wide answer. `busy` here is true when any service blocks, and unknown counts as blocking.",
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/busyAggregateFields"
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "relay": {
+      "type": "object",
+      "properties": {
+        "configured": {
+          "type": "boolean"
+        },
+        "running": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "configured",
+        "running"
+      ],
+      "additionalProperties": false
+    },
+    "lastUpdate": {
+      "description": "The 2.x record of the last update of one service. Kept for 2.x clients; a 3.x client reads `lastOperation` and the ops records instead.",
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "at": {
+              "$ref": "#/$defs/iso"
+            },
+            "from": {
+              "$ref": "#/$defs/version"
+            },
+            "to": {
+              "$ref": "#/$defs/version"
+            },
+            "result": {
+              "$ref": "#/$defs/text"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "at",
+            "from",
+            "to",
+            "result",
+            "message"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "maintenanceWindow": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/weekday"
+          },
+          "minItems": 1,
+          "maxItems": 7,
+          "uniqueItems": true
+        },
+        "from": {
+          "$ref": "#/$defs/clockTime"
+        },
+        "to": {
+          "$ref": "#/$defs/clockTime"
+        }
+      },
+      "required": [
+        "days",
+        "from",
+        "to"
+      ],
+      "additionalProperties": false
+    },
+    "maintenanceWindows": {
+      "description": "Local time on the machine. An empty list means any time. `from` later than `to` is an overnight window.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/maintenanceWindow"
+      },
+      "maxItems": 14
+    },
+    "maintenanceWindowsOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/maintenanceWindows"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "systemUpdates": {
+      "description": "The effective machine-wide update policy, as `status` and `policy` report it.",
+      "type": "object",
+      "properties": {
+        "automatic": {
+          "type": "boolean"
+        },
+        "pauseUntil": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "maintenanceWindows": {
+          "$ref": "#/$defs/maintenanceWindows"
+        },
+        "inWindowNow": {
+          "type": "boolean"
+        },
+        "nextWindow": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "lastCycle": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "opId": {
+                  "$ref": "#/$defs/opId"
+                },
+                "at": {
+                  "$ref": "#/$defs/iso"
+                },
+                "action": {
+                  "$ref": "#/$defs/opAction"
+                }
+              },
+              "required": [
+                "opId",
+                "at",
+                "action"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "automatic",
+        "pauseUntil",
+        "maintenanceWindows",
+        "inWindowNow",
+        "nextWindow",
+        "lastCycle"
+      ],
+      "additionalProperties": false
+    },
+    "serviceUpdates": {
+      "description": "One service's effective policy. `inherited` is true when the service sets none of its own and takes the machine's.",
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "#/$defs/serviceUpdatesFields"
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "opKind": {
+      "enum": [
+        "update",
+        "restart",
+        "boot",
+        "sleep",
+        "run",
+        "cycle",
+        "self-update"
+      ]
+    },
+    "opMode": {
+      "enum": [
+        "scheduled",
+        "manual",
+        "force",
+        "queued"
+      ]
+    },
+    "opState": {
+      "enum": [
+        "queued",
+        "running",
+        "finished"
+      ]
+    },
+    "opPhase": {
+      "description": "The union of the per-kind phase lists in v3.md section 2.3. Which phases a kind may report is fixed there; the union is what a decoder has to accept.",
+      "enum": [
+        "resolving",
+        "recovering",
+        "checking-busy",
+        "warming",
+        "locking",
+        "stopping",
+        "installing",
+        "verifying",
+        "starting",
+        "health",
+        "rolling-back",
+        "restarting",
+        "arming",
+        "rebooting",
+        "preparing",
+        "suspending",
+        "running",
+        "queued",
+        "services",
+        "staging",
+        "self-test",
+        "swapping",
+        "done"
+      ]
+    },
+    "opAction": {
+      "description": "The union of the per-kind result actions. Section 2.3 lists which of these each kind may produce.",
+      "enum": [
+        "accepted",
+        "already-running",
+        "armed",
+        "cancelled",
+        "checked",
+        "conflict",
+        "cycled",
+        "deferred",
+        "expired",
+        "failed",
+        "installed",
+        "interrupted",
+        "noop",
+        "queued",
+        "ran",
+        "rebooted",
+        "rebooting",
+        "restarted",
+        "rolled-back",
+        "skipped",
+        "slept",
+        "sleeping",
+        "updated"
+      ]
+    },
+    "opActionOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/opAction"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "opInitiator": {
+      "description": "Who asked. `client` comes from LEGIONCTL_CLIENT, which the restricted dispatcher sets from the authorized_keys comment; a local shell is \"cli\".",
+      "type": "object",
+      "properties": {
+        "client": {
+          "$ref": "#/$defs/text"
+        },
+        "device": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "user": {
+          "$ref": "#/$defs/textOrNull"
+        }
+      },
+      "required": [
+        "client",
+        "device",
+        "user"
+      ],
+      "additionalProperties": false
+    },
+    "opProgress": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "step": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "of": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "note": {
+              "$ref": "#/$defs/text"
+            }
+          },
+          "required": [
+            "step",
+            "of",
+            "note"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "opResult": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "action": {
+              "$ref": "#/$defs/opAction"
+            },
+            "reasonCode": {
+              "$ref": "#/$defs/reasonCodeOrNull"
+            },
+            "message": {
+              "$ref": "#/$defs/text"
+            },
+            "from": {
+              "$ref": "#/$defs/version"
+            },
+            "to": {
+              "$ref": "#/$defs/version"
+            },
+            "exitCode": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "output": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok",
+            "action",
+            "reasonCode",
+            "message"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "opLogEntry": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/iso"
+        },
+        "line": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "line"
+      ],
+      "additionalProperties": false
+    },
+    "opChild": {
+      "description": "One service's outcome inside a cycle.",
+      "type": "object",
+      "properties": {
+        "opId": {
+          "$ref": "#/$defs/opId"
+        },
+        "service": {
+          "$ref": "#/$defs/configuredId"
+        },
+        "action": {
+          "$ref": "#/$defs/opAction"
+        },
+        "reasonCode": {
+          "$ref": "#/$defs/reasonCodeOrNull"
+        }
+      },
+      "required": [
+        "opId",
+        "service",
+        "action",
+        "reasonCode"
+      ],
+      "additionalProperties": false
+    },
+    "opRecord": {
+      "description": "One operation, exactly as it is stored at <base>/ops/<id>.json and exactly as `op` returns it.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/opId"
+        },
+        "kind": {
+          "$ref": "#/$defs/opKind"
+        },
+        "service": {
+          "$ref": "#/$defs/configuredIdOrNull"
+        },
+        "target": {
+          "$ref": "#/$defs/tokenOrNull"
+        },
+        "actionId": {
+          "$ref": "#/$defs/configuredIdOrNull"
+        },
+        "mode": {
+          "$ref": "#/$defs/opMode"
+        },
+        "initiator": {
+          "$ref": "#/$defs/opInitiator"
+        },
+        "state": {
+          "$ref": "#/$defs/opState"
+        },
+        "phase": {
+          "$ref": "#/$defs/opPhase"
+        },
+        "progress": {
+          "$ref": "#/$defs/opProgress"
+        },
+        "requestedAt": {
+          "$ref": "#/$defs/iso"
+        },
+        "startedAt": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/iso"
+        },
+        "finishedAt": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "detached": {
+          "type": "boolean"
+        },
+        "from": {
+          "$ref": "#/$defs/version"
+        },
+        "to": {
+          "$ref": "#/$defs/version"
+        },
+        "result": {
+          "$ref": "#/$defs/opResult"
+        },
+        "log": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/opLogEntry"
+          },
+          "maxItems": 200
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/opChild"
+          },
+          "maxItems": 50
+        },
+        "replaced": {
+          "$ref": "#/$defs/opIdOrNull"
+        },
+        "agentVersion": {
+          "$ref": "#/$defs/semver"
+        },
+        "systemId": {
+          "$ref": "#/$defs/token"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "service",
+        "target",
+        "actionId",
+        "mode",
+        "initiator",
+        "state",
+        "phase",
+        "progress",
+        "requestedAt",
+        "startedAt",
+        "updatedAt",
+        "finishedAt",
+        "expiresAt",
+        "pid",
+        "detached",
+        "result",
+        "log",
+        "agentVersion",
+        "systemId"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "A finished operation has an end and a result; a running or queued one has neither.",
+          "if": {
+            "properties": {
+              "state": {
+                "const": "finished"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "finishedAt": {
+                "$ref": "#/$defs/iso"
+              },
+              "result": {
+                "type": "object",
+                "properties": {
+                  "ok": {},
+                  "action": {},
+                  "reasonCode": {},
+                  "message": {},
+                  "from": {},
+                  "to": {},
+                  "exitCode": {},
+                  "output": {},
+                  "verified": {}
+                }
+              },
+              "phase": {
+                "const": "done"
+              },
+              "pid": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "finishedAt": {
+                "type": "null"
+              },
+              "result": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "description": "A queued operation has an expiry and no pid; nothing else does.",
+          "if": {
+            "properties": {
+              "state": {
+                "const": "queued"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "expiresAt": {
+                "$ref": "#/$defs/iso"
+              },
+              "pid": {
+                "type": "null"
+              },
+              "startedAt": {
+                "type": "null"
+              },
+              "phase": {
+                "const": "queued"
+              }
+            }
+          }
+        },
+        {
+          "description": "Boot names a configured target; self-update names its immutable install or rollback identity. Other operation kinds leave target null.",
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "boot",
+                  "self-update"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "$ref": "#/$defs/token"
+              },
+              "service": {
+                "type": "null"
+              },
+              "actionId": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "target": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "actionId": {
+                "$ref": "#/$defs/token"
+              },
+              "service": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "actionId": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "cycle"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "service": {
+                "type": "null"
+              },
+              "children": {
+                "type": "array"
+              }
+            },
+            "required": [
+              "children"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "self-update"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "type": "string",
+                "pattern": "^(install|rollback):[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "opSummary": {
+      "description": "The short form of an operation, used by `status.operations` and by `history`. Every field is drawn from the record of the same name.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/opId"
+        },
+        "kind": {
+          "$ref": "#/$defs/opKind"
+        },
+        "service": {
+          "$ref": "#/$defs/configuredIdOrNull"
+        },
+        "target": {
+          "$ref": "#/$defs/tokenOrNull"
+        },
+        "actionId": {
+          "$ref": "#/$defs/configuredIdOrNull"
+        },
+        "mode": {
+          "$ref": "#/$defs/opMode"
+        },
+        "state": {
+          "$ref": "#/$defs/opState"
+        },
+        "phase": {
+          "$ref": "#/$defs/opPhase"
+        },
+        "action": {
+          "$ref": "#/$defs/opActionOrNull"
+        },
+        "reasonCode": {
+          "$ref": "#/$defs/reasonCodeOrNull"
+        },
+        "requestedAt": {
+          "$ref": "#/$defs/iso"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/iso"
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/isoOrNull"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "service",
+        "target",
+        "actionId",
+        "mode",
+        "state",
+        "phase",
+        "action",
+        "reasonCode",
+        "requestedAt",
+        "updatedAt",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    },
+    "opConflict": {
+      "description": "Who holds the operation lock. Sent with every `conflict` answer so the app can name what is in the way instead of saying \"busy\".",
+      "type": "object",
+      "properties": {
+        "opId": {
+          "$ref": "#/$defs/opId"
+        },
+        "kind": {
+          "$ref": "#/$defs/opKind"
+        },
+        "service": {
+          "$ref": "#/$defs/configuredIdOrNull"
+        },
+        "phase": {
+          "$ref": "#/$defs/opPhase"
+        },
+        "startedAt": {
+          "$ref": "#/$defs/iso"
+        }
+      },
+      "required": [
+        "opId",
+        "kind",
+        "service",
+        "phase",
+        "startedAt"
+      ],
+      "additionalProperties": false
+    },
+    "controllerSource": {
+      "description": "Which kind of client wrote the copy this machine holds. `legacy` is a 2.x push that carried no identity.",
+      "enum": [
+        "mac",
+        "desktop",
+        "phone",
+        "cli",
+        "legacy"
+      ]
+    },
+    "controllerMark": {
+      "description": "What `status` says about the setup copy. A 2.x agent sends only `hash`; the other four are null on a copy that was pushed without an identity.",
+      "type": "object",
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/sha256OrNull"
+        },
+        "id": {
+          "$ref": "#/$defs/setupIdOrNull"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/controllerSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "hash",
+        "id",
+        "revision",
+        "updatedAt",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "controllerMeta": {
+      "description": "The contents of <base>/controller.meta.json, written in the same transaction as the document itself. `id` is the SETUP id, shared by every peer; it does not identify a device.",
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/setupIdOrNull"
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "updatedAt": {
+              "$ref": "#/$defs/isoOrNull"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/controllerSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "lineage": {
+              "$ref": "#/$defs/lineage"
+            },
+            "device": {
+              "description": "Free text name of the device that wrote it, for the divergence screen. Never compared, never a key.",
+              "$ref": "#/$defs/textOrNull"
+            },
+            "hash": {
+              "$ref": "#/$defs/sha256OrNull"
+            },
+            "bytes": {
+              "$ref": "#/$defs/count"
+            }
+          },
+          "required": [
+            "id",
+            "revision",
+            "updatedAt",
+            "source",
+            "lineage"
+          ],
+          "additionalProperties": false,
+          "description": "A machine that holds no copy still answers with this object, every field null and the lineage empty. That is a different answer from `null` and both are allowed: the agent returns the object from `config meta` and `null` from `config` when there is no file at all."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "controllerDocument": {
+      "description": "The setup document, which the agent stores and never interprets. The two keys below are the only ones it checks before accepting the bytes; everything else belongs to the clients and is not part of this contract.",
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "number"
+            },
+            "machines": {
+              "type": "array"
+            }
+          },
+          "required": [
+            "version",
+            "machines"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "configProblem": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "enum": [
+            "error",
+            "warning",
+            "migration"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "$ref": "#/$defs/text"
+        },
+        "fix": {
+          "$ref": "#/$defs/textOrNull"
+        }
+      },
+      "required": [
+        "level",
+        "path",
+        "message",
+        "fix"
+      ],
+      "additionalProperties": false
+    },
+    "configReport": {
+      "description": "How the agent's own configuration loaded. `ok` false blocks every mutating command with reasonCode config-invalid.",
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "source": {
+          "enum": [
+            "file",
+            "defaults",
+            "last-known-good"
+          ]
+        },
+        "problems": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/configProblem"
+          },
+          "maxItems": 100
+        }
+      },
+      "required": [
+        "ok",
+        "source",
+        "problems"
+      ],
+      "additionalProperties": false
+    },
+    "bootTarget": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/configuredId"
+        },
+        "name": {
+          "$ref": "#/$defs/textOrNull"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "agentAction": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/configuredId"
+        },
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "confirm": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "busyGated": {
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "What running this action does. `command` spawns the configured argv; `wol` makes the agent send wake-on-LAN magic packets itself, so a Pi, a tower or a Mac can be a wake helper for its own LAN without a third-party binary.",
+          "enum": [
+            "command",
+            "wol"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "confirm",
+        "busyGated",
+        "kind"
+      ],
+      "additionalProperties": false
+    },
+    "serviceProcess": {
+      "type": "object",
+      "properties": {
+        "running": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "startedAt": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "error": {
+          "$ref": "#/$defs/textOrNull"
+        }
+      },
+      "required": [
+        "running",
+        "state",
+        "startedAt",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "serviceHealth": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 599
+        },
+        "checkedAt": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "elapsedMs": {
+          "$ref": "#/$defs/millisOrNull"
+        },
+        "error": {
+          "$ref": "#/$defs/textOrNull"
+        }
+      },
+      "required": [
+        "ok",
+        "status",
+        "checkedAt",
+        "elapsedMs",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "serviceEndpoint": {
+      "description": "Reachability from outside the machine. Only `doctor --deep` probes it; `status` always reports reachable null.",
+      "type": "object",
+      "properties": {
+        "configured": {
+          "type": "boolean"
+        },
+        "reachable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "configured",
+        "reachable"
+      ],
+      "additionalProperties": false
+    },
+    "serviceLastOperation": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "opId": {
+              "$ref": "#/$defs/opId"
+            },
+            "kind": {
+              "$ref": "#/$defs/opKind"
+            },
+            "action": {
+              "$ref": "#/$defs/opAction"
+            },
+            "at": {
+              "$ref": "#/$defs/iso"
+            }
+          },
+          "required": [
+            "opId",
+            "kind",
+            "action",
+            "at"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "serviceStatus": {
+      "description": "One service as `status` describes it. The first eighteen properties are the 2.x shape and keep their 2.x meaning; the rest are the additive v3 ones.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/configuredId"
+        },
+        "name": {
+          "$ref": "#/$defs/text"
+        },
+        "kind": {
+          "enum": [
+            "app",
+            "npm",
+            "command"
+          ]
+        },
+        "installed": {
+          "$ref": "#/$defs/version"
+        },
+        "latest": {
+          "$ref": "#/$defs/version"
+        },
+        "channel": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "upToDate": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "running": {
+          "type": "boolean"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "port": {
+          "$ref": "#/$defs/portOrNull"
+        },
+        "staged": {
+          "$ref": "#/$defs/version"
+        },
+        "appPath": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "busy": {
+          "$ref": "#/$defs/busy"
+        },
+        "relay": {
+          "$ref": "#/$defs/relay"
+        },
+        "pendingRestart": {
+          "type": "boolean"
+        },
+        "lastUpdate": {
+          "$ref": "#/$defs/lastUpdate"
+        },
+        "canUpdate": {
+          "type": "boolean"
+        },
+        "canRestart": {
+          "type": "boolean"
+        },
+        "process": {
+          "$ref": "#/$defs/serviceProcess"
+        },
+        "health": {
+          "$ref": "#/$defs/serviceHealth"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/serviceEndpoint"
+        },
+        "updates": {
+          "$ref": "#/$defs/serviceUpdates"
+        },
+        "pendingVersion": {
+          "$ref": "#/$defs/version"
+        },
+        "drain": {
+          "type": "boolean"
+        },
+        "lastOperation": {
+          "$ref": "#/$defs/serviceLastOperation"
+        },
+        "notes": {
+          "$ref": "#/$defs/notes"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "installed",
+        "latest",
+        "channel",
+        "upToDate",
+        "running",
+        "healthy",
+        "port",
+        "staged",
+        "appPath",
+        "busy",
+        "relay",
+        "pendingRestart",
+        "lastUpdate",
+        "canUpdate",
+        "canRestart",
+        "process",
+        "health",
+        "endpoint",
+        "updates",
+        "pendingVersion",
+        "drain",
+        "lastOperation"
+      ],
+      "additionalProperties": false
+    },
+    "t3Legacy": {
+      "description": "The first service, repeated in the 1.x shape. Present for as long as a 2.x client might read it; removed in contract 4. Null when the machine has no services.",
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "installed": {
+              "$ref": "#/$defs/version"
+            },
+            "nightly": {
+              "$ref": "#/$defs/version"
+            },
+            "upToDate": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "serverRunning": {
+              "type": "boolean"
+            },
+            "healthy": {
+              "type": "boolean"
+            },
+            "port": {
+              "$ref": "#/$defs/portOrNull"
+            },
+            "staged": {
+              "$ref": "#/$defs/version"
+            },
+            "appPath": {
+              "$ref": "#/$defs/textOrNull"
+            }
+          },
+          "required": [
+            "installed",
+            "nightly",
+            "upToDate",
+            "serverRunning",
+            "healthy",
+            "port"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "doctorCheck": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^(?:config\\.(?:parse|validate)|base\\.writable|node\\.(?:version|sqlite)|npm\\.(?:available|prefix)|service\\.[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:process|health|busy|relay|latest|endpoint)|scheduler\\.(?:present|command|lastRun)|privileges\\.(?:sudo|boot)|sleep\\.tool|locks|ops\\.dir|controller\\.copy|session\\.restricted|clock)$"
+        },
+        "level": {
+          "enum": [
+            "ok",
+            "warn",
+            "fail"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/text"
+        },
+        "detail": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "fix": {
+          "$ref": "#/$defs/textOrNull"
+        }
+      },
+      "required": [
+        "id",
+        "level",
+        "summary",
+        "detail",
+        "fix"
+      ],
+      "additionalProperties": false
+    },
+    "logLine": {
+      "description": "One line of a log. `at` is null on a line that carries no timestamp prefix, and `line` is then the whole line. `command` is an additive convenience: the agent writes the verb into its own log prefix, and splitting it once here saves every client the same regular expression.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "line": {
+          "type": "string"
+        },
+        "command": {
+          "$ref": "#/$defs/textOrNull"
+        }
+      },
+      "required": [
+        "at",
+        "line"
+      ],
+      "additionalProperties": false
+    },
+    "releaseManifest": {
+      "description": "The internal MANIFEST.json of the agent tarball, as `self-update` reports it after verifying the signature.",
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": 1
+        },
+        "version": {
+          "$ref": "#/$defs/semver"
+        },
+        "contract": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "files": {
+          "$ref": "#/$defs/count"
+        },
+        "signatureVerified": {
+          "type": "boolean"
+        },
+        "keyFingerprint": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "required": [
+        "schema",
+        "version",
+        "contract",
+        "files",
+        "signatureVerified"
+      ],
+      "additionalProperties": false
+    },
+    "busyFields": {
+      "type": "object",
+      "properties": {
+        "busy": {
+          "type": "boolean"
+        },
+        "unknown": {
+          "type": "boolean"
+        },
+        "monitored": {
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        },
+        "evidence": {
+          "$ref": "#/$defs/busyEvidence"
+        },
+        "checkedAt": {
+          "$ref": "#/$defs/iso"
+        },
+        "elapsedMs": {
+          "$ref": "#/$defs/millis"
+        },
+        "error": {
+          "$ref": "#/$defs/textOrNull"
+        },
+        "runningTurns": {
+          "$ref": "#/$defs/count"
+        },
+        "pendingTurns": {
+          "$ref": "#/$defs/count"
+        },
+        "pendingApprovals": {
+          "$ref": "#/$defs/count"
+        },
+        "staleTurns": {
+          "$ref": "#/$defs/count"
+        },
+        "staleApprovals": {
+          "$ref": "#/$defs/count"
+        },
+        "threads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/busyThread"
+          },
+          "maxItems": 50
+        },
+        "threadsTruncated": {
+          "$ref": "#/$defs/count"
+        }
+      },
+      "required": [
+        "busy",
+        "unknown",
+        "monitored",
+        "reason",
+        "evidence",
+        "checkedAt",
+        "elapsedMs",
+        "error"
+      ],
+      "allOf": [
+        {
+          "description": "A service nobody described a busy probe for blocks, and says so as all three of monitored false, unknown true and busy true. Only the evidence names it; a client that renders \"not monitored\" reads that, never the reason string.",
+          "if": {
+            "properties": {
+              "evidence": {
+                "const": "unmonitored"
+              }
+            },
+            "required": [
+              "evidence"
+            ]
+          },
+          "then": {
+            "properties": {
+              "monitored": {
+                "const": false
+              },
+              "unknown": {
+                "const": true
+              },
+              "busy": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "description": "Busy type \"none\" is a declaration that there is nothing here to protect. It is an answer, not the absence of one, so it counts as monitored: status.busy.unmonitoredServices is the number of services that block for want of a probe, and a client renders that count as something to fix.",
+          "if": {
+            "properties": {
+              "evidence": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "evidence"
+            ]
+          },
+          "then": {
+            "properties": {
+              "monitored": {
+                "const": true
+              },
+              "unknown": {
+                "const": false
+              },
+              "busy": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "description": "Fail closed, everywhere: a reading that could not be taken blocks. There is no state in which the gate does not know and lets the work through.",
+          "if": {
+            "properties": {
+              "unknown": {
+                "const": true
+              }
+            },
+            "required": [
+              "unknown"
+            ]
+          },
+          "then": {
+            "properties": {
+              "busy": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "busyAggregateFields": {
+      "type": "object",
+      "properties": {
+        "busy": {
+          "type": "boolean"
+        },
+        "unknown": {
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        },
+        "monitoredServices": {
+          "$ref": "#/$defs/count"
+        },
+        "unmonitoredServices": {
+          "$ref": "#/$defs/count"
+        }
+      },
+      "required": [
+        "busy",
+        "unknown",
+        "reason",
+        "monitoredServices",
+        "unmonitoredServices"
+      ]
+    },
+    "serviceUpdatesFields": {
+      "type": "object",
+      "properties": {
+        "automatic": {
+          "type": "boolean"
+        },
+        "inherited": {
+          "type": "boolean"
+        },
+        "pauseUntil": {
+          "$ref": "#/$defs/isoOrNull"
+        },
+        "maintenanceWindows": {
+          "$ref": "#/$defs/maintenanceWindowsOrNull"
+        },
+        "eligibleNow": {
+          "type": "boolean"
+        },
+        "deferredReason": {
+          "$ref": "#/$defs/reasonCodeOrNull"
+        },
+        "order": {
+          "description": "Optional ordering hint for the scheduled cycle. Lower runs first; the default 0 leaves the configured order. Clients may ignore it.",
+          "type": "integer"
+        },
+        "after": {
+          "description": "Optional service ids this one is walked after within a cycle. Clients may ignore it.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/token"
+          },
+          "maxItems": 20,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "automatic",
+        "inherited",
+        "pauseUntil",
+        "eligibleNow",
+        "deferredReason"
+      ]
+    },
+    "lineage": {
+      "description": "Hashes of the ancestors of a controller document, newest first: the canonical hash of the parent, then its parent, and so on. This is what makes concurrent edits detectable. A revision number only orders documents that came from one writer; with several peers editing offline, two documents can carry revision 6 and neither descend from the other, and nothing but ancestry can tell that apart from one of them simply being newer. Capped at 32, which means two branches more than 32 revisions apart are reported as divergence rather than as one being behind. That fails toward a question, never toward a loss.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/sha256"
+      },
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "configuredId": {
+      "description": "Agent-configured service, action or boot target identifier; matches config.mjs ID_PATTERN.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "setupId": {
+      "description": "Shared setup identity; matches controller.mjs SETUP_ID_PATTERN, not the generic argv grammar.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+    },
+    "configuredIdOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/configuredId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "setupIdOrNull": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/setupId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

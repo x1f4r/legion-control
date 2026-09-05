@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "config-missing",
+  "message": "there is no /home/x1f4r/.legion-control/config.json, so this machine has no services to update",
+  "command": "update",
+  "argument": null,
+  "error": "no config.json"
+}

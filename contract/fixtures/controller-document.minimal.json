@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "machines": [
+    {
+      "id": "pi",
+      "name": "Atlas",
+      "endpoints": [
+        {
+          "host": "192.168.178.40",
+          "user": "x1f4r"
+        }
+      ]
+    }
+  ]
+}

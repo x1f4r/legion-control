@@ -1,0 +1,55 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "the queued boot into windows was cancelled before it ran",
+  "id": "8c3a5f60-1d29-4b74-a8e3-5f0c7b91d642",
+  "action": "cancelled",
+  "op": {
+    "id": "8c3a5f60-1d29-4b74-a8e3-5f0c7b91d642",
+    "kind": "boot",
+    "service": null,
+    "target": "windows",
+    "actionId": null,
+    "mode": "queued",
+    "initiator": {
+      "client": "phone",
+      "device": "pixel-8",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T10:40:00.000Z",
+    "startedAt": null,
+    "updatedAt": "2026-09-05T12:00:00.000Z",
+    "finishedAt": "2026-09-05T12:00:00.000Z",
+    "expiresAt": "2026-09-05T14:40:00.000Z",
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": false,
+      "action": "cancelled",
+      "reasonCode": "cancelled",
+      "message": "the queued boot into windows was cancelled before it ran",
+      "exitCode": null,
+      "output": null
+    },
+    "log": [
+      {
+        "at": "2026-09-05T10:40:00.000Z",
+        "line": "queued until idle, expires in 4h"
+      },
+      {
+        "at": "2026-09-05T12:00:00.000Z",
+        "line": "cancelled by phone"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

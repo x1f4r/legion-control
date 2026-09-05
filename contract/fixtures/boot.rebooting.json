@@ -1,0 +1,49 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "BootNext set to 0002 (Windows 11) and read back; reboot scheduled in 3 seconds",
+  "action": "rebooting",
+  "target": "windows",
+  "armed": true,
+  "op": {
+    "id": "0d4c6e21-5a83-4b7f-9c10-2e8b3f5a6d94",
+    "kind": "boot",
+    "service": null,
+    "target": "windows",
+    "actionId": null,
+    "mode": "manual",
+    "initiator": {
+      "client": "phone",
+      "device": "pixel-8",
+      "user": "x1f4r"
+    },
+    "state": "running",
+    "phase": "rebooting",
+    "progress": null,
+    "requestedAt": "2026-09-03T14:00:00.000Z",
+    "startedAt": "2026-09-03T14:00:00.000Z",
+    "updatedAt": "2026-09-03T14:00:03.000Z",
+    "finishedAt": null,
+    "expiresAt": null,
+    "pid": 20114,
+    "detached": false,
+    "result": null,
+    "log": [
+      {
+        "at": "2026-09-03T14:00:00.000Z",
+        "line": "BootNext set to 0002 and read back"
+      },
+      {
+        "at": "2026-09-03T14:00:03.000Z",
+        "line": "reboot scheduled"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

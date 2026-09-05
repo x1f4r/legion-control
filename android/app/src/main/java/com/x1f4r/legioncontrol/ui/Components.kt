@@ -348,6 +348,7 @@ fun DocumentField(
     onValueChange: (String) -> Unit,
     placeholder: String,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     val cursor = MaterialTheme.colorScheme.primary
     Column(modifier.fillMaxWidth()) {
@@ -365,6 +366,7 @@ fun DocumentField(
                 )
             }
             BasicTextField(
+                enabled = enabled,
                 value = value,
                 onValueChange = onValueChange,
                 textStyle = MaterialTheme.typography.bodySmall.copy(

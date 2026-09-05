@@ -97,11 +97,14 @@ export function stagedVersion(service) {
 
 /** GET an https URL and return the body, or null. Never rejects. */
 function getBody(url, timeoutMs) {
+  if (timeoutMs <= 0) return Promise.resolve({ body: null, error: 'there was no time left in the budget for the release feed' });
   return new Promise((resolve) => {
     let settled = false;
+    let timer;
     const finish = (value) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       resolve(value);
     };
 
@@ -119,7 +122,7 @@ function getBody(url, timeoutMs) {
       (response) => {
         const status = response.statusCode ?? 0;
         if (status !== 200) {
-          response.resume();
+          request.destroy();
           finish({ body: null, error: `GitHub answered HTTP ${status}` });
           return;
         }
@@ -141,10 +144,14 @@ function getBody(url, timeoutMs) {
         response.on('error', (err) => finish({ body: null, error: err.message }));
       },
     );
-    request.on('timeout', () => {
+    const timedOut = () => {
       request.destroy();
       finish({ body: null, error: `GitHub timed out after ${timeoutMs} ms` });
-    });
+    };
+    // Socket timeouts only measure inactivity. A slow response delivering a
+    // byte at a time must still fit inside the complete status deadline.
+    timer = setTimeout(timedOut, timeoutMs);
+    request.on('timeout', timedOut);
     request.on('error', (err) => finish({ body: null, error: err.message }));
   });
 }

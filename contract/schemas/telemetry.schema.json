@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "telemetry.schema.json",
+  "title": "Agent-local telemetry configuration",
+  "description": "The optional config.json telemetry block. It describes only explicit local probes and is not part of the shared controller document.",
+  "anyOf": [
+    {
+      "type": "null"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "probes": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/probe"
+          }
+        }
+      },
+      "required": [
+        "probes"
+      ],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "probe": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "allOf": [
+            {
+              "$ref": "common.schema.json#/$defs/configuredId"
+            }
+          ],
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "not": {
+            "pattern": "[\\u0000-\\u001f\\u007f]"
+          }
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 24,
+          "not": {
+            "pattern": "[\\u0000-\\u001f\\u007f]"
+          }
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000]+$"
+          }
+        },
+        "timeoutSeconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 2
+        }
+      },
+      "required": [
+        "id",
+        "command"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

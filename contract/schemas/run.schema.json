@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run.schema.json",
+  "title": "legionctl run",
+  "description": "A configured action. `id` is the 2.x key for the action that ran and keeps that name; the operation record calls the same value `actionId`.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "$ref": "mutation.schema.json#/$defs/conflictRule"
+    },
+    {
+      "$ref": "mutation.schema.json#/$defs/queueRule"
+    },
+    {
+      "$ref": "mutation.schema.json#/$defs/acceptedRule"
+    }
+  ],
+  "properties": {
+    "action": {
+      "enum": [
+        "ran",
+        "deferred",
+        "queued",
+        "failed",
+        "accepted",
+        "conflict",
+        "interrupted",
+        "cancelled",
+        "expired",
+        "already-running"
+      ]
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/configuredIdOrNull"
+    },
+    "exitCode": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "output": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "op": {
+      "$ref": "mutation.schema.json#/$defs/opOrNull"
+    },
+    "detached": {
+      "type": "boolean"
+    },
+    "replayed": {
+      "type": "boolean"
+    },
+    "replaced": {
+      "$ref": "common.schema.json#/$defs/opIdOrNull"
+    },
+    "conflict": {
+      "$ref": "common.schema.json#/$defs/opConflict"
+    },
+    "opId": {
+      "description": "The operation id, echoed beside the record. Additive: the canonical place to read it is op.id.",
+      "$ref": "common.schema.json#/$defs/opId"
+    }
+  },
+  "required": [
+    "action",
+    "id",
+    "exitCode",
+    "output",
+    "op"
+  ],
+  "unevaluatedProperties": false
+}

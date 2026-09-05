@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "controller": {
+    "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+    "revision": 13,
+    "lineage": [
+      "668a9a05d7eabf59835baea274c89cd5a1275e1e4978929faeffe68dcc487c1c"
+    ]
+  },
+  "futureTopLevelKey": {
+    "addedBy": "1.4",
+    "keep": true
+  },
+  "machines": [
+    {
+      "id": "pi",
+      "name": "Atlas",
+      "futureMachineKey": [
+        "anything",
+        "at",
+        "all"
+      ],
+      "endpoints": [
+        {
+          "id": "lan",
+          "host": "192.168.178.40",
+          "user": "x1f4r",
+          "futureEndpointKey": 42
+        }
+      ]
+    }
+  ]
+}

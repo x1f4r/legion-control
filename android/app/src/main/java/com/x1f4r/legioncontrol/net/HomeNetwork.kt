@@ -51,6 +51,62 @@ class HomeNetwork(context: Context) {
     }
 
     /**
+     * Every IPv4 address this device holds, on every attached network.
+     *
+     * Every attached network and not only the default one: with a tunnel up the default network's
+     * only addresses are tunnel addresses, so asking it alone would say "not at home" while the
+     * phone is sitting on the home Wi-Fi.
+     */
+    @Suppress("DEPRECATION")
+    fun addresses(): List<String> = runCatching {
+        val manager = connectivity ?: return emptyList()
+        manager.allNetworks.flatMap { network ->
+            manager.getLinkProperties(network)?.linkAddresses.orEmpty()
+                .mapNotNull { it.address as? Inet4Address }
+                .mapNotNull { it.hostAddress }
+        }.distinct()
+    }.getOrDefault(emptyList())
+
+    /** The same, as a stream, so the site line follows the phone out of the house. */
+    fun observeAddresses(): Flow<List<String>> = callbackFlow {
+        val manager = connectivity
+        if (manager == null) {
+            trySend(emptyList())
+            awaitClose { }
+            return@callbackFlow
+        }
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                trySend(addresses())
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                trySend(addresses())
+            }
+
+            override fun onLost(network: Network) {
+                trySend(addresses())
+            }
+        }
+        trySend(addresses())
+        manager.registerDefaultNetworkCallback(callback)
+        awaitClose { runCatching { manager.unregisterNetworkCallback(callback) } }
+    }.distinctUntilChanged().conflate()
+
+    /**
+     * The network a magic packet has to leave by for one of a set of prefixes.
+     *
+     * The site version of [homeNetwork]: a site can name several prefixes and the packet has to go
+     * out of whichever interface actually holds one of them.
+     */
+    fun networkForPrefixes(prefixes: List<String>): Network? {
+        val manager = connectivity ?: return null
+        return prefixes.firstNotNullOfOrNull { prefix ->
+            prefix.takeIf { it.isNotBlank() }?.let { homeAddress(manager, it)?.second }
+        }
+    }
+
+    /**
      * The interface a magic packet has to leave by, when the phone has one.
      *
      * Handed to [WakeOnLan] so the socket is bound to the home network rather than to whatever is

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bundle.schema.json",
+  "title": "legionctl bundle",
+  "description": "Everything needed to work out what is wrong with a machine, in one reply a client can save to a file. Each part is the full reply of the command it is named after, so a client decodes it with the decoder it already has.",
+  "type": "object",
+  "allOf": [{ "$ref": "common.schema.json#/$defs/envelope" }],
+  "properties": {
+    "generatedAt": { "$ref": "common.schema.json#/$defs/iso" },
+    "doctor": { "$ref": "doctor.schema.json" },
+    "status": { "$ref": "status.schema.json" },
+    "history": { "$ref": "history.schema.json" },
+    "logs": { "$ref": "logs.schema.json" },
+    "config": { "$ref": "#/$defs/sanitizedConfig" },
+    "redacted": {
+      "description": "The config paths whose values were replaced with \"<redacted>\", so a reader knows what is missing rather than guessing.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "maxItems": 200
+    }
+  },
+  "required": ["generatedAt", "doctor", "status", "history", "logs", "config", "redacted"],
+  "unevaluatedProperties": false,
+  "$defs": {
+    "sanitizedConfig": {
+      "description": "The agent's own configuration document with sensitive values removed. Its full schema belongs to the agent, not to this reply contract, so only the keys a client reads are pinned here and the rest is passed through as the agent wrote it. Anything that looks like a key path or a token is the string \"<redacted>\".",
+      "type": "object",
+      "properties": {
+        "system": { "$ref": "common.schema.json#/$defs/systemIdentity" },
+        "services": { "type": "array" },
+        "updates": { "type": "object" },
+        "autoUpdate": { "type": "boolean" }
+      },
+      "required": ["system", "services"]
+    }
+  }
+}

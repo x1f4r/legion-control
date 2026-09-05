@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.net
 
 import com.x1f4r.legioncontrol.agent.AgentFailure
+import com.x1f4r.legioncontrol.agent.DispatchStage
 import com.x1f4r.legioncontrol.data.DeviceIdentity
 import com.x1f4r.legioncontrol.data.HostKeyStore
 import kotlinx.coroutines.CancellationException
@@ -17,8 +18,10 @@ import net.schmizz.sshj.common.SecurityUtils
 import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.userauth.UserAuthException
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
 import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
@@ -58,6 +61,15 @@ class SshTransport(
         endpoint: Endpoint,
         command: String,
         timeoutMillis: Long,
+        /**
+         * Bytes to write to the command's standard input, or null.
+         *
+         * The contract has two commands that take their payload this way rather than as an
+         * argument: `policy set`, which reads a JSON patch, and `self-update --stdin`, which reads a
+         * whole signed tarball. Both exist so that nothing large or quoted has to travel on a
+         * command line, which is also what makes them work through the restricted dispatcher.
+         */
+        stdin: StdinSource? = null,
     ): CommandOutcome = coroutineScope {
         val config = DefaultConfig().apply {
             // The long commands (update takes minutes) sit silent on a phone's connection, which is
@@ -65,8 +77,13 @@ class SshTransport(
             keepAliveProvider = KeepAliveProvider.KEEP_ALIVE
         }
 
-        val verifier = PinnedHostKeyVerifier(hostKeys, endpoint.address, endpoint.trustedKeyCapacity)
+        val verifier = PinnedHostKeyVerifier(hostKeys, endpoint.address)
         val client = SSHClient(config)
+
+        // Flipped the instant the command is handed to a channel, and read by every failure path
+        // below. It is the difference between "the far side never heard this" and "the far side may
+        // have run it", and a mutation is only ever repeated on the first of those.
+        val dispatched = AtomicBoolean(false)
 
         // The whole blocking conversation runs as a child, and this coroutine does nothing but wait
         // on it. That split is what makes cancellation work at all. sshj reads from a plain socket,
@@ -103,7 +120,7 @@ class SshTransport(
 
                 client.connection.keepAlive.keepAliveInterval = KEEP_ALIVE_SECONDS
 
-                exec(client, command, timeoutMillis)
+                exec(client, command, timeoutMillis, dispatched, stdin)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: AgentFailure) {
@@ -113,7 +130,7 @@ class SshTransport(
                 // throws checked exceptions out of places that are easy to miss, and the caller above
                 // this one catches AgentFailure only: anything that got past here would not become a
                 // sentence at the bottom of the screen, it would take the app down.
-                throw unreachable(endpoint, failure)
+                throw unreachable(endpoint, failure, stageOf(dispatched))
             } finally {
                 runCatching { client.close() }
             }
@@ -136,9 +153,12 @@ class SshTransport(
             // the screen launched, so anything else would take the whole app down rather than turn
             // into a sentence. sshj throws from more places than the ones translated by hand: opening
             // a channel, closing one, and every write on a link that has already gone.
-            throw unreachable(endpoint, failure)
+            throw unreachable(endpoint, failure, stageOf(dispatched))
         }
     }
+
+    private fun stageOf(dispatched: AtomicBoolean): DispatchStage =
+        if (dispatched.get()) DispatchStage.AMBIGUOUS else DispatchStage.NOT_STARTED
 
     private suspend fun connect(client: SSHClient, endpoint: Endpoint, verifier: PinnedHostKeyVerifier) {
         try {
@@ -154,6 +174,8 @@ class SshTransport(
                     trustedFingerprints = it.trustedFingerprints,
                     offeredFingerprint = it.offeredFingerprint,
                     offeredKeyBlob = it.offeredKeyBlob,
+                    isFirstContact = it.isFirstContact,
+                    canApprove = it.canApprove,
                     cause = failure,
                 )
             }
@@ -180,19 +202,82 @@ class SshTransport(
         }
     }
 
+    /**
+     * Copies a local file to the far side over SFTP.
+     *
+     * Used for one thing: putting a signed agent tarball on a machine whose agent is too old to have
+     * `self-update --stdin`. It is a file transfer, not a shell command, so there is no redirect to
+     * quote and no chance of the path turning into something else on the way. sshj opens the SFTP
+     * subsystem over the same authenticated connection.
+     */
+    suspend fun upload(
+        endpoint: Endpoint,
+        source: File,
+        remotePath: String,
+        timeoutMillis: Long,
+    ): Unit = coroutineScope {
+        val verifier = PinnedHostKeyVerifier(hostKeys, endpoint.address)
+        val client = SSHClient(DefaultConfig())
+        val work = async(Dispatchers.IO) {
+            try {
+                client.connectTimeout = CONNECT_TIMEOUT_MILLIS
+                client.timeout = timeoutMillis.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+                client.addHostKeyVerifier(verifier)
+                connect(client, endpoint, verifier)
+                authenticate(client, endpoint)
+                client.newSFTPClient().use { sftp ->
+                    // The agent's incoming directory does not exist on a machine that has never
+                    // been sent anything, and sshj's put does not create parents.
+                    remotePath.substringBeforeLast('/', "").takeIf { it.isNotEmpty() }?.let {
+                        runCatching { sftp.mkdirs(it) }
+                    }
+                    sftp.put(source.absolutePath, remotePath)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: AgentFailure) {
+                throw failure
+            } catch (failure: Exception) {
+                // An upload that failed halfway leaves a partial file, and the agent refuses an
+                // archive whose hash does not match, so a partial upload can only ever be refused
+                // rather than installed. Reported as ambiguous all the same: bytes did leave here.
+                throw unreachable(endpoint, failure, DispatchStage.AMBIGUOUS)
+            } finally {
+                runCatching { client.close() }
+            }
+        }
+        try {
+            work.await()
+        } catch (cancelled: CancellationException) {
+            runCatching { client.close() }
+            throw cancelled
+        } catch (failure: AgentFailure) {
+            throw failure
+        } catch (failure: Exception) {
+            throw unreachable(endpoint, failure, DispatchStage.AMBIGUOUS)
+        }
+    }
+
     private suspend fun exec(
         client: SSHClient,
         command: String,
         timeoutMillis: Long,
+        dispatched: AtomicBoolean,
+        stdin: StdinSource?,
     ): CommandOutcome = coroutineScope {
         val session: Session = try {
             client.startSession()
         } catch (failure: CancellationException) {
             throw failure
         } catch (failure: Exception) {
-            throw AgentFailure.BadOutput(
+            // The key was accepted and the channel was not opened, so the command was never handed
+            // over. Reported as unreachable rather than as unreadable output, because "unreadable"
+            // is the ambiguous case and this one is not: nothing ran.
+            throw AgentFailure.Unreachable(
+                machineName,
                 "$machineName accepted the key and then refused a session. ${describe(failure)}",
                 failure,
+                DispatchStage.NOT_STARTED,
             )
         }
 
@@ -212,12 +297,22 @@ class SshTransport(
 
         val outcome = try {
             val process = session.exec(command)
+            // From here on the far side has the command. Nothing below may be reported as "never
+            // sent", however it ends.
+            dispatched.set(true)
             // Both streams get drained at the same time. Reading one to the end first deadlocks as
             // soon as the other fills its window, and node writes progress to stderr while the JSON
             // is still coming out of stdout, so that is not a theoretical case here.
+            // Writing a whole tarball to stdin while nothing reads stdout deadlocks the same way
+            // that reading one output stream to the end before the other does, so all three run at
+            // once.
             val (out, err) = coroutineScope {
+                val writing = stdin?.let { source ->
+                    async(Dispatchers.IO) { writeStdin(process.outputStream, source) }
+                }
                 val stdout = async(Dispatchers.IO) { process.inputStream.readTextQuietly() }
                 val stderr = async(Dispatchers.IO) { process.errorStream.readTextQuietly() }
+                writing?.await()
                 stdout.await() to stderr.await()
             }
 
@@ -245,7 +340,11 @@ class SshTransport(
         outcome
     }
 
-    private fun unreachable(endpoint: Endpoint, failure: Throwable): AgentFailure.Unreachable {
+    private fun unreachable(
+        endpoint: Endpoint,
+        failure: Throwable,
+        stage: DispatchStage = DispatchStage.NOT_STARTED,
+    ): AgentFailure.Unreachable {
         val what = when (failure) {
             is UnknownHostException -> "${endpoint.host} could not be resolved."
             is NoRouteToHostException -> "There is no route to ${endpoint.host}."
@@ -253,7 +352,7 @@ class SshTransport(
             is SocketTimeoutException -> "${endpoint.address} did not answer in time."
             else -> describe(failure)
         }
-        return AgentFailure.Unreachable(machineName, "${endpoint.label}: $what", failure)
+        return AgentFailure.Unreachable(machineName, "${endpoint.label}: $what", failure, stage)
     }
 
     private fun describe(failure: Throwable): String {
@@ -300,6 +399,40 @@ private object SshjOnAndroid {
     }
 
     fun configure() = Unit
+}
+
+/**
+ * Where a command's standard input comes from.
+ *
+ * Two shapes because the two callers are genuinely different: a policy patch is a few hundred bytes
+ * that are already in memory, and an agent tarball is megabytes that should not be.
+ */
+sealed interface StdinSource {
+    class Bytes(val bytes: ByteArray) : StdinSource
+
+    /** Opened when the write starts and closed when it finishes. */
+    class Streamed(val open: () -> InputStream) : StdinSource
+}
+
+/**
+ * Writes the input and closes it, because a command reading stdin waits for end of file.
+ *
+ * Failures are swallowed on purpose. A far side that exited before reading its input closes the
+ * channel, and the write then throws; that is not the interesting failure, the reply is, and losing
+ * the reply to report a broken pipe would hide what actually happened.
+ */
+private fun writeStdin(output: OutputStream, source: StdinSource) {
+    try {
+        output.use { sink ->
+            when (source) {
+                is StdinSource.Bytes -> sink.write(source.bytes)
+                is StdinSource.Streamed -> source.open().use { it.copyTo(sink, 64 * 1024) }
+            }
+            sink.flush()
+        }
+    } catch (_: IOException) {
+        // The far side stopped listening. Whatever it said is the answer.
+    }
 }
 
 /**

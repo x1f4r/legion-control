@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Cut a release of Legion Control: both apps, one version, one tag, one GitHub release.
+# Cut a release of Legion Control: four clients, one version, one tag, one GitHub release.
 #
 #   ./scripts/release.sh 1.1.0                   bump, build, tag, publish
 #   ./scripts/release.sh 1.1.0 --dry-run         everything except commit, tag, push and publish
@@ -9,19 +9,9 @@
 #
 # With none of the notes options it opens $EDITOR on a template and waits.
 #
-# The conventions this keeps, because the two apps read them back at runtime to find their own
-# updates: the tag is vX.Y.Z, the release is named "Legion Control X.Y.Z", and exactly two assets
-# are attached, Legion-Control-macos-arm64.zip and Legion-Control-android-arm64.apk. The Mac app
-# picks the first asset whose name ends in .zip and the phone the first ending in .apk, so a third
-# asset of either kind would be a coin toss.
-#
-# The two version numbers stay mirrored. There is one release, not a Mac one and an Android one, and
-# a build number that means a different thing on each side is a number nobody can read. This refuses
-# to run when they have drifted rather than quietly picking one.
-#
-# Nothing is committed, tagged or pushed until both artifacts exist and both have been opened up and
-# asked what version they think they are. A tag pointing at a build that says something else is the
-# one mistake here that cannot be taken back.
+# A release contains four platform clients, the shared agent, and a signed manifest.
+# Checks, artifact version validation and integrity verification finish before publication.
+# Signing material lives outside the repository; see docs/security.md.
 #
 set -euo pipefail
 
@@ -34,6 +24,10 @@ GRADLE_REL="android/app/build.gradle.kts"
 PLIST="$ROOT/$PLIST_REL"
 GRADLE="$ROOT/$GRADLE_REL"
 DIST="$ROOT/dist"
+DESKTOP_REL="desktop/LegionControl.Desktop/LegionControl.Desktop.csproj"
+DESKTOP_PROJECT="$ROOT/$DESKTOP_REL"
+LINUX_ARCHIVE="$DIST/Legion-Control-linux-x64.tar.gz"
+WINDOWS_ARCHIVE="$DIST/Legion-Control-windows-x64.zip"
 MAC_ZIP="$DIST/Legion-Control-macos-arm64.zip"
 ANDROID_APK="$DIST/Legion-Control-android-arm64.apk"
 PLIST_BUDDY="/usr/libexec/PlistBuddy"
@@ -115,10 +109,12 @@ printf '%s' "$OLD_BUILD" | grep -Eq '^[0-9]+$' || die "CFBundleVersion in $PLIST
 printf '%s' "$OLD_CODE" | grep -Eq '^[0-9]+$' || die "versionCode in $GRADLE_REL is \"$OLD_CODE\", which cannot be incremented."
 
 [ "$OLD_VERSION" = "$OLD_NAME" ] \
-	|| die "the two apps disagree about the current version: the Mac says $OLD_VERSION and Android says $OLD_NAME. Put them back in step before releasing."
+	|| die "macOS and Android disagree about the current version: the Mac says $OLD_VERSION and Android says $OLD_NAME. Put them back in step before releasing."
 [ "$OLD_BUILD" = "$OLD_CODE" ] \
-	|| die "the two apps disagree about the current build number: the Mac says $OLD_BUILD and Android says $OLD_CODE. Put them back in step before releasing."
+	|| die "macOS and Android disagree about the current build number: the Mac says $OLD_BUILD and Android says $OLD_CODE. Put them back in step before releasing."
 
+OLD_DESKTOP_VERSION="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$DESKTOP_PROJECT" | head -1)"
+[ "$OLD_DESKTOP_VERSION" = "$OLD_VERSION" ] || die "desktop says $OLD_DESKTOP_VERSION while macOS and Android say $OLD_VERSION."
 BUILD_NUMBER=$((OLD_BUILD + 1))
 
 say "Currently $OLD_VERSION ($OLD_BUILD), releasing $VERSION ($BUILD_NUMBER)."
@@ -176,12 +172,15 @@ COMMITTED=0
 finish() {
 	cleanup_notes
 	if [ "$BUMPED" -eq 1 ] && [ "$COMMITTED" -eq 0 ]; then
-		git -C "$ROOT" checkout -- "$PLIST_REL" "$GRADLE_REL" 2>/dev/null || true
+		git -C "$ROOT" checkout -- "$PLIST_REL" "$GRADLE_REL" "$DESKTOP_REL" 2>/dev/null || true
 		say ""
 		say "The version numbers were put back to $OLD_VERSION ($OLD_BUILD)."
 	fi
 }
 trap finish EXIT
+
+step "Running the complete verification suite"
+"$ROOT/scripts/check.sh" all
 
 step "Bumping to $VERSION ($BUILD_NUMBER)"
 
@@ -196,14 +195,23 @@ sed -i '' -E "s/^([[:space:]]*versionName = \")[^\"]*(\")\$/\\1$VERSION\\2/" "$G
 [ "$(gradle_get versionName)" = "$VERSION" ] || die "$GRADLE_REL did not take the new versionName."
 [ "$(gradle_get versionCode)" = "$BUILD_NUMBER" ] || die "$GRADLE_REL did not take the new versionCode."
 
-say "$PLIST_REL and $GRADLE_REL now say $VERSION ($BUILD_NUMBER)."
+python3 - "$DESKTOP_PROJECT" "$VERSION" <<'PYVERSION'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1]); text = p.read_text()
+if not re.search(r'<Version>[^<]+</Version>', text):
+    raise SystemExit('Desktop project needs an explicit Version property.')
+p.write_text(re.sub(r'<Version>[^<]+</Version>', '<Version>' + sys.argv[2] + '</Version>', text))
+PYVERSION
+say "All client projects now say $VERSION ($BUILD_NUMBER)."
 
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 
-rm -rf "$DIST"
 mkdir -p "$DIST"
+
+step "Packaging and signing the bundled control agent"
+node "$ROOT/scripts/package-agent.mjs"
 
 step "Building the Mac app"
 
@@ -225,6 +233,11 @@ BUILT_APK="$ROOT/android/app/build/outputs/apk/release/app-release.apk"
 cp "$BUILT_APK" "$ANDROID_APK"
 say "Wrote $(basename "$ANDROID_APK") ($(du -h "$ANDROID_APK" | cut -f1))"
 
+step "Building Linux and Windows desktop apps"
+"$ROOT/desktop/build.sh"
+[ -f "$LINUX_ARCHIVE" ] || die "desktop/build.sh left no Linux archive."
+[ -f "$WINDOWS_ARCHIVE" ] || die "desktop/build.sh left no Windows archive."
+
 # ---------------------------------------------------------------------------
 # Ask the artifacts what they think they are
 # ---------------------------------------------------------------------------
@@ -240,13 +253,14 @@ ditto -x -k "$MAC_ZIP" "$VERIFY_DIR"
 ZIPPED_PLIST="$VERIFY_DIR/Legion Control.app/Contents/Info.plist"
 [ -f "$ZIPPED_PLIST" ] || { rm -rf "$VERIFY_DIR"; die "the Mac zip does not hold Legion Control.app."; }
 ZIPPED_VERSION="$("$PLIST_BUDDY" -c "Print :CFBundleShortVersionString" "$ZIPPED_PLIST")"
+ZIPPED_BUILD="$("$PLIST_BUDDY" -c "Print :CFBundleVersion" "$ZIPPED_PLIST")"
 rm -rf "$VERIFY_DIR"
+[ "$ZIPPED_BUILD" = "$BUILD_NUMBER" ] || die "the zipped app has build $ZIPPED_BUILD, not $BUILD_NUMBER."
 [ "$ZIPPED_VERSION" = "$VERSION" ] || die "the zipped app says $ZIPPED_VERSION, not $VERSION."
 say "The Mac zip holds Legion Control.app at $ZIPPED_VERSION."
 
 # aapt only exists when an Android SDK is installed, and the APK was just built by a script that
-# needs one, so this normally runs. It is a check and not a requirement, so a missing tool says so
-# and moves on rather than stopping a release over its own inability to look.
+# needs one. Refuse publication if the packaged version cannot be verified.
 SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
 AAPT=""
 for candidate in "$SDK_DIR"/build-tools/*/aapt2 "$SDK_DIR"/build-tools/*/aapt; do
@@ -254,11 +268,22 @@ for candidate in "$SDK_DIR"/build-tools/*/aapt2 "$SDK_DIR"/build-tools/*/aapt; d
 done
 if [ -n "$AAPT" ]; then
 	APK_VERSION="$("$AAPT" dump badging "$ANDROID_APK" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -1)"
+	APK_BUILD="$("$AAPT" dump badging "$ANDROID_APK" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -1)"
+	[ "$APK_BUILD" = "$BUILD_NUMBER" ] || die "the APK has build $APK_BUILD, not $BUILD_NUMBER."
 	[ "$APK_VERSION" = "$VERSION" ] || die "the APK says $APK_VERSION, not $VERSION."
 	say "The APK reports $APK_VERSION."
 else
-	say "No aapt under $SDK_DIR/build-tools, so the APK's version was not checked. Everything else was."
+	die "No aapt under $SDK_DIR/build-tools; APK version verification is required."
 fi
+
+# ---------------------------------------------------------------------------
+# Sign the exact final bytes before publication
+
+node "$ROOT/scripts/verify-desktop-artifacts.mjs" "$VERSION" "$DIST"
+
+node "$ROOT/scripts/sign-release.mjs" "$VERSION" "$DIST"
+AGENT_VERSION="$(node -p 'JSON.parse(require("node:fs").readFileSync("agent/package.json", "utf8")).version')"
+AGENT_ARCHIVE="$DIST/legionctl-agent-$AGENT_VERSION.tgz"
 
 # ---------------------------------------------------------------------------
 # Publish
@@ -266,7 +291,7 @@ fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
 	step "Dry run, stopping here"
-	say "Both artifacts are in dist/ and both say $VERSION."
+	say "All platform artifacts and the signed manifest are in dist/."
 	say "What a real run would do from here:"
 	say "    git commit -m \"Release $VERSION\" -- $PLIST_REL $GRADLE_REL"
 	say "    git tag -a v$VERSION -m \"Legion Control $VERSION\""
@@ -277,7 +302,7 @@ fi
 
 step "Committing, tagging and pushing"
 
-git -C "$ROOT" add -- "$PLIST_REL" "$GRADLE_REL"
+git -C "$ROOT" add -- "$PLIST_REL" "$GRADLE_REL" "$DESKTOP_REL"
 git -C "$ROOT" commit -m "Release $VERSION"
 COMMITTED=1
 git -C "$ROOT" tag -a "v$VERSION" -m "Legion Control $VERSION"
@@ -289,7 +314,8 @@ step "Publishing the release"
 URL="$(gh release create "v$VERSION" \
 	--title "Legion Control $VERSION" \
 	--notes-file "$NOTES" \
-	"$MAC_ZIP" "$ANDROID_APK")"
+	"$MAC_ZIP" "$ANDROID_APK" "$LINUX_ARCHIVE" "$WINDOWS_ARCHIVE" "$AGENT_ARCHIVE" \
+	"$DIST/Legion-Control-manifest.json" "$DIST/Legion-Control-manifest.json.sig")"
 
 say ""
 say "Legion Control $VERSION is out."

@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cycle.schema.json",
+  "title": "legionctl cycle",
+  "description": "The scheduled maintenance pass over every eligible service, and the command the schedulers run. One service being deferred or failing never stops the others, so the interesting content is in `children`.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "$ref": "mutation.schema.json#/$defs/conflictRule"
+    },
+    {
+      "description": "A dry run takes no lock and writes no record, so it has a plan and no operation. A real cycle is the other way round.",
+      "if": {
+        "properties": {
+          "dryRun": {
+            "const": true
+          }
+        },
+        "required": [
+          "dryRun"
+        ]
+      },
+      "then": {
+        "properties": {
+          "op": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "plan"
+        ]
+      },
+      "else": {
+        "required": [
+          "children"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "enum": [
+        "cycled",
+        "skipped",
+        "failed",
+        "conflict"
+      ]
+    },
+    "dryRun": {
+      "type": "boolean"
+    },
+    "op": {
+      "$ref": "mutation.schema.json#/$defs/opOrNull"
+    },
+    "children": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/opChild"
+      },
+      "maxItems": 50
+    },
+    "plan": {
+      "description": "What a real cycle would do right now, one entry per configured service, in the order they would be walked.",
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "properties": {
+          "service": {
+            "$ref": "common.schema.json#/$defs/token"
+          },
+          "wouldRun": {
+            "type": "boolean"
+          },
+          "reasonCode": {
+            "$ref": "common.schema.json#/$defs/reasonCodeOrNull"
+          },
+          "detail": {
+            "$ref": "common.schema.json#/$defs/text"
+          }
+        },
+        "required": [
+          "service",
+          "wouldRun",
+          "reasonCode",
+          "detail"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "queued": {
+      "description": "Queued when-idle operations this cycle ran or expired, oldest first.",
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "$ref": "common.schema.json#/$defs/opChild"
+      }
+    },
+    "recovered": {
+      "description": "Operations the recovery pass finished because the process that owned them is gone.",
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "$ref": "common.schema.json#/$defs/opChild"
+      }
+    },
+    "conflict": {
+      "$ref": "common.schema.json#/$defs/opConflict"
+    },
+    "opId": {
+      "description": "The operation id, echoed beside the record. Additive: the canonical place to read it is op.id.",
+      "$ref": "common.schema.json#/$defs/opId"
+    }
+  },
+  "required": [
+    "action",
+    "dryRun",
+    "op"
+  ],
+  "unevaluatedProperties": false
+}

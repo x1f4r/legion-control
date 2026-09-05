@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "no-update",
+  "message": "demo is already on 1.4.2",
+  "action": "noop",
+  "service": "demo",
+  "from": "1.4.2",
+  "to": "1.4.2",
+  "op": null
+}

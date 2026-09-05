@@ -1,0 +1,88 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "rolled back to the previous signed agent 3.0.0; the outgoing build is kept at /home/x1f4r/.legion-control/agent.prev",
+  "action": "rolled-back",
+  "current": {
+    "version": "3.0.0",
+    "contract": 3
+  },
+  "staged": null,
+  "previous": {
+    "version": "3.0.0",
+    "path": "/home/x1f4r/.legion-control/agent.prev"
+  },
+  "manifest": {
+    "schema": 1,
+    "version": "3.0.0",
+    "contract": 3,
+    "files": 31,
+    "signatureVerified": true,
+    "keyFingerprint": "8f2b6d41c0973ea5b8de10f47c26935ab0d84e7f1c53920684bfae7d3506c19b"
+  },
+  "selfTest": {
+    "ok": true,
+    "exitCode": 0,
+    "output": "{\"ok\":true,\"contract\":3,\"agentVersion\":\"3.0.0\",\"selfTest\":{\"ok\":true}}"
+  },
+  "op": {
+    "id": "7fd6806f-682a-4eb4-9aa7-a0d0c9fda733",
+    "kind": "self-update",
+    "service": null,
+    "target": "rollback:2222222222222222222222222222222222222222222222222222222222222222",
+    "actionId": null,
+    "mode": "manual",
+    "initiator": {
+      "client": "mac",
+      "device": "roberts-macbook-pro",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:00:00.000Z",
+    "startedAt": "2026-09-05T13:00:00.000Z",
+    "updatedAt": "2026-09-05T13:01:00.000Z",
+    "finishedAt": "2026-09-05T13:01:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": true,
+      "action": "rolled-back",
+      "reasonCode": null,
+      "message": "The previous signed build is restored.",
+      "from": "3.0.0",
+      "to": "3.0.0",
+      "exitCode": 0,
+      "output": null
+    },
+    "log": [
+      {
+        "at": "2026-09-05T13:00:00.000Z",
+        "line": "manifest signature verified against the release key"
+      },
+      {
+        "at": "2026-09-05T13:00:04.000Z",
+        "line": "31 files hashed and matched"
+      },
+      {
+        "at": "2026-09-05T13:00:40.000Z",
+        "line": "self-test: 18 modules loaded, contract 3"
+      },
+      {
+        "at": "2026-09-05T13:01:00.000Z",
+        "line": "agent.new swapped in, previous tree kept"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux",
+    "from": "3.0.0",
+    "to": "3.0.0"
+  }
+}

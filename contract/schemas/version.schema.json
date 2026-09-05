@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "version.schema.json",
+  "title": "legionctl version",
+  "description": "Who is answering. With --check it is also the self-test a staged tree has to pass before it is swapped in: it loads every module and prints the contract it implements.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    }
+  ],
+  "properties": {
+    "node": {
+      "$ref": "common.schema.json#/$defs/text"
+    },
+    "base": {
+      "$ref": "common.schema.json#/$defs/text"
+    },
+    "os": {
+      "enum": [
+        "linux",
+        "windows",
+        "mac"
+      ]
+    },
+    "selfTest": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "modules": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "failed": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "maxItems": 50
+        }
+      },
+      "required": [
+        "ok",
+        "modules",
+        "failed"
+      ],
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "description": "Optional documentation of behaviour, NEVER a gate. contract >= 3 unlocks the whole v3 surface; no client may require a name from this list to send a verb. Frozen names: setup-lineage, wol-action.",
+      "type": "array",
+      "items": {
+        "enum": [
+          "setup-lineage",
+          "wol-action"
+        ]
+      },
+      "maxItems": 8,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "node",
+    "base",
+    "os"
+  ],
+  "unevaluatedProperties": false
+}

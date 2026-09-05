@@ -1,0 +1,18 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "unknown-action",
+  "message": "this machine has no action called \"reindex\"; it has sunshine-restart and flush-cache",
+  "command": "run",
+  "argument": "reindex",
+  "accepts": [
+    "sunshine-restart",
+    "flush-cache"
+  ],
+  "error": "unknown action: reindex"
+}

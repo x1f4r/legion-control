@@ -1,0 +1,21 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "agent 2.1.0 is installed, contract 2; the bundled agent is 3.0.0",
+  "action": "checked",
+  "current": {
+    "version": "2.1.0",
+    "contract": 2
+  },
+  "staged": null,
+  "previous": null,
+  "manifest": null,
+  "selfTest": null,
+  "available": true,
+  "op": null
+}

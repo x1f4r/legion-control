@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "mac",
+    "name": "macOS"
+  },
+  "reasonCode": "app-closed",
+  "message": "T3 Desktop 1.9.4 is downloaded and applies when the app quits; it is still running, so nothing was replaced",
+  "action": "deferred",
+  "service": "t3-desktop",
+  "from": "1.9.3",
+  "to": "1.9.3",
+  "op": null
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "legacy-2x-mutation.schema.json",
+  "title": "update / restart / boot / sleep / run from an agent 2.x",
+  "description": "The whole of what 2.x said about a mutation: an outcome word and a sentence. No operation id, so a reply that never arrived can only be guessed at, and no reasonCode, so every kind of \"nothing happened\" reads the same. Both are the reasons contract 3 exists.",
+  "type": "object",
+  "properties": {
+    "ok": { "type": "boolean" },
+    "action": { "enum": ["updated", "noop", "deferred", "failed", "rolled-back", "restarted", "armed", "rebooting", "sleeping", "ran"] },
+    "service": { "$ref": "common.schema.json#/$defs/tokenOrNull" },
+    "target": { "$ref": "common.schema.json#/$defs/tokenOrNull" },
+    "id": { "$ref": "common.schema.json#/$defs/tokenOrNull" },
+    "from": { "$ref": "common.schema.json#/$defs/version" },
+    "to": { "$ref": "common.schema.json#/$defs/version" },
+    "exitCode": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+    "output": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+    "autoUpdate": { "type": "boolean" },
+    "message": { "$ref": "common.schema.json#/$defs/text" },
+    "error": { "$ref": "common.schema.json#/$defs/text" },
+    "contract": false
+  },
+  "required": ["ok", "action"],
+  "additionalProperties": false
+}

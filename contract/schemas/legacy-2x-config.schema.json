@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "legacy-2x-config.schema.json",
+  "title": "config and config set from an agent 2.x",
+  "description": "A 2.x machine stores the bytes and reports their hash. It has no idea of identity or revision, so a 3.x client that pushes to one records the copy as source \"legacy\" on its own side and never expects an ordering guarantee from the machine.",
+  "type": "object",
+  "properties": {
+    "ok": { "type": "boolean" },
+    "controller": { "$ref": "common.schema.json#/$defs/controllerDocument" },
+    "hash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+    "bytes": { "$ref": "common.schema.json#/$defs/count" },
+    "error": { "$ref": "common.schema.json#/$defs/text" },
+    "contract": false
+  },
+  "required": ["ok"],
+  "additionalProperties": false
+}

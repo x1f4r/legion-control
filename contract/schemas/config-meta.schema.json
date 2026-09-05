@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "config-meta.schema.json",
+  "title": "legionctl config meta",
+  "description": "The identity of the stored copy without the document itself, for a client that only wants to know whether it is behind. One line of output instead of a megabyte.",
+  "type": "object",
+  "allOf": [{ "$ref": "common.schema.json#/$defs/envelope" }],
+  "properties": {
+    "meta": { "$ref": "common.schema.json#/$defs/controllerMeta" },
+    "hash": { "$ref": "common.schema.json#/$defs/sha256OrNull" }
+  },
+  "required": ["meta", "hash"],
+  "unevaluatedProperties": false
+}

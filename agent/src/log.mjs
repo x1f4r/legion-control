@@ -44,3 +44,35 @@ export function note(message, command = '-') {
     /* stderr can be closed on a detached SSH session */
   }
 }
+
+/**
+ * The tail of the agent log, parsed back into fields.
+ *
+ * Lines the agent wrote carry a timestamp and the command that wrote them.
+ * Anything else in the file — a stray line from a child process that inherited
+ * the handle — is returned with nulls rather than dropped, because a diagnostic
+ * log that quietly hides the lines it does not recognise is worse than useless.
+ */
+export function readLogLines({ lines = 100, file = logPath() } = {}) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ok: true, path: file, lines: [], truncated: false, total: 0 };
+    return { ok: false, path: file, lines: [], truncated: false, total: 0, error: err.message };
+  }
+
+  const all = text.split('\n').filter((line) => line.trim().length > 0);
+  const shown = all.slice(-lines);
+  return {
+    ok: true,
+    path: file,
+    total: all.length,
+    truncated: all.length > shown.length,
+    lines: shown.map((line) => {
+      const match = /^(\S+)\s+\[([^\]]*)\]\s([\s\S]*)$/.exec(line);
+      if (!match || Number.isNaN(Date.parse(match[1]))) return { at: null, command: null, line };
+      return { at: new Date(match[1]).toISOString(), command: match[2] === '-' ? null : match[2], line: match[3] };
+    }),
+  };
+}

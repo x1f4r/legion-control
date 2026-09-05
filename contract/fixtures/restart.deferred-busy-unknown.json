@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "busy-unknown",
+  "message": "whether edge is busy could not be determined (no busy probe is configured), so the restart was not run; pass --force to restart anyway",
+  "action": "deferred",
+  "service": "edge",
+  "op": null
+}

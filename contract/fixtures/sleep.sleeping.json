@@ -1,0 +1,51 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "systemctl suspend was accepted; whether the machine actually suspended is not something this process can see",
+  "action": "sleeping",
+  "op": {
+    "id": "5e2a9c76-8d34-4b1e-97f0-6a3d5b8c214f",
+    "kind": "sleep",
+    "service": null,
+    "target": null,
+    "actionId": null,
+    "mode": "force",
+    "initiator": {
+      "client": "mac",
+      "device": "roberts-macbook-pro",
+      "user": "x1f4r"
+    },
+    "state": "running",
+    "phase": "suspending",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:59:00.000Z",
+    "startedAt": "2026-09-05T13:59:00.000Z",
+    "updatedAt": "2026-09-05T13:59:02.000Z",
+    "finishedAt": null,
+    "expiresAt": null,
+    "pid": 24902,
+    "detached": false,
+    "result": null,
+    "log": [
+      {
+        "at": "2026-09-05T13:59:00.000Z",
+        "line": "lock taken for sleep"
+      },
+      {
+        "at": "2026-09-05T13:59:01.000Z",
+        "line": "busy gate forced past: 1 turn running"
+      },
+      {
+        "at": "2026-09-05T13:59:02.000Z",
+        "line": "systemctl suspend accepted"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

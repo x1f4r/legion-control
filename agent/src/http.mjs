@@ -12,14 +12,20 @@ const MAX_BODY_BYTES = 1024 * 1024;
 export function httpGet({ host = '127.0.0.1', port, path = '/', timeoutMs = 5000, wantBody = false } = {}) {
   return new Promise((resolve) => {
     let settled = false;
+    let timer;
     const finish = (value) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       resolve(value);
     };
 
     if (!Number.isInteger(port) || port <= 0) {
       finish({ ok: false, status: 0, body: null, error: 'no port is configured' });
+      return;
+    }
+    if (timeoutMs <= 0) {
+      finish({ ok: false, status: 0, body: null, error: 'there was no time left in the HTTP probe budget' });
       return;
     }
 
@@ -30,7 +36,7 @@ export function httpGet({ host = '127.0.0.1', port, path = '/', timeoutMs = 5000
         if (!wantBody) {
           response.resume();
           response.on('end', () => finish({ ok: status === 200, status, body: null, error: null }));
-          response.on('error', () => finish({ ok: status === 200, status, body: null, error: null }));
+          response.on('error', (err) => finish({ ok: false, status, body: null, error: err.message }));
           return;
         }
         let body = '';
@@ -43,10 +49,12 @@ export function httpGet({ host = '127.0.0.1', port, path = '/', timeoutMs = 5000
         response.on('error', (err) => finish({ ok: false, status, body: null, error: err.message }));
       },
     );
-    request.on('timeout', () => {
+    const timedOut = () => {
       request.destroy();
       finish({ ok: false, status: 0, body: null, error: `${host}:${port}${path} timed out after ${timeoutMs} ms` });
-    });
+    };
+    timer = setTimeout(timedOut, timeoutMs);
+    request.on('timeout', timedOut);
     request.on('error', (err) => finish({ ok: false, status: 0, body: null, error: err.message }));
   });
 }

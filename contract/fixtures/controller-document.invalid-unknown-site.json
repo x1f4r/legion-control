@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "controller": {
+    "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+    "revision": 1,
+    "lineage": []
+  },
+  "sites": [
+    {
+      "id": "attic",
+      "name": "Attic house",
+      "lanPrefixes": [
+        "192.168.178."
+      ]
+    }
+  ],
+  "machines": [
+    {
+      "id": "tower",
+      "name": "Tower",
+      "site": "flat"
+    }
+  ]
+}

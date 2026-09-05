@@ -1,0 +1,32 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "internal",
+  "message": "the staged agent 3.0.0 failed its self-test (node:sqlite is not available in node 20.11.1), so nothing was swapped and 2.1.0 is still running",
+  "action": "failed",
+  "current": {
+    "version": "2.1.0",
+    "contract": 2
+  },
+  "staged": null,
+  "previous": null,
+  "manifest": {
+    "schema": 1,
+    "version": "3.0.0",
+    "contract": 3,
+    "files": 31,
+    "signatureVerified": true,
+    "keyFingerprint": "8f2b6d41c0973ea5b8de10f47c26935ab0d84e7f1c53920684bfae7d3506c19b"
+  },
+  "selfTest": {
+    "ok": false,
+    "exitCode": 1,
+    "output": "Error: Cannot find module 'node:sqlite'"
+  },
+  "op": null
+}

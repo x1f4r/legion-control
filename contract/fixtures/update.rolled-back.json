@@ -1,0 +1,66 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "rolled-back",
+  "message": "demo 1.5.0 would not answer its health check, so 1.4.2 was put back and is running",
+  "action": "rolled-back",
+  "service": "demo",
+  "from": "1.4.2",
+  "to": "1.4.2",
+  "op": {
+    "id": "9b6d0e54-1f83-4c27-8a95-4e2b7d13f6a0",
+    "kind": "update",
+    "service": "demo",
+    "target": null,
+    "actionId": null,
+    "mode": "manual",
+    "initiator": {
+      "client": "mac",
+      "device": "roberts-macbook-pro",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-03T13:59:00.000Z",
+    "startedAt": "2026-09-03T13:59:00.000Z",
+    "updatedAt": "2026-09-03T14:00:00.000Z",
+    "finishedAt": "2026-09-03T14:00:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": false,
+      "action": "rolled-back",
+      "reasonCode": "rolled-back",
+      "message": "demo 1.5.0 would not answer its health check, so 1.4.2 was put back and is running",
+      "from": "1.4.2",
+      "to": "1.4.2",
+      "exitCode": 1,
+      "output": null
+    },
+    "log": [
+      {
+        "at": "2026-09-03T13:59:00.000Z",
+        "line": "installed 1.5.0"
+      },
+      {
+        "at": "2026-09-03T13:59:30.000Z",
+        "line": "health check failed 4 times: connection refused"
+      },
+      {
+        "at": "2026-09-03T14:00:00.000Z",
+        "line": "rolled back to 1.4.2, health 200"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux",
+    "from": "1.4.2",
+    "to": "1.4.2"
+  }
+}

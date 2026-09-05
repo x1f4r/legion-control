@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "boot.schema.json",
+  "title": "legionctl boot",
+  "description": "Arm the next boot and reboot into it. `rebooting` means the reboot was scheduled and the arming was read back from the firmware; only a later reading of the same operation turns that into `rebooted`.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "$ref": "mutation.schema.json#/$defs/conflictRule"
+    },
+    {
+      "$ref": "mutation.schema.json#/$defs/queueRule"
+    }
+  ],
+  "properties": {
+    "action": {
+      "enum": [
+        "rebooting",
+        "rebooted",
+        "armed",
+        "noop",
+        "deferred",
+        "queued",
+        "failed",
+        "conflict",
+        "cancelled",
+        "expired",
+        "already-running"
+      ]
+    },
+    "target": {
+      "$ref": "common.schema.json#/$defs/configuredId"
+    },
+    "op": {
+      "$ref": "mutation.schema.json#/$defs/opOrNull"
+    },
+    "armed": {
+      "type": "boolean"
+    },
+    "replayed": {
+      "type": "boolean"
+    },
+    "replaced": {
+      "$ref": "common.schema.json#/$defs/opIdOrNull"
+    },
+    "conflict": {
+      "$ref": "common.schema.json#/$defs/opConflict"
+    },
+    "opId": {
+      "description": "The operation id, echoed beside the record. Additive: the canonical place to read it is op.id.",
+      "$ref": "common.schema.json#/$defs/opId"
+    }
+  },
+  "required": [
+    "action",
+    "target",
+    "op"
+  ],
+  "unevaluatedProperties": false
+}

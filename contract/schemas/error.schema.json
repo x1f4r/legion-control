@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "error.schema.json",
+  "title": "A refusal from any command",
+  "description": "The shape of every answer the agent gives when it will not do the thing at all: a bad argument, an unknown service, a configuration it cannot trust, a restricted session. There is always a reasonCode and always a message, because a client renders by code and falls back to prose.",
+  "type": "object",
+  "allOf": [{ "$ref": "common.schema.json#/$defs/envelope" }],
+  "properties": {
+    "ok": { "const": false },
+    "command": { "$ref": "common.schema.json#/$defs/tokenOrNull" },
+    "argument": {
+      "description": "The option or positional the refusal is about, when it is about one.",
+      "$ref": "common.schema.json#/$defs/textOrNull"
+    },
+    "accepts": {
+      "description": "What would have been accepted instead. The known service ids for unknown-service, the boot targets for unknown-target, the flags for bad-argument.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "maxItems": 50
+    },
+    "problems": {
+      "description": "config-invalid only: exactly why the configuration was refused, one entry per problem.",
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/configProblem" },
+      "maxItems": 100
+    },
+    "error": {
+      "description": "The 2.x key for the same sentence as `message`. Kept so a 2.x client still shows something.",
+      "$ref": "common.schema.json#/$defs/text"
+    }
+  },
+  "required": ["ok", "reasonCode", "message", "command"],
+  "unevaluatedProperties": false
+}

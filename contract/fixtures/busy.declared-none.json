@@ -1,0 +1,40 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "busy": true,
+  "unknown": true,
+  "reason": "Edge Proxy: not monitored",
+  "monitoredServices": 1,
+  "unmonitoredServices": 1,
+  "services": [
+    {
+      "id": "demo",
+      "name": "Demo",
+      "busy": false,
+      "unknown": false,
+      "monitored": true,
+      "reason": "declared never busy",
+      "evidence": "none",
+      "checkedAt": "2026-09-05T14:00:00.000Z",
+      "elapsedMs": 0,
+      "error": null
+    },
+    {
+      "id": "edge",
+      "name": "Edge Proxy",
+      "busy": true,
+      "unknown": true,
+      "monitored": false,
+      "reason": "not monitored",
+      "evidence": "unmonitored",
+      "checkedAt": "2026-09-05T14:00:00.000Z",
+      "elapsedMs": 0,
+      "error": "no busy probe is configured for edge; disruptive work waits until one is, or until busy.type is set to \"none\""
+    }
+  ]
+}

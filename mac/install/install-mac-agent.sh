@@ -31,10 +31,14 @@ set -euo pipefail
 # Settings
 # ---------------------------------------------------------------------------
 
-# Part of the frozen agent contract: this path is invoked unquoted, so it may
-# never contain a space. Same layout as install-linux.sh and install-windows.ps1
-# produce, on purpose, so that one command line works on all three machines.
-BASE="$HOME/.legion-control"
+# Same layout as install-linux.sh and install-windows.ps1 produce, on purpose, so
+# that one command line works on all three machines.
+#
+# The path no longer has to avoid spaces. Every client now serialises the agent
+# argv for the shell on the far side, so a home directory with a space in it is
+# an ordinary path rather than a broken setup; the old rule was a comment in the
+# config asking the user to work around a client that did not quote.
+BASE="${LEGIONCTL_HOME:-$HOME/.legion-control}"
 AGENT_DIR="$BASE/agent"
 AGENT_ENTRY="$AGENT_DIR/src/index.mjs"
 LOG_FILE="$BASE/launchd.log"
@@ -62,7 +66,7 @@ TEMPLATE="$SCRIPT_DIR/$LABEL.plist"
 # staged from somewhere else; normally it is the agent directory of this repo.
 SRC_AGENT="${LEGION_CONTROL_AGENT_SRC:-$SCRIPT_DIR/../../agent}"
 
-MIN_NODE_MAJOR=22
+MIN_NODE_MAJOR=24
 
 SUMMARY=()
 note() { SUMMARY+=("$1"); printf '  %s\n' "$1" >&2; }
@@ -70,13 +74,16 @@ step() { printf '\n== %s\n' "$1" >&2; }
 die()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
 
 UNINSTALL=0
+SKIP_SCHEDULER=0
 for arg in "$@"; do
   case "$arg" in
     --uninstall) UNINSTALL=1 ;;
+    --skip-scheduler) SKIP_SCHEDULER=1 ;;
     -h|--help)
       printf 'Deploy the Legion Control agent to this Mac and schedule its update check.\n\n'
       printf '  %s              install or refresh, then verify\n' "${BASH_SOURCE[0]}"
-      printf '  %s --uninstall  unload the job and remove its plist\n\n' "${BASH_SOURCE[0]}"
+      printf '  %s --uninstall  unload the job and remove its plist\n' "${BASH_SOURCE[0]}"
+      printf '  %s --skip-scheduler  deploy and verify files only\n\n' "${BASH_SOURCE[0]}"
       printf 'Environment:\n'
       printf '  LEGION_NODE_BIN             node to write into the job, when the found one is wrong\n'
       printf '  LEGION_CONTROL_AGENT_SRC    agent tree to deploy, when it is not this repo\n\n'
@@ -86,7 +93,7 @@ for arg in "$@"; do
   esac
 done
 
-if [ "$(id -u)" -eq 0 ]; then
+if [ "$(id -u)" -eq 0 ] && [ "$SKIP_SCHEDULER" -ne 1 ]; then
   die "run this as your own user without sudo. It installs a launchd USER agent and writes into \$HOME."
 fi
 
@@ -105,6 +112,7 @@ job_pid() {
   launchctl print "$1" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -1
 }
 
+if [ "$SKIP_SCHEDULER" -ne 1 ]; then
 RUNNING_LABEL="$LABEL"
 RUNNING_PID="$(job_pid "$TARGET" || true)"
 if [ -z "$RUNNING_PID" ]; then
@@ -115,6 +123,8 @@ if [ -z "$RUNNING_PID" ]; then
 fi
 if [ -n "$RUNNING_PID" ]; then
   die "$RUNNING_LABEL is running right now (pid $RUNNING_PID). It finishes in seconds to minutes; re-run then. Watch it with: tail -f $LOG_FILE"
+fi
+
 fi
 
 # ---------------------------------------------------------------------------
@@ -165,7 +175,8 @@ fi
 step "Preflight"
 
 case "$BASE" in
-  *[[:space:]]*) die "\$HOME contains a space ($HOME). The agent contract requires space free paths." ;;
+  /*) ;;
+  *) die "LEGIONCTL_HOME must be an absolute path." ;;
 esac
 
 [ -f "$TEMPLATE" ] || die "missing the job template at $TEMPLATE."
@@ -225,30 +236,17 @@ esac
 
 step "Agent"
 
-mkdir -p "$BASE"
-
-if [ "$SRC_AGENT" = "$AGENT_DIR" ]; then
-  # Running out of the deployed copy. Nothing to copy, and wiping the
-  # destination would delete the source under its own feet.
-  note "agent source is already $AGENT_DIR, skipping the copy"
-else
-  rm -rf "$AGENT_DIR"
-  mkdir -p "$AGENT_DIR"
-  cp -R "$SRC_AGENT/src" "$AGENT_DIR/src"
-  if [ -d "$SRC_AGENT/install" ]; then
-    # Same as the other two: ship the installers along so the machine can be
-    # re-provisioned from its own copy.
-    cp -R "$SRC_AGENT/install" "$AGENT_DIR/install"
-  fi
-  note "agent copied to $AGENT_DIR"
+# The common POSIX deployment path verifies and self-checks a staged tree,
+# preserves the previous live tree and config, and installs stable wrappers.
+# Skip its systemd integration; this script owns the launchd job below.
+LEGIONCTL_HOME="$BASE" LEGION_NODE_BIN="$NODE_BIN" bash "$SRC_AGENT/install/install-linux.sh" --skip-scheduler
+LAUNCHER_MODULE="$BASE/bin/launcher.mjs"
+AGENT_ENTRY="$LAUNCHER_MODULE"
+note "staged agent and stable launcher passed version --check"
+if [ "$SKIP_SCHEDULER" -eq 1 ]; then
+  note "launchd scheduler left untouched by --skip-scheduler"
+  exit 0
 fi
-
-[ -f "$AGENT_ENTRY" ] || die "agent entry point missing at $AGENT_ENTRY after the copy."
-
-# config.json and state.json are deliberately not written here, exactly as on
-# the Linux side. The agent falls back to its own defaults when they are absent,
-# and an installer that stamped a fresh config over the top would silently turn
-# auto update back on every single time it ran.
 
 # ---------------------------------------------------------------------------
 # launchd job
@@ -262,12 +260,14 @@ TMP_PLIST="$PLIST_DEST.tmp.$$"
 cleanup() { rm -f "$TMP_PLIST"; }
 trap cleanup EXIT
 
-sed \
-  -e "s|@NODE@|$NODE_BIN|g" \
-  -e "s|@NODE_DIR@|$NODE_DIR|g" \
-  -e "s|@AGENT_DIR@|$AGENT_DIR|g" \
-  -e "s|@BASE@|$BASE|g" \
-  "$TEMPLATE" > "$TMP_PLIST"
+"$NODE_BIN" --input-type=module - "$TEMPLATE" "$TMP_PLIST" "$NODE_BIN" "$NODE_DIR" "$LAUNCHER_MODULE" "$BASE" <<'NODE'
+import fs from 'node:fs';
+const [source, destination, node, nodeDir, launcher, base] = process.argv.slice(2);
+const escape = (value) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+const values = { NODE: node, NODE_DIR: nodeDir, LAUNCHER: launcher, BASE: base };
+const rendered = fs.readFileSync(source, 'utf8').replace(/@([A-Z_]+)@/g, (token, name) => name in values ? escape(values[name]) : token);
+fs.writeFileSync(destination, rendered);
+NODE
 
 plutil -lint "$TMP_PLIST" >/dev/null 2>&1 || {
   plutil -lint "$TMP_PLIST" >&2 || true

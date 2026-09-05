@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "logs.schema.json",
+  "title": "legionctl logs",
+  "description": "The tail of the agent log, or one operation's own log. Both come back as lines with the prefix already split off, because every client would otherwise write the same regular expression.",
+  "type": "object",
+  "allOf": [
+    { "$ref": "common.schema.json#/$defs/envelope" },
+    {
+      "if": { "properties": { "source": { "const": "operation" } }, "required": ["source"] },
+      "then": { "properties": { "opId": { "$ref": "common.schema.json#/$defs/opId" }, "path": { "type": "null" } } },
+      "else": { "properties": { "opId": { "type": "null" }, "path": { "$ref": "common.schema.json#/$defs/text" } } }
+    }
+  ],
+  "properties": {
+    "source": { "enum": ["agent", "operation"] },
+    "opId": { "$ref": "common.schema.json#/$defs/opIdOrNull" },
+    "path": { "$ref": "common.schema.json#/$defs/textOrNull" },
+    "requested": { "type": "integer", "minimum": 1, "maximum": 500 },
+    "returned": { "type": "integer", "minimum": 0, "maximum": 500 },
+    "truncated": {
+      "description": "True when there are older lines than the ones returned.",
+      "type": "boolean"
+    },
+    "lines": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/logLine" }, "maxItems": 500 }
+  },
+  "required": ["source", "opId", "path", "requested", "returned", "truncated", "lines"],
+  "unevaluatedProperties": false
+}

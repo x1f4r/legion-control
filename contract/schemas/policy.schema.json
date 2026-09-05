@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy.schema.json",
+  "title": "legionctl policy / policy set / auto-update",
+  "description": "The effective update policy, machine-wide or for one service. Every reply to a policy read or write is this shape, so a client renders the result of a change with the same code that drew the switch.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common.schema.json#/$defs/envelope"
+    },
+    {
+      "description": "A machine-wide read carries the system policy; a service read carries the service's effective policy and says which parts of it were inherited.",
+      "if": {
+        "properties": {
+          "service": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "service"
+        ]
+      },
+      "then": {
+        "properties": {
+          "updates": {
+            "$ref": "common.schema.json#/$defs/systemUpdates"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "updates": {
+            "$ref": "#/$defs/effectiveServicePolicy"
+          }
+        }
+      }
+    },
+    {
+      "description": "A machine-wide read carries the services; a single-service read does not.",
+      "if": {
+        "properties": {
+          "service": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "service"
+        ]
+      },
+      "then": {
+        "required": [
+          "services"
+        ]
+      },
+      "else": {
+        "properties": {
+          "services": false
+        }
+      }
+    }
+  ],
+  "properties": {
+    "service": {
+      "$ref": "common.schema.json#/$defs/configuredIdOrNull"
+    },
+    "updates": {},
+    "autoUpdate": {
+      "description": "The machine-wide `updates.automatic`, repeated as the plain boolean `auto-update` has always returned.",
+      "type": "boolean"
+    },
+    "changed": {
+      "description": "The keys this call actually rewrote, in the order they were applied. Empty on a read. Only the touched keys are ever written.",
+      "type": "array",
+      "items": {
+        "enum": [
+          "automatic",
+          "pauseUntil",
+          "maintenanceWindows"
+        ]
+      },
+      "maxItems": 3,
+      "uniqueItems": true
+    },
+    "services": {
+      "description": "Only on a machine-wide read: every service's effective policy, so a client draws the whole maintenance screen from one call instead of one call per service.",
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "common.schema.json#/$defs/token"
+          },
+          "name": {
+            "$ref": "common.schema.json#/$defs/text"
+          },
+          "updates": {
+            "$ref": "#/$defs/effectiveServicePolicy"
+          }
+        },
+        "required": [
+          "id",
+          "updates"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "service",
+    "updates",
+    "autoUpdate",
+    "changed"
+  ],
+  "unevaluatedProperties": false,
+  "$defs": {
+    "effectiveServicePolicy": {
+      "description": "One service's policy after inheritance. `inherited` says, key by key, whether the value came from the service or from the machine; a client shows \"inherited\" beside a switch rather than pretending the service set it.",
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/serviceUpdatesFields"
+        }
+      ],
+      "properties": {
+        "inheritedKeys": {
+          "type": "object",
+          "properties": {
+            "automatic": {
+              "type": "boolean"
+            },
+            "pauseUntil": {
+              "type": "boolean"
+            },
+            "maintenanceWindows": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "automatic",
+            "pauseUntil",
+            "maintenanceWindows"
+          ],
+          "additionalProperties": false
+        },
+        "inWindowNow": {
+          "type": "boolean"
+        },
+        "nextWindow": {
+          "$ref": "common.schema.json#/$defs/isoOrNull"
+        }
+      },
+      "required": [
+        "inheritedKeys",
+        "inWindowNow",
+        "nextWindow"
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

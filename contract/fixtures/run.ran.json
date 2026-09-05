@@ -1,0 +1,54 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "message": "sunshine-restart finished with exit code 0",
+  "action": "ran",
+  "id": "sunshine-restart",
+  "exitCode": 0,
+  "output": "Stopping sunshine.service\nStarting sunshine.service\nsunshine.service is active",
+  "detached": false,
+  "op": {
+    "id": "a1f8c3d7-2b46-4e58-90ca-7d1b4f62e830",
+    "kind": "run",
+    "service": null,
+    "target": null,
+    "actionId": "sunshine-restart",
+    "mode": "manual",
+    "initiator": {
+      "client": "phone",
+      "device": "pixel-8",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:30:00.000Z",
+    "startedAt": "2026-09-05T13:30:00.000Z",
+    "updatedAt": "2026-09-05T13:30:02.000Z",
+    "finishedAt": "2026-09-05T13:30:02.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": true,
+      "action": "ran",
+      "reasonCode": null,
+      "message": "sunshine-restart finished with exit code 0",
+      "exitCode": 0,
+      "output": "Stopping sunshine.service\nStarting sunshine.service\nsunshine.service is active"
+    },
+    "log": [
+      {
+        "at": "2026-09-05T13:30:00.000Z",
+        "line": "run sunshine-restart"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}

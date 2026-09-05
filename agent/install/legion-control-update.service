@@ -1,11 +1,18 @@
-# One update cycle. Driven by legion-control-update.timer, not enabled itself.
+# One maintenance cycle. Driven by legion-control-update.timer, not enabled itself.
 #
 # This is a TEMPLATE. install-linux.sh fills in the placeholders and writes the
-# result to ~/.config/systemd/user/legion-control-update.service.
+# result to the user's systemd unit directory.
 #
-# The agent decides everything: whether auto update is on, which service the
-# cycle is for, whether a newer version exists, whether the machine is busy.
+# The agent decides everything: whether automatic updates are on, which services
+# are eligible, whether a newer version exists, whether the machine is busy.
 # This unit only provides a clean environment to run it in.
+#
+# It runs "cycle", not "update". "update" acts on ONE service — the first one —
+# and does nothing else, so a machine with two services had one of them silently
+# left behind. A cycle recovers operations an earlier run left unfinished, takes
+# up anything queued for the next idle window, and then walks every eligible
+# service. Those first two steps are the reason the timer matters even on a
+# machine with nothing to update.
 
 [Unit]
 Description=Legion Control: run one update cycle
@@ -27,11 +34,13 @@ Environment=PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin
 Environment=XDG_RUNTIME_DIR=/run/user/@UID@
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
 
-ExecStart=@NODE@ @AGENT_DIR@/src/index.mjs update
+ExecStart="@LAUNCHER@" cycle
 
-# Worst case is a cold package cache plus the 120 s health wait plus a rollback,
-# so leave real headroom. A cycle that has not finished in 15 minutes is stuck.
-TimeoutStartSec=900
+# Worst case is several services, each with a cold package cache plus the 120 s
+# health wait plus a rollback, so leave real headroom. A run killed here leaves
+# operation records whose process is gone; the next cycle finds them, marks them
+# interrupted and puts back any service that was left stopped.
+TimeoutStartSec=1800
 
 # The agent prints one JSON object to stdout, which lands in the journal.
 # Read it back with: journalctl --user -u legion-control-update.service -n 50

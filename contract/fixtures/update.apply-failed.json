@@ -1,0 +1,58 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "mac",
+    "name": "macOS"
+  },
+  "reasonCode": "apply-failed",
+  "message": "the staged T3 Desktop 1.9.4 could not be applied (the pending bundle is not signed by the expected team); 1.9.3 is still installed and running",
+  "action": "failed",
+  "service": "t3-desktop",
+  "from": "1.9.3",
+  "to": "1.9.3",
+  "op": {
+    "id": "d35b8e04-7c91-4a26-b5f8-0e3a7d192c64",
+    "kind": "update",
+    "service": "t3-desktop",
+    "target": null,
+    "actionId": null,
+    "mode": "manual",
+    "initiator": {
+      "client": "mac",
+      "device": "roberts-macbook-pro",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:15:00.000Z",
+    "startedAt": "2026-09-05T13:15:00.000Z",
+    "updatedAt": "2026-09-05T13:16:00.000Z",
+    "finishedAt": "2026-09-05T13:16:00.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": false,
+      "action": "failed",
+      "reasonCode": "apply-failed",
+      "message": "the pending bundle is not signed by the expected team",
+      "from": "1.9.3",
+      "to": "1.9.3",
+      "exitCode": 1,
+      "output": null
+    },
+    "log": [
+      {
+        "at": "2026-09-05T13:15:00.000Z",
+        "line": "staged 1.9.4 found in the pending directory"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "mac",
+    "from": "1.9.3",
+    "to": "1.9.3"
+  }
+}

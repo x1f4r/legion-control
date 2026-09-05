@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hash-vectors.schema.json",
+  "title": "contract/hash-vectors.json",
+  "description": "The canonical controller-document hash, as test data. Every client and the agent run these through their own implementation of the six steps; agreement on all of them is what makes a hash comparison across four languages mean anything.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "contract": { "const": 3 },
+    "algorithm": { "const": "sha256" },
+    "encoding": { "type": "string", "minLength": 1 },
+    "steps": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 6, "maxItems": 6 },
+    "trimCodePoints": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^U\\+[0-9A-F]{4}$" },
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true
+    },
+    "notes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "vectors": {
+      "type": "array",
+      "minItems": 15,
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "purpose": { "type": "string", "minLength": 20 },
+          "inputBase64": { "type": "string", "pattern": "^[A-Za-z0-9+/]*={0,2}$" },
+          "inputBytes": { "type": "integer", "minimum": 0 },
+          "canonicalBase64": {
+            "anyOf": [{ "type": "string", "pattern": "^[A-Za-z0-9+/]*={0,2}$" }, { "type": "null" }]
+          },
+          "canonicalBytes": { "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] },
+          "sha256": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+          "accepted": {
+            "description": "Whether `config set` stores the document. A vector with a hash and accepted false is one the agent canonicalises and then refuses, which is not the same as one it cannot hash at all.",
+            "type": "boolean"
+          },
+          "reject": {
+            "anyOf": [{ "enum": ["invalid-utf8", "not-a-json-object", "empty", "too-large"] }, { "type": "null" }]
+          }
+        },
+        "required": ["name", "purpose", "inputBase64", "inputBytes", "canonicalBase64", "canonicalBytes", "sha256", "accepted", "reject"],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "description": "Bytes that are not valid UTF-8 have no canonical form and no hash; everything else has both.",
+            "if": { "properties": { "sha256": { "type": "null" } }, "required": ["sha256"] },
+            "then": {
+              "properties": {
+                "canonicalBase64": { "type": "null" },
+                "canonicalBytes": { "type": "null" },
+                "accepted": { "const": false },
+                "reject": { "const": "invalid-utf8" }
+              }
+            },
+            "else": {
+              "properties": {
+                "canonicalBase64": { "type": "string" },
+                "canonicalBytes": { "type": "integer" }
+              }
+            }
+          },
+          {
+            "description": "A vector that is not accepted says why.",
+            "if": { "properties": { "accepted": { "const": false } }, "required": ["accepted"] },
+            "then": { "properties": { "reject": { "type": "string" } } },
+            "else": { "properties": { "reject": { "type": "null" } } }
+          }
+        ]
+      }
+    }
+  },
+  "required": ["contract", "algorithm", "encoding", "steps", "trimCodePoints", "notes", "vectors"],
+  "additionalProperties": false
+}

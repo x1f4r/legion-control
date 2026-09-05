@@ -1,0 +1,54 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "not-running",
+  "message": "flush-cache exited 3",
+  "action": "failed",
+  "id": "flush-cache",
+  "exitCode": 3,
+  "output": "error: the build daemon is not running, so there is no cache to flush\n",
+  "op": {
+    "id": "bd407e15-9c62-4a38-85f1-3d0b7e2a6c94",
+    "kind": "run",
+    "service": null,
+    "target": null,
+    "actionId": "flush-cache",
+    "mode": "manual",
+    "initiator": {
+      "client": "desktop",
+      "device": "legion-cachy",
+      "user": "x1f4r"
+    },
+    "state": "finished",
+    "phase": "done",
+    "progress": null,
+    "requestedAt": "2026-09-05T13:40:00.000Z",
+    "startedAt": "2026-09-05T13:40:00.000Z",
+    "updatedAt": "2026-09-05T13:40:01.000Z",
+    "finishedAt": "2026-09-05T13:40:01.000Z",
+    "expiresAt": null,
+    "pid": null,
+    "detached": false,
+    "result": {
+      "ok": false,
+      "action": "failed",
+      "reasonCode": "not-running",
+      "message": "flush-cache exited 3",
+      "exitCode": 3,
+      "output": "error: the build daemon is not running, so there is no cache to flush\n"
+    },
+    "log": [
+      {
+        "at": "2026-09-05T13:40:00.000Z",
+        "line": "run flush-cache"
+      }
+    ],
+    "agentVersion": "3.0.0",
+    "systemId": "linux"
+  }
+}
