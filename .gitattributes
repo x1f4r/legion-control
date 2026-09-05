@@ -1,0 +1,2 @@
+# Signed fixture bytes must not be rewritten by checkout line-ending conversion.
+tests/fixtures/trust/manifest.json -text

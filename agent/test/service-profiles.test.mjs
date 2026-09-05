@@ -9,17 +9,23 @@ import { resolveClaudeUpdatePolicy, claudeTargetAllowed, readClaudeRemotePolicy 
 import { normalizeConfig } from '../src/config.mjs';
 import { readDesktopMetadata } from '../src/service-profile-desktop.mjs';
 
+// These fixtures describe a simulated POSIX host even when tests run on
+// Windows. Match filesystem lookups by separators, while keeping actual argv
+// assertions in the test runner's native path form.
+const fixturePath = (file) => String(file).replaceAll('\\', '/');
+
 function mockFiles(files = {}) {
   files = { '/proc/version': 'Linux version 6.12.0', ...files };
   const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' });
   return {
     statSync(file) {
+      file = fixturePath(file);
       if (Object.hasOwn(files, file)) return { isFile: () => true, size: Buffer.byteLength(files[file]) };
       if (Object.keys(files).some((entry) => entry.startsWith(`${file}/`))) return { isFile: () => false, size: 0 };
       throw missing();
     },
-    readFileSync(file) { if (!Object.hasOwn(files, file)) throw missing(); return files[file]; },
-    readdirSync(directory) { return [...new Set(Object.keys(files).filter((file) => file.startsWith(`${directory}/`)).map((file) => file.slice(directory.length + 1).split('/')[0]))]; },
+    readFileSync(file) { file = fixturePath(file); if (!Object.hasOwn(files, file)) throw missing(); return files[file]; },
+    readdirSync(directory) { directory = fixturePath(directory); return [...new Set(Object.keys(files).filter((file) => file.startsWith(`${directory}/`)).map((file) => file.slice(directory.length + 1).split('/')[0]))]; },
   };
 }
 const policyOptions = (files = {}, env = {}) => ({ home: '/home/test', platform: 'linux', executable: '/mock/claude', inspectRemote: () => 'not-eligible', env: { ANTHROPIC_BASE_URL: 'https://custom-provider.example', ...env }, io: mockFiles(files) });
@@ -127,7 +133,7 @@ test('desktop monitoring reads metadata through fixed OS tools and never starts 
   const io = mockFiles({ [`${location}/Contents/Info.plist`]: 'binary-plist' });
   const run = (executable, argv) => {
     assert.equal(executable, '/usr/bin/plutil');
-    assert.deepEqual(argv, ['-convert', 'json', '-o', '-', `${location}/Contents/Info.plist`]);
+    assert.deepEqual(argv, ['-convert', 'json', '-o', '-', path.join(location, 'Contents', 'Info.plist')]);
     return { status: 0, stdout: JSON.stringify({ CFBundleShortVersionString: '1.46388.4', CFBundleIdentifier: 'com.anthropic.claudefordesktop', Unrelated: 'never-return' }) };
   };
   assert.deepEqual(readDesktopMetadata(location, { platform: 'darwin', io, run }), { version: '1.46388.4', identity: 'com.anthropic.claudefordesktop' });
@@ -139,7 +145,7 @@ test('desktop monitoring reads metadata through fixed OS tools and never starts 
     return { status: 0, stdout: '{"version":"1.2.3","identity":"Claude"}' };
   } });
   assert.deepEqual(windows, { version: '1.2.3', identity: 'Claude' });
-  const desktopIo = { ...io, statSync: (file) => file === location ? { isDirectory: () => true } : io.statSync(file) };
+  const desktopIo = { ...io, statSync: (file) => fixturePath(file) === location ? { isDirectory: () => true } : io.statSync(file) };
   const profiles = discoverServiceProfiles({ platform: 'mac', home: '/home/test', env: {}, io: desktopIo, readDesktop: (file, options) => readDesktopMetadata(file, { ...options, run }) });
   const profile = profiles.find((entry) => entry.id === 'claude-desktop');
   assert.equal(profile.availability, 'manual'); assert.equal(profile.service.updates.automatic, false);
