@@ -1010,6 +1010,12 @@ extension AgentDevice {
 
         Task { @MainActor in
             let resolution = await work(record.id)
+            // Some endings have nothing of their own to say: a cancelled agent install, or one
+            // refused before anything was sent. The line would go on saying the action was under
+            // way, so it says what the action ended in instead.
+            if self.core.line == label + "." {
+                self.setStatus(resolution.summary, isError: resolution.state.isProblem, detail: resolution.detail)
+            }
             if resolution.state == .queued {
                 self.operations?.markQueued(record.id, expiresAt: resolution.expiresAt, summary: resolution.summary)
             } else {

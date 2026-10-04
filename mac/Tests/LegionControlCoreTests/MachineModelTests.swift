@@ -196,23 +196,28 @@ struct MachineModelTests {
         #expect(model.legacyInstallRefusal == nil)
     }
 
-    @Test("a 2.x agent behind a cmd login is not offered the upgrade, and is told why first")
-    func legacyCmdUpgradeIsRefusedUpFront() async throws {
+    /// A machine whose 2.x agent sits behind a cmd login, which the upgrade cannot be sent to.
+    static func legacyCmdModel(_ runner: FakeRunner) -> (MachineModel, URL) {
         let windows = Machine(
             id: "tower", name: "Tower",
             endpoints: [Endpoint(id: "lan", kind: "lan", host: "10.0.0.5", user: "me")],
             systems: [SystemConfig(id: "windows", name: "Windows", platform: .windows,
                                    agent: ["C:\\node.exe", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"])]
         )
-        let runner = FakeRunner()
         // cmd quotes every word, the verb included.
         runner.answer("\"status\"", json: #"{ "ok": true, "agentVersion": "2.1.0", "os": "windows" }"#)
         let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: directory) }
         var agent = RemoteAgent(machine: windows)
         agent.logDirectory = directory.appending(path: "ssh-logs")
         agent.runner = { _, arguments, _, _ in runner.run(arguments) }
-        let model = MachineModel(machine: windows, agent: agent)
+        return (MachineModel(machine: windows, agent: agent), directory)
+    }
+
+    @Test("a 2.x agent behind a cmd login is not offered the upgrade, and is told why first")
+    func legacyCmdUpgradeIsRefusedUpFront() async throws {
+        let runner = FakeRunner()
+        let (model, directory) = Self.legacyCmdModel(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
 
         await model.refresh(userInitiated: false)
         #expect(model.needsAgentUpgrade)
@@ -224,6 +229,27 @@ struct MachineModelTests {
         #expect(resolution.state == .failed)
         #expect(resolution.summary == refusal)
         #expect(runner.sentCommands.count == sent)
+    }
+
+    @Test("an action that ends without a word of its own leaves how it ended on the line, not its label")
+    func silentEndingReplacesTheLabel() async throws {
+        // An agent install refused before anything was sent never wrote the line, which went on
+        // saying "Installing agent 3.1.0 on Tower." with nothing being installed anywhere.
+        let runner = FakeRunner()
+        let (model, directory) = Self.legacyCmdModel(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh(userInitiated: false)
+        let refusal = try #require(model.legacyInstallRefusal)
+        // What the install button runs, once the archive has been verified.
+        model.perform("Installing agent 3.1.0 on Tower", kind: .appUpdate, subject: "control agent") { operation in
+            await model.installOverLegacyAgent(Data("archive".utf8), operation: operation, version: "3.1.0")
+        }
+        await Self.settle(model)
+
+        #expect(model.statusLine == refusal)
+        #expect(model.statusIsError)
+        #expect(model.lastActionOutcome?.text == refusal)
     }
 
     @Test("a successful background refresh clears its stale transport failure")
