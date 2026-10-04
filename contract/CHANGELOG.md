@@ -81,6 +81,9 @@ documents the 3.0 schema allowed are refused (see Changed).
   replay of a running record (section 5.5).
 - A cycle child deferred by policy may have `opId: null`; only a deferral may.
   3.0.x agents already sent it, and the schema now allows it.
+- A cycle's `queued` and `recovered` entries may have `service: null`. A
+  queued or recovered boot, sleep, run or cycle names no service, and the
+  schema refused every reply that carried one.
 - **Process evidence.** A process probe whose `error` is set or whose `state` is
   `unknown` is not evidence that the process stopped: no running turn is
   abandoned and the stop guard holds (section 6). A recovery obligation clears
@@ -105,7 +108,7 @@ not, the agent now answers as they say.
   `ok: true`, `replayed: true` and the record's `detached`, never `accepted`.
 - A lock `conflict` answers `ok: true`.
 - A finished record's `result.ok` is true exactly when its `reasonCode` is
-  null.
+  null. A failed cycle carries the code of its first failed service.
 - `cancel` of a running operation answers `conflict` with
   `reasonCode: "already-running"`, not `operation-in-progress`.
 - `--detach` replies carry every key of their command's shape, and a fresh
@@ -115,6 +118,21 @@ not, the agent now answers as they say.
   naming `--op`, never replayed and never reported as a lock `conflict`.
 - A `config set` refused by the operation lock exits 1, with outcome
   `deferred`.
+- `update` answers `failed` with `latest-unknown` when the newest version
+  cannot be resolved, and `failed` with `postcondition-failed` when nothing
+  could confirm an update, never `noop`, which reads as done. An app whose
+  staged build used up its attempts answers `failed` with
+  `apply-attempts-exhausted`, and one whose staged build waits for the app to
+  quit answers `deferred` with `app-closed`.
+- A mutation refused because `config.json` cannot be used is a refusal, with
+  `command`, `argument` and `problems` and no `action`.
+- `policy set` refusal problems carry `level` and `fix`, like every other
+  `problems` list.
+- A `config set` refused with `controller-conflict` always says `divergent`.
+- Every doctor check that is not `ok` offers a fix.
+- `bundle` redacts configured arguments from free text only. Identifiers, enum
+  values, versions and timestamps are kept, so an argument such as `restart` no
+  longer turns an operation's kind into `re<redacted>`.
 
 ### Client rules
 

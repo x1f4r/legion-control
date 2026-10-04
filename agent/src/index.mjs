@@ -755,7 +755,13 @@ async function commandPolicy(config, positional, options) {
     return refuse(
       REASON.badArgument,
       `the policy patch is not usable: ${validated.errors.map((entry) => `${entry.path}: ${entry.message}`).join('; ')}`,
-      { command: 'policy', problems: validated.errors, error: 'invalid policy patch' },
+      {
+        command: 'policy',
+        // In the one problem shape every refusal uses, so a client lists them
+        // the same way whichever command was refused.
+        problems: validated.errors.map((entry) => ({ level: 'error', path: entry.path, message: entry.message, fix: null })),
+        error: 'invalid policy patch',
+      },
     );
   }
 
@@ -1088,7 +1094,9 @@ async function commandConfig(positional, flags, options) {
         bytes: stored.bytes ?? 0,
         id,
         revision,
-        ...(stored.divergent ? { divergent: true } : {}),
+        // A controller-conflict is either two setups or two branches of one,
+        // and only the second is a merge, so it always says which.
+        ...(stored.reasonCode === REASON.controllerConflict ? { divergent: stored.divergent === true } : {}),
         ...(stored.current ? { current: stored.current } : {}),
         error: stored.error,
       });
@@ -1528,14 +1536,16 @@ async function answer(command, positional, flags, options) {
     // The file is there and unusable. `config-missing` is reserved for a machine
     // that has no config at all, and that machine is inert rather than broken —
     // its mutations are refused by having nothing to act on, not by this gate.
+    // Nothing was attempted, so this is a refusal in the refusal shape rather
+    // than an action of the command.
     return refuse(
       REASON.configInvalid,
       `${command} was refused because config.json cannot be used: ${problems.map((problem) => `${problem.path}: ${problem.message}`).join('; ') || loaded.error}`,
       {
         command,
+        argument: null,
         problems,
         error: loaded.error,
-        action: 'failed',
       },
     );
   }

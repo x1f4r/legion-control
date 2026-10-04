@@ -80,7 +80,7 @@ function configChecks(loaded) {
           : 'fix the JSON; every mutating command is refused until it parses',
       ),
     );
-    checks.push(check('config.validate', 'fail', 'not reached', 'the file has to parse first', null));
+    checks.push(check('config.validate', 'fail', 'not reached', 'the file has to parse first', 'fix config.json so it parses; this check runs once it does'));
     return checks;
   }
 
@@ -693,7 +693,7 @@ export async function runDoctor(loaded, { service = null, deep = false } = {}) {
     const stored = readController();
     checks.push(
       !stored.hash
-        ? check('controller.copy', 'warn', 'this machine carries no setup document', 'a client will push one the first time it connects', null)
+        ? check('controller.copy', 'warn', 'this machine carries no setup document', 'a client will push one the first time it connects', 'connect once from a client that holds the setup; it publishes the document here')
         : stored.error
           ? check('controller.copy', 'fail', 'the stored setup document cannot be read', stored.error, 'a client will push over it; until then this machine cannot answer setup questions')
           : check(
