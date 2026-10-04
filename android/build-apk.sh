@@ -92,7 +92,10 @@ ZIPALIGN="$SDK_DIR/build-tools/$BUILD_TOOLS_DIR/zipalign"
 # The agent the APK carries is the one agent/package.json describes, the file the agent itself
 # reads its version from, so a new agent needs no edit here.
 AGENT_PACKAGE="$HERE/../agent/package.json"
-AGENT_VERSION="$(sed -n 's|^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$AGENT_PACKAGE" 2>/dev/null | head -1)"
+[ -r "$AGENT_PACKAGE" ] || die "cannot read $AGENT_PACKAGE, which names the agent the APK carries."
+# Under set -e a failed read inside the assignment would end the script without a word, so a
+# failure here falls through to the check below and its message instead.
+AGENT_VERSION="$(sed -n 's|^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$AGENT_PACKAGE" 2>/dev/null | head -1 || true)"
 printf '%s' "$AGENT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 	|| die "could not read an x.y.z agent version from $AGENT_PACKAGE."
 
@@ -105,7 +108,7 @@ for artifact in "legionctl-agent-$AGENT_VERSION.tgz" Legion-Control-agent-manife
 done
 # The app finds the tarball by the name its signed manifest gives, so a manifest left over from
 # another agent would point it at a file the APK does not carry.
-MANIFEST_AGENT="$(sed -n 's|.*"agentVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$HERE/../dist/Legion-Control-agent-manifest.json" | head -1)"
+MANIFEST_AGENT="$(sed -n 's|.*"agentVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$HERE/../dist/Legion-Control-agent-manifest.json" | head -1 || true)"
 [ "$MANIFEST_AGENT" = "$AGENT_VERSION" ] \
 	|| die "dist/Legion-Control-agent-manifest.json is for agent ${MANIFEST_AGENT:-unknown}, not $AGENT_VERSION. Run scripts/package-agent.mjs again."
 

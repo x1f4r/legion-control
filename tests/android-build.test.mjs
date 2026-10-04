@@ -73,3 +73,28 @@ test('the APK build refuses a dist/ that holds another agent than agent/package.
   assert.equal(unversioned.status, 1);
   assert.match(unversioned.stderr, /could not read an x\.y\.z agent version/);
 });
+
+test('the APK build says why when it cannot read which agent to carry', { skip: process.platform === 'win32' }, (t) => {
+  // Under set -e a failed read inside an assignment used to end the script with no message at all.
+  const nameless = checkout(t);
+  fs.rmSync(path.join(nameless, 'agent', 'package.json'));
+  const missing = build(nameless);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /cannot read .*agent\/package\.json, which names the agent the APK carries/);
+  assert.equal(fs.existsSync(path.join(nameless, 'gradle-arguments')), false);
+
+  // Root reads a file whatever its mode, so the rest needs another user.
+  if (process.getuid?.() === 0) return;
+  const locked = checkout(t);
+  fs.chmodSync(path.join(locked, 'agent', 'package.json'), 0o000);
+  const unreadable = build(locked);
+  assert.equal(unreadable.status, 1);
+  assert.match(unreadable.stderr, /cannot read .*agent\/package\.json/);
+
+  const sealed = checkout(t);
+  fs.chmodSync(path.join(sealed, 'dist', 'Legion-Control-agent-manifest.json'), 0o000);
+  const manifest = build(sealed);
+  assert.equal(manifest.status, 1);
+  assert.match(manifest.stderr, /Legion-Control-agent-manifest\.json is for agent unknown, not 3\.1\.0/);
+  assert.equal(fs.existsSync(path.join(sealed, 'gradle-arguments')), false);
+});
