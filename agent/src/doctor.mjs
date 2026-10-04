@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import {
+  AGENT_TREE,
   AGENT_VERSION,
   basePath,
   configPath,
@@ -24,6 +25,7 @@ import {
   userHome,
 } from './config.mjs';
 import { CONTRACT_VERSION } from './contract.mjs';
+import { carriesSignedManifest } from './archive.mjs';
 import { selectSleepCommand } from './boot.mjs';
 import { readController } from './controller.mjs';
 import { checkEndpoint } from './endpoint.mjs';
@@ -273,7 +275,10 @@ function environmentChecks() {
   return checks;
 }
 
-/** The agent itself: the version floor it is held to (contract section 13). */
+/**
+ * The agent itself: the version floor it is held to, and whether the tree
+ * answering is a signed release (contract section 13).
+ */
 function agentChecks() {
   const checks = [];
   const floor = effectiveFloor();
@@ -319,6 +324,18 @@ function agentChecks() {
       ),
     );
   }
+
+  checks.push(
+    carriesSignedManifest(AGENT_TREE)
+      ? check('agent.signed', 'ok', 'the running agent carries its signed manifest', `${AGENT_TREE} has MANIFEST.json and MANIFEST.json.sig; the stable launcher verifies them before it runs the agent`, null)
+      : check(
+          'agent.signed',
+          'warn',
+          'the running agent carries no signed manifest',
+          `${AGENT_TREE} has no MANIFEST.json and MANIFEST.json.sig, so nothing shows it came from a release, and nothing checks its files or the version floor before it runs`,
+          'install a signed release with self-update or the installer from a release download; a source checkout is unsigned by design',
+        ),
+  );
   return checks;
 }
 

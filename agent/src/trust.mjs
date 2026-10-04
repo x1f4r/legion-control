@@ -9,10 +9,14 @@
 // key is therefore part of the installed program, separate from shared topology
 // and local machine configuration, with no runtime override.
 //
-// The value is the exact contents of contract/release-public-key.pem. Rotating
-// it means shipping a release signed by the OLD key that carries the new one; a
-// key that is lost without a backup cannot be rotated at all, and every install
-// then has to be replaced by hand.
+// The value is the exact contents of contract/release-public-key.pem. There is
+// no key-rotation protocol (docs/security.md, "Losing the signing key"), and
+// changing this value alone does not rotate anything: the clients, this agent
+// and the stable launcher, which keeps its own copy in install/launcher.mjs,
+// all have to agree, through recovery as much as after the next launch. A
+// release signed by the old key that carries a new one is not assumed to get
+// there, so a replaced key means verifying every step or reinstalling out of
+// band, and a lost key means every install has to be replaced by hand.
 
 import crypto from 'node:crypto';
 

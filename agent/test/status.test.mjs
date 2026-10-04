@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import https from 'node:https';
 import http from 'node:http';
@@ -15,7 +16,7 @@ import { httpGet } from '../src/http.mjs';
 import { acquireMutex, mutexPath } from '../src/mutex.mjs';
 import { stateLockPath } from '../src/state.mjs';
 import { buildStatus } from '../src/status.mjs';
-import { cli, fixtureConfig, fixtureData, withHome, writeConfig } from './helpers.mjs';
+import { cli, fixtureConfig, fixtureData, SRC, withHome, writeConfig } from './helpers.mjs';
 
 const pause = (ms) => [process.execPath, '-e', `setTimeout(() => process.exit(0), ${ms})`];
 async function withProbeScratch(home, body) {
@@ -273,4 +274,30 @@ test('a fresh status process reads legacy state without creating migration files
     assert.equal(fs.existsSync(path.join(home, 'state', 'legacy-first-service.json')), false);
     assert.equal(fs.existsSync(path.join(home, 'state', 'cache.json')), false);
   });
+});
+
+test('status and doctor say whether the running agent carries its signed manifest', () => {
+  // This checkout is a source tree, which no release signed.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-signed-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-signed-tree-'));
+  try {
+    assert.equal(cli(['status'], { home }).payload.agent.signed, false);
+    const unsigned = cli(['doctor'], { home }).payload.checks.find((check) => check.id === 'agent.signed');
+    assert.equal(unsigned.level, 'warn');
+    assert.ok(unsigned.fix);
+
+    fs.cpSync(SRC, path.join(root, 'src'), { recursive: true });
+    fs.copyFileSync(path.join(SRC, '..', 'package.json'), path.join(root, 'package.json'));
+    const run = (command) => JSON.parse(spawnSync(process.execPath, [path.join(root, 'src', 'index.mjs'), command], {
+      encoding: 'utf8', env: { ...process.env, LEGIONCTL_HOME: home }, timeout: 60_000,
+    }).stdout);
+    fs.writeFileSync(path.join(root, 'MANIFEST.json'), '{}\n');
+    assert.equal(run('status').agent.signed, false, 'a manifest without its signature is not a signed tree');
+    fs.writeFileSync(path.join(root, 'MANIFEST.json.sig'), 'signature\n');
+    assert.equal(run('status').agent.signed, true);
+    assert.equal(run('doctor').checks.find((check) => check.id === 'agent.signed').level, 'ok');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

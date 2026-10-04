@@ -339,6 +339,21 @@ function verifyAgentFiles(archiveFiles, root = 'agent') {
   return { ok: true, error: null, files, manifest, entryCount: manifest.files.length, agentFloor };
 }
 
+/**
+ * Whether a tree carries a signed manifest at all: MANIFEST.json and its
+ * signature, both regular files. It says nothing about whether they verify,
+ * which is verifyAgentTree's job and the launcher's before it runs a tree.
+ * Status reports it as `agent.signed`, so a source checkout or a hand-copied
+ * tree shows as what it is rather than passing for a release.
+ */
+export function carriesSignedManifest(directory) {
+  try {
+    return ['MANIFEST.json', 'MANIFEST.json.sig'].every((name) => fs.lstatSync(path.join(directory, name)).isFile());
+  } catch {
+    return false;
+  }
+}
+
 /** Verify a tree before executing it, including rejection of extra files and links. */
 export function verifyAgentTree(directory) {
   const reject = (error) => ({ ok: false, error, files: null, manifest: null });
