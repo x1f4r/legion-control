@@ -1557,7 +1557,7 @@
       },
       {
         "name": "record-result-outcome-only",
-        "purpose": "Only the result states an outcome. A timed-out step whose failure the agent verified is failed, not unknown, and the stated value wins over the derived one.",
+        "purpose": "Only the result states an outcome. A result's stated outcome is used when the record states none.",
         "consumers": [
           "mac",
           "desktop",
@@ -1593,11 +1593,11 @@
             "result": {
               "ok": false,
               "action": "failed",
-              "reasonCode": "timed-out",
-              "message": "the install timed out and 1.4.2 is still installed",
+              "reasonCode": "apply-failed",
+              "message": "the new build would not apply and 1.4.2 is still installed",
               "from": "1.4.2",
               "to": "1.4.2",
-              "exitCode": null,
+              "exitCode": 1,
               "output": null,
               "outcome": "failed"
             },

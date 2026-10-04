@@ -27,8 +27,8 @@ comparing versions (v3.md section 1, "Additions in agent 3.1.0").
 - `status.agent.signed`: whether the running tree carries its signed manifest.
 - Doctor checks `agent.floor`, `agent.signed`, `files.private` and `ssh.shell`.
 - `problems: [{path, message}]` on a `config-invalid` refusal of `config set`.
-- `config set` refusal codes `lock-held`, `restricted` and `internal`, which the
-  agent already sent and the schema did not allow.
+- `config set` refusal codes `lock-held` and `internal`, which the agent
+  already sent and the schema did not allow.
 - The guard grammars in `common.schema.json`: `sshHostGuard`, `sshUser`,
   `agentArgItem`, `githubRepo` and `launchPath`.
 

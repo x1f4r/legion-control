@@ -226,7 +226,7 @@ test('an empty bindings file is valid: a device with none behaves as it did befo
 const guard = (name) => ({ $ref: `common.schema.json#/$defs/${name}` });
 
 test('a host is a name or an address, and nothing ssh or known_hosts reads as syntax', () => {
-  for (const host of ['desk-tower', 'desk-tower.local', 'office-macbook-pro.example.ts.net', 'my_alias', '192.0.2.10', '100.64.0.10', '2001:db8::10', '::1', '::ffff:192.0.2.1', 'desk-tower.local.']) {
+  for (const host of ['desk-tower', 'desk-tower.local', 'desk-tower.example.net', 'my_alias', '192.0.2.10', '100.64.0.10', '2001:db8::10', '::1', '::ffff:192.0.2.1', 'desk-tower.local.']) {
     assert.deepEqual(schemaErrors(guard('sshHostGuard'), host), [], host);
   }
   for (const host of ['', '-oProxyCommand=x', 'victim.example,*', '*.example', 'host name', 'host;id', '[::1]', 'ssh://h', 'me@h', 'desk-tower\n']) {
@@ -235,10 +235,10 @@ test('a host is a name or an address, and nothing ssh or known_hosts reads as sy
 });
 
 test('a user is an account name, local or domain, and never syntax', () => {
-  for (const user of ['me', 'john.smith', '_svc', 'me@outlook.com', 'AzureAD\\me', 'John Smith', 'a']) {
+  for (const user of ['me', 'me.example', '_svc', 'me@example.net', 'AzureAD\\me', 'me 2', 'a']) {
     assert.deepEqual(schemaErrors(guard('sshUser'), user), [], user);
   }
-  for (const user of ['', '-o', 'me;id', 'me$(x)', "me'x", 'John  Smith', 'John -x', ' me', 'me ', 'me\\', 'me@', 'a'.repeat(65), 'mé', 'me\n']) {
+  for (const user of ['', '-o', 'me;id', 'me$(x)', "me'x", 'me  2', 'me -x', ' me', 'me ', 'me\\', 'me@', 'a'.repeat(65), 'mé', 'me\n']) {
     assert.ok(schemaErrors(guard('sshUser'), user).length > 0, JSON.stringify(user));
   }
 });

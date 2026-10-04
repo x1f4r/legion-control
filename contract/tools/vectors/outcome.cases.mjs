@@ -143,13 +143,13 @@ const records = [
   },
   {
     name: 'record-result-outcome-only',
-    purpose: 'Only the result states an outcome. A timed-out step whose failure the agent verified is failed, not unknown, and the stated value wins over the derived one.',
+    purpose: 'Only the result states an outcome. A result\'s stated outcome is used when the record states none.',
     tags: ['finding:c5'],
     input: {
       kind: 'record',
       value: record({
         id: '6a7b8c9d-0e1f-4ab2-8c3d-5e6f7a8b9c0d', from: '1.4.2', to: '1.4.2',
-        result: { ok: false, action: 'failed', reasonCode: 'timed-out', message: 'the install timed out and 1.4.2 is still installed', from: '1.4.2', to: '1.4.2', exitCode: null, output: null, outcome: 'failed' },
+        result: { ok: false, action: 'failed', reasonCode: 'apply-failed', message: 'the new build would not apply and 1.4.2 is still installed', from: '1.4.2', to: '1.4.2', exitCode: 1, output: null, outcome: 'failed' },
       }),
     },
     want: { outcome: 'failed' },

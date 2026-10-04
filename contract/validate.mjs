@@ -1448,8 +1448,6 @@ function checkCoverage(index, loaded) {
 }
 
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Pass 4: the vectors.
 //
 // contract/vectors/index.json names every family, the file it lives in, the
