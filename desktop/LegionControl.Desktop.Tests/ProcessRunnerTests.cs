@@ -98,6 +98,34 @@ public class ProcessRunnerTests
     }
 
     [Fact]
+    public async Task TheCapCountsTheBytesThePipeDeliveredNotTheCharactersTheyDecodeTo()
+    {
+        // Every other client counts bytes. Nine Mi two-byte characters are 18 MiB, so they are cut
+        // off at 16 MiB here too, rather than kept whole for being fewer than 16 Mi characters.
+        var script = "process.stdout.write('\\u00e9'.repeat(9*1024*1024));";
+        var result = await new ProcessRunner().RunAsync("node", new[] { "-e", script }, TimeSpan.FromSeconds(30));
+        Assert.True(result.Succeeded, result.FailureText);
+        Assert.True(result.StandardOutputTruncated);
+        // How many characters that is depends on the encoding this platform's reader uses, which on
+        // Windows may be a one-byte code page.
+        if (!OperatingSystem.IsWindows()) Assert.Equal(8 * 1024 * 1024, result.StandardOutput.Length);
+    }
+
+    [Fact]
+    public async Task AReplyInTwoByteTextIsFramedAcrossReadsThatSplitItsCharacters()
+    {
+        // 4096-byte reads of an odd-length prefix and two-byte characters split one of them on every
+        // read. The framing decodes statefully, so the reply still completes as soon as it is whole.
+        var script = "process.stdout.write(JSON.stringify({ok:true,data:'\\u00e9'.repeat(12000)})+'\\n');setInterval(()=>{},1000);";
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var result = await new ProcessRunner().RunAgentAsync("node", new[] { "-e", script }, TimeSpan.FromSeconds(8));
+        Assert.False(result.TimedOut);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(4));
+        using var json = System.Text.Json.JsonDocument.Parse(result.StandardOutput);
+        Assert.True(json.RootElement.GetProperty("ok").GetBoolean());
+    }
+
+    [Fact]
     public async Task ThePipesAreClosedEvenWhenAGrandchildStillHoldsThem()
     {
         // The grandchild's EPIPE is how this test sees this side's end of the pipe close. Windows

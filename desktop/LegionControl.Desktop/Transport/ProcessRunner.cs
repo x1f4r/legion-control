@@ -215,12 +215,14 @@ public sealed class ProcessRunner : IAgentProcessRunner
         // command is long finished.
         output.Close();
         errors.Close();
-        Trace($"return stdoutChars={output.Text.Length} stderrChars={errors.Text.Length} truncated={output.Truncated}");
+        var standardOutput = output.Text;
+        var standardError = errors.Text;
+        Trace($"return stdoutChars={standardOutput.Length} stderrChars={standardError.Length} truncated={output.Truncated}");
         return new CommandResult
         {
             ExitCode = process.HasExited ? process.ExitCode : -1,
-            StandardOutput = output.Text,
-            StandardError = errors.Text,
+            StandardOutput = standardOutput,
+            StandardError = standardError,
             StandardOutputTruncated = output.Truncated,
             TimedOut = timedOut,
             Cancelled = cancelled,
@@ -241,25 +243,46 @@ public sealed class ProcessRunner : IAgentProcessRunner
         }
     }
 
-    /// One output stream, kept up to [Limit] characters.
+    /// One output stream, kept up to [Limit] bytes.
     ///
-    /// The rest is read and thrown away rather than left in the pipe: a child that cannot write
-    /// blocks, and a blocked child is a timeout that says nothing. Sixteen Mi characters is far more
-    /// than any agent reply, so a stream that reaches it is not one this app could have read anyway.
+    /// Counted in the bytes the pipe delivered, the way every other client counts them, so a reply
+    /// one of them would cut off is cut off here too; a count of decoded characters let through
+    /// up to three times as many bytes of non-ASCII text. The rest is read and thrown away rather
+    /// than left in the pipe: a child that cannot write blocks, and a blocked child is a timeout
+    /// that says nothing. Sixteen MiB is far more than any agent reply, so a stream that reaches
+    /// it is not one this app could have read anyway.
+    ///
+    /// The kept bytes are decoded once at the end, by the same rules the process's own reader
+    /// would have used: its encoding, and a byte order mark that picks another.
     private sealed class OutputCapture
     {
         public const int Limit = 16 * 1024 * 1024;
-        private readonly StringBuilder _text = new();
+        private readonly MemoryStream _kept = new();
         private readonly object _gate = new();
         private readonly StreamReader _reader;
+        private readonly Encoding _encoding;
         private bool _truncated;
         public Task Completion { get; }
-        public string Text { get { lock (_gate) return _text.ToString(); } }
         public bool Truncated { get { lock (_gate) return _truncated; } }
         public OutputCapture(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing = null)
         {
             _reader = reader;
-            Completion = DrainAsync(reader, token, trace, framing);
+            // Nothing has been read through the reader, so this is still the encoding it was made
+            // with rather than one a byte order mark chose.
+            _encoding = reader.CurrentEncoding;
+            Completion = DrainAsync(reader.BaseStream, token, trace, framing);
+        }
+
+        /// The kept bytes as text.
+        public string Text
+        {
+            get
+            {
+                byte[] bytes;
+                lock (_gate) bytes = _kept.ToArray();
+                using var decoder = new StreamReader(new MemoryStream(bytes), _encoding, detectEncodingFromByteOrderMarks: true);
+                return decoder.ReadToEnd();
+            }
         }
 
         public void Close()
@@ -268,23 +291,35 @@ public sealed class ProcessRunner : IAgentProcessRunner
             catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException) { }
         }
 
-        private async Task DrainAsync(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing)
+        private async Task DrainAsync(Stream stream, CancellationToken token, Action<string> trace, AgentReplyFraming? framing)
         {
-            var buffer = new char[4096];
+            var buffer = new byte[4096];
+            // Decodes for the framing as the bytes arrive. Stateful, so a character split across
+            // two reads is still one character.
+            var decoder = _encoding.GetDecoder();
+            var characters = new char[_encoding.GetMaxCharCount(buffer.Length)];
+            var first = true;
             try
             {
                 while (true)
                 {
-                    var read = await reader.ReadAsync(buffer, token).ConfigureAwait(false);
+                    var read = await stream.ReadAsync(buffer, token).ConfigureAwait(false);
                     if (read == 0) { trace("EOF"); return; }
+                    int kept;
                     lock (_gate)
                     {
-                        var kept = Math.Min(read, Limit - _text.Length);
-                        _text.Append(buffer, 0, kept);
+                        kept = (int)Math.Min(read, Limit - _kept.Length);
+                        _kept.Write(buffer, 0, kept);
                         if (kept < read) _truncated = true;
                     }
-                    trace($"read chars={read}");
-                    framing?.Append(buffer.AsSpan(0, read));
+                    trace($"read bytes={read}");
+                    if (framing is null || kept == 0) continue;
+                    var decoded = decoder.GetChars(buffer, 0, kept, characters, 0, flush: false);
+                    var text = characters.AsSpan(0, decoded);
+                    // The reader would have taken a byte order mark as one, never as text.
+                    if (first && text.Length > 0 && text[0] == '\uFEFF') text = text[1..];
+                    if (decoded > 0) first = false;
+                    framing.Append(text);
                 }
             }
             // Closing the reader under a pending read ends the read with one of these too.
