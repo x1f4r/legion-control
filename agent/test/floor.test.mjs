@@ -189,13 +189,14 @@ test('an unrestricted session needs --allow-downgrade, which lowers the floor be
 
 test('a swap that does not commit puts the floor back, and only a committed install raises it', async () => {
   // The swap fails at the rename that would commit it, after keeping a copy of
-  // the floor file as it was at that moment.
+  // the floor file as it was at that moment. The statement is matched without
+  // its line ending, which a Windows checkout may have turned into CRLF.
   const patch = (src) => {
     const file = path.join(src, 'agent-swap.mjs');
     const text = fs.readFileSync(file, 'utf8');
-    const commit = '    io.renameSync(p.staging, p.live);\n';
+    const commit = '    io.renameSync(p.staging, p.live);';
     assert.equal(text.split(commit).length, 2);
-    fs.writeFileSync(file, text.replace(commit, () => `    if (exists(path.join(base, 'agent-floor.json'), io)) io.writeFileSync(path.join(base, 'floor-at-swap.json'), io.readFileSync(path.join(base, 'agent-floor.json')));\n    throw new Error('injected swap failure');\n`));
+    fs.writeFileSync(file, text.replace(commit, () => `    if (exists(path.join(base, 'agent-floor.json'), io)) io.writeFileSync(path.join(base, 'floor-at-swap.json'), io.readFileSync(path.join(base, 'agent-floor.json')));\n    throw new Error('injected swap failure');`));
   };
   await withAgent(async ({ module, base, candidate }) => {
     writeFloor(base, '3.1.0');
