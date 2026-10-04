@@ -202,6 +202,37 @@ const merges = [
     error: null,
   })),
 
+  // Endpoints without an id have no key, so the cursor cannot find them by one.
+  // Each of theirs' stands for the result's endpoint without an id at the same
+  // ordinal. Reading them as never moving the cursor, or as all standing for
+  // the first, passes every other case and still puts an endpoint theirs added
+  // somewhere else, so the merged document and its hash would differ by client.
+  mergeCase('idless-endpoints-keep-their-place', 'nas has two endpoints without an id and theirs adds wifi after them. Theirs\' n-th endpoint without an id stands for the result\'s n-th, so the cursor passes both and wifi lands last, where theirs has it, not first and not after the first one.', {
+    base: (document) => {
+      machine(document, 'nas').endpoints = [{ kind: 'lan', host: '192.0.2.11', user: 'me' }, { kind: 'remote', host: 'nas.example.net', user: 'me' }];
+    },
+    theirs: (document) => machine(document, 'nas').endpoints.push({ id: 'wifi', kind: 'lan', host: '192.0.2.12', user: 'me' }),
+  }, ({ result }) => ({
+    differences: [d('machines[nas].endpoints[wifi]', 'theirs')],
+    resultText: result((document) => machine(document, 'nas').endpoints.push({ id: 'wifi', kind: 'lan', host: '192.0.2.12', user: 'me' })),
+    error: null,
+  })),
+
+  mergeCase('endpoint-between-idless-endpoints', 'nas has three endpoints without an id and theirs adds wifi between the second and the third. Each of theirs\' endpoints without an id moves the cursor to its counterpart in the result, in order, so wifi lands between the same two there.', {
+    base: (document) => {
+      machine(document, 'nas').endpoints = [
+        { kind: 'lan', host: '192.0.2.11', user: 'me' },
+        { kind: 'lan', host: '192.0.2.13', user: 'me' },
+        { kind: 'remote', host: 'nas.example.net', user: 'me' },
+      ];
+    },
+    theirs: (document) => machine(document, 'nas').endpoints.splice(2, 0, { id: 'wifi', kind: 'lan', host: '192.0.2.12', user: 'me' }),
+  }, ({ result }) => ({
+    differences: [d('machines[nas].endpoints[wifi]', 'theirs')],
+    resultText: result((document) => machine(document, 'nas').endpoints.splice(2, 0, { id: 'wifi', kind: 'lan', host: '192.0.2.12', user: 'me' })),
+    error: null,
+  })),
+
   mergeCase('unknown-top-level-keys', 'Theirs edits the unknown top-level notes, and both add an unknown extra with different values. Unknown keys are entries like any other: notes from theirs, extra asked.', {
     base: (document) => { document.notes = 'Ask before rebooting tower'; },
     mine: (document) => { document.extra = { color: 'blue' }; },

@@ -308,6 +308,16 @@ referenceDefect('an endpoint without an id dropped from the merge', 'tools/setup
   'if (endpointId === null) continue;',
   /theirs-adds-idless-endpoint: tools\/setup-sync\.mjs gives/);
 
+referenceDefect('endpoints without an id that never move the merge cursor', 'tools/setup-sync.mjs',
+  'index = idless < positions.length ? positions[idless] : -1;',
+  'index = -1;',
+  /idless-endpoints-keep-their-place: tools\/setup-sync\.mjs gives/);
+
+referenceDefect('every endpoint without an id taken for the first one', 'tools/setup-sync.mjs',
+  'index = idless < positions.length ? positions[idless] : -1;',
+  'index = positions.length > 0 ? positions[0] : -1;',
+  /idless-endpoints-keep-their-place: tools\/setup-sync\.mjs gives/);
+
 referenceDefect('a deletion that silently beats an edit', 'tools/setup-sync.mjs',
   "  if (jsonEqual(found.mine, found.base)) return 'theirs';",
   "  if (found.theirs === undefined || jsonEqual(found.mine, found.base)) return 'theirs';",

@@ -335,11 +335,11 @@
       "groups": [
         {
           "group": "merges",
-          "cases": 27,
+          "cases": 29,
           "consumers": {
-            "mac": 27,
-            "desktop": 27,
-            "android": 27
+            "mac": 29,
+            "desktop": 29,
+            "android": 29
           }
         },
         {
