@@ -134,8 +134,10 @@ enum ControllerEditor {
     /// Add or replace one system on one machine.
     ///
     /// A Windows system this writes always says which shell it has, as section 15.1 of the contract
-    /// asks of every editor. One that had none is given cmd, which is what it already ran as, so
-    /// nothing that runs changes and no client is left to guess.
+    /// asks of every editor, so no client is left to guess. One that had none is given cmd, the
+    /// contract's default and what every 1.4 client already writes its lines in, so nothing a 1.4
+    /// client runs changes. It is not what a 1.3 Mac ran: that wrote Windows lines for PowerShell,
+    /// and on a PowerShell login the transport names the one-word fix.
     static func upsertSystem(_ system: [String: Any], onMachine machineId: String, in root: inout [String: Any]) throws {
         try mutateMachine(machineId, in: &root) { machine in
             try upsertKeyed(system, in: &machine, list: "systems", what: "system")

@@ -299,9 +299,11 @@ struct RemoteAgent: Sendable {
         var failure = AgentFailure(verdict.kind ?? .unreadableOutput, system: attempt.system, route: attempt.route.label,
                                    detail: detail(result, sshLog: sshLog), dispatch: verdict.dispatch)
         // A cmd line handed to a PowerShell login fails loudly, as a here-string PowerShell cannot
-        // parse. On a Windows system that left its shell to the default that is almost certainly
-        // what happened, and the fix is one word in the setup.
-        if attempt.system.platform == .windows, attempt.system.hasDefaultedShell, !command.restrictedSession,
+        // parse. Whenever a Windows line went out in cmd that is almost certainly what happened,
+        // and the fix is one word in the setup. It is not only a system that left its shell to
+        // the default: before 1.4 this Mac wrote Windows lines for PowerShell, and an edit made
+        // since then may have written `"shell": "cmd"` into a system on a PowerShell login.
+        if attempt.system.platform == .windows, case .success(.cmd) = command.grammar,
            ["parsererror", "here-string"].contains(where: { result.standardError.lowercased().contains($0) }) {
             failure.hint = "This account logs in to PowerShell; set shell to powershell."
         }

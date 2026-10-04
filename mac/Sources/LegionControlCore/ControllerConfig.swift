@@ -461,10 +461,6 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
     var symbolName: String { symbol ?? platform.symbolName }
 
     var isRestricted: Bool { restricted == true }
-
-    /// Whether the document chose a shell for this system. A Windows system that did not is written
-    /// for cmd, and a PowerShell login refusing that line is worth naming as the likely cause.
-    var hasDefaultedShell: Bool { shell == nil && restricted != true }
 }
 
 enum Platform: String, Decodable, Sendable, Equatable, CaseIterable {

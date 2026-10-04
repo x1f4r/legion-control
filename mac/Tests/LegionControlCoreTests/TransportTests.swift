@@ -135,12 +135,22 @@ struct TransportTests {
                                           result: result, sshLog: "")
         #expect(failure.message(machine: "Tower") == "This account logs in to PowerShell; set shell to powershell.")
 
-        // A system that chose cmd on purpose gets the plain reading: its document already says cmd.
-        var chosen = windows
-        chosen.shell = "cmd"
-        let plain = RemoteAgent.failure(verdict, attempt: .init(route: machine.routes[0], system: chosen),
-                                        command: RemoteCommand(system: chosen, arguments: ["status"]), result: result, sshLog: "")
-        #expect(plain.hint == nil)
+        func hint(shell: String?, restrictedSession: Bool = false, stderr: String = result.standardError) -> String? {
+            let system = SystemConfig(id: "windows", platform: .windows, agent: ["node", "C:\\a.mjs"], shell: shell)
+            let failed = Self.result(exit: 1, err: stderr)
+            return RemoteAgent.failure(AttemptClassifier.classify(AttemptEvidence(failed, sshLog: "")),
+                                       attempt: .init(route: machine.routes[0], system: system),
+                                       command: RemoteCommand(system: system, arguments: ["status"], restrictedSession: restrictedSession),
+                                       result: failed, sshLog: "").hint
+        }
+        // A setup that says cmd out loud gets the same hint. A 1.3 Mac wrote these lines for
+        // PowerShell, and an edit since may have written cmd into a system on a PowerShell login.
+        #expect(hint(shell: "cmd") == "This account logs in to PowerShell; set shell to powershell.")
+        // A line that went out as PowerShell or through the dispatcher was not refused for being cmd.
+        #expect(hint(shell: "powershell") == nil)
+        #expect(hint(shell: nil, restrictedSession: true) == nil)
+        // Nor is every failure of a cmd line a PowerShell login.
+        #expect(hint(shell: "cmd", stderr: "'node' is not recognized as an internal or external command") == nil)
     }
 
     // MARK: - Retrying elsewhere
