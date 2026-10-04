@@ -293,7 +293,18 @@ struct RemoteCommand: Sendable, Equatable {
 enum SSHLog {
     static let readLimit = 64 * 1024
 
+    /// How old a log has to be before it is taken for one a run left behind. Longer than any
+    /// attempt can last, so a log another copy of the app is still writing is never removed.
+    static let staleAfter: TimeInterval = 60 * 60
+
     static var directory: URL { AppPaths.support.appending(path: "ssh-logs") }
+
+    private final class Sweeps: @unchecked Sendable {
+        let lock = NSLock()
+        var done: Set<String> = []
+    }
+
+    private static let sweeps = Sweeps()
 
     /// A new empty file in `directory`, or nil when none could be made. ssh is then run without a
     /// log, and an exit 255 it would have explained reads as a link that went away: the cautious
@@ -307,11 +318,27 @@ enum SSHLog {
         } catch {
             return nil
         }
+        let path = directory.path(percentEncoded: false)
+        if sweeps.lock.withLock({ sweeps.done.insert(path).inserted }) { sweep(directory) }
         let file = directory.appending(path: "\(UUID().uuidString.lowercased()).log")
         let descriptor = open(file.path(percentEncoded: false), O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { return nil }
         close(descriptor)
         return file
+    }
+
+    /// Removes the logs a run left behind because it ended before reading them back, a crash for
+    /// one. Done once per directory and run, when its first log is made, and only to logs older
+    /// than `staleAfter`.
+    static func sweep(_ directory: URL, now: Date = Date()) {
+        let manager = FileManager.default
+        guard let files = try? manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        for file in files where file.pathExtension == "log" {
+            guard let modified = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                  now.timeIntervalSince(modified) > staleAfter else { continue }
+            try? manager.removeItem(at: file)
+        }
     }
 
     /// What ssh wrote, and the file is gone afterwards.

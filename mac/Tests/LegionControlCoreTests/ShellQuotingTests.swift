@@ -199,4 +199,32 @@ struct ShellQuotingTests {
         #expect(SSHLog.consume(file).utf8.count == SSHLog.readLimit)
         #expect(!FileManager.default.fileExists(atPath: file.path))
     }
+
+    @Test("logs a crashed run left behind are swept when the next run makes its first one")
+    func staleSSHLogsAreSwept() throws {
+        let manager = FileManager.default
+        let directory = manager.temporaryDirectory.appending(path: "ssh-logs-\(UUID().uuidString)")
+        defer { try? manager.removeItem(at: directory) }
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        func file(_ name: String, age: TimeInterval) throws -> URL {
+            let url = directory.appending(path: name)
+            try Data("ssh: connect to host x port 22: Connection refused\n".utf8).write(to: url)
+            try manager.setAttributes([.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: url.path)
+            return url
+        }
+        let left = try file("left-behind.log", age: SSHLog.staleAfter + 60)
+        let writing = try file("still-writing.log", age: 60)
+        let other = try file("notes.txt", age: SSHLog.staleAfter + 60)
+
+        let first = try #require(SSHLog.create(in: directory))
+        #expect(!manager.fileExists(atPath: left.path))
+        #expect(manager.fileExists(atPath: writing.path))
+        #expect(manager.fileExists(atPath: other.path))
+        #expect(manager.fileExists(atPath: first.path))
+
+        // Once a run: the attempts after the first do not list the folder again.
+        let later = try file("later.log", age: SSHLog.staleAfter + 60)
+        _ = try #require(SSHLog.create(in: directory))
+        #expect(manager.fileExists(atPath: later.path))
+    }
 }
