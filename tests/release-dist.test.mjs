@@ -24,7 +24,11 @@ process.exit(1);
 `);
   fs.writeFileSync(path.join(repo, '.gitignore'), 'dist/\n');
   fs.writeFileSync(path.join(root, 'gitconfig'), '');
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: path.join(root, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1', LEGION_TEST_RECORD: record };
+  // A gh that is not signed in, so the dry run asks nothing of GitHub, and the repository has no
+  // origin to fetch from: both only become notes of what a real run would stop at.
+  fs.mkdirSync(path.join(root, 'bin'));
+  fs.writeFileSync(path.join(root, 'bin', 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const env = { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, GIT_CONFIG_GLOBAL: path.join(root, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1', LEGION_TEST_RECORD: record };
   const git = (...args) => {
     const result = spawnSync('git', ['-C', repo, '-c', 'user.name=me', '-c', 'user.email=me@example.invalid', ...args], { encoding: 'utf8', env });
     assert.equal(result.status, 0, result.stderr);
@@ -41,8 +45,12 @@ process.exit(1);
 
   const result = spawnSync('bash', [path.join(repo, 'scripts', 'release.sh'), '1.4.0', '--dry-run', '--notes', path.join(root, 'notes.md')], { cwd: root, encoding: 'utf8', env });
   assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /A real run would stop here: gh is not signed in/);
+  assert.match(result.stderr, /A real run would stop here: cannot fetch main from origin/);
   assert.match(result.stdout, /Versions agree: agent 3\.1\.0 \(floor 3\.1\.0\), app 1\.4\.0 \(build 15\)\./);
-  assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')), []);
+  // Nothing an earlier run left, only this run's notes, kept there for a --resume.
+  assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')), ['release-notes.md']);
+  assert.equal(fs.readFileSync(path.join(repo, 'dist', 'release-notes.md'), 'utf8'), 'A release.\n');
   // The bump is put back when the release does not make it to a commit.
   assert.equal(git('status', '--porcelain'), '');
 });
