@@ -14,6 +14,12 @@ import { acquireOperationLock } from '../src/lock.mjs';
 const AGENT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CURRENT_VERSION = JSON.parse(fs.readFileSync(path.join(AGENT, 'package.json'), 'utf8')).version;
 
+/** A copy of the agent source as a tree, package.json included, in `root`. */
+function copyAgentSource(root) {
+  fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
+  fs.copyFileSync(path.join(AGENT, 'package.json'), path.join(root, 'package.json'));
+}
+
 function signingPair() { return crypto.generateKeyPairSync('ed25519'); }
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 
@@ -79,6 +85,7 @@ async function isolatedModule() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-selfupdate-module-'));
   const src = path.join(root, 'src');
   fs.cpSync(path.join(AGENT, 'src'), src, { recursive: true });
+  fs.copyFileSync(path.join(AGENT, 'package.json'), path.join(root, 'package.json'));
   const pair = signingPair();
   patchTrust(src, pair.publicKey);
   const module = await import(`${pathToFileURL(path.join(src, 'selfupdate.mjs')).href}?${Date.now()}-${Math.random()}`);
@@ -205,7 +212,7 @@ test('self-test must report the version and contract from the signed manifest', 
 test('version --check fails when an imported module is missing', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-module-check-'));
   try {
-    fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
+    copyAgentSource(root);
     const entry = path.join(root, 'src', 'index.mjs');
     fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace("'http.mjs', 'lock.mjs'", "'missing-check-module.mjs', 'lock.mjs'"));
     const result = spawnSync(process.execPath, [path.join(root, 'src', 'index.mjs'), 'version', '--check'], {
@@ -219,6 +226,30 @@ test('version --check fails when an imported module is missing', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('the agent states the version its package.json gives, and a tree without one fails its self-test', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-package-version-'));
+  try {
+    copyAgentSource(root);
+    const metadata = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ ...metadata, version: '9.8.7' }));
+    const run = (args) => spawnSync(process.execPath, [path.join(root, 'src', 'index.mjs'), ...args], {
+      encoding: 'utf8', env: { ...process.env, LEGIONCTL_HOME: path.join(root, 'data') }, timeout: 10_000,
+    });
+    // One place says which version this is, so no copy elsewhere can disagree.
+    assert.equal(JSON.parse(run(['version']).stdout).agentVersion, '9.8.7');
+    const checked = run(['version', '--check']);
+    assert.equal(checked.status, 0, checked.stdout);
+    assert.equal(JSON.parse(checked.stdout).agentVersion, '9.8.7');
+
+    fs.unlinkSync(path.join(root, 'package.json'));
+    const unknown = run(['version', '--check']);
+    assert.equal(unknown.status, 1);
+    const reply = JSON.parse(unknown.stdout);
+    assert.equal(reply.agentVersion, '0.0.0', 'a version no signed manifest names');
+    assert.match(reply.selfTest.failed.join(' '), /package\.json/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 for (const worker of ['status-probe-worker.mjs', 'service-profile-probe.mjs']) {
   for (const damage of ['missing', 'syntax', 'nested-import']) {
     test(`staged self-test rejects ${worker} with ${damage} damage`, () => {
@@ -226,7 +257,7 @@ for (const worker of ['status-probe-worker.mjs', 'service-profile-probe.mjs']) {
       const oldHome = process.env.LEGIONCTL_HOME;
       try {
         process.env.LEGIONCTL_HOME = path.join(root, 'data');
-        fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
+        copyAgentSource(root);
         const entry = path.join(root, 'src', worker);
         if (damage === 'missing') fs.unlinkSync(entry);
         else if (damage === 'syntax') fs.writeFileSync(entry, 'this is deliberately invalid syntax !!!');
@@ -252,7 +283,7 @@ test('staged self-test parses worker entry points and dependencies without execu
   const oldHome = process.env.LEGIONCTL_HOME;
   try {
     process.env.LEGIONCTL_HOME = path.join(root, 'data');
-    fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
+    copyAgentSource(root);
     const marker = path.join(root, 'worker-executed');
     const sentinel = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'executed'); throw new Error('worker must not execute');\n`;
     for (const worker of ['status-probe-worker.mjs', 'service-profile-probe.mjs']) {

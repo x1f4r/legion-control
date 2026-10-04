@@ -23,6 +23,7 @@ import { spawnDetached } from './detached.mjs';
 import { fileURLToPath } from 'node:url';
 import { checkWorkerModules } from './selftest-modules.mjs';
 import {
+  AGENT_METADATA_PROBLEM,
   AGENT_VERSION,
   basePath,
   configPath,
@@ -1360,6 +1361,9 @@ async function commandVersion(flags, loaded) {
     const workers = checkWorkerModules(fileURLToPath(new URL('.', import.meta.url)));
     if (!workers.ok) failed.push(`worker modules: ${workers.error}`);
     else loadedCount += 2;
+    // The version every reply carries comes from package.json. A tree that
+    // cannot say which version it is must not replace one that can.
+    if (AGENT_METADATA_PROBLEM) failed.push(`package.json: ${AGENT_METADATA_PROBLEM}`);
     // The configuration is read but never written: a self-test that changed the
     // machine it is testing would be worse than no self-test.
     if (!loaded.ok && loaded.config === null) failed.push(`config.json: ${loaded.error}`);

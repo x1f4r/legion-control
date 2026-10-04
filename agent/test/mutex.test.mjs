@@ -9,7 +9,7 @@ import { once } from 'node:events';
 import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { acquireMutex, mutexAvailable, mutexPath, probeMutex } from '../src/mutex.mjs';
-import { SRC, withHome } from './helpers.mjs';
+import { AGENT_VERSION, SRC, withHome } from './helpers.mjs';
 
 const isWindows = process.platform === 'win32';
 
@@ -283,6 +283,6 @@ test('a mutating command refuses cleanly when node:sqlite is missing', async () 
     // running cannot be diagnosed remotely.
     const payload = JSON.parse(result.stdout);
     assert.equal(payload.ok, true);
-    assert.equal(payload.agentVersion, '3.0.1');
+    assert.equal(payload.agentVersion, AGENT_VERSION);
   });
 });

@@ -17,6 +17,8 @@ export const ENTRY = path.join(SRC, 'index.mjs');
 export const REPO = path.resolve(SRC, '..', '..');
 /** The tiny controllable service the CLI tests drive. */
 export const FIXTURE = path.join(REPO, 'agent', 'test', 'fixture-service.mjs');
+/** The version agent/package.json states. It is written nowhere else, so the tests read it from there too. */
+export const AGENT_VERSION = JSON.parse(fs.readFileSync(path.join(SRC, '..', 'package.json'), 'utf8')).version;
 
 /**
  * An isolated base directory, with LEGIONCTL_HOME pointed at it for the

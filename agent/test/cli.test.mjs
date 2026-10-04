@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { cli, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
+import { AGENT_VERSION, cli, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
 
 /** A home with the fixture service configured and running. */
 async function withService(body, { config = null, initial = {} } = {}) {
@@ -21,7 +21,7 @@ test('status describes the service, its process, health and busy evidence apart'
     const { payload, exitCode } = cli(['status'], { home });
     assert.equal(exitCode, 0);
     assert.equal(payload.contract, 3);
-    assert.equal(payload.agentVersion, '3.0.1');
+    assert.equal(payload.agentVersion, AGENT_VERSION);
 
     const service = payload.services[0];
     assert.equal(service.installed, '1.0.0');
