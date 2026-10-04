@@ -1,5 +1,9 @@
 package com.x1f4r.legioncontrol.data
 
+import com.x1f4r.legioncontrol.contract.VectorJson
+import com.x1f4r.legioncontrol.contract.VectorJson.boolean
+import com.x1f4r.legioncontrol.contract.VectorJson.string
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -63,6 +67,19 @@ class PeerConfigValidationTest {
             read("""{"version":1,"controller":{"id":"setup-a","lineage":[$tooMany]},$base,"sites":[{"id":"home"}]}""")
                 .exceptionOrNull()!!.message!!.contains("at most"),
         )
+    }
+
+    @Test
+    fun `an ancestry entry is a hash exactly when the contract's sha256 vectors say so`() {
+        // Apply checks the ancestry with Contract.isSha256Hex, so the identifier vectors pin the code
+        // that runs here rather than a copy of the pattern kept beside it.
+        val cases = VectorJson.cases("identifiers", "sha256")
+        assertTrue(cases.isNotEmpty())
+        cases.forEach { case ->
+            val entry = JsonPrimitive(case.input.string("value")!!)
+            val text = """{"version":1,"controller":{"id":"setup-a","lineage":[$entry]},$base,"sites":[{"id":"home"}]}"""
+            assertEquals(case.name, case.expect.boolean("valid"), read(text).isSuccess)
+        }
     }
 
     @Test

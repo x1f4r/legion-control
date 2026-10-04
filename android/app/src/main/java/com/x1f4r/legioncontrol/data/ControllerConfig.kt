@@ -234,8 +234,6 @@ private const val SUPPORTED_VERSION = 1
 /** How many ancestors a document carries. Beyond this cap, a stale branch reads as divergence. */
 internal const val MAX_LINEAGE = 32
 
-private val SHA256_HEX = Regex("^[0-9a-f]{64}$")
-
 /**
  * Lenient on the way in for the same reason the agent's replies are: the Mac's half of this
  * document is not ours to reject, and a key added by a later release must cost nothing here.
@@ -305,7 +303,7 @@ fun ControllerConfig.validate(): Result<ControllerConfig> {
                     "$MAX_LINEAGE are allowed.",
             )
         }
-        identity.lineage.firstOrNull { !SHA256_HEX.matches(it) }?.let {
+        identity.lineage.firstOrNull { !Contract.isSha256Hex(it) }?.let {
             return failure("\"$it\" in the setup's ancestry is not a sha256 hash.")
         }
         if (identity.lineage.size != identity.lineage.toSet().size) {
