@@ -51,6 +51,25 @@ object ReleaseAssets {
     fun agentTarball(version: String) = "legionctl-agent-$version.tgz"
 }
 
+/**
+ * How much of each release file is read before it is refused as too large.
+ *
+ * The same caps the Mac uses. Every one of these files comes from wherever the setup's update
+ * source points, so none of them is read whole on the strength of being asked for: a release list,
+ * a manifest and a signature are all small, and an artefact is exactly the size its signed manifest
+ * gives and not a byte more.
+ */
+object ReleaseLimits {
+    /** GitHub's description of a release, with its assets and notes. */
+    const val RELEASE_JSON_BYTES = 1024 * 1024
+
+    /** `Legion-Control-manifest.json`. `scripts/release-integrity.mjs` holds releases to the same. */
+    const val MANIFEST_BYTES = 256 * 1024
+
+    /** The detached `.sig`: 88 characters of base64 and a newline. */
+    const val SIGNATURE_BYTES = 4 * 1024
+}
+
 /** Why a signed manifest was not accepted. Every one of these refuses the artefact. */
 sealed interface ManifestProblem {
     val sentence: String
@@ -62,6 +81,11 @@ sealed interface ManifestProblem {
 
     data object MissingSignature : ManifestProblem {
         override val sentence = "That release has a manifest and no signature over it."
+    }
+
+    data class TooLarge(val limit: Int) : ManifestProblem {
+        override val sentence =
+            "That release's manifest is over $limit bytes, far more than a manifest needs, so it was not read."
     }
 
     data object BadSignature : ManifestProblem {
@@ -94,6 +118,19 @@ sealed interface ManifestProblem {
     data class WrongSize(val name: String, val expected: Long, val actual: Long) : ManifestProblem {
         override val sentence =
             "$name is $actual bytes and the signed manifest says $expected. Nothing was installed."
+    }
+
+    /** The download went past the signed size, and was stopped there rather than read to its end. */
+    data class Oversized(val name: String, val expected: Long) : ManifestProblem {
+        override val sentence =
+            "$name went on past the $expected bytes the signed manifest says, so the download was " +
+                "stopped and deleted. Nothing was installed."
+    }
+
+    /** No size, so no point at which a download of it would stop. */
+    data class NoSize(val name: String) : ManifestProblem {
+        override val sentence =
+            "That release's manifest gives no size for $name, so it was not downloaded."
     }
 
     data class WrongHash(val name: String) : ManifestProblem {
@@ -135,6 +172,9 @@ object ReleaseVerification {
     ): Result<VerifiedManifest> {
         if (manifestBytes == null) return failure(ManifestProblem.MissingManifest)
         if (signature.isNullOrBlank()) return failure(ManifestProblem.MissingSignature)
+        if (manifestBytes.size > ReleaseLimits.MANIFEST_BYTES) {
+            return failure(ManifestProblem.TooLarge(ReleaseLimits.MANIFEST_BYTES))
+        }
         if (!Trust.verifyDetachedSignature(manifestBytes, signature)) {
             return failure(ManifestProblem.BadSignature)
         }
@@ -155,6 +195,20 @@ object ReleaseVerification {
     }
 
     /**
+     * The artefact [name] as the signed manifest describes it, or why it is not one to fetch.
+     *
+     * Asked before a byte is downloaded, because the signed size is where a download stops. An
+     * artefact with no size has no such point, and the release's own idea of the size or the
+     * server's Content-Length is not signed by anybody.
+     */
+    fun artifactToFetch(manifest: VerifiedManifest, name: String): Result<ReleaseArtifact> {
+        val artifact = manifest.artifact(name)
+            ?: return Result.failure(ManifestVerificationFailed(ManifestProblem.MissingArtifact(name)))
+        if (artifact.size <= 0) return Result.failure(ManifestVerificationFailed(ManifestProblem.NoSize(name)))
+        return Result.success(artifact)
+    }
+
+    /**
      * Whether these bytes are the artefact the signed manifest describes.
      *
      * Size before hash, because a size that is wrong is cheap to notice and says something more
@@ -165,8 +219,9 @@ object ReleaseVerification {
         name: String,
         bytes: ByteArray,
     ): ManifestProblem? {
-        val artifact = manifest.artifact(name) ?: return ManifestProblem.MissingArtifact(name)
-        if (artifact.size > 0 && bytes.size.toLong() != artifact.size) {
+        val artifact = artifactToFetch(manifest, name)
+            .getOrElse { return (it as ManifestVerificationFailed).problem }
+        if (bytes.size.toLong() != artifact.size) {
             return ManifestProblem.WrongSize(name, artifact.size, bytes.size.toLong())
         }
         if (!sha256Hex(bytes).equals(artifact.sha256, ignoreCase = true)) {

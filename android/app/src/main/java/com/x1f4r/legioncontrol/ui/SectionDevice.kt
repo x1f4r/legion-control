@@ -130,6 +130,7 @@ internal fun AppUpdateBlock(updates: AppUpdateModel) {
 
     updates.note?.let { QuietText(it, Modifier.padding(top = 6.dp)) }
     updates.failure?.let { QuietText(it, Modifier.padding(top = 6.dp)) }
+    updates.repositoryNote?.let { QuietText(it, Modifier.padding(top = 6.dp)) }
 }
 
 /** Why there is nothing to press, in one line. Null when there is. */
