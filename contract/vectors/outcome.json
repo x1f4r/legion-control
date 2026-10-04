@@ -7,7 +7,7 @@
   "reference": "tools/outcome.mjs",
   "notes": [
     "reduce: the input holds only the fields the reducer reads; a key that is absent is absent from the reply. Feed the object to the reducer exactly as it is.",
-    "records: kind \"record\" is reduced from { ...value.result, state: value.state, outcome: value.outcome ?? value.result.outcome }; kind \"summary\" is reduced from the summary itself. Decode value with the decoder used for op records and summaries in production.",
+    "records: kind \"record\" is reduced from { ...value.result, state: value.state, outcome: value.outcome ?? value.result?.outcome }, where result is null until the record is finished; kind \"summary\" is reduced from the summary itself. Decode value with the decoder used for op records and summaries in production.",
     "A stated outcome this version does not know reduces to unknown; it is never passed through."
   ],
   "groups": {

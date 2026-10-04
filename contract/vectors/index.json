@@ -158,12 +158,12 @@
         },
         {
           "group": "commandLines",
-          "cases": 49,
+          "cases": 51,
           "consumers": {
             "agent": 8,
-            "mac": 49,
-            "desktop": 49,
-            "android": 49
+            "mac": 51,
+            "desktop": 51,
+            "android": 51
           }
         },
         {
