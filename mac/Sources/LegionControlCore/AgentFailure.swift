@@ -7,9 +7,9 @@ import Foundation
 /// that may have reached it can never be retried, because "reboot" and "update" are not questions
 /// you get to ask twice, and a second one landing on a machine that already took the first is how a
 /// user loses work.
-enum Dispatch: Sendable, Equatable {
+enum Dispatch: String, Sendable, Equatable {
     /// The agent provably never ran: no route, refused, authentication rejected, host key refused,
-    /// or the interpreter itself was missing.
+    /// the interpreter itself was missing, or this app refused to write the command line at all.
     case never
     /// It may or may not have run. A timeout and a link that dropped mid-session both land here.
     case unknown
@@ -57,6 +57,41 @@ struct AgentFailure: Error, Sendable, Equatable {
         case unreadableOutput
         /// The agent replied cleanly and what it said was that it had failed.
         case agentFailed
+        /// This app refused to send the command: a line its grammar cannot carry, or an address
+        /// it does not dial. Nothing left this Mac.
+        case badRequest
+
+        /// Whether the failure is about the address rather than about the command, so the other
+        /// systems on that address are not worth trying (section 15.5).
+        var isRouteLevel: Bool {
+            switch self {
+            case .hostUnreachable, .connectionRefused, .authenticationFailed,
+                 .hostKeyChanged, .hostKeyUnknown, .launchFailed, .noRoute, .timedOut, .linkLost:
+                true
+            case .interpreterMissing, .agentMissing, .unreadableOutput, .agentFailed, .badRequest:
+                false
+            }
+        }
+
+        /// The kind's name in the contract and the shared vectors.
+        var contractName: String {
+            switch self {
+            case .noRoute: "noRoute"
+            case .launchFailed: "launchFailed"
+            case .hostUnreachable: "hostUnreachable"
+            case .connectionRefused: "connectionRefused"
+            case .authenticationFailed: "authenticationFailed"
+            case .hostKeyChanged: "hostKeyChanged"
+            case .hostKeyUnknown: "hostKeyUnknown"
+            case .timedOut: "timedOut"
+            case .linkLost: "linkLost"
+            case .interpreterMissing: "interpreterMissing"
+            case .agentMissing: "agentMissing"
+            case .unreadableOutput: "unreadableOutput"
+            case .agentFailed: "agentFailed"
+            case .badRequest: "badRequest"
+            }
+        }
     }
 
     var kind: Kind
@@ -106,6 +141,8 @@ struct AgentFailure: Error, Sendable, Equatable {
             return "The agent replied with something unreadable."
         case .agentFailed:
             return "The control agent reported a problem. \(detail)"
+        case .badRequest:
+            return "Nothing was sent to \(machine): this app will not write that command line or dial that address."
         }
     }
 
@@ -136,6 +173,7 @@ struct AgentFailure: Error, Sendable, Equatable {
         case .agentMissing: "agent not installed"
         case .unreadableOutput: "unreadable reply"
         case .agentFailed: "agent reported a failure"
+        case .badRequest: "not sent"
         }
     }
 }

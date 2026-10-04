@@ -292,7 +292,7 @@ struct RemoteAgent: Sendable {
         case .hostUnreachable, .connectionRefused, .authenticationFailed,
              .hostKeyChanged, .hostKeyUnknown, .launchFailed, .noRoute, .timedOut, .linkLost:
             true
-        case .interpreterMissing, .agentMissing, .unreadableOutput, .agentFailed:
+        case .interpreterMissing, .agentMissing, .unreadableOutput, .agentFailed, .badRequest:
             false
         }
     }
@@ -312,7 +312,7 @@ struct RemoteAgent: Sendable {
             case .connectionRefused, .hostUnreachable, .launchFailed, .noRoute: 4
             case .timedOut, .linkLost: 4
             case .agentMissing: 3
-            case .unreadableOutput, .agentFailed: 2
+            case .unreadableOutput, .agentFailed, .badRequest: 2
             case .interpreterMissing: 1
             }
         }
