@@ -113,6 +113,23 @@ function validBroadcasts(list) {
 }
 
 /**
+ * What a client that predates section 10.1 does with a dotted prefix written
+ * without its trailing dot. It matches the prefix as text, so it also takes an
+ * address whose next octet merely begins with the prefix's last one:
+ * `192.168.1` takes 192.168.10.x to 192.168.19.x and 192.168.100.x to
+ * 192.168.199.x. Octets have no leading zeros and stop at 255, so that needs a
+ * last octet from 1 to 25. After a 0, or after 26 and above, no octet
+ * continues it and text matching is right by luck, so the message names an
+ * address it wrongly takes only when there is one.
+ */
+function withoutDotMessage(text) {
+  const last = Number(text.slice(text.lastIndexOf('.') + 1));
+  const start = `${JSON.stringify(text)} has no trailing dot; clients that predate section 10.1 match it as text`;
+  if (last >= 1 && last <= 25) return `${start}, so they also take ${text}0.x for ${text}.x`;
+  return `${start}, which takes nothing more here only because no octet begins with ${last} but ${last} itself`;
+}
+
+/**
  * The warnings of section 9.7 that come from addresses: `shared-prefix`,
  * `prefix-invalid`, `prefix-without-dot`, `broadcast-invalid` and
  * `wake-broadcast-defaulted`, as `{ code, path, message }` in document order.
@@ -136,7 +153,7 @@ export function prefixWarnings(document) {
     if (parsed === null) {
       add('prefix-invalid', path, `${JSON.stringify(text)} is not a dotted or CIDR IPv4 prefix, so it never matches any address`);
     } else if (parsed.form === 'dotted' && !text.endsWith('.')) {
-      add('prefix-without-dot', path, `${JSON.stringify(text)} has no trailing dot; clients that predate section 10.1 match it as text, so they also take ${text}0.x for ${text}.x`);
+      add('prefix-without-dot', path, withoutDotMessage(text));
     }
     return parsed;
   };

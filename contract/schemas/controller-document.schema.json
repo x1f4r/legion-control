@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "controller-document.schema.json",
   "title": "The shared setup document",
-  "description": "The one document every peer edits and every machine carries a copy of. The agent stores its bytes and reads only the `controller` block; everything else is for the clients. Unknown keys are allowed ANYWHERE and MUST be preserved when a client edits the document: a client that round-trips through a typed model and drops a key it did not know silently deletes another peer's newer setting, and the canonical hash then makes that deletion look like a legitimate edit. Edit the parsed JSON, not the model.\n\nThis file is not a reply. It is validated by contract/validate.mjs so that the client editors and the example configs agree about a shape none of them owns alone.",
+  "description": "The one document every peer edits and every machine carries a copy of. The agent stores its bytes and reads the `controller` block, and from agent 3.1.0 on it checks the document's structure on config set and, for a restricted session, its launch values (contract §9.4); everything else is for the clients. Unknown keys are allowed ANYWHERE and MUST be preserved when a client edits the document: a client that round-trips through a typed model and drops a key it did not know silently deletes another peer's newer setting, and the canonical hash then makes that deletion look like a legitimate edit. Edit the parsed JSON, not the model.\n\nThis file is not a reply. It is validated by contract/validate.mjs so that the client editors and the example configs agree about a shape none of them owns alone.",
   "type": "object",
   "properties": {
     "version": {
@@ -343,7 +343,7 @@
           ]
         },
         "restricted": {
-          "description": "This system's key is bound to the restricted forced-command dispatcher. The dispatcher is not a shell: it parses a limited quoted argv grammar and never expands anything, so a client MUST serialise POSIX argv for it whatever `shell` says. Default false. Launch value: see contract §9.9.",
+          "description": "This system's key is bound to the restricted forced-command dispatcher. The dispatcher is not a shell: it parses a limited quoted argv grammar and never expands anything, so a client serialises with the dispatch grammar of contract §15.2 whatever `shell` says. Default false. Launch value: see contract §9.9.",
           "type": "boolean"
         },
         "agent": {

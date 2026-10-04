@@ -1,7 +1,7 @@
 // The canonical form of a controller document, and its hash.
 //
-// This is the reference implementation of the rule in v3.md, section "Canonical
-// controller bytes". It is the only place in this repository where the rule is
+// This is the reference implementation of the rule in v3.md, section 12
+// "Canonical setup bytes". It is the only place in this repository where the rule is
 // written as code; the agent and the three clients each implement it again in
 // their own language, and contract/hash-vectors.json is what proves the four
 // implementations agree.

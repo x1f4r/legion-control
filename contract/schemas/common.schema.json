@@ -146,7 +146,7 @@
       ]
     },
     "reasonCode": {
-      "description": "The closed enum from v3.md section 2.2. Codes may be added in a later 3.x; a client that meets one it does not know renders the message and treats the reply as failed.",
+      "description": "The closed enum from v3.md section 3. Codes may be added in a later 3.x; a client that meets one it does not know renders the message and treats the reply as failed.",
       "enum": [
         "busy",
         "busy-unknown",
@@ -542,7 +542,7 @@
       ]
     },
     "opPhase": {
-      "description": "The union of the per-kind phase lists in v3.md section 2.3. Which phases a kind may report is fixed there; the union is what a decoder has to accept.",
+      "description": "The union of the per-kind phase lists in v3.md section 5.2. Which phases a kind may report is fixed there; the union is what a decoder has to accept.",
       "enum": [
         "resolving",
         "recovering",
