@@ -336,6 +336,29 @@ struct MacModelTests {
         #expect(model.note?.contains("did not happen") == true)
     }
 
+    @Test("what a configured action printed here stays with this Mac's own line")
+    func localActionOutputStaysWithTheLine() async throws {
+        // It used to be folded into the line itself. It is the line's detail now, which the local
+        // section offers behind Details rather than leaving it to the window's status bar.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("run", json: """
+        { "ok": true, "contract": 3, "action": "ran", "output": "reindexed 412 documents" }
+        """)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        let action = try #require(model.actions.first)
+        model.run(action, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        #expect(model.note == "Reindex ran.")
+        #expect(model.noteDetail == "reindexed 412 documents")
+        #expect(store.newestFirst.first { $0.kind == .action }?.output == "reindexed 412 documents")
+    }
+
     @Test("the local agent is run through the bound argv when the device is a machine in the setup")
     func boundLocalAgent() async throws {
         // The `self` binding: this device is one of the machines in the shared document, and it is
