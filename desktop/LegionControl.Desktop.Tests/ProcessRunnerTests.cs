@@ -57,6 +57,62 @@ public class ProcessRunnerTests
     }
 
     [Fact]
+    public async Task ACallerCancellationIsReportedAsARunThisAppEndedNotAsAnOrdinaryResult()
+    {
+        // The kill leaves an exit status behind, and handing that back as a normal result made a
+        // cancelled change look like one that had failed on the far side.
+        using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
+        var result = await new ProcessRunner().RunAsync("node",
+            new[] { "-e", "process.stdout.write('started');setInterval(()=>{},1000);" }, TimeSpan.FromSeconds(20), null, cancel.Token);
+        Assert.True(result.TimedOut);
+        Assert.True(result.Cancelled);
+        Assert.Contains("cancelled", result.FailureText);
+        Assert.Contains("started", result.StandardOutput);
+    }
+
+    [Fact]
+    public async Task ACommandCancelledBeforeItStartsIsNeverStarted()
+    {
+        var marker = Path.Combine(Path.GetTempPath(), $"legion-never-started-{Guid.NewGuid():N}");
+        using var cancel = new CancellationTokenSource();
+        cancel.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new ProcessRunner().RunAsync("node",
+            new[] { "-e", $"require('fs').writeFileSync({System.Text.Json.JsonSerializer.Serialize(marker)},'ran')" },
+            TimeSpan.FromSeconds(5), null, cancel.Token));
+        Assert.False(File.Exists(marker));
+    }
+
+    [Fact]
+    public async Task ThePipesAreClosedEvenWhenAGrandchildStillHoldsThem()
+    {
+        // The grandchild's EPIPE is how this test sees this side's end of the pipe close. Windows
+        // reports a write to a closed pipe differently, and the rule is the same code path there.
+        if (OperatingSystem.IsWindows()) return;
+        var marker = Path.Combine(Path.GetTempPath(), $"legion-pipe-closed-{Guid.NewGuid():N}");
+        var markerJson = System.Text.Json.JsonSerializer.Serialize(marker);
+        // The child leaves behind a grandchild that inherited its stdout and keeps writing to it.
+        // Once this side has closed its end, a write fails, and the grandchild records why.
+        var grandchild = "const fs=require('fs');let n=0;const t=setInterval(()=>{try{fs.writeSync(1,'tick\\n')}" +
+                         $"catch(e){{fs.writeFileSync({markerJson},e.code);clearInterval(t)}}if(++n>80)clearInterval(t)}},100);";
+        var child = "require('child_process').spawn(process.execPath,['-e'," + System.Text.Json.JsonSerializer.Serialize(grandchild) +
+                    "],{stdio:['ignore','inherit','inherit'],detached:true}).unref();";
+        var result = await new ProcessRunner().RunAsync("node", new[] { "-e", child }, TimeSpan.FromSeconds(10));
+        Assert.True(result.Succeeded, result.FailureText);
+
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (!File.Exists(marker) && waited.Elapsed < TimeSpan.FromSeconds(5)) await Task.Delay(100);
+        try
+        {
+            Assert.True(File.Exists(marker), "the grandchild could still write after the run returned");
+            Assert.Equal("EPIPE", File.ReadAllText(marker));
+        }
+        finally
+        {
+            File.Delete(marker);
+        }
+    }
+
+    [Fact]
     public async Task LargeInputAndBothOutputsDrainWithoutADeadlock()
     {
         var script = "let n=0;process.stdin.on('data',x=>{n+=x.length;process.stdout.write('x'.repeat(8192));process.stderr.write('y'.repeat(8192));});process.stdin.on('end',()=>process.stdout.write('bytes='+n));";

@@ -9,9 +9,14 @@ public sealed record CommandResult
     public int ExitCode { get; init; }
     public string StandardOutput { get; init; } = "";
     public string StandardError { get; init; } = "";
-    /// Our own watchdog fired. The far side may well still be working, so this is never read as
-    /// either success or failure anywhere above this line.
+    /// This app ended the process: our own watchdog fired, or the caller cancelled. The far side
+    /// may well still be working, so this is never read as either success or failure anywhere
+    /// above this line.
     public bool TimedOut { get; init; }
+    /// The caller cancelled, rather than the watchdog firing. Always together with [TimedOut]: a
+    /// cancelled command is exactly as unknown as one that ran out of time, and is only told
+    /// differently to the person reading about it.
+    public bool Cancelled { get; init; }
     public string? LaunchFailure { get; init; }
 
     public bool Succeeded => ExitCode == 0 && !TimedOut && LaunchFailure is null;
@@ -24,6 +29,7 @@ public sealed record CommandResult
         get
         {
             if (LaunchFailure is not null) return LaunchFailure;
+            if (Cancelled) return "The command was cancelled before it finished.";
             if (TimedOut) return "The command did not finish in time.";
             var fromError = InformativeLines(StandardError);
             if (fromError.Length > 0) return fromError;
@@ -114,6 +120,11 @@ public sealed class ProcessRunner : IAgentProcessRunner
         // packet.
         startInfo.Environment["LEGION_NO_WAKE"] = "1";
 
+        // A command that was cancelled before it started never ran, and saying so is the one
+        // honest answer there is. Once it has started, a cancellation is reported below as this
+        // app ending a command whose outcome is not known.
+        cancellationToken.ThrowIfCancellationRequested();
+
         using var process = new Process { StartInfo = startInfo };
         try
         {
@@ -149,6 +160,7 @@ public sealed class ProcessRunner : IAgentProcessRunner
         else writing = WriteInputAsync(process, input, linked.Token);
 
         var timedOut = false;
+        var cancelled = false;
         try
         {
             var exited = process.WaitForExitAsync(linked.Token);
@@ -165,8 +177,13 @@ public sealed class ProcessRunner : IAgentProcessRunner
         }
         catch (OperationCanceledException)
         {
-            timedOut = watchdog.IsCancellationRequested;
-            Trace($"wait cancelled watchdog={timedOut}");
+            // The watchdog and the caller end the process the same way, and either way the far
+            // side may already have acted on what it was sent. A cancelled run is therefore never
+            // handed back as an ordinary result with whatever exit status the kill produced: it is
+            // a run this app ended, exactly as unknown as one that ran out of time.
+            timedOut = true;
+            cancelled = cancellationToken.IsCancellationRequested;
+            Trace($"wait cancelled watchdog={watchdog.IsCancellationRequested} caller={cancelled}");
             TryKill(process);
             // Give the process a moment to go, then take whatever the readers already have. The
             // pipe stays open as long as anything holds the far end, and ssh hands its own stderr
@@ -184,6 +201,12 @@ public sealed class ProcessRunner : IAgentProcessRunner
         await Task.WhenAny(Task.WhenAll(output.Completion, errors.Completion, writing), Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None));
 
         drains.Cancel();
+        // The process only closes the streams it was never asked for. These two were, so they are
+        // closed here: a grandchild that inherited the far end (a ProxyCommand, a helper ssh
+        // started) would otherwise keep both pipes, and a drain blocked on one, alive after the
+        // command is long finished.
+        output.Close();
+        errors.Close();
         Trace($"return stdoutChars={output.Text.Length} stderrChars={errors.Text.Length}");
         return new CommandResult
         {
@@ -191,6 +214,7 @@ public sealed class ProcessRunner : IAgentProcessRunner
             StandardOutput = output.Text,
             StandardError = errors.Text,
             TimedOut = timedOut,
+            Cancelled = cancelled,
         };
     }
 
@@ -212,9 +236,21 @@ public sealed class ProcessRunner : IAgentProcessRunner
     {
         private readonly StringBuilder _text = new();
         private readonly object _gate = new();
+        private readonly StreamReader _reader;
         public Task Completion { get; }
         public string Text { get { lock (_gate) return _text.ToString(); } }
-        public OutputCapture(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing = null) => Completion = DrainAsync(reader, token, trace, framing);
+        public OutputCapture(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing = null)
+        {
+            _reader = reader;
+            Completion = DrainAsync(reader, token, trace, framing);
+        }
+
+        public void Close()
+        {
+            try { _reader.Dispose(); }
+            catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException) { }
+        }
+
         private async Task DrainAsync(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing)
         {
             var buffer = new char[4096];
@@ -229,7 +265,9 @@ public sealed class ProcessRunner : IAgentProcessRunner
                     framing?.Append(buffer.AsSpan(0, read));
                 }
             }
-            catch (Exception error) when (error is IOException or ObjectDisposedException or OperationCanceledException) { }
+            // Closing the reader under a pending read ends the read with one of these too.
+            catch (Exception error) when (error is IOException or ObjectDisposedException or OperationCanceledException
+                                              or InvalidOperationException) { }
         }
     }
 
