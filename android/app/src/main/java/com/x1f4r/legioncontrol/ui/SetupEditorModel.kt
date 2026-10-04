@@ -176,7 +176,7 @@ class SetupEditorModel(
                         put("name", JsonPrimitive(name.trim().ifBlank { trimmed }))
                         put("platform", JsonPrimitive(platform))
                         put("agent", JsonArray(emptyList()))
-                    }
+                    }.withWindowsShell()
                 }
             }
         }
@@ -217,7 +217,7 @@ class SetupEditorModel(
                             .forEach { add(JsonPrimitive(it)) }
                     }
                     ),
-            )
+            ).withWindowsShell()
         }
 
     fun setSystemShell(machineId: String, systemId: String, shell: String?) =
@@ -225,7 +225,7 @@ class SetupEditorModel(
 
     fun setSystemRestricted(machineId: String, systemId: String, restricted: Boolean) =
         editSystem(machineId, systemId) { system ->
-            JsonObject(system + ("restricted" to JsonPrimitive(restricted)))
+            JsonObject(system + ("restricted" to JsonPrimitive(restricted))).withWindowsShell()
         }
 
     // MARK: - Waking
@@ -363,3 +363,18 @@ class SetupEditorModel(
         return SetupMerge.differences(mine = to, theirs = from, base = null)
     }
 }
+
+/**
+ * Contract section 15.1: an editor writes `shell` for every Windows system it creates or changes.
+ *
+ * The grammar a command is written in then sits in the document rather than in a default each client
+ * reads for itself. cmd, because it is what a stock Windows OpenSSH runs and what an absent shell
+ * already means on Windows, so writing it changes nothing that runs. A shell that is already there,
+ * PowerShell included, is left alone.
+ */
+internal fun JsonObject.withWindowsShell(): JsonObject =
+    if (text("platform") == "windows" && this["shell"] == null) {
+        JsonObject(this + ("shell" to JsonPrimitive("cmd")))
+    } else {
+        this
+    }

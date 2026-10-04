@@ -7,6 +7,22 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
+ * The per-machine hints a call to a machine reads and writes: which route answered last and which
+ * system was running. An interface so the agent client can be run in a test without a phone.
+ */
+interface MachineHints {
+    fun lastGoodRoute(machineId: String): StateFlow<String?>
+
+    fun rememberRoute(machineId: String, id: String)
+
+    fun forgetRoute(machineId: String)
+
+    fun lastKnownSystem(machineId: String): StateFlow<String?>
+
+    fun rememberSystem(machineId: String, systemId: String)
+}
+
+/**
  * The handful of things worth remembering between launches, per machine.
  *
  * All of it is a hint that makes the next call faster and none of it is trusted: a remembered route
@@ -17,7 +33,7 @@ import kotlinx.coroutines.flow.asStateFlow
  * machine that leaves the configuration leaves its hints behind rather than misdirecting the next
  * one to take its place.
  */
-class Settings(context: Context) {
+class Settings(context: Context) : MachineHints {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences("legion-control", Context.MODE_PRIVATE)
 
@@ -26,10 +42,10 @@ class Settings(context: Context) {
 
     /** The route that worked last time, so the next call starts there instead of probing everything. */
     @Synchronized
-    fun lastGoodRoute(machineId: String): StateFlow<String?> = route(machineId).asStateFlow()
+    override fun lastGoodRoute(machineId: String): StateFlow<String?> = route(machineId).asStateFlow()
 
     @Synchronized
-    fun rememberRoute(machineId: String, id: String) {
+    override fun rememberRoute(machineId: String, id: String) {
         val flow = route(machineId)
         if (flow.value == id) return
         prefs.edit().putString(routeKey(machineId), id).apply()
@@ -37,7 +53,7 @@ class Settings(context: Context) {
     }
 
     @Synchronized
-    fun forgetRoute(machineId: String) {
+    override fun forgetRoute(machineId: String) {
         prefs.edit().remove(routeKey(machineId)).apply()
         route(machineId).value = null
     }
@@ -47,10 +63,10 @@ class Settings(context: Context) {
      * than second, and for nothing else: what the UI shows always comes from the current reply.
      */
     @Synchronized
-    fun lastKnownSystem(machineId: String): StateFlow<String?> = system(machineId).asStateFlow()
+    override fun lastKnownSystem(machineId: String): StateFlow<String?> = system(machineId).asStateFlow()
 
     @Synchronized
-    fun rememberSystem(machineId: String, systemId: String) {
+    override fun rememberSystem(machineId: String, systemId: String) {
         val flow = system(machineId)
         if (flow.value == systemId) return
         prefs.edit().putString(systemKey(machineId), systemId).apply()

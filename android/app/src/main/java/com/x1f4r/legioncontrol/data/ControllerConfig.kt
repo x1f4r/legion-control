@@ -1,10 +1,13 @@
 package com.x1f4r.legioncontrol.data
 
+import com.x1f4r.legioncontrol.agent.Addresses
+import com.x1f4r.legioncontrol.agent.CommandLineRefusal
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.ControllerSource
 import com.x1f4r.legioncontrol.agent.RemoteShell
-import com.x1f4r.legioncontrol.agent.UnquotableArgument
 import com.x1f4r.legioncontrol.agent.buildRemoteCommand
+import com.x1f4r.legioncontrol.agent.describeRefusal
+import com.x1f4r.legioncontrol.agent.grammarFor
 import com.x1f4r.legioncontrol.net.parseMacAddress
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -194,23 +197,25 @@ data class SystemConfig(
     /**
      * The exact argv run over ssh.
      *
-     * It no longer has to avoid quoting: an argv is turned into a command line by the rules of the
-     * shell the account logs in to. What it does have to do is say which shell that is, in [shell],
-     * whenever any of these needs quoting at all.
+     * Every element is literal: it is turned into a command line by the rules of the grammar the
+     * system logs in with (contract section 15.2), and nothing expands it. `~` is a directory called
+     * `~` rather than the home directory; an absolute path, or `/bin/sh -c` with `$HOME`, is what
+     * reaches the home directory.
      */
     val agent: List<String> = emptyList(),
     /**
-     * "posix", "cmd" or "powershell". Absent means "nothing here needs quoting", which is true of
-     * every path without a space in it and is checked rather than assumed.
+     * "posix", "cmd" or "powershell": the shell the account's OpenSSH runs. Absent means the
+     * platform's stock one, cmd on Windows and a POSIX shell everywhere else. PowerShell is never
+     * assumed, so an account that logs in to it has to say so.
      */
     val shell: String? = null,
     /**
      * True when this system's key is restricted to the agent's forced-command dispatcher.
      *
-     * The dispatcher parses a POSIX argv grammar itself and no shell ever sees the line, so a
-     * PowerShell system behind one must be serialised as POSIX rather than with a leading call
-     * operator. The agent reports `restrictedSession` once a request has landed; this flag is how
-     * the very first request gets the serialisation right, before anything has answered.
+     * The dispatcher parses its own argv grammar and no shell ever sees the line, so a system
+     * behind one is written in the dispatcher grammar whatever [shell] says. The agent reports
+     * `restrictedSession` once a request has landed; this flag is how the very first request gets
+     * the serialisation right, before anything has answered.
      */
     val restricted: Boolean = false,
 )
@@ -353,21 +358,11 @@ fun ControllerConfig.validate(): Result<ControllerConfig> {
                 )
             }
             val declared = system.shell
-            if (declared != null && RemoteShell.fromWire(declared) == RemoteShell.AUTO &&
-                !declared.equals("auto", ignoreCase = true)
-            ) {
+            if (declared != null && RemoteShell.fromWire(declared) == null) {
                 return failure(
                     "The system \"${system.id}\" on $where says its shell is \"$declared\". " +
                         "It has to be \"posix\", \"cmd\" or \"powershell\".",
                 )
-            }
-            // Checked here rather than at the moment a button is pressed. An agent path with a space
-            // in it and no declared shell is a configuration that cannot be used, and finding that
-            // out when Apply is pressed is much better than finding it out during a restart.
-            try {
-                buildRemoteCommand(RemoteShell.fromWire(system.shell), system.agent + listOf("status"))
-            } catch (unquotable: UnquotableArgument) {
-                return failure("The system \"${system.id}\" on $where cannot be run: ${unquotable.reason}")
             }
         }
 
@@ -508,6 +503,45 @@ private fun ControllerConfig.helperCycle(): String? {
 /** Warnings that are worth showing beside a field and are never a reason to refuse a document. */
 fun ControllerConfig.advisories(): List<String> = buildList {
     val byId = machines.associateBy { it.id }
+    for (machine in machines) {
+        val where = machine.name?.takeIf { it.isNotBlank() } ?: machine.id
+
+        // Contract section 15.6: an address outside the dial grammar is kept and never dialled.
+        for (endpoint in machine.endpoints) {
+            if (!Addresses.isDialable(endpoint.host, endpoint.user, endpoint.port)) {
+                add(
+                    "The address \"${endpoint.id}\" on $where (${endpoint.user}@${endpoint.host}:" +
+                        "${endpoint.port}) is not a host, user and port this app dials, so it is skipped.",
+                )
+            }
+        }
+
+        for (system in machine.systems) {
+            val name = system.name ?: system.id
+            // Argv elements are literal. A tilde reached the home directory only while a shell
+            // happened to see it bare, and it no longer does, so the command runs a file in a
+            // directory called ~.
+            system.agent.firstOrNull { it.startsWith("~") }?.let { argument ->
+                add(
+                    "The command for $name on $where starts \"$argument\" with ~, which is not " +
+                        "expanded. Use an absolute path, or /bin/sh -c with \$HOME.",
+                )
+            }
+            // A command its grammar cannot write is a valid document and a system that is never
+            // driven. Said here, at Apply, rather than first at the moment a button is pressed.
+            if (system.agent.isEmpty()) continue
+            val choice = grammarFor(system.platform, system.shell, system.restricted, false, system.agent.size)
+            val problem = choice.grammar?.let { grammar ->
+                try {
+                    buildRemoteCommand(grammar, system.agent + "status")
+                    null
+                } catch (refusal: CommandLineRefusal) {
+                    refusal.message
+                }
+            } ?: choice.refusal?.let { describeRefusal(it, null) }
+            problem?.let { add("The command for $name on $where cannot be sent: $it") }
+        }
+    }
     for (machine in machines) {
         val wake = machine.wake ?: continue
         val where = machine.name?.takeIf { it.isNotBlank() } ?: machine.id

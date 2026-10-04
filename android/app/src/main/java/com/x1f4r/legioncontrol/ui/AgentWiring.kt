@@ -217,7 +217,7 @@ private class WiredMachineClient(
 
     override val route: Route? get() = lastRoute
 
-    override suspend fun status(): Result<AgentStatus> = attempt { wiring.agent.status(STATUS_BUDGET_MS) }
+    override suspend fun status(): Result<AgentStatus> = attempt { wiring.agent.status() }
 
     override suspend fun update(
         request: UpdateRequest,
@@ -329,7 +329,7 @@ private class WiredMachineClient(
     override suspend fun waitForWake(): Boolean = withTimeoutOrNull(WAKE_WAIT_MILLIS) {
         while (true) {
             delay(WAKE_POLL_MILLIS)
-            val status = runCatching { wiring.agent.status(STATUS_BUDGET_MS) }.getOrNull()?.value
+            val status = runCatching { wiring.agent.status() }.getOrNull()?.value
             if (status?.ok != false && status?.systemId != null) return@withTimeoutOrNull true
         }
         @Suppress("UNREACHABLE_CODE")
@@ -399,11 +399,6 @@ private class WiredMachineClient(
     }
 
     private companion object {
-        /**
-         * The agent's own budget for a snapshot, well inside the client's thirty second command
-         * budget so that a bounded partial answer always beats a client timeout.
-         */
-        const val STATUS_BUDGET_MS = 20_000L
         const val WAKE_POLL_MILLIS = 3_000L
         const val WAKE_WAIT_MILLIS = 45_000L
 

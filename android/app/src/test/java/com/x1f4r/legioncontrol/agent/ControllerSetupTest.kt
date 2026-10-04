@@ -99,55 +99,36 @@ class ControllerSetupTest {
 
     @Test
     fun `the command shapes are the standard installs, written for their own shells`() {
-        val commands = setupCommands("me")
+        val commands = setupCommands()
 
         // The layouts the installers write, and nothing else. This list exists for the one machine
         // that is not in any configuration yet, because it is the machine the configuration is
-        // about to come from; everything else is dialled with the argv the document names.
+        // about to come from; everything else is dialled with the argv the document names. The home
+        // directory is the far side's own $HOME, expanded by a shell that is asked for by name,
+        // because a bare ~ is a literal directory now.
         assertEquals(
             listOf(
-                "/usr/bin/node /home/me/.legion-control/agent/src/index.mjs config",
-                "node ~/.legion-control/agent/src/index.mjs config",
-                "/opt/homebrew/bin/node ~/.legion-control/agent/src/index.mjs config",
-                "node C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs config",
+                "/bin/sh -c 'exec \"\$HOME/.legion-control/bin/legionctl\" \"\$@\"' legionctl config",
+                "@\"powershell.exe\" \"-NoProfile\" \"-NonInteractive\" \"-ExecutionPolicy\" \"Bypass\" " +
+                    "\"-EncodedCommand\" \"${commands[1].arguments.last()}\"",
+                "& 'powershell.exe' '-NoProfile' '-NonInteractive' '-ExecutionPolicy' 'Bypass' " +
+                    "'-EncodedCommand' '${commands[2].arguments.last()}'",
+                "/bin/sh -c 'exec node \"\$HOME/.legion-control/agent/src/index.mjs\" \"\$@\"' legionctl config",
             ),
-            // Distinct lines: nothing here needs quoting, so the cmd.exe and PowerShell forms are
-            // the same string, and the fetch runs it once rather than twice.
-            commands.drop(2).mapNotNull { it.line() }.distinct(),
+            commands.map { it.line() },
         )
+        assertEquals(
+            listOf(RemoteShell.POSIX, RemoteShell.CMD, RemoteShell.POWERSHELL, RemoteShell.POSIX),
+            commands.map { it.grammar },
+        )
+        assertTrue("no shape carries a tilde", commands.flatMap { it.arguments }.none { it.contains('~') })
     }
 
     @Test
-    fun `a user name that needs quoting is written correctly, or the shape is skipped`() {
-        // Unusual and not impossible, and the one value in these commands that comes from outside.
-        val commands = setupCommands("first last")
-
-        // The one POSIX shape that carries the user name quotes it rather than producing two
-        // arguments. The other two use ~, which does not contain the name at all.
-        val posix = commands.filter { it.shell == RemoteShell.POSIX }.mapNotNull { it.line() }
-        assertTrue(
-            posix.any { it.contains("'/home/first last/.legion-control/agent/src/index.mjs'") },
-        )
-
-        // A tilde is never quoted, because a quoted tilde is a directory literally called "~".
-        assertTrue(posix.any { it.contains(" ~/.legion-control/agent/src/index.mjs ") })
-
-        // The Windows shapes carry it in the two forms those shells actually read.
-        val cmd = commands.last { it.shell == RemoteShell.CMD }.line()
-        assertTrue(cmd!!.contains("\"C:\\Users\\first last\\.legion-control\\agent\\src\\index.mjs\""))
-        val powershell = commands.first { it.shell == RemoteShell.POWERSHELL }.line()
-        assertTrue(powershell!!.startsWith("& 'node' '"))
-        assertTrue(powershell.contains("C:\\Users\\first last\\"))
-
-        // Nothing that would run a second command can be produced from it.
-        assertTrue(commands.mapNotNull { it.line() }.none { it.contains(";") })
-    }
-
-    @Test
-    fun `stable wrappers precede all runtime guesses and ignore the login user`() {
-        val commands = setupCommands("me")
-        assertEquals("~/.legion-control/bin/legionctl config", commands[0].line())
+    fun `both Windows shapes run the same fixed script, whatever the login user is`() {
+        val commands = setupCommands()
         val windows = commands[1]
+        assertEquals(windows.arguments, commands[2].arguments)
         assertEquals("powershell.exe", windows.arguments.first())
         assertEquals("-EncodedCommand", windows.arguments[5])
         val script = String(Base64.getDecoder().decode(windows.arguments.last()), Charsets.UTF_16LE)
@@ -155,8 +136,6 @@ class ControllerSetupTest {
         assertTrue(script.contains("& (Join-Path \$HOME '.legion-control/bin/legionctl.ps1') config"))
         assertTrue(script.contains("exit \$LASTEXITCODE"))
         assertTrue(script.endsWith("exit 1 }"))
-        assertEquals(windows.line(), buildRemoteCommand(RemoteShell.POWERSHELL, windows.arguments))
-        assertEquals(commands.take(2), setupCommands("';$(touch injected);%USERPROFILE%!&").take(2))
     }
 
     @Test
@@ -172,7 +151,7 @@ class ControllerSetupTest {
                 writeText("#!/bin/sh\nexec " + quotePosix(runtime.absolutePath) + " \"\$@\"\n")
                 setExecutable(true)
             }
-            val process = ProcessBuilder("/bin/sh", "-c", setupCommands("unused").first().line()!!)
+            val process = ProcessBuilder("/bin/sh", "-c", setupCommands().first().line()!!)
                 .apply { environment()["HOME"] = home.absolutePath; environment()["PATH"] = "/missing" }
                 .start()
             val stdout = process.inputStream.bufferedReader().readText()
@@ -185,18 +164,21 @@ class ControllerSetupTest {
     }
 
     @Test
-    fun `bootstrap stops at the first reply and retains legacy fallback`() = runBlocking {
+    fun `bootstrap stops at the first reply and moves on from a shell that could not start it`() = runBlocking {
         val tried = mutableListOf<String>()
-        val expectedLegacy = setupCommands("me")[2].line()
-        val result = fetchController("me") { line ->
+        val powershell = setupCommands()[2].line()
+        val result = fetchController { line ->
             tried += line
-            if (line == expectedLegacy) CommandOutcome(0, document, "")
-            else CommandOutcome(127, "", "command not found")
+            if (line == powershell) {
+                CommandOutcome(0, document, "")
+            } else {
+                CommandOutcome(9009, "", "'powershell.exe' is not recognized as an internal or external command")
+            }
         }
         assertTrue(result is ControllerFetch.Document)
-        assertEquals(setupCommands("me").take(3).map { it.line() }, tried)
+        assertEquals(setupCommands().take(3).map { it.line() }, tried)
         var count = 0
-        assertEquals(ControllerFetch.NothingStored, fetchController("me") {
+        assertEquals(ControllerFetch.NothingStored, fetchController {
             count++
             CommandOutcome(0, "{\"controller\":null}", "")
         })
@@ -207,7 +189,7 @@ class ControllerSetupTest {
     fun `explicit agent refusal ends discovery without claiming an old or absent agent`() = runBlocking {
         var attempts = 0
         val failure = try {
-            fetchController("me") {
+            fetchController {
                 attempts++
                 CommandOutcome(1, "{\"ok\":false,\"error\":\"restricted command refused\",\"controller\":null}", "")
             }
@@ -221,16 +203,35 @@ class ControllerSetupTest {
     fun `exhausted bootstrap reports discovery uncertainty with bounded diagnostics`() = runBlocking {
         var attempts = 0
         val failure = try {
-            fetchController("me") {
+            fetchController {
                 attempts++
                 CommandOutcome(127, "", "runtime unavailable " + "x".repeat(500))
             }
             error("Expected discovery failure")
         } catch (failure: AgentFailure.DiscoveryFailed) { failure }
-        assertEquals(setupCommands("me").mapNotNull { it.line() }.distinct().size, attempts)
+        assertEquals(setupCommands().size, attempts)
         assertEquals("Could not locate or start the control agent on that machine.", failure.summary)
         assertFalse(failure.summary.contains("not installed"))
         assertEquals(403, failure.detail!!.length)
+    }
+
+    @Test
+    fun `a lost link or a timeout ends discovery, because the address itself is in question`() = runBlocking {
+        val endings = listOf(
+            CommandOutcome(null, "", "") to AgentFailure.Unreachable::class.java,
+            CommandOutcome(255, "", "") to AgentFailure.Unreachable::class.java,
+            CommandOutcome(null, "partial", "", timedOut = true) to AgentFailure.TimedOut::class.java,
+        )
+        for ((outcome, expected) in endings) {
+            var count = 0
+            val failure = try {
+                fetchController { count++; outcome }
+                error("Expected a route-level failure")
+            } catch (failure: AgentFailure) { failure }
+            assertTrue("$outcome gave $failure", expected.isInstance(failure))
+            assertTrue(failure.dispatch.mayHaveRun)
+            assertEquals(1, count)
+        }
     }
 
     @Test
@@ -245,7 +246,7 @@ class ControllerSetupTest {
         for (expected in failures) {
             var count = 0
             val actual = try {
-                fetchController("me") { count++; throw expected }
+                fetchController { count++; throw expected }
                 error("Expected transport failure")
             } catch (failure: AgentFailure) { failure }
             assertSame(expected, actual)

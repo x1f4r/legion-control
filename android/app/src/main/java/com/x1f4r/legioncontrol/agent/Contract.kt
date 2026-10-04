@@ -60,11 +60,18 @@ object Contract {
      * Called on every id that came out of a document or off a machine, before it goes anywhere near
      * a command line. The quoting layer would make a hostile id harmless anyway; this is the second
      * lock on the same door, and it is the one that also catches an id that is merely wrong.
+     *
+     * A refusal is an [AgentFailure.BadRequest], never sent and safe to report, because every caller
+     * already turns an [AgentFailure] into a sentence. It used to be an IllegalArgumentException,
+     * which nothing between here and the screen caught.
      */
     fun requireToken(value: String, what: String): String {
-        require(TOKEN.matches(value)) {
-            "$what \"$value\" is not a valid identifier. Letters, digits and . _ : @ / \\ ~ = + - " +
-                "only, starting with a letter or a digit."
+        if (!isToken(value)) {
+            throw AgentFailure.BadRequest(
+                "This app will not send that request.",
+                "$what \"$value\" is not a valid identifier. Letters, digits and . _ : @ / \\ ~ = + - " +
+                    "only, starting with a letter or a digit.",
+            )
         }
         return value
     }

@@ -670,7 +670,7 @@ class MachineModel(
             }
 
             val failure = outcome.exceptionOrNull()
-            if (failure?.dispatchStage == com.x1f4r.legioncontrol.agent.DispatchStage.AMBIGUOUS ||
+            if (failure?.dispatchStage?.mayHaveRun == true ||
                 (result != null && (result.op?.state in listOf("queued", "running") || result.effectiveAction == null))) {
                 val settled = if (helperClient.abilities.speaksV3) {
                     helperClient.operation(operationId, waitSeconds = 20).getOrNull()

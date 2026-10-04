@@ -164,6 +164,19 @@ class OperationReducerTest {
     }
 
     @Test
+    fun `a reply that could not be read is reconciled like a dropped link, never resent`() {
+        val result = record()
+            .reduce(OperationEvent.Dispatched(trackable = false, at = at))
+            .reduce(OperationEvent.TransportFailed("unreadable", null, DispatchStage.ACKNOWLEDGED, at))
+
+        assertEquals(TrackedState.OUTCOME_UNKNOWN, result.state)
+        assertNull(result.succeeded)
+        assertFalse(result.retryable)
+        assertTrue(DispatchStage.ACKNOWLEDGED.mayHaveRun)
+        assertFalse(DispatchStage.NOT_STARTED.mayHaveRun)
+    }
+
+    @Test
     fun `a timeout is ambiguous, not a failure`() {
         val failure = AgentFailure.TimedOut(240, "still going")
         assertEquals(DispatchStage.AMBIGUOUS, failure.dispatch)

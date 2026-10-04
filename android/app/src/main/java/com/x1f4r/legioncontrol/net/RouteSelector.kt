@@ -1,7 +1,7 @@
 package com.x1f4r.legioncontrol.net
 
 import com.x1f4r.legioncontrol.agent.Machine
-import com.x1f4r.legioncontrol.data.Settings
+import com.x1f4r.legioncontrol.data.MachineHints
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -22,7 +22,7 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class RouteSelector(
     private val machine: Machine,
-    private val settings: Settings,
+    private val settings: MachineHints,
     private val now: () -> Long = System::currentTimeMillis,
 ) {
 

@@ -398,7 +398,7 @@ fun Throwable.toLinkState(): LinkState = when (this) {
         canApprove = canApprove,
     )
 
-    is AgentFailure.Unquotable -> LinkState.Misconfigured(detail ?: summary)
+    is AgentFailure.BadRequest -> LinkState.Misconfigured(detail ?: summary)
     // A command that ran too long says nothing about the link, because the link is what carried it
     // right up to the moment we gave up. Drawing that as offline would claim the machine is asleep on
     // the strength of it having answered, and a boot handler that reads an offline link as "the
@@ -410,7 +410,7 @@ fun Throwable.toLinkState(): LinkState = when (this) {
         // A link that dropped while a command was on it is not the same as one that was never there.
         // The first is unsettled and the second is offline, and only the second is a reason to say
         // the machine is asleep.
-        if (dispatch == DispatchStage.AMBIGUOUS) LinkState.Unsettled(summary) else LinkState.Offline(sentence)
+        if (dispatch.mayHaveRun) LinkState.Unsettled(summary) else LinkState.Offline(sentence)
 
     else -> LinkState.Offline(sentence)
 }

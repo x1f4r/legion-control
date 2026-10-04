@@ -404,7 +404,7 @@ class AppModel(
                     // A push whose reply was lost is byte-identical when it is tried again and the
                     // agent answers `noop`, so there is nothing to recover here: the next poll does
                     // it. Nothing is reported for an ordinary unreachable machine.
-                    if (failure.dispatchStage == com.x1f4r.legioncontrol.agent.DispatchStage.AMBIGUOUS) {
+                    if (failure.dispatchStage.mayHaveRun) {
                         "The setup may or may not have reached ${client.machine.name}. " +
                             "The next check settles it."
                     } else {

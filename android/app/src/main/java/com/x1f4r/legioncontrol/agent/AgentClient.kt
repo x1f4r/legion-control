@@ -1,14 +1,15 @@
 package com.x1f4r.legioncontrol.agent
 
-import com.x1f4r.legioncontrol.data.Settings
+import com.x1f4r.legioncontrol.data.MachineHints
 import com.x1f4r.legioncontrol.net.CommandOutcome
+import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.RouteSelector
-import com.x1f4r.legioncontrol.net.SshTransport
 import com.x1f4r.legioncontrol.net.StdinSource
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.JsonObject
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 /** An answer, plus how it was obtained, because the UI is expected to show the route it used. */
 data class AgentReply<T>(
@@ -17,16 +18,6 @@ data class AgentReply<T>(
     /** Straight out of the agent's own reply. Never inferred from the address. */
     val systemId: String?,
 )
-
-/**
- * Whether a command changes anything, which decides what may be done when it fails.
- *
- * A status that fails on one address is retried on the next, because reading twice is reading once.
- * A restart that fails on one address is only retried when it is known not to have started, and
- * never on the strength of "the connection went away", because that is exactly what a restart looks
- * like from here.
- */
-private enum class CommandNature { READ, MUTATION }
 
 /**
  * How an update was asked for, which is three separate ideas rather than one boolean.
@@ -59,11 +50,12 @@ data class InterruptRequest(
 /**
  * The agent contract, spoken over ssh.
  *
- * One JSON object per invocation, one command per connection. What has changed since 1.2 is that the
- * command line is built rather than pasted together: an argv is not a string, and joining one with
- * spaces works right up to the first path with a space in it. See [buildRemoteCommand]. Every value
- * this app puts on a command line is also checked against the contract's token grammar first, so an
- * id out of a document can never become a second command whatever the quoting does.
+ * One JSON object per invocation, one command per connection. The command line is built rather than
+ * pasted together: an argv is not a string, and joining one with spaces works right up to the first
+ * path with a space in it. See [buildRemoteCommand]. Every value this app puts on a command line is
+ * also checked against the contract's token grammar first, so an id out of a document can never
+ * become a second command whatever the quoting does, and a value that fails is a refused request
+ * rather than an exception nobody catches.
  *
  * Everything added in contract 3 is gated on the far side saying `"contract": 3`. A 2.x agent
  * refuses a flag it does not recognise rather than ignoring it, so one unknown flag fails the whole
@@ -71,9 +63,11 @@ data class InterruptRequest(
  */
 class AgentClient(
     private val machine: Machine,
-    private val transport: SshTransport,
+    private val transport: CommandTransport,
     private val routes: RouteSelector,
-    private val settings: Settings,
+    private val settings: MachineHints,
+    /** Milliseconds, for the one deadline each command has. Replaced in tests, and only there. */
+    private val clock: () -> Long = System::currentTimeMillis,
 ) {
     /**
      * What the last reply said the far side is.
@@ -86,26 +80,42 @@ class AgentClient(
     var abilities: AgentAbilities = AgentAbilities.unknown
         private set
 
+    /**
+     * The routes whose last authenticated status said they arrived through the restricted
+     * dispatcher, by endpoint id.
+     *
+     * A key restricted on the far side and not marked so in the document is still restricted, and a
+     * command line written for a shell is one the dispatcher refuses. Once a status over a route has
+     * said so, every system on that route is written in the dispatcher grammar (contract section
+     * 15.1), which is the only way the run time is allowed to change a grammar.
+     */
+    private val restrictedRoutes = ConcurrentHashMap<String, Boolean>()
+
     // MARK: - Reads
 
-    suspend fun status(budgetMillis: Long? = null): AgentReply<AgentStatus> = call(
-        buildList {
-            add("status")
-            if (budgetMillis != null && abilities.speaksV3) {
-                add("--budget-ms")
-                add(budgetMillis.toString())
-            }
-        },
+    /**
+     * A snapshot of the machine, inside the one 30 second deadline a status has.
+     *
+     * Against an agent known to speak contract 3, every attempt sends the `--budget-ms` that the time
+     * left still allows (section 15.5, step 3), so a working route that comes third is not cut off by
+     * this app's own deadline.
+     */
+    suspend fun status(): AgentReply<AgentStatus> = call(
+        listOf("status"),
         STATUS_TIMEOUT_MILLIS,
         AgentStatus.serializer(),
-        CommandNature.READ,
-    ).also { abilities = AgentAbilities.of(it.value).copy(verbs = abilities.verbs) }
+        CommandSafety.READ,
+        budgeted = true,
+    ).also { reply ->
+        abilities = AgentAbilities.of(reply.value).copy(verbs = abilities.verbs)
+        restrictedRoutes[reply.route.id] = reply.value.agent?.restrictedSession == true
+    }
 
     suspend fun busy(): AgentReply<BusyStatus> =
-        call(listOf("busy"), STATUS_TIMEOUT_MILLIS, BusyStatus.serializer(), CommandNature.READ)
+        call(listOf("busy"), STATUS_TIMEOUT_MILLIS, BusyStatus.serializer(), CommandSafety.READ)
 
     suspend fun version(): AgentReply<AgentVersion> =
-        call(listOf("version"), SHORT_TIMEOUT_MILLIS, AgentVersion.serializer(), CommandNature.READ)
+        call(listOf("version"), SHORT_TIMEOUT_MILLIS, AgentVersion.serializer(), CommandSafety.READ)
             .also { abilities = AgentAbilities.of(it.value).copy(verbs = abilities.verbs) }
 
     /**
@@ -116,7 +126,7 @@ class AgentClient(
      */
     suspend fun readVerbs(): Set<String> {
         if (abilities.verbs.isNotEmpty()) return abilities.verbs
-        val reply = call(listOf("help"), SHORT_TIMEOUT_MILLIS, HelpReply.serializer(), CommandNature.READ)
+        val reply = call(listOf("help"), SHORT_TIMEOUT_MILLIS, HelpReply.serializer(), CommandSafety.READ)
         val verbs = reply.value.verbs
         abilities = abilities.copy(
             contract = reply.value.contract ?: abilities.contract,
@@ -134,22 +144,22 @@ class AgentClient(
         },
         if (deep) DEEP_DOCTOR_TIMEOUT_MILLIS else DOCTOR_TIMEOUT_MILLIS,
         DoctorReport.serializer(),
-        CommandNature.READ,
+        CommandSafety.READ,
     )
 
     suspend fun serviceConfigGet(): AgentReply<JsonObject> =
-        call(listOf("service-config", "get"), SHORT_TIMEOUT_MILLIS, JsonObject.serializer(), CommandNature.READ)
+        call(listOf("service-config", "get"), SHORT_TIMEOUT_MILLIS, JsonObject.serializer(), CommandSafety.READ)
 
     suspend fun serviceConfigWrite(action: String, payload: JsonObject): AgentReply<JsonObject> {
-        require(action == "validate" || action == "set")
+        if (action != "validate" && action != "set") refuse("service-config takes validate or set, not \"$action\".")
         return call(listOf("service-config", action, "--stdin"), DOCTOR_TIMEOUT_MILLIS,
-            JsonObject.serializer(), if (action == "set") CommandNature.MUTATION else CommandNature.READ,
+            JsonObject.serializer(), if (action == "set") CommandSafety.MUTATION else CommandSafety.READ,
             stdin = StdinSource.Bytes(payload.toString().toByteArray(Charsets.UTF_8)))
     }
 
     /** Doctor, status, history, logs and a redacted config, for the export action. */
     suspend fun bundle(): AgentReply<JsonObject> =
-        call(listOf("bundle"), DEEP_DOCTOR_TIMEOUT_MILLIS, JsonObject.serializer(), CommandNature.READ)
+        call(listOf("bundle"), DEEP_DOCTOR_TIMEOUT_MILLIS, JsonObject.serializer(), CommandSafety.READ)
 
     /**
      * What became of an operation, by the id this app gave it.
@@ -171,7 +181,7 @@ class AgentClient(
             }
         }
         val budget = waitSeconds?.let { (it * 1000L) + OP_WAIT_MARGIN_MILLIS } ?: SHORT_TIMEOUT_MILLIS
-        val reply = call(arguments, budget, OpEnvelope.serializer(), CommandNature.READ)
+        val reply = call(arguments, budget, OpEnvelope.serializer(), CommandSafety.READ)
         return AgentReply(reply.value.record(), reply.route, reply.systemId)
     }
 
@@ -192,7 +202,7 @@ class AgentClient(
         },
         SHORT_TIMEOUT_MILLIS,
         HistoryReply.serializer(),
-        CommandNature.READ,
+        CommandSafety.READ,
     )
 
     suspend fun logs(lines: Int = 100, operationId: String? = null): AgentReply<LogsReply> = call(
@@ -207,7 +217,7 @@ class AgentClient(
         },
         SHORT_TIMEOUT_MILLIS,
         LogsReply.serializer(),
-        CommandNature.READ,
+        CommandSafety.READ,
     )
 
     /**
@@ -219,11 +229,11 @@ class AgentClient(
      * that is carrying nothing. [readControllerReply] does the reading.
      */
     suspend fun config(): AgentReply<JsonObject> =
-        call(listOf("config"), SHORT_TIMEOUT_MILLIS, JsonObject.serializer(), CommandNature.READ)
+        call(listOf("config"), SHORT_TIMEOUT_MILLIS, JsonObject.serializer(), CommandSafety.READ)
 
     /** Identity, revision, ancestry and hash without the document, for deciding descent. */
     suspend fun configMeta(): AgentReply<ConfigMetaReply> =
-        call(listOf("config", "meta"), SHORT_TIMEOUT_MILLIS, ConfigMetaReply.serializer(), CommandNature.READ)
+        call(listOf("config", "meta"), SHORT_TIMEOUT_MILLIS, ConfigMetaReply.serializer(), CommandSafety.READ)
 
     /**
      * Publishes a document to this machine.
@@ -243,7 +253,7 @@ class AgentClient(
         replace: Boolean = false,
     ): AgentReply<ConfigSetReply> {
         Contract.requireToken(setupId, "setup id")
-        require(revision >= 0) { "a revision counts up from zero" }
+        if (revision < 0) refuse("A setup revision counts up from zero, and this one is $revision.")
         return call(
             buildList {
                 add("config")
@@ -256,7 +266,7 @@ class AgentClient(
             },
             SHORT_TIMEOUT_MILLIS,
             ConfigSetReply.serializer(),
-            CommandNature.MUTATION,
+            CommandSafety.MUTATION,
             stdin = StdinSource.Bytes(canonicalDocument.toByteArray(Charsets.UTF_8)),
         )
     }
@@ -269,7 +279,7 @@ class AgentClient(
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.READ,
+        CommandSafety.READ,
     )
 
     // MARK: - Mutations
@@ -294,7 +304,7 @@ class AgentClient(
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.MUTATION,
+        CommandSafety.MUTATION,
         stdin = StdinSource.Bytes(encodePolicyPatch(patch)),
     )
 
@@ -312,7 +322,7 @@ class AgentClient(
         },
         if (request.detach && abilities.speaksV3) SHORT_TIMEOUT_MILLIS else UPDATE_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.MUTATION,
+        CommandSafety.MUTATION,
     )
 
     suspend fun restart(
@@ -330,7 +340,7 @@ class AgentClient(
         },
         if (request.detach && abilities.speaksV3) SHORT_TIMEOUT_MILLIS else RESTART_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.MUTATION,
+        CommandSafety.MUTATION,
     )
 
     /**
@@ -352,7 +362,7 @@ class AgentClient(
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.MUTATION,
+        CommandSafety.MUTATION,
     )
 
     /** `auto-update pause DUR` and `auto-update resume`. */
@@ -361,7 +371,7 @@ class AgentClient(
         serviceId: String? = null,
         operationId: String? = null,
     ): AgentReply<AgentActionResult> {
-        require(Contract.isDuration(duration)) { "a pause is written like 30m, 4h or 2d" }
+        if (!Contract.isDuration(duration)) refuse("A pause is written like 30m, 4h or 2d, not \"$duration\".")
         return call(
             buildList {
                 add("auto-update")
@@ -372,7 +382,7 @@ class AgentClient(
             },
             SHORT_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
-            CommandNature.MUTATION,
+            CommandSafety.MUTATION,
         )
     }
 
@@ -388,7 +398,7 @@ class AgentClient(
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.MUTATION,
+        CommandSafety.MUTATION,
     )
 
     /**
@@ -416,7 +426,7 @@ class AgentClient(
             },
             BOOT_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
-            CommandNature.MUTATION,
+            CommandSafety.MUTATION,
         )
     }
 
@@ -433,7 +443,7 @@ class AgentClient(
         },
         SLEEP_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.MUTATION,
+        CommandSafety.MUTATION,
     )
 
     /** Runs one of the actions the agent offered. Busy gated by the agent, exactly as the rest are. */
@@ -454,7 +464,7 @@ class AgentClient(
             },
             ACTION_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
-            CommandNature.MUTATION,
+            CommandSafety.MUTATION,
         )
     }
 
@@ -465,7 +475,7 @@ class AgentClient(
             listOf("cancel", operationId),
             SHORT_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
-            CommandNature.MUTATION,
+            CommandSafety.MUTATION,
         )
     }
 
@@ -482,7 +492,7 @@ class AgentClient(
             // A dry run changes nothing, but it still takes the same care: an agent that does not
             // know the flag would run the real thing, and that must never be retried on a second
             // route after an ambiguous failure.
-            CommandNature.MUTATION,
+            CommandSafety.MUTATION,
         )
 
     /**
@@ -503,7 +513,7 @@ class AgentClient(
         },
         SELF_UPDATE_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.MUTATION,
+        CommandSafety.MUTATION,
         stdin = StdinSource.Streamed { tarball.inputStream() },
     )
 
@@ -520,7 +530,7 @@ class AgentClient(
         },
         SELF_UPDATE_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
-        CommandNature.MUTATION,
+        CommandSafety.MUTATION,
     )
 
     /**
@@ -539,18 +549,21 @@ class AgentClient(
         stagingDirectory: String,
         operationId: String? = null,
     ): AgentReply<AgentActionResult> {
-        val system = machine.systems.firstOrNull { it.isConfigured }
+        val system = machine.systems.firstOrNull { it.isDriven }
             ?: throw AgentFailure.AgentMissing(null, "no system on this machine names an interpreter")
 
         // tar is on Windows 10 and later, on macOS and on every Linux, so this is one command
         // everywhere rather than three.
-        val unpack = buildRemoteCommand(
-            system.shell,
-            listOf("tar", "-xzf", tarballPath, "-C", stagingDirectory),
-        )
         val endpoint = routes.candidates().firstOrNull()
             ?: throw AgentFailure.Unreachable(machine.name, routes.probeSummary())
+        val unpack = commandLine(
+            grammarOn(endpoint, system, system.agent.size),
+            listOf("tar", "-xzf", tarballPath, "-C", stagingDirectory),
+        )
         val unpacked = transport.run(endpoint, unpack, SELF_UPDATE_TIMEOUT_MILLIS)
+        if (unpacked.timedOut) {
+            throw AgentFailure.TimedOut((SELF_UPDATE_TIMEOUT_MILLIS / 1000L).toInt(), condense(unpacked.failureText))
+        }
         if (unpacked.exitStatus != null && unpacked.exitStatus != 0) {
             throw AgentFailure.BadOutput(
                 "unpacking the agent bundle failed: " +
@@ -566,7 +579,7 @@ class AgentClient(
             listOf("self-update", "--install"),
             SELF_UPDATE_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
-            CommandNature.MUTATION,
+            CommandSafety.MUTATION,
             overrideArgv = listOf(interpreter, staged),
         )
     }
@@ -591,7 +604,7 @@ class AgentClient(
             },
             WAKE_PROXY_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
-            CommandNature.MUTATION,
+            CommandSafety.MUTATION,
         )
     }
 
@@ -606,71 +619,40 @@ class AgentClient(
      * One authenticated request against exactly one address, and what it did.
      *
      * The diagnostics page runs these on demand and nothing else does. It is the authenticated
-     * authenticated readiness check: it answers what a bare TCP probe answered and four more
-     * questions besides, and because it only happens when a person presses a button it cannot become
-     * the background traffic that gets a source penalised.
+     * readiness check: it answers what a bare TCP probe answered and four more questions besides,
+     * and because it only happens when a person presses a button it cannot become the background
+     * traffic that gets a source penalised.
      */
     suspend fun diagnose(endpoint: Endpoint): EndpointDiagnosis {
-        val started = System.currentTimeMillis()
-        fun took() = System.currentTimeMillis() - started
-        val failures = Failures()
+        val started = clock()
+        fun took() = clock() - started
         return try {
-            val reply = attempt(
-                endpoint,
+            val reply = call(
                 listOf("version"),
                 DIAGNOSE_TIMEOUT_MILLIS,
                 AgentVersion.serializer(),
-                failures,
-                CommandNature.READ,
-                null,
-                null,
+                CommandSafety.READ,
+                only = endpoint,
             )
-            when {
-                reply != null -> EndpointDiagnosis(
-                    endpoint = endpoint,
-                    status = DiagnosisStatus.ANSWERED,
-                    detail = reply.value.agentVersion?.let {
-                        "control agent $it, contract ${reply.value.contract ?: 2}"
-                    },
-                    millis = took(),
-                )
-
-                failures.hostKeyChanged != null -> EndpointDiagnosis(
-                    endpoint,
-                    DiagnosisStatus.HOST_KEY_CHANGED,
-                    failures.hostKeyChanged?.detail,
-                    took(),
-                )
-
-                failures.scriptMissing != null || failures.wrongShape != null -> EndpointDiagnosis(
-                    endpoint,
-                    DiagnosisStatus.NO_AGENT,
-                    (failures.scriptMissing ?: failures.wrongShape)?.detail,
-                    took(),
-                )
-
-                failures.unreadable != null -> EndpointDiagnosis(
-                    endpoint,
-                    DiagnosisStatus.UNREADABLE,
-                    failures.unreadable?.detail,
-                    took(),
-                )
-
-                else -> EndpointDiagnosis(
-                    endpoint,
-                    DiagnosisStatus.UNREACHABLE,
-                    failures.unreachable?.detail,
-                    took(),
-                )
-            }
-        } catch (failure: AgentFailure.NotAuthorised) {
-            EndpointDiagnosis(endpoint, DiagnosisStatus.REFUSED_KEY, failure.detail, took())
-        } catch (failure: AgentFailure.TimedOut) {
-            EndpointDiagnosis(endpoint, DiagnosisStatus.TIMED_OUT, failure.detail, took())
-        } catch (failure: AgentFailure.HostKeyChanged) {
-            EndpointDiagnosis(endpoint, DiagnosisStatus.HOST_KEY_CHANGED, failure.detail, took())
+            EndpointDiagnosis(
+                endpoint = endpoint,
+                status = DiagnosisStatus.ANSWERED,
+                detail = reply.value.agentVersion?.let {
+                    "control agent $it, contract ${reply.value.contract ?: 2}"
+                },
+                millis = took(),
+            )
         } catch (failure: AgentFailure) {
-            EndpointDiagnosis(endpoint, DiagnosisStatus.UNREACHABLE, failure.detail, took())
+            val status = when (failure) {
+                is AgentFailure.NotAuthorised -> DiagnosisStatus.REFUSED_KEY
+                is AgentFailure.TimedOut -> DiagnosisStatus.TIMED_OUT
+                is AgentFailure.HostKeyChanged -> DiagnosisStatus.HOST_KEY_CHANGED
+                is AgentFailure.AgentMissing -> DiagnosisStatus.NO_AGENT
+                is AgentFailure.BadOutput -> DiagnosisStatus.UNREADABLE
+                is AgentFailure.BadRequest -> DiagnosisStatus.NOT_DIALLED
+                else -> DiagnosisStatus.UNREACHABLE
+            }
+            EndpointDiagnosis(endpoint, status, failure.detail, took())
         }
     }
 
@@ -688,7 +670,7 @@ class AgentClient(
         // Where it cannot be sent, the caller is told the operation is not trackable and leaves an
         // ambiguous outcome unknown instead of repeating it.
         if (!abilities.speaksV3) return
-        require(Contract.isOpId(id)) { "an operation id is lowercase, 8 to 64 of [a-z0-9-]" }
+        if (!Contract.isOpId(id)) refuse("The operation id \"$id\" is not lowercase, 8 to 64 of [a-z0-9-].")
         add("--op")
         add(id)
     }
@@ -710,22 +692,23 @@ class AgentClient(
     // MARK: - Transport
 
     /**
-     * One command, across the addresses worth trying.
+     * One command, across the attempts worth making: contract section 15.5.
      *
-     * The route that worked last time leads and is dialled directly, with no probe in front of it.
-     * That probe used to be the first thing every call did, and it is the traffic OpenSSH counts
-     * against a source when it never completes authentication.
+     * Attempts are the routes in order, and on each route the systems that can be driven. The route
+     * that worked last time leads and is dialled directly, with no probe in front of it. One deadline
+     * covers the whole command, every attempt is given what is left of it, and once one attempt has
+     * been made no other is started with less than four seconds to go.
      *
-     * [nature] decides what may happen after a failure. A read moves on to the next address. A
-     * mutation moves on only while the failure says nothing reached the far side; the moment one
-     * says it may have, the search stops and the caller is told it is ambiguous, because trying the
-     * next address is how one press becomes two restarts.
+     * [safety] decides what may happen after a failure, through [AttemptWalk]. A read moves on after
+     * anything. A mutation moves on only while the failure proves nothing reached the far side; the
+     * moment one says it may have, the walk stops and the caller is told it is ambiguous, because
+     * trying the next address is how one press becomes two restarts.
      */
     private suspend fun <T : Any> call(
         arguments: List<String>,
         timeoutMillis: Long,
         deserializer: KSerializer<T>,
-        nature: CommandNature,
+        safety: CommandSafety,
         stdin: StdinSource? = null,
         /**
          * The argv to run instead of the system's configured one.
@@ -735,128 +718,206 @@ class AgentClient(
          * because a machine this app has not been told about must not be reachable by it at all.
          */
         overrideArgv: List<String>? = null,
+        /** `status` only: each attempt sends the `--budget-ms` the time left allows. */
+        budgeted: Boolean = false,
+        /** One address and nothing else, for the diagnostics page. */
+        only: Endpoint? = null,
     ): AgentReply<T> {
+        val deadline = clock() + timeoutMillis
+        val walk = AttemptWalk(safety)
         val failures = Failures()
-        val candidates = routes.candidates()
+        val candidates = only?.let(::listOf) ?: routes.candidates()
+        if (candidates.isEmpty()) {
+            throw AgentFailure.Unreachable(machine.name, routes.probeSummary(), reason = FailureKind.NO_ROUTE)
+        }
+        var attemptsMade = 0
 
-        for (endpoint in candidates) {
-            val outcome =
-                attempt(endpoint, arguments, timeoutMillis, deserializer, failures, nature, stdin, overrideArgv)
-            if (outcome != null) return outcome
-            if (failures.stopSearching) break
+        routes@ for (endpoint in candidates) {
+            if (!Addresses.isDialable(endpoint.host, endpoint.user, endpoint.port)) {
+                // Nothing to dial, so nothing to send on any of its systems. Recorded once, and the
+                // transport would refuse it in the same words if it were asked.
+                routes.note(endpoint, "is not an address this app dials")
+                failures.record(undialable(endpoint))
+                continue
+            }
+            for (system in attemptOrder(endpoint)) {
+                if (walk.skips(endpoint.id)) continue@routes
+                val remaining = deadline - clock()
+                if (attemptsMade > 0 && remaining < MINIMUM_ATTEMPT_MILLIS) break@routes
+
+                val argv = (overrideArgv ?: system.agent) + arguments + if (budgeted && abilities.speaksV3) {
+                    val budget = statusBudget(remaining, attemptsMade) ?: break@routes
+                    listOf("--budget-ms", budget.toString())
+                } else {
+                    emptyList()
+                }
+                val line = try {
+                    commandLine(grammarOn(endpoint, system, (overrideArgv ?: system.agent).size), argv)
+                } catch (refused: AgentFailure.BadRequest) {
+                    // Nothing was sent, and another system's line may be fine: a request that could
+                    // not be made is never sent, which is what lets the walk go on.
+                    failures.record(refused)
+                    walk.after(endpoint.id, AttemptReading.failure(FailureKind.BAD_REQUEST, DispatchStage.NOT_STARTED))
+                    continue
+                }
+
+                attemptsMade += 1
+                val outcome = try {
+                    transport.run(endpoint, line, remaining.coerceAtLeast(1L), stdin)
+                } catch (failure: AgentFailure) {
+                    noteFailure(endpoint, failure)
+                    failures.record(failure)
+                    val reading = AttemptReading.failure(
+                        failure.kind ?: FailureKind.LINK_LOST,
+                        failure.dispatch,
+                    )
+                    if (walk.after(endpoint.id, reading) == WalkEnding.STOPPED) throw failure
+                    continue
+                }
+
+                var reading = AttemptClassifier.classify(outcome)
+                if (reading.isReply) {
+                    val decoded = decode(outcome, deserializer)
+                    if (decoded != null) {
+                        if (safety == CommandSafety.READ) requireAcceptedRead(decoded)
+                        routes.remember(endpoint)
+                        val reported = reportedSystem(decoded)?.also { settings.rememberSystem(machine.id, it) }
+                        return AgentReply(value = decoded, route = endpoint, systemId = reported)
+                    }
+                    // The agent answered with an object this build cannot read. It had the command,
+                    // so a change that ends here is reconciled rather than sent again.
+                    reading = AttemptReading.failure(FailureKind.UNREADABLE_OUTPUT, DispatchStage.ACKNOWLEDGED)
+                }
+
+                val failure = failureFor(reading, outcome, system, remaining)
+                noteFailure(endpoint, failure)
+                failures.record(failure)
+                if (walk.after(endpoint.id, reading) == WalkEnding.STOPPED) throw failure
+            }
         }
 
-        if (candidates.isEmpty()) throw AgentFailure.Unreachable(machine.name, routes.probeSummary())
+        if (attemptsMade == 0) {
+            failures.worthReporting()?.let { throw it }
+            // Not a single system on this machine can be driven: every one either names no agent or
+            // has a shell this app does not write for. Saying "did not answer" would send the user
+            // to look at the network.
+            machine.systems.firstOrNull { it.isConfigured && it.grammar == null }?.let { system ->
+                throw AgentFailure.BadRequest(
+                    "This app cannot write commands for ${system.name}.",
+                    describeRefusal(system.grammarRefusal ?: UNKNOWN_SHELL, null),
+                )
+            }
+        }
         throw failures.worthReporting() ?: AgentFailure.Unreachable(machine.name, routes.probeSummary())
     }
 
     /**
-     * One address, every command shape. Returns the reply, or null once each shape has failed and
-     * the reason has been recorded.
+     * The grammar a system's line is written in on [endpoint].
      *
-     * An unauthorised key is thrown rather than recorded: it does not get better by trying another
-     * address, and it would otherwise fill the machine's auth log with one refused login per address
-     * per refresh. A command that ran out of time is thrown for the opposite reason, that repeating
-     * it against the other addresses would spend the same budget again on each of them.
+     * The document's grammar, unless the last status over this route said it came through the
+     * restricted dispatcher, which moves it to the dispatcher grammar and nowhere else.
      */
-    private suspend fun <T : Any> attempt(
-        endpoint: Endpoint,
-        arguments: List<String>,
-        timeoutMillis: Long,
-        deserializer: KSerializer<T>,
-        failures: Failures,
-        nature: CommandNature,
-        stdin: StdinSource?,
-        overrideArgv: List<String>? = null,
-    ): AgentReply<T>? {
-        for (system in shapeOrder(endpoint)) {
-            val line = try {
-                buildRemoteCommand(system.shell, (overrideArgv ?: system.agent) + arguments)
-            } catch (failure: UnquotableArgument) {
-                // Nothing was sent, and nothing on another address would be either: it is the same
-                // configuration everywhere. Thrown, because there is nothing here to retry and the
-                // fix is a field in the document.
-                throw AgentFailure.Unquotable(failure.argument, failure.reason)
-            }
-
-            val outcome = try {
-                transport.run(endpoint, line, timeoutMillis, stdin)
-            } catch (failure: AgentFailure.NotAuthorised) {
-                routes.note(endpoint, "refused this phone's key")
-                throw failure
-            } catch (failure: AgentFailure.TimedOut) {
-                routes.note(endpoint, "did not finish in time")
-                throw failure
-            } catch (failure: AgentFailure.HostKeyChanged) {
-                // Recorded rather than thrown, because the pin is per address and the other addresses
-                // are not affected by it. A LAN address legitimately changes host key every time the
-                // machine boots into another system, and letting that one address stop the call would
-                // strand the app on a question the user has to answer, while a remote route that
-                // still matches its pin sits there working. It is reported first if nothing answers.
-                routes.note(endpoint, "offered an untrusted host key")
-                failures.hostKeyChanged = failures.hostKeyChanged ?: failure
-                return null
-            } catch (failure: AgentFailure.Unreachable) {
-                if (failure.dispatch == DispatchStage.AMBIGUOUS) {
-                    routes.note(endpoint, "dropped the link with the command running")
-                    // The far side has the command. Whether it ran is not knowable from here, and
-                    // the one thing that must not happen next is sending it somewhere else.
-                    if (nature == CommandNature.MUTATION) throw failure
-                    failures.ambiguous = failures.ambiguous ?: failure
-                    return null
-                }
-                routes.penalise(endpoint, "did not answer")
-                failures.unreachable = failures.unreachable ?: failure
-                return null
-            }
-
-            val json = sliceJsonObject(outcome.stdout)
-            if (json != null) {
-                val value = try {
-                    AgentJson.decodeFromString(deserializer, json)
-                } catch (failure: Exception) {
-                    // Something ran and printed something. For a mutation that is ambiguous by
-                    // definition, and BadOutput says so.
-                    throw AgentFailure.BadOutput(
-                        "${failure.message} Output: ${condense(outcome.stdout)}",
-                        failure,
-                    )
-                }
-                if (nature == CommandNature.READ) requireAcceptedRead(value)
-                routes.remember(endpoint)
-                val reported = reportedSystem(value)?.also { settings.rememberSystem(machine.id, it) }
-                return AgentReply(value = value, route = endpoint, systemId = reported)
-            }
-
-            when (classify(outcome)) {
-                Failure.ScriptMissing -> {
-                    routes.note(endpoint, "answered without the control agent installed")
-                    failures.scriptMissing = failures.scriptMissing
-                        ?: AgentFailure.AgentMissing(system, condense(outcome.failureText))
-                }
-
-                Failure.InterpreterMissing ->
-                    failures.wrongShape = failures.wrongShape
-                        ?: AgentFailure.AgentMissing(system, condense(outcome.failureText))
-
-                Failure.Other -> {
-                    routes.note(endpoint, "answered with something unreadable")
-                    failures.unreadable = failures.unreadable
-                        ?: AgentFailure.BadOutput(condense(outcome.failureText))
-                    // A shell that ran the command and printed something that is not JSON has run
-                    // it. Trying the next shape would run it again.
-                    if (nature == CommandNature.MUTATION) {
-                        failures.stopSearching = true
-                        return null
-                    }
-                }
-            }
+    private fun grammarOn(endpoint: Endpoint, system: MachineSystem, agentLength: Int): RemoteShell {
+        if (restrictedRoutes[endpoint.id] == true) {
+            val choice = grammarFor(null, null, null, restrictedSession = true, agentLength = agentLength)
+            return choice.grammar ?: throw AgentFailure.BadRequest(
+                "This app cannot write commands for ${system.name} through a restricted key.",
+                describeRefusal(choice.refusal ?: RESTRICTED_AGENT_SHAPE, null),
+            )
         }
-        return null
+        return system.grammar ?: throw AgentFailure.BadRequest(
+            "This app cannot write commands for ${system.name}.",
+            describeRefusal(system.grammarRefusal ?: UNKNOWN_SHELL, null),
+        )
+    }
+
+    /** One command line, or the refusal as a request that could not be made. */
+    private fun commandLine(grammar: RemoteShell, argv: List<String>): String = try {
+        buildRemoteCommand(grammar, argv)
+    } catch (refusal: CommandLineRefusal) {
+        // Nothing was sent, and the fix is a field in the document.
+        throw AgentFailure.BadRequest(
+            "This app cannot write that command for the shell on the far side.",
+            refusal.message,
+        )
+    }
+
+    /** The reply decoded, or null when it is a JSON object this build cannot read as [deserializer]. */
+    private fun <T : Any> decode(outcome: CommandOutcome, deserializer: KSerializer<T>): T? {
+        val json = sliceJsonObject(outcome.stdout) ?: return null
+        return try {
+            AgentJson.decodeFromString(deserializer, json)
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**
-     * The failures collected across every address and command shape, and which one to report.
+     * What a failed attempt is called on screen, from what section 15.4 made of it.
+     *
+     * The stage comes from the reading and nothing else. Every sentence below is about what the far
+     * side printed, and none of it decides whether the command may be sent again.
+     */
+    private fun failureFor(
+        reading: AttemptReading,
+        outcome: CommandOutcome,
+        system: MachineSystem,
+        budgetMillis: Long,
+    ): AgentFailure = when (reading.kind) {
+        FailureKind.TIMED_OUT -> AgentFailure.TimedOut(
+            seconds = (budgetMillis / 1000L).toInt(),
+            detail = "The connection was open and the command had not finished. " +
+                "Partial output: ${outcome.stdout.take(200).trim()}",
+        )
+
+        FailureKind.LINK_LOST -> AgentFailure.Unreachable(
+            machine.name,
+            "The link closed with the command running: ${condense(outcome.failureText)}",
+            stage = reading.dispatch,
+            reason = FailureKind.LINK_LOST,
+        )
+
+        FailureKind.AGENT_MISSING, FailureKind.INTERPRETER_MISSING ->
+            AgentFailure.AgentMissing(system, condense(outcome.failureText), reading.dispatch, reading.kind)
+
+        else -> AgentFailure.BadOutput(
+            if (reading.dispatch == DispatchStage.ACKNOWLEDGED) {
+                "The reply could not be read. Output: ${condense(outcome.stdout)}"
+            } else {
+                condense(outcome.failureText)
+            },
+            stage = reading.dispatch,
+        )
+    }
+
+    /** What an address did, for the next call's order and for the sentence when nothing answers. */
+    private fun noteFailure(endpoint: Endpoint, failure: AgentFailure) {
+        when (failure.kind) {
+            // Only an address that did not get as far as a session is held back. One that answered
+            // and turned something down is answering, and holding it back would hide that.
+            FailureKind.HOST_UNREACHABLE, FailureKind.CONNECTION_REFUSED, FailureKind.NO_ROUTE ->
+                routes.penalise(endpoint, "did not answer")
+
+            FailureKind.AUTHENTICATION_FAILED -> routes.note(endpoint, "refused this phone's key")
+            FailureKind.HOST_KEY_CHANGED, FailureKind.HOST_KEY_UNKNOWN ->
+                routes.note(endpoint, "offered an untrusted host key")
+
+            FailureKind.TIMED_OUT -> routes.note(endpoint, "did not finish in time")
+            FailureKind.LINK_LOST -> routes.note(endpoint, "dropped the link with the command running")
+            FailureKind.AGENT_MISSING -> routes.note(endpoint, "answered without the control agent installed")
+            FailureKind.UNREADABLE_OUTPUT -> routes.note(endpoint, "answered with something unreadable")
+            else -> Unit
+        }
+    }
+
+    private fun undialable(endpoint: Endpoint) = AgentFailure.BadRequest(
+        "This app does not dial ${endpoint.label} as it is written.",
+        "${endpoint.label} on ${machine.name} is not a host, user and port this app dials, scans or " +
+            "pins a host key for, so that address was skipped. Correct it in the setup.",
+    )
+
+    /**
+     * The failures collected across every address and system, and which one to report.
      *
      * The order is not arbitrary. On a machine with more than one system, every attempt but one is
      * aimed at a system that is not running and is guaranteed to fail, so the loudest failure is
@@ -864,41 +925,60 @@ class AgentClient(
      * wrong, which says nothing. An interpreter that ran and could not find the script means the
      * shape was right and the agent really is missing, which is the thing worth telling the user.
      *
-     * A host key that does not match its pin comes first of all, because it is the only one of these
-     * that is a question rather than a report, and it is the only one with an action attached.
+     * A host key that does not match its pin comes first of all, and a refused key next, because
+     * they are questions rather than reports and the only ones with an action attached. A request
+     * that could not be made is a fault in the document, which is the next most useful thing to say.
      */
     private class Failures {
         var hostKeyChanged: AgentFailure? = null
+        var notAuthorised: AgentFailure? = null
+        var badRequest: AgentFailure? = null
         var scriptMissing: AgentFailure? = null
         var wrongShape: AgentFailure? = null
         var unreadable: AgentFailure? = null
         var unreachable: AgentFailure? = null
         var ambiguous: AgentFailure? = null
 
-        /** Set when carrying on would risk running a change a second time. */
-        var stopSearching: Boolean = false
+        fun record(failure: AgentFailure) {
+            when (failure) {
+                is AgentFailure.HostKeyChanged -> hostKeyChanged = hostKeyChanged ?: failure
+                is AgentFailure.NotAuthorised -> notAuthorised = notAuthorised ?: failure
+                is AgentFailure.BadRequest -> badRequest = badRequest ?: failure
+                is AgentFailure.AgentMissing ->
+                    if (failure.kind == FailureKind.AGENT_MISSING) {
+                        scriptMissing = scriptMissing ?: failure
+                    } else {
+                        wrongShape = wrongShape ?: failure
+                    }
+
+                is AgentFailure.BadOutput -> unreadable = unreadable ?: failure
+                else ->
+                    if (failure.dispatch.mayHaveRun) {
+                        ambiguous = ambiguous ?: failure
+                    } else {
+                        unreachable = unreachable ?: failure
+                    }
+            }
+        }
 
         fun worthReporting(): AgentFailure? =
-            hostKeyChanged ?: scriptMissing ?: unreadable ?: ambiguous ?: wrongShape ?: unreachable
+            hostKeyChanged ?: notAuthorised ?: badRequest ?: scriptMissing ?: unreadable ?: ambiguous ?:
+                wrongShape ?: unreachable
     }
 
     /**
-     * Which interpreter to try first.
+     * The systems to try on one address, in the order of section 15.5.
      *
-     * An address that belongs to one system says so in the configuration, and that answer is free.
-     * A shared address cannot say, so the last system that answered is a better guess than nothing.
-     * Everything else follows, and a wrong guess only ever costs one extra round trip.
+     * The system the address belongs to, when the configuration says, then the one that answered
+     * last, then the rest in document order. Only systems that can be driven, and only the command
+     * they name: no launcher, interpreter or grammar is derived here, because a guessed second shape
+     * is one more way for one press to run twice.
      */
-    private fun shapeOrder(endpoint: Endpoint): List<MachineSystem> {
-        val usable = machine.systems.filter { it.isConfigured }
+    private fun attemptOrder(endpoint: Endpoint): List<MachineSystem> {
+        val driven = machine.systems.filter { it.isDriven }
         val hinted = machine.system(endpoint.systemHint)
-            ?: machine.system(settings.lastKnownSystem(machine.id).value)
-        val first = hinted?.takeIf { it in usable }
-        return (listOfNotNull(first) + usable).distinct().flatMap { system ->
-            listOf(system) + listOfNotNull(stableLauncherArgv(system.agent)?.let { stable ->
-                system.copy(agent = stable)
-            })
-        }.distinct()
+        val preferred = machine.system(settings.lastKnownSystem(machine.id).value)
+        return (listOfNotNull(hinted, preferred).filter { it in driven } + driven).distinct()
     }
 
     private fun <T> reportedSystem(value: T): String? = when (value) {
@@ -906,29 +986,14 @@ class AgentClient(
         else -> null
     }
 
-    private enum class Failure { InterpreterMissing, ScriptMissing, Other }
-
-    private fun classify(outcome: CommandOutcome): Failure {
-        val text = outcome.failureText.lowercase()
-        // The interpreter itself starting and then failing to find the script. That is the right
-        // shape on the wrong install, and it is the message worth showing.
-        val script = listOf("cannot find module", "module_not_found", "err_module_not_found")
-        if (script.any { text.contains(it) }) return Failure.ScriptMissing
-
-        val interpreter = listOf(
-            "command not found", "unknown command", "not recognized as the name",
-            "is not recognized as an internal", "commandnotfoundexception",
-            "no such file or directory",
-        )
-        if (interpreter.any { text.contains(it) }) return Failure.InterpreterMissing
-
-        return Failure.Other
-    }
-
     private fun condense(text: String): String {
         val trimmed = text.trim()
         return if (trimmed.length <= 400) trimmed else trimmed.take(400) + "..."
     }
+
+    /** A value this app was about to send that it must not, as a request that was never made. */
+    private fun refuse(sentence: String): Nothing =
+        throw AgentFailure.BadRequest("This app will not send that request.", sentence)
 
     private companion object {
         const val SHORT_TIMEOUT_MILLIS = 40_000L
@@ -961,28 +1026,6 @@ class AgentClient(
 
         /** Short. A diagnosis that has to wait a minute has already told you what you needed. */
         const val DIAGNOSE_TIMEOUT_MILLIS = 20_000L
-    }
-}
-
-/**
- * The stable launcher survives replacement of the active `agent/` directory. Keep the configured
- * Node executable and replace only the conventional entry path, so shell and PATH assumptions do
- * not change. A staged 2.x bootstrap supplies an explicit argv and does not use this fallback.
- */
-internal fun stableLauncherArgv(argv: List<String>): List<String>? {
-    val index = argv.indexOfFirst { value ->
-        value.endsWith("/agent/src/index.mjs") || value.endsWith("\\agent\\src\\index.mjs")
-    }
-    if (index < 0) return null
-    val original = argv[index]
-    val suffix = if (original.endsWith("/agent/src/index.mjs")) {
-        "/agent/src/index.mjs"
-    } else {
-        "\\agent\\src\\index.mjs"
-    }
-    val separator = if (suffix.startsWith('/')) "/" else "\\"
-    return argv.toMutableList().also {
-        it[index] = original.removeSuffix(suffix) + separator + "bin" + separator + "launcher.mjs"
     }
 }
 
