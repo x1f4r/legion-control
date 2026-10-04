@@ -155,7 +155,10 @@ dependencies {
     testImplementation(libs.junit)
 
     implementation(libs.sshj)
+    // The ssh identity's ed25519 key: sshj 0.39 signs with this library's key classes and no other.
+    // Release signatures are checked with Bouncy Castle below, not with this.
     implementation(libs.eddsa)
+    implementation(libs.bcprov)
     // sshj logs through slf4j. Without a binding, slf4j 2 falls back to a no-op and prints a warning
     // on first use; this sends the same lines to logcat instead, which is where they are useful.
     runtimeOnly(libs.slf4j.android)

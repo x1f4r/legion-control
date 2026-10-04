@@ -18,6 +18,10 @@ serialization = "1.11.0"
 # Bouncy Castle's JCE provider, which is exactly the thing Android ships a stripped down copy of.
 sshj = "0.39.0"
 eddsa = "0.3.0"
+# Bouncy Castle checks release signatures (data/Trust.kt) with its own Ed25519 signer. sshj already
+# depends on it; it is named here because this app now calls it directly, and at the version sshj
+# resolves so that naming it changes nothing that ships.
+bouncycastle = "1.78.1"
 slf4jAndroid = "2.0.17-0"
 
 desugar = "2.1.5"
@@ -43,6 +47,7 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 
 sshj = { group = "com.hierynomus", name = "sshj", version.ref = "sshj" }
 eddsa = { group = "net.i2p.crypto", name = "eddsa", version.ref = "eddsa" }
+bcprov = { group = "org.bouncycastle", name = "bcprov-jdk18on", version.ref = "bouncycastle" }
 slf4j-android = { group = "uk.uuid.slf4j", name = "slf4j-android", version.ref = "slf4jAndroid" }
 
 desugar-jdk-libs = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugar" }

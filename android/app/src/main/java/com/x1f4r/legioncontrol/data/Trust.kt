@@ -1,10 +1,9 @@
 package com.x1f4r.legioncontrol.data
 
-import net.i2p.crypto.eddsa.EdDSAEngine
-import net.i2p.crypto.eddsa.EdDSAPublicKey
-import net.i2p.crypto.eddsa.spec.EdDSANamedCurveTable
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
+import org.bouncycastle.crypto.signers.Ed25519Signer
+import org.bouncycastle.crypto.util.PublicKeyFactory
 import java.security.MessageDigest
-import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 
 /**
@@ -16,11 +15,14 @@ import java.util.Base64
  * the whole of the story, and it is the only honest one, because a key an attacker can supply is not
  * a signature check, it is a signature-shaped ritual.
  *
- * Ed25519 verification goes through net.i2p.crypto:eddsa, which is already a dependency of the ssh
- * layer, rather than through `java.security.Signature.getInstance("Ed25519")`. That name exists only
- * from API 33 and this app's minimum is 30; a phone on 30 or 32 would otherwise be unable to check a
+ * Ed25519 verification goes through Bouncy Castle's own signer, which the ssh layer already brings,
+ * rather than through `java.security.Signature.getInstance("Ed25519")`. That name exists only from
+ * API 33 and this app's minimum is 30; a phone on 30 or 32 would otherwise be unable to check a
  * signature, which would mean either refusing every update or skipping the check on old phones, and
- * neither is acceptable.
+ * neither is acceptable. The signer is used directly rather than through a JCE provider, because the
+ * provider called "BC" on a phone is Android's own cut-down copy and not this library. It replaced
+ * net.i2p.crypto:eddsa here, which is no longer maintained; that one now serves only sshj's ed25519
+ * user key, which is where sshj 0.39 requires it.
  */
 object Trust {
 
@@ -40,8 +42,8 @@ object Trust {
         Base64.getDecoder().decode(RELEASE_PUBLIC_KEY_SPKI_BASE64)
     }
 
-    private val publicKey: EdDSAPublicKey by lazy {
-        EdDSAPublicKey(X509EncodedKeySpec(spkiDer))
+    private val publicKey: Ed25519PublicKeyParameters by lazy {
+        PublicKeyFactory.createKey(spkiDer) as Ed25519PublicKeyParameters
     }
 
     /**
@@ -74,10 +76,10 @@ object Trust {
         val raw = decodeSignature(signature) ?: return false
         if (raw.size != SIGNATURE_BYTES) return false
         return try {
-            val engine = EdDSAEngine(MessageDigest.getInstance(EdDSANamedCurveTable.ED_25519_CURVE_SPEC.hashAlgorithm))
-            engine.initVerify(publicKey)
-            engine.update(content)
-            engine.verify(raw)
+            val signer = Ed25519Signer()
+            signer.init(false, publicKey)
+            signer.update(content, 0, content.size)
+            signer.verifySignature(raw)
         } catch (_: Exception) {
             // A signature that cannot be checked is a signature that did not check out. There is no
             // third answer here and pretending there is would be the whole vulnerability.

@@ -57,6 +57,22 @@ class TrustTest {
     }
 
     @Test
+    fun `one changed bit in the signature is refused`() {
+        val manifest = fixture("manifest.json")
+        val signature = fixture("manifest.json.sig")
+        assumeTrue("the shared trust fixture is not in this checkout", manifest != null && signature != null)
+
+        val raw = java.util.Base64.getDecoder().decode(signature!!.readText().trim())
+        for (index in listOf(0, 31, 32, 63)) {
+            val flipped = raw.copyOf().also { it[index] = (it[index].toInt() xor 1).toByte() }
+            assertFalse(
+                "a signature with byte $index changed is not the signature",
+                Trust.verifyDetachedSignature(manifest!!.readBytes(), java.util.Base64.getEncoder().encodeToString(flipped)),
+            )
+        }
+    }
+
+    @Test
     fun `a signature that is not base64, is empty, or is the wrong length is refused`() {
         val manifest = fixture("manifest.json") ?: return
         val bytes = manifest.readBytes()
