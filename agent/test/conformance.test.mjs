@@ -223,7 +223,7 @@ test('status conforms with no config, every busy kind, a broken config and a res
   });
 });
 
-test('a process probe that fails is reported as unknown, never as stopped', async () => {
+test('a process probe that does not answer in time is reported as unknown, never as stopped', async () => {
   await withHome(async (home) => {
     oneService(home, { service: { process: { type: 'command', running: node('setTimeout(() => {}, 10000)') } } });
     // The running probe never answers inside the budget. Section 8: a process
