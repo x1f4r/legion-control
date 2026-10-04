@@ -24,7 +24,7 @@ import org.junit.rules.TemporaryFolder
 import java.io.File
 
 /**
- * The legacy bootstrap, gated as the Mac gates it (SPEC S1.11).
+ * The legacy bootstrap, gated as the Mac's `AgentBootstrap.swift` gates it.
  *
  * It is the one path in the app that runs code a machine has only just received, so what matters
  * most here is when it is not offered: before an authenticated status, through a restricted key, on a

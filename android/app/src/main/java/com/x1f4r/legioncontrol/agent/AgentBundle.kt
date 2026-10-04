@@ -188,11 +188,11 @@ sealed interface AgentDeploymentPath {
         /**
          * The path for a machine, from its last authenticated status and the system that gave it.
          *
-         * The Mac's gate, row for row (SPEC S1.11). The order is the rule: nothing is decided before
-         * an authenticated status, a contract 3 agent installs on standard input whatever key it was
-         * reached with, and the legacy bootstrap needs every one of the rows after that to pass. The
-         * previous version took a contract it had not read as zero, so a machine nobody had heard
-         * from yet was sent the legacy upload.
+         * The Mac's gate in `AgentBootstrap.swift`, row for row. The order is the rule: nothing is
+         * decided before an authenticated status, a contract 3 agent installs on standard input
+         * whatever key it was reached with, and the legacy bootstrap needs every one of the rows after
+         * that to pass. The previous version took a contract it had not read as zero, so a machine
+         * nobody had heard from yet was sent the legacy upload.
          */
         fun decide(
             abilities: AgentAbilities,

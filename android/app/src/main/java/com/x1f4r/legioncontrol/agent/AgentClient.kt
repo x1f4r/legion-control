@@ -553,8 +553,8 @@ class AgentClient(
     )
 
     /**
-     * Puts a signed agent on a machine whose 2.x agent cannot install one: the legacy bootstrap of
-     * SPEC S1.11, as the Mac does it.
+     * Puts a signed agent on a machine whose 2.x agent cannot install one: the bootstrap of contract
+     * section 13, as the Mac does it.
      *
      * Three steps on one address, all with [system]'s own interpreter: [AgentBootstrap.PREPARE]
      * checks [layout]'s base holds an installed agent, the archive goes over SFTP into its

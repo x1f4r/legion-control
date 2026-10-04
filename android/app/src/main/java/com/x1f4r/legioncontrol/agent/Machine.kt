@@ -65,7 +65,7 @@ data class MachineSystem(
     val isDriven: Boolean get() = isConfigured && grammar != null
 }
 
-/** Where a system's command stands with this device's approvals (S1.3 `launchState`). */
+/** Where a system's command stands with this device's approvals (contract section 9.9). */
 enum class LaunchState {
     /** The command in force is the one this device approved. */
     APPROVED,

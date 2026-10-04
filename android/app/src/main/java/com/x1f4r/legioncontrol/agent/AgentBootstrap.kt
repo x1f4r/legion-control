@@ -3,11 +3,12 @@ package com.x1f4r.legioncontrol.agent
 /**
  * Putting a signed 3.x agent on a machine whose 2.x agent has no way to install one itself.
  *
- * A port of the Mac's `AgentBootstrap.swift`, and gated the same way (SPEC S1.11): only over an
- * authenticated status from an actual 1.x or 2.x agent, only with a key that is not restricted, and
- * only when the configured command shows where the agent is installed. The base is never guessed:
- * a command this file does not recognise means nothing is offered, because the bootstrap runs code
- * the far side has only just received, and it has to run it in the right place.
+ * The 2.x bootstrap of contract section 13, ported from the Mac's `AgentBootstrap.swift` and gated
+ * the same way: only over an authenticated status from an actual 1.x or 2.x agent, only with a key
+ * that is not restricted, and only when the configured command shows where the agent is installed.
+ * The base is never guessed: a command this file does not recognise means nothing is offered,
+ * because the bootstrap runs code the far side has only just received, and it has to run it in the
+ * right place.
  *
  * Three steps, each with the agent's own interpreter: [PREPARE] checks the base holds an installed
  * agent and makes `incoming/`; the archive goes over SFTP to [archivePath]; [INSTALL] checks the
