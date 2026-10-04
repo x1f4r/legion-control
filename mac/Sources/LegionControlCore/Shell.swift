@@ -95,6 +95,9 @@ enum Shell {
                         arguments: arguments,
                         timeout: timeout,
                         input: input,
+                        // Worked out here rather than in the caller: the first command waits for the
+                        // login shell to answer, and that wait belongs on this thread, not on one of
+                        // the few that run every task in the app.
                         environment: environment ?? childEnvironment(),
                         outputLimit: outputLimit,
                         drainGrace: drainGrace,
@@ -107,8 +110,11 @@ enum Shell {
         }
     }
 
-    /// The environment every command gets: this app's own, with one change.
-    static func childEnvironment(base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+    /// The environment every command gets: this app's own, with two changes.
+    static func childEnvironment(
+        base: [String: String] = ProcessInfo.processInfo.environment,
+        loginPath: String? = LoginShellPath.value()
+    ) -> [String: String] {
         var environment = base
         // Never wake a machine just by looking at it.
         //
@@ -122,10 +128,15 @@ enum Shell {
         // ProxyCommand inherits this environment, which is what makes the opt-out reach the helper.
         // The Wake button does not go through here at all: it sends its own packet from Swift.
         environment["LEGION_NO_WAKE"] = "1"
+        // An app started from Finder or at login has only the bare system PATH, so a ProxyCommand
+        // naming a Homebrew tool worked in Terminal and failed here, with an exit 255 that read as
+        // a sleeping machine. The PATH a login shell sets up is the one the user's ssh config was
+        // written against.
+        if let loginPath { environment["PATH"] = loginPath }
         return environment
     }
 
-    private static func runBlocking(
+    fileprivate static func runBlocking(
         executable: String,
         arguments: [String],
         timeout: TimeInterval,
@@ -417,4 +428,87 @@ private final class StreamWriter: @unchecked Sendable {
     /// The command is gone. Whatever it did not read is dropped rather than left waiting for a
     /// reader that will never come.
     func stop() { channel.close(flags: .stop) }
+}
+
+/// The PATH the user's login shell sets up, which an app started from Finder or at login does not
+/// have: launchd hands it only the bare system directories.
+///
+/// Read once per app run, in the background from the moment the app starts, and only by the app:
+/// a test run keeps the environment it was started with and never reads anyone's shell profile.
+enum LoginShellPath {
+    private final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var pending: DispatchWorkItem?
+        var resolved: String?
+    }
+
+    private static let state = State()
+
+    /// Starts reading it. Called once, at launch.
+    static func resolveInBackground(shell: String = userShell()) {
+        state.lock.withLock {
+            guard state.pending == nil else { return }
+            let item = DispatchWorkItem {
+                let path = resolve(shell: shell)
+                state.lock.withLock { state.resolved = path }
+            }
+            state.pending = item
+            DispatchQueue.global(qos: .userInitiated).async(execute: item)
+        }
+    }
+
+    /// The login PATH, waiting for a read still in flight. Nil when none was started or the shell
+    /// gave nothing usable, and then a command keeps the PATH this app was started with.
+    static func value() -> String? {
+        guard let item = state.lock.withLock({ state.pending }) else { return nil }
+        item.wait()
+        return state.lock.withLock { state.resolved }
+    }
+
+    /// The account's login shell, from the user database rather than from `SHELL`, which an app
+    /// started by launchd may not have.
+    static func userShell() -> String {
+        if let entry = getpwuid(getuid()), let shell = entry.pointee.pw_shell {
+            let path = String(cString: shell)
+            if path.hasPrefix("/") { return path }
+        }
+        return "/bin/zsh"
+    }
+
+    static let marker = "__LEGION_CONTROL_PATH__"
+
+    /// Asks a login shell for its PATH. `echo`, `;` and an absolute `printenv` mean the same thing
+    /// to sh, bash, zsh, fish and tcsh, and the markers keep whatever a profile prints on the way
+    /// in or out from being taken for the answer. The shell gets this app's own environment: the
+    /// one every other command gets is the one being worked out.
+    static func resolve(shell: String, timeout: TimeInterval = 10) -> String? {
+        var environment = ProcessInfo.processInfo.environment
+        environment["LEGION_NO_WAKE"] = "1"
+        let result = Shell.runBlocking(
+            executable: shell,
+            arguments: ["-l", "-c", "echo \(marker); /usr/bin/printenv PATH; echo \(marker)"],
+            timeout: timeout,
+            input: nil,
+            environment: environment,
+            outputLimit: 64 * 1024,
+            drainGrace: 2,
+            control: RunControl(killGrace: 3)
+        )
+        guard result.launchFailure == nil, !result.timedOut else { return nil }
+        return parse(result.standardOutput)
+    }
+
+    /// The line between the two markers, when it is a list of absolute directories.
+    static func parse(_ output: String) -> String? {
+        let lines = output.unicodeScalars.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String(String.UnicodeScalarView($0)).trimmingCharacters(in: CharacterSet(charactersIn: "\r")) }
+        guard let start = lines.firstIndex(of: marker), start + 2 < lines.count, lines[start + 2] == marker else {
+            return nil
+        }
+        let path = lines[start + 1]
+        guard !path.isEmpty,
+              path.split(separator: ":", omittingEmptySubsequences: false).allSatisfy({ $0.hasPrefix("/") })
+        else { return nil }
+        return path
+    }
 }

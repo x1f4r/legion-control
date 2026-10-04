@@ -153,4 +153,53 @@ struct ShellTests {
         #expect(result.launchFailure != nil)
         #expect(result.exitCode == nil)
     }
+
+    // MARK: - The login PATH
+
+    @Test("every command gets the login shell's PATH and the no-wake opt-out")
+    func childEnvironment() async {
+        // M4. An app started from Finder has only the system directories, so a ProxyCommand naming
+        // a Homebrew tool failed here with an exit 255 that read as a sleeping machine.
+        let environment = Shell.childEnvironment(base: ["PATH": "/usr/bin:/bin", "HOME": "/Users/me"],
+                                                 loginPath: "/opt/tools/bin:/usr/bin:/bin")
+        #expect(environment["PATH"] == "/opt/tools/bin:/usr/bin:/bin")
+        #expect(environment["LEGION_NO_WAKE"] == "1")
+        #expect(environment["HOME"] == "/Users/me")
+        #expect(Shell.childEnvironment(base: ["PATH": "/usr/bin"], loginPath: nil)["PATH"] == "/usr/bin")
+
+        let seen = await Shell.run(executable: "/usr/bin/printenv", arguments: ["PATH"], timeout: 10,
+                                   environment: environment)
+        #expect(seen.standardOutput == "/opt/tools/bin:/usr/bin:/bin\n")
+    }
+
+    @Test("the login shell's PATH is read between markers, whatever its profile prints")
+    func loginPathIsRead() throws {
+        let directory = try Self.scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // A stand-in login shell: its profile sets a PATH and is chatty on the way in and out.
+        let shell = directory.appending(path: "login-shell")
+        try """
+        #!/bin/sh
+        PATH=/opt/tools/bin:/usr/bin:/bin; export PATH
+        echo "Welcome back"
+        /bin/sh -c "$3"
+        echo "Logged out"
+        """.write(to: shell, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: shell.path)
+
+        #expect(LoginShellPath.resolve(shell: shell.path) == "/opt/tools/bin:/usr/bin:/bin")
+        #expect(LoginShellPath.resolve(shell: directory.appending(path: "missing").path) == nil)
+    }
+
+    @Test("nothing but a list of absolute directories between the markers is taken")
+    func loginPathParsing() {
+        let marker = LoginShellPath.marker
+        #expect(LoginShellPath.parse("noise\n\(marker)\n/a/bin:/usr/bin\n\(marker)\n") == "/a/bin:/usr/bin")
+        #expect(LoginShellPath.parse("\(marker)\r\n/a/bin\r\n\(marker)\r\n") == "/a/bin")
+        #expect(LoginShellPath.parse("\(marker)\nrelative/bin:/usr/bin\n\(marker)\n") == nil)
+        #expect(LoginShellPath.parse("\(marker)\n\n\(marker)\n") == nil)
+        #expect(LoginShellPath.parse("/usr/bin\n") == nil)
+        // Without a resolution started, a command keeps the PATH it was started with.
+        #expect(LoginShellPath.value() == nil)
+    }
 }
