@@ -118,7 +118,7 @@ function configChecks(loaded) {
           config.actions.length === 1 ? '' : 's'
         }`,
         notes.length > 0 ? notes.map((note) => `${note.path}: ${note.message}`).join(' | ') : null,
-        notes.map((note) => note.fix).filter(Boolean).join(' | ') || null,
+        notes.length > 0 ? notes.map((note) => note.fix).filter(Boolean).join(' | ') || 'review the paths listed above' : null,
       ),
     );
   }
@@ -265,7 +265,7 @@ function environmentChecks() {
       Number.isFinite(drift) ? 'ok' : 'warn',
       `the machine clock reads ${new Date().toISOString()}`,
       `local offset ${-new Date().getTimezoneOffset() / 60} h; maintenance windows are local time`,
-      null,
+      Number.isFinite(drift) ? null : 'set the clock, or turn on network time; every timestamp, expiry and maintenance window depends on it',
     ),
   );
 
@@ -550,7 +550,9 @@ async function serviceChecks(config, service, { deep }) {
           probe.running ? 'fail' : 'warn',
           `${service.name} does not answer`,
           health.error,
-          probe.running ? 'check the service log; the process is up but not serving' : null,
+          probe.running
+            ? 'check the service log; the process is up but not serving'
+            : `it cannot answer while it is stopped; start it with "legionctl restart --service ${id}"`,
         ),
   );
 
@@ -639,13 +641,16 @@ export async function runDoctor(loaded, { service = null, deep = false } = {}) {
 
     const selected = service ? config.services.filter((entry) => entry.id === service) : config.services;
     if (service && selected.length === 0) {
+      const ids = config.services.map((entry) => entry.id);
       checks.push(
         check(
           `service.${service}.process`,
           'fail',
           `this machine has no service called ${service}`,
-          `it has: ${config.services.map((entry) => entry.id).join(', ') || 'none'}`,
-          null,
+          `it has: ${ids.join(', ') || 'none'}`,
+          ids.length > 0
+            ? `use one of ${ids.join(', ')}, or leave out --service to check them all`
+            : 'leave out --service; this machine looks after no services',
         ),
       );
     }

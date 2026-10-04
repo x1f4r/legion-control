@@ -492,9 +492,9 @@ test('cycle conforms with a deferred child, as a dry run, and against a lock', a
 // Operations
 // ---------------------------------------------------------------------------
 
-test('op, cancel, history and logs conform for queued, finished and unknown ids', async () => {
+test('op, cancel, history, logs and doctor conform for queued, finished and unknown ids', async () => {
   await withHome(async (home) => {
-    oneService(home, { initial: { busy: 'on' } });
+    const dir = oneService(home, { initial: { busy: 'on' } });
     const queued = invoke(home, ['restart', '--when-idle']).op.id;
     assert.equal(invoke(home, ['op', queued]).op.state, 'queued');
 
@@ -520,6 +520,13 @@ test('op, cancel, history and logs conform for queued, finished and unknown ids'
     invoke(home, ['logs', '--op', queued]);
     invoke(home, ['doctor']);
     invoke(home, ['bundle']);
+
+    // Every check that is not ok offers a fix, the ones a narrowed doctor and
+    // a stopped service produce as much as any other.
+    invoke(home, ['doctor', '--service', 'nowhere']);
+    writeFixture(dir, 'running', 'off');
+    const stopped = invoke(home, ['doctor']);
+    assert.equal(stopped.checks.find((entry) => entry.id === 'service.demo.health').level, 'warn');
   });
 });
 
