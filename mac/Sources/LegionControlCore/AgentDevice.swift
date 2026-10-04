@@ -81,6 +81,10 @@ final class DeviceCore {
     /// What this device knows about its agent's copy of the setup. Kept by AgentDeviceSetup.swift.
     var setup = SetupCopyState()
 
+    /// Counts the agents this device has been pointed at. A reply that set out before the count
+    /// moved came from an agent the device no longer runs, and is not taken as the new one's.
+    @ObservationIgnored private(set) var agentGeneration = 0
+
     /// The last time the app asked the far side about an operation it had lost track of.
     @ObservationIgnored fileprivate var lastReconcileAttempt: Date = .distantPast
 
@@ -113,6 +117,18 @@ final class DeviceCore {
     /// The line is a failed status read. Set by the model that read it, after saying so.
     func markLineAsRefreshFailure() {
         lineIsRefreshFailure = true
+    }
+
+    /// The device now runs a different agent, so what the old one said about itself goes: its
+    /// doctor run, and all that is known about its copy of the setup, a refused push included,
+    /// which would otherwise be held against the new agent for a minute. What the user has in
+    /// flight stays, because it is theirs rather than the agent's: the action running, how the last
+    /// one ended, the operation being watched, and a setup read or push that is still out.
+    func agentDidChange() {
+        agentGeneration += 1
+        doctor = nil
+        doctorRanAt = nil
+        setup = SetupCopyState(isSharing: setup.isSharing)
     }
 }
 
@@ -692,12 +708,17 @@ extension AgentDevice {
 
     func runDoctor(deep: Bool = false) {
         guard dialect.supportsDoctor else { return }
+        let generation = core.agentGeneration
         perform(deep ? "Checking \(name) thoroughly" : "Checking \(name)",
                 kind: .policy, subject: "diagnostics") { _ in
             do {
                 let result = try await self.send(.doctor(deep: deep), decoding: AgentDoctorResult.self)
-                self.core.doctor = result
-                self.core.doctorRanAt = Date()
+                // The checks are about the agent that ran them, and it may have been replaced
+                // while they ran.
+                if self.core.agentGeneration == generation {
+                    self.core.doctor = result
+                    self.core.doctorRanAt = Date()
+                }
                 let checks = result.checks ?? []
                 let bad = checks.filter { $0.verdict == .failed }.count
                 let warned = checks.filter { $0.verdict == .warning }.count

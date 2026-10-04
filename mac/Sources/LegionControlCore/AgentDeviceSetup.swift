@@ -109,6 +109,7 @@ extension AgentDevice {
     private func publish(_ local: ControllerDocument) {
         core.setup.isSharing = true
         let dialect = dialect
+        let generation = core.agentGeneration
         Task { @MainActor in
             var failure: String?
             do {
@@ -133,6 +134,13 @@ extension AgentDevice {
                 failure = error.localizedDescription
             }
 
+            // The agent this went to was replaced while it was out. What it made of the document
+            // says nothing about the new one, which gets a push of its own on its first read.
+            guard self.core.agentGeneration == generation else {
+                self.core.setup.isSharing = false
+                self.onStateChange?()
+                return
+            }
             let sentence = failure.map { "The setup could not be shared with \(self.name): \($0)" }
             self.core.setup.lastShare = (hash: local.hash, at: Date(), failure: sentence)
             if let sentence { self.setStatus(sentence, isError: true) }
@@ -254,6 +262,7 @@ extension AgentDevice {
     func replaceSetup() {
         guard let local = controllerConfig?() else { return }
         let dialect = dialect
+        let generation = core.agentGeneration
         perform("Replacing the setup on \(name)", kind: .shareSetup, subject: "setup") { _ in
             do {
                 let request = try AgentRequest.configSet(local, replace: true, dialect: dialect)
@@ -263,7 +272,11 @@ extension AgentDevice {
                     self.setStatus("The setup was not replaced: \(sentence)", isError: true)
                     return .init(state: .failed, summary: "The setup on \(self.setupHolder) was not replaced. \(sentence)")
                 }
-                self.core.setup.lastShare = (hash: local.hash, at: Date(), failure: nil)
+                // A push noted against an agent that has since been replaced would hold back the
+                // new one's for a minute.
+                if self.core.agentGeneration == generation {
+                    self.core.setup.lastShare = (hash: local.hash, at: Date(), failure: nil)
+                }
                 self.core.setup.remoteIdentity = nil
                 self.core.setup.remoteLineageForHash = nil
                 self.setStatus("Replaced the setup \(self.setupHolder) was holding with this device's.")

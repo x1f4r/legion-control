@@ -53,13 +53,29 @@ final class MacModel: AgentDevice {
     /// The model used to be replaced whenever the local block or the bindings changed, which threw
     /// away anything in flight along with it. The same device is still the same device: only its
     /// name, its agent command or the machine it is bound to change.
+    ///
+    /// A new command is a different agent, though, and what the old one reported is not the new
+    /// one's to show. The section reads "checking" until the new agent answers, as a new model
+    /// did, rather than showing the old agent's services until the next read, and a document the
+    /// old one refused is pushed to the new one on its first read.
     func update(config: LocalConfig, agent: MacAgent, boundMachineId: String?, boundAgentArgv: [String]?) {
+        if (boundAgentArgv ?? [config.agentPath]) != agentCommand {
+            status = nil
+            failure = nil
+            lastChecked = nil
+            lastRefreshFinished = nil
+            core.agentDidChange()
+        }
         self.config = config
         self.agent = agent
         self.boundMachineId = boundMachineId
         self.boundAgentArgv = boundAgentArgv
         onStateChange?()
     }
+
+    /// What this device runs to reach its agent: the argv the bindings give, or else the script the
+    /// local block names.
+    private var agentCommand: [String] { boundAgentArgv ?? [config.agentPath] }
 
     var name: String { config.name }
 
@@ -163,14 +179,21 @@ final class MacModel: AgentDevice {
     func refresh(duringAction: Bool = false) async {
         guard !isRefreshing, duringAction || activity == nil else { return }
         isRefreshing = true
+        let generation = core.agentGeneration
         defer {
             isRefreshing = false
-            lastRefreshFinished = Date()
+            // A read of an agent this device no longer runs does not count as a read, so nothing
+            // waits two seconds before asking the new one.
+            if core.agentGeneration == generation { lastRefreshFinished = Date() }
             onStateChange?()
         }
 
         do {
             let reply = try await agent.status(dialect: dialect)
+            // The agent may have been replaced while this read was out. What the old one said is not
+            // the new one's state, so it is dropped, here and below, and the next read asks the new
+            // one.
+            guard core.agentGeneration == generation else { return }
             guard reply.ok != false else {
                 status = nil
                 failure = AgentFailure(.agentFailed, detail: reply.message ?? "the agent reported a failure",
@@ -184,10 +207,12 @@ final class MacModel: AgentDevice {
             reconcileSetup()
             reconcileIfNeeded()
         } catch let error as AgentFailure {
+            guard core.agentGeneration == generation else { return }
             status = nil
             failure = error
             lastChecked = Date()
         } catch {
+            guard core.agentGeneration == generation else { return }
             status = nil
             failure = AgentFailure(.unreadableOutput, detail: error.localizedDescription, dispatch: .unknown)
             lastChecked = Date()
