@@ -11,7 +11,7 @@ import { commitInstallSwap, commitRollbackSwap, recoverAgentSwap, swapPaths } fr
 import { log, note } from './log.mjs';
 import { withOperation } from './operate.mjs';
 import { readOperation, recordPhase } from './operations.mjs';
-import { trustFingerprint } from './trust.mjs';
+import { trustFingerprint, trustKeyHash } from './trust.mjs';
 
 export const STDIN_IDLE_TIMEOUT_MS = 15_000;
 export const STDIN_TOTAL_TIMEOUT_MS = 120_000;
@@ -39,7 +39,7 @@ function manifestShape(verified) {
     contract: verified.manifest.contract ?? null,
     files: verified.entryCount,
     signatureVerified: true,
-    keyFingerprint: trustFingerprint(),
+    keyFingerprint: trustKeyHash(),
   };
 }
 

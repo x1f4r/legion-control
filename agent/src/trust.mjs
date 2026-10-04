@@ -61,8 +61,17 @@ export function verifyDetachedSignature(bytes, signature) {
     : { ok: false, error: 'the signature does not match the release key compiled into this agent' };
 }
 
+/**
+ * The SHA-256 of the trusted key's SPKI, in hex. A self-update reply's
+ * `manifest.keyFingerprint` is this whole value, as the contract's sha256
+ * pattern requires; people read the short form below.
+ */
+export function trustKeyHash() {
+  const der = publicKey().export({ type: 'spki', format: 'der' });
+  return crypto.createHash('sha256').update(der).digest('hex');
+}
+
 /** A short, stable fingerprint of the trusted key, for doctor and diagnostics. */
 export function trustFingerprint() {
-  const der = publicKey().export({ type: 'spki', format: 'der' });
-  return crypto.createHash('sha256').update(der).digest('hex').slice(0, 16);
+  return trustKeyHash().slice(0, 16);
 }

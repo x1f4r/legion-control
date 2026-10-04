@@ -441,6 +441,7 @@ test('bundle installs bind exact bytes and refuse a rollback id in either direct
     });
     const first = await install('bundle-install-0001');
     assert.equal(first.action, 'installed', first.message);
+    assert.match(first.manifest.keyFingerprint, /^[0-9a-f]{64}$/, 'the whole key hash, as the contract\'s sha256 pattern requires');
     assert.equal((await install('bundle-install-0001')).replayed, true);
     fs.appendFileSync(path.join(candidate, 'src', 'index.mjs'), '// another payload\n');
     signTree(candidate, isolated.pair.privateKey);

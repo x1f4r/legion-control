@@ -8,7 +8,7 @@ import path from 'node:path';
 import test from 'node:test';
 import zlib from 'node:zlib';
 import { rejectUnsafePath, readTar, stageFiles, verifyAgentArchive } from '../src/archive.mjs';
-import { verifyDetachedSignature, trustFingerprint } from '../src/trust.mjs';
+import { verifyDetachedSignature, trustFingerprint, trustKeyHash } from '../src/trust.mjs';
 import { REPO, withHome } from './helpers.mjs';
 
 // --- tar writing, so a hostile archive can be built without a hostile tool ----
@@ -86,6 +86,9 @@ test('the pinned key verifies the shared golden fixture', () => {
   assert.equal(verifyDetachedSignature(tampered, signature).ok, false, 'one flipped byte must be caught');
   assert.equal(verifyDetachedSignature(manifest, signature.slice(0, 40)).ok, false);
   assert.match(trustFingerprint(), /^[0-9a-f]{16}$/);
+  // A reply's manifest.keyFingerprint is the whole hash the contract's sha256 pattern names.
+  assert.match(trustKeyHash(), /^[0-9a-f]{64}$/);
+  assert.ok(trustKeyHash().startsWith(trustFingerprint()));
 });
 
 test('every unsafe path shape is named and refused', () => {
