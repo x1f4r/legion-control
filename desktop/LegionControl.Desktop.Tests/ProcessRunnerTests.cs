@@ -8,11 +8,10 @@ public class ProcessRunnerTests
     [Fact]
     public async Task AgentReplyCompletesAfterAFullNewlineTerminatedObjectEvenWhenChildKeepsPipesOpen()
     {
+        // The child never exits, so only the framing can end this run before the deadline does.
         var script = "process.stdout.write(JSON.stringify({ok:true,contract:3,data:'x'.repeat(12000)})+'\\n');setInterval(()=>{},1000);";
-        var watch = System.Diagnostics.Stopwatch.StartNew();
         var result = await new ProcessRunner().RunAgentAsync("node", new[] { "-e", script }, TimeSpan.FromSeconds(8));
         Assert.False(result.TimedOut);
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(4));
         using var json = System.Text.Json.JsonDocument.Parse(result.StandardOutput);
         Assert.True(json.RootElement.GetProperty("ok").GetBoolean());
         Assert.Equal(12000, json.RootElement.GetProperty("data").GetString()!.Length);
@@ -61,16 +60,35 @@ public class ProcessRunnerTests
     {
         // The kill leaves an exit status behind, and handing that back as a normal result made a
         // cancelled change look like one that had failed on the far side.
-        using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
-        var result = await new ProcessRunner().RunAsync("node",
-            new[] { "-e", "process.stdout.write('started');setInterval(()=>{},1000);" }, TimeSpan.FromSeconds(20), null, cancel.Token);
-        Assert.True(result.TimedOut);
-        Assert.True(result.Cancelled);
-        Assert.Contains("cancelled", result.FailureText);
-        Assert.Contains("started", result.StandardOutput);
-        var reading = AttemptClassifier.Classify(result);
-        Assert.Equal(FailureKind.TimedOut, reading.Kind);
-        Assert.Equal(Dispatch.Unknown, reading.Dispatch);
+        //
+        // The child says so on stdout and then leaves a file behind, and the run is cancelled only
+        // once that file is there. A timer could fire before a slow machine had even started node,
+        // and a run cancelled before it starts is a different rule (the test below).
+        var marker = Path.Combine(Path.GetTempPath(), $"legion-started-{Guid.NewGuid():N}");
+        var script = $"const fs=require('fs');fs.writeSync(1,'started');fs.writeFileSync({System.Text.Json.JsonSerializer.Serialize(marker)},'');" +
+                     "setInterval(()=>{},1000);";
+        using var cancel = new CancellationTokenSource();
+        var running = new ProcessRunner().RunAsync("node", new[] { "-e", script }, TimeSpan.FromSeconds(60), null, cancel.Token);
+        try
+        {
+            var waited = System.Diagnostics.Stopwatch.StartNew();
+            while (!File.Exists(marker) && !running.IsCompleted && waited.Elapsed < TimeSpan.FromSeconds(30)) await Task.Delay(50);
+            Assert.True(File.Exists(marker), "the child never started");
+            cancel.Cancel();
+            var result = await running;
+            Assert.True(result.TimedOut);
+            Assert.True(result.Cancelled);
+            Assert.Contains("cancelled", result.FailureText);
+            Assert.Contains("started", result.StandardOutput);
+            var reading = AttemptClassifier.Classify(result);
+            Assert.Equal(FailureKind.TimedOut, reading.Kind);
+            Assert.Equal(Dispatch.Unknown, reading.Dispatch);
+        }
+        finally
+        {
+            cancel.Cancel();
+            File.Delete(marker);
+        }
     }
 
     [Fact]
@@ -115,22 +133,21 @@ public class ProcessRunnerTests
     public async Task AReplyInTwoByteTextIsFramedAcrossReadsThatSplitItsCharacters()
     {
         // 4096-byte reads of an odd-length prefix and two-byte characters split one of them on every
-        // read. The framing decodes statefully, so the reply still completes as soon as it is whole.
+        // read. The framing decodes statefully, so the reply still completes as soon as it is whole;
+        // the child never exits, so a reply the framing missed ends in the deadline instead.
         var script = "process.stdout.write(JSON.stringify({ok:true,data:'\\u00e9'.repeat(12000)})+'\\n');setInterval(()=>{},1000);";
-        var watch = System.Diagnostics.Stopwatch.StartNew();
         var result = await new ProcessRunner().RunAgentAsync("node", new[] { "-e", script }, TimeSpan.FromSeconds(8));
         Assert.False(result.TimedOut);
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(4));
         using var json = System.Text.Json.JsonDocument.Parse(result.StandardOutput);
         Assert.True(json.RootElement.GetProperty("ok").GetBoolean());
     }
 
-    [Fact]
+    // The grandchild's EPIPE is how this test sees this side's end of the pipe close. Windows
+    // reports a write to a closed pipe differently, so there it is reported as skipped rather than
+    // passing without having looked. The rule is the same code path on both.
+    [UnixFact("The closed pipe is observed through a POSIX EPIPE in a grandchild, which Windows does not report the same way.")]
     public async Task ThePipesAreClosedEvenWhenAGrandchildStillHoldsThem()
     {
-        // The grandchild's EPIPE is how this test sees this side's end of the pipe close. Windows
-        // reports a write to a closed pipe differently, and the rule is the same code path there.
-        if (OperatingSystem.IsWindows()) return;
         var marker = Path.Combine(Path.GetTempPath(), $"legion-pipe-closed-{Guid.NewGuid():N}");
         var markerJson = System.Text.Json.JsonSerializer.Serialize(marker);
         // The child leaves behind a grandchild that inherited its stdout and keeps writing to it.
@@ -163,5 +180,15 @@ public class ProcessRunnerTests
         Assert.True(result.Succeeded, result.FailureText);
         Assert.Contains("bytes=200000", result.StandardOutput);
         Assert.Contains("yyyy", result.StandardError);
+    }
+}
+
+/// A fact only Unix can observe. Reported as skipped on Windows, with the reason, rather than
+/// counted as a pass there.
+public sealed class UnixFactAttribute : FactAttribute
+{
+    public UnixFactAttribute(string reason)
+    {
+        if (OperatingSystem.IsWindows()) Skip = reason;
     }
 }
