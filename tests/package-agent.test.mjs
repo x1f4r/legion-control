@@ -13,7 +13,7 @@ test('agent package authenticates exact inventory and rejects symlink payloads',
     const source = path.join(scratch, 'source');
     fs.mkdirSync(path.join(source, 'src'), { recursive: true });
     fs.mkdirSync(path.join(source, 'install'));
-    fs.writeFileSync(path.join(source, 'package.json'), '{"version":"3.0.0"}\n');
+    fs.writeFileSync(path.join(source, 'package.json'), '{"version":"3.0.0","legionControl":{"agentFloor":"3.0.0"}}\n');
     fs.writeFileSync(path.join(source, 'src/index.mjs'), 'console.log("test agent");\n');
     fs.writeFileSync(path.join(source, 'install/install.sh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const privateKey = path.join(scratch, 'private.pem');
@@ -41,6 +41,28 @@ test('agent package authenticates exact inventory and rejects symlink payloads',
     if (process.platform !== 'win32') {
       fs.symlinkSync('/tmp', path.join(source, 'src/escape'));
       await assert.rejects(packageAgent(options), /symlinks/);
+    }
+  } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+});
+
+test('agent package refuses a floor that is missing, malformed or above the version before it signs anything', async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-package-floor-test-'));
+  try {
+    const source = path.join(scratch, 'source');
+    fs.mkdirSync(path.join(source, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(source, 'install'));
+    fs.writeFileSync(path.join(source, 'src/index.mjs'), 'console.log("test agent");\n');
+    // No signing key at all: the floor is refused first, so nothing is staged, signed or written.
+    const options = { source, clientVersion: '1.4.0', destination: path.join(scratch, 'dist'), privateKey: path.join(scratch, 'absent.pem') };
+    const floors = [[undefined, /declares no legionControl\.agentFloor/], ['3.1', /"3\.1", which is not an x\.y\.z version/], ['3.2.0', /3\.2\.0, above its own version 3\.1\.0/]];
+    for (const [agentFloor, refusal] of floors) {
+      fs.writeFileSync(path.join(source, 'package.json'), JSON.stringify({ version: '3.1.0', legionControl: { agentFloor } }) + '\n');
+      await assert.rejects(packageAgent(options), (error) => refusal.test(error.message) && /Nothing was packaged/.test(error.message));
+      assert.equal(fs.existsSync(options.destination), false);
+    }
+    for (const agentFloor of ['3.1.0', '3.0.0']) {
+      fs.writeFileSync(path.join(source, 'package.json'), JSON.stringify({ version: '3.1.0', legionControl: { agentFloor } }) + '\n');
+      await assert.rejects(packageAgent(options), /Release signing key missing/);
     }
   } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
 });

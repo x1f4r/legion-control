@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { artifactDigest, signManifest, verifyManifest, verifyArtifact } from './release-integrity.mjs';
+import { agentFloorProblem } from './check-versions.mjs';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export async function packageAgent({ source = path.join(repository, 'agent'), destination = path.join(repository, 'dist'), privateKey = path.join(os.homedir(), '.legion-control/release-signing.key'), publicKey = path.join(repository, 'contract/release-public-key.pem'), clientVersion } = {}) {
@@ -13,8 +14,13 @@ export async function packageAgent({ source = path.join(repository, 'agent'), de
     clientVersion = project.match(/<Version>([^<]+)<\/Version>/)?.[1];
   }
   if (!/^\d+\.\d+\.\d+$/.test(clientVersion ?? '')) throw new Error('Client version must be a stable semantic version.');
-  const version = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version;
+  const agentPackage = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8'));
+  const { version } = agentPackage;
   if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Agent version must be a stable semantic version.');
+  // The floor travels inside the signed package.json, so a bundle that gets it wrong cannot be
+  // corrected once it is out. Refuse it before anything is staged or signed.
+  const floorProblem = agentFloorProblem(agentPackage);
+  if (floorProblem) throw new Error(`${floorProblem} Nothing was packaged.`);
   if (!fs.existsSync(privateKey)) throw new Error('Release signing key missing. See docs/security.md.');
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-agent-package-'));
   const stage = path.join(scratch, 'agent');
