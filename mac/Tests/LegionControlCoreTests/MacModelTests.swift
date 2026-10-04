@@ -359,6 +359,31 @@ struct MacModelTests {
         #expect(store.newestFirst.first { $0.kind == .action }?.output == "reindexed 412 documents")
     }
 
+    @Test("replacing the copy the local agent holds names the local agent, not this Mac")
+    func localSetupReplacementWording() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced" }"#)
+        runner.answer("status", json: Self.status)
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        model.controllerConfig = { document }
+        var asked: PendingDialog?
+        model.ask = { asked = $0 }
+
+        await model.refresh()
+        model.core.setup.decision = .diverged
+        model.requestSetupReplacement()
+        let question = try #require(asked)
+        #expect(question.title == "Replace the setup the local agent is holding?")
+
+        question.perform()
+        await Self.settle(model)
+        #expect(model.note == "Replaced the setup the local agent was holding with this device's.")
+        #expect(runner.sent.contains { $0.contains("config") && $0.contains("--replace") })
+    }
+
     @Test("the local agent is run through the bound argv when the device is a machine in the setup")
     func boundLocalAgent() async throws {
         // The `self` binding: this device is one of the machines in the shared document, and it is

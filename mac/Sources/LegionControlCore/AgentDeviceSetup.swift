@@ -240,7 +240,7 @@ extension AgentDevice {
         guard case .conflict(let reason) = setupSharing else { return }
         ask?(PendingDialog(
             id: "replace-setup-\(historyMachineId)",
-            title: "Replace the setup \(name) is holding?",
+            title: "Replace the setup \(setupHolder) is holding?",
             message: "\(reason)\n\nReplacing it overwrites the copy the agent has with the document this app is running on.",
             confirmTitle: "Replace it",
             perform: { [weak self] in self?.replaceSetup() }
@@ -261,12 +261,12 @@ extension AgentDevice {
                 if result.ok == false {
                     let sentence = result.error ?? result.message ?? "the agent refused the document."
                     self.setStatus("The setup was not replaced: \(sentence)", isError: true)
-                    return .init(state: .failed, summary: "The setup on \(self.name) was not replaced. \(sentence)")
+                    return .init(state: .failed, summary: "The setup on \(self.setupHolder) was not replaced. \(sentence)")
                 }
                 self.core.setup.lastShare = (hash: local.hash, at: Date(), failure: nil)
                 self.core.setup.remoteIdentity = nil
                 self.core.setup.remoteLineageForHash = nil
-                self.setStatus("\(self.name) now holds this device's setup.")
+                self.setStatus("Replaced the setup \(self.setupHolder) was holding with this device's.")
                 return .init(state: .succeeded,
                              summary: "\(self.name) now holds revision \(local.identity.revisionNumber).",
                              refresh: true)
