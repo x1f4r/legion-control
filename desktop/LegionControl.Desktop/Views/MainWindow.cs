@@ -29,6 +29,7 @@ public sealed class MainWindow : Window
     private readonly CancellationTokenSource _updateLifetime = new();
     private readonly DispatcherTimer _updateTimer = new() { Interval = AppUpdateSuggestions.PeriodicInterval };
     private bool _reviewingUpdate;
+    private LaunchReviewSheet? _launchReview;
     private readonly Grid _panes = new();
     private readonly Border _navigation = new();
     private readonly ComboBox _devicePicker = new() { MinWidth = 120, MaxWidth = 220, HorizontalAlignment = HorizontalAlignment.Stretch };
@@ -151,7 +152,26 @@ public sealed class MainWindow : Window
         else if (_page == "device") BuildDiagnostics();
         else if (_selection.SelectedId is { } id && _app.Machine(id) is { } selected) BuildMachine(selected);
         else BuildEmpty();
+        // Commands nobody here approved open their review once per revision. Not now keeps it
+        // shut for that revision; the notice above stays.
+        if (IsVisible && _launchReview is null && _app.LaunchReview.Count > 0 && !_app.IsLaunchReviewDeferred) OpenLaunchReview();
+    }
 
+    private void OpenLaunchReview()
+    {
+        if (_launchReview is { } open)
+        {
+            open.Activate();
+            return;
+        }
+        var sheet = new LaunchReviewSheet(_app);
+        sheet.Closed += (_, _) =>
+        {
+            _launchReview = null;
+            if (_app.LaunchReview.Count > 0) _app.DeferLaunchReview();
+        };
+        _launchReview = sheet;
+        sheet.Show(this);
     }
 
     private void UpdateNavigation()
@@ -179,12 +199,18 @@ public sealed class MainWindow : Window
         if (_app.Config.Problem is { } problem)
             _content.Children.Add(Ui.Actions(Ui.Note("Setup needs attention", Ui.Bad),
                 Ui.Action("Details", () => Sheets.Text(this, "Setup", problem))));
+        if (_app.Approvals.Problem is { } launchProblem)
+            _content.Children.Add(Ui.Actions(Ui.Note("Approved commands need attention", Ui.Bad),
+                Ui.Action("Details", () => Sheets.Text(this, "Approved commands", launchProblem))));
         if (_app.Config.Warnings.Count > 0)
             _content.Children.Add(Ui.Actions(Ui.Action("Setup warnings", () => Sheets.Text(this, "Setup", string.Join("\n", _app.Config.Warnings)))));
         var unresolved = _app.Reconciler.Outcomes.Count(entry => entry.Value is ReconcileOutcome.NeedsDecision);
         if (unresolved > 0 && _page != "setup")
             _content.Children.Add(Ui.Actions(Ui.Note("Setup changes need review", Ui.Unknown),
                 Ui.Action("Review", () => { _page = "setup"; Rebuild(); })));
+        if (_app.LaunchReview.Count > 0 && _page != "setup")
+            _content.Children.Add(Ui.Actions(Ui.Note("Commands from the shared setup need approval", Ui.Unknown),
+                Ui.Action("Review", OpenLaunchReview)));
     }
 
     private void BuildEmpty()
@@ -217,6 +243,7 @@ public sealed class MainWindow : Window
             : machine.Status is { } status ? (status.SystemName ?? status.SystemId ?? "Online") + (machine.IsSelf ? " · This device" : "")
             : "Not checked yet";
         identity.Children.Add(Ui.Note(state, machine.Failure is null ? null : Ui.Unknown));
+        foreach (var line in LaunchLines(machine)) identity.Children.Add(Ui.Note(line, Ui.Unknown));
         heading.Children.Add(identity);
         var controls = BuildMachineActions(machine);
         if (ContentWidth < 650) { Grid.SetRow(controls, 1); Grid.SetColumnSpan(controls, 2); }
@@ -228,6 +255,23 @@ public sealed class MainWindow : Window
             _content.Children.Add(Ui.Actions(Ui.Action("Details", () => ShowMachineDetails(machine))));
         BuildOperations(machine);
         BuildServices(machine);
+    }
+
+    /// What this device runs on each system whose command is not simply the one the setup offers.
+    private IEnumerable<string> LaunchLines(MachineModel machine)
+    {
+        var systems = machine.Machine.Systems;
+        foreach (var system in systems)
+        {
+            var waiting = _app.LaunchReview.Any(entry => entry.Path == LaunchValues.SystemPath(machine.Id, system.Id));
+            var line = system.LaunchState switch
+            {
+                LaunchState.ApprovedWithChangeWaiting => "Runs the approved command. A changed one is waiting for approval.",
+                LaunchState.NotDriven when waiting => "Not driven from this device until its command is approved.",
+                _ => null,
+            };
+            if (line is not null) yield return systems.Count > 1 ? $"{system.Name}: {line}" : line;
+        }
     }
 
     private void ShowMachineDetails(MachineModel machine)
@@ -515,6 +559,13 @@ public sealed class MainWindow : Window
         _content.Children.Add(Ui.Rule());
         _content.Children.Add(Ui.SectionHeading("The setup"));
         _content.Children.Add(Ui.Actions(Ui.Action("Setup details", SetupDetails)));
+        if (_app.LaunchReview.Count > 0)
+        {
+            _content.Children.Add(Ui.DetailRow("Commands",
+                _app.LaunchReview.Count == 1 ? "1 waits for approval on this device" : $"{_app.LaunchReview.Count} wait for approval on this device",
+                Ui.Unknown));
+            _content.Children.Add(Ui.Actions(Ui.Action("Review commands", OpenLaunchReview)));
+        }
         foreach (var machine in _app.Machines)
         {
             if (!_app.Reconciler.Outcomes.TryGetValue(machine.Id, out var outcome)) continue;

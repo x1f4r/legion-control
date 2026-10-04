@@ -162,11 +162,18 @@ public sealed class SetupEditor : Window
     {
         var plan = ControllerEditor.Plan(_text.Text ?? "", _app.Config.Config, "check", _ => { });
         var decoded = ControllerConfig.From(Contract.Value.Parse(plan.Text));
-        Report(plan.Problems, plan.Preview.Lines().Concat(decoded.Warnings()).ToList());
+        Report(plan.Problems, plan.Preview.Lines().Concat(decoded.Warnings()).ToList(), _app.LaunchEditProblems(_text.Text ?? ""));
     }
 
     private void Apply()
     {
+        // Saving here approves every command it changes, so a command waiting for approval is
+        // approved or reverted on its own first, never carried along by an edit to its shell.
+        if (_app.LaunchEditProblems(_text.Text ?? "") is { Count: > 0 } refused)
+        {
+            Report(Array.Empty<string>(), Array.Empty<string>(), refused);
+            return;
+        }
         var (document, problem) = _app.Config.ApplyEdit(_text.Text ?? "", "edited here");
         if (problem is not null)
         {
@@ -188,12 +195,48 @@ public sealed class SetupEditor : Window
         Check();
     }
 
-    private void Report(IReadOnlyList<string> problems, IReadOnlyList<string> notes)
+    private void Report(IReadOnlyList<string> problems, IReadOnlyList<string> notes,
+        IReadOnlyList<LaunchGate.EditProblem>? launch = null)
     {
+        launch ??= Array.Empty<LaunchGate.EditProblem>();
         _report.Children.Clear();
-        _report.Children.Add(Ui.SectionHeading(problems.Count == 0 ? "Ready" : "Not yet"));
+        _report.Children.Add(Ui.SectionHeading(problems.Count == 0 && launch.Count == 0 ? "Ready" : "Not yet"));
         foreach (var problem in problems) _report.Children.Add(Ui.Note(problem, Ui.Bad));
+        foreach (var problem in launch)
+        {
+            _report.Children.Add(Ui.Note(problem.Sentence, Ui.Bad));
+            if (problem.Waiting is not { } entry) continue;
+            _report.Children.Add(Ui.Actions(
+                entry.Approvable ? Ui.Action("Approve", () => ApproveWaiting(entry)) : null,
+                entry.CanRevert ? Ui.Action("Revert", () => RevertWaiting(entry),
+                    explanation: "Puts the command this device approved back into the document below. Apply saves it.") : null));
+        }
         foreach (var note in notes) _report.Children.Add(Ui.Note(note));
+    }
+
+    /// Approves exactly the waiting value that was shown, then checks the document again.
+    private void ApproveWaiting(LaunchReviewEntry entry)
+    {
+        if (_app.ApproveLaunch(new[] { entry }) is { } problem)
+        {
+            Report(new[] { problem }, Array.Empty<string>());
+            return;
+        }
+        Check();
+    }
+
+    /// Puts the approved value back in the document being edited, keeping every other change in
+    /// it, so that Apply saves the revert together with them.
+    private void RevertWaiting(LaunchReviewEntry entry)
+    {
+        var (text, problem) = LaunchGate.Reverted(ControllerDocument.FromText(_text.Text ?? ""), entry);
+        if (text is null)
+        {
+            Report(new[] { problem ?? "The approved value could not be put back." }, Array.Empty<string>());
+            return;
+        }
+        _text.Text = text;
+        Check();
     }
 }
 

@@ -100,13 +100,51 @@ public sealed class ImportSetup : Window
             catch (Exception error) { problem.Text = error.Message; }
         })));
         body.Children.Add(preview); body.Children.Add(problem);
-        body.Children.Add(Ui.Actions(Ui.Action("Cancel", Close), Ui.Action("Adopt this exact setup here", () =>
+        body.Children.Add(Ui.Actions(Ui.Action("Cancel", Close), Ui.Action("Adopt this exact setup here", async () =>
         {
             if (fetched is null) { problem.Text = "Fetch and review a setup first."; return; }
-            var failure = app.Config.Apply(fetched, "imported from a machine");
-            if (failure is not null) { problem.Text = failure; return; }
-            Close();
+            try
+            {
+                // Enrolment approves every command in the setup, so all of them are shown first
+                // and Cancel applies nothing. A device that already applies a setup approves
+                // nothing by adopting another one: what it has not approved waits for review.
+                var document = fetched;
+                if (app.IsEnrolment && !await ConfirmEnrolmentAsync(document)) return;
+                var failure = app.AdoptImported(document);
+                if (failure is not null) { problem.Text = failure; return; }
+                Close();
+            }
+            catch (Exception error) { problem.Text = error.Message; }
         })));
         Content = new ScrollViewer { Content = body };
+    }
+
+    /// Every launch value of the setup, for a person to confirm before this device approves them all.
+    private async Task<bool> ConfirmEnrolmentAsync(ControllerDocument document)
+    {
+        var dialog = new Window
+        {
+            Title = "Approve this setup's commands", Width = 640, Height = 560,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+        };
+        var body = Ui.Column(8); body.Margin = new Thickness(20);
+        body.Children.Add(Ui.Title(dialog.Title));
+        body.Children.Add(Ui.Note(
+            "This device holds no setup yet. Adopting this one approves every command in it: this device will run them over ssh with its own key. A command a peer changes later waits for approval here."));
+        body.Children.Add(new ScrollViewer
+        {
+            MaxHeight = 340,
+            Content = new SelectableTextBlock
+            {
+                Text = string.Join("\n", LaunchGate.Summary(document)),
+                FontFamily = new Avalonia.Media.FontFamily("monospace"),
+                TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+            },
+        });
+        var confirmed = false;
+        body.Children.Add(Ui.Actions(Ui.Action("Cancel", dialog.Close), Ui.Action("Confirm", () => { confirmed = true; dialog.Close(); })));
+        dialog.Content = body;
+        await dialog.ShowDialog(this);
+        return confirmed;
     }
 }
