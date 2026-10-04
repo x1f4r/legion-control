@@ -333,6 +333,21 @@ class AgentClientTest {
     }
 
     @Test
+    fun `a phone key that could not be read outranks an address that did not answer`() = runBlocking {
+        // The first address is off and the second answered, and only this phone's key stood in the
+        // way. Recorded in the same place as the first, it was reported as a machine that was asleep.
+        val transport = FakeTransport { sent ->
+            if (sent.endpoint == "first") {
+                throw AgentFailure.Unreachable("Tower", "no answer", null, DispatchStage.NOT_STARTED, FailureKind.HOST_UNREACHABLE)
+            }
+            throw AgentFailure.KeyUnavailable(IllegalStateException("keystore is not ready"))
+        }
+        val (agent, _) = client(machine(systems = listOf(linux)), transport)
+        failsWith<AgentFailure.KeyUnavailable> { agent.status() }
+        assertEquals(listOf("first", "second"), transport.sent.map { it.endpoint })
+    }
+
+    @Test
     fun `a command that cannot be written is refused, and another system's line still goes`() = runBlocking {
         val transport = FakeTransport { accepted }
         val awkward = linux.copy(agent = listOf("/usr/bin/node", "/home/me/odd\\\\name/index.mjs"))

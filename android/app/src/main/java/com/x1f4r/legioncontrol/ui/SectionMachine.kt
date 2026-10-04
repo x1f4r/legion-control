@@ -152,6 +152,7 @@ private fun compactMachineState(model: MachineModel): String = when (val state =
     is LinkState.NeedsKeyAuthorisation -> "SSH key needs authorization"
     is LinkState.Unsettled -> "Outcome unconfirmed"
     is LinkState.Misconfigured -> "Setup needs attention"
+    is LinkState.PhoneKeyUnavailable -> "This phone's key could not be read"
     is LinkState.Offline -> "Not reachable"
     LinkState.Unknown -> "Checking…"
 }
@@ -501,6 +502,9 @@ private fun RunningNow(model: MachineModel) {
 
                 state is LinkState.Misconfigured ->
                     StatusLine(Mark.Bad, "This machine's setup cannot be used to reach it")
+
+                state is LinkState.PhoneKeyUnavailable ->
+                    StatusLine(Mark.Attention, "This phone's key could not be read, so nothing was sent")
 
                 state is LinkState.Offline -> StatusLine(Mark.Attention, "Asleep or unreachable")
 

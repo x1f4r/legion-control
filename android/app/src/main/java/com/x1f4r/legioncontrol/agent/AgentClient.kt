@@ -968,6 +968,11 @@ class AgentClient(
      * they are questions rather than reports and the only ones with an action attached. A request
      * that could not be made is a fault in the document, which is the next most useful thing to say.
      *
+     * A key this phone could not read comes just before a machine that did not answer. Every address
+     * that got as far as signing in failed on this side, so it is the better thing to say: reported
+     * behind an address that was off, it turned a phone that could not read its own key into a
+     * machine that was asleep.
+     *
      * An address skipped because it is outside the dial grammar comes last of all, after a machine
      * that did not answer. The document holding it is valid and Apply has already named the entry,
      * so it is worth saying only when nothing else happened: reported first, beside a good address
@@ -982,6 +987,7 @@ class AgentClient(
         var scriptMissing: AgentFailure? = null
         var wrongShape: AgentFailure? = null
         var unreadable: AgentFailure? = null
+        var keyUnavailable: AgentFailure? = null
         var unreachable: AgentFailure? = null
         var ambiguous: AgentFailure? = null
         var undialable: AgentFailure? = null
@@ -1004,6 +1010,7 @@ class AgentClient(
                     }
 
                 is AgentFailure.BadOutput -> unreadable = unreadable ?: failure
+                is AgentFailure.KeyUnavailable -> keyUnavailable = keyUnavailable ?: failure
                 else ->
                     if (failure.dispatch.mayHaveRun) {
                         ambiguous = ambiguous ?: failure
@@ -1015,7 +1022,7 @@ class AgentClient(
 
         fun worthReporting(): AgentFailure? =
             hostKeyChanged ?: notAuthorised ?: badRequest ?: scriptMissing ?: unreadable ?: ambiguous ?:
-                wrongShape ?: unreachable ?: undialable
+                wrongShape ?: keyUnavailable ?: unreachable ?: undialable
     }
 
     /**

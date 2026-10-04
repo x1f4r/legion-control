@@ -98,6 +98,15 @@ sealed interface LinkState {
 
     /** The command could not be written for the shell the far side uses. A configuration fault. */
     data class Misconfigured(val reason: String) : LinkState
+
+    /**
+     * This phone's own key could not be read, so nothing was sent.
+     *
+     * Not offline, and not a fault in the setup: the machine may well have answered, and what failed
+     * is on this side. Drawn as offline it read as a machine that was asleep, offered to wake it, and
+     * during a reboot went on waiting for a machine that may have been back for minutes.
+     */
+    data class PhoneKeyUnavailable(val reason: String) : LinkState
 }
 
 /** Whether a wake packet can reach a machine right now, and in one sentence why not. */
@@ -412,6 +421,7 @@ fun Throwable.toLinkState(): LinkState = when (this) {
     )
 
     is AgentFailure.BadRequest -> LinkState.Misconfigured(detail ?: summary)
+    is AgentFailure.KeyUnavailable -> LinkState.PhoneKeyUnavailable(summary)
     // A command that ran too long says nothing about the link, because the link is what carried it
     // right up to the moment we gave up. Drawing that as offline would claim the machine is asleep on
     // the strength of it having answered, and a boot handler that reads an offline link as "the

@@ -8,6 +8,7 @@ import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.MachineSystem
 import com.x1f4r.legioncontrol.agent.Platform
 import com.x1f4r.legioncontrol.agent.RemoteShell
+import com.x1f4r.legioncontrol.data.DeviceKeyUnavailable
 import com.x1f4r.legioncontrol.data.HostTrustSnapshot
 import com.x1f4r.legioncontrol.data.MachineHints
 import kotlinx.coroutines.CompletableDeferred
@@ -36,6 +37,7 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.security.KeyPairGenerator
+import java.security.KeyStoreException
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 
@@ -87,8 +89,12 @@ class SshTransportTest {
 
     private val clients = Collections.synchronizedList(mutableListOf<FakeClient>())
 
-    private fun transport(capBytes: Int = SshTransport.OUTPUT_CAP_BYTES, client: (Config) -> FakeClient) = SshTransport(
-        keys = { proxy(KeyProvider::class.java) { _, _ -> error("the fake client never asks for the key") } },
+    private fun transport(
+        capBytes: Int = SshTransport.OUTPUT_CAP_BYTES,
+        keys: suspend () -> KeyProvider = { proxy(KeyProvider::class.java) { _, _ -> error("the fake client never asks for the key") } },
+        client: (Config) -> FakeClient,
+    ) = SshTransport(
+        keys = keys,
         verifierFor = { address -> PinnedHostKeyVerifier({ HostTrustSnapshot(0, emptyList(), emptyList()) }, address) },
         machineName = "Tower",
         newClient = { config -> client(config).also { clients += it } },
@@ -181,6 +187,22 @@ class SshTransportTest {
         val failure = failsWith<AgentFailure.Unreachable> { noSession.run(endpoint, "status", 10_000L) }
         assertEquals(FailureKind.CONNECTION_REFUSED, failure.kind)
         assertEquals(DispatchStage.NOT_STARTED, failure.dispatch)
+    }
+
+    @Test
+    fun `a phone key that could not be read is said so, and nothing reaches the far side`() = runBlocking {
+        // Folded into the generic translation, this read as a machine that did not answer.
+        var authenticated = false
+        val ssh = transport(
+            keys = { throw DeviceKeyUnavailable(KeyStoreException("keystore is not ready")) },
+        ) { config -> FakeClient(config, onAuthenticate = { authenticated = true }) }
+
+        val failure = failsWith<AgentFailure.KeyUnavailable> { ssh.run(endpoint, "status", 10_000L) }
+        assertEquals(DispatchStage.NOT_STARTED, failure.dispatch)
+        assertEquals(FailureKind.LAUNCH_FAILED, failure.kind)
+        assertEquals("keystore is not ready", failure.detail)
+        assertFalse(authenticated)
+        assertTrue("the connection that was opened is closed", clients.single().closedOn.isNotEmpty())
     }
 
     @Test
