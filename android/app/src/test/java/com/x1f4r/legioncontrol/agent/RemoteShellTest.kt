@@ -4,6 +4,7 @@ import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.EndpointConfig
 import com.x1f4r.legioncontrol.data.MachineConfig
 import com.x1f4r.legioncontrol.data.SystemConfig
+import com.x1f4r.legioncontrol.ui.withShell
 import com.x1f4r.legioncontrol.ui.withWindowsShell
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -81,6 +82,12 @@ class RemoteShellTest {
         assertEquals(powershell, powershell.withWindowsShell())
         val linux = system("id" to "linux", "platform" to "linux")
         assertEquals(linux, linux.withWindowsShell())
+
+        // Choosing a shell goes through the same rule, so unsetting one on Windows writes cmd rather
+        // than saving a Windows system with no shell. Anywhere else, unset is unset.
+        assertEquals(system("id" to "windows", "platform" to "windows", "shell" to "cmd"), powershell.withShell(null))
+        assertEquals(powershell, system("id" to "windows", "platform" to "windows").withShell("powershell"))
+        assertEquals(linux, system("id" to "linux", "platform" to "linux", "shell" to "posix").withShell(null))
     }
 
     @Test

@@ -221,7 +221,7 @@ class SetupEditorModel(
         }
 
     fun setSystemShell(machineId: String, systemId: String, shell: String?) =
-        editSystem(machineId, systemId) { it.withText("shell", shell) }
+        editSystem(machineId, systemId) { it.withShell(shell) }
 
     fun setSystemRestricted(machineId: String, systemId: String, restricted: Boolean) =
         editSystem(machineId, systemId) { system ->
@@ -378,3 +378,11 @@ internal fun JsonObject.withWindowsShell(): JsonObject =
     } else {
         this
     }
+
+/**
+ * A system with its `shell` set to [shell], or taken out when it is null.
+ *
+ * Taking it out of a Windows system writes cmd instead, by the same rule: a Windows system this
+ * editor changes is never saved without a shell.
+ */
+internal fun JsonObject.withShell(shell: String?): JsonObject = withText("shell", shell).withWindowsShell()

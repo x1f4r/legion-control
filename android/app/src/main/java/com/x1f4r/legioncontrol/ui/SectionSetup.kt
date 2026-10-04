@@ -313,10 +313,14 @@ private fun SystemsEditor(app: AppModel, machine: MachineConfig) {
                             emphasis = system.shell == shell,
                         ) { editor.setSystemShell(machine.id, system.id, shell) }
                     }
-                    PlainAction(
-                        label = "unset",
-                        enabled = system.shell != null,
-                    ) { editor.setSystemShell(machine.id, system.id, null) }
+                    // A Windows system is always saved with a shell (contract section 15.1), so
+                    // unsetting one would only write cmd, which has its own action.
+                    if (system.platform != "windows") {
+                        PlainAction(
+                            label = "unset",
+                            enabled = system.shell != null,
+                        ) { editor.setSystemShell(machine.id, system.id, null) }
+                    }
                 }
                 QuietText(
                     when (RemoteShell.fromWire(system.shell)) {
