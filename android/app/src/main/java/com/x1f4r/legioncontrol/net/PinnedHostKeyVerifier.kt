@@ -1,6 +1,8 @@
 package com.x1f4r.legioncontrol.net
 
+import com.x1f4r.legioncontrol.agent.Addresses
 import com.x1f4r.legioncontrol.data.HostKeyStore
+import com.x1f4r.legioncontrol.data.HostTrustSnapshot
 import net.schmizz.sshj.common.Buffer
 import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import java.security.PublicKey
@@ -23,11 +25,19 @@ import java.util.Base64
  * A mismatch is recorded rather than thrown, because sshj wants a boolean here and turns a false into
  * a transport exception of its own. The caller reads [mismatch] afterwards to tell that failure apart
  * from every other reason a connection can go wrong.
+ *
+ * Only an address built from a host and port that passed the dial grammar is ever keyed. The
+ * transport refuses to dial anything else, so this never sees one; if it did, it would refuse the
+ * key without recording a mismatch, which is what keeps a host string nobody checked from being
+ * offered for approval and pinned.
  */
 class PinnedHostKeyVerifier(
-    private val store: HostKeyStore,
+    /** What is trusted for an address right now. Read at the moment of the handshake. */
+    private val trust: (address: String) -> HostTrustSnapshot,
     private val address: String,
 ) : HostKeyVerifier {
+
+    constructor(store: HostKeyStore, address: String) : this(store::snapshot, address)
 
     data class Mismatch(
         val address: String,
@@ -46,12 +56,15 @@ class PinnedHostKeyVerifier(
         private set
 
     override fun verify(hostname: String, port: Int, key: PublicKey): Boolean {
+        if (!Addresses.isPinnable(address)) return false
+
         // The wire encoding, not the JCE encoding: it is what ssh itself hashes, so the fingerprint
         // this produces is the one ssh-keygen -lf prints for the same host key.
         val offered = Base64.getEncoder()
             .encodeToString(Buffer.PlainBuffer().putPublicKey(key).compactData)
 
-        return when (val decision = decideHostKey(store.trusted(address), offered, canApprove = store.snapshot(address).canApprove)) {
+        val snapshot = trust(address)
+        return when (val decision = decideHostKey(snapshot.trusted, offered, canApprove = snapshot.canApprove)) {
             HostKeyDecision.Trusted -> true
             is HostKeyDecision.Refused -> {
                 mismatch = Mismatch(
@@ -69,7 +82,7 @@ class PinnedHostKeyVerifier(
 
     /** Prefer already approved algorithms so algorithm negotiation cannot consume another OS group. */
     override fun findExistingAlgorithms(hostname: String, port: Int): List<String> =
-        store.trusted(address).mapNotNull { runCatching { com.x1f4r.legioncontrol.data.HostIdentityKey.fromBlob(it).algorithm }.getOrNull() }.distinct()
+        trust(address).trusted.mapNotNull { runCatching { com.x1f4r.legioncontrol.data.HostIdentityKey.fromBlob(it).algorithm }.getOrNull() }.distinct()
 
 }
 

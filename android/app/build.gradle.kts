@@ -161,6 +161,12 @@ dependencies {
     runtimeOnly(libs.slf4j.android)
 }
 
+// The logcat binding reaches for android.util.Log, which a JVM unit test does not have, and sshj
+// then cannot initialise at all. Unit tests run sshj without it: slf4j falls back to a no-op.
+configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configureEach {
+    exclude(group = "uk.uuid.slf4j", module = "slf4j-android")
+}
+
 // Shared contract and signature fixtures are test inputs even though they live outside Android.
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     inputs.files(rootProject.fileTree("../contract/fixtures") { include("*.json") })
