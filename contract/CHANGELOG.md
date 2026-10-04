@@ -129,6 +129,56 @@ not, the agent now answers as they say.
   while section 12 accepts its bytes. `wake.helper` is a helper even beside an
   empty `wake.helpers`, where `validate.mjs` used to skip it, so the alias is
   held to `helper-self`, `helper-unknown` and `helper-cycle`.
+- **Client rules for setup sync, acceptance and merge are normative** (sections
+  9.5–9.8), with one reference, `contract/tools/setup-sync.mjs`, and the
+  `setup-reconcile` and `setup-merge` vectors. A status is decided by eleven
+  ordered rules, and automatic writes follow strict descent only. Fetched bytes
+  are adopted only when they hash to what the decision expected, and only as a
+  compare-and-swap against the head the decision was made from, so an edit saved
+  during the read is never overwritten; Take theirs, Keep mine and Merge do the
+  same. One setup request per machine at a time, a 60 s back-off per applied
+  hash, no push during a running mutation, and a push refused with `restricted`
+  or `config-invalid` is held until the hash changes or a person asks. A merge
+  goes entry by entry: it asks about a deletion against an edit, keeps endpoints
+  without an id and unknown keys, inserts what theirs added after its
+  predecessor, and never rewrites a number.
+- **A client older than its agent** keeps using the highest contract it
+  implements and says so once (section 1, rule 9). Nothing on the wire changes.
+- **Sites and wake are normative** (sections 10.1 and 10.2), with one
+  reference, `contract/tools/wake-plan.mjs`, and the `wake` vectors. None of the
+  rules below changes the wire or adds a document key.
+- **LAN prefixes** are dotted (one to three octets and an optional trailing dot)
+  or CIDR (`/8` to `/32`, no host bits), matched on octet or bit boundaries, so
+  `192.168.1` no longer holds 192.168.10.7. Anything else never matches and is a
+  warning.
+- **Placement** counts only addresses on broadcast-capable interfaces; on
+  Android never a VPN network or one blocked for the app. `currentSite` counts
+  only while one of its site's prefixes matches or the site has none. Exactly one
+  matching site is effective; several are ambiguous and none is picked.
+- **Direct wake** sends to `wake.broadcast`, else the site's `broadcast`, else
+  the directed broadcast of the placing address when its prefix length is known
+  and at most 30, else 255.255.255.255. Only dotted IPv4 counts and names are
+  never resolved. Ports are 1–65535, else 9 and 7, and every address and port
+  gets three packets.
+- **Readiness** is the authenticated status poll, first at 5 s and then at
+  intervals growing 1.6× to at most 20 s, for 120 s after each send. A step that
+  sent nothing does not wait.
+- **Helpers** are walked as `helpers`, else `[helper]`, and an entry is skipped
+  as `missing`, `self`, `duplicate`, `asleep`, `unusable`, `no-action` or
+  `held`, checked in that order. After `ran` the client waits for the target
+  and moves on only if it does not answer.
+- **Wake holds.** A helper action not declared `wol` that ends ambiguously
+  becomes a hold on its target, kept in this device's operation history with
+  `wakeTarget`. While a hold exists no non-`wol` helper runs for that target. It
+  is released only by a finished record, an answer that the operation is
+  unknown, the target answering, the helper leaving the setup, or a person
+  choosing to try the other helpers.
+- **Helpers are never woken automatically.** "Wake it first" is offered only for
+  a helper skipped as asleep that has a wake block of its own.
+- **Android** tracks every network that is not a VPN, with an address book per
+  network, and sends magic packets from the network holding the placing
+  address. The off-contract wake verb probe, the TCP readiness probe and the
+  unused readiness helpers are gone; no 1.4 client reads `wake.probe.host`.
 
 ### Conformance
 
@@ -153,6 +203,8 @@ not, the agent now answers as they say.
   upgrade a 2.x agent from a locally verified archive. The Mac and Android
   copies are compared with them byte for byte; `install.cjs` checks the upload's
   size and SHA-256 before tar reads it.
+- `fixtures/controller-document.wake-defaults.json` is the setup every wake
+  plan vector runs against, `WAKE_DEFAULTS` in `contract/tools/documents.mjs`.
 - `contract/test/transport-shells.test.mjs` runs serialised lines through sh,
   dash, bash, zsh, ksh and fish, and on Windows through cmd.exe, Windows
   PowerShell and pwsh, and checks that node receives exactly the argv. A shell

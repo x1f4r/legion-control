@@ -121,6 +121,7 @@
           "$ref": "#/$defs/text"
         },
         "lanPrefixes": {
+          "description": "IPv4 prefixes, dotted (`192.168.1.`: one to three octets, trailing dot recommended) or CIDR (`192.168.16.0/20`, length 8–32, no host bits). See contract §10.1. Anything else never matches and is reported as a warning.",
           "type": "array",
           "minItems": 1,
           "maxItems": 10,
@@ -130,7 +131,7 @@
           }
         },
         "broadcast": {
-          "description": "Default broadcast addresses for machines at this site.",
+          "description": "Dotted IPv4 broadcast addresses for machines at this site that name none of their own. Other entries are ignored.",
           "type": "array",
           "maxItems": 10,
           "items": {
@@ -153,7 +154,7 @@
           "$ref": "#/$defs/text"
         },
         "site": {
-          "description": "Which site this machine is on. Must name an entry in sites[] when sites[] is present. A machine with no site is unplaced: direct wake falls back to wake.lanPrefix and helpers still work.",
+          "description": "Which site this machine is on. Must name an entry in sites[] when sites[] is non-empty (contract §9.7, unknown-site). A machine that names no site in sites[] is placed by wake.lanPrefix alone, or not at all: then direct wake is impossible and helpers still work (contract §10.1).",
           "$ref": "#/$defs/token"
         },
         "alwaysOn": {
@@ -205,6 +206,7 @@
       "type": "object",
       "properties": {
         "id": {
+          "description": "Unique among the machine's endpoints. Optional, but an endpoint without an id cannot be remembered as a route, is never a duplicate, and merges together with the machine's other id-less endpoints as one entry (contract §9.7, §9.8).",
           "$ref": "#/$defs/token"
         },
         "kind": {
@@ -245,6 +247,7 @@
           "pattern": "^[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}$"
         },
         "broadcast": {
+          "description": "Dotted IPv4 broadcast addresses. When there are none: the site's `broadcast`, then the directed broadcast of the controller's address on that network, then 255.255.255.255 (contract §10.2). Other entries are ignored.",
           "type": "array",
           "maxItems": 10,
           "items": {
@@ -253,6 +256,7 @@
           }
         },
         "ports": {
+          "description": "UDP ports. Entries outside 1–65535 are ignored; none means [9, 7].",
           "type": "array",
           "maxItems": 5,
           "items": {
@@ -262,6 +266,7 @@
           }
         },
         "probe": {
+          "description": "Not used by contract 3 clients: readiness is an authenticated status poll, never a TCP probe. Kept for 1.2 documents.",
           "type": "object",
           "properties": {
             "host": {
@@ -278,7 +283,7 @@
           ]
         },
         "lanPrefix": {
-          "description": "DEPRECATED alias, used only when the machine has no site.",
+          "description": "DEPRECATED alias, used only when the machine names no site in sites[]. Same grammar as sites[].lanPrefixes.",
           "type": "string",
           "minLength": 1
         },
@@ -287,7 +292,7 @@
           "$ref": "#/$defs/helper"
         },
         "helpers": {
-          "description": "Ordered failover. Walked in order; the first helper whose wake action reports `ran` wins. Helpers are never woken automatically: a cascade would quietly turn the always-off tower into an always-on one, which is the thing this design exists to avoid.",
+          "description": "Ordered failover. Walked in order; after a helper reports `ran` the client waits for the target and moves on only if it does not answer. Helpers are never woken automatically: a cascade would quietly turn the always-off tower into an always-on one, which is the thing this design exists to avoid.",
           "type": "array",
           "maxItems": 5,
           "items": {
