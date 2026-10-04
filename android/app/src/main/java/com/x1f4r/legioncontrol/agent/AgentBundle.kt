@@ -182,6 +182,9 @@ sealed interface AgentDeploymentPath {
     data class Unavailable(val reason: String) : AgentDeploymentPath
 
     companion object {
+        /** Why nothing is offered until a machine has answered with an authenticated status. */
+        const val READ_STATUS_FIRST = "Read an authenticated agent status first."
+
         /**
          * The path for a machine, from its last authenticated status and the system that gave it.
          *
@@ -196,7 +199,7 @@ sealed interface AgentDeploymentPath {
             lastStatus: AgentStatus?,
             system: MachineSystem?,
         ): AgentDeploymentPath {
-            if (lastStatus?.ok != true) return Unavailable("Read an authenticated agent status first.")
+            if (lastStatus?.ok != true) return Unavailable(READ_STATUS_FIRST)
             if ((abilities.contract ?: 0) >= Contract.REQUIRED) return Stdin
             if (!AgentBootstrap.isAuthenticatedLegacy(lastStatus)) {
                 return Unavailable(

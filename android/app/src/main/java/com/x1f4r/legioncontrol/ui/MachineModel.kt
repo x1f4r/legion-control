@@ -1205,7 +1205,7 @@ class MachineModel(
      * why when it cannot. The wiring decides again from its own last status before anything is sent.
      */
     val agentDeployment: AgentDeploymentPath
-        get() = AgentDeploymentPath.decide(abilities, status, currentSystem)
+        get() = agentDeploymentFor(machine, abilities, status, link)
 
     fun requestAgentInstall(version: String) {
         if (refuseAgentInstall()) return
@@ -1471,6 +1471,29 @@ fun freshness(checkedAt: Long?, now: Long): String {
             "checked $hours hour${if (hours == 1L) "" else "s"} ago"
         }
     }
+}
+
+/**
+ * How a signed agent would be put on [machine], from the reading on screen.
+ *
+ * The system is read off [status] itself, as the wiring reads it before it sends anything, rather
+ * than off the link, which names none unless it is online. The link only says whether [status] is
+ * still the machine's word. A status that names one of this machine's systems is what puts the
+ * link online, so one that does while the link is anything else is from before a failure: the
+ * machine is not answering now, and that is the reason given, not that its agent never said which
+ * system it is. A status that names no system is current, and that is what it says.
+ */
+internal fun agentDeploymentFor(
+    machine: Machine,
+    abilities: AgentAbilities,
+    status: AgentStatus?,
+    link: LinkState,
+): AgentDeploymentPath {
+    val system = status?.let { machine.resolveSystem(it.systemId, it.systemName, it.osName) }
+    if (system != null && link !is LinkState.Online) {
+        return AgentDeploymentPath.Unavailable(AgentDeploymentPath.READ_STATUS_FIRST)
+    }
+    return AgentDeploymentPath.decide(abilities, status, system)
 }
 
 /**
