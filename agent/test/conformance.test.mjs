@@ -344,43 +344,53 @@ test('update conforms through every ending a fixture service can produce', async
 
 test('a replay says what the operation is doing, and a detached one keeps its shape', async () => {
   await withHome(async (home) => {
-    // An updater that takes a few seconds, so there is time to ask again.
-    const dir = fixtureData(home, { latest: '2.0.0', 'slow-seconds': '3' });
-    writeConfig(home, fixtureConfig(dir, { services: [commandService(dir, { update: call(dir, 'slow') })] }));
-
-    // A run in its own session, still going: the same id answers
-    // already-running, which a client follows exactly as it follows accepted.
+    // An updater held at a gate this test opens, so every question asked while
+    // it runs meets it running, however long each launch of the agent takes.
+    const dir = oneService(home, { initial: { latest: '2.0.0' } });
+    const closeGate = () => writeFixture(dir, 'update-gate', 'closed');
+    const openGate = () => fs.rmSync(path.join(dir, 'update-gate'), { force: true });
     const spawned = 'conform-spawned-0001';
-    const first = invokeLater(home, ['update', '--op', spawned]);
-    await recordReaches(home, spawned, 'running');
-    const running = invoke(home, ['update', '--op', spawned]);
-    assert.equal(running.action, 'already-running');
-    assert.equal(running.reasonCode, 'already-running');
-    assert.equal(running.replayed, true);
-    assert.equal(running.detached, false);
-    assert.equal(running.outcome, 'pending');
-    await first;
-
     const detached = 'conform-detached-0001';
-    const accepted = invoke(home, ['update', '--detach', '--op', detached]);
-    assert.equal(accepted.action, 'accepted');
-    assert.equal(accepted.outcome, 'pending');
-    assert.equal(accepted.service, 'demo');
-    assert.ok('from' in accepted && 'to' in accepted, '--detach answers in the update shape');
-    assert.notEqual(accepted.op.phase, null, 'a record that has not reached a phase yet is in its first');
 
-    const again = invoke(home, ['update', '--detach', '--op', detached]);
-    assert.equal(again.action, 'already-running');
-    assert.equal(again.detached, true);
-    assert.equal(invoke(home, ['update', '--op', detached]).action, 'already-running');
-    assert.equal(invoke(home, ['op', detached]).op.outcome, 'pending');
+    try {
+      // A run in its own session, still going: the same id answers
+      // already-running, which a client follows exactly as it follows accepted.
+      closeGate();
+      const first = invokeLater(home, ['update', '--op', spawned]);
+      await recordReaches(home, spawned, 'running');
+      const running = invoke(home, ['update', '--op', spawned]);
+      assert.equal(running.action, 'already-running');
+      assert.equal(running.reasonCode, 'already-running');
+      assert.equal(running.replayed, true);
+      assert.equal(running.detached, false);
+      assert.equal(running.outcome, 'pending');
+      openGate();
+      assert.equal((await first).action, 'updated');
 
-    const cancel = invoke(home, ['cancel', detached]);
-    assert.equal(cancel.action, 'conflict');
-    assert.equal(cancel.reasonCode, 'already-running');
+      writeFixture(dir, 'latest', '3.0.0');
+      closeGate();
+      const accepted = invoke(home, ['update', '--detach', '--op', detached]);
+      assert.equal(accepted.action, 'accepted');
+      assert.equal(accepted.outcome, 'pending');
+      assert.equal(accepted.service, 'demo');
+      assert.ok('from' in accepted && 'to' in accepted, '--detach answers in the update shape');
+      assert.notEqual(accepted.op.phase, null, 'a record that has not reached a phase yet is in its first');
+
+      const again = invoke(home, ['update', '--detach', '--op', detached]);
+      assert.equal(again.action, 'already-running');
+      assert.equal(again.detached, true);
+      assert.equal(invoke(home, ['update', '--op', detached]).action, 'already-running');
+      assert.equal(invoke(home, ['op', detached]).op.outcome, 'pending');
+
+      const cancel = invoke(home, ['cancel', detached]);
+      assert.equal(cancel.action, 'conflict');
+      assert.equal(cancel.reasonCode, 'already-running');
+    } finally {
+      openGate();
+    }
 
     const waited = untilFinished(home, detached);
-    assert.notEqual(waited.op.outcome, 'pending');
+    assert.equal(waited.op.outcome, 'succeeded');
     assert.equal(waited.op.outcome, waited.op.result.outcome);
     const finished = invoke(home, ['update', '--detach', '--op', detached]);
     assert.equal(finished.replayed, true);
