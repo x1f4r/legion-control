@@ -343,6 +343,38 @@ test('once origin has the tag, --resume only publishes, from the tag, whatever m
   assert.equal(originGit('rev-parse', 'refs/tags/v1.4.0^{commit}'), tagged);
 });
 
+test('--resume says when dist/ no longer holds the release, and how to go on from there', mac, (t) => {
+  // Nothing of it public yet: the tag and the bump commit go, and it is cut again.
+  const unpushed = releaseCheckout(t);
+  unpushed.gh.set(state => ({ ...state, fail: { create: 'before' } }));
+  assert.equal(unpushed.release('1.4.0', '--notes', unpushed.notes).status, 1);
+  unpushed.gh.set(state => ({ ...state, fail: {} }));
+  fs.rmSync(path.join(unpushed.repo, 'dist'), { recursive: true });
+  const cleared = unpushed.release('1.4.0', '--resume', '--notes', unpushed.notes);
+  assert.equal(cleared.status, 1);
+  assert.match(cleared.stderr, /dist\/ no longer holds Legion-Control-macos-arm64\.zip .*legionctl-agent-3\.1\.0\.tgz .*, built for v1\.4\.0, and --resume builds nothing\. Nothing of v1\.4\.0 is public yet, so cut it again: git tag -d v1\.4\.0, git reset --hard origin\/main to drop the bump commit, then \.\/scripts\/release\.sh 1\.4\.0\./);
+  assert.doesNotMatch(cleared.stderr, /left no notes|ditto|is tagged here and not out yet/);
+  assert.deepEqual(unpushed.happened(), []);
+  // Which is a way that works.
+  unpushed.git('tag', '-d', 'v1.4.0');
+  unpushed.git('reset', '-q', '--hard', 'origin/main');
+  const again = unpushed.release('1.4.0', '--notes', unpushed.notes);
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(unpushed.gh.get().releases.find(entry => entry.tagName === 'v1.4.0').isDraft, false);
+
+  // Once origin has the tag, the version is taken, and what is gone has to be built again.
+  const pushed = releaseCheckout(t);
+  pushed.gh.set(state => ({ ...state, fail: { publish: true } }));
+  assert.equal(pushed.release('1.4.0', '--notes', pushed.notes).status, 1);
+  pushed.gh.set(state => ({ ...state, fail: {} }));
+  fs.rmSync(path.join(pushed.repo, 'dist', 'Legion-Control-android-arm64.apk'));
+  const lost = pushed.release('1.4.0', '--resume');
+  assert.equal(lost.status, 1);
+  assert.match(lost.stderr, /dist\/ no longer holds Legion-Control-android-arm64\.apk, built for v1\.4\.0, and --resume builds nothing\. origin has v1\.4\.0 already, so the version cannot be cut again: build them at v1\.4\.0 by hand into dist\//);
+  assert.doesNotMatch(lost.stderr, /git tag -d|gh release delete/);
+  assert.deepEqual(pushed.happened(), []);
+});
+
 test('--resume refuses what it cannot finish, without sending anyone round to --resume again', mac, (t) => {
   const { repo, git, originGit, release, happened } = releaseCheckout(t);
   const refused = (args, message) => {

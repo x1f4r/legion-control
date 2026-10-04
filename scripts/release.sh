@@ -204,6 +204,16 @@ PUBLISHED=0
 # version is taken whatever happens to the release: the only way left is to finish it.
 PUSHED=0
 
+# Every asset of the release: what the builds leave in dist/, then the release manifest signed over
+# them, which is the one part --resume makes again.
+release_assets() {
+	AGENT_VERSION="$(node -p 'JSON.parse(require("node:fs").readFileSync("agent/package.json", "utf8")).version')"
+	AGENT_ARCHIVE="$DIST/legionctl-agent-$AGENT_VERSION.tgz"
+	BUILT=("$MAC_ZIP" "$ANDROID_APK" "$LINUX_ARCHIVE" "$LINUX_ARM_ARCHIVE" "$WINDOWS_ARCHIVE" "$AGENT_ARCHIVE"
+		"$DIST/Legion-Control-agent-manifest.json" "$DIST/Legion-Control-agent-manifest.json.sig")
+	ASSETS=("${BUILT[@]}" "$DIST/Legion-Control-manifest.json" "$DIST/Legion-Control-manifest.json.sig")
+}
+
 draft_holds_everything() {
 	local view
 	view="$(gh release view "$TAG" --json assets)" || { DRAFT_SAYS="gh could not read the draft release $TAG."; return 1; }
@@ -211,11 +221,7 @@ draft_holds_everything() {
 }
 
 publish() {
-	AGENT_VERSION="$(node -p 'JSON.parse(require("node:fs").readFileSync("agent/package.json", "utf8")).version')"
-	AGENT_ARCHIVE="$DIST/legionctl-agent-$AGENT_VERSION.tgz"
-	ASSETS=("$MAC_ZIP" "$ANDROID_APK" "$LINUX_ARCHIVE" "$LINUX_ARM_ARCHIVE" "$WINDOWS_ARCHIVE" "$AGENT_ARCHIVE"
-		"$DIST/Legion-Control-manifest.json" "$DIST/Legion-Control-manifest.json.sig"
-		"$DIST/Legion-Control-agent-manifest.json" "$DIST/Legion-Control-agent-manifest.json.sig")
+	release_assets
 
 	step "Putting every asset on a draft release"
 	if [ "$STATE" = "none" ]; then
@@ -346,6 +352,30 @@ if [ "$RESUME" -eq 1 ]; then
 		say "$TAG is at $RELEASE_COMMIT, and GitHub has a draft of it."
 	else
 		say "$TAG is at $RELEASE_COMMIT, and GitHub has no release of it yet."
+	fi
+
+	# The artifacts are in dist/ until something clears it: another run of this script, a dry run of
+	# another version included, or a git clean. Asked before the notes, which would be no use then.
+	release_assets
+	MISSING=()
+	for asset in "${BUILT[@]}"; do
+		[ -s "$asset" ] || MISSING+=("$(basename "$asset")")
+	done
+	if [ "${#MISSING[@]}" -gt 0 ]; then
+		GONE="dist/ no longer holds ${MISSING[*]}, built for $TAG, and --resume builds nothing."
+		[ "$PUSHED" -eq 0 ] \
+			|| die "$GONE origin has $TAG already, so the version cannot be cut again: build them at $TAG by hand into dist/, the way the Build section of scripts/release.sh does, then run this again."
+		# Nothing of it is public, so it is cut again from where it started: the tag goes, the draft
+		# if there is one, and the bump commit if the run made one, which is the one commit HEAD can
+		# be ahead of origin/main by here.
+		AGAIN="git tag -d $TAG"
+		[ "$STATE" = "none" ] || AGAIN="$AGAIN, gh release delete $TAG"
+		if [ "$AHEAD" -eq 1 ]; then
+			AGAIN="$AGAIN, git reset --hard origin/main to drop the bump commit, then ./scripts/release.sh $VERSION"
+		else
+			AGAIN="$AGAIN, then ./scripts/release.sh $VERSION --tag-head"
+		fi
+		die "$GONE Nothing of $TAG is public yet, so cut it again: $AGAIN."
 	fi
 
 	if [ "$STATE" = "none" ]; then
