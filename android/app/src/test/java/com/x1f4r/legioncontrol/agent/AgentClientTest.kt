@@ -397,6 +397,17 @@ class AgentClientTest {
     }
 
     @Test
+    fun `an object the other clients cannot parse is not a reply, however kindly the decoder reads it`() = runBlocking {
+        // kotlinx parsed the bare word, and the lenient decoder read it as the string "restarted",
+        // so this came back as a restart that had worked. The other clients call it unreadable.
+        val transport = FakeTransport { CommandOutcome(0, """{"ok":true,"contract":3,"action":restarted}""", "") }
+        val (agent, _) = client(machine(), transport)
+        val failure = failsWith<AgentFailure.BadOutput> { agent.restart("t3") }
+        assertEquals(DispatchStage.AMBIGUOUS, failure.dispatch)
+        assertEquals(1, transport.sent.size)
+    }
+
+    @Test
     fun `a reply wins even when it arrived as the watchdog fired`() = runBlocking {
         val transport = FakeTransport { CommandOutcome(null, accepted.stdout, "", timedOut = true) }
         val (agent, _) = client(machine(), transport)

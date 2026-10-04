@@ -2,7 +2,10 @@ package com.x1f4r.legioncontrol.agent
 
 import com.x1f4r.legioncontrol.net.CommandOutcome
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * Why one attempt did not end in a reply, in the contract's own words (section 15.4).
@@ -109,14 +112,69 @@ object AttemptClassifier {
      * The reply in stdout: from its first `{` to its last `}`, when that parses as a JSON object.
      * Windows PowerShell can put a `#< CLIXML` banner in front of anything a native program prints,
      * and a login script can print a line or two; the slice is what survives both.
+     *
+     * "Parses" means what `JSON.parse` takes, because that is what the reference and the other
+     * clients read the slice with. kotlinx is strict about structure and not about everything else:
+     * it reads a bare word where a value goes as a literal of that spelling, so `{"ok":tru}` and
+     * `{"a":01}` parse, and it keeps a control character left raw inside a string. Both are held
+     * to the JSON rule here, before and after the parse, so that output the other clients call
+     * unreadable is not a reply on this one, and a lenient decoder never gets to make a success of it.
      */
     fun jsonObjectSlice(stdout: String): JsonObject? {
         val text = sliceJsonObject(stdout) ?: return null
-        return try {
+        if (!scansAsJsonText(text)) return null
+        val parsed = try {
             StrictJson.parseToJsonElement(text) as? JsonObject
         } catch (_: Exception) {
             null
         }
+        return parsed?.takeIf(::holdsOnlyJsonValues)
+    }
+
+    /**
+     * What a scan of the raw text can tell that the parse cannot: no control character is left raw
+     * inside a string, and nothing is nested deeper than [MAX_NESTING].
+     *
+     * The first is a rule of JSON text that kotlinx does not keep, and the parsed string cannot show
+     * it any more, because an escaped newline and a raw one read back the same. The second is this
+     * app's own limit, and the one place it reads differently from the reference: kotlinx reads
+     * arrays by recursion and runs out of stack on nesting a far side is free to print, which is an
+     * error no catch here would see. No reply the agent writes comes near it.
+     *
+     * Quotes are told apart the way kotlinx tells them apart, so the depth counted here is the depth
+     * the parse would reach.
+     */
+    private fun scansAsJsonText(text: String): Boolean {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (char in text) {
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    char == '\\' -> escaped = true
+                    char == '"' -> inString = false
+                    char < ' ' -> return false
+                }
+            } else {
+                when (char) {
+                    '"' -> inString = true
+                    '{', '[' -> if (++depth > MAX_NESTING) return false
+                    '}', ']' -> depth--
+                }
+            }
+        }
+        return true
+    }
+
+    /**
+     * Whether every value that is not a string is one JSON has: `true`, `false`, `null`, or a number
+     * as RFC 8259 writes it. Recursive, which the depth limit above makes safe.
+     */
+    private fun holdsOnlyJsonValues(element: JsonElement): Boolean = when (element) {
+        is JsonObject -> element.values.all(::holdsOnlyJsonValues)
+        is JsonArray -> element.all(::holdsOnlyJsonValues)
+        is JsonPrimitive -> element.isString || element.content in JSON_WORDS || JSON_NUMBER.matches(element.content)
     }
 
     /** Exit statuses only a shell that could not start the command produces. The agent exits 0 or 1. */
@@ -127,8 +185,21 @@ object AttemptClassifier {
     private val INTERPRETER_MISSING_MARKERS =
         listOf("is not recognized as", "commandnotfoundexception", "cannot find the path specified")
 
-    /** Plain JSON, the way the reference parses the slice. The decoders are lenient; this is not. */
+    /**
+     * The default configuration, which refuses unquoted keys, comments and trailing commas. The
+     * decoders are lenient about all of those; this is not. What it lets through is checked by hand
+     * in [jsonObjectSlice].
+     */
     private val StrictJson = Json
+
+    /** The only bare words JSON has. */
+    private val JSON_WORDS = setOf("true", "false", "null")
+
+    /** A JSON number: no leading zero, no bare point, no sign but a leading minus, no NaN or Infinity. */
+    private val JSON_NUMBER = Regex("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")
+
+    /** Deeper than any reply the agent writes by far, and shallow enough for kotlinx's recursion. */
+    private const val MAX_NESTING = 512
 
     /** ASCII case folding only, so no locale and no other alphabet can make a marker match. */
     private fun String.asciiLowercase(): String =
