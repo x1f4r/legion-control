@@ -583,6 +583,17 @@ export function storeController(input, { id = null, revision = null, source = nu
   if (raw.length > MAX_CONTROLLER_BYTES) return failed(`the document is larger than ${MAX_CONTROLLER_BYTES} bytes`);
   if (!isValidUtf8(raw)) return failed('the document is not valid UTF-8');
 
+  // The limit is on the bytes this machine would hold and serve, and those are
+  // the canonical bytes. Canonical form adds the final newline a sender may
+  // have left out, so a document sent at exactly the limit can come out one
+  // byte over it, and a commit whose metadata claims more than the limit is
+  // one no reader accepts: it stayed behind, and every later read and push
+  // answered internal until somebody deleted it by hand.
+  const body = canonicalBytes(raw);
+  if (body.length > MAX_CONTROLLER_BYTES) {
+    return failed(`the document is larger than ${MAX_CONTROLLER_BYTES} bytes once it ends in a single newline (contract section 12)`);
+  }
+
   let parsed;
   try {
     parsed = JSON.parse(raw.toString('utf8'));
@@ -626,7 +637,6 @@ export function storeController(input, { id = null, revision = null, source = nu
   const effectiveRevision = revision ?? block.revision;
   const lineage = block.lineage;
 
-  const body = canonicalBytes(raw);
   const hash = crypto.createHash('sha256').update(body).digest('hex');
   // Publication already owns the operation mutex. Complete an earlier committed
   // transaction before judging ancestry, but never do that from a read path.

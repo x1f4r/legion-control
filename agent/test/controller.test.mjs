@@ -5,7 +5,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { canonicalBytes, canonicalHash, judgeIncoming, readControllerBlock, readController, readControllerMeta, storeController } from '../src/controller.mjs';
+import {
+  MAX_CONTROLLER_BYTES, canonicalBytes, canonicalHash, judgeIncoming, readControllerBlock, readController, readControllerMeta, storeController,
+} from '../src/controller.mjs';
 import { REPO, fresh, withHome } from './helpers.mjs';
 
 const vectors = JSON.parse(fs.readFileSync(path.join(REPO, 'contract', 'hash-vectors.json'), 'utf8'));
@@ -184,6 +186,37 @@ test('a setup file larger than the agent ever stores is not served', async () =>
     assert.match(oversized.error, /larger than 1048576 bytes/);
     // Nothing anybody depends on is held, so a push may still replace it.
     assert.equal(storeController(document('setup-a', 1, 'alpha'), { id: 'setup-a', revision: 1 }).ok, true);
+  });
+});
+
+test('the size limit is on the canonical bytes, so a document it would push over is refused before anything is staged', async () => {
+  await withHome(async (home) => {
+    // Exactly 1 MiB as sent, with no final newline: canonical form adds one,
+    // and the bytes this machine would hold are one over the limit. Storing
+    // them left a commit journal no reader accepts, and every later `config`
+    // and `config set` answered internal until somebody deleted it by hand.
+    const sized = (length) => {
+      const opening = '{"version": 1, "machines": [], "notes": "';
+      return `${opening}${'x'.repeat(length - opening.length - 2)}"}`;
+    };
+    const atLimit = sized(MAX_CONTROLLER_BYTES);
+    assert.equal(Buffer.byteLength(atLimit), MAX_CONTROLLER_BYTES);
+
+    const refused = storeController(atLimit);
+    assert.equal(refused.ok, false);
+    assert.equal(refused.reasonCode, 'bad-argument');
+    assert.match(refused.error, /larger than 1048576 bytes/);
+    for (const name of ['controller.json', 'controller.json.staged', 'controller.commit.json', 'controller.meta.json']) {
+      assert.equal(fs.existsSync(path.join(home, name)), false, `${name} was written for a refused document`);
+    }
+    assert.equal(readController().consistent, true);
+
+    // One byte shorter, it fits with its newline, and is stored and served.
+    const fits = sized(MAX_CONTROLLER_BYTES - 1);
+    const stored = storeController(fits);
+    assert.equal(stored.ok, true, stored.error);
+    assert.equal(stored.bytes, MAX_CONTROLLER_BYTES);
+    assert.equal(readController().text, `${fits}\n`);
   });
 });
 
