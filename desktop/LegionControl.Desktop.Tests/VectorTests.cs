@@ -82,10 +82,12 @@ public class VectorTests
             ["transport/hosts"] = input =>
             {
                 var form = Addresses.HostForm(Text(input["value"]));
+                if (Dialled("host", input["value"]) != form is not null)
+                    throw new InvalidOperationException($"the dialler and the host grammar disagree about {input["value"]!.ToJsonString()}");
                 return new JsonObject { ["valid"] = form is not null, ["form"] = form };
             },
-            ["transport/users"] = input => Valid(Addresses.IsUser(Text(input["value"]))),
-            ["transport/ports"] = input => Valid(Addresses.IsPort(JsonSerializer.SerializeToElement(input["value"]))),
+            ["transport/users"] = input => Valid(Dialled("user", input["value"])),
+            ["transport/ports"] = input => Valid(Dialled("port", input["value"])),
         };
 
     public static TheoryData<string> Groups()
@@ -164,6 +166,22 @@ public class VectorTests
     private static string? Text(JsonNode? node) => node?.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() : null;
 
     private static JsonNode Valid(bool valid) => new JsonObject { ["valid"] = valid };
+
+    /// Whether this app dials an address that is good in every field but [field], read out of a
+    /// document the way the app reads one: as an endpoint, and as the deprecated `ssh` block. The
+    /// two have to agree. A grammar check the dialler never asks would pass these vectors while
+    /// the value went to ssh anyway, so the value goes through the reader and the refusal that ship.
+    private static bool Dialled(string field, JsonNode? value)
+    {
+        var holder = new JsonObject { ["host"] = "tower.example", [field] = value?.DeepClone() };
+        var machine = new JsonObject { ["id"] = "tower", ["endpoints"] = new JsonArray(holder.DeepClone()) };
+        var endpoint = Addresses.Refusal(MachineConfig.From(Value.Parse(machine.ToJsonString())).Routes.Single().Target) is null;
+        // A block with no host in it is no target at all, which is never dialled either.
+        var legacy = SshTarget.From(Value.Parse(holder.ToJsonString())) is { } target && Addresses.Refusal(target) is null;
+        if (endpoint != legacy)
+            throw new InvalidOperationException($"an endpoint and the ssh block read {field} {value?.ToJsonString()} differently");
+        return endpoint;
+    }
 
     private static JsonNode Reading(AttemptReading reading) => new JsonObject
     {

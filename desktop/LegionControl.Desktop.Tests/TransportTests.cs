@@ -928,6 +928,46 @@ public class RetryTests
         Assert.Contains("victim.example,*", failure.Detail);
     }
 
+    [Theory]
+    [InlineData("port", "\"22\"")]
+    [InlineData("port", "22.5")]
+    [InlineData("port", "1e10")]
+    [InlineData("port", "null")]
+    [InlineData("user", "42")]
+    [InlineData("user", "true")]
+    [InlineData("user", "\"\"")]
+    [InlineData("host", "true")]
+    public async Task AFieldThatOnlyReadsAsAnAddressOnceCoercedIsNeverDialled(string field, string written)
+    {
+        // The schema refuses every one of these, but a document this device already applies is
+        // kept whatever it holds. Read through the coercing accessors, "22" and 22.5 were the port
+        // 22, 1e10 and null were no port and so the usual one, and 42 was the user "42".
+        using var home = new TempHome();
+        var address = new System.Text.Json.Nodes.JsonObject { ["host"] = "10.0.0.5", ["user"] = "me" };
+        address[field] = System.Text.Json.Nodes.JsonNode.Parse(written);
+        var endpoint = address.DeepClone();
+        endpoint["id"] = "lan";
+        var document = new System.Text.Json.Nodes.JsonObject
+        {
+            ["id"] = "legion",
+            ["endpoints"] = new System.Text.Json.Nodes.JsonArray(endpoint),
+            ["systems"] = System.Text.Json.Nodes.JsonNode.Parse("""[{"id": "linux", "agent": ["node", "/agent.mjs"]}]"""),
+        };
+        var machine = MachineConfig.From(Value.Parse(document.ToJsonString()));
+        var runner = FakeRunner.Replying("""{"ok":true,"contract":3,"action":"restarted"}""");
+        var failure = await Assert.ThrowsAsync<AgentFailure>(() =>
+            new RemoteAgent(machine, runner).MutateAsync(new[] { "restart" }, TimeSpan.FromSeconds(30)));
+        Assert.Equal(FailureKind.BadRequest, failure.Kind);
+        Assert.Equal(Dispatch.Never, failure.Dispatch);
+        Assert.Contains($"The {field} {written} is not", failure.Detail);
+        Assert.Empty(runner.Calls);
+
+        // The deprecated ssh block is read the same way.
+        var legacy = SshTarget.From(Value.Parse(address.ToJsonString()));
+        Assert.NotNull(legacy);
+        Assert.StartsWith($"The {field} {written} is not", Addresses.Refusal(legacy));
+    }
+
     [Fact]
     public async Task AnArgumentTheGrammarCannotCarryIsRefusedAndNothingIsSent()
     {

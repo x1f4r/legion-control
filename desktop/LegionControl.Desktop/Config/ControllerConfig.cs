@@ -325,6 +325,9 @@ public sealed record MachineConfig
                         User = endpoint.User,
                         Port = endpoint.Port,
                         IdentityFile = identity,
+                        UndialableHost = endpoint.UndialableHost,
+                        UndialableUser = endpoint.UndialableUser,
+                        UndialablePort = endpoint.UndialablePort,
                     },
                     endpoint.System,
                     endpoint.Kind ?? "remote"));
@@ -352,6 +355,18 @@ public sealed record SshTarget
     public string? User { get; init; }
     public int? Port { get; init; }
     public string? IdentityFile { get; init; }
+    /// The host, user or port exactly as the document wrote it, when it is not the JSON value
+    /// section 15.6 reads as one at all: a host or a user that is not a string, a port that is not
+    /// an integer from 1 to 65535.
+    ///
+    /// [Value] coerces on the way in, which is right for an agent's reply and wrong for an
+    /// address. It reads the string "22" and 22.5 as the port 22, 1e10 as no port and so the usual
+    /// one, and the number 42 as the user "42". The schema refuses all of these, but a document
+    /// this device already applies is kept whatever it holds, so the dialler cannot rely on that:
+    /// [Addresses.Refusal] refuses a target that carries one, and it is never dialled.
+    public string? UndialableHost { get; init; }
+    public string? UndialableUser { get; init; }
+    public string? UndialablePort { get; init; }
 
     public static SshTarget? From(Value json)
     {
@@ -361,10 +376,23 @@ public sealed record SshTarget
         return new SshTarget
         {
             Host = host,
-            User = json["user"].AsText(),
+            User = json["user"].AsString(),
             Port = json["port"].AsInt(),
             IdentityFile = json["identityFile"].AsText(),
+            UndialableHost = Undialable(json, "host"),
+            UndialableUser = Undialable(json, "user"),
+            UndialablePort = Undialable(json, "port"),
         };
+    }
+
+    /// The JSON written for [field], when the document has the field and it is not a value
+    /// section 15.6 reads as that field; null when it is absent or is one. A string host or user
+    /// is passed on as it stands and judged by [Addresses.Refusal] like any other.
+    public static string? Undialable(Value holder, string field)
+    {
+        if (!holder.IsObject || !holder.Raw.TryGetProperty(field, out var written)) return null;
+        var readable = field == "port" ? Addresses.IsPort(written) : written.ValueKind == System.Text.Json.JsonValueKind.String;
+        return readable ? null : written.GetRawText();
     }
 
     /// `user@host`, or just the host when the document leaves the user to ssh.
@@ -402,6 +430,10 @@ public sealed record EndpointConfig
     /// that says otherwise is still accepted.
     public string? System { get; init; }
     public string? Label { get; init; }
+    /// What [SshTarget.UndialableHost] and its two siblings say, carried onto the route.
+    public string? UndialableHost { get; init; }
+    public string? UndialableUser { get; init; }
+    public string? UndialablePort { get; init; }
 
     public static EndpointConfig From(Value json)
     {
@@ -412,9 +444,12 @@ public sealed record EndpointConfig
             Id = json["id"].AsText() ?? host,
             Kind = json["kind"].AsText(),
             Port = json["port"].AsInt(),
-            User = json["user"].AsText(),
+            User = json["user"].AsString(),
             System = json["system"].AsText(),
             Label = json["label"].AsText(),
+            UndialableHost = SshTarget.Undialable(json, "host"),
+            UndialableUser = SshTarget.Undialable(json, "user"),
+            UndialablePort = SshTarget.Undialable(json, "port"),
         };
     }
 }

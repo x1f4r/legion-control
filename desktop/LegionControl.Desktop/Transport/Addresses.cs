@@ -52,7 +52,8 @@ public static class Addresses
     public static bool IsPort(int? value) => value is >= 1 and <= 65535;
 
     /// The same rule for a port read straight out of a JSON document, where a string "22" or a
-    /// fraction is a different value from the integer 22 and is not a port.
+    /// fraction is a different value from the integer 22 and is not a port. [SshTarget] reads every
+    /// port in a document through this before it is ever dialled.
     public static bool IsPort(JsonElement value)
     {
         if (value.ValueKind != JsonValueKind.Number || !value.TryGetDouble(out var number)) return false;
@@ -62,13 +63,20 @@ public static class Addresses
     /// Why this device will not dial a target, naming the field, or null when it will.
     ///
     /// An absent user is fine: ssh then takes the one its own configuration names. An absent port is
-    /// the usual 22. Everything that is present has to pass.
+    /// the usual 22. Everything that is present has to pass, as the document wrote it: a value
+    /// that only reads as a host, a user or a port once coerced is refused here too.
     public static string? Refusal(SshTarget target)
     {
+        if (target.UndialableHost is { } writtenHost)
+            return $"The host {writtenHost} is not a host name or an IP address this app will dial, so nothing was sent to it.";
         if (!IsHost(target.Host))
             return $"The host \"{target.Host}\" is not a host name or an IP address this app will dial, so nothing was sent to it.";
+        if (target.UndialableUser is { } writtenUser)
+            return $"The user {writtenUser} is not an account name this app will pass to ssh, so nothing was sent to {target.Host}.";
         if (target.User is { } user && !IsUser(user))
             return $"The user \"{user}\" is not an account name this app will pass to ssh, so nothing was sent to {target.Host}.";
+        if (target.UndialablePort is { } writtenPort)
+            return $"The port {writtenPort} is not a TCP port, so nothing was sent to {target.Host}.";
         if (target.Port is { } port && !IsPort(port))
             return $"The port {port} is not a TCP port, so nothing was sent to {target.Host}.";
         return null;
