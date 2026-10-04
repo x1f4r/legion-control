@@ -105,6 +105,24 @@ export const PHASES = {
  */
 export const DISRUPTED_PHASES = new Set(['stopping', 'installing', 'verifying', 'starting', 'rolling-back']);
 
+/**
+ * The phases in which a run may already have changed the machine, whether or
+ * not it can leave a service down. A run that fails for a reason of its own
+ * making in one of these reports its outcome as unknown rather than failed: it
+ * may have restarted, armed, suspended, run or swapped something nobody then
+ * observed, and "failed" would invite a retry of work that may have happened.
+ */
+export const MUTATING_PHASES = new Set([
+  ...DISRUPTED_PHASES,
+  'restarting',
+  'arming',
+  'rebooting',
+  'preparing',
+  'suspending',
+  'running',
+  'swapping',
+]);
+
 /** The action values each kind may report. Supersets of the 2.x values. */
 export const ACTIONS = {
   update: [
@@ -119,14 +137,87 @@ export const ACTIONS = {
     'interrupted',
     'cancelled',
     'expired',
+    'already-running',
   ],
-  restart: ['restarted', 'deferred', 'queued', 'failed', 'accepted', 'conflict', 'interrupted', 'cancelled', 'expired'],
-  boot: ['rebooting', 'rebooted', 'armed', 'noop', 'deferred', 'queued', 'failed', 'conflict', 'cancelled', 'expired'],
-  sleep: ['sleeping', 'slept', 'deferred', 'queued', 'failed', 'conflict', 'cancelled', 'expired'],
-  run: ['ran', 'deferred', 'queued', 'failed', 'accepted', 'conflict', 'interrupted', 'cancelled', 'expired'],
-  cycle: ['cycled', 'skipped', 'failed', 'conflict'],
-  'self-update': ['installed', 'rolled-back', 'noop', 'failed', 'conflict'],
+  restart: ['restarted', 'deferred', 'queued', 'failed', 'accepted', 'conflict', 'interrupted', 'cancelled', 'expired', 'already-running'],
+  boot: ['rebooting', 'rebooted', 'armed', 'noop', 'deferred', 'queued', 'failed', 'conflict', 'cancelled', 'expired', 'already-running'],
+  sleep: ['sleeping', 'slept', 'deferred', 'queued', 'failed', 'conflict', 'cancelled', 'expired', 'already-running'],
+  run: ['ran', 'deferred', 'queued', 'failed', 'accepted', 'conflict', 'interrupted', 'cancelled', 'expired', 'already-running'],
+  cycle: ['cycled', 'skipped', 'failed', 'conflict', 'already-running'],
+  'self-update': ['installed', 'rolled-back', 'noop', 'checked', 'failed', 'conflict', 'accepted', 'already-running'],
 };
+
+// ---------------------------------------------------------------------------
+// Outcome
+// ---------------------------------------------------------------------------
+
+/**
+ * What a client decides on (contract section 5.6). `ok` keeps its older
+ * meanings, which differ between a reply and a record; `outcome` is the one
+ * field that says the same thing everywhere.
+ */
+export const OUTCOMES = ['succeeded', 'failed', 'deferred', 'pending', 'unknown'];
+
+/**
+ * The actions rule 7 answers with `ok: true` and exit 0, whatever the work
+ * itself returned: they are answers about the request, not failures of it.
+ */
+export const OK_REPLY_ACTIONS = new Set(['accepted', 'already-running', 'queued', 'deferred', 'noop', 'conflict']);
+
+const PENDING_ACTIONS = new Set(['accepted', 'already-running', 'queued', 'rebooting', 'sleeping']);
+const SUCCESS_ACTIONS = new Set([
+  'updated', 'restarted', 'ran', 'rebooted', 'slept', 'armed', 'installed',
+  'cycled', 'noop', 'checked', 'skipped', 'stored', 'replaced',
+]);
+const DEFERRED_ACTIONS = new Set(['deferred', 'conflict', 'expired']);
+
+/**
+ * The outcome of a reply, a result, a summary or a cycle child, exactly as the
+ * reducer of section 5.6 gives it. Every client ports the same function, and
+ * contract/vectors/outcome.json is what proves this copy agrees with theirs.
+ *
+ * It never invents optimism: where the fields do not say, the answer is
+ * `unknown`, and `pending` belongs only to work the agent still owns.
+ */
+export function outcomeOf(x) {
+  if (typeof x.outcome === 'string') return OUTCOMES.includes(x.outcome) ? x.outcome : 'unknown';
+  if (x.state === 'queued' || x.state === 'running') return 'pending';
+
+  const { action, reasonCode } = x;
+  if (action === undefined || action === null) {
+    if (x.ok === true) return reasonCode == null ? 'succeeded' : 'unknown';
+    if (x.ok === false) {
+      if (reasonCode === REASON.operationInProgress || reasonCode === REASON.lockHeld) return 'deferred';
+      if (reasonCode === REASON.timedOut || reasonCode === REASON.interrupted || reasonCode === REASON.internal) return 'unknown';
+      return 'failed';
+    }
+    return 'unknown';
+  }
+  if (PENDING_ACTIONS.has(action)) return 'pending';
+  if (SUCCESS_ACTIONS.has(action)) return 'succeeded';
+  if (DEFERRED_ACTIONS.has(action)) return 'deferred';
+  if (action === 'cancelled') return reasonCode === REASON.cancelled ? 'deferred' : 'succeeded';
+  if (action === 'rolled-back') return reasonCode == null ? 'succeeded' : 'failed';
+  if (action === 'interrupted') return 'unknown';
+  if (action === 'failed') return reasonCode === REASON.timedOut || reasonCode === REASON.interrupted ? 'unknown' : 'failed';
+  return 'unknown';
+}
+
+/**
+ * The outcome the agent states for something it produced.
+ *
+ * It is the reducer's answer for the fields beside it, with one exception: a
+ * producer that knows a failed run may have changed the machine marks it
+ * `outcome: 'unknown'`, so no client resends it. Lowering `failed` to
+ * `unknown` is the only move section 5.6 allows, so any other stated value is
+ * recomputed rather than trusted, and the agent can never report something
+ * more optimistic than the function.
+ */
+export function producedOutcome(x) {
+  const { outcome, ...fields } = x;
+  const reduced = outcomeOf(fields);
+  return outcome === 'unknown' && reduced === 'failed' ? 'unknown' : reduced;
+}
 
 // ---------------------------------------------------------------------------
 // The token grammar

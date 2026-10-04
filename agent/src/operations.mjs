@@ -24,7 +24,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { AGENT_VERSION, operationsDir, runArgv } from './config.mjs';
-import { CONTRACT_VERSION, DISRUPTED_PHASES, OPERATION_ID_PATTERN, REASON } from './contract.mjs';
+import { CONTRACT_VERSION, DISRUPTED_PHASES, OPERATION_ID_PATTERN, outcomeOf, PHASES, producedOutcome, REASON } from './contract.mjs';
+import { log } from './log.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
 import { processIsAlive, writeJsonAtomic } from './state.mjs';
 
@@ -202,6 +203,27 @@ export function listOperations({ limit = 30, service = null, kind = null, state 
 }
 
 /**
+ * The phase a record is in. A record opened a moment ago has not reached its
+ * first phase yet, and reporting null there would leave a client with a running
+ * operation it cannot describe, so it reads as the first phase of its kind.
+ */
+function currentPhase(record) {
+  return record.phase ?? (record.state === 'finished' ? 'done' : PHASES[record.kind]?.[0] ?? null);
+}
+
+/**
+ * A record's outcome (contract section 5.6): pending while the agent still owns
+ * the work, and once it has finished, the outcome stored with its result. A
+ * record finished by an agent before 3.1.0 has none stored, and is reduced from
+ * its result the way a client would reduce it.
+ */
+function recordOutcome(record) {
+  if (record.state !== 'finished') return 'pending';
+  const result = record.result !== null && typeof record.result === 'object' ? record.result : {};
+  return typeof result.outcome === 'string' ? producedOutcome(result) : outcomeOf(result);
+}
+
+/**
  * The record as clients see it.
  *
  * The file on disk carries a few things the wire contract does not name — the
@@ -209,9 +231,13 @@ export function listOperations({ limit = 30, service = null, kind = null, state 
  * queued — and those stay internal. Projecting explicitly rather than deleting
  * keys means a field added to the file later cannot leak onto the wire by
  * accident.
+ *
+ * A finished record states its outcome twice, on the record and on its result,
+ * and the two always agree: a client may reduce from either.
  */
 export function wireRecord(record) {
   if (!record) return null;
+  const outcome = recordOutcome(record);
   const wire = {
     id: record.id,
     kind: record.kind,
@@ -225,7 +251,7 @@ export function wireRecord(record) {
       user: record.initiator?.user ?? null,
     },
     state: record.state,
-    phase: record.state === 'finished' ? 'done' : record.phase ?? null,
+    phase: record.state === 'finished' ? 'done' : currentPhase(record),
     progress: record.progress ?? null,
     requestedAt: record.requestedAt ?? null,
     startedAt: record.startedAt ?? null,
@@ -234,7 +260,7 @@ export function wireRecord(record) {
     expiresAt: record.expiresAt ?? null,
     pid: record.pid ?? null,
     detached: record.detached === true,
-    result: record.result ?? null,
+    result: record.result ? (record.state === 'finished' ? { ...record.result, outcome } : record.result) : null,
     log: Array.isArray(record.log) ? record.log : [],
     agentVersion: record.agentVersion ?? AGENT_VERSION,
     systemId: record.systemId ?? null,
@@ -243,6 +269,7 @@ export function wireRecord(record) {
   if (record.to !== undefined && record.to !== null) wire.to = record.to;
   if (Array.isArray(record.children)) wire.children = record.children;
   if (record.replaced) wire.replaced = record.replaced;
+  wire.outcome = outcome;
   return wire;
 }
 
@@ -257,12 +284,13 @@ export function summarize(record) {
     actionId: record.actionId ?? null,
     mode: record.mode ?? null,
     state: record.state,
-    phase: record.phase ?? null,
+    phase: currentPhase(record),
     action: record.result?.action ?? null,
     reasonCode: record.result?.reasonCode ?? null,
     requestedAt: record.requestedAt ?? null,
     updatedAt: record.updatedAt ?? null,
     expiresAt: record.expiresAt ?? null,
+    outcome: recordOutcome(record),
   };
 }
 
@@ -464,6 +492,35 @@ export function finishOperation(id, result, { keepPhase = false } = {}) {
   return withOperationsStore(() => finishOperationUnlocked(id, result, { keepPhase }));
 }
 
+/**
+ * The result a finished record stores, with its outcome.
+ *
+ * A record's `ok` is exactly "it finished without a reason code" (contract
+ * section 5.1), whatever the producer returned: a deferral is not a failure of
+ * the agent, but it is not the plain success `ok: true` promises a reader of
+ * the record either. And a producer that said it failed without saying why is
+ * stored as `internal`, and logged, because "it failed and we will not say
+ * why" is the answer contract 3 exists to remove.
+ */
+function storedResult(record, result) {
+  let reasonCode = result.reasonCode ?? null;
+  if (result.ok === false && reasonCode === null) {
+    log(`operation ${record.id} finished ${result.action ?? 'without an action'} with no reason code; recorded as internal`, record.kind ?? 'operation');
+    reasonCode = REASON.internal;
+  }
+  const stored = {
+    ok: reasonCode === null,
+    action: result.action,
+    reasonCode,
+    message: result.message ?? '',
+    from: result.from ?? record.from ?? null,
+    to: result.to ?? record.to ?? null,
+    exitCode: result.exitCode ?? null,
+    output: result.output ?? null,
+  };
+  return { ...stored, outcome: producedOutcome({ ...stored, outcome: result.outcome }) };
+}
+
 function finishOperationUnlocked(id, result, { keepPhase = false } = {}) {
   return updateOperationUnlocked(id, (record) => ({
     state: 'finished',
@@ -479,16 +536,7 @@ function finishOperationUnlocked(id, result, { keepPhase = false } = {}) {
     finishedAt: nowIso(),
     from: result.from ?? record.from ?? null,
     to: result.to ?? record.to ?? null,
-    result: {
-      ok: result.ok === true,
-      action: result.action,
-      reasonCode: result.reasonCode ?? null,
-      message: result.message ?? '',
-      from: result.from ?? record.from ?? null,
-      to: result.to ?? record.to ?? null,
-      exitCode: result.exitCode ?? null,
-      output: result.output ?? null,
-    },
+    result: storedResult(record, result),
     log: appendLine(record.log, `finished: ${result.action}${result.reasonCode ? ` (${result.reasonCode})` : ''}`),
   }));
 }
@@ -659,12 +707,20 @@ export function expireQueue({ now = Date.now() } = {}) {
   });
 }
 
+/** What an id with no record is: never arrived, or pruned. Never an error about the machine. */
+export function missingOperation(id) {
+  return `no operation ${id} on this machine; it either never arrived or has been pruned`;
+}
+
 /**
  * Cancel an operation.
  *
  * A queued request is simply retired. A running one is NOT killed: there is no
  * safe way to abort an installer from outside it, and pretending otherwise would
  * be the more dangerous lie. It answers `conflict` and says so.
+ *
+ * An id with no record answers `missing` with no action at all, because
+ * nothing was attempted: the caller refuses it in the refusal shape.
  */
 export function cancelOperation(id) {
   return withOperationsStore(() => cancelOperationUnlocked(id));
@@ -673,7 +729,7 @@ export function cancelOperation(id) {
 function cancelOperationUnlocked(id) {
   const record = readOperation(id);
   if (!record) {
-    return { ok: false, action: 'failed', reasonCode: REASON.badArgument, message: `there is no operation ${id}` };
+    return { ok: false, missing: true, reasonCode: REASON.notConfigured, message: missingOperation(id) };
   }
   if (record.state === 'finished') {
     return {
@@ -696,7 +752,7 @@ function cancelOperationUnlocked(id) {
   return {
     ok: false,
     action: 'conflict',
-    reasonCode: REASON.operationInProgress,
+    reasonCode: REASON.alreadyRunning,
     message: `operation ${id} is running (${record.phase ?? 'no phase'}) and cannot be cancelled; a running install is never aborted from outside`,
     op: summarize(record),
   };

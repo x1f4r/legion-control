@@ -311,7 +311,7 @@ test('installed manifest is reported verified only while the signed tree is comp
   } finally { fs.rmSync(isolated.root, { recursive: true, force: true }); }
 });
 
-test('staged signed bootstrap installs the intended base, replays, and conflicts with rollback', async () => {
+test('staged signed bootstrap installs the intended base, replays, and refuses its id for other bytes or a rollback', async () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-bootstrap-'));
   try {
     const pair = signingPair();
@@ -352,13 +352,18 @@ test('staged signed bootstrap installs the intended base, replays, and conflicts
     const changed = spawnSync(process.execPath, [entry, 'self-update', '--install', '--op', 'bootstrap-install-0001'], {
       encoding: 'utf8', cwd: os.tmpdir(), env, timeout: 120_000,
     });
-    assert.equal(JSON.parse(changed.stdout).action, 'conflict');
+    // The id names the install of other bytes, so it is a bad --op: never a
+    // replay and never a conflict to wait out.
+    const reused = JSON.parse(changed.stdout);
+    assert.equal(reused.reasonCode, 'bad-argument');
+    assert.equal(reused.argument, '--op');
 
     const rollback = spawnSync(process.execPath, [path.join(base, 'agent', 'src', 'index.mjs'), 'self-update', '--rollback', '--op', 'bootstrap-install-0001'], {
       encoding: 'utf8', env: { ...env, LEGIONCTL_HOME: base }, timeout: 120_000,
     });
-    const conflict = JSON.parse(rollback.stdout);
-    assert.equal(conflict.action, 'conflict');
+    const refused = JSON.parse(rollback.stdout);
+    assert.equal(refused.reasonCode, 'bad-argument');
+    assert.equal(refused.argument, '--op');
     assert.equal(fs.existsSync(path.join(base, 'agent')), true);
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
@@ -384,7 +389,7 @@ test('rollback refuses a tampered signed previous tree and leaves it retained', 
   }
 });
 
-test('bundle installs bind exact bytes and conflict with a rollback operation in either direction', async () => {
+test('bundle installs bind exact bytes and refuse a rollback id in either direction', async () => {
   const isolated = await isolatedModule();
   const oldHome = process.env.LEGIONCTL_HOME;
   try {
@@ -408,11 +413,12 @@ test('bundle installs bind exact bytes and conflict with a rollback operation in
     assert.equal((await install('bundle-install-0001')).replayed, true);
     fs.appendFileSync(path.join(candidate, 'src', 'index.mjs'), '// another payload\n');
     signTree(candidate, isolated.pair.privateKey);
-    assert.equal((await install('bundle-install-0001', bundleTree(candidate))).action, 'conflict');
-    assert.equal((await isolated.module.runRollback({ system: { id: 'test' } }, { opId: 'bundle-install-0001' })).action, 'conflict');
+    const reusedOp = { command: 'self-update', argument: '--op' };
+    assert.deepEqual((await install('bundle-install-0001', bundleTree(candidate))).refusal, reusedOp);
+    assert.deepEqual((await isolated.module.runRollback({ system: { id: 'test' } }, { opId: 'bundle-install-0001' })).refusal, reusedOp);
     const rollback = await isolated.module.runRollback({ system: { id: 'test' } }, { opId: 'bundle-rollback-0001' });
     assert.equal(rollback.action, 'rolled-back', rollback.message);
-    assert.equal((await install('bundle-rollback-0001')).action, 'conflict');
+    assert.deepEqual((await install('bundle-rollback-0001')).refusal, reusedOp);
     assert.equal(fs.readFileSync(path.join(live, 'src', 'index.mjs'), 'utf8'), `${script}// agent\n`);
   } finally {
     if (oldHome === undefined) delete process.env.LEGIONCTL_HOME; else process.env.LEGIONCTL_HOME = oldHome;

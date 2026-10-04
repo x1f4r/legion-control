@@ -947,9 +947,12 @@ export async function runUpdate(config, service, options = {}) {
         return await runCommandUpdate(config, service, { force, opId, lock });
       } catch (error) {
         if (!(error instanceof ServiceStateError)) throw error;
+        // Once the state was writable the update may have run, so a failure to
+        // record it is no evidence that it did not: the outcome is unknown.
         return {
           ok: false, action: 'failed', reasonCode: REASON.internal, to: installedFor(service),
           message: `${error.message}; ${stateReady ? 'work may have changed the service; its state could not be saved, so completion is not confirmed' : 'no service work was started'}`,
+          ...(stateReady ? { outcome: 'unknown' } : {}),
         };
       }
     },

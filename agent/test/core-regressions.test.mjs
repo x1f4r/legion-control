@@ -36,12 +36,17 @@ test('retrying a running cycle preserves its live record byte for byte', async (
     try {
       const before = fs.readFileSync(operationPath(id), 'utf8');
       const retry = cli(['cycle', '--op', id], { home }).payload;
-      assert.equal(retry.action, 'accepted');
+      assert.equal(retry.action, 'already-running');
+      assert.equal(retry.reasonCode, 'already-running');
+      assert.equal(retry.ok, true);
       assert.equal(retry.replayed, true);
+      assert.equal(retry.detached, false);
+      assert.equal(retry.outcome, 'pending');
       assert.equal(retry.op.state, 'running');
       assert.equal(fs.readFileSync(operationPath(id), 'utf8'), before);
       const changed = cli(['cycle', '--force', '--op', id], { home }).payload;
-      assert.equal(changed.action, 'conflict');
+      assert.equal(changed.reasonCode, 'bad-argument');
+      assert.equal(changed.argument, '--op');
       assert.equal(fs.readFileSync(operationPath(id), 'utf8'), before);
     } finally { held.lock.release(); }
   });
@@ -53,7 +58,9 @@ test('a cycle id binds its selected services', async () => {
     const id = 'cycle-selection-001';
     beginOperation({ id, kind: 'cycle', services: ['a'], systemId: 'test' });
     const before = fs.readFileSync(operationPath(id), 'utf8');
-    assert.equal((await runCycle(config, { opId: id, services: ['b'] })).action, 'conflict');
+    const reused = await runCycle(config, { opId: id, services: ['b'] });
+    assert.equal(reused.reasonCode, 'bad-argument');
+    assert.deepEqual(reused.refusal, { command: 'cycle', argument: '--op' });
     assert.equal(fs.readFileSync(operationPath(id), 'utf8'), before);
   });
 });
@@ -64,7 +71,7 @@ test('queued arm-only boot keeps its intent and never dispatches a reboot', asyn
     const id = 'queued-arm-only-001';
     assert.equal(cli(['boot', 'other', '--when-idle', '--no-reboot', '--op', id], { home }).payload.action, 'queued');
     assert.equal(readOperation(id).noReboot, true);
-    assert.equal(cli(['boot', 'other', '--when-idle', '--op', id], { home }).payload.action, 'conflict');
+    assert.equal(cli(['boot', 'other', '--when-idle', '--op', id], { home }).payload.reasonCode, 'bad-argument');
     assert.equal(cli(['cycle'], { home }).payload.action, 'cycled');
     assert.equal(fs.existsSync(marker), false);
     const record = readOperation(id);
@@ -79,7 +86,7 @@ test('arm-only and ordinary boot cannot reuse an operation id', async () => {
     const id = 'arm-intent-001';
     assert.equal(cli(['boot', 'other', '--no-reboot', '--op', id], { home }).payload.action, 'armed');
     const before = fs.readFileSync(operationPath(id), 'utf8');
-    assert.equal(cli(['boot', 'other', '--op', id], { home }).payload.action, 'conflict');
+    assert.equal(cli(['boot', 'other', '--op', id], { home }).payload.reasonCode, 'bad-argument');
     assert.equal(fs.readFileSync(operationPath(id), 'utf8'), before);
     assert.equal(fs.existsSync(marker), false);
     assert.equal(cli(['boot', 'other', '--no-reboot', '--op', id], { home }).payload.replayed, true);

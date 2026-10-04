@@ -159,12 +159,19 @@ test('the same operation id twice does the work once', async () => {
   );
 });
 
-test('an operation id names one intent; reusing it for another is a conflict', async () => {
+test('an operation id names one intent; reusing it for another is a bad --op, not a conflict', async () => {
   await withService(async ({ home }) => {
     const id = 'bbbbbbbb-2222-4222-8222-222222222222';
     cli(['restart', '--op', id], { home });
     const clash = cli(['update', '--op', id], { home });
-    assert.equal(clash.payload.action, 'conflict');
+    // A conflict tells a client to try the same request later; this one can
+    // never succeed, so it is refused about the argument instead.
+    assert.equal(clash.exitCode, 1);
+    assert.equal(clash.payload.reasonCode, 'bad-argument');
+    assert.equal(clash.payload.action, undefined);
+    assert.equal(clash.payload.command, 'update');
+    assert.equal(clash.payload.argument, '--op');
+    assert.equal(clash.payload.outcome, 'failed');
     assert.match(clash.payload.message, /binds one intent/);
   });
 });

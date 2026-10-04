@@ -69,9 +69,14 @@ export function busyAnswer(evidence, reason, startedAt = undefined) {
   return answer('busy', { busy: true, monitored: true, evidence, reason, startedAt });
 }
 
-/** Declared never busy. Permits action, and nobody is warned about it. */
+/**
+ * Declared never busy. Permits action, and nobody is warned about it. It is an
+ * answer somebody gave, not the absence of one, so it counts as monitored:
+ * `unmonitoredServices` is the number of services that block for want of a
+ * probe, and a declaration is not one of them.
+ */
 export function declaredIdle(startedAt = undefined) {
-  return answer('idle', { busy: false, monitored: false, evidence: 'none', reason: 'declared never busy', startedAt });
+  return answer('idle', { busy: false, monitored: true, evidence: 'none', reason: 'declared never busy', startedAt });
 }
 
 /** Nobody said. Blocks, and says exactly what to write. */

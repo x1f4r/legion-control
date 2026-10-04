@@ -241,8 +241,10 @@ export async function runCycle(config, options = {}) {
     services,
     systemId: config.system.id,
   });
+  // As for every mutation, an id that names a different cycle is a bad --op
+  // argument, never a lock conflict (operate.mjs says why).
   if (opened.conflict) {
-    return { ok: false, action: 'conflict', reasonCode: opened.reasonCode, opId: id, message: opened.error, children: [] };
+    return { ok: false, reasonCode: REASON.badArgument, opId: null, message: opened.error, children: [], refusal: { command: 'cycle', argument: '--op' } };
   }
   if (!opened.ok) {
     return {
@@ -257,7 +259,10 @@ export async function runCycle(config, options = {}) {
     if (opened.record.state === 'finished') {
       return { ...opened.record.result, children: opened.record.children ?? [], opId: id, op: summarize(opened.record), replayed: true };
     }
-    return { ok: true, action: 'accepted', reasonCode: REASON.alreadyRunning, opId: id, op: summarize(opened.record), replayed: true, children: opened.record.children ?? [], message: `cycle ${id} is already ${opened.record.state}; it was not started again` };
+    return {
+      ok: true, action: 'already-running', reasonCode: REASON.alreadyRunning, opId: id, op: summarize(opened.record), replayed: true,
+      detached: opened.record.detached === true, children: opened.record.children ?? [], message: `cycle ${id} is already ${opened.record.state}; it was not started again`,
+    };
   }
 
   // A cycle record must carry its children from the moment it exists, because a
@@ -279,6 +284,9 @@ export async function runCycle(config, options = {}) {
   const lock = acquired.lock;
 
   const report = { recovery: null, queue: [], children: [], expired: [] };
+  // From the services phase on, a cycle that throws may have left an update
+  // half done, so its failure is unknown rather than failed (see the catch).
+  let servicesReached = false;
   try {
     const transitioning = pendingPowerOperation({ excludeId: id });
     if (transitioning) {
@@ -302,6 +310,7 @@ export async function runCycle(config, options = {}) {
 
     lock.phase('services');
     recordPhase(id, 'services');
+    servicesReached = true;
     const selected = services ? config.services.filter((service) => services.includes(service.id)) : config.services;
     const { ordered, cycles } = orderServices(selected);
     if (cycles.length > 0) {
@@ -363,21 +372,24 @@ export async function runCycle(config, options = {}) {
         ? 'no services on this machine are eligible for a scheduled update'
         : `${updated.length} updated, ${report.children.length - updated.length - failed.length} left alone, ${failed.length} failed`;
 
+    // A failed cycle says why with the reason of the first service that failed,
+    // so it is never the failure with no code that contract 3 exists to remove.
     const summary = {
       ok: failed.length === 0,
       action: failed.length === 0 ? 'cycled' : 'failed',
-      reasonCode: null,
+      reasonCode: failed.length === 0 ? null : failed[0].reasonCode ?? REASON.internal,
       message,
       durationMs: Date.now() - started,
       ...report,
     };
-    finishOperation(id, { ok: summary.ok, action: summary.action, reasonCode: null, message });
+    finishOperation(id, { ok: summary.ok, action: summary.action, reasonCode: summary.reasonCode, message });
     return { ...summary, opId: id };
   } catch (err) {
     const message = err?.message ?? String(err);
     log(`cycle threw: ${message}`, 'cycle');
-    finishOperation(id, { ok: false, action: 'failed', reasonCode: REASON.internal, message });
-    return { ok: false, action: 'failed', reasonCode: REASON.internal, opId: id, message, ...report };
+    const result = { ok: false, action: 'failed', reasonCode: REASON.internal, message, ...(servicesReached ? { outcome: 'unknown' } : {}) };
+    finishOperation(id, result);
+    return { ...result, opId: id, ...report };
   } finally {
     lock.release();
   }
