@@ -172,6 +172,18 @@ class RemoteShellTest {
         assertEquals("node 'a\\'", buildRemoteCommand(RemoteShell.DISPATCH, listOf("node", "a\\")))
     }
 
+    @Test
+    fun `a backslash before a final line separator is written, as the reference writes it`() {
+        // java.util.regex lets `$` match before a final U+0085, U+2028 or U+2029, which JavaScript
+        // does not. None of the three is a control character, so the backslash is not before the
+        // end of the element and the reference quotes it rather than refusing it.
+        listOf('\u0085', '\u2028', '\u2029').forEach { separator ->
+            val argument = "a\\$separator"
+            assertEquals("node '$argument'", buildRemoteCommand(RemoteShell.POSIX, listOf("node", argument)))
+        }
+        assertRefused("posix-backslash", 1) { buildRemoteCommand(RemoteShell.POSIX, listOf("node", "a\u2028\\")) }
+    }
+
     private fun assertRefused(code: String, index: Int?, block: () -> Unit) {
         try {
             block()

@@ -212,8 +212,14 @@ internal fun describeRefusal(code: String, argument: String?): String {
 /** What a POSIX shell and the dispatcher both read as one literal word. */
 private val POSIX_BARE = Regex("^[A-Za-z0-9._/:@+,-][A-Za-z0-9._/:@+,=-]*$")
 
-/** The backslash sequences fish reads as escapes inside single quotes. */
-private val POSIX_BACKSLASH = Regex("\\\\(?:\\\\|'|$)")
+/**
+ * The backslash sequences fish reads as escapes inside single quotes.
+ *
+ * The end is `\z`, not `$`: this is a search rather than a whole match, and java.util.regex lets `$`
+ * match before a final U+0085, U+2028 or U+2029 too, none of which is a control character here. A
+ * backslash before one of those is written by the reference and has to be written here as well.
+ */
+private val POSIX_BACKSLASH = Regex("\\\\(?:\\\\|'|\\z)")
 
 /**
  * PowerShell's tokenizer reads U+2018 to U+201B as single quotes too. Doubling only U+0027 left a
