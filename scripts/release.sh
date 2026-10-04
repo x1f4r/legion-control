@@ -203,12 +203,20 @@ if not re.search(r'<Version>[^<]+</Version>', text):
     raise SystemExit('Desktop project needs an explicit Version property.')
 p.write_text(re.sub(r'<Version>[^<]+</Version>', '<Version>' + sys.argv[2] + '</Version>', text))
 PYVERSION
+# The lines above read back the plist and the Gradle file. This reads every copy the way check.sh
+# does, the desktop project and the agent version included.
+node "$ROOT/scripts/check-versions.mjs"
 say "All client projects now say $VERSION ($BUILD_NUMBER)."
 
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 
+# Everything in dist/ is built by this run. A leftover from an earlier one, the agent tarball of
+# the previous version above all, would otherwise go out with this release: the desktop project
+# embeds every legionctl-agent-*.tgz it finds there. dist/ is gitignored and holds nothing that
+# cannot be built again.
+rm -rf "$DIST"
 mkdir -p "$DIST"
 
 step "Packaging and signing the bundled control agent"
