@@ -66,8 +66,14 @@ class AgentClient(
     private val transport: CommandTransport,
     private val routes: RouteSelector,
     private val settings: MachineHints,
-    /** Milliseconds, for the one deadline each command has. Replaced in tests, and only there. */
-    private val clock: () -> Long = System::currentTimeMillis,
+    /**
+     * Milliseconds, for the one deadline each command has. Replaced in tests, and only there.
+     *
+     * Monotonic rather than the wall clock. One deadline now spans every attempt, so a clock set
+     * forward by NTP or the network in the middle of a walk would cut a read short, and one set back
+     * would give the later attempts more time than the deadline has.
+     */
+    private val clock: () -> Long = { System.nanoTime() / 1_000_000L },
 ) {
     /**
      * What the last reply said the far side is.
