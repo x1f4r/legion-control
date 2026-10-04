@@ -105,6 +105,18 @@ class AgentBootstrapTest {
     }
 
     @Test
+    fun `the 2_x status the contract keeps counts as legacy and is bootstrapped`() {
+        // The only real 2.x evidence there is. Checked against hand-written statuses alone, the gate
+        // could drift from what a 2.x agent prints and nothing here would notice.
+        val fixture = status(ContractCorpus.file("fixtures/legacy-2x.status.json").readText())
+        assertTrue(AgentBootstrap.isAuthenticatedLegacy(fixture))
+
+        val path = decide(fixture, linux)
+        assertTrue("got $path", path is AgentDeploymentPath.UploadAndInstall)
+        assertEquals(linux, (path as AgentDeploymentPath.UploadAndInstall).system)
+    }
+
+    @Test
     fun `the base is read only off the two installed shapes, and only when it is absolute`() {
         val posix = AgentBootstrap.layout(listOf("/opt/node", "/home/me/agent base/agent/src/index.mjs"))
         assertEquals(AgentBootstrap.Layout("/home/me/agent base", listOf("/opt/node")), posix)
