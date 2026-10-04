@@ -113,8 +113,12 @@ test('an updater that does nothing is caught, rolled back, and --force does not 
 test('an update whose result cannot be confirmed at all is refused before it touches anything', async () => {
   await withService(
     async ({ home, dir }) => {
-      const { payload } = cli(['update', '--force'], { home });
-      assert.equal(payload.action, 'noop');
+      const { payload, exitCode } = cli(['update', '--force'], { home });
+      // Refused, and failed rather than a no-op: a client must never show an
+      // update nothing could confirm as done.
+      assert.equal(payload.action, 'failed');
+      assert.equal(payload.outcome, 'failed');
+      assert.equal(exitCode, 1);
       assert.equal(payload.reasonCode, 'postcondition-failed');
       assert.match(payload.message, /--force overrides the busy gate, not the evidence/);
       assert.equal(readFixture(dir, 'update-runs', '0'), '0', 'nothing may run when nothing could confirm it');
@@ -130,11 +134,13 @@ test('an update whose result cannot be confirmed at all is refused before it tou
   );
 });
 
-test('a version lookup that fails is a no-op that --force cannot push past', async () => {
+test('a version lookup that fails is a failed update that --force cannot push past', async () => {
   await withService(
     async ({ home, dir }) => {
-      const { payload } = cli(['update', '--force'], { home });
-      assert.equal(payload.action, 'noop');
+      const { payload, exitCode } = cli(['update', '--force'], { home });
+      assert.equal(payload.action, 'failed');
+      assert.equal(payload.outcome, 'failed');
+      assert.equal(exitCode, 1);
       assert.equal(payload.reasonCode, 'latest-unknown');
       assert.equal(readFixture(dir, 'update-runs', '0'), '0', 'installing an unnamed version is a guess, not an update');
     },

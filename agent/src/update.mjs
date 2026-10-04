@@ -339,11 +339,13 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
   const pattern = npmProvider.versionPattern(service);
   if (!to || (pattern && !pattern.test(to))) {
     // Not a failure of the machine, and NOT something --force may push past: an
-    // install of an unknown version is not an update, it is a guess.
+    // install of an unknown version is not an update, it is a guess. It is a
+    // failed update all the same, never a no-op: nobody can say the service is
+    // current, and a client must not show it as done.
     const message = `could not resolve a valid ${channel} version: ${resolved.error ?? 'no version returned'}`;
     log(message, 'update');
     recordLastUpdate(service, 'failed', from, null, message);
-    return { ok: true, action: 'noop', reasonCode: REASON.latestUnknown, from, to: null, message };
+    return { ok: false, action: 'failed', reasonCode: REASON.latestUnknown, from, to: null, message };
   }
 
   if (from === to) return alreadyOnTarget(config, service, from, to, { force, opId });
@@ -461,8 +463,8 @@ async function runAppUpdate(config, service, { force, opId, lock }) {
       `${staged} failed to apply ${failures.count} times, so it will not be retried automatically. ` +
       `Quit and reopen ${service.name} yourself to apply it, or pass --force to try again`;
     return {
-      ok: true,
-      action: 'noop',
+      ok: false,
+      action: 'failed',
       reasonCode: REASON.applyAttemptsExhausted,
       from,
       to: staged,
@@ -474,11 +476,11 @@ async function runAppUpdate(config, service, { force, opId, lock }) {
   // Not running: nothing to do and nothing wrong. The updater applies a staged
   // build when the app quits, so a closed app picks this up by itself the next
   // time it is opened and closed. Opening it from a background timer would be
-  // worse than useless.
+  // worse than useless. Not applied yet is deferred, not done.
   if (!appProvider.isAppRunning(service)) {
     return {
       ok: true,
-      action: 'noop',
+      action: 'deferred',
       reasonCode: REASON.appClosed,
       from,
       to: staged,
@@ -504,7 +506,7 @@ async function runAppUpdate(config, service, { force, opId, lock }) {
   if (restarted.notRunning) {
     const message = `${service.name} closed while the update was starting; ${staged} applies on that quit by itself`;
     log(message, 'update');
-    return { ok: true, action: 'noop', reasonCode: REASON.appClosed, from, to: staged, message };
+    return { ok: true, action: 'deferred', reasonCode: REASON.appClosed, from, to: staged, message };
   }
   if (!restarted.ok) {
     log(`update to ${staged} failed: ${restarted.message}`, 'update');
@@ -725,17 +727,18 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
     const message = `could not resolve the newest version: ${resolved.error ?? 'no version returned'}`;
     log(message, 'update');
     recordLastUpdate(service, 'failed', from, null, message);
-    return { ok: true, action: 'noop', reasonCode: REASON.latestUnknown, from, to: null, message };
+    return { ok: false, action: 'failed', reasonCode: REASON.latestUnknown, from, to: null, message };
   }
 
   if (!to && !service.latestVersion && !service.verify) {
     // Nothing to compare against and nothing to verify with: there is no way
     // this update could ever be reported honestly, so it is refused before it
-    // touches the service rather than after.
+    // touches the service rather than after, and it is a failed update, not a
+    // no-op a client would show as done.
     const message =
       `${service.name} has neither a latestVersion command nor a verify command, so an update could not be confirmed. ` +
       'Configure one of them; --force overrides the busy gate, not the evidence';
-    return { ok: true, action: 'noop', reasonCode: REASON.postconditionFailed, from, to: null, message };
+    return { ok: false, action: 'failed', reasonCode: REASON.postconditionFailed, from, to: null, message };
   }
 
   if (to && from === to) return alreadyOnTarget(config, service, from, to, { force, opId });
