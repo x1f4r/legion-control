@@ -13,7 +13,7 @@ public enum LegionControlMain {
     public static func main() {
         // Before anything is run: the first ssh call waits for this rather than going out with the
         // bare PATH launchd gives an app.
-        LoginShellPath.resolveInBackground()
+        LoginShellPath.shared.resolveInBackground()
         let app = NSApplication.shared
         app.delegate = delegate
         // Starts as a normal app with a Dock icon and a window. It only becomes an accessory once the

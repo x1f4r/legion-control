@@ -113,7 +113,7 @@ enum Shell {
     /// The environment every command gets: this app's own, with two changes.
     static func childEnvironment(
         base: [String: String] = ProcessInfo.processInfo.environment,
-        loginPath: String? = LoginShellPath.value()
+        loginPath: String? = LoginShellPath.shared.value()
     ) -> [String: String] {
         var environment = base
         // Never wake a machine just by looking at it.
@@ -435,34 +435,40 @@ private final class StreamWriter: @unchecked Sendable {
 ///
 /// Read once per app run, in the background from the moment the app starts, and only by the app:
 /// a test run keeps the environment it was started with and never reads anyone's shell profile.
-enum LoginShellPath {
-    private final class State: @unchecked Sendable {
-        let lock = NSLock()
-        var pending: DispatchWorkItem?
-        var resolved: String?
-    }
+/// A test that needs a lookup makes one of its own.
+final class LoginShellPath: @unchecked Sendable {
+    /// The one every command reads. Started at launch, and never in a test run.
+    static let shared = LoginShellPath()
 
-    private static let state = State()
+    private let lock = NSLock()
+    /// Entered when the lookup starts and left when it ends. A group, because every command waits
+    /// on it, often several at once: a DispatchWorkItem may be waited on only once, and the second
+    /// command used to trap there and take the app down with it.
+    private let lookup = DispatchGroup()
+    private var started = false
+    private var resolved: String?
 
-    /// Starts reading it. Called once, at launch.
-    static func resolveInBackground(shell: String = userShell()) {
-        state.lock.withLock {
-            guard state.pending == nil else { return }
-            let item = DispatchWorkItem {
-                let path = resolve(shell: shell)
-                state.lock.withLock { state.resolved = path }
-            }
-            state.pending = item
-            DispatchQueue.global(qos: .userInitiated).async(execute: item)
+    /// Starts reading it. Called once, at launch; a second call changes nothing.
+    func resolveInBackground(shell: String = LoginShellPath.userShell()) {
+        let first = lock.withLock {
+            guard !started else { return false }
+            started = true
+            lookup.enter()
+            return true
+        }
+        guard first else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let path = Self.resolve(shell: shell)
+            self.lock.withLock { self.resolved = path }
+            self.lookup.leave()
         }
     }
 
     /// The login PATH, waiting for a read still in flight. Nil when none was started or the shell
     /// gave nothing usable, and then a command keeps the PATH this app was started with.
-    static func value() -> String? {
-        guard let item = state.lock.withLock({ state.pending }) else { return nil }
-        item.wait()
-        return state.lock.withLock { state.resolved }
+    func value() -> String? {
+        lookup.wait()
+        return lock.withLock { resolved }
     }
 
     /// The account's login shell, from the user database rather than from `SHELL`, which an app

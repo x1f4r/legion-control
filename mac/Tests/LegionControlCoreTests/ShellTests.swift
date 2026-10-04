@@ -172,23 +172,57 @@ struct ShellTests {
         #expect(seen.standardOutput == "/opt/tools/bin:/usr/bin:/bin\n")
     }
 
-    @Test("the login shell's PATH is read between markers, whatever its profile prints")
-    func loginPathIsRead() throws {
-        let directory = try Self.scratch()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        // A stand-in login shell: its profile sets a PATH and is chatty on the way in and out.
+    /// A stand-in login shell: its profile sets a PATH and is chatty on the way in and out, and it
+    /// takes `delay` seconds to get there.
+    static func loginShell(in directory: URL, delay: String = "0") throws -> URL {
         let shell = directory.appending(path: "login-shell")
         try """
         #!/bin/sh
+        sleep \(delay)
         PATH=/opt/tools/bin:/usr/bin:/bin; export PATH
         echo "Welcome back"
         /bin/sh -c "$3"
         echo "Logged out"
         """.write(to: shell, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: shell.path)
+        return shell
+    }
+
+    @Test("the login shell's PATH is read between markers, whatever its profile prints")
+    func loginPathIsRead() throws {
+        let directory = try Self.scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let shell = try Self.loginShell(in: directory)
 
         #expect(LoginShellPath.resolve(shell: shell.path) == "/opt/tools/bin:/usr/bin:/bin")
         #expect(LoginShellPath.resolve(shell: directory.appending(path: "missing").path) == nil)
+    }
+
+    @Test("every command can wait for the login PATH, any number of times and all at once")
+    func loginPathHasManyWaiters() throws {
+        // The lookup is read by every command the app runs. The first version waited on the work
+        // item itself, which libdispatch allows only once: the second command the app started
+        // trapped, and two machines read at once at launch took the app down together.
+        let directory = try Self.scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let shell = try Self.loginShell(in: directory, delay: "0.3")
+        let lookup = LoginShellPath()
+        lookup.resolveInBackground(shell: shell.path)
+        // A second start changes nothing: the lookup already running is the one waited for.
+        lookup.resolveInBackground(shell: directory.appending(path: "missing").path)
+
+        // Several waiters arrive while the shell is still starting, and more after it has answered.
+        final class Seen: @unchecked Sendable {
+            let lock = NSLock()
+            var values: [String?] = []
+            func append(_ value: String?) { lock.withLock { values.append(value) } }
+        }
+        let seen = Seen()
+        DispatchQueue.concurrentPerform(iterations: 8) { _ in seen.append(lookup.value()) }
+        for _ in 0..<3 { seen.append(lookup.value()) }
+        #expect(seen.values.count == 11)
+        #expect(seen.values.allSatisfy { $0 == "/opt/tools/bin:/usr/bin:/bin" })
+        #expect(Shell.childEnvironment(base: [:], loginPath: lookup.value())["PATH"] == "/opt/tools/bin:/usr/bin:/bin")
     }
 
     @Test("nothing but a list of absolute directories between the markers is taken")
@@ -199,7 +233,9 @@ struct ShellTests {
         #expect(LoginShellPath.parse("\(marker)\nrelative/bin:/usr/bin\n\(marker)\n") == nil)
         #expect(LoginShellPath.parse("\(marker)\n\n\(marker)\n") == nil)
         #expect(LoginShellPath.parse("/usr/bin\n") == nil)
-        // Without a resolution started, a command keeps the PATH it was started with.
-        #expect(LoginShellPath.value() == nil)
+        // Without a lookup started, a command keeps the PATH it was started with, and a test run
+        // never starts the app's own.
+        #expect(LoginShellPath().value() == nil)
+        #expect(LoginShellPath.shared.value() == nil)
     }
 }
