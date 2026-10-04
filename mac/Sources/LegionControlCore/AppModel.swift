@@ -23,7 +23,7 @@ final class AppModel {
     /// The question waiting for an answer, whoever raised it.
     var dialog: PendingDialog?
     /// The setup disagreement waiting to be settled, when there is one.
-    var divergence: MachineModel.SetupDivergence?
+    var divergence: SetupDivergence?
 
     let config: ConfigStore
     /// This device's own settings, which are never published to anyone.
@@ -134,12 +134,25 @@ final class AppModel {
         return model
     }
 
+    /// What every device is told the same way: where questions go, where history is written, and
+    /// the setup it shares.
+    private func wireDevice(_ device: some AgentDevice) {
+        device.onStateChange = { [weak self] in self?.onStateChange?() }
+        device.ask = { [weak self] dialog in self?.dialog = dialog }
+        device.controllerConfig = { [weak self] in self?.config.document }
+        device.operations = operations
+        device.onOperationFinished = { [weak self] record in self?.announce(record) }
+        device.adoptSetup = { [weak self] bytes, description in
+            self?.config.adopt(bytes, describedAs: description)
+        }
+        device.setupBase = { [weak self] mine, theirs in
+            self?.config.commonAncestor(mine: mine, theirs: theirs)
+        }
+        device.onSetupDiverged = { [weak self] divergence in self?.divergence = divergence }
+    }
+
     private func wire(_ model: MachineModel) {
-        model.onStateChange = { [weak self] in self?.onStateChange?() }
-        model.ask = { [weak self] dialog in self?.dialog = dialog }
-        model.controllerConfig = { [weak self] in self?.config.document }
-        model.operations = operations
-        model.onOperationFinished = { [weak self] record in self?.announce(record) }
+        wireDevice(model)
         model.bindings = { [weak self] in self?.bindings.bindings ?? .empty }
         model.setup = { [weak self] in self?.config.config }
         model.peer = { [weak self] id in self?.machine(id: id) }
@@ -154,13 +167,6 @@ final class AppModel {
             }
         }
         model.placement = { [weak self] in self?.placement ?? SiteAwareness.Placement(matching: [], confirmed: nil) }
-        model.adoptSetup = { [weak self] bytes, description in
-            self?.config.adopt(bytes, describedAs: description)
-        }
-        model.setupBase = { [weak self] mine, theirs in
-            self?.config.commonAncestor(mine: mine, theirs: theirs)
-        }
-        model.onSetupDiverged = { [weak self] divergence in self?.divergence = divergence }
     }
 
     /// The local model: either this device's own agent as configured by `local`, or the machine this
@@ -192,25 +198,14 @@ final class AppModel {
     }
 
     private func wireLocal(_ model: MacModel) {
+        wireDevice(model)
         model.migrateAgentCommand = { [weak self, weak model] argv in
             guard let self, model?.boundMachineId != nil else { return }
             _ = self.bindings.update { $0.localAgent = .init(argv: argv) }
         }
-        model.onStateChange = { [weak self] in self?.onStateChange?() }
-        model.ask = { [weak self] dialog in self?.dialog = dialog }
-        model.controllerConfig = { [weak self] in self?.config.document }
-        model.operations = operations
-        model.onOperationFinished = { [weak self] record in self?.announce(record) }
-        model.adoptSetup = { [weak self] bytes, description in
-            self?.config.adopt(bytes, describedAs: description)
-        }
-        model.setupBase = { [weak self] mine, theirs in
-            self?.config.commonAncestor(mine: mine, theirs: theirs)
-        }
-        model.onSetupDiverged = { [weak self] divergence in self?.divergence = divergence }
     }
 
-    func replaceSetupOnPeer(_ divergence: MachineModel.SetupDivergence) {
+    func replaceSetupOnPeer(_ divergence: SetupDivergence) {
         self.divergence = nil
         if let machine = machine(id: divergence.machineId) {
             machine.replaceSetup()
@@ -260,7 +255,7 @@ final class AppModel {
 
     /// Settle a divergence by merging the two branches.
     @discardableResult
-    func resolveDivergence(_ divergence: MachineModel.SetupDivergence,
+    func resolveDivergence(_ divergence: SetupDivergence,
                            choices: [String: SetupMerge.Choice]) -> String? {
         do {
             let identity = divergence.mine.identity.merged(
@@ -300,14 +295,14 @@ final class AppModel {
     /// Not a replace: the new revision lists the machine's document as one of its parents, so the
     /// machine accepts it as an ordinary fast-forward and no `--replace` is ever sent.
     @discardableResult
-    func keepMine(_ divergence: MachineModel.SetupDivergence) -> String? {
+    func keepMine(_ divergence: SetupDivergence) -> String? {
         let choices = Dictionary(uniqueKeysWithValues: divergence.differences.map { ($0.id, SetupMerge.Choice.mine) })
         return resolveDivergence(divergence, choices: choices)
     }
 
     /// Settle a divergence by taking the machine's branch.
     @discardableResult
-    func takeTheirs(_ divergence: MachineModel.SetupDivergence) -> String? {
+    func takeTheirs(_ divergence: SetupDivergence) -> String? {
         config.keepRevision(divergence.mine.bytes)
         let problem = config.adopt(divergence.theirsBytes, describedAs: "took the setup from \(divergence.machineName)")
         if problem == nil { self.divergence = nil }
@@ -340,17 +335,19 @@ final class AppModel {
     }
 
     var statusDetail: String? {
-        guard let recent = mostRecent else { return nil }
-        if let mac, mac.noteStamp > recent.statusStamp, mac.note != nil { return nil }
+        guard let recent = mostRecent else { return mac?.noteDetail }
+        if let mac, mac.noteStamp > recent.statusStamp, mac.note != nil { return mac.noteDetail }
         return recent.statusDetail
     }
 
-    /// What the last action the user started ended in.
-    var lastActionOutcome: MachineModel.ActionOutcome? {
-        machines
-            .filter { $0.lastActionOutcome != nil }
-            .max { $0.statusStamp < $1.statusStamp }?
-            .lastActionOutcome
+    /// What the last action the user started ended in, on whichever device spoke last. This Mac is
+    /// one of them: a failure here has to reach the panel's notice as surely as one over ssh.
+    var lastActionOutcome: ActionOutcome? {
+        var spoken: [(at: Date, outcome: ActionOutcome)] = machines.compactMap { machine in
+            machine.lastActionOutcome.map { (machine.statusStamp, $0) }
+        }
+        if let mac, let outcome = mac.lastActionOutcome { spoken.append((mac.noteStamp, outcome)) }
+        return spoken.max { $0.at < $1.at }?.outcome
     }
 
     /// Operations this app started and never learned the outcome of. The one thing that asks for

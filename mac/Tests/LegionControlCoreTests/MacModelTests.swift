@@ -240,6 +240,78 @@ struct MacModelTests {
         #expect(model.noteIsError)
     }
 
+    // MARK: - One core with the machines
+
+    @Test("a failed action here is kept as the last outcome, exactly as one over ssh is")
+    func localFailureIsTheLastOutcome() async throws {
+        // The local side had no last outcome at all, so the panel's error notice, which reads it,
+        // never showed a failure on the device the app runs on.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("update", json: """
+        { "ok": false, "contract": 3, "action": "failed", "message": "The updater refused this release." }
+        """, exit: 1)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        let service = try #require(model.services.first)
+        model.update(service, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        let outcome = try #require(model.lastActionOutcome)
+        #expect(outcome.isError)
+        #expect(outcome.text.contains("refused this release"))
+        #expect(outcome.operationId == store.newestFirst.first { $0.kind == .update }?.id)
+    }
+
+    @Test("a setup the local agent cannot hand over is said, not swallowed")
+    func unreadableLocalSetupIsSaid() async throws {
+        // Reading the local agent's copy used to return nothing on any error without a word, so a
+        // setup this Mac could not read looked exactly like one that was never asked for.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answerTimeout("config")
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        model.adoptRemoteSetup()
+        let deadline = Date().addingTimeInterval(2)
+        while model.note == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+
+        #expect(model.note?.contains("could not be read") == true)
+        #expect(model.note?.contains("did not finish within") == true)
+        #expect(model.noteIsError)
+    }
+
+    @Test("the local maintenance cycle keeps what happened to each service")
+    func localCycleKeepsDetails() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("cycle", json: """
+        { "ok": true, "contract": 3, "action": "cycled",
+          "children": [ { "service": "t3", "action": "updated" },
+                        { "service": "edge", "action": "deferred", "reasonCode": "busy" } ] }
+        """)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        model.runCycle()
+        await Self.settle(model)
+
+        let record = try #require(store.newestFirst.first { $0.kind == .updateAll })
+        #expect(record.state == .succeeded)
+        #expect(record.summary == "Maintenance cycle on This Mac: 1 updated, 1 held back.")
+        // The counts used to be all there was. Which service was held back, and why, is the part
+        // anyone acting on the result needs.
+        #expect(record.detail == "t3: updated\nedge: deferred (busy)")
+        #expect(model.noteDetail == record.detail)
+    }
+
     @Test("the local agent is run through the bound argv when the device is a machine in the setup")
     func boundLocalAgent() async throws {
         // The `self` binding: this device is one of the machines in the shared document, and it is
