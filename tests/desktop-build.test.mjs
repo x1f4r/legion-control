@@ -48,6 +48,8 @@ test('with --require-agent the desktop build stops unless every part of the bund
   const refused = build(empty, 'test', '--require-agent');
   assert.equal(refused.status, 1);
   assert.match(refused.stderr, /Missing signed agent artifact: legionctl-agent-3\.1\.0\.tgz\. Run scripts\/package-agent\.mjs first\./);
+  // A release log that stops for want of the bundle never first says the build goes on without it.
+  assert.doesNotMatch(refused.stdout, /No signed agent bundle/);
   assert.deepEqual(dotnetCalls(empty), []);
 
   const partial = checkout(t, { bundle: true });

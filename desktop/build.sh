@@ -51,12 +51,8 @@ fi
 echo "Legion Control desktop $version, built with $("$dotnet" --version)"
 
 # The signed agent bundle, when the release tooling has produced one. A normal build carries none
-# and says so in the app rather than offering an action that cannot work.
-if [ -f "$out/legionctl-agent-$agent_version.tgz" ]; then
-  echo "Bundling the signed agent from $out"
-else
-  echo "No signed agent bundle in $out: the agent install action will be unavailable in this build."
-fi
+# and says so in the app rather than offering an action that cannot work. A build that requires it
+# stops first, so its log never says it went ahead without one.
 if [ "$require_agent" -eq 1 ]; then
   for artifact in "legionctl-agent-$agent_version.tgz" Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig; do
     if [ ! -s "$out/$artifact" ]; then
@@ -64,6 +60,11 @@ if [ "$require_agent" -eq 1 ]; then
       exit 1
     fi
   done
+fi
+if [ -f "$out/legionctl-agent-$agent_version.tgz" ]; then
+  echo "Bundling the signed agent from $out"
+else
+  echo "No signed agent bundle in $out: the agent install action will be unavailable in this build."
 fi
 
 case "$target" in
