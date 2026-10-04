@@ -55,6 +55,14 @@ test('the agent takes its version from agent/package.json rather than a copy of 
   const stale = await check(t, literal('3.0.1'));
   assert.deepEqual(files(stale), [config, config]);
   assert.match(stale[1].message, /reports agent "3\.0\.1", but agent\/package\.json says 3\.1\.0/);
+  // config.mjs split up, passing on a version written out in a module of its own.
+  const moved = await check(t, (root) => {
+    fs.mkdirSync(path.join(root, 'agent/src/config'));
+    fs.writeFileSync(path.join(root, 'agent/src/config/version.mjs'), "export const AGENT_VERSION = '3.1.0';\n");
+    fs.writeFileSync(path.join(root, config), "export { AGENT_VERSION } from './config/version.mjs';\n");
+  });
+  assert.deepEqual(files(moved), ['agent/src/config/version.mjs']);
+  assert.match(moved[0].message, /agent\/src\/config\/version\.mjs writes AGENT_VERSION out as a literal/);
 });
 
 test('the Android build bundles the agent of agent/package.json when nobody says otherwise', async (t) => {
@@ -129,6 +137,9 @@ test('a copy that moved is reported rather than passed over', async (t) => {
   const gone = await check(t, root => fs.rmSync(path.join(root, 'mac/Resources/Info.plist')));
   assert.deepEqual(gone.map(({ file, missing }) => ({ file, missing })), [{ file: 'mac/Resources/Info.plist', missing: true }]);
   assert.match(gone[0].message, /cannot be read \(ENOENT\)/);
+  // The module the agent's version is asked of, gone with nothing in its place.
+  const config = await check(t, root => fs.rmSync(path.join(root, 'agent/src/config.mjs')));
+  assert.deepEqual(config.map(({ file, missing }) => ({ file, missing })), [{ file: 'agent/src/config.mjs', missing: true }]);
 });
 
 test('this repository has every copy where the check looks, and its builds follow agent/package.json', async () => {

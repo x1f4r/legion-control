@@ -50,6 +50,19 @@ export const AGENT_COPIES = [
   { file: 'android/app/src/main/java/com/x1f4r/legioncontrol/agent/Contract.kt', name: 'BUNDLED_AGENT_VERSION', pattern: /\bconst val BUNDLED_AGENT_VERSION = "([^"]*)"/ },
 ];
 
+/**
+ * Every module of the agent, relative to `root` and with forward slashes, in a stable order. None
+ * when there is no agent/src, which the check reports when it reads config.mjs.
+ */
+function agentModules(root) {
+  try {
+    return fs.readdirSync(path.join(root, 'agent/src'), { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile() && /\.[cm]?js$/.test(entry.name))
+      .map(entry => path.relative(root, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'))
+      .sort();
+  } catch { return []; }
+}
+
 // The builds that look the signed bundle up in dist/ by its file name. A name with the version
 // written into it goes stale with the next agent, and the build then either stops or ships
 // without the agent, so each takes the version from agent/package.json or the bundle's manifest.
@@ -119,12 +132,17 @@ export async function checkVersions(root = repository) {
   if (floorProblem) problem('agent/package.json', floorProblem);
 
   if (STABLE.test(version ?? '')) {
-    // What the agent reports in every reply, asked of the module itself rather than read out of
-    // its text, so it holds however config.mjs comes by it. It has to come from agent/package.json,
-    // which is signed and installed beside it: a second copy is the one that gets forgotten.
+    // What the agent reports in every reply, asked of config.mjs, the module the rest of the agent
+    // imports it from, rather than read out of its text, so it holds however config.mjs comes by
+    // it. It has to come from agent/package.json, which is signed and installed beside it: a
+    // second copy is the one that gets forgotten. That copy is looked for in every module of the
+    // agent, not in config.mjs alone: config.mjs passing on a literal written in another module
+    // agrees today just the same.
+    for (const file of agentModules(root)) {
+      if (/\bAGENT_VERSION\s*=\s*['"`]/.test(read(file) ?? '')) problem(file, `${file} writes AGENT_VERSION out as a literal; read it from agent/package.json.`);
+    }
     const config = 'agent/src/config.mjs';
     if (read(config) !== null) {
-      if (/\bAGENT_VERSION\s*=\s*['"`]/.test(read(config))) problem(config, `${config} writes AGENT_VERSION out as a literal; read it from agent/package.json.`);
       try {
         const reported = (await import(pathToFileURL(path.join(root, config)).href)).AGENT_VERSION;
         if (reported !== version) problem(config, `${config} reports agent ${JSON.stringify(reported)}, but agent/package.json says ${version}.`);
