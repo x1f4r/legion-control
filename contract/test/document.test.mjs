@@ -17,6 +17,10 @@ const BINDINGS_SCHEMA = { $ref: 'bindings.schema.json' };
 
 const schemaErrors = (schema, data) => validate(schema, data, { file: 'common.schema.json' }).errors;
 const helper = (machine, action) => ({ machine, action });
+// checkControllerDocument (tools/document-rules.mjs) reports {code, path, message};
+// the assertions below read the messages, which is what a person is shown.
+const text = (problems) => problems.map((problem) => problem.message).join(' ');
+const codes = (problems) => [...new Set(problems.map((problem) => problem.code))].sort();
 
 const document = (overrides = {}) => ({
   version: 1,
@@ -70,14 +74,16 @@ test('a machine cannot be its own wake helper', () => {
   const { errors } = checkControllerDocument(document({
     machines: [{ id: 'tower', wake: { helpers: [helper('tower', 'wake-tower')] } }],
   }));
-  assert.match(errors.join(' '), /its own wake helper/);
+  assert.match(text(errors), /its own wake helper/);
+  assert.deepEqual(codes(errors), ['helper-self']);
 });
 
 test('a helper must be a machine this document describes', () => {
   const { errors } = checkControllerDocument(document({
     machines: [{ id: 'tower', wake: { helpers: [helper('ghost', 'wake-tower')] } }],
   }));
-  assert.match(errors.join(' '), /"ghost" is not a machine/);
+  assert.match(text(errors), /"ghost" is not a machine/);
+  assert.deepEqual(codes(errors), ['helper-unknown']);
 });
 
 test('helpers that wake each other are a cycle, and a cycle is refused', () => {
@@ -87,7 +93,8 @@ test('helpers that wake each other are a cycle, and a cycle is refused', () => {
       { id: 'b', wake: { helpers: [helper('a', 'wake-b')] } },
     ],
   }));
-  assert.match(errors.join(' '), /wake helper cycle/);
+  assert.match(text(errors), /wake helper cycle/);
+  assert.deepEqual(codes(errors), ['helper-cycle']);
 });
 
 test('a longer ring is still a ring', () => {
@@ -98,7 +105,8 @@ test('a longer ring is still a ring', () => {
       { id: 'c', wake: { helpers: [helper('a', 'wake-c')] } },
     ],
   }));
-  assert.match(errors.join(' '), /wake helper cycle/);
+  assert.match(text(errors), /wake helper cycle/);
+  assert.deepEqual(codes(errors), ['helper-cycle']);
 });
 
 test('a chain that is not a ring is fine', () => {
@@ -119,7 +127,8 @@ test('the singular helper must repeat helpers[0]', () => {
       { id: 'tower', wake: { helper: helper('nas', 'wake-tower'), helpers: [helper('pi', 'wake-tower')] } },
     ],
   });
-  assert.match(checkControllerDocument(diverging).errors.join(' '), /compatibility alias/);
+  assert.match(text(checkControllerDocument(diverging).errors), /compatibility alias/);
+  assert.deepEqual(codes(checkControllerDocument(diverging).errors), ['helper-alias']);
 
   const agreeing = document({
     machines: [
@@ -135,17 +144,19 @@ test('a machine cannot name a site nobody defined', () => {
     sites: [{ id: 'attic', lanPrefixes: ['10.0.0.'] }],
     machines: [{ id: 'tower', site: 'flat' }],
   }));
-  assert.match(errors.join(' '), /site "flat" is not in sites/);
+  assert.match(text(errors), /site "flat" is not in sites/);
+  assert.deepEqual(codes(errors), ['unknown-site']);
 });
 
 test('duplicate ids are refused wherever a route or a record would become ambiguous', () => {
-  assert.match(checkControllerDocument(document({ machines: [{ id: 'pi' }, { id: 'pi' }] })).errors.join(' '), /two machines share/);
-  assert.match(checkControllerDocument(document({
+  assert.match(text(checkControllerDocument(document({ machines: [{ id: 'pi' }, { id: 'pi' }] })).errors), /two machines share/);
+  assert.match(text(checkControllerDocument(document({
     machines: [{ id: 'pi', endpoints: [{ id: 'lan', host: 'a' }, { id: 'lan', host: 'b' }] }],
-  })).errors.join(' '), /two endpoints share/);
-  assert.match(checkControllerDocument(document({
+  })).errors), /two endpoints share/);
+  assert.match(text(checkControllerDocument(document({
     machines: [{ id: 'pi', systems: [{ id: 'linux' }, { id: 'linux' }] }],
-  })).errors.join(' '), /two systems share/);
+  })).errors), /two systems share/);
+  assert.match(text(checkControllerDocument(document({ sites: [{ id: 'home' }, { id: 'home' }] })).errors), /two sites share/);
 });
 
 // --- overlapping subnets ----------------------------------------------------
@@ -162,7 +173,7 @@ test('two sites may share a private subnet, and that is a warning, not an error'
     machines: [{ id: 'pi', site: 'attic' }, { id: 'tower', site: 'flat' }],
   }));
   assert.deepEqual(errors, []);
-  assert.match(warnings.join(' '), /does not say which site a device is on/);
+  assert.match(text(warnings), /does not say which site a device is on/);
 });
 
 test('a cross-site helper warns, because a router action is a legitimate one', () => {
@@ -174,21 +185,24 @@ test('a cross-site helper warns, because a router action is a legitimate one', (
     ],
   }));
   assert.deepEqual(errors, []);
-  assert.match(warnings.join(' '), /another way, such as a router or a VPN/);
+  assert.match(text(warnings), /another way, such as a router or a VPN/);
 });
 
 test('a helper that is not always on is worth saying out loud', () => {
   const { warnings } = checkControllerDocument(document({
     machines: [{ id: 'legion' }, { id: 'tower', wake: { helpers: [helper('legion', 'wake-tower')] } }],
   }));
-  assert.match(warnings.join(' '), /not marked alwaysOn/);
+  assert.match(text(warnings), /not marked alwaysOn/);
 });
 
 test('a machine that nothing can wake says so', () => {
+  // No site, no lanPrefix and no helper: no client can tell when it shares the
+  // machine's network, so direct wake is never tried and nothing else exists.
   const { warnings } = checkControllerDocument(document({
-    machines: [{ id: 'tower', wake: { mac: 'AA:BB:CC:DD:EE:FF' } }],
+    machines: [{ id: 'tower', wake: { mac: '02:00:00:00:00:01' } }],
   }));
-  assert.match(warnings.join(' '), /only be woken by a controller that happens to be on its LAN/);
+  assert.match(text(warnings), /nothing can wake it/);
+  assert.ok(codes(warnings).includes('wake-unplaced'));
 });
 
 // --- private bindings -------------------------------------------------------
@@ -251,7 +265,8 @@ test('an argv item is not empty and holds no control character', () => {
     assert.ok(schemaErrors(guard('agentArgItem'), item).length > 0, JSON.stringify(item));
   }
   const tooManyBytes = { version: 1, machines: [{ id: 'tower', systems: [{ id: 'linux', agent: ['node', 'é'.repeat(2049)] }] }] };
-  assert.match(checkControllerDocument(tooManyBytes).errors.join(' '), /4098 UTF-8 bytes/);
+  assert.match(text(checkControllerDocument(tooManyBytes).errors), /4098 UTF-8 bytes/);
+  assert.deepEqual(codes(checkControllerDocument(tooManyBytes).errors), ['schema']);
 });
 
 test('a repository is owner/name, and . and .. are not names', () => {

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "setup-acceptance-vectors.schema.json",
+  "title": "contract/vectors/setup-acceptance.json",
+  "description": "Document acceptance, v3.md section 9.7, as cases: a setup document as text and the intake it arrives through, and the verdict every client reaches for it, with the error and warning codes behind it.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "family": { "const": "setup-acceptance" },
+    "contract": { "const": 3 },
+    "section": { "const": "9.7" },
+    "reference": { "const": "tools/document-rules.mjs" },
+    "notes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/text" } },
+    "groups": {
+      "type": "object",
+      "properties": {
+        "documents": { "type": "array", "minItems": 55, "items": { "$ref": "#/$defs/documentsCase" } }
+      },
+      "required": ["documents"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["family", "contract", "section", "reference", "notes", "groups"],
+  "additionalProperties": false,
+  "$defs": {
+    "errorCode": {
+      "enum": ["duplicate-member", "schema", "duplicate-machine", "duplicate-site", "duplicate-system", "duplicate-endpoint", "unknown-site", "helper-self", "helper-unknown", "helper-alias", "helper-cycle"]
+    },
+    "warningCode": {
+      "enum": ["no-machines", "machine-no-systems", "machine-no-endpoints", "system-no-agent", "endpoint-no-id", "endpoint-no-user", "endpoint-unknown-system", "endpoint-undialable", "wake-no-mac", "wake-unplaced", "wake-broadcast-defaulted", "helper-alias-unused", "helper-other-site", "helper-not-always-on", "shared-prefix", "prefix-invalid", "prefix-without-dot", "broadcast-invalid"]
+    },
+    "documentsCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "intake": { "enum": ["peer", "local", "applied"] },
+            "text": {
+              "description": "The document as a client reads it, checked as its UTF-8 bytes. It need not be JSON at all.",
+              "type": "string"
+            }
+          },
+          "required": ["intake", "text"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "valid": { "type": "boolean" },
+            "errors": { "type": "array", "items": { "$ref": "#/$defs/errorCode" }, "uniqueItems": true },
+            "warnings": { "type": "array", "items": { "$ref": "#/$defs/warningCode" }, "uniqueItems": true },
+            "assignsIdentity": { "type": "boolean" },
+            "keep": { "type": "boolean" }
+          },
+          "required": ["valid", "errors", "warnings", "assignsIdentity", "keep"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    }
+  }
+}

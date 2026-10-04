@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "transport-vectors.schema.json",
+  "title": "contract/vectors/transport.json",
+  "description": "Command lines and retry safety, v3.md section 15, as cases: the grammar a system is written in, the one line an argv becomes, what an attempt's evidence says, which attempts a walk makes, the status budget, and the dial grammar for hosts, users and ports.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "family": { "const": "transport" },
+    "contract": { "const": 3 },
+    "section": { "const": "15" },
+    "reference": { "const": "tools/transport.mjs" },
+    "notes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/text" } },
+    "groups": {
+      "type": "object",
+      "properties": {
+        "grammars": { "type": "array", "minItems": 10, "items": { "$ref": "#/$defs/grammarsCase" } },
+        "commandLines": { "type": "array", "minItems": 40, "items": { "$ref": "#/$defs/commandLinesCase" } },
+        "classifications": { "type": "array", "minItems": 45, "items": { "$ref": "#/$defs/classificationsCase" } },
+        "walks": { "type": "array", "minItems": 8, "items": { "$ref": "#/$defs/walksCase" } },
+        "statusBudgets": { "type": "array", "minItems": 7, "items": { "$ref": "#/$defs/statusBudgetsCase" } },
+        "hosts": { "type": "array", "minItems": 30, "items": { "$ref": "#/$defs/hostsCase" } },
+        "users": { "type": "array", "minItems": 20, "items": { "$ref": "#/$defs/usersCase" } },
+        "ports": { "type": "array", "minItems": 8, "items": { "$ref": "#/$defs/portsCase" } }
+      },
+      "required": ["grammars", "commandLines", "classifications", "walks", "statusBudgets", "hosts", "users", "ports"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["family", "contract", "section", "reference", "notes", "groups"],
+  "additionalProperties": false,
+  "$defs": {
+    "grammar": { "enum": ["posix", "dispatch", "cmd", "powershell"] },
+    "kind": {
+      "description": "The failure kinds of section 15.4, and badRequest for a line section 15.2 or 15.6 refused.",
+      "enum": ["noRoute", "launchFailed", "hostUnreachable", "connectionRefused", "authenticationFailed", "hostKeyChanged", "hostKeyUnknown", "timedOut", "linkLost", "interpreterMissing", "agentMissing", "unreadableOutput", "badRequest"]
+    },
+    "classification": {
+      "type": "object",
+      "properties": {
+        "outcome": { "enum": ["reply", "failure"] },
+        "kind": { "anyOf": [{ "$ref": "#/$defs/kind" }, { "type": "null" }] },
+        "dispatch": { "enum": ["never", "unknown", "acknowledged"] },
+        "routeLevel": { "type": "boolean" }
+      },
+      "required": ["outcome", "kind", "dispatch", "routeLevel"],
+      "additionalProperties": false
+    },
+    "grammarsCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "description": "The three document fields as they are in the document (null when absent), whether the route's last status reported a restricted session, and how many items the agent argv has.",
+          "type": "object",
+          "properties": {
+            "platform": { "type": ["string", "null"] },
+            "shell": { "type": ["string", "null"] },
+            "restricted": { "type": ["boolean", "null"] },
+            "restrictedSession": { "type": "boolean" },
+            "agentLength": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["platform", "shell", "restricted", "restrictedSession", "agentLength"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "grammar": { "anyOf": [{ "$ref": "#/$defs/grammar" }, { "type": "null" }] },
+            "refusal": { "enum": ["restricted-agent-shape", "unknown-shell", null] }
+          },
+          "required": ["grammar", "refusal"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "commandLinesCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "grammar": { "$ref": "#/$defs/grammar" },
+            "argv": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["grammar", "argv"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "description": "The line, byte for byte, or why there is none: the refusal and the index of the refused element, null when the whole argv or line is refused.",
+          "type": "object",
+          "properties": {
+            "line": { "type": ["string", "null"] },
+            "refusal": {
+              "enum": [null, "no-command", "empty-argument", "control-character", "posix-backslash", "too-many-arguments", "argument-too-long", "line-too-long", "double-quote", "percent", "exclamation", "trailing-backslash", "double-space"]
+            },
+            "index": { "type": ["integer", "null"], "minimum": 0 }
+          },
+          "required": ["line", "refusal", "index"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "classificationsCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "description": "The evidence of one attempt: whether ssh could be started, whether the client terminated it, the exit status (null when the channel closed without one), stdout, stderr and the text ssh wrote to its -E log.",
+          "type": "object",
+          "properties": {
+            "launchFailed": { "type": "boolean" },
+            "timedOut": { "type": "boolean" },
+            "exitCode": { "type": ["integer", "null"] },
+            "stdout": { "type": "string" },
+            "stderr": { "type": "string" },
+            "sshLog": { "type": "string" }
+          },
+          "required": ["launchFailed", "timedOut", "exitCode", "stdout", "stderr", "sshLog"],
+          "additionalProperties": false
+        },
+        "expect": { "$ref": "#/$defs/classification" }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "walksCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "safety": { "enum": ["mutation", "read"] },
+            "attempts": {
+              "description": "In the order of section 10.3. Each result is what that attempt would end in if it were made.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "route": { "type": "string" },
+                  "system": { "type": "string" },
+                  "result": { "$ref": "#/$defs/classification" }
+                },
+                "required": ["route", "system", "result"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["safety", "attempts"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "sent": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+            "ending": { "enum": ["reply", "stopped", "exhausted"] }
+          },
+          "required": ["sent", "ending"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "statusBudgetsCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "remainingMs": { "type": "integer" },
+            "attemptsMade": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["remainingMs", "attemptsMade"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "attempt": { "type": "boolean" },
+            "budgetMs": { "anyOf": [{ "type": "integer", "minimum": 1000, "maximum": 20000 }, { "type": "null" }] }
+          },
+          "required": ["attempt", "budgetMs"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "hostsCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": { "value": { "type": "string" } },
+          "required": ["value"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "valid": { "type": "boolean" },
+            "form": { "enum": ["dns", "ipv4", "ipv6", null] }
+          },
+          "required": ["valid", "form"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "usersCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": { "value": { "type": "string" } },
+          "required": ["value"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": { "valid": { "type": "boolean" } },
+          "required": ["valid"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "portsCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "description": "Any JSON value: a port is an integer, and the cases include a string and a fraction that are not.",
+          "type": "object",
+          "properties": { "value": { "type": ["integer", "number", "string"] } },
+          "required": ["value"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": { "valid": { "type": "boolean" } },
+          "required": ["valid"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    }
+  }
+}

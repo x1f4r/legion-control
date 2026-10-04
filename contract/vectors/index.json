@@ -136,6 +136,146 @@
           }
         }
       ]
+    },
+    {
+      "family": "transport",
+      "file": "vectors/transport.json",
+      "schema": "transport-vectors.schema.json",
+      "layout": "groups",
+      "section": "15",
+      "reference": "tools/transport.mjs",
+      "generator": "tools/vectors/transport.cases.mjs",
+      "groups": [
+        {
+          "group": "grammars",
+          "cases": 17,
+          "consumers": {
+            "agent": 17,
+            "mac": 17,
+            "desktop": 17,
+            "android": 17
+          }
+        },
+        {
+          "group": "commandLines",
+          "cases": 49,
+          "consumers": {
+            "agent": 8,
+            "mac": 49,
+            "desktop": 49,
+            "android": 49
+          }
+        },
+        {
+          "group": "classifications",
+          "cases": 63,
+          "consumers": {
+            "mac": 63,
+            "desktop": 63,
+            "android": 23
+          }
+        },
+        {
+          "group": "walks",
+          "cases": 12,
+          "consumers": {
+            "mac": 12,
+            "desktop": 12,
+            "android": 12
+          }
+        },
+        {
+          "group": "statusBudgets",
+          "cases": 8,
+          "consumers": {
+            "mac": 8,
+            "desktop": 8,
+            "android": 8
+          }
+        },
+        {
+          "group": "hosts",
+          "cases": 34,
+          "consumers": {
+            "agent": 34,
+            "mac": 34,
+            "desktop": 34,
+            "android": 34
+          }
+        },
+        {
+          "group": "users",
+          "cases": 20,
+          "consumers": {
+            "agent": 20,
+            "mac": 20,
+            "desktop": 20,
+            "android": 20
+          }
+        },
+        {
+          "group": "ports",
+          "cases": 8,
+          "consumers": {
+            "agent": 8,
+            "mac": 8,
+            "desktop": 8,
+            "android": 8
+          }
+        }
+      ]
+    },
+    {
+      "family": "setup-acceptance",
+      "file": "vectors/setup-acceptance.json",
+      "schema": "setup-acceptance-vectors.schema.json",
+      "layout": "groups",
+      "section": "9.7",
+      "reference": "tools/document-rules.mjs",
+      "generator": "tools/vectors/setup-acceptance.cases.mjs",
+      "groups": [
+        {
+          "group": "documents",
+          "cases": 78,
+          "consumers": {
+            "agent": 69,
+            "mac": 78,
+            "desktop": 78,
+            "android": 78
+          }
+        }
+      ]
+    },
+    {
+      "family": "launch",
+      "file": "vectors/launch.json",
+      "schema": "launch-vectors.schema.json",
+      "layout": "groups",
+      "section": "9.9",
+      "reference": "tools/launch.mjs",
+      "generator": "tools/vectors/launch.cases.mjs",
+      "groups": [
+        {
+          "group": "review",
+          "cases": 38,
+          "consumers": {
+            "agent": 38,
+            "mac": 38,
+            "desktop": 38,
+            "android": 38
+          }
+        },
+        {
+          "group": "migration",
+          "cases": 12,
+          "consumers": {
+            "agent": 12,
+            "mac": 12,
+            "desktop": 12,
+            "android": 12
+          }
+        }
+      ]
     }
   ]
 }

@@ -35,6 +35,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { reduceOutcome, recordInput } from './tools/outcome.mjs';
+import { checkControllerDocument, checkDocument } from './tools/document-rules.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_DIR = path.join(HERE, 'schemas');
@@ -459,20 +460,31 @@ function checkFixtures(index) {
 
     const { errors } = validate(registry.get(entry.schema), data, { file: entry.schema });
 
-    // A document fixture may be here precisely because it is wrong. The graph
-    // rules a schema cannot express — a helper cycle, a machine pointing at a
-    // site nobody defined — are checked in code, and both sources of problems
-    // count toward whether the fixture is refused.
-    const graph = entry.kind === 'document' && entry.schema === 'controller-document.schema.json'
-      ? checkControllerDocument(data)
-      : { errors: [], warnings: [] };
-    const problems = [...errors, ...graph.errors];
+    // A setup document fixture may be here precisely because it is wrong. It
+    // goes through section 9.7 as a client's peer intake reads it, from the
+    // file's own bytes: tools/document-rules.mjs writes the schema out by hand
+    // and adds the rules a schema cannot express (a helper cycle, a machine
+    // pointing at a site nobody defined, a member written twice). Both sources
+    // count toward whether the fixture is refused, and the two readings of the
+    // schema have to agree with each other as well.
+    const isSetupDocument = entry.kind === 'document' && entry.schema === 'controller-document.schema.json';
+    const graph = isSetupDocument ? checkDocument(fs.readFileSync(file), { intake: 'peer' }) : { errors: [], warnings: [] };
+    const describe = (problem) => `${problem.path === '' ? '<document>' : problem.path}: ${problem.message} (${problem.code})`;
+    const problems = [...errors, ...graph.errors.map(describe)];
+    if (isSetupDocument && !graph.errors.some((problem) => problem.code === 'duplicate-member')) {
+      const written = graph.errors.some((problem) => problem.code === 'schema');
+      if (written !== (errors.length > 0)) {
+        fail(`fixtures/${entry.file}`, `${entry.schema} ${errors.length > 0 ? 'refuses' : 'accepts'} this document and tools/document-rules.mjs ${written ? 'reports' : 'reports no'} schema error; the schema written out by hand has drifted from the schema`);
+      } else {
+        pass();
+      }
+    }
 
     if (entry.expect === 'invalid') {
       // The point of an invalid fixture is that something rejects it. One that
       // quietly passes means the rule it was written for does not exist.
       if (problems.length === 0) {
-        fail(`fixtures/${entry.file}`, `the index expects this to be refused and nothing refused it; the rule it was written for is missing from ${entry.schema} and from checkControllerDocument`);
+        fail(`fixtures/${entry.file}`, `the index expects this to be refused and nothing refused it; the rule it was written for is missing from ${entry.schema} and from tools/document-rules.mjs`);
       } else {
         pass();
       }
@@ -488,7 +500,7 @@ function checkFixtures(index) {
       loaded.delete(entry.file);
     } else {
       pass();
-      for (const warning of graph.warnings) warn(`fixtures/${entry.file}: ${warning}`);
+      for (const warning of graph.warnings) warn(`fixtures/${entry.file}: ${warning.message} (${warning.code})`);
     }
 
     // Everything below describes a reply. A document has no envelope, no exit
@@ -580,141 +592,6 @@ function checkOutcomePresence(where, entry, data) {
   if (!mutating && 'outcome' in data) {
     fail(where, `a ${entry.command} reply changes nothing, so it carries no outcome`);
   }
-}
-
-// ---------------------------------------------------------------------------
-// The shared setup document: the rules that are about relationships.
-//
-// JSON Schema can say a helper has a machine id and an action id. It cannot say
-// that the machine exists, that it is not the machine being woken, or that the
-// helpers do not form a ring in which every machine waits for another to be
-// awake first. Those are the mistakes an editor actually makes, so they are
-// checked here and every client editor has to refuse the same documents.
-// ---------------------------------------------------------------------------
-
-function helpersOf(machine) {
-  const list = machine.wake?.helpers ?? (machine.wake?.helper ? [machine.wake.helper] : []);
-  return list.filter((helper) => helper && typeof helper.machine === 'string');
-}
-
-function checkControllerDocument(document) {
-  const errors = [];
-  const warnings = [];
-  const machines = Array.isArray(document.machines) ? document.machines : [];
-  const sites = Array.isArray(document.sites) ? document.sites : [];
-
-  const machineIds = new Set();
-  for (const machine of machines) {
-    if (machineIds.has(machine.id)) errors.push(`two machines share the id "${machine.id}"`);
-    machineIds.add(machine.id);
-
-    const endpointIds = new Set();
-    for (const endpoint of machine.endpoints ?? []) {
-      if (endpoint.id === undefined) continue;
-      if (endpointIds.has(endpoint.id)) {
-        errors.push(`${machine.id}: two endpoints share the id "${endpoint.id}", so a remembered route is ambiguous`);
-      }
-      endpointIds.add(endpoint.id);
-    }
-
-    const systemIds = new Set();
-    for (const system of machine.systems ?? []) {
-      if (systemIds.has(system.id)) errors.push(`${machine.id}: two systems share the id "${system.id}"`);
-      systemIds.add(system.id);
-      // The argv-item guard's limit is 4096 UTF-8 bytes. A schema can only
-      // count characters, so the bytes are counted here.
-      for (const item of Array.isArray(system.agent) ? system.agent : []) {
-        if (typeof item === 'string' && Buffer.byteLength(item, 'utf8') > 4096) {
-          errors.push(`${machine.id}/${system.id}: an agent argv item is ${Buffer.byteLength(item, 'utf8')} UTF-8 bytes, over the 4096 every dispatcher and client allows`);
-        }
-      }
-    }
-  }
-
-  const siteIds = new Set();
-  for (const site of sites) {
-    if (siteIds.has(site.id)) errors.push(`two sites share the id "${site.id}"`);
-    siteIds.add(site.id);
-  }
-
-  // Identical private subnets on two sites are legal and expected: home routers
-  // ship the same default range. It is a warning because it tells the reader
-  // that a prefix match cannot decide where this device is, and that the client
-  // has to fall back to the user's own answer or treat itself as off-site.
-  const byPrefix = new Map();
-  for (const site of sites) {
-    for (const prefix of site.lanPrefixes ?? []) {
-      if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
-      byPrefix.get(prefix).push(site.id);
-    }
-  }
-  for (const [prefix, owners] of byPrefix) {
-    if (owners.length > 1) {
-      warnings.push(`sites ${owners.join(' and ')} both use the prefix ${prefix}, so matching it does not say which site a device is on; the client must treat its location as unconfirmed unless the user has chosen one`);
-    }
-  }
-
-  for (const machine of machines) {
-    if (machine.site !== undefined && sites.length > 0 && !siteIds.has(machine.site)) {
-      errors.push(`${machine.id}: site "${machine.site}" is not in sites[], so this machine drops out of every on-site decision`);
-    }
-
-    const helpers = helpersOf(machine);
-    for (const helper of helpers) {
-      if (helper.machine === machine.id) {
-        errors.push(`${machine.id}: is its own wake helper, which asks a machine that is off to wake itself`);
-      } else if (!machineIds.has(helper.machine)) {
-        errors.push(`${machine.id}: wake helper "${helper.machine}" is not a machine in this document`);
-      }
-    }
-
-    // The singular key is what a 1.2 client reads. If the two disagree, an old
-    // and a new client try different machines from the same document.
-    if (machine.wake?.helper && Array.isArray(machine.wake.helpers) && machine.wake.helpers.length > 0) {
-      const first = machine.wake.helpers[0];
-      if (first.machine !== machine.wake.helper.machine || first.action !== machine.wake.helper.action) {
-        errors.push(`${machine.id}: wake.helper is ${machine.wake.helper.machine}/${machine.wake.helper.action} and wake.helpers[0] is ${first.machine}/${first.action}; the singular key is the compatibility alias and must repeat the first entry`);
-      }
-    }
-
-    if (machine.wake && helpers.length > 0) {
-      for (const helper of helpers) {
-        const target = machines.find((entry) => entry.id === helper.machine);
-        if (target && machine.site !== undefined && target.site !== undefined && target.site !== machine.site) {
-          warnings.push(`${machine.id}: helper ${helper.machine} is at site ${target.site}, not ${machine.site}; this only works if the action reaches the target's network another way, such as a router or a VPN`);
-        }
-        if (target && target.alwaysOn !== true) {
-          warnings.push(`${machine.id}: helper ${helper.machine} is not marked alwaysOn, so waking ${machine.id} may need ${helper.machine} to be woken first`);
-        }
-      }
-    }
-
-    if (machine.wake && helpers.length === 0 && machine.site === undefined && machine.wake.lanPrefix === undefined) {
-      warnings.push(`${machine.id}: has a wake block but no site, no lanPrefix and no helper, so it can only be woken by a controller that happens to be on its LAN`);
-    }
-  }
-
-  // A ring of helpers is the failure that looks fine one machine at a time.
-  for (const machine of machines) {
-    const seen = new Set([machine.id]);
-    const walk = (id, trail) => {
-      const current = machines.find((entry) => entry.id === id);
-      if (!current) return;
-      for (const helper of helpersOf(current)) {
-        if (seen.has(helper.machine)) {
-          if (helper.machine === machine.id && trail.length > 0) {
-            errors.push(`wake helper cycle: ${[...trail, id, helper.machine].join(' needs ')}; every machine in it waits for another to be awake first`);
-          }
-          continue;
-        }
-        seen.add(helper.machine);
-        walk(helper.machine, [...trail, id]);
-      }
-    };
-    walk(machine.id, []);
-  }
-
-  return { errors: [...new Set(errors)], warnings: [...new Set(warnings)] };
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,6 +1422,375 @@ function unsafeNumbers(value, at, found = []) {
   return found;
 }
 
+// ---------------------------------------------------------------------------
+// Command lines, read back (section 15.2).
+//
+// A line is decoded the way the program at the other end reads it, by code
+// written here from the rules of that program and not from the serialiser: a
+// POSIX shell's single quotes (which the dispatcher shares), the C runtime's
+// reading of a Windows command line after cmd strips its @, PowerShell's
+// single-quoted strings with its five quote characters. The decoded words must
+// be the argv, and every rule a grammar exists for must hold of the line, so a
+// serialiser that drops the @ or leaves a tilde bare fails here even when its
+// own vectors agree with it.
+// ---------------------------------------------------------------------------
+
+// What a POSIX shell, zsh and fish included, read as plain characters outside quotes.
+const SHELL_PLAIN = /^[A-Za-z0-9._/:@+,=-]$/;
+
+/** A POSIX line as sh reads it: words separated by one space, each made of plain characters, '...' runs and \'. */
+function decodePosixLine(line) {
+  const words = [];
+  const runs = [];
+  let index = 0;
+  while (index < line.length) {
+    let word = '';
+    let bare = true;
+    let first = true;
+    while (index < line.length && line[index] !== ' ') {
+      const character = line[index];
+      if (character === "'") {
+        const close = line.indexOf("'", index + 1);
+        if (close < 0) return { error: 'a quoted run is never closed' };
+        runs.push(line.slice(index + 1, close));
+        word += line.slice(index + 1, close);
+        bare = false;
+        index = close + 1;
+      } else if (character === '\\' && line[index + 1] === "'") {
+        word += "'";
+        bare = false;
+        index += 2;
+      } else if (SHELL_PLAIN.test(character)) {
+        // zsh expands a word that starts with = to the path of a command.
+        if (first && character === '=') return { error: 'a word starts with an unquoted =' };
+        word += character;
+        index += 1;
+      } else {
+        return { error: `${JSON.stringify(character)} stands outside quotes, where a shell reads it as syntax` };
+      }
+      first = false;
+    }
+    // sh reads an unquoted first word with = in it as a variable assignment.
+    if (words.length === 0 && bare && word.includes('=')) return { error: 'the first word is an unquoted assignment' };
+    words.push(word);
+    if (index < line.length) {
+      index += 1;
+      if (index === line.length || line[index] === ' ') return { error: 'words are not separated by exactly one space' };
+    }
+  }
+  return { words, runs };
+}
+
+/** A cmd line: @, then double-quoted elements separated by one space, read with the C runtime's backslash rule. */
+function decodeCmdLine(line) {
+  if (!line.startsWith('@')) return { error: 'a cmd line starts with @, so cmd /c runs it the same whether or not sshd quoted it' };
+  if (/[%!]/.test(line)) return { error: 'cmd expands % and ! even inside double quotes' };
+  const body = line.slice(1);
+  const words = [];
+  let index = 0;
+  while (index < body.length) {
+    if (body[index] !== '"') return { error: 'every element of a cmd line is double-quoted' };
+    index += 1;
+    let word = '';
+    for (;;) {
+      let slashes = 0;
+      while (body[index] === '\\') {
+        slashes += 1;
+        index += 1;
+      }
+      if (index >= body.length) return { error: 'a quoted element is never closed' };
+      if (body[index] === '"') {
+        // 2n backslashes and a quote: n backslashes, and the quote closes.
+        if (slashes % 2 === 1) return { error: 'an element carries an escaped double quote' };
+        word += '\\'.repeat(slashes / 2);
+        index += 1;
+        break;
+      }
+      word += '\\'.repeat(slashes) + body[index];
+      index += 1;
+    }
+    words.push(word);
+    if (index < body.length) {
+      if (body[index] !== ' ' || body[index + 1] !== '"') return { error: 'elements are not separated by exactly one space' };
+      index += 1;
+    }
+  }
+  return { words };
+}
+
+const POWERSHELL_QUOTES = new Set(["'", '\u2018', '\u2019', '\u201a', '\u201b']);
+
+/** A PowerShell line: the call operator, then single-quoted strings in which any of five quote characters doubled is one. */
+function decodePowershellLine(line) {
+  if (!line.startsWith('& ')) return { error: 'a PowerShell line starts with the call operator and one space' };
+  const body = line.slice(2);
+  const words = [];
+  let index = 0;
+  while (index < body.length) {
+    if (!POWERSHELL_QUOTES.has(body[index])) return { error: 'every element of a PowerShell line is single-quoted' };
+    index += 1;
+    let word = '';
+    for (;;) {
+      if (index >= body.length) return { error: 'a quoted element is never closed' };
+      const character = body[index];
+      if (POWERSHELL_QUOTES.has(character)) {
+        // The tokenizer reads two quote characters in a row as one, the second.
+        if (POWERSHELL_QUOTES.has(body[index + 1])) {
+          word += body[index + 1];
+          index += 2;
+          continue;
+        }
+        index += 1;
+        break;
+      }
+      word += character;
+      index += 1;
+    }
+    words.push(word);
+    if (index < body.length) {
+      if (body[index] !== ' ' || index + 1 === body.length) return { error: 'elements are not separated by exactly one space' };
+      index += 1;
+    }
+  }
+  return { words };
+}
+
+/** What each refusal code claims about the element it names, restated from section 15.2. */
+const ELEMENT_REFUSALS = {
+  'empty-argument': (value) => value === '',
+  'control-character': (value) => /[\u0000-\u001f\u007f]/.test(value),
+  'posix-backslash': (value) => value.includes('\\\\') || value.includes("\\'") || value.endsWith('\\'),
+  'argument-too-long': (value) => Buffer.byteLength(value, 'utf8') > 4096,
+  'double-quote': (value) => value.includes('"'),
+  percent: (value) => value.includes('%'),
+  exclamation: (value) => value.includes('!'),
+  'trailing-backslash': (value) => value.endsWith('\\'),
+  'double-space': (value) => value.includes('  '),
+};
+
+function checkCommandLine(where, entry) {
+  const { grammar, argv } = entry.input ?? {};
+  const { line, refusal, index } = entry.expect ?? {};
+  if (typeof line !== 'string') {
+    // A refusal names the element it is about, and that element has to show
+    // what the code says; the elements before it must not.
+    if (index !== null) {
+      const holds = ELEMENT_REFUSALS[refusal];
+      if (holds === undefined || typeof argv?.[index] !== 'string' || !holds(argv[index])) {
+        fail(where, `the refusal ${refusal} names element ${index}, ${JSON.stringify(argv?.[index])}, which does not show it`);
+      } else {
+        pass();
+      }
+    } else if (refusal === 'no-command' && argv.length !== 0) fail(where, 'no-command is for an empty argv');
+    else if (refusal === 'too-many-arguments' && argv.length <= 64) fail(where, 'too-many-arguments is for more than 64 elements');
+    else pass();
+    return;
+  }
+  const decoded = grammar === 'cmd' ? decodeCmdLine(line)
+    : grammar === 'powershell' ? decodePowershellLine(line)
+      : decodePosixLine(line);
+  if (decoded.error) {
+    fail(where, `the ${grammar} line does not read back: ${decoded.error}`);
+    return;
+  }
+  if (!jsonEqual(decoded.words, argv)) {
+    fail(where, `the ${grammar} line reads back as ${JSON.stringify(decoded.words)}, not the argv ${JSON.stringify(argv)}`);
+    return;
+  }
+  const problems = [];
+  if (grammar === 'posix') {
+    // fish reads \\ and \' inside single quotes as escapes, so neither may
+    // appear in a run, and a run may not end in a backslash.
+    if (decoded.runs.some((run) => run.includes('\\\\') || run.endsWith('\\'))) problems.push('a quoted run holds a sequence fish reads as an escape');
+  }
+  if (grammar === 'dispatch') {
+    if (Buffer.byteLength(line, 'utf8') > 16384) problems.push('the line is over the 16384 bytes the dispatcher reads');
+    if (decoded.words.length > 64) problems.push('the line has more than the 64 words the dispatcher reads');
+    if (decoded.words.some((word) => Buffer.byteLength(word, 'utf8') > 4096)) problems.push('a word is over the 4096 bytes the dispatcher reads');
+  }
+  if (grammar === 'powershell' && decoded.words.some((word) => word.includes('"') || word.endsWith('\\') || word.includes('  '))) {
+    problems.push('an element holds what PowerShell native-argument passing mangles');
+  }
+  if (problems.length > 0) fail(where, problems.join('; '));
+  else pass();
+}
+
+const ROUTE_LEVEL_KINDS = new Set(['noRoute', 'launchFailed', 'hostUnreachable', 'connectionRefused',
+  'authenticationFailed', 'hostKeyChanged', 'hostKeyUnknown', 'timedOut', 'linkLost']);
+const isBlank = (text) => /^[\t\n\r ]*$/.test(text);
+
+/** Whether stdout holds a JSON object from its first { to its last }, decided here again. */
+function holdsReply(stdout) {
+  const from = stdout.indexOf('{');
+  const to = stdout.lastIndexOf('}');
+  if (from < 0 || to <= from) return false;
+  try {
+    const value = JSON.parse(stdout.slice(from, to + 1));
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The safety claims a classification makes, checked against its evidence: a
+ * reply is a reply exactly when stdout holds one, and `never` is only claimed
+ * when something shows the command cannot have run. That second claim is the
+ * one a mutation is resent on, so it is the one worth checking twice.
+ */
+function checkClassification(where, entry) {
+  const evidence = entry.input ?? {};
+  const expect = entry.expect ?? {};
+  const problems = [];
+  if ((expect.outcome === 'reply') !== holdsReply(evidence.stdout ?? '')) problems.push('the outcome does not follow from whether stdout holds a JSON object');
+  if ((expect.outcome === 'reply') !== (expect.dispatch === 'acknowledged')) problems.push('only a reply is acknowledged');
+  if (expect.outcome === 'failure' && expect.routeLevel !== ROUTE_LEVEL_KINDS.has(expect.kind)) problems.push(`routeLevel is ${expect.routeLevel} for ${expect.kind}`);
+  if (expect.dispatch === 'never') {
+    const proven = evidence.launchFailed === true
+      || (evidence.exitCode === 255 && isBlank(evidence.stdout) && !isBlank(evidence.sshLog))
+      || ([126, 127, 9009].includes(evidence.exitCode) && isBlank(evidence.stdout));
+    if (!proven || evidence.timedOut === true && !evidence.launchFailed) problems.push('never is claimed without evidence that the command cannot have run');
+  }
+  if (problems.length > 0) fail(where, problems.join('; '));
+  else pass();
+}
+
+/** A walk may move a mutation on only from an attempt that was never dispatched. */
+function checkWalk(where, entry) {
+  const { safety, attempts } = entry.input ?? {};
+  const { sent, ending } = entry.expect ?? {};
+  const problems = [];
+  if (!sent.every((value, position) => position === 0 || value > sent[position - 1])) problems.push('attempts are not made in order');
+  if (safety === 'mutation') {
+    for (const position of sent.slice(0, -1)) {
+      if (attempts[position]?.result?.dispatch !== 'never') problems.push(`attempt ${position} may have run and a later one was made anyway`);
+    }
+  }
+  if (ending === 'reply' && attempts[sent.at(-1)]?.result?.outcome !== 'reply') problems.push('a walk that ends in a reply ends on one');
+  if (problems.length > 0) fail(where, problems.join('; '));
+  else pass();
+}
+
+// ---------------------------------------------------------------------------
+// Document acceptance, against the schema (section 9.7).
+// ---------------------------------------------------------------------------
+
+/** Whether any argv item of a document is over 4096 UTF-8 bytes: the one guard a schema cannot count. */
+function argvOverBytes(document) {
+  return (Array.isArray(document?.machines) ? document.machines : []).some((machine) =>
+    (Array.isArray(machine?.systems) ? machine.systems : []).some((system) =>
+      (Array.isArray(system?.agent) ? system.agent : []).some((item) => typeof item === 'string' && Buffer.byteLength(item, 'utf8') > 4096)));
+}
+
+function checkAcceptanceCase(where, entry) {
+  const { intake, text } = entry.input ?? {};
+  const expect = entry.expect ?? {};
+  const problems = [];
+  for (const key of ['errors', 'warnings']) {
+    const list = expect[key] ?? [];
+    if (!list.every((code, position) => position === 0 || code > list[position - 1])) problems.push(`${key} are not sorted and unique`);
+  }
+  if (expect.valid !== (expect.errors.length === 0)) problems.push('valid is not "no errors"');
+  if (expect.errors.length > 0 && expect.warnings.length > 0) problems.push('warnings are only reported for a document without errors');
+  if ((entry.tags ?? []).includes('agent-enforced') && expect.valid) problems.push('an agent-enforced case must be refused, because agent 3.1.0 refuses it');
+
+  const bytes = Buffer.from(text, 'utf8');
+  const refused = rejectionAgain(bytes) !== null;
+  const keep = intake === 'applied' ? !refused : expect.valid;
+  if (expect.keep !== keep) problems.push(`keep is ${expect.keep}; under ${intake} intake it is ${keep}`);
+
+  // Whether the schema refuses the document, decided by this file's validator.
+  // A text section 12 refuses is no document and breaks the schema; local
+  // intake first gives a document without an id the identity of section 9.5.
+  if (!expect.errors.includes('duplicate-member')) {
+    let schemaRefuses = refused;
+    let identity = false;
+    if (!refused) {
+      let document = JSON.parse(canonicalBytesAgain(bytes).toString('utf8'));
+      const block = document.controller;
+      identity = intake === 'local' && (!('controller' in document)
+        || (block !== null && typeof block === 'object' && !Array.isArray(block) && (block.id === undefined || block.id === null)));
+      if (identity) document = { ...document, controller: { ...(block ?? {}), id: 'setup-assigned', revision: 1, lineage: [] } };
+      schemaRefuses = validate(registry.get('controller-document.schema.json'), document, { file: 'controller-document.schema.json' }).errors.length > 0
+        || argvOverBytes(document);
+    }
+    if (expect.errors.includes('schema') !== schemaRefuses) {
+      problems.push(`controller-document.schema.json ${schemaRefuses ? 'refuses' : 'accepts'} the document and the case ${expect.errors.includes('schema') ? 'says' : 'does not say'} schema`);
+    }
+    if (expect.assignsIdentity !== identity) problems.push(`assignsIdentity is ${expect.assignsIdentity} and section 9.5 gives ${identity}`);
+  }
+  if (problems.length > 0) fail(where, problems.join('; '));
+  else pass();
+}
+
+// ---------------------------------------------------------------------------
+// Launch values (section 9.9).
+// ---------------------------------------------------------------------------
+
+/** Section 15.1 without a restricted session, restated: the grammar a launch tuple records. */
+function grammarAgain(system, length) {
+  if (system.restricted === true) return length === 2 ? 'dispatch' : 'refused:restricted-agent-shape';
+  if (system.shell === undefined || system.shell === null) return system.platform === 'windows' ? 'cmd' : 'posix';
+  return ['posix', 'cmd', 'powershell'].includes(system.shell) ? system.shell : 'refused:unknown-shell';
+}
+
+/** The record that approves every launch value of a document, built here apart from tools/launch.mjs. */
+function approvalsAgain(document) {
+  const record = { schema: 1, seededFrom: 'none', machines: {} };
+  const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  for (const machine of Array.isArray(document.machines) ? document.machines : []) {
+    if (!isObject(machine) || typeof machine.id !== 'string' || Object.hasOwn(record.machines, machine.id)) continue;
+    const entry = { systems: {} };
+    for (const system of Array.isArray(machine.systems) ? machine.systems : []) {
+      if (!isObject(system) || typeof system.id !== 'string' || Object.hasOwn(entry.systems, system.id)) continue;
+      const { agent } = system;
+      if (!Array.isArray(agent) || agent.length === 0 || !agent.every((item) => typeof item === 'string')) continue;
+      entry.systems[system.id] = { agent, grammar: grammarAgain(system, agent.length) };
+    }
+    if (isObject(machine.ssh) && typeof machine.ssh.identityFile === 'string' && machine.ssh.identityFile !== '') entry.identityFile = machine.ssh.identityFile;
+    record.machines[machine.id] = entry;
+  }
+  const repo = isObject(document.appUpdates) ? document.appUpdates.githubRepo : undefined;
+  if (typeof repo === 'string' && repo !== '' && repo !== 'x1f4r/legion-control') record.githubRepo = repo;
+  if (isObject(document.local) && document.local.enabled !== false) {
+    record.local = { agent: typeof document.local.agent === 'string' && document.local.agent !== '' ? document.local.agent : null };
+  }
+  return record;
+}
+
+function checkLaunchCase(where, entry, reference) {
+  const { heldText, offeredText } = entry.input ?? {};
+  const problems = [];
+  // The agent stores the held document and is pushed the offered one, so both
+  // must be documents section 9.7 accepts, and the offered one must descend
+  // from the held one.
+  for (const [label, text] of [['heldText', heldText], ['offeredText', offeredText]]) {
+    if (text === null) continue;
+    const document = JSON.parse(text);
+    if (validate(registry.get('controller-document.schema.json'), document, { file: 'controller-document.schema.json' }).errors.length > 0) {
+      problems.push(`${label} breaks controller-document.schema.json`);
+    }
+    const accepted = checkDocument(text, { intake: 'peer' });
+    if (!accepted.valid) problems.push(`${label} is refused by section 9.7: ${accepted.errors.map((problem) => problem.code).join(', ')}`);
+  }
+  const offered = JSON.parse(offeredText);
+  if (heldText !== null) {
+    const held = JSON.parse(heldText);
+    const heldHash = crypto.createHash('sha256').update(canonicalBytesAgain(Buffer.from(heldText, 'utf8'))).digest('hex');
+    if (offered.controller?.id !== held.controller?.id || !(offered.controller?.revision > held.controller?.revision)
+      || !(offered.controller?.lineage ?? []).includes(heldHash)) {
+      problems.push('offeredText does not descend from heldText, so the agent would refuse it before reading its launch values');
+    }
+    // What agent 3.1.0 answers a restricted push, from a record built here.
+    const refused = reference.launchReview(approvalsAgain(held), reference.launchProjection(offered)).length > 0;
+    if (refused !== entry.expect?.restrictedRefused) problems.push(`with the held document's own values approved, a restricted push is ${refused ? '' : 'not '}refused, and the case says restrictedRefused ${entry.expect?.restrictedRefused}`);
+  } else if (entry.expect?.restrictedRefused !== false) {
+    problems.push('with nothing held, the ordinary rules apply and a restricted push is not refused for launch values');
+  }
+  if (problems.length > 0) fail(where, problems.join('; '));
+  else pass();
+}
+
 /**
  * The checks each family gets from code that is not its reference. A family
  * the index lists and this table does not is a failure: a vector checked only
@@ -1574,6 +1820,32 @@ const INDEPENDENT = {
   outcome: (where) => {
     if (outcomesCompared === 0) fail(where, 'no fixture outcome was compared with the reducer, so the outcome family was checked by its own reference only');
     else pass();
+  },
+
+  transport: (where, data, groups) => {
+    for (const entry of groups.get('commandLines') ?? []) checkCommandLine(`${where}/commandLines/${entry.name}`, entry);
+    for (const entry of groups.get('classifications') ?? []) checkClassification(`${where}/classifications/${entry.name}`, entry);
+    for (const entry of groups.get('walks') ?? []) checkWalk(`${where}/walks/${entry.name}`, entry);
+    for (const entry of groups.get('statusBudgets') ?? []) {
+      const { remainingMs, attemptsMade } = entry.input ?? {};
+      const { attempt, budgetMs } = entry.expect ?? {};
+      const at = `${where}/statusBudgets/${entry.name}`;
+      if (attempt && !(budgetMs >= 1000 && budgetMs <= 20000 && budgetMs <= Math.max(1000, remainingMs - 5000))) {
+        fail(at, `a budget of ${budgetMs} ms with ${remainingMs} ms left breaks the 1000 to 20000 ms range or the 5 s margin`);
+      } else if (!attempt && (attemptsMade === 0 || budgetMs !== null)) {
+        fail(at, 'only a later attempt may be skipped, and a skipped attempt has no budget');
+      } else {
+        pass();
+      }
+    }
+  },
+
+  'setup-acceptance': (where, data, groups) => {
+    for (const entry of groups.get('documents') ?? []) checkAcceptanceCase(`${where}/documents/${entry.name}`, entry);
+  },
+
+  launch: (where, data, groups, reference) => {
+    for (const entry of groups.get('review') ?? []) checkLaunchCase(`${where}/review/${entry.name}`, entry, reference);
   },
 };
 
@@ -1690,7 +1962,7 @@ async function checkVectorFamilies(index) {
     if (independent === undefined) {
       fail(where, `validate.mjs has no independent check for the ${entry.family} family; a family checked only by its own reference checks nothing`);
     } else {
-      independent(where, data, groups);
+      independent(where, data, groups, reference);
     }
     families.set(entry.family, { data, groups });
   }
