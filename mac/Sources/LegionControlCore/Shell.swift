@@ -12,6 +12,11 @@ struct CommandResult: Sendable {
     /// True when this app ended the process: its watchdog fired or the task that ran it was
     /// cancelled. Either way the far side may have been halfway through something.
     var timedOut: Bool
+    /// True when the task that ran it was cancelled before the command had finished, whether it
+    /// had been started or not. The watchdog firing is evidence about the far side; a cancellation
+    /// is only evidence that nobody wants the answer any more, and a transport must not read it as
+    /// a route that failed.
+    var cancelled = false
     var launchFailure: String?
     /// True when a stream went past `Shell.outputLimit` and the rest of it was thrown away. Output
     /// that did not arrive whole is never read as an agent's reply.
@@ -25,6 +30,7 @@ struct CommandResult: Sendable {
     /// banner, stack frames and caret art, so the lines that carry no message are dropped first.
     var failureText: String {
         if let launchFailure { return launchFailure }
+        if cancelled { return "The request was cancelled before the command finished." }
         if timedOut { return "The command did not finish in time." }
         let fromError = Self.informativeLines(standardError)
         if !fromError.isEmpty { return fromError }
@@ -71,7 +77,7 @@ enum Shell {
     /// else here wants: nothing should ever sit waiting on a terminal that is not there.
     ///
     /// Cancelling the task that awaits this stops the command the way the watchdog does, and the
-    /// result says this app ended it rather than that it finished.
+    /// result says this app ended it rather than that it finished, and that a cancellation was why.
     ///
     /// The rest is for the tests: `environment` replaces the one every command normally gets,
     /// `killGrace` is the time between SIGTERM and SIGKILL, and `drainGrace` is how long output may
@@ -106,7 +112,7 @@ enum Shell {
                 }
             }
         } onCancel: {
-            control.stop()
+            control.cancel()
         }
     }
 
@@ -205,7 +211,9 @@ enum Shell {
         // yet, so nothing has to be stopped, and nothing ran.
         if control.isStopping {
             output.closeBoth(); errors.closeBoth(); inputPipe?.closeBoth()
-            return launchFailure("\(executable) was not started: the request was cancelled first.")
+            var result = launchFailure("\(executable) was not started: the request was cancelled first.")
+            result.cancelled = true
+            return result
         }
 
         var pid: pid_t = 0
@@ -269,6 +277,7 @@ enum Shell {
             standardOutput: String(decoding: out.data, as: UTF8.self),
             standardError: String(decoding: err.data, as: UTF8.self),
             timedOut: control.endedByThisApp,
+            cancelled: control.wasCancelled,
             launchFailure: nil,
             standardOutputTruncated: out.truncated,
             standardErrorTruncated: err.truncated
@@ -287,6 +296,7 @@ private final class RunControl: @unchecked Sendable {
     private var pid: pid_t = 0
     private var stopping = false
     private var signalled = false
+    private var cancelled = false
     private var collected = false
     private var killTimer: DispatchWorkItem?
 
@@ -294,6 +304,7 @@ private final class RunControl: @unchecked Sendable {
 
     var isStopping: Bool { lock.withLock { stopping } }
     var endedByThisApp: Bool { lock.withLock { signalled } }
+    var wasCancelled: Bool { lock.withLock { cancelled } }
 
     func started(_ pid: pid_t) {
         lock.withLock {
@@ -302,12 +313,26 @@ private final class RunControl: @unchecked Sendable {
         }
     }
 
+    /// The watchdog's way in.
     func stop() {
+        lock.withLock { stopLocked() }
+    }
+
+    /// The task that ran the command was cancelled. It is stopped the way the watchdog stops it,
+    /// and remembered as cancelled, unless it had already finished on its own.
+    func cancel() {
         lock.withLock {
-            guard !stopping else { return }
-            stopping = true
-            if pid != 0, !collected { terminate() }
+            guard !collected else { return }
+            cancelled = true
+            stopLocked()
         }
+    }
+
+    /// Called with the lock held.
+    private func stopLocked() {
+        guard !stopping else { return }
+        stopping = true
+        if pid != 0, !collected { terminate() }
     }
 
     /// The process has exited and is about to be collected. When this app was stopping it, whatever

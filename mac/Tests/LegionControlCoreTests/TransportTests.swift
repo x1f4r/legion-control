@@ -205,6 +205,48 @@ struct TransportTests {
         }
     }
 
+    @Test("a cancelled request ends the walk and holds no route back", arguments: [CommandSafety.readOnly, .mutation])
+    func cancellationIsNotARouteFailure(safety: CommandSafety) async throws {
+        // Cancelling a task stops its ssh, which reads as a timeout, and a timeout is about the
+        // route. Recorded, it held every address of the machine back for a minute, and a read
+        // went on to the next route only to find the task cancelled and record a launch failure
+        // there too. Closing the Service setup sheet while it loaded did exactly that.
+        let machine = Self.machine()
+        let calls = Counter()
+        let (agent, logs) = Self.agent(machine) { _ in
+            await calls.increment()
+            // ssh as Shell runs it: a process that is still going when the task is cancelled.
+            return await Shell.run(executable: "/bin/sleep", arguments: ["30"], timeout: 60)
+        }
+        defer { try? FileManager.default.removeItem(at: logs) }
+        let request = safety == .readOnly ? AgentRequest.status(dialect: .v3) : try Self.restart()
+        let task = Task { try await agent.send(request, decoding: AgentActionResult.self, preferring: nil) }
+        while await calls.value == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        task.cancel()
+        let outcome = await task.result
+
+        #expect(await calls.value == 1)
+        for route in machine.routes { #expect(agent.backoff.failure(for: route.target) == nil, "\(route.label)") }
+        switch (safety, outcome) {
+        case (.readOnly, .failure(let error)):
+            #expect(error is CancellationError)
+        case (.mutation, .failure(let error as AgentFailure)):
+            // It may have started on the far side, and cancelling it here does not stop it there.
+            #expect(error.dispatch == .unknown)
+        default:
+            Issue.record("unexpected outcome \(outcome)")
+        }
+
+        // A task cancelled before anything was sent sends nothing.
+        let early = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await agent.send(request, decoding: AgentActionResult.self, preferring: nil)
+        }
+        if case .failure(let error) = await early.result { #expect(error is CancellationError) }
+        else { Issue.record("a cancelled request was answered") }
+        #expect(await calls.value == 1)
+    }
+
     @Test("a reply that cannot be read is an acknowledgement, and is not sent again")
     func unreadableReplyIsNotRetried() async throws {
         let calls = Counter()

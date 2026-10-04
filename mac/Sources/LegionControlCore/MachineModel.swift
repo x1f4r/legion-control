@@ -347,6 +347,9 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
             }
             reconcileSetup()
             reconcileIfNeeded()
+        } catch is CancellationError {
+            // Nobody is waiting for this read any more, and it learnt nothing about the machine,
+            // so the machine keeps reading as it did.
         } catch let failure as AgentFailure {
             handleStatusFailure(failure)
             lastChecked = Date()

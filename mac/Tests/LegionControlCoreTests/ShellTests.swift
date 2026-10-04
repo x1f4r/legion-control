@@ -55,9 +55,26 @@ struct ShellTests {
         let result = await task.value
 
         #expect(result.timedOut)
+        // And it says why, so a transport does not take the stop for a route that went quiet.
+        #expect(result.cancelled)
         #expect(result.launchFailure == nil)
         #expect(Date().timeIntervalSince(started) < 10)
         #expect(await Self.isGone(child))
+    }
+
+    @Test("a command whose task was cancelled before it started is never run, and says so")
+    func cancelledBeforeStart() async throws {
+        let directory = try Self.scratch()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let marker = directory.appending(path: "ran")
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await Shell.run(executable: "/usr/bin/touch", arguments: [marker.path], timeout: 10)
+        }
+        let result = await task.value
+        #expect(result.cancelled)
+        #expect(result.launchFailure != nil)
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
     }
 
     @Test("a helper that ignores SIGTERM goes with the command it belonged to")
@@ -86,6 +103,8 @@ struct ShellTests {
         let result = await Shell.run(executable: "/bin/sh", arguments: ["-c", "trap '' TERM; sleep 30"],
                                      timeout: 0.3, killGrace: 0.3)
         #expect(result.timedOut)
+        // The watchdog is not a cancellation: it is what the far side's silence comes to.
+        #expect(!result.cancelled)
         // Ended by a signal, so there is no exit status to read anything from.
         #expect(result.exitCode == nil)
         #expect(Date().timeIntervalSince(started) < 10)

@@ -163,6 +163,9 @@ struct RemoteAgent: Sendable {
     /// a mutation goes on only after a failure that proves nothing ran, and AttemptWalk is where that
     /// rule is written. Each attempt gets a fresh ssh log, because ssh's own words are the only
     /// evidence of where a command stopped.
+    ///
+    /// Cancelling the task ends the walk with a CancellationError, except for a mutation that may
+    /// already have run, which is reported as unknown like any other.
     private func call<Value: Decodable & Sendable>(
         _ request: AgentRequest,
         decoding: Value.Type,
@@ -186,6 +189,9 @@ struct RemoteAgent: Sendable {
         var dead = Set<String>()
 
         for attempt in attempts where !dead.contains(attempt.route.id) {
+            // Nobody is waiting for the answer any more, so the walk ends where it is. The routes
+            // it has not tried have done nothing wrong, and nothing more is sent to find that out.
+            try Task.checkCancellation()
             if var failure = backoff.failure(for: attempt.route.target) {
                 failure.dispatch = .never
                 best = Self.preferred(best, failure)
@@ -262,11 +268,18 @@ struct RemoteAgent: Sendable {
 
             var failure = Self.failure(verdict, attempt: attempt, command: command, result: result, sshLog: sshLog)
             failure.target = attempt.route.target
-            if verdict.routeLevel { backoff.record(failure, target: attempt.route.target) }
+            // A cancelled request stops its ssh, or never starts it, and the classifier reads that
+            // as a timeout or a launch failure. Neither says anything about the route. Recorded,
+            // it held every address of the machine back for a minute: closing a sheet while it
+            // loaded made the machine read as unreachable and refused every action on it untried.
+            let cancelled = result.cancelled || Task.isCancelled
+            if verdict.routeLevel, !cancelled { backoff.record(failure, target: attempt.route.target) }
 
             // The rule the whole walk exists for. A mutation whose fate is not known is never sent
-            // anywhere else, on any route, under any system: it is reported as it is.
+            // anywhere else, on any route, under any system: it is reported as it is. That holds
+            // for a cancelled one too, because cancelling it here does not stop it there.
             if step == .stop { throw failure }
+            if cancelled { throw CancellationError() }
 
             best = Self.preferred(best, failure)
             // A failure at the connection level says nothing about the command shape, so trying the

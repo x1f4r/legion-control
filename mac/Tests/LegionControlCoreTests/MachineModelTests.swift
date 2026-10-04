@@ -155,6 +155,27 @@ struct MachineModelTests {
         #expect(!model.needsAgentUpgrade)
     }
 
+    @Test("a status read nobody is waiting for any more leaves the machine as it was")
+    func cancelledReadChangesNothing() async throws {
+        // A cancelled read learnt nothing about the machine, so it must not draw it as failed.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        let (model, _, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await model.refresh(userInitiated: false)
+        #expect(model.isAwake)
+        let sent = runner.sentCommands.count
+
+        let read = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            await model.refresh(userInitiated: false)
+        }
+        await read.value
+        #expect(model.isAwake)
+        #expect(model.currentSystem?.id == "linux")
+        #expect(runner.sentCommands.count == sent)
+    }
+
     @Test("a 2.x agent is shown as too old rather than as broken")
     func legacyAgentIsFlagged() async throws {
         let runner = FakeRunner()
