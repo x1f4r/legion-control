@@ -348,7 +348,7 @@ class MachineModel(
     /** What this machine's last handover of the setup did, while that is still news. */
     val setupNote: String? get() = setup.noteFor(machine.id, now)
 
-    val actions: List<AgentAction> get() = status?.actions.orEmpty().filter { !it.id.isNullOrBlank() }
+    val actions: List<AgentAction> get() = runnableActions(status?.actions)
 
     /** Every change this app has asked this machine for, newest first. */
     val history: List<OperationRecord> get() = operations.forMachine(machine.id)
@@ -1451,3 +1451,12 @@ fun freshness(checkedAt: Long?, now: Long): String {
         }
     }
 }
+
+/**
+ * The actions an agent offered, as far as this app can send them back.
+ *
+ * An id goes straight onto a command line when it is run, so one that is not a token is left out
+ * here rather than offered as a button that can only fail.
+ */
+internal fun runnableActions(offered: List<AgentAction>?): List<AgentAction> =
+    offered.orEmpty().filter { Contract.isToken(it.id) }
