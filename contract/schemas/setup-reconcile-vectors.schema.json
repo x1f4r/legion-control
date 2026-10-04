@@ -160,7 +160,10 @@
               "type": "object",
               "properties": {
                 "hash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
-                "replyHash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+                "replyHash": {
+                  "description": "The hash the reply carried. A reply without one is a failed request and never reaches admit (section 9.5).",
+                  "$ref": "#/$defs/hash"
+                },
                 "id": { "$ref": "common.schema.json#/$defs/setupIdOrNull" },
                 "lineage": { "$ref": "common.schema.json#/$defs/lineage" }
               },

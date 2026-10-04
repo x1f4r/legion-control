@@ -1873,14 +1873,28 @@ function beforeByCodePoint(a, b) {
 
 const hashAgain = (text) => crypto.createHash('sha256').update(canonicalBytesAgain(Buffer.from(text, 'utf8'))).digest('hex');
 
+/**
+ * The section 9.7 rules mine may break and still be merged: the ones about how
+ * parts that are well formed on their own refer to each other. Written out
+ * here rather than imported, so a reference that let a structural error into a
+ * merge would disagree with this list.
+ */
+const RELATIONSHIP_RULES = ['unknown-site', 'helper-self', 'helper-unknown', 'helper-alias', 'helper-cycle'];
+
 function checkMergeCase(where, entry) {
   const { baseText, mineText, theirsText, mineHash, theirsHash, writer = {} } = entry.input ?? {};
   const { differences = [], resultText, error } = entry.expect ?? {};
   const problems = [];
   if (hashAgain(mineText) !== mineHash) problems.push('mineHash is not the canonical hash of mineText');
   if (hashAgain(theirsText) !== theirsHash) problems.push('theirsHash is not the canonical hash of theirsText');
-  for (const [label, text] of [['baseText', baseText], ['mineText', mineText], ['theirsText', theirsText]]) {
-    if (text !== null && !checkDocument(text, { intake: 'peer' }).valid) problems.push(`${label} is refused by section 9.7, and only documents peer intake accepts are merged`);
+  for (const [label, text] of [['baseText', baseText], ['theirsText', theirsText]]) {
+    if (text !== null && !checkDocument(text, { intake: 'peer' }).valid) problems.push(`${label} is refused by section 9.7, and a theirs or a base is merged only when peer intake accepts it`);
+  }
+  // Mine is the applied document, which applied intake keeps with its errors.
+  // Only an error that leaves its entries undefined keeps it out of a merge.
+  const structural = checkDocument(mineText, { intake: 'applied' }).errors.filter((problem) => !RELATIONSHIP_RULES.includes(problem.code));
+  if (structural.length > 0) {
+    problems.push(`mineText breaks section 9.7 (${structural.map((problem) => problem.code).join(', ')}), and a mine with an error other than ${RELATIONSHIP_RULES.join(', ')} is not merged`);
   }
   const keys = differences.map((difference) => difference.entry);
   if (!keys.every((key, index) => index === 0 || beforeByCodePoint(keys[index - 1], key))) problems.push('differences are not listed once each in code-point order of their keys');

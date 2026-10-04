@@ -113,6 +113,12 @@ export function decide({ local, status, metaByHash }) {
  * expected one but is the reply's own means the machine moved on; one that is
  * neither means the bytes could not be reproduced, which is what an agent that
  * sends no `raw` gives a client that rebuilt them in another spelling (C1).
+ *
+ * A `config` reply without a `hash` never gets here. The agent sends one
+ * whenever it holds a document, so such a reply describes none, and section
+ * 9.5 never adopts it: the client counts it as a failed request before it
+ * admits anything. `fetched.replyHash` is therefore always a hash, and admit()
+ * does not test for its absence.
  */
 export function admit({ expected, currentLocalHash, fetched, accepted }) {
   if (currentLocalHash !== expected.localHash) return 'headMoved';
@@ -469,13 +475,36 @@ const IDENTITY_KEYS = Object.freeze(['id', 'revision', 'updatedAt', 'source', 'd
 const STRUCTURE_KEYS = Object.freeze(['controller', 'machines', 'sites']);
 /** The members of a machine that are entries of their own when both sides have the machine. */
 const MACHINE_PARTS = Object.freeze(['endpoints', 'systems', 'wake']);
+/** How the keys of the other entries begin, and the quote that marks a top-level key written in quotes. */
+const QUOTED_BEGINNINGS = Object.freeze(['"', 'controller.', 'sites[', 'machines[']);
+
+/**
+ * The entry key of a top-level member: its name, unless the name begins the
+ * way another entry's key does (`controller.`, `sites[`, `machines[`). Then it
+ * is written inside double quotes with nothing escaped, and so is a name that
+ * already begins with a quote, which keeps the quoting reversible.
+ *
+ * An unknown key can be any string. Without the quotes, a peer document with a
+ * member called `sites[home]` beside a site `home` would give one key to two
+ * entries, and neither a choice nor the list of differences could tell them
+ * apart; peer intake accepts that document, so a merge has to as well.
+ * Machine, site, system and endpoint ids are tokens, which hold no bracket, so
+ * the other keys never collide with each other.
+ */
+export function topLevelKey(name) {
+  return QUOTED_BEGINNINGS.some((beginning) => name.startsWith(beginning)) ? `"${name}"` : name;
+}
 
 /**
  * One document's entries, as a Map from key to `{ place, value }`. `paired`
  * holds the ids of the machines both mine and theirs have: those are split
  * into their fields, wake block, systems and endpoints, and every other
- * machine is one entry. Two entries of one document under one key would make
- * every later step ambiguous, so that throws instead.
+ * machine is one entry.
+ *
+ * Keys are unique in every document a merge takes: section 9.7 refuses two
+ * machines, two sites, or two systems or endpoints of one machine with one id,
+ * and topLevelKey() keeps unknown names apart from the rest. So a second entry
+ * under one key is a bug, and it throws rather than merge one of the two.
  */
 function entryMap(document, paired) {
   const map = new Map();
@@ -485,7 +514,7 @@ function entryMap(document, paired) {
   };
   if (document?.kind !== 'object') return map;
   for (const [name, value] of document.members) {
-    if (!STRUCTURE_KEYS.includes(name)) add(name, { scope: 'top', name }, value);
+    if (!STRUCTURE_KEYS.includes(name)) add(topLevelKey(name), { scope: 'top', name }, value);
   }
   const controller = memberOf(document, 'controller');
   if (controller?.kind === 'object') {
@@ -743,11 +772,37 @@ function walkTheirs(holder, name, theirsArray, entryOf, taken) {
   }
 }
 
-/** Parse a side of a merge, which must be a document section 9.7 accepts under peer intake. */
+/**
+ * The section 9.7 errors mine may carry into a merge. Each is about how parts
+ * that are well formed on their own refer to each other: a site or a helper
+ * that names nothing, a helper that is its own, a loop, an alias that
+ * disagrees. Mine is the applied document, which applied intake keeps with its
+ * errors, and sections 9.5 and 9.7 let a device in that state go on merging.
+ * The result is checked like any other, so taking theirs' side of the machine
+ * or wake block at fault repairs it, and keeping mine's names the rule.
+ *
+ * Every other error leaves no single answer to what the document's entries
+ * are: a repeated member, a part that is not the array or object the entries
+ * are read from, two parts with one id. A mine with one of those is fixed in
+ * the editor before it is merged.
+ */
+export const MERGEABLE_ERRORS = Object.freeze(['unknown-site', 'helper-self', 'helper-unknown', 'helper-alias', 'helper-cycle']);
+
+/**
+ * Parse a side of a merge. Theirs and the base are held to section 9.7 under
+ * peer intake, as everything read from a machine or kept is. Mine is held to
+ * applied intake, and may only break the rules MERGEABLE_ERRORS names.
+ * Anything else throws: a client checks the same before it offers Merge or
+ * Keep mine, and a merge that never starts is nothing a vector could pin.
+ */
 function intake(text, side) {
-  const verdict = checkDocument(text, { intake: 'peer' });
-  if (!verdict.valid) {
-    throw new Error(`${side} breaks section 9.7 (${verdict.errors.map((problem) => problem.code).join(', ')}); only documents peer intake accepts are merged`);
+  const verdict = checkDocument(text, { intake: side === 'mine' ? 'applied' : 'peer' });
+  const blocking = verdict.errors.filter((problem) => side !== 'mine' || !MERGEABLE_ERRORS.includes(problem.code));
+  if (blocking.length > 0) {
+    const codes = blocking.map((problem) => problem.code).join(', ');
+    throw new Error(side === 'mine'
+      ? `mine breaks section 9.7 (${codes}) in a way that leaves its entries undefined; it is fixed in the editor before it is merged`
+      : `${side} breaks section 9.7 (${codes}); a theirs or a base is merged only when peer intake accepts it`);
   }
   return parseJson(canonicalBytes(text).toString('utf8'));
 }
@@ -769,7 +824,8 @@ function intake(text, side) {
  *
  * The result is held to section 9.7 under peer intake. One it refuses is not
  * written: `resultText` is null and `error` is the first of its error codes in
- * code-point order, so the person can be told which rule the choices broke.
+ * code-point order, so the person can be told which rule the choices broke, or
+ * which rule mine broke already and the choices kept.
  */
 export function merge({ baseText, mineText, theirsText, mineHash, theirsHash, writer, choices = {} }) {
   const mine = intake(mineText, 'mine');

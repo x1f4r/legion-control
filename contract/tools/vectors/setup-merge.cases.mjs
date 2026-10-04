@@ -398,6 +398,50 @@ const merges = [
     resultText: result((document) => { machine(document, 'nas').systems = [linux('Debian')]; }),
     error: null,
   })),
+
+  // Mine is the applied document, which applied intake keeps with its errors.
+  // These two cases pin that such a mine is merged all the same, and that the
+  // result alone decides whether anything is written.
+  mergeCase('mine-with-error-repaired', 'Mine breaks section 9.7: an edit outside the app deleted pi and left tower\'s helper naming it (helper-unknown). Applied intake keeps that document, so it is still merged. Theirs renamed pi, the question is left at theirs, pi comes back, and the result passes.', {
+    mine: (document) => removeMachine(document, 'pi'),
+    theirs: (document) => { machine(document, 'pi').name = 'Pi'; },
+  }, ({ theirsDoc, result }) => ({
+    differences: [d('machines[pi]', 'both')],
+    resultText: result((document) => { document.machines.splice(1, 0, copyOf(machine(theirsDoc, 'pi'))); }),
+    error: null,
+  })),
+
+  mergeCase('mine-with-error-kept', 'The same mine with the question answered mine, which is Keep mine: the result still names a helper that does not exist, so nothing is written and the rule mine already broke is named.', {
+    mine: (document) => removeMachine(document, 'pi'),
+    theirs: (document) => { machine(document, 'pi').name = 'Pi'; },
+    choices: { 'machines[pi]': 'mine' },
+  }, () => ({
+    differences: [d('machines[pi]', 'both')],
+    resultText: null,
+    error: 'helper-unknown',
+  })),
+
+  mergeCase('top-level-keys-like-entries', 'Unknown top-level keys named sites[home] and controller.name. Their keys are written in quotes, so theirs\' edit of the member "sites[home]" and mine\'s rename of the site home are two entries, and so are mine\'s edit of the member "controller.name" and theirs\' rename of the setup.', {
+    base: (document) => {
+      document['sites[home]'] = 'Router in the hall';
+      document['controller.name'] = 'Home setup';
+    },
+    mine: (document) => {
+      document.sites[0].name = 'Home LAN';
+      document['controller.name'] = 'Home';
+    },
+    theirs: (document) => {
+      document['sites[home]'] = 'Router in the attic';
+      document.controller.name = 'Family setup';
+    },
+  }, ({ result }) => ({
+    differences: [d('"controller.name"', 'mine'), d('"sites[home]"', 'theirs'), d('controller.name', 'theirs'), d('sites[home]', 'mine')],
+    resultText: result((document) => {
+      document['sites[home]'] = 'Router in the attic';
+      document.controller.name = 'Family setup';
+    }),
+    error: null,
+  })),
 ];
 
 // ---------------------------------------------------------------------------
@@ -468,9 +512,10 @@ export default {
   reference: 'tools/setup-sync.mjs',
   notes: [
     'merges: baseText is the base the device chose (bases gives the rule), or null when there is none. mineHash and theirsHash are the canonical hashes of mineText and theirsText. choices maps an entry key to mine or theirs; an entry it does not name takes mine when its kind is mine and theirs otherwise.',
+    'merges: theirsText and baseText pass section 9.7 under peer intake. mineText is the applied document, kept by applied intake, and may break unknown-site, helper-self, helper-unknown, helper-alias and helper-cycle; it is merged all the same. A mine with any other error, and a theirs or base that peer intake refuses, is not merged at all: a client checks that before it offers Merge or Keep mine, and no case starts such a merge.',
     'merges: differences lists every entry where mine and theirs differ, in code-point order of the key, with its kind: mine or theirs (with a base, the side that changed it), both (with a base, both changed it, a deletion against an edit included) or noBase.',
     'merges: resultText is the merged document, or null when section 9.7 refuses it under peer intake; error is then the first of its error codes in code-point order. Compare resultText as a parsed document: object key order ignored, array order exact, number lexemes exact.',
-    'Entry keys: <key> for a top-level key other than controller, machines and sites; controller.<key> for a controller key other than id, revision, updatedAt, source, device and lineage; sites[<id>]; machines[<id>] when only one side has the machine; machines[<id>].fields, .wake, .systems[<id>], .endpoints[<id>] and .endpoints[] (the endpoints without an id, in order, as one value) when both have it.',
+    'Entry keys: <key> for a top-level key other than controller, machines and sites, written "<key>" (inside double quotes, nothing escaped) when it begins with ", controller., sites[ or machines[; controller.<key> for a controller key other than id, revision, updatedAt, source, device and lineage; sites[<id>]; machines[<id>] when only one side has the machine; machines[<id>].fields, .wake, .systems[<id>], .endpoints[<id>] and .endpoints[] (the endpoints without an id, in order, as one value) when both have it.',
     'bases: kept maps a hash to the text this device kept for it. The base is the first hash of mineLineage that is in theirsLineage and whose kept text hashes to it, or null.',
     'numbers: a and b are JSON number lexemes, equal when they are the same decimal value.',
   ],

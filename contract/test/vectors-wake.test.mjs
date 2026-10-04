@@ -116,15 +116,17 @@ test('every machine of the wake setup has one endpoint and one Linux system, so 
 
 // --- coverage -----------------------------------------------------------------
 
-test('every reason a direct step or a helper can be skipped for is pinned, except those a valid setup cannot reach', () => {
+test('every reason a direct step or a helper can be skipped for is pinned, except those the shared setup cannot reach', () => {
   const reasons = new Set(plans.flatMap((plan) => plan.expect.skipped.map((skip) => `${skip.kind}:${skip.reason}`)));
   // missing and self are errors of section 9.7 (helper-unknown, helper-self),
-  // and every wake block of the shared setup is placed, so no plan against a
-  // valid document reaches them or unplaced; the unit tests below do.
-  const unreachable = ['direct:unplaced', 'helper:missing', 'helper:self'];
+  // so no plan against a valid document reaches them. unplaced is only a
+  // warning (wake-unplaced), so a valid document can reach it, but the shared
+  // setup places every wake block and no vector does. The unit tests below
+  // are what pins these three, direct:unplaced included.
+  const pinnedBelow = ['direct:unplaced', 'helper:missing', 'helper:self'];
   const expected = ['direct:no-mac', 'direct:ambiguous', 'direct:unplaced', 'direct:elsewhere',
     'helper:missing', 'helper:self', 'helper:duplicate', 'helper:asleep', 'helper:unusable', 'helper:no-action', 'helper:held', 'helpers:none'];
-  assert.deepEqual(expected.filter((reason) => !reasons.has(reason) && !unreachable.includes(reason)), []);
+  assert.deepEqual(expected.filter((reason) => !reasons.has(reason) && !pinnedBelow.includes(reason)), []);
   for (const state of ['ready', 'asleep', 'unusable', 'unknown', 'not-driven']) {
     assert.ok(plans.some((plan) => Object.values(plan.input.helpers).some((helper) => helper.state === state)), state);
   }

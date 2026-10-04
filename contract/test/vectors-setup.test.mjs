@@ -9,8 +9,9 @@
 // familiar, a push retried after a refusal no retry can cure, an edit saved
 // during a read and then overwritten; a merged entry moved to the end of its
 // array, `22.0` printed as `22`, an endpoint without an id dropped, a deletion
-// that silently beats an edit. Each must be caught by validate.mjs and by the
-// generator. The vector-file defects prove that validate.mjs holds every case
+// that silently beats an edit, a device whose own document has an error unable
+// to merge, an unknown key named like a site taken for the site. Each must be
+// caught by validate.mjs and by the generator. The vector-file defects prove that validate.mjs holds every case
 // to the schema with its own validator, refuses an agent-enforced case that
 // claims to be valid, and checks the reconciliation and merge cases with code
 // of its own.
@@ -20,10 +21,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CONTRACT, defect, readJson, referenceDefect, writeJson } from './support.mjs';
-import { rejection } from '../tools/canonical.mjs';
+import { canonicalHash, rejection } from '../tools/canonical.mjs';
 import { ERROR_CODES, INTAKES, WARNING_CODES, checkDocument } from '../tools/document-rules.mjs';
 import {
-  afterPush, decide, decimalKey, entries, gate, jsonEqual, merge, mergedLineage, parseJson, peerState, printJson, recordPush, run,
+  MERGEABLE_ERRORS, afterPush, decide, decimalKey, entries, gate, jsonEqual, merge, mergedLineage, parseJson, peerState, printJson,
+  recordPush, run, topLevelKey,
 } from '../tools/setup-sync.mjs';
 
 const acceptance = readJson(path.join(CONTRACT, 'vectors', 'setup-acceptance.json'));
@@ -316,6 +318,16 @@ referenceDefect('the lineages interleaved theirs first', 'tools/setup-sync.mjs',
   '    if (index < theirsLineage.length) add(theirsLineage[index]);\n    if (index < mineLineage.length) add(mineLineage[index]);',
   /long-lineages: tools\/setup-sync\.mjs gives/);
 
+referenceDefect('mine held to peer intake, so a device whose own document has an error cannot merge', 'tools/setup-sync.mjs',
+  "side !== 'mine' || !MERGEABLE_ERRORS.includes(problem.code)",
+  'true',
+  /mine-with-error-repaired: the reference throws: mine breaks section 9\.7/);
+
+referenceDefect('an unknown top-level key taken for the entry it is named like', 'tools/setup-sync.mjs',
+  "add(topLevelKey(name), { scope: 'top', name }, value)",
+  "add(name, { scope: 'top', name }, value)",
+  /top-level-keys-like-entries: the reference throws: two entries of one document are both called/);
+
 const editMerge = (group, name, change) => (dir) => {
   const file = path.join(dir, 'vectors', 'setup-merge.json');
   const data = readJson(file);
@@ -327,6 +339,14 @@ defect('a merge result section 9.7 refuses',
   /setup-merge\.json\/merges\/both-sides-applied: .*the merged document is refused by section 9\.7: helper-unknown/,
   editMerge('merges', 'both-sides-applied', (entry) => {
     entry.expect.resultText = entry.expect.resultText.replace('"machine": "pi"', '"machine": "ghost"');
+  }));
+
+defect('a merge from a mine whose entries are undefined',
+  /setup-merge\.json\/merges\/mine-with-error-repaired: .*mineText breaks section 9\.7 \(duplicate-machine\)/,
+  editMerge('merges', 'mine-with-error-repaired', (entry) => {
+    const mine = JSON.parse(entry.input.mineText);
+    mine.machines.push(structuredClone(mine.machines[0]));
+    entry.input.mineText = `${JSON.stringify(mine, null, 2)}\n`;
   }));
 
 defect('a head hash that is not the hash of its text',
@@ -424,7 +444,35 @@ test('the merged lineage holds both heads, then both lineages interleaved, and n
   assert.equal(mergedLineage(h(1), h(2), Array.from({ length: 32 }, (_, i) => h(100 + i)), Array.from({ length: 32 }, (_, i) => h(200 + i))).length, 32);
 });
 
-test('a side that section 9.7 refuses is never merged', () => {
+test('theirs and the base are merged only as peer intake accepts them, and mine as applied intake keeps it', () => {
   const entry = merges[0];
   assert.throws(() => merge({ ...entry.input, theirsText: '{"version": 2, "machines": []}' }), /theirs breaks section 9\.7/);
+  assert.throws(() => merge({ ...entry.input, baseText: '{"version": 2, "machines": []}' }), /base breaks section 9\.7/);
+  // A mine that breaks a relationship rule is merged: the vectors pin what
+  // comes of it. One whose entries are undefined, or text section 12 refuses,
+  // is not.
+  assert.ok(merges.some((candidate) => !checkDocument(candidate.input.mineText, { intake: 'peer' }).valid && candidate.expect.resultText !== null));
+  const twice = JSON.parse(entry.input.mineText);
+  twice.machines.push(structuredClone(twice.machines[0]));
+  assert.throws(() => merge({ ...entry.input, mineText: `${JSON.stringify(twice, null, 2)}\n` }), /mine breaks section 9\.7 \(duplicate-machine\)/);
+  assert.throws(() => merge({ ...entry.input, mineText: '{"version": 1,' }), /mine breaks section 9\.7 \(schema\)/);
+  assert.deepEqual(MERGEABLE_ERRORS.filter((code) => !ERROR_CODES.includes(code)), []);
+});
+
+test('a top-level key named like another entry is quoted, so every key names one entry', () => {
+  assert.equal(topLevelKey('notes'), 'notes');
+  assert.equal(topLevelKey('controllers'), 'controllers');
+  assert.equal(topLevelKey('sites[home]'), '"sites[home]"');
+  assert.equal(topLevelKey('"sites[home]"'), '""sites[home]""');
+  // Every structural key a document could mimic, beside the part it mimics.
+  const entry = merges[0];
+  const theirs = JSON.parse(entry.input.theirsText);
+  for (const name of ['controller.name', 'sites[home]', 'machines[pi]', 'machines[tower].fields', 'machines[tower].endpoints[lan]', 'machines[tower].endpoints[]']) theirs[name] = 'mimic';
+  const theirsText = `${JSON.stringify(theirs, null, 2)}\n`;
+  assert.equal(checkDocument(theirsText, { intake: 'peer' }).valid, true);
+  const result = merge({ ...entry.input, theirsText, theirsHash: canonicalHash(theirsText) });
+  const quoted = result.differences.filter((difference) => difference.entry.startsWith('"'));
+  assert.deepEqual(quoted, ['"controller.name"', '"machines[pi]"', '"machines[tower].endpoints[]"', '"machines[tower].endpoints[lan]"', '"machines[tower].fields"', '"sites[home]"']
+    .map((key) => ({ entry: key, kind: 'theirs' })));
+  assert.equal(JSON.parse(result.resultText)['sites[home]'], 'mimic');
 });

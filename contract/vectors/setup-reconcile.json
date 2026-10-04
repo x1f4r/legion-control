@@ -8,6 +8,7 @@
   "notes": [
     "decide: local is {hash, id, lineage} or null; status is the status reply with only contract and controller {hash, id}; metaByHash maps a hash to the config meta answer or refusal current filed for it. expect is the hash a fetch must produce, null for every other decision.",
     "admit: expected is what the decision was made from; currentLocalHash is the applied hash read again from storage after the read; fetched is the canonical hash of the bytes, the hash the reply carried, and the id and lineage of the bytes' own controller block; accepted is section 9.7 under peer intake. Checked in the order headMoved, moved, unverifiable, invalid, inconsistent, adopt.",
+    "admit: a config reply without a hash never reaches admit. Section 9.5 never adopts it; the client counts it as a failed request (the 60 s back-off) before admitting anything, so replyHash is always a hash and admit does not test for its absence.",
     "gate: times are integer milliseconds on one clock. failedAt and held are keyed by the applied hash; settled holds \"<applied hash> <remote hash> <agentVersion>\" for each remembered admission refusal. The back-off is 60000 ms: a failure exactly 60000 ms ago no longer holds.",
     "pushReply: reply is the parsed config set reply, or null when none was read. metaHash is set only for fileMeta."
   ],
@@ -613,6 +614,53 @@
           "decision": "fetch",
           "reason": null,
           "expect": "81a6d710365ad9a0289cff90310898e22c04795134d6de67f58b207b3938e7a4"
+        }
+      },
+      {
+        "name": "filed-current-diverges",
+        "purpose": "The current of the divergent refusal in push-divergent, filed and decided on at once: a sibling of the revision this device pushed, so neither descends from the other and a person decides.",
+        "consumers": [
+          "mac",
+          "desktop",
+          "android"
+        ],
+        "tags": [],
+        "input": {
+          "local": {
+            "hash": "5f570288e60399e0970010f8703ca5e5ff668dc21fe3a053ca6280a9c0ea3ec9",
+            "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+            "lineage": [
+              "1c680fab2ecc79f4b1c2a06e4e3ed2f8a1d54c6f0b93e7a25c8d0f416b2e93a7",
+              "1a5ee25ee34b2f9c07d61a8b45e0c3f27d9b8140a6532e7fc019d84b6a3e5027"
+            ]
+          },
+          "status": {
+            "contract": 3,
+            "controller": {
+              "hash": "81a6d710365ad9a0289cff90310898e22c04795134d6de67f58b207b3938e7a4",
+              "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846"
+            }
+          },
+          "metaByHash": {
+            "81a6d710365ad9a0289cff90310898e22c04795134d6de67f58b207b3938e7a4": {
+              "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+              "revision": 12,
+              "updatedAt": "2026-09-02T16:00:00.000Z",
+              "source": "mac",
+              "lineage": [
+                "1c680fab2ecc79f4b1c2a06e4e3ed2f8a1d54c6f0b93e7a25c8d0f416b2e93a7",
+                "1a5ee25ee34b2f9c07d61a8b45e0c3f27d9b8140a6532e7fc019d84b6a3e5027"
+              ],
+              "device": "Office MacBook Pro",
+              "hash": "81a6d710365ad9a0289cff90310898e22c04795134d6de67f58b207b3938e7a4",
+              "bytes": 5071
+            }
+          }
+        },
+        "expect": {
+          "decision": "diverged",
+          "reason": null,
+          "expect": null
         }
       }
     ],
@@ -1734,7 +1782,7 @@
       },
       {
         "name": "push-divergent",
-        "purpose": "config.set.conflict-divergent.json: the current is filed, and the next decision says diverged.",
+        "purpose": "config.set.conflict-divergent.json for a revision 12 of this device's own: the current, a sibling of it, is filed under its hash and decided on at once (filed-current-diverges).",
         "consumers": [
           "mac",
           "desktop",
@@ -1772,7 +1820,7 @@
               "bytes": 5071
             }
           },
-          "localHash": "1c680fab2ecc79f4b1c2a06e4e3ed2f8a1d54c6f0b93e7a25c8d0f416b2e93a7",
+          "localHash": "5f570288e60399e0970010f8703ca5e5ff668dc21fe3a053ca6280a9c0ea3ec9",
           "now": 1000000
         },
         "expect": {

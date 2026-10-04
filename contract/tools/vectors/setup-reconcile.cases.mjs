@@ -45,9 +45,14 @@ const r = (decided, reason = null, expect = null) => ({ decision: decided, reaso
 // so c0 is in neither lineage.
 const chain = Array.from({ length: 34 }, (_, index) => h(`chain ${index}`));
 
-// The refusal R4 files, decided on at once in D16.
+// The refusals R4 and R5 file, each decided on at once: D16 for the
+// stale-revision one, D17 for the divergent one. The divergent push came from
+// a revision 12 of this device's own, a sibling of the machine's: both have
+// H_PARENT as their parent, so neither lineage holds the other.
 const fixture = (name) => JSON.parse(buildFixtures().get(`fixtures/${name}`));
 const STALE = fixture('config.set.stale-revision.json');
+const DIVERGENT = fixture('config.set.conflict-divergent.json');
+const SIBLING_12 = h('revision 12, a sibling of the machine\'s');
 
 const decisions = [
   decision('unsupported-2x-agent', 'A 2.x agent sends no contract. It cannot carry the setup and is left out, never shown as a conflict.',
@@ -90,6 +95,12 @@ const decisions = [
       status: { contract: 3, controller: { hash: STALE.current.hash, id: STALE.current.id } },
       metaByHash: { [STALE.current.hash]: STALE.current },
     }, r('fetch', null, STALE.current.hash)),
+  decision('filed-current-diverges', 'The current of the divergent refusal in push-divergent, filed and decided on at once: a sibling of the revision this device pushed, so neither descends from the other and a person decides.',
+    {
+      local: { hash: SIBLING_12, id: SETUP_ID, lineage: [H_PARENT, H_GRANDPARENT] },
+      status: { contract: 3, controller: { hash: DIVERGENT.current.hash, id: DIVERGENT.current.id } },
+      metaByHash: { [DIVERGENT.current.hash]: DIVERGENT.current },
+    }, r('diverged')),
 ];
 
 const EXPECTED = Object.freeze({ localHash: HD, localId: SETUP_ID, remoteHash: THEIRS_13 });
@@ -182,7 +193,7 @@ const replies = [
   replied('push-replaced', 'config.set.replaced.json for the hash this device pushed.', fixture('config.set.replaced.json'), fixture('config.set.replaced.json').hash, 'clear'),
   replied('push-stored-other-hash', 'A push that stored something other than the applied document: the machine holds bytes this device did not send, so this is a failure.', STORED, H_PARENT, 'fail'),
   replied('push-stale-revision', 'config.set.stale-revision.json: the machine is ahead. Its current is filed under its hash and decided on at once (filed-current-fetches).', STALE, H_PARENT, 'fileMeta', STALE.current.hash),
-  replied('push-divergent', 'config.set.conflict-divergent.json: the current is filed, and the next decision says diverged.', fixture('config.set.conflict-divergent.json'), H_PARENT, 'fileMeta', fixture('config.set.conflict-divergent.json').current.hash),
+  replied('push-divergent', 'config.set.conflict-divergent.json for a revision 12 of this device\'s own: the current, a sibling of it, is filed under its hash and decided on at once (filed-current-diverges).', DIVERGENT, SIBLING_12, 'fileMeta', DIVERGENT.current.hash),
   replied('push-operation-in-progress', 'config.set.locked.json: an update holds the lock; push again once a later status lists nothing running.', LOCKED, H_PARENT, 'locked'),
   replied('push-lock-held', 'The lock refusal under its other code.', { ...LOCKED, reasonCode: 'lock-held' }, H_PARENT, 'locked'),
   replied('push-no-reply', 'No reply was read: the link dropped or the command timed out. The push may have landed or not; back off and decide from the next status.', null, H_PARENT, 'fail'),
@@ -199,6 +210,7 @@ export default {
   notes: [
     'decide: local is {hash, id, lineage} or null; status is the status reply with only contract and controller {hash, id}; metaByHash maps a hash to the config meta answer or refusal current filed for it. expect is the hash a fetch must produce, null for every other decision.',
     'admit: expected is what the decision was made from; currentLocalHash is the applied hash read again from storage after the read; fetched is the canonical hash of the bytes, the hash the reply carried, and the id and lineage of the bytes\' own controller block; accepted is section 9.7 under peer intake. Checked in the order headMoved, moved, unverifiable, invalid, inconsistent, adopt.',
+    'admit: a config reply without a hash never reaches admit. Section 9.5 never adopts it; the client counts it as a failed request (the 60 s back-off) before admitting anything, so replyHash is always a hash and admit does not test for its absence.',
     'gate: times are integer milliseconds on one clock. failedAt and held are keyed by the applied hash; settled holds "<applied hash> <remote hash> <agentVersion>" for each remembered admission refusal. The back-off is 60000 ms: a failure exactly 60000 ms ago no longer holds.',
     'pushReply: reply is the parsed config set reply, or null when none was read. metaHash is set only for fileMeta.',
   ],

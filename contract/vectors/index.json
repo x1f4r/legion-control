@@ -288,11 +288,11 @@
       "groups": [
         {
           "group": "decide",
-          "cases": 16,
+          "cases": 17,
           "consumers": {
-            "mac": 16,
-            "desktop": 16,
-            "android": 16
+            "mac": 17,
+            "desktop": 17,
+            "android": 17
           }
         },
         {
@@ -335,11 +335,11 @@
       "groups": [
         {
           "group": "merges",
-          "cases": 24,
+          "cases": 27,
           "consumers": {
-            "mac": 24,
-            "desktop": 24,
-            "android": 24
+            "mac": 27,
+            "desktop": 27,
+            "android": 27
           }
         },
         {
