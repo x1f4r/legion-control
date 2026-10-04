@@ -4,6 +4,7 @@ using LegionControl.Desktop.Cli;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Model;
+using LegionControl.Desktop.Transport;
 using LegionControl.Desktop.Updates;
 using Xunit;
 
@@ -351,6 +352,26 @@ public class AppUpdateTests
             // A release build carries one, and it verified on the way in.
             Assert.Equal(AgentContract.BundledAgentVersion, bundle.Version);
         }
+    }
+
+    [Fact]
+    public void ABootstrapStepThatRanAndFailedIsNotKnownAndKeepsWhatTheMachineSaid()
+    {
+        // mkdir refusing the directory exits 1 on the far side. That ran, so the step is not known
+        // rather than failed, and the line that says what to fix there still reaches the person.
+        var refused = new CommandResult { ExitCode = 1, StandardError = "mkdir: cannot create directory '/opt/legion': Permission denied\n" };
+        var ran = AgentInstaller.Unfinished(new RawSshResult(refused, AttemptClassifier.Classify(refused)), "Failed.", "Not known.");
+        var notKnown = Assert.IsType<AgentInstallOutcome.NotKnown>(ran);
+        Assert.Equal("Not known.", notKnown.Sentence_);
+        Assert.Equal("Not known.\nmkdir: cannot create directory '/opt/legion': Permission denied", notKnown.Report);
+
+        var rejected = new CommandResult { ExitCode = 255, SshLog = "me@pi: Permission denied (publickey).\n" };
+        var never = AgentInstaller.Unfinished(new RawSshResult(rejected, AttemptClassifier.Classify(rejected)), "Failed.", "Not known.");
+        Assert.IsType<AgentInstallOutcome.Failed>(never);
+        Assert.Equal("Failed.\nme@pi: Permission denied (publickey).", never.Report);
+
+        // Nothing to add, nothing added.
+        Assert.Equal("Unavailable.", new AgentInstallOutcome.Unavailable("Unavailable.").Report);
     }
 
     [Fact]

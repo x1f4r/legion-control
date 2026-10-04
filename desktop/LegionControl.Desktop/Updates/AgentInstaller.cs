@@ -79,7 +79,7 @@ public abstract record AgentInstallOutcome
     public sealed record Unavailable(string Sentence) : AgentInstallOutcome;
     public sealed record Failed(string Sentence, string? Detail) : AgentInstallOutcome;
     /// The upload or the install may or may not have happened. Never either of the other two.
-    public sealed record NotKnown(string Sentence) : AgentInstallOutcome;
+    public sealed record NotKnown(string Sentence, string? Detail = null) : AgentInstallOutcome;
 
     public string Sentence_ => this switch
     {
@@ -89,6 +89,19 @@ public abstract record AgentInstallOutcome
         NotKnown notKnown => notKnown.Sentence,
         _ => "",
     };
+
+    /// What the machine itself said, when it said something.
+    public string? Detail_ => this switch
+    {
+        Failed failed => failed.Detail,
+        NotKnown notKnown => notKnown.Detail,
+        _ => null,
+    };
+
+    /// The sentence with what the machine said under it, which is how an install is reported. A
+    /// remote "Permission denied" or a full disk is what tells somebody what to fix there, and the
+    /// sentence alone cannot.
+    public string Report => string.IsNullOrWhiteSpace(Detail_) ? Sentence_ : $"{Sentence_}\n{RemoteAgent.Condense(Detail_)}";
 }
 
 /// Puts a verified agent tree on a machine.
@@ -191,10 +204,8 @@ public sealed class AgentInstaller(IProcessRunner runner)
             TimeSpan.FromMinutes(5), cancellationToken);
         if (!upload.Succeeded)
         {
-            return upload.NeverRan
-                ? new AgentInstallOutcome.Failed($"The archive could not be written to {machine.Name}.", upload.FailureText)
-                : new AgentInstallOutcome.NotKnown(
-                    $"The upload to {machine.Name} did not finish cleanly. Whether anything was written there is not known.");
+            return Unfinished(upload, $"The archive could not be written to {machine.Name}.",
+                $"The upload to {machine.Name} did not finish cleanly. Whether anything was written there is not known.");
         }
 
         var unpack = await raw.RunAsync(route, system,
@@ -215,12 +226,9 @@ public sealed class AgentInstaller(IProcessRunner runner)
         var json = install.Reading.IsReply ? AttemptClassifier.JsonObjectSlice(install.Result.StandardOutput) : null;
         if (json is null)
         {
-            // Only a failure that proves the staged agent never started is a failure. A dropped
-            // link or a timeout may have left it halfway through installing itself.
-            return install.NeverRan
-                ? new AgentInstallOutcome.Failed($"The staged agent on {machine.Name} did not install.", install.FailureText)
-                : new AgentInstallOutcome.NotKnown(
-                    $"The install on {machine.Name} did not answer. Read the agent version on the next status to find out what happened.");
+            // A dropped link or a timeout may have left it halfway through installing itself.
+            return Unfinished(install, $"The staged agent on {machine.Name} did not install.",
+                $"The install on {machine.Name} did not answer. Read the agent version on the next status to find out what happened.");
         }
 
         var envelope = AgentEnvelope.From(Value.Parse(json));
@@ -231,6 +239,14 @@ public sealed class AgentInstaller(IProcessRunner runner)
         return new AgentInstallOutcome.Failed(
             envelope.Sentence() ?? $"The staged agent on {machine.Name} refused to install itself.", null);
     }
+
+    /// What a bootstrap step that did not finish means. A failure only when it provably never
+    /// ran; anything else may have done some or all of its work, and is not known. Either way what
+    /// the machine said goes with it.
+    public static AgentInstallOutcome Unfinished(RawSshResult step, string failed, string notKnown) =>
+        step.NeverRan
+            ? new AgentInstallOutcome.Failed(failed, step.FailureText)
+            : new AgentInstallOutcome.NotKnown(notKnown, step.FailureText);
 
     private static async Task<AgentInstallOutcome> ConfirmInstalledAsync(MachineModel machine, string version, CancellationToken token)
     {

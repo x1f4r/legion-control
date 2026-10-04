@@ -643,7 +643,7 @@ public static class Runner
             return bundle is null ? Failed : Ok;
         }
         var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, token, line.Value("base"));
-        output.WriteLine(outcome.Sentence_);
+        output.WriteLine(outcome.Report);
         return outcome switch
         {
             AgentInstallOutcome.Installed => Ok,
