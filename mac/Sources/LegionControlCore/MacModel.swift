@@ -135,6 +135,12 @@ final class MacModel: AgentDevice {
     /// were somewhere else. What is really being read is the local agent's copy.
     var setupHolder: String { "the local agent" }
 
+    /// Reading the local agent costs one process launch and no network, so this Mac reads itself
+    /// again after every action, as it always has, and not only after the ones that ask. An action
+    /// that never reached the agent, because the agent has gone missing say, then corrects the
+    /// section at once rather than at the next poll, and no poll comes while nothing is on screen.
+    var readsAfterEveryAction: Bool { true }
+
     func send<Value: Decodable & Sendable>(_ request: AgentRequest, decoding: Value.Type) async throws -> Value {
         try await agent.send(request, decoding: Value.self)
     }

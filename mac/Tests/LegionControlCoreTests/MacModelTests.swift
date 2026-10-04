@@ -312,6 +312,30 @@ struct MacModelTests {
         #expect(model.noteDetail == record.detail)
     }
 
+    @Test("a local action that never reached the agent is followed by a fresh read straight away")
+    func localNeverDispatchedRereads() async throws {
+        // A failure that proves nothing ran asks for no read over ssh. Here the read costs one local
+        // process, and without it this Mac went on showing an agent that had gone, until the next
+        // poll, which never comes while nothing is on screen.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        #expect(model.isReachable)
+        let service = try #require(model.services.first)
+        try FileManager.default.removeItem(at: directory.appending(path: "index.mjs"))
+        model.restart(service, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        #expect(store.newestFirst.first { $0.kind == .restart }?.state == .failed)
+        #expect(model.failure?.kind == .agentMissing)
+        #expect(!model.isReachable)
+        // The read does not take the action's own sentence away.
+        #expect(model.note?.contains("did not happen") == true)
+    }
+
     @Test("the local agent is run through the bound argv when the device is a machine in the setup")
     func boundLocalAgent() async throws {
         // The `self` binding: this device is one of the machines in the shared document, and it is

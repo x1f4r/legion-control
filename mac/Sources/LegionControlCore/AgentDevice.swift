@@ -30,6 +30,9 @@ protocol AgentDevice: AnyObject, Sendable {
     var recordedRoute: String? { get }
     /// What sentences about this device's copy of the setup call whoever holds it.
     var setupHolder: String { get }
+    /// Whether a fresh status read follows every action, rather than only the ones whose resolution
+    /// asks for one.
+    var readsAfterEveryAction: Bool { get }
 
     /// Put one request in front of this device's agent and decode what comes back.
     ///
@@ -176,6 +179,8 @@ extension AgentDevice {
     var doctorRanAt: Date? { core.doctorRanAt }
 
     var setupHolder: String { name }
+
+    var readsAfterEveryAction: Bool { false }
 
     /// Which contract the far side speaks, and therefore what may be sent to it.
     var dialect: AgentDialect { AgentDialect(status) }
@@ -994,7 +999,10 @@ extension AgentDevice {
                     forceUnresolved: resolution.unresolved
                 )
             }
-            if resolution.refresh { await self.refreshQuietly() }
+            // A question on screen keeps the action open, so nothing is read under it either way.
+            if resolution.refresh || (self.readsAfterEveryAction && !resolution.awaitingDecision) {
+                await self.refreshQuietly()
+            }
             self.core.activity = nil
             self.core.lastActionOutcome = ActionOutcome(
                 text: resolution.summary,
