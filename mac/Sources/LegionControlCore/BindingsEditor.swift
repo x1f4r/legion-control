@@ -60,6 +60,11 @@ struct BindingsEditor: View {
                 Text("A private alias is tried before the shared endpoints and uses your configured SSH behavior.")
                     .font(.caption).foregroundStyle(.secondary)
                 Button("Save SSH override") {
+                    // Dialled as a host, so held to the same grammar as every other one.
+                    if !alias.isEmpty, Addresses.hostForm(alias) == nil {
+                        problem = "This app never dials the alias \"\(alias)\". Use the name of a Host entry in your SSH config."
+                        return
+                    }
                     problem = model.bindings.update {
                         var binding = $0.machines?[overrideMachine] ?? .init()
                         binding.sshAlias = alias.isEmpty ? nil : alias

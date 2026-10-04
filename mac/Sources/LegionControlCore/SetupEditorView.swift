@@ -402,6 +402,10 @@ private struct NewMachineEditor: View {
             Button("Add the machine") { add() }
                 .buttonStyle(.borderedProminent)
                 .disabled(!canAdd)
+
+            if let undialable = undialablePart(host: host, user: user) {
+                QuietNote(text: "This app never dials \(undialable).")
+            }
         }
         .onChange(of: user) { oldUser, newUser in
             if agentArgv == CommandArguments.installedAgent(platform: platform, user: oldUser) {
@@ -418,6 +422,7 @@ private struct NewMachineEditor: View {
     private var canAdd: Bool {
         AgentToken.isValid(id.trimmingCharacters(in: .whitespaces))
             && !host.trimmingCharacters(in: .whitespaces).isEmpty
+            && undialablePart(host: host, user: user) == nil
             && !agentArgv.isEmpty
     }
 
@@ -510,16 +515,33 @@ private struct EndpointForm: View {
                     "kind": kind
                 ]
                 if !user.isEmpty { entry["user"] = user.trimmingCharacters(in: .whitespaces) }
-                if let number = Int(port) { entry["port"] = number }
+                if let number = Int(port.trimmingCharacters(in: .whitespaces)) { entry["port"] = number }
                 if !system.isEmpty { entry["system"] = system }
                 if save(entry) {
                     id = ""; host = ""; user = ""; port = ""; system = ""
                 }
             }
             .disabled(!AgentToken.isValid(id.trimmingCharacters(in: .whitespaces))
-                      || host.trimmingCharacters(in: .whitespaces).isEmpty)
+                      || host.trimmingCharacters(in: .whitespaces).isEmpty || undialable != nil)
+
+            if let undialable { QuietNote(text: "This app never dials \(undialable).") }
         }
     }
+
+    private var undialable: String? { undialablePart(host: host, user: user, port: port) }
+}
+
+/// The part of an address typed into a form that this app would never dial, scan or pin (section
+/// 15.6 of the contract), or nil when there is none or nothing has been typed yet. Saving one would
+/// only add an address every call skips, so the forms refuse it.
+private func undialablePart(host: String, user: String, port: String = "") -> String? {
+    let host = host.trimmingCharacters(in: .whitespaces)
+    let user = user.trimmingCharacters(in: .whitespaces)
+    let port = port.trimmingCharacters(in: .whitespaces)
+    guard !host.isEmpty else { return nil }
+    if !port.isEmpty, Int(port) == nil { return "the port \"\(port)\"" }
+    return Addresses.undialablePart(of: SSHTarget(host: host, user: user.isEmpty ? nil : user,
+                                                  port: Int(port), identityFile: nil))
 }
 
 private struct SystemForm: View {

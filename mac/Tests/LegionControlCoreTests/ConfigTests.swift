@@ -286,6 +286,45 @@ struct ConfigTests {
         }
     }
 
+    @Test("an address the app would never dial is refused by the editor, naming the part that fails")
+    func editorRefusesUndialableAddresses() throws {
+        // C-2: the schema lets these through and the app only warns about one a peer wrote, but an
+        // editor is where a person types it. Saved, it would be skipped on every call.
+        var root: [String: Any] = ["version": 1, "machines": [[
+            "id": "tower", "endpoints": [["id": "lan", "host": "192.0.2.10", "user": "me"]],
+            "systems": [["id": "linux", "platform": "linux", "agent": ["node", "/a"]]]
+        ] as [String: Any]]]
+        let refusals: [([String: Any], String)] = [
+            (["id": "bad", "host": "victim.example,*"], "the host \"victim.example,*\""),
+            (["id": "bad", "host": "-oProxyCommand=x"], "the host \"-oProxyCommand=x\""),
+            (["id": "bad", "host": "192.0.2.11", "user": "me$(id)"], "the user \"me$(id)\""),
+            (["id": "bad", "host": "192.0.2.11", "port": 70000], "the port 70000"),
+            // A merge that leaves an old host with a new, bad port is one bad address too.
+            (["id": "lan", "port": 0], "the port 0")
+        ]
+        for (endpoint, part) in refusals {
+            do {
+                try ControllerEditor.upsertEndpoint(endpoint, onMachine: "tower", in: &root)
+                Issue.record("saved \(endpoint)")
+            } catch let failure as ControllerEditor.EditFailure {
+                #expect(failure.message.contains(part), "\(failure.message)")
+            }
+        }
+        #expect(throws: ControllerEditor.EditFailure.self) {
+            try ControllerEditor.upsertMachine(["id": "nas", "ssh": ["host": "nas.example,*"]], in: &root)
+        }
+        #expect(throws: ControllerEditor.EditFailure.self) {
+            try ControllerEditor.upsertMachine(["id": "nas", "endpoints": [["id": "e", "host": "nas.example", "port": 0]]], in: &root)
+        }
+        // Nothing refused was written, and a good address still is.
+        let tower = try #require((root["machines"] as? [[String: Any]])?.first)
+        #expect((tower["endpoints"] as? [[String: Any]])?.count == 1)
+        #expect((tower["endpoints"] as? [[String: Any]])?.first?["port"] == nil)
+        #expect((root["machines"] as? [[String: Any]])?.count == 1)
+        try ControllerEditor.upsertEndpoint(["id": "remote", "host": "desk-tower.local", "port": 2222], onMachine: "tower", in: &root)
+        try ControllerEditor.upsertMachine(["id": "nas", "endpoints": [["id": "e", "host": "2001:db8::5", "user": "me"]]], in: &root)
+    }
+
     @Test("a Windows system the editor writes always names its shell, and keeps one it had")
     func editorWritesWindowsShell() throws {
         var root: [String: Any] = ["version": 1, "machines": [[
@@ -294,8 +333,8 @@ struct ConfigTests {
                         ["id": "linux", "platform": "linux", "agent": ["node", "/a"]],
                         ["id": "pwsh", "platform": "windows", "shell": "powershell", "agent": ["node", "C:\\a.mjs"]]]
         ] as [String: Any]]]
-        // The launcher migration changes only the agent, and the system it touches gains the shell it
-        // already ran as.
+        // The launcher migration changes only the agent, and the system it touches gains cmd, the
+        // shell every 1.4 client already writes its lines in.
         try ControllerEditor.upsertSystem(["id": "windows", "agent": ["node", "C:\\lc\\bin\\launcher.mjs"]],
                                           onMachine: "tower", in: &root)
         try ControllerEditor.upsertSystem(["id": "linux", "agent": ["node", "/b"]], onMachine: "tower", in: &root)
