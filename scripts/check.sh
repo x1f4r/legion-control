@@ -8,6 +8,7 @@ case "$component" in all|agent|mac|android|desktop) ;; *) echo "Usage: $0 [all|a
 
 if [[ "$component" == all || "$component" == agent ]]; then
   npm --prefix agent run check
+  node scripts/check-versions.mjs
   npm --prefix agent test
   node --test tests/*.test.mjs
   node contract/validate.mjs
