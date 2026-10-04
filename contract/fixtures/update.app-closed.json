@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.1",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "mac",
     "name": "macOS"

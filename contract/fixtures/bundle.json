@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.1",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -10,7 +10,7 @@
   "doctor": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.1",
+    "agentVersion": "3.1.0",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
@@ -182,7 +182,7 @@
   "status": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.1",
+    "agentVersion": "3.1.0",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
@@ -195,7 +195,7 @@
       "partial": false
     },
     "agent": {
-      "version": "3.0.1",
+      "version": "3.1.0",
       "contract": 3,
       "base": "/home/me/.legion-control",
       "node": "24.9.0",
@@ -206,7 +206,7 @@
         "configured-telemetry",
         "service-config-admin"
       ],
-      "floor": "3.0.1",
+      "floor": "3.1.0",
       "signed": true
     },
     "config": {
@@ -619,7 +619,7 @@
   "history": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.1",
+    "agentVersion": "3.1.0",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
@@ -685,7 +685,7 @@
   "logs": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.1",
+    "agentVersion": "3.1.0",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"

@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.1",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -82,7 +82,7 @@
         "line": "agent.new swapped in, previous tree kept"
       }
     ],
-    "agentVersion": "3.0.1",
+    "agentVersion": "3.1.0",
     "systemId": "linux",
     "from": "3.0.0",
     "to": "3.0.0",

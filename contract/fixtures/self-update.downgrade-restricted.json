@@ -1,20 +1,20 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.1",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "restricted",
-  "message": "agent 3.0.0 is below the version floor 3.0.1; a restricted key can only move the agent forward or roll back to a signed agent at or above 3.0.1",
+  "message": "agent 3.0.0 is below the version floor 3.1.0; a restricted key can only move the agent forward or roll back to a signed agent at or above 3.1.0",
   "outcome": "failed",
   "action": "failed",
   "current": {
-    "version": "3.0.1",
+    "version": "3.1.0",
     "contract": 3
   },
-  "floor": "3.0.1",
+  "floor": "3.1.0",
   "staged": null,
   "previous": null,
   "manifest": {

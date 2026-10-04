@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { CONTRACT, discard, runGenerate, scratch, writeJson } from './support.mjs';
+import { CONTRACT, discard, readJson, runGenerate, scratch, writeJson } from './support.mjs';
 import { managedOnDisk } from '../tools/emit.mjs';
 
 /** Break one thing in a copy, and assert --check fails and says `expect`. */
@@ -142,5 +142,22 @@ test('two runs from nothing, in different places and environments, write the sam
   } finally {
     discard(one);
     discard(two);
+  }
+});
+
+test('the fixtures take the floor agent/package.json declares, and nothing else', () => {
+  const dir = scratch();
+  try {
+    const file = path.join(path.dirname(dir), 'agent', 'package.json');
+    const declared = readJson(file);
+    assert.equal(readJson(path.join(dir, 'fixtures', 'status.full.json')).agent.floor, declared.legionControl.agentFloor);
+    for (const [name, legionControl] of [['missing', undefined], ['above the version', { agentFloor: '99.0.0' }], ['not x.y.z', { agentFloor: '3.1' }]]) {
+      writeJson(file, { ...declared, legionControl });
+      const result = runGenerate(dir, ['--check']);
+      assert.equal(result.ok, false, `a floor ${name} was accepted`);
+      assert.match(result.output, /declares no legionControl\.agentFloor at most its version/);
+    }
+  } finally {
+    discard(dir);
   }
 });

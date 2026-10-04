@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.1",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -51,7 +51,7 @@
         "line": "cancelled by phone"
       }
     ],
-    "agentVersion": "3.0.1",
+    "agentVersion": "3.1.0",
     "systemId": "linux",
     "outcome": "deferred"
   }

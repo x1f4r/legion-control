@@ -51,21 +51,22 @@ if (typeof AGENT !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(AGENT)) {
   throw new Error(`agent/package.json has no x.y.z version (found ${JSON.stringify(AGENT)})`);
 }
 
-// The version floor a 3.1.0 agent reports (contract section 13). It is the
-// agentFloor its signed package.json declares, and agent 3.1.0 declares 3.1.0.
-// Until that declaration is in agent/package.json the fixtures state it here,
-// but never above AGENT: a declared floor is at most the agent's own version,
-// and the launcher refuses a signed tree below its floor, so a fixture with a
-// live agent under its floor would show a reply no agent can send. While the
-// package still says 3.0.x the floor is that version; the release that bumps
-// it regenerates every fixture anyway.
+// The version floor a 3.1.0 agent reports (contract section 13): the
+// agentFloor its signed package.json declares. It is read from there like the
+// version, and it is never above AGENT: a declared floor is at most the
+// agent's own version, and the launcher refuses a signed tree below its floor,
+// so a fixture with a live agent under its floor would show a reply no agent
+// can send.
+const AGENT_FLOOR = AGENT_PACKAGE.legionControl?.agentFloor;
 const versionKey = (version) => version.split('.').map(Number);
-const lowerVersion = (a, b) => {
-  const [x, y] = [versionKey(a), versionKey(b)];
-  const index = x.findIndex((part, at) => part !== y[at]);
-  return index >= 0 && x[index] > y[index] ? b : a;
+const floorAboveAgent = () => {
+  const [floor, agent] = [versionKey(AGENT_FLOOR), versionKey(AGENT)];
+  const index = floor.findIndex((part, at) => part !== agent[at]);
+  return index >= 0 && floor[index] > agent[index];
 };
-const AGENT_FLOOR = AGENT_PACKAGE.legionControl?.agentFloor ?? lowerVersion('3.1.0', AGENT);
+if (typeof AGENT_FLOOR !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(AGENT_FLOOR) || floorAboveAgent()) {
+  throw new Error(`agent/package.json declares no legionControl.agentFloor at most its version ${AGENT} (found ${JSON.stringify(AGENT_FLOOR)})`);
+}
 
 const LINUX = { id: 'linux', name: 'Raspberry Pi OS' };
 const MAC = { id: 'mac', name: 'macOS' };
