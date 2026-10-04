@@ -85,6 +85,41 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         self.agent = agent
     }
 
+    /// Follow an edit to this machine's entry in the setup without starting over.
+    ///
+    /// The app used to build a new model whenever the entry changed and throw this one away, with
+    /// its link state, its last reading and anything in flight. The action carried on in the
+    /// discarded model, out of sight, while the new one let the user start another on the same
+    /// machine. The model now stays; only what the setup says about the machine changes, and the
+    /// next poll reads it as it is.
+    func update(machine new: Machine) {
+        guard new != machine else { return }
+        machine = new
+        agent.machine = new
+
+        // What this model remembers about the machine is re-read against the new entry, so nothing
+        // is commanded with a launcher or an address the setup no longer has.
+        if let route = lastRoute {
+            lastRoute = new.routes(bindings: agent.bindings).first { $0.id == route.id }
+        }
+        switch link {
+        case .online(let system):
+            if let configured = new.system(id: system.id) {
+                link = .online(SystemDescriptor(configured))
+            } else if system.configured != nil {
+                link = .online(SystemDescriptor(unknownId: system.id, platform: status?.platform))
+            }
+        case .reachableWithoutAgent(let system):
+            if let configured = new.system(id: system.id) { link = .reachableWithoutAgent(configured) }
+        case .unknown, .offline:
+            break
+        }
+        if let expectation = rebootExpectation, let target = new.system(id: expectation.target.id) {
+            rebootExpectation = (target, expectation.until)
+        }
+        onStateChange?()
+    }
+
     /// How long an unreachable machine still reads as "asleep" rather than as a problem. The phone
     /// uses the same ten minutes, and the two apps have to say the same thing about the same machine.
     private static let sleepGrace: TimeInterval = 600

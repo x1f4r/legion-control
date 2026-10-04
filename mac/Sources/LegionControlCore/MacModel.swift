@@ -48,6 +48,19 @@ final class MacModel: AgentDevice {
         self.agent = agent
     }
 
+    /// Follow a change to how this device runs its own agent without starting over.
+    ///
+    /// The model used to be replaced whenever the local block or the bindings changed, which threw
+    /// away anything in flight along with it. The same device is still the same device: only its
+    /// name, its agent command or the machine it is bound to change.
+    func update(config: LocalConfig, agent: MacAgent, boundMachineId: String?, boundAgentArgv: [String]?) {
+        self.config = config
+        self.agent = agent
+        self.boundMachineId = boundMachineId
+        self.boundAgentArgv = boundAgentArgv
+        onStateChange?()
+    }
+
     var name: String { config.name }
 
     var historyMachineId: String { boundMachineId ?? Self.machineId }

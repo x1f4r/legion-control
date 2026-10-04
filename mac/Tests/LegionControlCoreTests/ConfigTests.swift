@@ -462,7 +462,7 @@ struct ConfigTests {
         #expect(FilePreferences(url: url).bool(forKey: "bool") == false)
     }
 
-    @Test("changing the bound local argv replaces the transport and uses this device's name")
+    @Test("changing the bound local argv replaces the transport in place and uses this device's name")
     func boundTransportTracksEdits() throws {
         let home = try Self.temporaryHome()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -482,7 +482,9 @@ struct ConfigTests {
         #expect(before.name == "My local name")
         #expect(app.machines.isEmpty)
         bindings.update { $0.localAgent = .init(argv: ["/bin/echo", "second"]) }
-        #expect(app.mac !== before)
+        // The same model, so nothing in flight on this device is left behind in one the app no
+        // longer shows; only the command it spawns its agent with has changed.
+        #expect(app.mac === before)
         #expect(app.mac?.boundAgentArgv == ["/bin/echo", "second"])
     }
 }

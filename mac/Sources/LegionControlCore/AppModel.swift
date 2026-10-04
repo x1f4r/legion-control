@@ -4,9 +4,9 @@ import Observation
 /// Everything the app knows: one model per machine in the setup, plus the device this runs on.
 ///
 /// This object owns nothing about any particular machine. It holds the shared setup and this
-/// device's private bindings, rebuilds the models when either changes, fans the poll out across
-/// them, keeps the one place a question is shown, and owns the operation history the machines all
-/// write into.
+/// device's private bindings, brings the models in line when either changes, fans the poll out
+/// across them, keeps the one place a question is shown, and owns the operation history the
+/// machines all write into.
 ///
 /// It is also where "every device is a peer" is actually true. There is no authority flag and no
 /// follower mode: this device edits the setup when the user edits it, publishes it to any machine
@@ -90,11 +90,12 @@ final class AppModel {
 
     // MARK: - Following the setup
 
-    /// Builds the models the setup asks for, keeping the ones whose machine has not changed.
+    /// Builds the models the setup asks for, keeping every one whose machine is still there.
     ///
-    /// Keeping them matters more than it looks: a rebuild throws away the link state, the last
+    /// Keeping them matters more than it looks: a new model starts without the link state, the last
     /// reading and anything in flight, and the config file is written by hand while the app is open.
-    /// An edit to one machine must not reset the others.
+    /// An edit to one machine must not reset the others, and an edit to a machine that is busy must
+    /// not reset that one either: its model takes the new entry in place.
     private func rebuild() {
         appUpdates.repositoryDidChange()
         let binding = bindings.bindings
@@ -108,8 +109,9 @@ final class AppModel {
             // inventing a loopback endpoint would be inventing a route nobody asked for.
             .filter { $0.id != selfMachineId }
             .map { machine in
-                if let model = existing[machine.id], model.machine == machine { return model }
-                return makeMachineModel(machine)
+                guard let model = existing[machine.id] else { return makeMachineModel(machine) }
+                model.update(machine: machine)
+                return model
             }
 
         rebuildLocalModel(selfMachineId: selfMachineId)
@@ -171,11 +173,19 @@ final class AppModel {
 
     /// The local model: either this device's own agent as configured by `local`, or the machine this
     /// device is bound to when the bindings say so.
+    ///
+    /// Like the machines, the model is kept once there is one. A new name, a new agent command or a
+    /// new binding is taken in place, so an action running here is never left behind in a model
+    /// the app no longer shows.
     private func rebuildLocalModel(selfMachineId: String?) {
         if let selfMachineId, let machine = config.config?.machine(id: selfMachineId),
            let argv = bindings.bindings.localAgent?.argv, !argv.isEmpty {
             let local = LocalConfig(enabled: true, name: bindings.bindings.effectiveDeviceName, agent: argv.last ?? "")
-            if mac?.config.name != local.name || mac?.boundMachineId != selfMachineId || mac?.boundAgentArgv != argv {
+            if let mac {
+                if mac.config.name != local.name || mac.boundMachineId != selfMachineId || mac.boundAgentArgv != argv {
+                    mac.update(config: local, agent: MacAgent(argv: argv), boundMachineId: selfMachineId, boundAgentArgv: argv)
+                }
+            } else {
                 let model = MacModel(config: local, agent: MacAgent(argv: argv))
                 model.boundMachineId = selfMachineId
                 model.boundAgentArgv = argv
@@ -187,7 +197,13 @@ final class AppModel {
         }
 
         if !bindings.isPresent, let local = config.local {
-            if mac?.config != local || mac?.boundMachineId != nil {
+            if let mac {
+                if mac.config != local || mac.boundMachineId != nil {
+                    mac.update(config: local, agent: MacAgent(scriptPath: local.agentPath),
+                               boundMachineId: nil, boundAgentArgv: nil)
+                    mac.boundMachine = nil
+                }
+            } else {
                 let model = MacModel(config: local)
                 wireLocal(model)
                 mac = model

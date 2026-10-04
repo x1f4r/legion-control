@@ -47,6 +47,12 @@ struct MachineModelTests {
             lock.lock(); defer { lock.unlock() }
             return commands.compactMap(\.last)
         }
+
+        /// Every argv as ssh was given it, address included.
+        var commandArguments: [[String]] {
+            lock.lock(); defer { lock.unlock() }
+            return commands
+        }
     }
 
     static func machine() -> Machine {
@@ -565,6 +571,94 @@ struct MachineModelTests {
         #expect(model.statusIsError)
         #expect(model.statusLine.contains("is invalid"))
         #expect(!runner.sentCommands.contains { $0.contains("bad id") })
+    }
+
+    // MARK: - Setup edits
+
+    /// Holds one scripted command until the test lets it go.
+    final class Gate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var open = false
+
+        func release() { lock.withLock { open = true } }
+
+        var isOpen: Bool { lock.withLock { open } }
+    }
+
+    @Test("an edit to a busy machine's entry is taken in place, and the action finishes in the same model")
+    func editDuringActionKeepsTheModel() async throws {
+        // A setup change used to replace the model. The restart carried on in the discarded one, out
+        // of sight, and the new one would have let the user start another on the same machine.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("restart", json: """
+        { "ok": true, "contract": 3, "action": "restarted", "service": "demo" }
+        """)
+        let gate = Gate()
+        var agent = RemoteAgent(machine: Self.machine())
+        agent.runner = { _, arguments, _, _ in
+            let verb = arguments.last?.split(separator: " ").dropFirst(2).first
+            while verb == "restart", !gate.isOpen { try? await Task.sleep(for: .milliseconds(5)) }
+            return runner.run(arguments)
+        }
+        let model = MachineModel(machine: Self.machine(), agent: agent)
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        model.operations = store
+
+        await model.refresh(userInitiated: false)
+        let service = try #require(model.services.first)
+        model.restart(service, force: false, whenIdle: false)
+        #expect(model.isWorking)
+
+        var edited = Self.machine()
+        edited.name = "Pi in the hall"
+        edited.endpoints = [Endpoint(id: "lan", kind: "lan", host: "10.0.0.6", user: "me")]
+        model.update(machine: edited)
+
+        // Still the one action, so nothing else can be started on top of it.
+        #expect(model.isWorking)
+        #expect(model.machine.name == "Pi in the hall")
+        #expect(model.commandableSystem?.id == "linux")
+
+        gate.release()
+        await Self.settle(model)
+
+        let record = try #require(store.newestFirst.first { $0.kind == .restart })
+        #expect(record.state == .succeeded)
+        #expect(model.lastActionOutcome?.operationId == record.id)
+        #expect(model.lastActionOutcome?.isError == false)
+
+        // And what comes next goes where the setup now says.
+        await model.refresh(userInitiated: false)
+        let last = try #require(runner.commandArguments.last)
+        #expect(last.contains { $0.contains("10.0.0.6") })
+        #expect(!last.contains { $0.contains("10.0.0.5") })
+    }
+
+    @Test("a system removed from the entry is no longer commanded with its old launcher")
+    func editDropsARemovedSystem() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        let (model, _, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh(userInitiated: false)
+        #expect(model.commandableSystem?.agent == ["node", "/a.mjs"])
+
+        var edited = Self.machine()
+        edited.systems = [SystemConfig(id: "linux", name: "Linux", platform: .linux, agent: ["node", "/c.mjs"])]
+        model.update(machine: edited)
+        #expect(model.commandableSystem?.agent == ["node", "/c.mjs"])
+
+        edited.systems = [SystemConfig(id: "other", name: "Other", platform: .linux, agent: ["node", "/b.mjs"])]
+        model.update(machine: edited)
+        // Still answering as linux until the next read, but nothing the setup no longer describes
+        // can be commanded.
+        #expect(model.currentSystem?.id == "linux")
+        #expect(model.commandableSystem == nil)
     }
 
     // MARK: - Notes and evidence

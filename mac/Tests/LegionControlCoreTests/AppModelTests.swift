@@ -27,6 +27,43 @@ struct AppModelTests {
         )
     }
 
+    static let twoMachines = """
+    {
+      "version": 1,
+      "machines": [
+        { "id": "pi", "name": "Pi",
+          "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.0.2.5", "user": "me" } ],
+          "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] },
+        { "id": "tower", "name": "Tower",
+          "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.0.2.9", "user": "me" } ],
+          "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] }
+      ]
+    }
+    """
+
+    @Test("an edit to a machine's entry updates its model rather than replacing it")
+    func editKeepsMachineModels() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try Self.app(Self.twoMachines, in: home)
+        let pi = try #require(app.machine(id: "pi"))
+        let tower = try #require(app.machine(id: "tower"))
+
+        let problem = app.editSetup("renamed the pi") { root in
+            var machines = try #require(root["machines"] as? [[String: Any]])
+            machines[0]["name"] = "Pi in the hall"
+            machines[0]["endpoints"] = [["id": "lan", "kind": "lan", "host": "192.0.2.6", "user": "me"]]
+            root["machines"] = machines
+        }
+        #expect(problem == nil)
+
+        // The same objects: an action running in either one is still the one the window shows.
+        #expect(app.machine(id: "pi") === pi)
+        #expect(app.machine(id: "tower") === tower)
+        #expect(pi.machine.name == "Pi in the hall")
+        #expect(pi.machine.endpoints.first?.host == "192.0.2.6")
+    }
+
     @Test("a failure on this device reaches the panel's notice, as one on a machine does")
     func localFailureReachesThePanel() async throws {
         let home = try Self.home()
