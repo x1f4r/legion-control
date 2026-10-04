@@ -318,12 +318,14 @@ trap finish EXIT
 # this checks they still belong together, signs the manifest again (the same bytes: Ed25519 is
 # deterministic and so is the manifest), and takes whichever of draft, push and publish is left.
 #
-# Origin is asked first. Until it has the tag, nothing of the release is public, and a release that
-# cannot be finished can still be cut again. Once it has it, the version is taken and the release
-# is only ever finished: from the tag, whatever main has done since, checked out on its own if main
-# has moved on here as well. Origin's main has to have the release commit all the same, since the
-# bump is in it, and a tag that got to origin without it has main pushed after it. And once the
-# draft holds every asset, it stands in for a dist/ that has been cleared since.
+# Origin is asked first. Until it has the tag, nothing of the release is public, a release that
+# cannot be finished can still be cut again, and one that can is held to the same checks against CI
+# and the releases already out as a run that starts from scratch. Once it has it, the version is
+# taken and the release is only ever finished: from the tag, whatever main has done since, checked
+# out on its own if main has moved on here as well. Origin's main has to have the release commit
+# all the same, since the bump is in it, and a tag that got to origin without it has main pushed
+# after it. And once the draft holds every asset, it stands in for a dist/ that has been cleared
+# since.
 
 if [ "$RESUME" -eq 1 ]; then
 	step "Picking up $TAG"
@@ -382,6 +384,31 @@ if [ "$RESUME" -eq 1 ]; then
 		say "$TAG is at $RELEASE_COMMIT, and GitHub has a draft of it."
 	else
 		say "$TAG is at $RELEASE_COMMIT, and GitHub has no release of it yet."
+	fi
+
+	# Until origin has the tag, the release is held to what a real run is held to before it builds:
+	# CI passed on origin's main, the commit it was cut from, the one commit on top of that, if there
+	# is one, is the version bump and nothing else, and the version is above every one already out.
+	# The run that tagged it checked all of that, but a tag made by hand over what a dry run left in
+	# dist/ was never checked, and a release cut since may have gone past this one.
+	if [ "$PUSHED" -eq 0 ]; then
+		CUT_FROM="$(git -C "$ROOT" rev-parse origin/main)"
+		if [ "$AHEAD" -eq 1 ]; then
+			while IFS= read -r changed; do
+				case "$changed" in
+					"$PLIST_REL"|"$GRADLE_REL"|"$DESKTOP_REL") ;;
+					*) die "$RELEASE_COMMIT, the commit $TAG is at, changes $changed, and a release adds nothing to the commit CI checked but its version bump. Nothing of $TAG is public yet: delete the tag (and its draft, if there is one) and release again." ;;
+				esac
+			done < <(git -C "$ROOT" diff --name-only "$CUT_FROM" HEAD)
+		fi
+		RUNS="$(gh run list --commit "$CUT_FROM" --limit 100 --json workflowName,headSha,status,conclusion,createdAt)" \
+			|| die "gh could not list the CI runs of $CUT_FROM."
+		CI="$(printf '%s' "$RUNS" | node "$RELEASE_STATE" ci "$CUT_FROM")" || die "$CI"
+		say "$CI"
+		REMOTE_TAGS="$(git -C "$ROOT" ls-remote --tags origin)" || die "cannot list the tags on origin."
+		NEWEST="$(printf '%s' "$RELEASES" | node "$RELEASE_STATE" newer "$VERSION" "$REMOTE_TAGS")" \
+			|| die "$NEWEST Nothing of $TAG is public yet: delete the tag (and its draft, if there is one) and release a higher version."
+		say "The newest version out is ${NEWEST:-none}."
 	fi
 
 	# The artifacts are in dist/ until something clears it: another run of this script, a dry run of

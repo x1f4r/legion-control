@@ -193,6 +193,15 @@ for archive in Legion-Control-linux-x64.tar.gz Legion-Control-linux-arm64.tar.gz
   return { root, repo, git, originGit, gh, release, happened, manifest, pushFromElsewhere, notes: path.join(root, 'notes.md') };
 }
 
+// The versions of the 1.3.4 checkout set to 1.4.0 and `build`, as a commit of their own sets them.
+function setVersions(repo, build) {
+  edit(repo, 'mac/Resources/Info.plist', '<string>1.3.4</string>', '<string>1.4.0</string>');
+  edit(repo, 'mac/Resources/Info.plist', '<string>14</string>', `<string>${build}</string>`);
+  edit(repo, 'android/app/build.gradle.kts', 'versionCode = 14', `versionCode = ${build}`);
+  edit(repo, 'android/app/build.gradle.kts', 'versionName = "1.3.4"', 'versionName = "1.4.0"');
+  edit(repo, 'desktop/LegionControl.Desktop/LegionControl.Desktop.csproj', '<Version>1.3.4</Version>', '<Version>1.4.0</Version>');
+}
+
 const BUILDS = ['check.sh all', 'package-agent', 'mac/build.sh --no-install --require-agent', 'android/build-apk.sh --require-agent', 'desktop/build.sh --require-agent', 'verify-desktop-artifacts 1.4.0'];
 const ASSETS = ['Legion-Control-macos-arm64.zip', 'Legion-Control-android-arm64.apk', 'Legion-Control-linux-x64.tar.gz', 'Legion-Control-linux-arm64.tar.gz', 'Legion-Control-windows-x64.zip', 'legionctl-agent-3.1.0.tgz', 'Legion-Control-manifest.json', 'Legion-Control-manifest.json.sig', 'Legion-Control-agent-manifest.json', 'Legion-Control-agent-manifest.json.sig'];
 
@@ -508,6 +517,58 @@ test('--resume refuses what it cannot finish, without sending anyone round to --
   assert.doesNotMatch(pushed.stderr, /delete/);
 });
 
+test('--resume holds a release nothing of which is public to the checks a run from scratch makes', mac, (t) => {
+  const { repo, git, gh, release, happened, manifest, notes } = releaseCheckout(t);
+  // The versions set in a commit of their own and pushed, and CI failed on it.
+  setVersions(repo, 15);
+  git('commit', '-qam', 'Set the versions to 1.4.0');
+  git('push', '-q', 'origin', 'main');
+  const reviewed = git('rev-parse', 'HEAD');
+  gh.set(state => ({ ...state, runs: [{ ...gh.passed(reviewed), conclusion: 'failure' }] }));
+  // A dry run builds everything into dist/ whatever CI said, and a tag made by hand over that is a
+  // release no run checked.
+  assert.equal(release('1.4.0', '--tag-head', '--dry-run', '--notes', notes).status, 0);
+  git('tag', '-a', 'v1.4.0', '-m', 'Legion Control 1.4.0');
+  const refused = (message) => {
+    const result = release('1.4.0', '--resume', '--notes', notes);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr, message);
+    assert.doesNotMatch(result.stderr, /is tagged here and not out yet/);
+    assert.deepEqual(happened(), []);
+    assert.equal(gh.get().releases.some(entry => entry.tagName === 'v1.4.0'), false);
+  };
+  refused(/CI did not pass on [0-9a-f]{12} \(Checks: failure\)/);
+
+  // A release cut since has gone past it.
+  gh.set(state => ({ ...state, runs: [gh.passed(reviewed)], releases: [...state.releases, { tagName: 'v1.4.1', isDraft: false, isPrerelease: false, assets: [] }] }));
+  refused(/1\.4\.0 is not above 1\.4\.1, the newest version already released\. .* Nothing of v1\.4\.0 is public yet: delete the tag \(and its draft, if there is one\) and release a higher version\./);
+
+  // Checked as a run from scratch would be, it is the release a --tag-head run would have made.
+  gh.set(state => ({ ...state, releases: state.releases.filter(entry => entry.tagName !== 'v1.4.1') }));
+  const resumed = release('1.4.0', '--resume', '--notes', notes);
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.match(resumed.stdout, /CI passed on [0-9a-f]{12} \(Checks\)\.\nThe newest version out is 1\.3\.4\./);
+  assert.deepEqual(happened(), [
+    'verify-desktop-artifacts 1.4.0',
+    'gh release create v1.4.0 draft=true target=main assets=10',
+    'push refs/tags/v1.4.0',
+    'gh release edit v1.4.0 draft=false',
+  ]);
+  assert.equal(manifest().commit, reviewed);
+
+  // The one commit a release may add to what CI checked is the bump, and nothing comes with it.
+  const unreviewed = releaseCheckout(t);
+  setVersions(unreviewed.repo, 15);
+  fs.writeFileSync(path.join(unreviewed.repo, 'unreviewed.txt'), 'never on origin\n');
+  unreviewed.git('add', '-A');
+  unreviewed.git('commit', '-qm', 'Release 1.4.0');
+  unreviewed.git('tag', '-a', 'v1.4.0', '-m', 'Legion Control 1.4.0');
+  const smuggled = unreviewed.release('1.4.0', '--resume', '--notes', unreviewed.notes);
+  assert.equal(smuggled.status, 1);
+  assert.match(smuggled.stderr, new RegExp(`${unreviewed.git('rev-parse', 'HEAD')}, the commit v1\\.4\\.0 is at, changes unreviewed\\.txt, and a release adds nothing to the commit CI checked but its version bump\\. Nothing of v1\\.4\\.0 is public yet: delete the tag \\(and its draft, if there is one\\) and release again\\.`));
+  assert.deepEqual(unreviewed.happened(), []);
+});
+
 test('a release is refused before anything is built unless CI passed on the very commit origin has, and the version is new', mac, (t) => {
   const { repo, git, originGit, gh, release, happened, pushFromElsewhere, notes } = releaseCheckout(t);
   const base = git('rev-parse', 'HEAD');
@@ -570,11 +631,7 @@ test('--tag-head releases the reviewed HEAD without a bump commit, its build abo
   const { repo, git, originGit, gh, release, happened, manifest, notes } = releaseCheckout(t);
   // The versions set in a commit of their own, reviewed and merged like any other.
   const bump = (build) => {
-    edit(repo, 'mac/Resources/Info.plist', '<string>1.3.4</string>', '<string>1.4.0</string>');
-    edit(repo, 'mac/Resources/Info.plist', '<string>14</string>', `<string>${build}</string>`);
-    edit(repo, 'android/app/build.gradle.kts', 'versionCode = 14', `versionCode = ${build}`);
-    edit(repo, 'android/app/build.gradle.kts', 'versionName = "1.3.4"', 'versionName = "1.4.0"');
-    edit(repo, 'desktop/LegionControl.Desktop/LegionControl.Desktop.csproj', '<Version>1.3.4</Version>', '<Version>1.4.0</Version>');
+    setVersions(repo, build);
     git('commit', '-qam', 'Set the versions to 1.4.0');
     git('push', '-q', 'origin', 'main');
     gh.set(state => ({ ...state, runs: [gh.passed(git('rev-parse', 'HEAD'))] }));
