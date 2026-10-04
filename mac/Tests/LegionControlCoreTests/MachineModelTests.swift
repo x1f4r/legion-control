@@ -694,6 +694,113 @@ struct MachineModelTests {
         #expect(model.commandableSystem == nil)
     }
 
+    @Test("a status read that was out during an edit is taken against the entry as it is now")
+    func readDuringEditFollowsTheEdit() async throws {
+        // The read came back after the edit and put back the route it went out over, old address
+        // and all. Sends only use the route to order their tries, but the legacy agent install
+        // uploads to its address, so it would have gone to a host the setup no longer has.
+        let runner = FakeRunner()
+        // A 2.x agent that names neither its system nor its platform, so the launcher that worked
+        // is all there is to go on.
+        runner.answer("status", json: """
+        { "ok": true, "agentVersion": "2.1.0",
+          "t3": { "installed": "1", "nightly": "2", "upToDate": false } }
+        """)
+        let gate = Gate(holding: "status")
+        let (model, _, directory) = try Self.gatedModel(runner, gate: gate)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let reading = Task { await model.refresh(userInitiated: false) }
+        let read = try #require(await gate.waitUntilHolding())
+        #expect(read.contains { $0.contains("10.0.0.5") })
+
+        var edited = Self.machine()
+        edited.endpoints = [Endpoint(id: "lan", kind: "lan", host: "10.0.0.6", user: "me")]
+        edited.systems[0].agent = ["node", "/c.mjs"]
+        model.update(machine: edited)
+        gate.release()
+        await reading.value
+
+        #expect(model.lastRoute?.target.host == "10.0.0.6")
+        #expect(model.commandableSystem?.agent == ["node", "/c.mjs"])
+    }
+
+    @Test("a read that went out over an address the entry has since dropped leaves no route to it")
+    func readOverADroppedAddress() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        let gate = Gate(holding: "status")
+        let (model, _, directory) = try Self.gatedModel(runner, gate: gate)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let reading = Task { await model.refresh(userInitiated: false) }
+        #expect(await gate.waitUntilHolding() != nil)
+        var edited = Self.machine()
+        edited.endpoints = [Endpoint(id: "wired", kind: "lan", host: "10.0.0.7", user: "me")]
+        model.update(machine: edited)
+        gate.release()
+        await reading.value
+
+        // The machine answered, so it is up, but the way it answered is gone with the edit.
+        #expect(model.isAwake)
+        #expect(model.lastRoute == nil)
+    }
+
+    static let unknownHostKey = CommandResult(
+        exitCode: 255, standardOutput: "",
+        standardError: "No ED25519 host key is known for pi and you have requested strict checking.",
+        timedOut: false, launchFailure: nil)
+
+    @Test("a host key question goes with the address it was about")
+    func hostKeyQuestionFollowsTheEntry() async throws {
+        // The question used to outlive an edit that dropped its address, so a key could still be
+        // pinned for a host this device no longer dials.
+        let runner = FakeRunner()
+        runner.answer("status", with: [Self.unknownHostKey])
+        let (model, _, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh(userInitiated: false)
+        #expect(model.hostKeyPrompt?.target?.host == "10.0.0.5")
+        model.selectedHostSystem = "linux"
+        model.confirmedHostSystems = ["linux"]
+        model.hostSystemsConfirmed = true
+
+        // A new name says nothing about the address, so the question stands.
+        var edited = Self.machine()
+        edited.name = "Pi in the hall"
+        model.update(machine: edited)
+        #expect(model.hostKeyPrompt?.target?.host == "10.0.0.5")
+        #expect(model.hostSystemsConfirmed)
+
+        edited.endpoints = [Endpoint(id: "wired", kind: "lan", host: "10.0.0.7", user: "me")]
+        model.update(machine: edited)
+        #expect(model.hostKeyPrompt == nil)
+        #expect(model.selectedHostSystem.isEmpty)
+        #expect(model.confirmedHostSystems.isEmpty)
+        #expect(!model.hostSystemsConfirmed)
+    }
+
+    @Test("a read that meets an unknown key at an address the entry has since dropped asks nothing")
+    func hostKeyFailureDuringEditAsksNothing() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", with: [Self.unknownHostKey])
+        let gate = Gate(holding: "status")
+        let (model, _, directory) = try Self.gatedModel(runner, gate: gate)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let reading = Task { await model.refresh(userInitiated: false) }
+        #expect(await gate.waitUntilHolding() != nil)
+        var edited = Self.machine()
+        edited.endpoints = [Endpoint(id: "wired", kind: "lan", host: "10.0.0.7", user: "me")]
+        model.update(machine: edited)
+        gate.release()
+        await reading.value
+
+        #expect(model.statusIsError)
+        #expect(model.hostKeyPrompt == nil)
+    }
+
     @Test("every machine writes into one remembered store, so none erases another's reading")
     func rememberedSettingsAreShared() async throws {
         // Each model used to load its own copy at launch and write the whole of it back, so the last

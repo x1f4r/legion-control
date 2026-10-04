@@ -103,9 +103,7 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
 
         // What this model remembers about the machine is re-read against the new entry, so nothing
         // is commanded with a launcher or an address the setup no longer has.
-        if let route = lastRoute {
-            lastRoute = new.routes(bindings: agent.bindings).first { $0.id == route.id }
-        }
+        lastRoute = lastRoute.flatMap(currentRoute)
         switch link {
         case .online(let system):
             if let configured = new.system(id: system.id) {
@@ -121,7 +119,28 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         if let expectation = rebootExpectation, let target = new.system(id: expectation.target.id) {
             rebootExpectation = (target, expectation.until)
         }
+        // A host key belongs to one address. A question about an address the entry has dropped is
+        // a question about a machine this device no longer dials, and answering it would pin a key
+        // for nothing. If the new address has the same problem, the next poll asks again.
+        if let prompt = hostKeyPrompt, !(prompt.target.map(isCurrentAddress) ?? false) {
+            clearHostKeyPrompt()
+        }
         onStateChange?()
+    }
+
+    /// The route with this one's id as the entry has it now, or nil when the entry no longer has it.
+    ///
+    /// A route is remembered by id and dialled by its target, so a route kept across an edit has to
+    /// be looked up again: the id can stay while the address behind it changes.
+    private func currentRoute(_ route: MachineRoute) -> MachineRoute? {
+        machine.routes(bindings: agent.bindings).first { $0.id == route.id }
+    }
+
+    /// Whether the entry still reaches this machine at that host and port, under any route.
+    private func isCurrentAddress(_ target: SSHTarget) -> Bool {
+        machine.routes(bindings: agent.bindings).contains {
+            $0.target.host == target.host && ($0.target.port ?? 22) == (target.port ?? 22)
+        }
     }
 
     /// How long an unreachable machine still reads as "asleep" rather than as a problem. The phone
@@ -308,7 +327,10 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
             }
             hostKeyPrompt = nil
             apply(reply.value, fallback: reply.system)
-            lastRoute = reply.route
+            // The entry may have been edited while the read was out, and the reply names the route
+            // as the entry had it then. Kept as it is, it would put an address back that the edit
+            // took away, and the legacy agent install uploads to exactly that address.
+            lastRoute = currentRoute(reply.route)
             lastChecked = Date()
             if !userInitiated, core.lineIsRefreshFailure {
                 if let outcome = lastActionOutcome {
@@ -365,10 +387,13 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     }
 
     private func handleStatusFailure(_ failure: AgentFailure) {
+        // The failure names the system and the address as the entry had them when the read went
+        // out, which is not always the entry as it is now. Both are taken only while the entry
+        // still has them.
         switch failure.kind {
         case .agentMissing, .interpreterMissing:
             status = nil
-            if let system = failure.system {
+            if let system = failure.system.flatMap({ machine.system(id: $0.id) }) {
                 link = .reachableWithoutAgent(system)
                 setStatus("The control agent is missing on \(system.name). Run the installer there, or use Install agent below.",
                           isError: true, detail: failure.detailText)
@@ -381,18 +406,12 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
             link = .offline(failure)
             // Nothing is written to known_hosts here. Accepting a key is a trust decision and it gets
             // its own question, with the fingerprint in it.
-            let target = failure.target ?? machine.sshTarget
-            if hostKeyPrompt?.target != target || hostKeyPrompt == nil {
-                hostKeyPrompt = HostKeyPrompt(machine: machine.name, target: target, detail: failure.detail)
-            }
+            askAboutHostKey(failure)
             setStatus(failure.message(machine: machine.name), isError: true, detail: failure.detailText)
         case .hostKeyChanged:
             status = nil
             link = .offline(failure)
-            let target = failure.target ?? machine.sshTarget
-            if hostKeyPrompt?.target != target || hostKeyPrompt == nil {
-                hostKeyPrompt = HostKeyPrompt(machine: machine.name, target: target, detail: failure.detail)
-            }
+            askAboutHostKey(failure)
             setStatus(failure.message(machine: machine.name), isError: true, detail: failure.detailText)
         default:
             status = nil
@@ -436,6 +455,27 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     var confirmedHostSystems: Set<String> = []
     var legacyHostAssignments: [String: String] = [:]
     var hostSystemsConfirmed = false
+
+    /// Raise the question about the key a status read met, unless the same question is already up.
+    /// A read that went out before an edit can come back about an address the entry has since
+    /// dropped, and that one gets no question at all.
+    private func askAboutHostKey(_ failure: AgentFailure) {
+        let target = failure.target ?? machine.sshTarget
+        if let target, !isCurrentAddress(target) { return }
+        if hostKeyPrompt?.target != target || hostKeyPrompt == nil {
+            hostKeyPrompt = HostKeyPrompt(machine: machine.name, target: target, detail: failure.detail)
+        }
+    }
+
+    /// Drop the question along with every answer given to it so far, so none of them can be applied
+    /// to a different one.
+    private func clearHostKeyPrompt() {
+        hostKeyPrompt = nil
+        selectedHostSystem = ""
+        confirmedHostSystems = []
+        legacyHostAssignments = [:]
+        hostSystemsConfirmed = false
+    }
 
     func readHostKeyFingerprint() {
         guard let prompt = hostKeyPrompt, let target = prompt.target else { return }
