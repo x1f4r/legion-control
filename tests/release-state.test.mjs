@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { assetVerdict, ciVerdict, newerVerdict, releaseState } from '../scripts/release-state.mjs';
+import { assetVerdict, ciVerdict, newerVerdict, releaseState, uploadedVerdict } from '../scripts/release-state.mjs';
 
 const repository = path.resolve(import.meta.dirname, '..');
 const SHA = 'a'.repeat(40);
@@ -73,6 +73,15 @@ test('the draft holds every asset only when each is there at the size it was bui
   assert.match(assetVerdict({}, files).message, /does not hold a\.zip, b\.apk/);
 });
 
+test('without the files to measure, the draft holds every asset only when each name is there, uploaded in full', () => {
+  const names = ['a.zip', 'b.apk'];
+  assert.deepEqual(uploadedVerdict({ assets: [{ name: 'a.zip', size: 3, state: 'uploaded' }, { name: 'b.apk', size: 5 }] }, names), { ok: true, message: 'The draft release holds all 2 assets.' });
+  assert.deepEqual(uploadedVerdict({ assets: [{ name: 'a.zip', size: 3 }] }, names), { ok: false, message: 'the draft release does not hold b.apk.' });
+  // An upload that broke off is still on the draft, in the state GitHub keeps it in until it is whole.
+  assert.match(uploadedVerdict({ assets: [{ name: 'a.zip', size: 3, state: 'starter' }, { name: 'b.apk', size: 5 }] }, names).message, /does not hold a\.zip\.$/);
+  assert.match(uploadedVerdict({}, names).message, /does not hold a\.zip, b\.apk\.$/);
+});
+
 test('the command answers on one line and exits 1 when the release has to stop', (t) => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-release-state-'));
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
@@ -88,6 +97,11 @@ test('the command answers on one line and exits 1 when the release has to stop',
   assert.equal(ask(releases, 'newer', '1.3.4').status, 1);
   const assets = ask(JSON.stringify({ assets: [{ name: 'a.zip', size: 3 }] }), 'assets', path.join(scratch, 'a.zip'));
   assert.deepEqual([assets.status, assets.stdout], [0, 'The draft release holds all 1 assets.\n']);
+  // By name, nothing is read from disk: the file named need not be there at all.
+  const uploaded = ask(JSON.stringify({ assets: [{ name: 'gone.zip', size: 9, state: 'uploaded' }] }), 'uploaded', 'gone.zip');
+  assert.deepEqual([uploaded.status, uploaded.stdout], [0, 'The draft release holds all 1 assets.\n']);
+  const short = ask(JSON.stringify({ assets: [] }), 'uploaded', 'gone.zip');
+  assert.deepEqual([short.status, short.stdout], [1, 'the draft release does not hold gone.zip.\n']);
   const garbled = ask('release not found', 'state', '1.4.0');
   assert.equal(garbled.status, 1);
   assert.match(garbled.stdout, /^gh printed something that is not JSON/);

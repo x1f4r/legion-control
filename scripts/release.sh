@@ -206,6 +206,9 @@ PUSHED=0
 # Set by --resume when origin has the tag and its main does not have the release commit yet,
 # because the tag got there on its own rather than in the atomic push below.
 MAIN_BEHIND=0
+# Set by --resume when dist/ has been cleared since the draft was filled. The draft is then all
+# there is of the assets, and it is published as it is.
+DIST_GONE=0
 
 # Every asset of the release: what the builds leave in dist/, then the release manifest signed over
 # them, which is the one part --resume makes again.
@@ -217,29 +220,35 @@ release_assets() {
 	ASSETS=("${BUILT[@]}" "$DIST/Legion-Control-manifest.json" "$DIST/Legion-Control-manifest.json.sig")
 }
 
+# Whether the draft holds every asset: each file in dist/ at the size it was built (assets FILE...),
+# or, once dist/ no longer has the files to measure, each name uploaded in full (uploaded NAME...).
 draft_holds_everything() {
 	local view
 	view="$(gh release view "$TAG" --json assets)" || { DRAFT_SAYS="gh could not read the draft release $TAG."; return 1; }
-	DRAFT_SAYS="$(printf '%s' "$view" | node "$RELEASE_STATE" assets "${ASSETS[@]}")"
+	DRAFT_SAYS="$(printf '%s' "$view" | node "$RELEASE_STATE" "$@")"
 }
 
 publish() {
 	release_assets
 
 	step "Putting every asset on a draft release"
-	if [ "$STATE" = "none" ]; then
-		# --target only because gh refuses a tag that exists here and not yet on origin. The tag is
-		# pushed before the draft is published, and publishing checks it is there, so main's head is
-		# never what the release ends up at.
-		gh release create "$TAG" --draft --target main \
-			--title "Legion Control $VERSION" \
-			--notes-file "$NOTES" \
-			"${ASSETS[@]}" >/dev/null
-	fi
-	if ! draft_holds_everything; then
-		say "Uploading again, because $DRAFT_SAYS"
-		gh release upload "$TAG" --clobber "${ASSETS[@]}"
-		draft_holds_everything || die "$DRAFT_SAYS"
+	# Without dist/ there is nothing here to upload, and --resume has found every asset on the draft
+	# already.
+	if [ "$DIST_GONE" -eq 0 ]; then
+		if [ "$STATE" = "none" ]; then
+			# --target only because gh refuses a tag that exists here and not yet on origin. The tag is
+			# pushed before the draft is published, and publishing checks it is there, so main's head
+			# is never what the release ends up at.
+			gh release create "$TAG" --draft --target main \
+				--title "Legion Control $VERSION" \
+				--notes-file "$NOTES" \
+				"${ASSETS[@]}" >/dev/null
+		fi
+		if ! draft_holds_everything assets "${ASSETS[@]}"; then
+			say "Uploading again, because $DRAFT_SAYS"
+			gh release upload "$TAG" --clobber "${ASSETS[@]}"
+			draft_holds_everything assets "${ASSETS[@]}" || die "$DRAFT_SAYS"
+		fi
 	fi
 	say "$DRAFT_SAYS"
 
@@ -313,7 +322,8 @@ trap finish EXIT
 # cannot be finished can still be cut again. Once it has it, the version is taken and the release
 # is only ever finished: from the tag, whatever main has done since, checked out on its own if main
 # has moved on here as well. Origin's main has to have the release commit all the same, since the
-# bump is in it, and a tag that got to origin without it has main pushed after it.
+# bump is in it, and a tag that got to origin without it has main pushed after it. And once the
+# draft holds every asset, it stands in for a dist/ that has been cleared since.
 
 if [ "$RESUME" -eq 1 ]; then
 	step "Picking up $TAG"
@@ -383,19 +393,32 @@ if [ "$RESUME" -eq 1 ]; then
 	done
 	if [ "${#MISSING[@]}" -gt 0 ]; then
 		GONE="dist/ no longer holds ${MISSING[*]}, built for $TAG, and --resume builds nothing."
-		[ "$PUSHED" -eq 0 ] \
-			|| die "$GONE origin has $TAG already, so the version cannot be cut again: build them at $TAG by hand into dist/, the way the Build section of scripts/release.sh does, then run this again."
-		# Nothing of it is public, so it is cut again from where it started: the tag goes, the draft
-		# if there is one, and the bump commit if the run made one, which is the one commit HEAD can
-		# be ahead of origin/main by here.
-		AGAIN="git tag -d $TAG"
-		[ "$STATE" = "none" ] || AGAIN="$AGAIN, gh release delete $TAG"
-		if [ "$AHEAD" -eq 1 ]; then
-			AGAIN="$AGAIN, git reset --hard origin/main to drop the bump commit, then ./scripts/release.sh $VERSION"
+		if [ "$PUSHED" -eq 1 ]; then
+			# The version is taken, so what is gone has to come from the draft, and it can once the
+			# draft holds every asset: each was uploaded from dist/ after it was checked and signed for
+			# the tag, the signed manifest with them, so all that is left is to publish it. Rebuilding
+			# would only put new bytes in place of ones that were checked.
+			if [ "$STATE" = "none" ]; then
+				DRAFT_SAYS="GitHub has no draft of it to publish instead."
+			elif draft_holds_everything uploaded "${ASSETS[@]##*/}"; then
+				DIST_GONE=1
+			fi
+			[ "$DIST_GONE" -eq 1 ] \
+				|| die "$GONE origin has $TAG already, so the version cannot be cut again, and $DRAFT_SAYS Build them at $TAG by hand into dist/, the way the Build section of scripts/release.sh does, then run this again."
+			say "$GONE The draft holds every asset, so it is published as it is."
 		else
-			AGAIN="$AGAIN, then ./scripts/release.sh $VERSION --tag-head"
+			# Nothing of it is public, so it is cut again from where it started: the tag goes, the
+			# draft if there is one, and the bump commit if the run made one, which is the one commit
+			# HEAD can be ahead of origin/main by here.
+			AGAIN="git tag -d $TAG"
+			[ "$STATE" = "none" ] || AGAIN="$AGAIN, gh release delete $TAG"
+			if [ "$AHEAD" -eq 1 ]; then
+				AGAIN="$AGAIN, git reset --hard origin/main to drop the bump commit, then ./scripts/release.sh $VERSION"
+			else
+				AGAIN="$AGAIN, then ./scripts/release.sh $VERSION --tag-head"
+			fi
+			die "$GONE Nothing of $TAG is public yet, so cut it again: $AGAIN."
 		fi
-		die "$GONE Nothing of $TAG is public yet, so cut it again: $AGAIN."
 	fi
 
 	if [ "$STATE" = "none" ]; then
@@ -412,8 +435,10 @@ if [ "$RESUME" -eq 1 ]; then
 		grep -q '[^[:space:]]' "$NOTES" || die "the release notes are empty."
 	fi
 
-	check_artifacts
-	sign_release "$RELEASE_COMMIT"
+	if [ "$DIST_GONE" -eq 0 ]; then
+		check_artifacts
+		sign_release "$RELEASE_COMMIT"
+	fi
 	# From here on a failure is one more --resume can get past; the ones above are not.
 	TAGGED=1
 	publish

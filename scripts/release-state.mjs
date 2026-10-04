@@ -6,6 +6,7 @@
 //   gh release list --json tagName,isDraft,...  | release-state.mjs state X.Y.Z
 //   gh release list --json tagName,isDraft,...  | release-state.mjs newer X.Y.Z "$(git ls-remote --tags origin)"
 //   gh release view vX.Y.Z --json assets        | release-state.mjs assets FILE...
+//   gh release view vX.Y.Z --json assets        | release-state.mjs uploaded NAME...
 //
 // Each prints one line. `state` prints none, draft or published. The others exit 1 when the release
 // has to stop, and the line then says why; otherwise `newer` prints the newest version already out,
@@ -74,6 +75,17 @@ export function assetVerdict(view, files) {
   return { ok: true, message: `The draft release holds all ${files.length} assets.` };
 }
 
+/**
+ * Whether the release `view` holds every one of `names` uploaded in full, at whatever size: all that
+ * can be asked of a draft once the files it was filled from are no longer there to measure.
+ */
+export function uploadedVerdict(view, names) {
+  const uploaded = new Set((Array.isArray(view?.assets) ? view.assets : []).filter(asset => (asset?.state ?? 'uploaded') === 'uploaded').map(asset => asset.name));
+  const missing = names.filter(name => !uploaded.has(name));
+  if (missing.length) return { ok: false, message: `the draft release does not hold ${missing.join(', ')}.` };
+  return { ok: true, message: `The draft release holds all ${names.length} assets.` };
+}
+
 // Compared through realpath, as the other release scripts do: Node resolves the symlinks in
 // import.meta.url but not in argv[1], so through a symlinked checkout this would answer nothing.
 const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
@@ -90,7 +102,8 @@ if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.
     if (verdict.ok) verdict.message = verdict.newest;
   } else if (question === 'assets' && args.length >= 1) {
     verdict = assetVerdict(input, args.map(file => ({ name: path.basename(file), size: fs.statSync(file).size })));
-  } else verdict = { ok: false, message: 'Usage: release-state.mjs ci SHA | state X.Y.Z | newer X.Y.Z [TAGS] | assets FILE...' };
+  } else if (question === 'uploaded' && args.length >= 1) verdict = uploadedVerdict(input, args);
+  else verdict = { ok: false, message: 'Usage: release-state.mjs ci SHA | state X.Y.Z | newer X.Y.Z [TAGS] | assets FILE... | uploaded NAME...' };
   console.log(verdict.message);
   process.exitCode = verdict.ok ? 0 : 1;
 }

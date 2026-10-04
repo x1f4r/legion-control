@@ -35,7 +35,7 @@ for (let at = 0; at < args.length; at += 1) {
 }
 const [noun, verb, tag, ...files] = words;
 const find = () => state.releases.find(release => release.tagName === tag);
-const asset = (file) => ({ name: path.basename(file), size: fs.statSync(file).size });
+const asset = (file, state = 'uploaded') => ({ name: path.basename(file), size: fs.statSync(file).size, state });
 if (noun === 'auth') process.exit(0);
 if (noun === 'run' && verb === 'list') { print(state.runs.filter(run => run.headSha === flags['--commit'])); process.exit(0); }
 if (noun === 'release' && verb === 'list') { print(state.releases.map(({ tagName, isDraft, isPrerelease }) => ({ tagName, isDraft, isPrerelease }))); process.exit(0); }
@@ -49,8 +49,9 @@ if (noun === 'release' && verb === 'create') {
   if (state.fail.create === 'before') fail('HTTP 502: the release could not be created');
   if (find()) fail('Release.tag_name already exists');
   state.releases.push({ tagName: tag, isDraft: flags['--draft'] === 'true', isPrerelease: false, title: flags['--title'], notes: fs.readFileSync(flags['--notes-file'], 'utf8'), assets: [], url: \`https://github.com/x1f4r/legion-control/releases/tag/\${tag}\` });
-  // A connection that drops half way leaves a draft with some of the assets on it.
-  find().assets = (state.fail.create === 'partial' ? files.slice(0, 3) : files).map(asset);
+  // A connection that drops half way leaves a draft with some of the assets on it, and the one it
+  // was uploading when it dropped in the state GitHub keeps an unfinished upload in.
+  find().assets = state.fail.create === 'partial' ? [...files.slice(0, 3).map(file => asset(file)), asset(files[3], 'starter')] : files.map(file => asset(file));
   save();
   if (state.fail.create === 'partial') fail('HTTP 502: an asset upload failed');
   process.exit(0);
@@ -58,7 +59,7 @@ if (noun === 'release' && verb === 'create') {
 if (noun === 'release' && verb === 'upload') {
   note(\`gh release upload \${tag} clobber=\${flags['--clobber']} assets=\${files.length}\`);
   const release = find() ?? fail('release not found');
-  for (const uploaded of files.map(asset)) release.assets = release.assets.filter(other => other.name !== uploaded.name).concat(uploaded);
+  for (const uploaded of files.map(file => asset(file))) release.assets = release.assets.filter(other => other.name !== uploaded.name).concat(uploaded);
   save();
   process.exit(0);
 }
@@ -362,17 +363,44 @@ test('--resume says when dist/ no longer holds the release, and how to go on fro
   assert.equal(again.status, 0, again.stderr);
   assert.equal(unpushed.gh.get().releases.find(entry => entry.tagName === 'v1.4.0').isDraft, false);
 
-  // Once origin has the tag, the version is taken, and what is gone has to be built again.
+  // Once origin has the tag the version is taken. A draft that holds every asset stands in for
+  // what is gone, and is published as it is: nothing is built, uploaded or signed again.
   const pushed = releaseCheckout(t);
   pushed.gh.set(state => ({ ...state, fail: { publish: true } }));
   assert.equal(pushed.release('1.4.0', '--notes', pushed.notes).status, 1);
   pushed.gh.set(state => ({ ...state, fail: {} }));
-  fs.rmSync(path.join(pushed.repo, 'dist', 'Legion-Control-android-arm64.apk'));
-  const lost = pushed.release('1.4.0', '--resume');
-  assert.equal(lost.status, 1);
-  assert.match(lost.stderr, /dist\/ no longer holds Legion-Control-android-arm64\.apk, built for v1\.4\.0, and --resume builds nothing\. origin has v1\.4\.0 already, so the version cannot be cut again: build them at v1\.4\.0 by hand into dist\//);
-  assert.doesNotMatch(lost.stderr, /git tag -d|gh release delete/);
-  assert.deepEqual(pushed.happened(), []);
+  const drafted = pushed.gh.get().releases.find(entry => entry.tagName === 'v1.4.0').assets;
+  fs.rmSync(path.join(pushed.repo, 'dist'), { recursive: true });
+  const fromDraft = pushed.release('1.4.0', '--resume');
+  assert.equal(fromDraft.status, 0, fromDraft.stderr);
+  assert.match(fromDraft.stdout, /dist\/ no longer holds Legion-Control-macos-arm64\.zip .*, built for v1\.4\.0, and --resume builds nothing\. The draft holds every asset, so it is published as it is\.\n/);
+  assert.match(fromDraft.stdout, /The draft release holds all 10 assets\./);
+  assert.deepEqual(pushed.happened(), ['gh release edit v1.4.0 draft=false']);
+  const published = pushed.gh.get().releases.find(entry => entry.tagName === 'v1.4.0');
+  assert.equal(published.isDraft, false);
+  assert.deepEqual(published.assets, drafted);
+  assert.equal(fs.existsSync(path.join(pushed.repo, 'dist')), false);
+
+  // A draft that does not hold them all cannot stand in for them, and neither can no draft at all:
+  // then what is gone has to be built again. The tag got to origin on its own in both, pushed by
+  // hand before the draft was filled.
+  for (const [create, draftSays] of [
+    ['partial', 'the draft release does not hold Legion-Control-linux-arm64\\.tar\\.gz, Legion-Control-windows-x64\\.zip, .*Legion-Control-manifest\\.json\\.sig\\.'],
+    ['before', 'GitHub has no draft of it to publish instead\\.'],
+  ]) {
+    const handPushed = releaseCheckout(t);
+    handPushed.gh.set(state => ({ ...state, fail: { create } }));
+    assert.equal(handPushed.release('1.4.0', '--notes', handPushed.notes).status, 1);
+    handPushed.gh.set(state => ({ ...state, fail: {} }));
+    handPushed.git('push', '-q', 'origin', 'refs/tags/v1.4.0');
+    fs.rmSync(path.join(handPushed.repo, 'dist', 'Legion-Control-android-arm64.apk'));
+    const lost = handPushed.release('1.4.0', '--resume');
+    assert.equal(lost.status, 1, create);
+    assert.match(lost.stderr, new RegExp(`dist/ no longer holds Legion-Control-android-arm64\\.apk, built for v1\\.4\\.0, and --resume builds nothing\\. origin has v1\\.4\\.0 already, so the version cannot be cut again, and ${draftSays} Build them at v1\\.4\\.0 by hand into dist/, the way the Build section of scripts/release\\.sh does, then run this again\\.`));
+    assert.doesNotMatch(lost.stderr, /git tag -d|gh release delete/);
+    assert.deepEqual(handPushed.happened(), []);
+    assert.equal(handPushed.originGit('rev-parse', 'refs/heads/main'), handPushed.originGit('rev-parse', 'refs/tags/v1.3.4^{commit}'));
+  }
 });
 
 test('a tag that got to origin on its own is not published until origin\'s main has the commit it is at', mac, (t) => {
