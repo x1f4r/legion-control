@@ -10,6 +10,7 @@ const repository = path.resolve(import.meta.dirname, '..');
 // android/build-apk.sh in a scratch checkout, with a JDK, an SDK and a Gradle wrapper that only
 // pretend: enough to see which agent bundle the script asks for and what it tells Gradle.
 function checkout(t, { agent = '3.1.0', bundle = agent, manifest = bundle } = {}) {
+  // bundle: null is a dist/ without any of the bundle, which is every checkout but a release's.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion android build '));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const write = (file, text, mode = 0o644) => {
@@ -25,9 +26,11 @@ mkdir -p app/build/outputs/apk/release
 printf 'apk' > app/build/outputs/apk/release/app-release-unsigned.apk
 `, 0o755);
   write('agent/package.json', agent === null ? '{ "name": "legionctl" }\n' : JSON.stringify({ name: 'legionctl', version: agent, legionControl: { agentFloor: agent } }, null, 2) + '\n');
-  write(`dist/legionctl-agent-${bundle}.tgz`, 'tarball');
-  write('dist/Legion-Control-agent-manifest.json', JSON.stringify({ schema: 1, version: '1.4.0', agentVersion: manifest, artifacts: [] }, null, 2) + '\n');
-  write('dist/Legion-Control-agent-manifest.json.sig', 'signature\n');
+  if (bundle !== null) {
+    write(`dist/legionctl-agent-${bundle}.tgz`, 'tarball');
+    write('dist/Legion-Control-agent-manifest.json', JSON.stringify({ schema: 1, version: '1.4.0', agentVersion: manifest, artifacts: [] }, null, 2) + '\n');
+    write('dist/Legion-Control-agent-manifest.json.sig', 'signature\n');
+  }
   write('jdk/bin/java', "#!/bin/sh\necho '    java.specification.version = 21' >&2\n", 0o755);
   write('jdk/bin/keytool', '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -keystore ] && : > "$2"; shift; done\n', 0o755);
   write('sdk/build-tools/35.0.0/zipalign', '#!/bin/sh\ncp "$4" "$5"\n', 0o755);
@@ -40,23 +43,45 @@ cp "$1" "$out"
   return root;
 }
 
-function build(root) {
+function build(root, ...args) {
   const env = { ...process.env, HOME: path.join(root, 'home'), LEGION_ANDROID_JAVA_HOME: path.join(root, 'jdk'), ANDROID_SDK_ROOT: path.join(root, 'sdk') };
   delete env.ANDROID_HOME;
-  return spawnSync('bash', [path.join(root, 'android', 'build-apk.sh')], { encoding: 'utf8', env });
+  return spawnSync('bash', [path.join(root, 'android', 'build-apk.sh'), ...args], { encoding: 'utf8', env });
 }
 const gradleArguments = (root) => fs.readFileSync(path.join(root, 'gradle-arguments'), 'utf8').trim().split('\n');
 
 test('the APK build bundles the agent agent/package.json names and tells Gradle which one', { skip: process.platform === 'win32' }, (t) => {
-  const root = checkout(t);
-  const result = build(root);
+  for (const args of [[], ['--require-agent']]) {
+    const root = checkout(t);
+    const result = build(root, ...args);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Bundling the signed agent 3\.1\.0 from dist\//);
+    assert.deepEqual(gradleArguments(root), ['--no-daemon', 'assembleRelease', '-Plegion.agentVersion=3.1.0']);
+    assert.equal(fs.existsSync(path.join(root, 'android/app/build/outputs/apk/release/app-release.apk')), true);
+  }
+});
+
+test('without the signed agent bundle the APK builds and says so, unless a release requires it', { skip: process.platform === 'win32' }, (t) => {
+  // Anyone without the release key: no dist/ at all.
+  const contributor = checkout(t, { bundle: null });
+  const result = build(contributor);
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(gradleArguments(root), ['--no-daemon', 'assembleRelease', '-Plegion.agentVersion=3.1.0']);
-  assert.equal(fs.existsSync(path.join(root, 'android/app/build/outputs/apk/release/app-release.apk')), true);
+  assert.match(result.stdout, /No signed agent bundle in dist\/, so this APK carries no agent and its install action says so\./);
+  assert.match(result.stdout, /A release build passes --require-agent/);
+  assert.deepEqual(gradleArguments(contributor), ['--no-daemon', 'assembleRelease', '-Plegion.agentVersion=3.1.0']);
+  assert.equal(fs.existsSync(path.join(contributor, 'android/app/build/outputs/apk/release/app-release.apk')), true);
+
+  const release = checkout(t, { bundle: null });
+  const required = build(release, '--require-agent');
+  assert.equal(required.status, 1);
+  assert.match(required.stderr, /missing signed agent artifact: legionctl-agent-3\.1\.0\.tgz\. Run scripts\/package-agent\.mjs first\./);
+  assert.equal(fs.existsSync(path.join(release, 'gradle-arguments')), false);
 });
 
 test('the APK build refuses a dist/ that holds another agent than agent/package.json', { skip: process.platform === 'win32' }, (t) => {
-  // What dist/ looks like after the agent moved on and the bundle was not built again.
+  // What dist/ looks like after the agent moved on and the bundle was not built again. Part of a
+  // bundle is refused with or without --require-agent: the APK would carry a manifest naming a
+  // tarball it does not have.
   const stale = checkout(t, { bundle: '3.0.1' });
   const missing = build(stale);
   assert.equal(missing.status, 1);
