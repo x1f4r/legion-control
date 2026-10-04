@@ -102,6 +102,12 @@ final class AppModel {
     /// reading and anything in flight, and the config file is written by hand while the app is open.
     /// An edit to one machine must not reset the others, and an edit to a machine that is busy must
     /// not reset that one either: its model takes the new entry in place.
+    ///
+    /// One change still drops a model, busy or not: a binding that makes a machine this device, or
+    /// stops it being this device, swaps its machine model for the local one or back, because the
+    /// two reach the agent in different ways. An action running in the dropped model finishes
+    /// there, and its record still lands and is announced as usual, but no section shows it any
+    /// more, and the agent's own mutation lock is then all that stands in the way of a second one.
     private func rebuild() {
         appUpdates.repositoryDidChange()
         let binding = bindings.bindings
