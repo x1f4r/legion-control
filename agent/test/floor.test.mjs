@@ -219,6 +219,43 @@ test('a swap that does not commit puts the floor back, and only a committed inst
   }, { patch });
 });
 
+test('the judge under the lock sees the agent that an interrupted swap puts back', async () => {
+  await withAgent(async ({ module, src, base, candidate }) => {
+    writeFloor(base, '3.1.0');
+    const floorBefore = fs.readFileSync(floorFile(base), 'utf8');
+    // An install of 3.4.0 dies between parking the live 3.3.0 and renaming the
+    // new tree into place. With no agent/ at all, a judge before the lock can
+    // only go by the running agent's own 3.1.0.
+    fs.cpSync(candidate('interrupted', '3.4.0', { floor: '3.1.0' }), path.join(base, 'agent.new'), { recursive: true });
+    const crashed = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import path from 'node:path';
+      import { commitInstallSwap } from ${JSON.stringify(pathToFileURL(path.join(src, 'agent-swap.mjs')).href)};
+      const base = process.argv[1];
+      const io = new Proxy(fs, { get(target, property) {
+        if (property !== 'renameSync') return Reflect.get(target, property);
+        return (source, destination) => {
+          if (source === path.join(base, 'agent.new')) process.exit(77);
+          fs.renameSync(source, destination);
+        };
+      }});
+      commitInstallSwap(base, { io });
+    `, base], { encoding: 'utf8', timeout: 30_000 });
+    assert.equal(crashed.status, 77, crashed.stderr);
+    assert.equal(fs.existsSync(path.join(base, 'agent')), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(base, 'agent-swap.json'), 'utf8')).phase, 'live-parked');
+
+    process.env.LEGIONCTL_RESTRICTED = '1';
+    const refused = await install(module, candidate('older', '3.2.0', { floor: '3.1.0' }), { opId: 'after-interrupted-0001' });
+    assert.equal(refused.reasonCode, 'restricted');
+    assert.match(refused.message, /^agent 3\.2\.0 is below the installed 3\.3\.0/);
+    assert.equal(fs.existsSync(path.join(base, 'ops', 'after-interrupted-0001.json')), true, 'the judge before the lock let it through');
+    assert.equal(versionOf(path.join(base, 'agent')), '3.3.0', 'recovery put the parked tree back, and nothing replaced it');
+    assert.equal(fs.existsSync(path.join(base, 'agent.prev')), false);
+    assert.equal(fs.readFileSync(floorFile(base), 'utf8'), floorBefore);
+  }, { live: '3.3.0', liveFloor: '3.1.0' });
+});
+
 // ---------------------------------------------------------------------------
 // Rolling back
 // ---------------------------------------------------------------------------
