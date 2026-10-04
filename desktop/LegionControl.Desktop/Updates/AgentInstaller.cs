@@ -170,6 +170,10 @@ public sealed class AgentInstaller(IProcessRunner runner)
 
         if (system is null || route is null || machine.Bindings.CanRunLocally(machine.Id))
             return new AgentInstallOutcome.Unavailable("Install the signed agent locally before using this device's local binding.");
+        // The bootstrap runs the system's own interpreter over ssh, so it needs a command this
+        // device approved as much as any agent command does.
+        if (system.LaunchState == LaunchState.NotDriven)
+            return new AgentInstallOutcome.Unavailable($"{system.Name} on {machine.Name} is not driven from this device until its command is approved.");
         if (machine.Status.AgentVersion is not { } version || !int.TryParse(version.Split('.')[0], out var major) || major >= 3)
             return new AgentInstallOutcome.Unavailable("Raw bootstrap requires an authenticated agent reporting a version older than 3.");
         if (system.Restricted || machine.Status.Agent?.RestrictedSession == true)

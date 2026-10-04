@@ -15,6 +15,8 @@ public sealed class AppModel : IDisposable
     private readonly IProcessRunner _runner;
     private readonly List<MachineModel> _machines = new();
     private CancellationTokenSource? _polling;
+    /// The revisions whose launch review a person put off with "Not now" in this run.
+    private readonly HashSet<string> _deferredReviews = new(StringComparer.Ordinal);
 
     public AppModel(
         ConfigStore? configStore = null,
@@ -23,11 +25,26 @@ public sealed class AppModel : IDisposable
         DesktopSettings? settings = null,
         INotificationSink? notifications = null,
         Bindings? bindings = null,
-        AppUpdateSuggestions? updateSuggestions = null)
+        AppUpdateSuggestions? updateSuggestions = null,
+        LaunchApprovals? approvals = null)
     {
         _runner = runner ?? new ProcessRunner();
         Bindings = bindings ?? Bindings.Load();
-        Config = configStore ?? new ConfigStore(deviceName: Bindings.Device);
+        // The record before the document: the first read of the setup can already be an edit made
+        // on this device, and that edit approves what it changed.
+        Approvals = approvals ?? new LaunchApprovals();
+        if (configStore is null)
+        {
+            Config = new ConfigStore(deviceName: Bindings.Device, localEdit: RecordLocalEdit);
+        }
+        else
+        {
+            Config = configStore;
+            Config.LocalEdit += RecordLocalEdit;
+        }
+        // The first start of this build approves what it already applies, before anything is
+        // evaluated against the record, so an upgrade drives what it drove before.
+        Approvals.SeedIfMissing(Config.Document);
         Tracker = tracker ?? new OperationTracker();
         Settings = settings ?? DesktopSettings.Load();
         Notifications = notifications ?? Model.Notifications.ForThisSystem();
@@ -40,6 +57,15 @@ public sealed class AppModel : IDisposable
     }
 
     public ConfigStore Config { get; }
+    /// The launch values this device approved. Never published, never shared.
+    public LaunchApprovals Approvals { get; }
+    /// The setup as this device runs it: the document, with every launch value it has not
+    /// approved replaced by the one it did approve at that place, or by nothing. Every machine,
+    /// update check and command reads this, never the document.
+    public ControllerConfig? Effective { get; private set; }
+    /// Each launch value the document offers that this device has not approved, in the order a
+    /// person reviews them.
+    public IReadOnlyList<LaunchReviewEntry> LaunchReview { get; private set; } = Array.Empty<LaunchReviewEntry>();
     public OperationTracker Tracker { get; }
     public DesktopSettings Settings { get; private set; }
     public INotificationSink Notifications { get; }
@@ -65,17 +91,22 @@ public sealed class AppModel : IDisposable
     /// The machine this device is, when the bindings say it is one of them.
     public MachineModel? Self => Bindings.Self is { } self ? Machine(self.Machine) : null;
 
+    /// The machines as this device drives them. The window and the command line both build from
+    /// this, so neither can reach a machine with a command this device did not approve.
+    public IReadOnlyList<MachineConfig> EffectiveMachines() => Effective?.Machines ?? Array.Empty<MachineConfig>();
+
     /// Rebuilds the machine list from the document, keeping the models for machines that are still
     /// there. Keeping them matters: they hold the last reading and the route that answered, and
     /// throwing that away on every edit would make the window blink through "not read yet".
     private void Rebuild()
     {
+        Gate();
         UpdateSuggestions.SelectRepository(UpdateRepository);
         Presence = SitePresence.Decide(Config.Config, Bindings);
         lock (_machines)
         {
             var kept = new List<MachineModel>();
-            foreach (var configured in Config.Machines)
+            foreach (var configured in EffectiveMachines())
             {
                 var existing = _machines.FirstOrDefault(machine => machine.Id == configured.Id);
                 if (existing is not null)
@@ -98,6 +129,86 @@ public sealed class AppModel : IDisposable
             _machines.AddRange(kept);
         }
         Changed?.Invoke();
+    }
+
+    /// Evaluates the document against the record (contract section 9.9).
+    ///
+    /// The record is read again first when another process wrote it. A value accepted because it
+    /// is approved somewhere else, or is the launcher migration of an approved one, is then recorded
+    /// where it now sits, and the gate runs once more over the record that wrote.
+    private void Gate()
+    {
+        Approvals.ReloadIfChanged();
+        // Deleting the record is a local reset: it is seeded again from the current document.
+        if (Approvals.IsMissing) Approvals.SeedIfMissing(Config.Document);
+        if (Config.Config is not { } config)
+        {
+            Effective = null;
+            LaunchReview = Array.Empty<LaunchReviewEntry>();
+            return;
+        }
+        var gate = LaunchGate.Effective(config, Config.Document, Approvals.Current);
+        if (Approvals.RecordAccepted(gate.Launches)) gate = LaunchGate.Effective(config, Config.Document, Approvals.Current);
+        Effective = gate.Config;
+        LaunchReview = gate.Review;
+    }
+
+    /// A record that could not be written says so through [LaunchApprovals.Problem]. The edit
+    /// itself still applies, and what it changed waits for review.
+    private void RecordLocalEdit(byte[]? before, ControllerDocument after) => Approvals.RecordLocalEdit(before, after);
+
+    // MARK: approving launch values
+
+    /// Records exactly the values the entries showed. A value that changed since it was shown is a
+    /// new entry, and waits.
+    public string? ApproveLaunch(IReadOnlyList<LaunchReviewEntry> entries)
+    {
+        var problem = Approvals.Approve(entries);
+        Rebuild();
+        return problem;
+    }
+
+    /// Puts the value this device approved back into the document at the entry's place. An
+    /// ordinary edit: it gets the next revision and replicates.
+    public string? RevertLaunch(LaunchReviewEntry entry)
+    {
+        if (Config.Document is not { } document) return "There is no setup to change.";
+        var (text, problem) = LaunchGate.Reverted(document, entry);
+        if (text is null) return problem;
+        return Config.ApplyEdit(text, $"reverted {entry.Path}").Problem;
+    }
+
+    /// What an editor refuses about saving [editedText] over the current setup.
+    public IReadOnlyList<LaunchGate.EditProblem> LaunchEditProblems(string editedText) =>
+        LaunchGate.EditProblems(Config.Document, LaunchReview, editedText);
+
+    /// "Not now": the review does not open by itself again for this revision while the app runs.
+    /// What waits is still shown.
+    public void DeferLaunchReview()
+    {
+        if (Config.Document?.Hash is { } hash) lock (_deferredReviews) _deferredReviews.Add(hash);
+    }
+
+    public bool IsLaunchReviewDeferred
+    {
+        get
+        {
+            if (Config.Document?.Hash is not { } hash) return false;
+            lock (_deferredReviews) return _deferredReviews.Contains(hash);
+        }
+    }
+
+    /// Whether adopting an imported setup would be enrolment: this device applies none yet.
+    public bool IsEnrolment => Config.Document is null;
+
+    /// Applies a setup fetched in the explicit import flow. On a device that applies none yet this
+    /// is enrolment: every launch value of it is approved, which is why the caller shows all of
+    /// them and asks first. Anywhere else it is adopting a different setup, which approves nothing,
+    /// and what this device has not approved waits for review.
+    public string? AdoptImported(ControllerDocument document)
+    {
+        if (IsEnrolment && Approvals.ApproveAll(document) is { } problem) return problem;
+        return Config.Apply(document, "imported from a machine");
     }
 
     public string? UpdateSettings(DesktopSettings settings)
@@ -125,6 +236,8 @@ public sealed class AppModel : IDisposable
     public async Task RefreshAllAsync(CancellationToken cancellationToken = default)
     {
         Config.ReloadIfChanged();
+        // The command line may have approved something since the last reading.
+        if (Approvals.ReloadIfChanged()) Rebuild();
         var before = SnapshotOutcomes();
         await Task.WhenAll(Machines.Select(machine => RefreshOneAsync(machine, cancellationToken)));
         AnnounceChanges(before);
@@ -260,7 +373,8 @@ public sealed class AppModel : IDisposable
 
     // MARK: this app's own updates
 
-    private string UpdateRepository => Config.Config?.Repo ?? ControllerConfig.DefaultUpdateRepo;
+    /// The repository this device approved, or the built-in one. Never one only the document names.
+    private string UpdateRepository => Effective?.Repo ?? ControllerConfig.DefaultUpdateRepo;
 
     public Task<UpdateAvailability> CheckForAppUpdateAsync(CancellationToken cancellationToken = default, bool force = true)
     {

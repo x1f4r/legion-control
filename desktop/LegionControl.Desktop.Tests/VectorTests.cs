@@ -19,7 +19,7 @@ public class VectorTests
 
     /// The families this client runs. A family joins this list when its port lands here, and from
     /// then on the accounting test holds it to the index exactly.
-    private static readonly string[] Families = { "identifiers", "transport" };
+    private static readonly string[] Families = { "identifiers", "transport", "launch" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -88,6 +88,12 @@ public class VectorTests
             },
             ["transport/users"] = input => Valid(Dialled("user", input["value"])),
             ["transport/ports"] = input => Valid(Dialled("port", input["value"])),
+
+            ["launch/review"] = Launch,
+            ["launch/migration"] = input => new JsonObject
+            {
+                ["migration"] = LaunchValues.IsLauncherMigration(LaunchTuple.From(input["approved"]), LaunchTuple.From(input["offered"])),
+            },
         };
 
     public static TheoryData<string> Groups()
@@ -181,6 +187,54 @@ public class VectorTests
         if (endpoint != legacy)
             throw new InvalidOperationException($"an endpoint and the ssh block read {field} {value?.ToJsonString()} differently");
         return endpoint;
+    }
+
+    /// The review, what runs, and what agent 3.1.0 answers a restricted push, all through the gate
+    /// that ships. The record is the one given, else the one seeding from the held document gives,
+    /// else an empty one. What runs is read back out of the gated machines as well, so a gate that
+    /// worked out the right values and then built the wrong systems fails here.
+    private static JsonNode Launch(JsonNode input)
+    {
+        var held = Text(input["heldText"]);
+        var offered = ControllerDocument.FromText(Text(input["offeredText"])!);
+        var record = input["approvals"] is JsonObject approvals
+            ? new LaunchRecord(approvals)
+            : held is null
+                ? LaunchRecord.Empty()
+                : LaunchRecord.Seeded(LaunchProjection.Of(held), ControllerDocument.FromText(held).Hash);
+        var gate = LaunchGate.Effective(offered.Decoded, offered, record);
+
+        foreach (var launch in gate.Launches.Where(launch => launch.Scope == LaunchScope.System))
+        {
+            var system = gate.Config.Machine(launch.MachineId!)!.System(launch.SystemId!)!;
+            var runs = launch.Tuple is { } tuple
+                ? system.Agent.SequenceEqual(tuple.Agent!) && system.Grammar.Wire == tuple.Grammar && system.LaunchState != LaunchState.NotDriven
+                : system.Agent.Count == 0 && system.LaunchState == LaunchState.NotDriven;
+            if (!runs) throw new InvalidOperationException($"the gated model does not run what {launch.Path} says");
+        }
+
+        var restrictedRefused = held is not null
+            && LaunchValues.Review(LaunchRecord.Seeded(LaunchProjection.Of(held), "none"), LaunchProjection.Of(offered)).Count > 0;
+        return new JsonObject
+        {
+            ["review"] = new JsonArray(gate.Review.Select(entry => (JsonNode)new JsonObject
+            {
+                ["path"] = entry.Path,
+                ["scope"] = entry.Scope.Wire(),
+                ["kind"] = entry.Kind,
+                ["approvable"] = entry.Approvable,
+            }).ToArray()),
+            ["effective"] = new JsonArray(gate.Launches.Select(launch => (JsonNode)new JsonObject
+            {
+                ["path"] = launch.Path,
+                ["scope"] = launch.Scope.Wire(),
+                ["state"] = launch.Use.Wire(),
+                ["agent"] = launch.Tuple is { } tuple ? new JsonArray(tuple.Agent!.Select(item => (JsonNode)item!).ToArray()) : null,
+                ["grammar"] = launch.Tuple?.Grammar,
+                ["text"] = launch.Text,
+            }).ToArray()),
+            ["restrictedRefused"] = restrictedRefused,
+        };
     }
 
     private static JsonNode Reading(AttemptReading reading) => new JsonObject

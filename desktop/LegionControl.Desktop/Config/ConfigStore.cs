@@ -29,17 +29,21 @@ public sealed class ConfigStore : IDisposable
     private AppliedSetup _applied = new();
     private readonly object _gate = new();
 
+    /// [localEdit] is subscribed to [LocalEdit] before the file is first read, because that first
+    /// read can already be an edit made on this device: a hand edit made while the app was closed.
     public ConfigStore(
         string? path = null,
         string? statePath = null,
         SetupLedger? ledger = null,
         string? deviceName = null,
-        bool watch = true)
+        bool watch = true,
+        Action<byte[]?, ControllerDocument>? localEdit = null)
     {
         Path = path ?? AppPaths.ConfigFile;
         StatePath = statePath ?? System.IO.Path.Combine(AppPaths.Home, "setup-state.json");
         Ledger = ledger ?? new SetupLedger();
         DeviceName = deviceName ?? Environment.MachineName;
+        if (localEdit is not null) LocalEdit += localEdit;
         _applied = AppliedSetup.Load(StatePath);
         Load();
         if (watch) StartWatching();
@@ -63,6 +67,16 @@ public sealed class ConfigStore : IDisposable
     public string? AssignedSetupId { get; private set; }
 
     public event Action? Changed;
+
+    /// An edit made on this device is about to be written: the document it was made to (null when
+    /// there was none) and the document it makes. An edit approves the launch values it changes
+    /// (contract section 9.9), and this is raised before the write so the approval is in place
+    /// before the document is applied and nobody is asked about what they just typed.
+    ///
+    /// Raised by [ApplyEdit], by a hand edit of the file that keeps its `controller` block, by a
+    /// file with no identity that is given one here, and by [WriteExample]. Never by [Apply] or
+    /// [ApplyIfCurrent]: what another peer wrote, a merge and a kept revision approve nothing.
+    public event Action<byte[]?, ControllerDocument>? LocalEdit;
 
     public IReadOnlyList<MachineConfig> Machines => Config?.Machines ?? Array.Empty<MachineConfig>();
 
@@ -143,7 +157,9 @@ public sealed class ConfigStore : IDisposable
         if (!document.Identity.HasIdentity)
         {
             var assigned = ControllerIdentity.NewSetup(decoded.Identity.Name, DeviceName);
-            if (StampIdentity(assigned, data, "assigned-setup-id") is { } stampProblem)
+            // A file with no identity is the user's own: one written by hand, or the first one on
+            // this device. Whatever it changed from what was applied here is theirs.
+            if (StampIdentity(assigned, data, "assigned-setup-id", AppliedEditedFrom()) is { } stampProblem)
             {
                 Problem = stampProblem;
                 return;
@@ -161,7 +177,7 @@ public sealed class ConfigStore : IDisposable
             && _applied.MatchesIdentityOf(document.Identity))
         {
             var next = document.Identity.Next(applied, DeviceName);
-            if (StampIdentity(next, data, "hand-edit") is { } stampProblem)
+            if (StampIdentity(next, data, "hand-edit", AppliedEditedFrom()) is { } stampProblem)
             {
                 Problem = stampProblem;
                 return;
@@ -182,21 +198,41 @@ public sealed class ConfigStore : IDisposable
         Changed?.Invoke();
     }
 
+    /// The document a local edit was made to: [Bytes] null when nothing was applied before it.
+    private sealed record EditedFrom(byte[]? Bytes);
+
+    /// What this device applied last, as the document a hand edit started from: no document when
+    /// it never applied one, and null when it did but those bytes are no longer anywhere. Without
+    /// them nobody can say which launch values the edit changed, so it approves none of them and
+    /// they wait for review like any other.
+    ///
+    /// A document handed over by another peer is recorded as applied before it is read back, so
+    /// when it has no identity of its own, the one it is given here is stamped onto exactly what
+    /// was applied: nothing it carries counts as changed, and it approves nothing.
+    private EditedFrom? AppliedEditedFrom()
+    {
+        if (_applied.Hash is not { } hash) return new EditedFrom(null);
+        if (Document?.Hash == hash) return new EditedFrom(Document.Bytes);
+        return Ledger.Read(hash) is { } kept ? new EditedFrom(kept.Bytes) : null;
+    }
+
     /// Rewrites only the `controller` block of the file on disk, keeping everything else exactly as
-    /// the user left it.
-    private string? StampIdentity(ControllerIdentity identity, byte[] current, string description)
+    /// the user left it. When the file is an edit made on this device, [editedFrom] is what it was
+    /// made to, and [LocalEdit] is raised before the write.
+    private string? StampIdentity(ControllerIdentity identity, byte[] current, string description, EditedFrom? editedFrom)
     {
         try
         {
             var root = JsonNode.Parse(Encoding.UTF8.GetString(Canonical.Bytes(current))) as JsonObject;
             if (root is null) return "The setup file is not a JSON object.";
             root["controller"] = IdentityJson(identity, root["controller"] as JsonObject);
-            var text = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+            var stamped = ControllerDocument.FromText(root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
             // The previous bytes go into the ledger before the file changes: a stamp that lost the
             // document it stamped would leave a merge with no base.
             if (Document is not null) Ledger.Remember(Document);
             else Ledger.Remember(ControllerDocument.FromRaw(current));
-            AtomicWrite.Bytes(Path, Canonical.Bytes(Encoding.UTF8.GetBytes(text)));
+            if (editedFrom is not null) LocalEdit?.Invoke(editedFrom.Bytes, stamped);
+            AtomicWrite.Bytes(Path, stamped.Bytes);
             return null;
         }
         catch (Exception error)
@@ -303,6 +339,7 @@ public sealed class ConfigStore : IDisposable
         root["controller"] = IdentityJson(next, root["controller"] as JsonObject);
         var stamped = ControllerDocument.FromText(root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
 
+        LocalEdit?.Invoke(Document?.Bytes, stamped);
         var problem = Apply(stamped, description);
         return problem is null ? (Document, null) : (null, problem);
     }
@@ -313,7 +350,9 @@ public sealed class ConfigStore : IDisposable
         if (File.Exists(Path)) return $"There is already a setup file at {Path}.";
         try
         {
-            AtomicWrite.Bytes(Path, Canonical.Bytes(Encoding.UTF8.GetBytes(SetupTemplates.Example)));
+            var example = ControllerDocument.FromText(SetupTemplates.Example);
+            LocalEdit?.Invoke(null, example);
+            AtomicWrite.Bytes(Path, example.Bytes);
             _lastSignature = null;
             Load();
             return null;

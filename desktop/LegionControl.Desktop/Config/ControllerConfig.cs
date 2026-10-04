@@ -546,7 +546,8 @@ public sealed record SystemConfig
     public string Id { get; init; } = "";
     public string Name { get; init; } = "";
     public Platform Platform { get; init; } = Platform.Linux;
-    /// The exact argv run over ssh, quoted for that system's shell on the way out.
+    /// The exact argv run over ssh, quoted for that system's shell on the way out. In the model the
+    /// machines are driven from, this is the argv [LaunchGate] approved, and empty when there is none.
     public IReadOnlyList<string> Agent { get; init; } = Array.Empty<string>();
     public string? Symbol { get; init; }
     /// The `shell` the document names, exactly as it is written, or null when it names none.
@@ -563,6 +564,9 @@ public sealed record SystemConfig
     /// dispatcher, which parses an argv grammar of its own. So the command is serialised for the
     /// dispatcher whatever platform the far side runs.
     public bool Restricted { get; init; }
+    /// How this device drives the system, as [LaunchGate] decided it. Never read from a document:
+    /// a system built here, from a form or a template, runs what it was given.
+    public LaunchState LaunchState { get; init; } = LaunchState.Approved;
 
     private CommandGrammar? _grammar;
 

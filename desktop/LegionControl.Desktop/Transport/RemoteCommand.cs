@@ -17,7 +17,13 @@ public sealed record RemoteCommand(SystemConfig System, IReadOnlyList<string> Ar
 
     /// The single string ssh is given, written for whatever parses it on the far side. Throws a
     /// [CommandLineRefusal] for an argv that grammar cannot carry, and nothing is sent.
-    public string CommandLine => Grammar.Serialize(Argv);
+    ///
+    /// A system with no approved agent is refused as having no command at all. Attempts already
+    /// leave it out; this is the second guard, because the verb on its own would otherwise be the
+    /// whole line and the far side's shell would run `status` or `update` as a program.
+    public string CommandLine => System.Agent.Count == 0 || System.LaunchState == LaunchState.NotDriven
+        ? throw new CommandLineRefusal("no-command")
+        : Grammar.Serialize(Argv);
 
     /// Everything after `ssh`: the options, the destination, and the one quoted command.
     ///

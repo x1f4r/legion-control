@@ -203,8 +203,8 @@ public sealed class RemoteAgent
     /// answers. On each route the system its endpoint names comes first, then the preferred one,
     /// then the rest in document order: a hint orders the attempts and never hides a system, for
     /// reads and mutations alike, because the walk itself decides when a mutation may move on. A
-    /// system with no agent command is not driven and is not in the list at all; nothing here ever
-    /// derives a launcher, an interpreter or a grammar of its own.
+    /// system with no agent command, or none this device approved, is not driven and is not in the
+    /// list at all; nothing here ever derives a launcher, an interpreter or a grammar of its own.
     public static IReadOnlyList<Attempt> Attempts(
         IReadOnlyList<MachineRoute> allRoutes,
         IReadOnlyList<SystemConfig> allSystems,
@@ -223,7 +223,7 @@ public sealed class RemoteAgent
             }
         }
 
-        var driven = allSystems.Where(system => system.Agent.Count > 0).ToList();
+        var driven = allSystems.Where(system => system.LaunchState != LaunchState.NotDriven && system.Agent.Count > 0).ToList();
         var attempts = new List<Attempt>();
         foreach (var route in routes)
         {

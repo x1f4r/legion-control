@@ -197,6 +197,9 @@ public sealed record Bindings
     /// own ssh config and it usually knows about jump hosts and proxies this app does not. Every
     /// route inherits the key: dropping the identity on an explicit address is how a machine that
     /// works through its alias fails through its address.
+    ///
+    /// [machine] is the one [LaunchGate] built, so the document's key path here is one this device
+    /// approved, never one a peer only wrote into the setup.
     public IReadOnlyList<MachineRoute> RoutesFor(MachineConfig machine)
     {
         var routes = new List<MachineRoute>();
