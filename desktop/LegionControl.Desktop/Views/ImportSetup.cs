@@ -60,7 +60,7 @@ public sealed class ImportSetup : Window
             {
                 Id = "import-peer", Name = address,
                 Endpoints = new[] { new EndpointConfig { Id = "import", Host = address, Port = number, User = string.IsNullOrWhiteSpace(user.Text) ? null : user.Text, Kind = "remote" } },
-                Systems = new[] { new SystemConfig { Id = systemId.Text!, Name = systemId.Text!, Shell = RemoteShells.Parse(shell.SelectedItem as string), Agent = parts, Restricted = restricted.IsChecked == true } },
+                Systems = new[] { new SystemConfig { Id = systemId.Text!, Name = systemId.Text!, Shell = shell.SelectedItem as string, Agent = parts, Restricted = restricted.IsChecked == true } },
             };
             return new MachineModel(config, new ProcessRunner(), app.Tracker, bindings: app.Bindings with
             {

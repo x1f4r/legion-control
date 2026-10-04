@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
+using LegionControl.Desktop.Transport;
 using Xunit;
 
 namespace LegionControl.Desktop.Tests;
@@ -18,7 +19,7 @@ public class VectorTests
 
     /// The families this client runs. A family joins this list when its port lands here, and from
     /// then on the accounting test holds it to the index exactly.
-    private static readonly string[] Families = { "identifiers" };
+    private static readonly string[] Families = { "identifiers", "transport" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -30,6 +31,61 @@ public class VectorTests
             ["identifiers/duration"] = input => Valid(CommandSurface.IsValidDuration(Text(input["value"]))),
             ["identifiers/clockTime"] = input => Valid(CommandSurface.IsValidClockTime(Text(input["value"]))),
             ["identifiers/sha256"] = input => Valid(ControllerIdentity.IsHash(Text(input["value"]))),
+
+            ["transport/grammars"] = input =>
+            {
+                var grammar = RemoteShells.Resolve(Text(input["platform"]), Text(input["shell"]),
+                    input["restricted"]?.GetValueKind() == JsonValueKind.True,
+                    input["restrictedSession"]!.GetValue<bool>(), input["agentLength"]!.GetValue<int>());
+                return new JsonObject { ["grammar"] = grammar.Shell?.Wire(), ["refusal"] = grammar.Refusal };
+            },
+            ["transport/commandLines"] = input =>
+            {
+                var grammar = RemoteShells.FromWire(Text(input["grammar"]))
+                              ?? throw new InvalidOperationException($"no grammar called {input["grammar"]}");
+                var argv = input["argv"]!.AsArray().Select(item => item!.GetValue<string>()).ToList();
+                try
+                {
+                    return new JsonObject { ["line"] = grammar.Serialize(argv), ["refusal"] = null, ["index"] = null };
+                }
+                catch (CommandLineRefusal refusal)
+                {
+                    return new JsonObject { ["line"] = null, ["refusal"] = refusal.Code, ["index"] = refusal.Index };
+                }
+            },
+            ["transport/classifications"] = input =>
+            {
+                var reading = AttemptClassifier.Classify(new AttemptEvidence(
+                    input["launchFailed"]!.GetValue<bool>(), input["timedOut"]!.GetValue<bool>(),
+                    input["exitCode"]?.GetValue<int>(), Text(input["stdout"])!, Text(input["stderr"])!,
+                    Text(input["sshLog"])!));
+                return Reading(reading);
+            },
+            ["transport/walks"] = input =>
+            {
+                var safety = Text(input["safety"]) == "mutation" ? CommandSafety.Mutation : CommandSafety.ReadOnly;
+                var attempts = input["attempts"]!.AsArray()
+                    .Select(attempt => (Text(attempt!["route"])!, Reading(attempt["result"]!)))
+                    .ToList();
+                var (sent, ending) = AttemptWalk.Simulate(safety, attempts);
+                return new JsonObject
+                {
+                    ["sent"] = new JsonArray(sent.Select(index => (JsonNode)index).ToArray()),
+                    ["ending"] = Wire(ending),
+                };
+            },
+            ["transport/statusBudgets"] = input =>
+            {
+                var decision = StatusBudget.Next(input["remainingMs"]!.GetValue<long>(), input["attemptsMade"]!.GetValue<int>());
+                return new JsonObject { ["attempt"] = decision.Attempt, ["budgetMs"] = decision.BudgetMs };
+            },
+            ["transport/hosts"] = input =>
+            {
+                var form = Addresses.HostForm(Text(input["value"]));
+                return new JsonObject { ["valid"] = form is not null, ["form"] = form };
+            },
+            ["transport/users"] = input => Valid(Addresses.IsUser(Text(input["value"]))),
+            ["transport/ports"] = input => Valid(Addresses.IsPort(JsonSerializer.SerializeToElement(input["value"]))),
         };
 
     public static TheoryData<string> Groups()
@@ -108,4 +164,25 @@ public class VectorTests
     private static string? Text(JsonNode? node) => node?.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() : null;
 
     private static JsonNode Valid(bool valid) => new JsonObject { ["valid"] = valid };
+
+    private static JsonNode Reading(AttemptReading reading) => new JsonObject
+    {
+        ["outcome"] = reading.IsReply ? "reply" : "failure",
+        ["kind"] = reading.Kind is { } kind ? Wire(kind) : null,
+        ["dispatch"] = Wire(reading.Dispatch),
+        ["routeLevel"] = reading.RouteLevel,
+    };
+
+    private static AttemptReading Reading(JsonNode result) => new(
+        Text(result["outcome"]) == "reply",
+        Text(result["kind"]) is { } kind ? Enum.Parse<FailureKind>(kind, ignoreCase: true) : null,
+        Enum.Parse<Dispatch>(Text(result["dispatch"])!, ignoreCase: true),
+        result["routeLevel"]!.GetValue<bool>());
+
+    /// The contract spells every enum value in camel case: linkLost, never, exhausted.
+    private static string Wire(Enum value)
+    {
+        var name = value.ToString();
+        return char.ToLowerInvariant(name[0]) + name[1..];
+    }
 }

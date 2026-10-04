@@ -90,8 +90,7 @@ public sealed class MachineModel
     {
         try
         {
-            var reply = await NewAgent().StatusAsync(Capabilities, PreferredSystem(), null,
-                cancellationToken: cancellationToken);
+            var reply = await NewAgent().StatusAsync(Capabilities, PreferredSystem(), null, cancellationToken);
             var previousSystem = Routes.RememberedSystemId;
             Status = reply.Value;
             Failure = null;
@@ -104,7 +103,7 @@ public sealed class MachineModel
             {
                 Routes.ForgetRoute($"the machine answered as {reported} rather than {previousSystem}");
             }
-            Routes.Remember(reply.Route, reply.System);
+            Routes.Remember(reply.Route, reply.System, reply.Value.Agent?.RestrictedSession == true);
 
             ObserveTransition(reply.Value);
             if (Settings.KeepMetricsHistory && reply.Value.Metrics is { } metrics)
@@ -842,7 +841,11 @@ public sealed class MachineModel
         }
         var routes = Routes.Order(Bindings.RoutesFor(Machine), ExpectedSystemId(), Presence.IsOnNetworkOf(Machine))
             .Where(route => !Routes.IsBackedOff(route.Id)).ToList();
-        return new RemoteAgent(Machine, _runner, routes) { KnownHostsFile = Bindings.KnownHosts };
+        return new RemoteAgent(Machine, _runner, routes)
+        {
+            KnownHostsFile = Bindings.KnownHosts,
+            RestrictedRoutes = Routes.RestrictedRoutes,
+        };
     }
 
     /// Which system to build the command for first.

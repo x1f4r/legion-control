@@ -100,9 +100,15 @@ public class EndToEndTests
         if (!CanRunAScript) return;
         using var home = new TempHome();
         File.WriteAllText(home.ConfigPath, Setup);
+        // ssh writes why it gave up to the file named by -E, not to stderr, and only that file is
+        // read as evidence that nothing ran.
         var script = home.Write("fake-ssh.sh", """
             #!/bin/sh
-            echo "ssh: connect to host beacon.example port 22: No route to host" >&2
+            while [ $# -gt 0 ]; do
+              if [ "$1" = "-E" ]; then log="$2"; fi
+              shift
+            done
+            echo "ssh: connect to host beacon.example port 22: No route to host" >> "$log"
             exit 255
             """);
         if (!OperatingSystem.IsWindows())

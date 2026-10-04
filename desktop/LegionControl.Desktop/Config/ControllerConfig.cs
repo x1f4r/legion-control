@@ -514,17 +514,37 @@ public sealed record SystemConfig
     /// The exact argv run over ssh, quoted for that system's shell on the way out.
     public IReadOnlyList<string> Agent { get; init; } = Array.Empty<string>();
     public string? Symbol { get; init; }
-    /// Which shell the far side hands an ssh command to, when it is not the one the platform
-    /// implies. The only system that needs this is a Windows one whose OpenSSH DefaultShell has
-    /// been pointed at PowerShell.
-    public RemoteShell? Shell { get; init; }
-    /// Whether this system's key is restricted to a forced command.
+    /// The `shell` the document names, exactly as it is written, or null when it names none.
+    ///
+    /// Kept raw rather than parsed, because a value this app does not know is not a shell to
+    /// guess at: the system's grammar is then refused (`unknown-shell`) and it is not driven. The
+    /// only system that needs one at all is a Windows one whose OpenSSH DefaultShell has been
+    /// pointed at PowerShell.
+    public string? Shell { get; init; }
+    /// Whether this system's key is restricted to a forced command: the JSON value true, and
+    /// nothing that merely reads as true.
     ///
     /// A restricted key never reaches a shell: sshd hands the whole SSH_ORIGINAL_COMMAND to the
-    /// dispatcher, which parses a POSIX argv grammar itself. So the command has to be serialised
-    /// as POSIX argv whatever platform the far side runs, and a PowerShell call operator would be
-    /// rejected by that grammar rather than executed.
+    /// dispatcher, which parses an argv grammar of its own. So the command is serialised for the
+    /// dispatcher whatever platform the far side runs.
     public bool Restricted { get; init; }
+
+    private CommandGrammar? _grammar;
+
+    /// The grammar this system's command lines are written in (contract section 15.1), as the
+    /// document gives it. Serialisation reads this and nothing else; the launch gate writes the
+    /// grammar it approved here, and without one it is worked out from the fields above.
+    public CommandGrammar Grammar
+    {
+        get => _grammar ?? RemoteShells.Resolve(Platform.Wire(), Shell, Restricted, restrictedSession: false, Agent.Count);
+        init => _grammar = value;
+    }
+
+    /// The grammar on a route whose last status said whether this key runs in a restricted
+    /// session. A status can only ever move a system to the dispatcher, never away from it.
+    public CommandGrammar GrammarOn(bool restrictedSession) => restrictedSession
+        ? RemoteShells.Resolve(null, null, restricted: true, restrictedSession: true, Agent.Count)
+        : Grammar;
 
     public static SystemConfig From(Value json)
     {
@@ -534,16 +554,23 @@ public sealed record SystemConfig
             Id = json["id"].AsText() ?? "",
             Platform = platform,
             Name = json["name"].AsText() ?? platform.DefaultName(),
-            Agent = json["agent"].AsStringList(),
+            Agent = AgentArgv(json["agent"]),
             Symbol = json["symbol"].AsText(),
-            Shell = RemoteShells.Parse(json["shell"].AsText()),
-            Restricted = json["restricted"].AsBool() ?? false,
+            Shell = json["shell"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["shell"].Raw.GetString() : null,
+            Restricted = json["restricted"].Raw.ValueKind == System.Text.Json.JsonValueKind.True,
         };
     }
 
-    /// The shell to serialise for: POSIX argv when the key is restricted, whatever the document
-    /// names otherwise, and the platform's usual shell when it names nothing.
-    public RemoteShell RemoteShell => Restricted ? Transport.RemoteShell.Posix : Shell ?? RemoteShells.Default(Platform);
+    /// The agent argv exactly as written: every element a string, kept even when it is empty, so
+    /// the command line refuses it rather than this app quietly sending a different command. An
+    /// argv with anything but strings in it is no command at all, and the system is not driven.
+    private static IReadOnlyList<string> AgentArgv(Value json)
+    {
+        if (!json.IsArray) return Array.Empty<string>();
+        var items = json.AsArray();
+        if (items.Any(item => item.Raw.ValueKind != System.Text.Json.JsonValueKind.String)) return Array.Empty<string>();
+        return items.Select(item => item.Raw.GetString()!).ToList();
+    }
 }
 
 /// The device the app itself runs on, looked after by an agent running here rather than over ssh.

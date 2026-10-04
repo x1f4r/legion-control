@@ -425,10 +425,10 @@ public class DocumentFixtureTests
         Assert.Equal("pi", legion.Wake.EffectiveHelpers[0].Machine);
         // The singular alias is the first of the list, for clients that read only that.
         Assert.Equal(legion.Wake.Helpers[0], legion.Wake.Helper);
-        // A restricted key is serialised as POSIX argv whatever the platform says.
+        // A restricted key is written for the dispatcher whatever the platform says.
         Assert.True(config.Machine("pi")!.Systems[0].Restricted);
-        Assert.Equal(RemoteShell.Posix, config.Machine("pi")!.Systems[0].RemoteShell);
-        Assert.Equal(RemoteShell.Cmd, config.Machine("tower")!.System("windows")!.RemoteShell);
+        Assert.Equal(RemoteShell.Dispatch, config.Machine("pi")!.Systems[0].Grammar.Shell);
+        Assert.Equal(RemoteShell.Cmd, config.Machine("tower")!.System("windows")!.Grammar.Shell);
     }
 
     [Fact]

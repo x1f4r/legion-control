@@ -67,6 +67,7 @@ public class ConfiguredFeaturesTests
     [Fact]
     public async Task ServiceConfigurationValidationAndSavePreserveTheSamePayloadBytes()
     {
+        using var home = new TempHome();
         var runner = new FakeRunner(_ => FakeRunner.Ok("{\"ok\":true,\"valid\":true}"));
         var machine = new MachineConfig { Id = "pi", Ssh = new SshTarget { Host = "pi" },
             Systems = new[] { new SystemConfig { Id = "linux", Agent = new[] { "node", "/agent/src/index.mjs" } } } };
@@ -84,7 +85,8 @@ public class ConfiguredFeaturesTests
     public void NoInputSshCommandsDisableOpenSshStdinWorker()
     {
         var system = new SystemConfig { Id = "linux", Agent = new[] { "node", "/agent/src/index.mjs" } };
-        var arguments = RemoteCommand.SshArguments(new SshTarget { Host = "pi" }, 8, new RemoteCommand(system, new[] { "status" }));
+        var arguments = RemoteCommand.SshArguments(new SshTarget { Host = "pi" }, 8, new RemoteCommand(system, new[] { "status" }),
+            "/tmp/legion-test/ssh-logs/attempt.log");
         Assert.Contains("-n", arguments);
     }
 }

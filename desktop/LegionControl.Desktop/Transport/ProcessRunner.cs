@@ -21,6 +21,9 @@ public sealed record CommandResult
     /// More came out than is kept, and the rest was discarded. Output that was cut off can never be
     /// read as a reply, however much of one it seems to hold.
     public bool StandardOutputTruncated { get; init; }
+    /// What ssh wrote to its own log (`-E`), read back after the run. Only ssh writes there, never
+    /// the far side, which is why this and not stderr is the evidence of where a command stopped.
+    public string SshLog { get; init; } = "";
 
     public bool Succeeded => ExitCode == 0 && !TimedOut && LaunchFailure is null;
 
@@ -34,6 +37,8 @@ public sealed record CommandResult
             if (LaunchFailure is not null) return LaunchFailure;
             if (Cancelled) return "The command was cancelled before it finished.";
             if (TimedOut) return "The command did not finish in time.";
+            var fromLog = InformativeLines(SshLog);
+            if (fromLog.Length > 0) return fromLog;
             var fromError = InformativeLines(StandardError);
             if (fromError.Length > 0) return fromError;
             var fromOutput = InformativeLines(StandardOutput);

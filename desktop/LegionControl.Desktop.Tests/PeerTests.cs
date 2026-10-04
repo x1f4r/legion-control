@@ -556,7 +556,7 @@ public class WakeTests
               ]
             }
             """));
-        var models = Models(home, new FakeRunner(_ => FakeRunner.SshFailure("No route to host")), config);
+        var models = Models(home, new FakeRunner(_ => FakeRunner.SshFailure("ssh: connect to host 10.0.0.5 port 22: No route to host")), config);
         await models["pi"].RefreshAsync();
 
         var plan = WakePlanner.Plan(config.Machine("legion")!, config, new SitePresence(), models,
@@ -594,7 +594,7 @@ public class WakeTests
         {
             if (call.Arguments.Any(argument => argument.Contains("10.0.0.7")) && !awake)
             {
-                return FakeRunner.SshFailure("No route to host");
+                return FakeRunner.SshFailure("ssh: connect to host 10.0.0.7 port 22: No route to host");
             }
             return FakeRunner.Ok("""
                 { "ok": true, "contract": 3, "agentVersion": "3.0.0", "system": { "id": "linux" },
@@ -630,7 +630,7 @@ public class WakeTests
             if (call.RemoteCommand.Contains("run wake-legion")) return FakeRunner.TimedOutResult();
             if (call.Arguments.Any(argument => argument.Contains("10.0.0.7")))
             {
-                return FakeRunner.SshFailure("No route to host");
+                return FakeRunner.SshFailure("ssh: connect to host 10.0.0.7 port 22: No route to host");
             }
             return FakeRunner.Ok("""
                 { "ok": true, "contract": 3, "agentVersion": "3.0.0",

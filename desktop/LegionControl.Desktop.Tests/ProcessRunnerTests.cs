@@ -68,6 +68,9 @@ public class ProcessRunnerTests
         Assert.True(result.Cancelled);
         Assert.Contains("cancelled", result.FailureText);
         Assert.Contains("started", result.StandardOutput);
+        var reading = AttemptClassifier.Classify(result);
+        Assert.Equal(FailureKind.TimedOut, reading.Kind);
+        Assert.Equal(Dispatch.Unknown, reading.Dispatch);
     }
 
     [Fact]
@@ -90,6 +93,8 @@ public class ProcessRunnerTests
         Assert.True(result.Succeeded, result.FailureText);
         Assert.True(result.StandardOutputTruncated);
         Assert.Equal(16 * 1024 * 1024, result.StandardOutput.Length);
+        // The kept part starts with what looks like a whole reply, and it is still not one.
+        Assert.False(AttemptClassifier.Classify(result).IsReply);
     }
 
     [Fact]

@@ -14,6 +14,7 @@ namespace LegionControl.Desktop.Transport;
 public sealed class RouteBook
 {
     private readonly Dictionary<string, DateTimeOffset> _failedAt = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _restricted = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
     /// How long an address that failed is left alone. The rule is per address, not per machine: a
@@ -25,14 +26,27 @@ public sealed class RouteBook
     /// The system that answered last, which is the shape the next command is built for.
     public string? RememberedSystemId { get; private set; }
 
-    public void Remember(MachineRoute route, SystemConfig system)
+    /// The route and system that just answered. When the answer was an authenticated status,
+    /// [restrictedSession] is what it said about this key on that route; an answer to anything
+    /// else passes null and leaves what is known about the route alone.
+    public void Remember(MachineRoute route, SystemConfig system, bool? restrictedSession = null)
     {
         lock (_gate)
         {
             RememberedRouteId = route.Id;
             RememberedSystemId = system.Id;
             _failedAt.Remove(route.Id);
+            if (restrictedSession == true) _restricted.Add(route.Id);
+            else if (restrictedSession == false) _restricted.Remove(route.Id);
         }
+    }
+
+    /// The routes whose last authenticated status reported `agent.restrictedSession: true`. A
+    /// system is restricted on such a route whatever the document says, and its command lines are
+    /// written for the dispatcher (contract section 15.1).
+    public IReadOnlySet<string> RestrictedRoutes
+    {
+        get { lock (_gate) return new HashSet<string>(_restricted, StringComparer.Ordinal); }
     }
 
     public void NoteFailure(string routeId, DateTimeOffset? at = null)

@@ -170,7 +170,7 @@ public sealed class AgentInstaller(IProcessRunner runner)
         MachineModel machine, AgentBundle bundle, SystemConfig system, MachineRoute route,
         CancellationToken cancellationToken, string? installationBase)
     {
-        if (system.RemoteShell != RemoteShell.Posix)
+        if (system.Grammar.Shell != RemoteShell.Posix)
         {
             return new AgentInstallOutcome.Unavailable(
                 $"{machine.Name} runs an agent too old to be replaced from here, and this app only bootstraps POSIX systems. Install agent {bundle.Version} on that system by hand.");
@@ -191,10 +191,10 @@ public sealed class AgentInstaller(IProcessRunner runner)
             TimeSpan.FromMinutes(5), cancellationToken);
         if (!upload.Succeeded)
         {
-            return upload.TimedOut
-                ? new AgentInstallOutcome.NotKnown(
-                    $"The upload to {machine.Name} did not finish in time. Whether anything was written there is not known.")
-                : new AgentInstallOutcome.Failed($"The archive could not be written to {machine.Name}.", upload.FailureText);
+            return upload.NeverRan
+                ? new AgentInstallOutcome.Failed($"The archive could not be written to {machine.Name}.", upload.FailureText)
+                : new AgentInstallOutcome.NotKnown(
+                    $"The upload to {machine.Name} did not finish cleanly. Whether anything was written there is not known.");
         }
 
         var unpack = await raw.RunAsync(route, system,
@@ -212,13 +212,15 @@ public sealed class AgentInstaller(IProcessRunner runner)
             new[] { interpreter, $"{basePath}/incoming/agent/src/index.mjs", "self-update", "--install" },
             TimeSpan.FromMinutes(5), cancellationToken);
 
-        var json = install.StandardOutputTruncated ? null : RemoteAgent.ExtractJsonObject(install.StandardOutput);
+        var json = install.Reading.IsReply ? AttemptClassifier.JsonObjectSlice(install.Result.StandardOutput) : null;
         if (json is null)
         {
-            return install.TimedOut
-                ? new AgentInstallOutcome.NotKnown(
-                    $"The install on {machine.Name} did not answer in time. Read the agent version on the next status to find out what happened.")
-                : new AgentInstallOutcome.Failed($"The staged agent on {machine.Name} did not install.", install.FailureText);
+            // Only a failure that proves the staged agent never started is a failure. A dropped
+            // link or a timeout may have left it halfway through installing itself.
+            return install.NeverRan
+                ? new AgentInstallOutcome.Failed($"The staged agent on {machine.Name} did not install.", install.FailureText)
+                : new AgentInstallOutcome.NotKnown(
+                    $"The install on {machine.Name} did not answer. Read the agent version on the next status to find out what happened.");
         }
 
         var envelope = AgentEnvelope.From(Value.Parse(json));

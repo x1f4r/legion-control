@@ -38,7 +38,6 @@ public static class Repo
         return File.ReadAllText(path);
     }
 
-
     public static string TrustFixtures => Path.Combine(Root, "tests", "fixtures", "trust");
 
     public static bool HasFixtures => Directory.Exists(Fixtures);
@@ -126,14 +125,27 @@ public sealed class FakeRunner : IProcessRunner
         string executable, IReadOnlyList<string> arguments, TimeSpan timeout, byte[]? input = null,
         CancellationToken cancellationToken = default)
     {
-        var call = new FakeCall(executable, arguments, input);
+        var call = new FakeCall(executable, arguments, input, timeout);
         Calls.Add(call);
-        return Task.FromResult(_answer(call));
+        var result = _answer(call);
+        // A real ssh writes its own diagnostics to the file named by -E, and the app reads them
+        // back from there. The fake does the same, so the reading path is the one that ships.
+        if (result.SshLog.Length > 0 && call.After("-E") is { } log)
+        {
+            File.WriteAllText(log, result.SshLog);
+            result = result with { SshLog = "" };
+        }
+        return Task.FromResult(result);
     }
 
     public static CommandResult Ok(string stdout) => new() { ExitCode = 0, StandardOutput = stdout };
 
-    public static CommandResult SshFailure(string stderr) => new() { ExitCode = 255, StandardError = stderr };
+    /// ssh giving up before the command started, with the line it logs for that.
+    public static CommandResult SshFailure(string log) => new() { ExitCode = 255, SshLog = log };
+
+    /// An exit 255 with something on stderr and nothing in ssh's own log: the far side said it, so
+    /// it proves nothing about where the command stopped.
+    public static CommandResult RemoteStderr(string stderr) => new() { ExitCode = 255, StandardError = stderr };
 
     public static CommandResult TimedOutResult() => new() { ExitCode = -1, TimedOut = true };
 
@@ -141,7 +153,7 @@ public sealed class FakeRunner : IProcessRunner
         new() { ExitCode = exitCode, StandardOutput = stdout, StandardError = stderr };
 }
 
-public sealed record FakeCall(string Executable, IReadOnlyList<string> Arguments, byte[]? Input)
+public sealed record FakeCall(string Executable, IReadOnlyList<string> Arguments, byte[]? Input, TimeSpan Timeout = default)
 {
     /// The one string ssh was given: the whole remote command line, after the options.
     public string RemoteCommand => Arguments.Count == 0 ? "" : Arguments[^1];

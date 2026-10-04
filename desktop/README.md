@@ -50,6 +50,7 @@ sending it again.
 | earlier setups, by hash | `revisions/` beside it | the same |
 | operations this app started | `operations.json` beside it | the same |
 | desktop preferences | `desktop-settings.json` beside it | the same |
+| ssh's own log while a command runs, deleted after each attempt | `ssh-logs/` beside it | the same |
 
 Linux uses `$XDG_CONFIG_HOME/legion-control/` instead when `XDG_CONFIG_HOME` is set.
 

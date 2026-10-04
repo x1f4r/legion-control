@@ -57,17 +57,37 @@ public sealed class RemoteAgent
     /// Where the pinned host keys are, when this device keeps them somewhere of its own. Null
     /// leaves ssh with the user's configuration, which is what a normal run wants.
     public string? KnownHostsFile { get; init; }
+    /// Where ssh writes its own log for each attempt.
+    public string SshLogDirectory { get; init; } = AppPaths.SshLogDirectory;
+    /// The routes whose last authenticated status said this key runs in a restricted session.
+    /// Every system is driven through the dispatcher there, whatever the document says.
+    public IReadOnlySet<string> RestrictedRoutes { get; init; } = new HashSet<string>();
+    /// The clock the whole command's deadline is kept by.
+    public TimeProvider Time { get; init; } = TimeProvider.System;
 
     /// True when this machine is driven by spawning the agent here rather than over ssh.
     public bool IsLocal => _local is not null;
 
     // MARK: reading
 
+    /// One status, inside one 30 second deadline for every route and system it tries.
+    ///
+    /// The agent's own budget is worked out per attempt from what is left (section 15.5), so a
+    /// working address tried after two dead ones gets an answer back inside the deadline rather
+    /// than being cut off by it. An agent not yet known to speak contract 3 is sent no budget at
+    /// all: it has never heard of the flag.
     public async Task<AgentReply<AgentStatus>> StatusAsync(
         AgentCapabilities capabilities, SystemConfig? preferring = null, MachineRoute? route = null,
-        int budgetMs = 20000, CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default)
     {
-        var reply = await CallAsync(CommandSurface.Status(capabilities, budgetMs), AgentStatus.From, TimeSpan.FromSeconds(30),
+        IReadOnlyList<string>? Arguments(int remainingMs, int attemptsMade)
+        {
+            if (!capabilities.SpeaksV3) return CommandSurface.Status(capabilities);
+            var budget = StatusBudget.Next(remainingMs, attemptsMade);
+            return budget.Attempt ? CommandSurface.Status(capabilities, budget.BudgetMs) : null;
+        }
+
+        var reply = await CallAsync(Arguments, AgentStatus.From, TimeSpan.FromSeconds(30),
             CommandSafety.ReadOnly, preferring, route, cancellationToken: cancellationToken);
         if (reply.Value.Envelope.Ok == false)
         {
@@ -103,7 +123,7 @@ public sealed class RemoteAgent
     public Task<AgentReply<string>> BundleAsync(
         AgentCapabilities capabilities, SystemConfig? preferring = null, MachineRoute? route = null,
         CancellationToken cancellationToken = default) =>
-        CallRawAsync(CommandSurface.Bundle(capabilities), TimeSpan.FromSeconds(120), CommandSafety.ReadOnly,
+        CallRawAsync(Fixed(CommandSurface.Bundle(capabilities)), TimeSpan.FromSeconds(120), CommandSafety.ReadOnly,
             preferring, route, cancellationToken, agentReply: true);
 
     /// Ask what became of an operation this app started earlier. Read-only, and the whole point of
@@ -175,19 +195,20 @@ public sealed class RemoteAgent
             json => json, TimeSpan.FromSeconds(45), verb == "set" ? CommandSafety.Mutation : CommandSafety.ReadOnly,
             null, null, input, token);
 
-    /// The order to try things in.
+    /// The order to try things in (section 15.5).
     ///
     /// Routes outer, systems inner. The address is the thing most likely to be wrong when nothing
-    /// answers. Reads treat a configured system as a hint and can try other configured command
-    /// shapes. Mutations retain the selected shape and never infer a replacement launcher.
+    /// answers. On each route the system its endpoint names comes first, then the preferred one,
+    /// then the rest in document order: a hint orders the attempts and never hides a system, for
+    /// reads and mutations alike, because the walk itself decides when a mutation may move on. A
+    /// system with no agent command is not driven and is not in the list at all; nothing here ever
+    /// derives a launcher, an interpreter or a grammar of its own.
     public static IReadOnlyList<Attempt> Attempts(
         IReadOnlyList<MachineRoute> allRoutes,
         IReadOnlyList<SystemConfig> allSystems,
         SystemConfig? preferredSystem,
-        MachineRoute? preferredRoute, bool allowHintFallback = false)
+        MachineRoute? preferredRoute)
     {
-        if (allRoutes.Count == 0 || allSystems.Count == 0) return Array.Empty<Attempt>();
-
         var routes = allRoutes.ToList();
         if (preferredRoute is not null)
         {
@@ -200,31 +221,35 @@ public sealed class RemoteAgent
             }
         }
 
-        var systems = allSystems.ToList();
-        if (preferredSystem is not null)
-        {
-            var index = systems.FindIndex(system => system.Id == preferredSystem.Id);
-            if (index > 0)
-            {
-                var found = systems[index];
-                systems.RemoveAt(index);
-                systems.Insert(0, found);
-            }
-        }
-
+        var driven = allSystems.Where(system => system.Agent.Count > 0).ToList();
         var attempts = new List<Attempt>();
         foreach (var route in routes)
         {
-            var usable = route.SystemId is { } pinned
-                ? allowHintFallback ? systems.OrderBy(system => system.Id == pinned ? 0 : 1) : systems.Where(system => system.Id == pinned)
-                : systems;
-            foreach (var system in usable) attempts.Add(new Attempt(route, system));
+            var ordered = driven.OrderBy(system =>
+                route.SystemId is { } hinted && system.Id == hinted ? 0
+                : preferredSystem is not null && system.Id == preferredSystem.Id ? 1
+                : 2);
+            foreach (var system in ordered) attempts.Add(new Attempt(route, system));
         }
         return attempts;
     }
 
-    private async Task<AgentReply<T>> CallAsync<T>(
+    /// The same argv for every attempt.
+    private static Func<int, int, IReadOnlyList<string>?> Fixed(IReadOnlyList<string> arguments) => (_, _) => arguments;
+
+    private Task<AgentReply<T>> CallAsync<T>(
         IReadOnlyList<string> arguments,
+        Func<Value, T> decode,
+        TimeSpan timeout,
+        CommandSafety safety,
+        SystemConfig? preferred,
+        MachineRoute? preferredRoute,
+        byte[]? input = null,
+        CancellationToken cancellationToken = default) =>
+        CallAsync(Fixed(arguments), decode, timeout, safety, preferred, preferredRoute, input, cancellationToken);
+
+    private async Task<AgentReply<T>> CallAsync<T>(
+        Func<int, int, IReadOnlyList<string>?> arguments,
         Func<Value, T> decode,
         TimeSpan timeout,
         CommandSafety safety,
@@ -245,8 +270,13 @@ public sealed class RemoteAgent
         return new AgentReply<T>(decode(json), system, raw.Route, raw.Attempts);
     }
 
+    /// One command, walked over every attempt until one answers or the walk says to stop.
+    ///
+    /// [arguments] is asked for the command's own argv before each attempt, with the time left and
+    /// the number of attempts already made, and may answer null to make no further attempt: that
+    /// is how a status sends each attempt the budget it can still use.
     private async Task<AgentReply<string>> CallRawAsync(
-        IReadOnlyList<string> arguments,
+        Func<int, int, IReadOnlyList<string>?> arguments,
         TimeSpan timeout,
         CommandSafety safety,
         SystemConfig? preferred,
@@ -254,86 +284,116 @@ public sealed class RemoteAgent
         CancellationToken cancellationToken,
         byte[]? input = null, bool agentReply = false)
     {
-        if (_local is { } local) return await CallLocalAsync(local, arguments, timeout, input, cancellationToken);
+        if (_local is { } local)
+        {
+            var argv = arguments((int)timeout.TotalMilliseconds, 0)
+                       ?? throw new AgentFailure(FailureKind.BadRequest, Dispatch.Never, local.System, detail: "There was no command to send.");
+            return await CallLocalAsync(local, argv, timeout, input, cancellationToken);
+        }
 
-        var attempts = Attempts(_routes, Machine.Systems, preferred, preferredRoute, safety == CommandSafety.ReadOnly);
-        if (attempts.Count == 0)
+        if (_routes.Count == 0)
         {
             throw new AgentFailure(FailureKind.NoRoute, Dispatch.Never,
                 detail: $"{Machine.Name} has no address this device can dial and no local agent binding.");
+        }
+        var attempts = Attempts(_routes, Machine.Systems, preferred, preferredRoute);
+        if (attempts.Count == 0)
+        {
+            throw new AgentFailure(FailureKind.BadRequest, Dispatch.Never,
+                detail: $"No system on {Machine.Name} has an agent command this device may run.");
         }
 
         // Every attempt shares the budget the caller gave the whole command. Without this, a
         // machine with three addresses and two systems could spend six times the status timeout
         // finding out it is asleep, which is exactly the "reachable machine looks unavailable"
         // failure this transport exists to avoid.
-        var deadline = DateTimeOffset.UtcNow + timeout;
+        var deadline = Time.GetUtcNow() + timeout;
+        var walk = new AttemptWalk(safety);
         AgentFailure? best = null;
         var failedRoutes = new List<string>();
-        var tried = 0;
-        var index = 0;
+        var made = 0;
 
-        while (index < attempts.Count)
+        foreach (var attempt in attempts)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var attempt = attempts[index];
-            index += 1;
-            var remaining = deadline - DateTimeOffset.UtcNow;
+            if (walk.Skips(attempt.Route.Id)) continue;
+            var remaining = deadline - Time.GetUtcNow();
             // Below this there is not enough time left for a connection, let alone a command, and
             // spending it produces a timeout that says nothing.
-            if (tried > 0 && remaining < TimeSpan.FromSeconds(4)) break;
+            if (made > 0 && remaining < TimeSpan.FromSeconds(4)) break;
+            var argv = arguments((int)Math.Max(0, Math.Floor(remaining.TotalMilliseconds)), made);
+            if (argv is null) break;
 
-            tried += 1;
-            var attemptTimeout = remaining < TimeSpan.FromSeconds(4) ? TimeSpan.FromSeconds(4) : remaining;
-            var connectTimeout = Math.Max(2, Math.Min(ConnectTimeout, (int)attemptTimeout.TotalSeconds));
-            Func<string, IReadOnlyList<string>, TimeSpan, byte[]?, CancellationToken, Task<CommandResult>> run =
-                agentReply && _runner is IAgentProcessRunner protocolRunner ? protocolRunner.RunAgentAsync : _runner.RunAsync;
-            var result = await run(
-                SshPath,
-                RemoteCommand.SshArguments(
-                    attempt.Route.Target,
-                    connectTimeout,
-                    new RemoteCommand(attempt.System, arguments),
-                    KnownHostsFile, hasInput: input is not null),
-                attemptTimeout,
-                input,
-                cancellationToken);
-
-            // Look for the reply before classifying failures: `boot` prints its JSON and then pulls
-            // the machine out from under ssh, so a non-zero exit with a good reply still means the
-            // agent spoke.
-            // Output that was cut off is never a reply, however much of one it seems to hold.
-            var extracted = result.StandardOutputTruncated ? null : ExtractJsonObject(result.StandardOutput);
-            if (extracted is not null)
+            AttemptReading reading;
+            AgentFailure failure;
+            var (line, refused) = LineFor(attempt, new RemoteCommand(attempt.System, argv, RestrictedRoutes.Contains(attempt.Route.Id)));
+            if (refused is not null)
             {
-                return new AgentReply<string>(extracted, attempt.System, attempt.Route, tried);
+                // Refused here, before anything was started: nothing left this device.
+                reading = AttemptReading.Failure(FailureKind.BadRequest, Dispatch.Never);
+                failure = refused;
+            }
+            else
+            {
+                made += 1;
+                var attemptTimeout = remaining < TimeSpan.FromSeconds(4) ? TimeSpan.FromSeconds(4) : remaining;
+                var connectTimeout = Math.Max(2, Math.Min(ConnectTimeout, (int)attemptTimeout.TotalSeconds));
+                Func<string, IReadOnlyList<string>, TimeSpan, byte[]?, CancellationToken, Task<CommandResult>> run =
+                    agentReply && _runner is IAgentProcessRunner protocolRunner ? protocolRunner.RunAgentAsync : _runner.RunAsync;
+                var result = await RunSshAsync(run, attempt.Route.Target, connectTimeout, line!,
+                    attemptTimeout, input, cancellationToken);
+
+                reading = AttemptClassifier.Classify(result);
+                // `boot` prints its JSON and then pulls the machine out from under ssh, so a
+                // non-zero exit with a good reply still means the agent spoke.
+                if (reading.IsReply)
+                {
+                    return new AgentReply<string>(AttemptClassifier.JsonObjectSlice(result.StandardOutput)!,
+                        attempt.System, attempt.Route, made);
+                }
+                failure = Failure(reading, result, attempt, (int)timeout.TotalSeconds);
             }
 
-            var failure = Classify(result, attempt, (int)timeout.TotalSeconds);
-            if (IsRouteLevel(failure.Kind) && !failedRoutes.Contains(attempt.Route.Id))
-            {
-                failedRoutes.Add(attempt.Route.Id);
-            }
+            if (reading.RouteLevel && !failedRoutes.Contains(attempt.Route.Id)) failedRoutes.Add(attempt.Route.Id);
+            best = Preferred(best, failure);
 
             // The rule this whole file exists for. A mutation whose fate is not known is never sent
             // anywhere else, on any route, under any system: it is reported as it is.
-            if (safety == CommandSafety.Mutation && (!failure.IsSafeToRetryMutation
-                || failure.Kind is FailureKind.AgentMissing or FailureKind.InterpreterMissing))
-                throw Carrying(failure, failedRoutes)!;
-
-            best = Preferred(best, failure);
-
-            // A failure at the connection level says nothing about the command shape, so trying the
-            // other systems at the same address would be more attempts at a machine that is not
-            // answering. Skip to the next route instead.
-            if (IsRouteLevel(failure.Kind))
-            {
-                while (index < attempts.Count && attempts[index].Route.Id == attempt.Route.Id) index += 1;
-            }
+            if (walk.After(attempt.Route.Id, reading) == WalkEnding.Stopped) throw Carrying(failure, failedRoutes)!;
         }
 
         throw Carrying(best, failedRoutes)
               ?? new AgentFailure(FailureKind.UnreadableOutput, Dispatch.Unknown, detail: "No output.");
+    }
+
+    /// One ssh run with a log of its own, read back into the result and deleted.
+    private Task<CommandResult> RunSshAsync(
+        Func<string, IReadOnlyList<string>, TimeSpan, byte[]?, CancellationToken, Task<CommandResult>> run,
+        SshTarget target, int connectTimeout, string line, TimeSpan timeout, byte[]? input,
+        CancellationToken cancellationToken) =>
+        SshLog.RunAsync(SshLogDirectory, log => run(SshPath,
+            RemoteCommand.SshArguments(target, connectTimeout, line, log, KnownHostsFile, hasInput: input is not null),
+            timeout, input, cancellationToken));
+
+    /// The line this attempt sends, or why it is refused before anything is started: an address
+    /// outside the dial grammar, or an argv the system's grammar cannot carry. A refusal names what
+    /// it skipped, and nothing is sent.
+    private static (string? Line, AgentFailure? Refusal) LineFor(Attempt attempt, RemoteCommand command)
+    {
+        if (Addresses.Refusal(attempt.Route.Target) is { } address)
+        {
+            return (null, new AgentFailure(FailureKind.BadRequest, Dispatch.Never, attempt.System, attempt.Route.Label,
+                $"{attempt.Route.Label}: {address}", routeId: attempt.Route.Id));
+        }
+        try
+        {
+            return (command.CommandLine, null);
+        }
+        catch (CommandLineRefusal refusal)
+        {
+            return (null, new AgentFailure(FailureKind.BadRequest, Dispatch.Never, attempt.System, attempt.Route.Label,
+                $"{attempt.System.Name}: {refusal.Message}", routeId: attempt.Route.Id));
+        }
     }
 
     /// The same failure, carrying every address that did not answer.
@@ -349,9 +409,9 @@ public sealed class RemoteAgent
 
     /// The same command, spawned here.
     ///
-    /// There is no route and no shell, so most of the failure classification above does not apply:
-    /// a process that could not be started never ran, and one that ran and said nothing readable is
-    /// exactly as ambiguous as it would be over ssh.
+    /// There is no route, no shell and no ssh log, so the reading of section 15.4 applies with an
+    /// empty log: a process that could not be started never ran, and one that ran and said nothing
+    /// readable is exactly as ambiguous as it would be over ssh.
     private async Task<AgentReply<string>> CallLocalAsync(
         LocalExecution local, IReadOnlyList<string> arguments, TimeSpan timeout, byte[]? input,
         CancellationToken cancellationToken)
@@ -370,84 +430,32 @@ public sealed class RemoteAgent
             input,
             cancellationToken);
 
-        var extracted = result.StandardOutputTruncated ? null : ExtractJsonObject(result.StandardOutput);
-        if (extracted is not null) return new AgentReply<string>(extracted, local.System, route, 1);
-
+        var reading = AttemptClassifier.Classify(result);
+        if (reading.IsReply)
+        {
+            return new AgentReply<string>(AttemptClassifier.JsonObjectSlice(result.StandardOutput)!, local.System, route, 1);
+        }
         if (result.LaunchFailure is { } launchFailure)
         {
+            // Spawned directly, so what could not be started is the interpreter itself, not ssh.
             throw new AgentFailure(FailureKind.InterpreterMissing, Dispatch.Never, local.System, route.Label,
                 launchFailure);
         }
-        if (result.TimedOut)
-        {
-            throw new AgentFailure(FailureKind.TimedOut, Dispatch.Unknown, local.System, route.Label,
-                Condense(result.FailureText), (int)timeout.TotalSeconds);
-        }
-        var text = result.StandardError + "\n" + result.StandardOutput;
-        if (SshDiagnosis.AgentIsMissing(text))
-        {
-            throw new AgentFailure(FailureKind.AgentMissing, Dispatch.Never, local.System, route.Label,
-                Condense(result.FailureText));
-        }
-        throw new AgentFailure(FailureKind.UnreadableOutput, Dispatch.Unknown, local.System, route.Label,
-            Condense(result.FailureText));
+        throw new AgentFailure(reading.Kind!.Value, reading.Dispatch, local.System, route.Label,
+            Condense(result.FailureText), reading.Kind == FailureKind.TimedOut ? (int)timeout.TotalSeconds : 0);
     }
 
-    public static AgentFailure Classify(CommandResult result, Attempt attempt, int timeoutSeconds)
+    /// What one ssh attempt's result says when it is not a reply, or null when it is one. The
+    /// reading itself is [AttemptClassifier]'s, the same as every other client's.
+    public static AgentFailure? Classify(CommandResult result, Attempt attempt, int timeoutSeconds)
     {
-        if (result.LaunchFailure is { } launchFailure)
-        {
-            return new AgentFailure(FailureKind.LaunchFailed, Dispatch.Never, attempt.System,
-                attempt.Route.Label, launchFailure, routeId: attempt.Route.Id);
-        }
-        if (result.TimedOut)
-        {
-            // Our own watchdog. The far side may be halfway through an install, so this is the one
-            // outcome that is genuinely unknown and must never be read as success or as failure.
-            return new AgentFailure(FailureKind.TimedOut, Dispatch.Unknown, attempt.System,
-                attempt.Route.Label, Condense(result.FailureText), timeoutSeconds, attempt.Route.Id);
-        }
-
-        var text = result.StandardError + "\n" + result.StandardOutput;
-
-        // ssh reserves exit status 255 for its own failures. Anything else came from the far side,
-        // which means a session was established and the command ran.
-        if (result.ExitCode == 255)
-        {
-            var diagnosis = SshDiagnosis.Classify(text) ?? (FailureKind.LinkLost, Dispatch.Unknown);
-            return new AgentFailure(diagnosis.Item1, diagnosis.Item2, attempt.System, attempt.Route.Label,
-                Condense(result.FailureText), routeId: attempt.Route.Id);
-        }
-
-        // Which failure is reported matters, because every attempt but one is aimed at a system
-        // that is not running and is guaranteed to fail. An interpreter that was not found means
-        // the shape was wrong; an interpreter that ran and could not find the script means the
-        // shape was right and the agent really is not installed.
-        if (SshDiagnosis.AgentIsMissing(text))
-        {
-            return new AgentFailure(FailureKind.AgentMissing, Dispatch.Never, attempt.System,
-                attempt.Route.Label, Condense(result.FailureText), routeId: attempt.Route.Id);
-        }
-        if (SshDiagnosis.InterpreterIsMissing(text))
-        {
-            return new AgentFailure(FailureKind.InterpreterMissing, Dispatch.Never, attempt.System,
-                attempt.Route.Label, Condense(result.FailureText), routeId: attempt.Route.Id);
-        }
-
-        // Something ran on the far side and said something we do not understand. It got as far as a
-        // shell, so we cannot claim it did nothing.
-        return new AgentFailure(FailureKind.UnreadableOutput, Dispatch.Unknown, attempt.System,
-            attempt.Route.Label, Condense(result.FailureText), routeId: attempt.Route.Id);
+        var reading = AttemptClassifier.Classify(result);
+        return reading.IsReply ? null : Failure(reading, result, attempt, timeoutSeconds);
     }
 
-    /// Whether the failure is about the address rather than about the command.
-    public static bool IsRouteLevel(FailureKind kind) => kind switch
-    {
-        FailureKind.HostUnreachable or FailureKind.ConnectionRefused or FailureKind.AuthenticationFailed
-            or FailureKind.HostKeyChanged or FailureKind.HostKeyUnknown or FailureKind.LaunchFailed
-            or FailureKind.NoRoute or FailureKind.TimedOut or FailureKind.LinkLost => true,
-        _ => false,
-    };
+    private static AgentFailure Failure(AttemptReading reading, CommandResult result, Attempt attempt, int timeoutSeconds) =>
+        new(reading.Kind!.Value, reading.Dispatch, attempt.System, attempt.Route.Label, Condense(result.FailureText),
+            reading.Kind == FailureKind.TimedOut ? timeoutSeconds : 0, attempt.Route.Id);
 
     /// Which of two failures is the one worth telling the user about.
     ///
@@ -476,15 +484,5 @@ public sealed class RemoteAgent
     {
         var trimmed = text.Trim();
         return trimmed.Length <= 400 ? trimmed : trimmed[..400] + "...";
-    }
-
-    /// PowerShell prepends a CLIXML banner and can interleave progress records, so take the slice
-    /// from the first brace to the last brace rather than trusting the whole stream to be JSON.
-    public static string? ExtractJsonObject(string text)
-    {
-        var start = text.IndexOf('{');
-        var end = text.LastIndexOf('}');
-        if (start < 0 || end <= start) return null;
-        return text[start..(end + 1)];
     }
 }
