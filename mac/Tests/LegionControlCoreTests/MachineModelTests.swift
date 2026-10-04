@@ -575,14 +575,54 @@ struct MachineModelTests {
 
     // MARK: - Setup edits and remembered settings
 
-    /// Holds one scripted command until the test lets it go.
+    /// Holds every command with one verb until the test lets it go, and says when one has arrived.
+    ///
+    /// The suite runs on the main actor, so a task the model starts cannot run before the test's
+    /// next await. Waiting for the held command is what makes an edit land while it is really out.
     final class Gate: @unchecked Sendable {
         private let lock = NSLock()
+        private let verb: String
         private var open = false
+        private var held: [String]?
+
+        init(holding verb: String) { self.verb = verb }
 
         func release() { lock.withLock { open = true } }
 
-        var isOpen: Bool { lock.withLock { open } }
+        private var isOpen: Bool { lock.withLock { open } }
+
+        private var holding: [String]? { lock.withLock { held } }
+
+        private func arrive(_ arguments: [String]) { lock.withLock { held = arguments } }
+
+        /// Called by the runner with every command, and returns once the command may go on.
+        func pass(_ arguments: [String]) async {
+            guard arguments.last?.split(separator: " ").dropFirst(2).first.map(String.init) == verb else { return }
+            arrive(arguments)
+            while !isOpen { try? await Task.sleep(for: .milliseconds(5)) }
+        }
+
+        /// The argv of the command being held, once one has arrived, or nil if none did in time.
+        func waitUntilHolding(timeout: TimeInterval = 5) async -> [String]? {
+            let deadline = Date().addingTimeInterval(timeout)
+            while holding == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+            return holding
+        }
+    }
+
+    /// A model whose transport waits at the gate, with somewhere to write its operations.
+    static func gatedModel(_ runner: FakeRunner, gate: Gate) throws -> (MachineModel, OperationStore, URL) {
+        var agent = RemoteAgent(machine: machine())
+        agent.runner = { _, arguments, _, _ in
+            await gate.pass(arguments)
+            return runner.run(arguments)
+        }
+        let model = MachineModel(machine: machine(), agent: agent)
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        model.operations = store
+        return (model, store, directory)
     }
 
     @Test("an edit to a busy machine's entry is taken in place, and the action finishes in the same model")
@@ -594,23 +634,16 @@ struct MachineModelTests {
         runner.answer("restart", json: """
         { "ok": true, "contract": 3, "action": "restarted", "service": "demo" }
         """)
-        let gate = Gate()
-        var agent = RemoteAgent(machine: Self.machine())
-        agent.runner = { _, arguments, _, _ in
-            let verb = arguments.last?.split(separator: " ").dropFirst(2).first
-            while verb == "restart", !gate.isOpen { try? await Task.sleep(for: .milliseconds(5)) }
-            return runner.run(arguments)
-        }
-        let model = MachineModel(machine: Self.machine(), agent: agent)
-        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let gate = Gate(holding: "restart")
+        let (model, store, directory) = try Self.gatedModel(runner, gate: gate)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = OperationStore(url: directory.appending(path: "operations.json"))
-        model.operations = store
 
         await model.refresh(userInitiated: false)
         let service = try #require(model.services.first)
         model.restart(service, force: false, whenIdle: false)
+        // The restart has gone out over the old address and has not come back.
+        let restart = try #require(await gate.waitUntilHolding())
+        #expect(restart.contains { $0.contains("10.0.0.5") })
         #expect(model.isWorking)
 
         var edited = Self.machine()
