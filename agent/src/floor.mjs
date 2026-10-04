@@ -15,7 +15,8 @@
 // is the higher of the file and what the live tree declares (contract section
 // 13).
 //
-// The file moves in three ways only. A committed install raises it. A
+// The file moves in three ways only. A committed install raises it, whether
+// this agent made the install or an installer's promote.mjs did. A
 // deliberate --allow-downgrade from an unrestricted session lowers it to its
 // target just before the swap, and a swap that then fails without committing
 // puts the earlier file back. Recovery from an interrupted swap never reads it:

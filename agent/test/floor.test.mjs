@@ -385,11 +385,11 @@ function launcherBase() {
   fs.mkdirSync(path.join(base, 'bin'));
   fs.copyFileSync(path.join(AGENT, 'install', 'launcher.mjs'), path.join(base, 'bin', 'launcher.mjs'));
   patchLauncherTrust(path.join(base, 'bin', 'launcher.mjs'), pair.publicKey);
-  const tree = (name, version, label, { signed = true } = {}) => {
+  const tree = (name, version, label, { signed = true, floor = null } = {}) => {
     const dir = path.join(base, name);
     fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'src', 'index.mjs'), `process.stdout.write(${JSON.stringify(`${label}\n`)});\n`);
-    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version, type: 'module' }));
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version, type: 'module', ...(floor ? { legionControl: { agentFloor: floor } } : {}) }));
     if (signed) signTree(dir, pair.privateKey);
     return dir;
   };
@@ -441,7 +441,7 @@ test('recovering an interrupted swap never consults the floor; running the resto
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
-test('the installer does not promote a signed agent below the recorded floor', () => {
+test('the installer promotes a signed agent only at or above the recorded floor, and then raises it', () => {
   const { base, pair, tree } = launcherBase();
   try {
     const source = path.join(base, 'installer');
@@ -452,20 +452,52 @@ test('the installer does not promote a signed agent below the recorded floor', (
     patchLauncherTrust(path.join(source, 'install', 'launcher.mjs'), pair.publicKey);
     fs.copyFileSync(path.join(SRC, 'agent-swap.mjs'), path.join(source, 'src', 'agent-swap.mjs'));
     tree('agent', '3.1.0', 'live');
-    const stage = tree('agent.install.new.1', '3.0.0', 'staged');
-    const promote = () => spawnSync(process.execPath, [path.join(source, 'install', 'promote.mjs'), base, stage], { encoding: 'utf8' });
+    const promote = (stage) => spawnSync(process.execPath, [path.join(source, 'install', 'promote.mjs'), base, stage], { encoding: 'utf8' });
 
     writeFloor(base, '3.1.0');
-    const refused = promote();
+    const older = tree('agent.install.new.1', '3.0.0', 'staged');
+    const refused = promote(older);
     assert.notEqual(refused.status, 0);
     assert.match(refused.stderr, /staged agent 3\.0\.0 is below the version floor 3\.1\.0/);
+    // An installer has no --allow-downgrade, so the refusal names the ways back.
+    assert.ok(refused.stderr.includes('run legionctl self-update --from <bundle> --allow-downgrade from an unrestricted session'), refused.stderr);
+    assert.ok(refused.stderr.includes(`lower the version in ${floorFile(base)} by hand`), refused.stderr);
     assert.equal(versionOf(path.join(base, 'agent')), '3.1.0');
-    assert.equal(fs.existsSync(stage), true);
+    assert.equal(fs.existsSync(older), true);
 
     writeFloor(base, '3.0.0');
-    const promoted = promote();
+    const promoted = promote(older);
     assert.equal(promoted.status, 0, promoted.stderr);
     assert.equal(versionOf(path.join(base, 'agent')), '3.0.0');
+    assert.deepEqual(readFloor(base), { schema: 1, version: '3.0.0', updatedAt: '2026-01-01T00:00:00.000Z', reason: 'install' }, 'a release that declares no floor raises none');
+
+    // A committed promotion raises the floor to what the release declares, as
+    // the agent's own install does, so the launcher holds the next one to it.
+    const raised = promote(tree('agent.install.new.2', '3.2.0', 'newer', { floor: '3.2.0' }));
+    assert.equal(raised.status, 0, raised.stderr);
+    assert.deepEqual([readFloor(base).version, readFloor(base).reason], ['3.2.0', 'install']);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(floorFile(base)).mode & 0o777, 0o600, 'only this user reads or writes the floor');
+
+    // The agent refuses a bundle that declares a floor above its own version,
+    // and the installer refuses the same tree.
+    const above = promote(tree('agent.install.new.3', '3.3.0', 'above', { floor: '3.4.0' }));
+    assert.notEqual(above.status, 0);
+    assert.match(above.stderr, /declares agentFloor "3\.4\.0", which is not an x\.y\.z version at most 3\.3\.0/);
+    assert.equal(versionOf(path.join(base, 'agent')), '3.2.0');
+
+    // A floor file that cannot be read is not written over.
+    fs.writeFileSync(floorFile(base), 'not json');
+    const unreadable = promote(tree('agent.install.new.4', '3.3.0', 'unreadable', { floor: '3.3.0' }));
+    assert.equal(unreadable.status, 0, unreadable.stderr);
+    assert.equal(versionOf(path.join(base, 'agent')), '3.3.0');
+    assert.equal(fs.readFileSync(floorFile(base), 'utf8'), 'not json');
+    assert.match(unreadable.stderr, /version floor was not raised/);
+
+    // An unsigned tree vouches for nothing, so its declaration raises nothing.
+    writeFloor(base, '3.3.0');
+    const unsigned = promote(tree('agent.install.new.5', '3.4.0', 'checkout', { signed: false, floor: '3.4.0' }));
+    assert.equal(unsigned.status, 0, unsigned.stderr);
+    assert.equal(readFloor(base).version, '3.3.0');
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
