@@ -147,6 +147,10 @@ not, the agent now answers as they say.
   order mark or surrounding whitespace no longer makes a document unparseable.
   The hash vector `double-bom` pins that exactly one leading byte order mark
   is stripped.
+- `contract/bootstrap/prepare.cjs` and `install.cjs` are the two scripts that
+  upgrade a 2.x agent from a locally verified archive. The Mac and Android
+  copies are compared with them byte for byte; `install.cjs` checks the upload's
+  size and SHA-256 before tar reads it.
 - `contract/test/transport-shells.test.mjs` runs serialised lines through sh,
   dash, bash, zsh, ksh and fish, and on Windows through cmd.exe, Windows
   PowerShell and pwsh, and checks that node receives exactly the argv. A shell
