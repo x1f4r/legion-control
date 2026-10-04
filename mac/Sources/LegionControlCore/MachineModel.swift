@@ -830,7 +830,6 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         status = nil
     }
 
-
     // MARK: - Services
 
     /// Deliberately NOT forced, and deliberately not judged from what we last read.

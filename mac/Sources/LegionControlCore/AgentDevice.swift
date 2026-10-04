@@ -7,11 +7,11 @@ import Observation
 /// All of what follows used to be written twice. MachineModel and MacModel each carried their own
 /// copy of how an action is started, sent, followed and written down, how a lost outcome is chased,
 /// how the setup is shared, and every verb in between: about six hundred lines apiece, and the
-/// copies had drifted. A failure on this Mac never reached the panel's error notice, a setup this Mac could
-/// not read failed without a word, and the local maintenance cycle threw away what happened to each
-/// service. Each of those rules is now written once, in this file and in AgentDeviceSetup.swift, and
-/// a model adds only what is really its own: how its agent is reached, how its status is read, and
-/// what power means for the machine it is.
+/// copies had drifted. A failure on this Mac never reached the panel's error notice, a setup this
+/// Mac could not read failed without a word, and the local maintenance cycle threw away what
+/// happened to each service. Each of those rules is now written once, in this file and in
+/// AgentDeviceSetup.swift, and a model adds only what is really its own: how its agent is reached,
+/// how its status is read, and what power means for the machine it is.
 @MainActor
 protocol AgentDevice: AnyObject, Sendable {
     /// What every device keeps the same way.
