@@ -120,26 +120,65 @@ class AgentBundle private constructor(
 class AgentBundleMissing(override val message: String) : Exception(message)
 
 /**
- * How to get a signed agent onto one machine.
+ * How to get a signed agent onto one machine, or why it cannot be done from here.
  *
- * Two paths, chosen by what is already there. A machine that already speaks contract 3 takes the
- * bytes on standard input, which needs no writable temporary path and works through the restricted
- * dispatcher. A machine on 2.x has no `self-update` at all, so the tarball goes over SFTP and the
- * staged tree installs itself, which is the bootstrap the contract describes.
+ * Two paths, chosen by what an authenticated status said is already there. A machine that already
+ * speaks contract 3 takes the bytes on standard input, which needs no writable temporary path and
+ * works through the restricted dispatcher. A machine on 2.x has no `self-update` at all, so the
+ * tarball goes over SFTP and the staged tree installs itself, which is the bootstrap the contract
+ * describes and [AgentBootstrap] carries out.
  *
  * SFTP rather than `cat > path`: a redirect is shell syntax, and this app's whole quoting discipline
  * exists so that it never has to write any.
  */
-enum class AgentDeploymentPath {
+sealed interface AgentDeploymentPath {
     /** `self-update --stdin`, streaming the tarball. Contract 3 and later. */
-    STDIN,
+    data object Stdin : AgentDeploymentPath
 
-    /** SFTP into `<base>/incoming/` then run the staged tree's own `self-update --install`. */
-    UPLOAD_AND_INSTALL,
-    ;
+    /** Prepare [AgentBootstrap.Layout.base], upload into its `incoming/`, and install from there. */
+    data class UploadAndInstall(
+        /** The system that answered the status, which is the one whose interpreter runs the steps. */
+        val system: MachineSystem,
+        val layout: AgentBootstrap.Layout,
+    ) : AgentDeploymentPath
+
+    /** Nothing is sent, and [reason] says why in a sentence for the machine page. */
+    data class Unavailable(val reason: String) : AgentDeploymentPath
 
     companion object {
-        fun forAgent(abilities: AgentAbilities): AgentDeploymentPath =
-            if (abilities.speaksV3) STDIN else UPLOAD_AND_INSTALL
+        /**
+         * The path for a machine, from its last authenticated status and the system that gave it.
+         *
+         * The Mac's gate, row for row (SPEC S1.11). The order is the rule: nothing is decided before
+         * an authenticated status, a contract 3 agent installs on standard input whatever key it was
+         * reached with, and the legacy bootstrap needs every one of the rows after that to pass. The
+         * previous version took a contract it had not read as zero, so a machine nobody had heard
+         * from yet was sent the legacy upload.
+         */
+        fun decide(
+            abilities: AgentAbilities,
+            lastStatus: AgentStatus?,
+            system: MachineSystem?,
+        ): AgentDeploymentPath {
+            if (lastStatus?.ok != true) return Unavailable("Read an authenticated agent status first.")
+            if ((abilities.contract ?: 0) >= Contract.REQUIRED) return Stdin
+            if (!AgentBootstrap.isAuthenticatedLegacy(lastStatus)) {
+                return Unavailable(
+                    "This agent's status does not say it is a 1.x or 2.x agent, so nothing is " +
+                        "installed over it from the phone.",
+                )
+            }
+            if (system == null) return Unavailable("The agent did not say which of this machine's systems it is.")
+            if (system.launchState == LaunchState.NOT_DRIVEN) return Unavailable("Not approved on this device.")
+            if (system.grammar == RemoteShell.DISPATCH || lastStatus.agent?.restrictedSession == true) {
+                return Unavailable("Needs an administrator connection.")
+            }
+            if (system.grammar != RemoteShell.POSIX) {
+                return Unavailable("Only POSIX systems are bootstrapped from the phone.")
+            }
+            val layout = AgentBootstrap.layout(system.agent)
+                ?: return Unavailable("The installation base cannot be derived from this command.")
+            return UploadAndInstall(system, layout)
+        }
     }
 }

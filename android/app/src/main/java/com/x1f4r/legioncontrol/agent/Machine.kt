@@ -41,6 +41,15 @@ data class MachineSystem(
     val grammar: RemoteShell? = RemoteShell.POSIX,
     /** Why [grammar] is null: `unknown-shell` or `restricted-agent-shape`. */
     val grammarRefusal: String? = null,
+    /**
+     * Whether this device approved the command it runs here (contract section 9.9).
+     *
+     * Set by the launch gate, which is what decides [agent] and [grammar]. A system the gate leaves
+     * [LaunchState.NOT_DRIVEN] is never sent anything, and nothing new is put on it either: the
+     * legacy bootstrap runs code with this argv's interpreter, so it is refused there in so many
+     * words rather than by the empty argv alone.
+     */
+    val launchState: LaunchState = LaunchState.APPROVED,
 ) {
     /**
      * A system the agent named that the configuration does not have. It can still be reported and
@@ -54,6 +63,18 @@ data class MachineSystem(
      * and never driven.
      */
     val isDriven: Boolean get() = isConfigured && grammar != null
+}
+
+/** Where a system's command stands with this device's approvals (S1.3 `launchState`). */
+enum class LaunchState {
+    /** The command in force is the one this device approved. */
+    APPROVED,
+
+    /** The approved command is in force, and a changed one is waiting for approval. */
+    APPROVED_WITH_CHANGE_WAITING,
+
+    /** No approved command: nothing is sent to this system from this device. */
+    NOT_DRIVEN,
 }
 
 /** Everything a magic packet needs, and how to tell when the machine is back. */

@@ -1,14 +1,18 @@
 package com.x1f4r.legioncontrol.agent
 
 import com.x1f4r.legioncontrol.data.MachineHints
+import com.x1f4r.legioncontrol.data.sha256Hex
 import com.x1f4r.legioncontrol.net.CommandOutcome
 import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.StdinSource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.JsonObject
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
 /** An answer, plus how it was obtained, because the UI is expected to show the route it used. */
@@ -87,6 +91,16 @@ class AgentClient(
         private set
 
     /**
+     * The last status this machine answered, which is always an accepted read.
+     *
+     * Kept for the one decision that needs more than the contract number: whether a signed agent may
+     * be put on the machine, and how. See [AgentDeploymentPath.decide].
+     */
+    @Volatile
+    var lastStatus: AgentStatus? = null
+        private set
+
+    /**
      * The routes whose last authenticated status said they arrived through the restricted
      * dispatcher, by endpoint id.
      *
@@ -114,6 +128,7 @@ class AgentClient(
         budgeted = true,
     ).also { reply ->
         abilities = AgentAbilities.of(reply.value).copy(verbs = abilities.verbs)
+        lastStatus = reply.value
         restrictedRoutes[reply.route.id] = reply.value.agent?.restrictedSession == true
     }
 
@@ -540,53 +555,72 @@ class AgentClient(
     )
 
     /**
-     * Unpacks an uploaded bundle and lets the new tree install itself.
+     * Puts a signed agent on a machine whose 2.x agent cannot install one: the legacy bootstrap of
+     * SPEC S1.11, as the Mac does it.
      *
-     * The path onto a machine whose agent predates `self-update` entirely, so there is nothing there
-     * that could do the install. The staged tree does it: it verifies its own signed manifest, finds
-     * the base it is replacing, and swaps itself in keeping the old tree.
+     * Three steps on one address, all with [system]'s own interpreter: [AgentBootstrap.PREPARE]
+     * checks [layout]'s base holds an installed agent, the archive goes over SFTP into its
+     * `incoming/`, and [AgentBootstrap.INSTALL] checks the upload's size and SHA-256 against the ones
+     * sent from here before tar reads a byte of it. Only the last step changes anything, so a failure
+     * before it is [AgentFailure.BootstrapStopped], which is a definite "nothing was installed"; a
+     * failure of the last step is read like any other mutation.
      *
-     * Two commands rather than one, and both are visible in the operation log, because this is the
-     * only path in the app that runs code the far side has just received. The interpreter is the one
-     * the configuration already names for this system, so nothing new is trusted to find node.
+     * The caller has already been through [AgentDeploymentPath.decide]: this only ever runs for an
+     * authenticated 2.x status on a POSIX system with a recognised base and an unrestricted key.
      */
-    suspend fun bootstrapAgent(
-        tarballPath: String,
-        stagingDirectory: String,
-        operationId: String? = null,
+    suspend fun bootstrapLegacy(
+        system: MachineSystem,
+        layout: AgentBootstrap.Layout,
+        tarball: File,
+        operationId: String?,
     ): AgentReply<AgentActionResult> {
-        val system = machine.systems.firstOrNull { it.isDriven }
-            ?: throw AgentFailure.AgentMissing(null, "no system on this machine names an interpreter")
-
-        // tar is on Windows 10 and later, on macOS and on every Linux, so this is one command
-        // everywhere rather than three.
-        val endpoint = routes.candidates().firstOrNull()
-            ?: throw AgentFailure.Unreachable(machine.name, routes.probeSummary())
-        val unpack = commandLine(
-            grammarOn(endpoint, system, system.agent.size),
-            listOf("tar", "-xzf", tarballPath, "-C", stagingDirectory),
-        )
-        val unpacked = transport.run(endpoint, unpack, SELF_UPDATE_TIMEOUT_MILLIS)
-        if (unpacked.timedOut) {
-            throw AgentFailure.TimedOut((SELF_UPDATE_TIMEOUT_MILLIS / 1000L).toInt(), condense(unpacked.failureText))
+        val operation = operationId?.takeIf { Contract.isOpId(it) }
+            ?: refuse("An agent upgrade needs an operation id of 8 to 64 of [a-z0-9-] to name its upload.")
+        // One address for all three steps: the upload has to land on the machine that was prepared,
+        // and the install has to run where the upload is. The route that answered last leads.
+        val endpoint = routes.candidates().firstOrNull { Addresses.isDialable(it.host, it.user, it.port) }
+            ?: throw AgentFailure.Unreachable(machine.name, routes.probeSummary(), reason = FailureKind.NO_ROUTE)
+        val (sha256, size) = try {
+            withContext(Dispatchers.IO) { sha256Hex(tarball.readBytes()) to tarball.length() }
+        } catch (failure: IOException) {
+            throw AgentFailure.BootstrapStopped(
+                "The agent upgrade on ${machine.name} stopped before anything was installed.",
+                "The signed bundle could not be read on this phone: ${failure.message}",
+                failure,
+            )
         }
-        if (unpacked.exitStatus != null && unpacked.exitStatus != 0) {
-            throw AgentFailure.BadOutput(
-                "unpacking the agent bundle failed: " +
-                    listOf(unpacked.stderr, unpacked.stdout).firstOrNull { it.isNotBlank() },
+        val archive = AgentBootstrap.archivePath(layout, operation)
+
+        try {
+            val prepared = call(
+                emptyList(),
+                SHORT_TIMEOUT_MILLIS,
+                AgentActionResult.serializer(),
+                CommandSafety.MUTATION,
+                overrideArgv = AgentBootstrap.prepareArgv(layout),
+                only = endpoint,
+                onlySystem = system,
+            )
+            if (prepared.value.ok != true) {
+                throw AgentFailure.Reported(prepared.value.message ?: "The preflight did not answer ok.")
+            }
+            transport.upload(endpoint, tarball, archive, SELF_UPDATE_TIMEOUT_MILLIS)
+        } catch (failure: AgentFailure) {
+            throw AgentFailure.BootstrapStopped(
+                "The agent upgrade on ${machine.name} stopped before anything was installed.",
+                listOfNotNull(failure.summary, failure.detail).joinToString(" "),
+                failure,
             )
         }
 
-        // The staged tree's own entry point, run with this system's interpreter. `--install` is the
-        // form that means "you are the new agent; put yourself in place".
-        val interpreter = system.agent.first()
-        val staged = "$stagingDirectory/agent/src/index.mjs"
         return call(
-            listOf("self-update", "--install"),
+            emptyList(),
             SELF_UPDATE_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
             CommandSafety.MUTATION,
-            overrideArgv = listOf(interpreter, staged),
+            overrideArgv = AgentBootstrap.installArgv(layout, archive, sha256, size, operation),
+            only = endpoint,
+            onlySystem = system,
         )
     }
 
@@ -612,13 +646,6 @@ class AgentClient(
             AgentActionResult.serializer(),
             CommandSafety.MUTATION,
         )
-    }
-
-    /** Puts a file on the machine over SFTP. Used only for the agent bootstrap over a 2.x agent. */
-    suspend fun upload(source: File, remotePath: String) {
-        val endpoint = routes.candidates().firstOrNull()
-            ?: throw AgentFailure.Unreachable(machine.name, routes.probeSummary())
-        transport.upload(endpoint, source, remotePath, SELF_UPDATE_TIMEOUT_MILLIS)
     }
 
     /**
@@ -719,15 +746,21 @@ class AgentClient(
         /**
          * The argv to run instead of the system's configured one.
          *
-         * Used by exactly one caller: the bootstrap, which has to run the tree it has just uploaded
-         * rather than the one that is already installed. Everything else uses what the setup names,
-         * because a machine this app has not been told about must not be reachable by it at all.
+         * Used by exactly one caller: the legacy bootstrap, whose steps are scripts run with the
+         * interpreter of the agent that is already installed. Everything else uses what the setup
+         * names, because a machine this app has not been told about must not be reachable by it at
+         * all.
          */
         overrideArgv: List<String>? = null,
         /** `status` only: each attempt sends the `--budget-ms` the time left allows. */
         budgeted: Boolean = false,
-        /** One address and nothing else, for the diagnostics page. */
+        /** One address and nothing else, for the diagnostics page and the bootstrap. */
         only: Endpoint? = null,
+        /**
+         * One system and nothing else, for the bootstrap: its steps are written for the system whose
+         * status asked for them, and are never tried as another system's command.
+         */
+        onlySystem: MachineSystem? = null,
     ): AgentReply<T> {
         val deadline = clock() + timeoutMillis
         val walk = AttemptWalk(safety)
@@ -746,7 +779,7 @@ class AgentClient(
                 failures.skipped(undialable(endpoint))
                 continue
             }
-            for (system in attemptOrder(endpoint)) {
+            for (system in onlySystem?.let(::listOf) ?: attemptOrder(endpoint)) {
                 if (walk.skips(endpoint.id)) continue@routes
                 val remaining = deadline - clock()
                 if (attemptsMade > 0 && remaining < MINIMUM_ATTEMPT_MILLIS) break@routes

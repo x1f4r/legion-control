@@ -6,6 +6,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentAction
+import com.x1f4r.legioncontrol.agent.AgentDeploymentPath
 import com.x1f4r.legioncontrol.agent.AgentStatus
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.DoctorReport
@@ -1197,7 +1198,17 @@ class MachineModel(
         }
     }
 
+    /**
+     * How a signed agent would be put on this machine, or why it would not.
+     *
+     * From the reading on screen, so the install action is offered only when it can work and says
+     * why when it cannot. The wiring decides again from its own last status before anything is sent.
+     */
+    val agentDeployment: AgentDeploymentPath
+        get() = AgentDeploymentPath.decide(abilities, status, currentSystem)
+
     fun requestAgentInstall(version: String) {
+        if (refuseAgentInstall()) return
         dialog = Dialog.ConfirmAgentInstall(machine.name, version, abilities.agentVersion)
     }
 
@@ -1209,6 +1220,7 @@ class MachineModel(
             statusDetail = fleet.agentBundleProblem
             return
         }
+        if (refuseAgentInstall()) return
         change(
             task = Task.AGENT,
             label = "Installing the control agent",
@@ -1217,6 +1229,15 @@ class MachineModel(
         ) { id ->
             client.installAgent(bundle, id)
         }
+    }
+
+    /** Says why the agent cannot be installed from here, when it cannot. True when it said so. */
+    private fun refuseAgentInstall(): Boolean {
+        val unavailable = agentDeployment as? AgentDeploymentPath.Unavailable ?: return false
+        statusLine = "The control agent cannot be installed from here."
+        statusIsError = true
+        statusDetail = unavailable.reason
+        return true
     }
 
     // MARK: - Plumbing
