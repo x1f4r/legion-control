@@ -139,13 +139,14 @@ export const REMEMBERED_ADMISSIONS = Object.freeze(['invalid', 'unverifiable', '
 export const settledKey = (localHash, remoteHash, agentVersion) => `${localHash} ${remoteHash} ${agentVersion}`;
 
 /**
- * A fresh per-machine state, in memory only. The fields are the ones `gate`
- * reads; `meta` is `decide`'s `metaByHash`. Times are integer milliseconds on
- * the device's own clock and are only ever compared with each other.
+ * A fresh per-machine state, in memory only. `metaByHash` is what `decide`
+ * reads under that name, the cache section 9.5 calls `meta`; the other fields
+ * are the ones `gate` reads. Times are integer milliseconds on the device's
+ * own clock and are only ever compared with each other.
  */
 export function peerState() {
   return {
-    meta: {},
+    metaByHash: {},
     inFlight: false,
     failedAt: {},
     held: {},
@@ -203,6 +204,12 @@ export function gate({ decision, localHash, remoteHash, agentVersion, now, state
  * a person asks. A reply that stored something other than the applied hash is
  * a failure too: the machine now holds a document this device did not send.
  * `now` never changes the effect; recordPush() writes it into the state.
+ *
+ * Two readings a port might find more natural are failures on purpose. Only a
+ * reply with `ok: false` is a refusal: the agent sends it with every refusal
+ * code, so a code on anything else is a reply this device cannot account for.
+ * And meta is filed under the hash it describes, so a `current` without a hash
+ * has nothing to be filed under and says nothing about what the machine holds.
  */
 export function afterPush(reply, localHash, now) {
   const r = (effect, metaHash = null) => ({ effect, metaHash });
@@ -226,10 +233,10 @@ export function afterPush(reply, localHash, now) {
  * clears a hold except a new applied hash.
  */
 export function recordPush(state, { effect, metaHash }, { reply, localHash, now }) {
-  const next = { ...state, failedAt: { ...state.failedAt }, held: { ...state.held }, meta: { ...state.meta }, inFlight: false };
+  const next = { ...state, failedAt: { ...state.failedAt }, held: { ...state.held }, metaByHash: { ...state.metaByHash }, inFlight: false };
   if (effect === 'clear') delete next.failedAt[localHash];
   else if (effect === 'fail') next.failedAt[localHash] = now;
-  else if (effect === 'fileMeta') next.meta[metaHash] = reply.current;
+  else if (effect === 'fileMeta') next.metaByHash[metaHash] = reply.current;
   else if (effect === 'locked') next.lockedAt = now;
   else if (effect === 'hold') next.held[localHash] = reply.reasonCode;
   else throw new Error(`"${effect}" is not an effect of a push reply`);

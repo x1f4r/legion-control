@@ -205,6 +205,11 @@ referenceDefect('a back-off that still holds at exactly 60 s', 'tools/setup-sync
   'now - failed <= BACKOFF_MS',
   /push-backoff-over: tools\/setup-sync\.mjs gives/);
 
+referenceDefect('a refusal current filed under null when it has no hash', 'tools/setup-sync.mjs',
+  "&& typeof own(reply.current, 'hash') === 'string'",
+  '&& isPlainObject(reply.current)',
+  /push-stale-revision-without-hash: tools\/setup-sync\.mjs gives/);
+
 referenceDefect('reads held for a running operation like pushes', 'tools/setup-sync.mjs',
   "  if (decision === 'push') {\n    if (state.localInvalid)",
   '  {\n    if (state.localInvalid)',
@@ -268,7 +273,10 @@ test('a push reply turns into the state change section 9.5 names', () => {
   assert.equal(after({ ok: false, reasonCode: 'lock-held' }).lockedAt, now);
   assert.equal(after({ ok: false, reasonCode: 'restricted' }).held[localHash], 'restricted');
   const current = { id: null, lineage: [], hash: 'b'.repeat(64) };
-  assert.deepEqual(after({ ok: false, reasonCode: 'stale-revision', current }).meta[current.hash], current);
+  assert.deepEqual(after({ ok: false, reasonCode: 'stale-revision', current }).metaByHash[current.hash], current);
+  // A current without a hash has nothing to be filed under: it is a failure.
+  const unhashed = after({ ok: false, reasonCode: 'stale-revision', current: { ...current, hash: null } });
+  assert.deepEqual([unhashed.metaByHash, unhashed.failedAt[localHash]], [{}, now]);
   for (const reply of [null, { ok: true, hash: localHash }]) assert.equal(after(reply).inFlight, false);
   // A held push stays held for that hash only, and the gate reads it.
   const held = after({ ok: false, reasonCode: 'config-invalid' });

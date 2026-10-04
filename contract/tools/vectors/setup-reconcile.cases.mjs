@@ -187,6 +187,9 @@ const INTERNAL = { ...fixture('config.set.bad-argument.json'), reasonCode: 'inte
 delete INTERNAL.current;
 delete INTERNAL.divergent;
 
+/** The stale-revision refusal with a current that has no hash, which no agent sends and nothing can be filed under. */
+const STALE_WITHOUT_HASH = { ...STALE, current: { ...STALE.current, hash: null } };
+
 const replies = [
   replied('push-stored', 'config.set.stored.json for the hash this device pushed: the failure, if any, is forgotten.', STORED, STORED.hash, 'clear'),
   replied('push-noop', 'config.set.noop.json: the machine already held exactly these bytes.', fixture('config.set.noop.json'), STORED.hash, 'clear'),
@@ -201,6 +204,7 @@ const replies = [
   replied('push-restricted', 'config.set.restricted-launch.json: this key may not publish these launch values, and trying again cannot change that.', fixture('config.set.restricted-launch.json'), H_PARENT, 'hold'),
   replied('push-config-invalid', 'config.set.invalid-document.json: the agent refused the document\'s structure.', fixture('config.set.invalid-document.json'), H_PARENT, 'hold'),
   replied('push-internal', 'An internal refusal is a failure to back off from.', INTERNAL, H_PARENT, 'fail'),
+  replied('push-stale-revision-without-hash', 'The stale-revision refusal with a null current.hash. Meta is filed under the hash it describes, and this current has none, so it says nothing about what the machine holds: a failure, never meta filed under null.', STALE_WITHOUT_HASH, H_PARENT, 'fail'),
 ];
 
 export default {
@@ -213,6 +217,7 @@ export default {
     'admit: a config reply without a hash never reaches admit. Section 9.5 never adopts it; the client counts it as a failed request (the 60 s back-off) before admitting anything, so replyHash is always a hash and admit does not test for its absence.',
     'gate: times are integer milliseconds on one clock. failedAt and held are keyed by the applied hash; settled holds "<applied hash> <remote hash> <agentVersion>" for each remembered admission refusal. The back-off is 60000 ms: a failure exactly 60000 ms ago no longer holds.',
     'pushReply: reply is the parsed config set reply, or null when none was read. metaHash is set only for fileMeta.',
+    'pushReply: only a reply with ok: false is a refusal, whatever its reasonCode. fileMeta needs current.hash to be a hash; otherwise the reply is a failure.',
   ],
   consumers: { decide: CLIENTS, admit: CLIENTS, gate: CLIENTS, pushReply: CLIENTS },
   groups: { decide: decisions, admit: admissions, gate: gates, pushReply: replies },

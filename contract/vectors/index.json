@@ -315,11 +315,11 @@
         },
         {
           "group": "pushReply",
-          "cases": 13,
+          "cases": 14,
           "consumers": {
-            "mac": 13,
-            "desktop": 13,
-            "android": 13
+            "mac": 14,
+            "desktop": 14,
+            "android": 14
           }
         }
       ]
