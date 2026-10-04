@@ -27,6 +27,27 @@ test('bundle redacts short arbitrary argv and configured credential echoes acros
   assert.equal(redactConfig(config).identityFile, '<redacted>');
 }));
 
+test('an argument that is also a contract word is redacted from prose and kept where a client decodes it', async () => withHome(async () => {
+  // Real argv is full of words the contract also uses: systemctl restart, a
+  // probe called busy. The export must still decode, so identifiers, enum
+  // values, versions and timestamps stay as they are.
+  const config = { services: [{ id: 'demo', process: { start: ['systemctl', 'restart', 'demo'] }, busy: { command: ['probe', 'busy'] } }] };
+  const summary = { id: 'aaaaaaaa-1111-4111-8111-111111111111', kind: 'restart', service: 'demo', state: 'finished', phase: 'done', action: 'deferred', reasonCode: 'busy' };
+  const bundle = await buildBundle({
+    config,
+    doctor: { checks: [{ id: 'service.demo.busy', level: 'warn', summary: 'probe busy said restart later', detail: null, fix: 'run restart by hand' }] },
+    status: { services: [{ id: 'demo', updates: { deferredReason: 'busy' }, lastOperation: summary }] },
+    history: { operations: [summary] },
+    logs: { lines: [{ at: null, command: 'restart', line: 'systemctl restart demo' }] },
+  });
+  assert.deepEqual(bundle.history.operations[0], summary);
+  assert.equal(bundle.status.services[0].updates.deferredReason, 'busy');
+  assert.equal(bundle.doctor.checks[0].id, 'service.demo.busy');
+  assert.equal(bundle.logs.lines[0].command, 'restart');
+  assert.equal(bundle.doctor.checks[0].summary, 'probe <redacted> said <redacted> later');
+  assert.equal(bundle.logs.lines[0].line, 'systemctl <redacted> <redacted>');
+}));
+
 test('JSON-escaped argument echoes and raw-config values omitted by normalization are removed from exports', async () => withHome(async () => {
   const canary = 'q7x"r8z\\p4k';
   const rawOnly = 's9t';
@@ -44,14 +65,16 @@ test('CLI export omits an echoed short argument while normal action and log inte
   fs.writeFileSync(echo, 'process.stdout.write(process.argv[2])');
   writeConfig(home, {
     configVersion: 3, services: [], system: { id: 'test', name: 'Test' }, updates: { automatic: false },
-    actions: [{ id: canary, name: 'Echo', command: [process.execPath, echo, canary] }],
+    // The action has an id of its own: an identifier is part of the reply's
+    // shape, never redacted, and only the argument is private.
+    actions: [{ id: 'echo', name: 'Echo', command: [process.execPath, echo, canary] }],
     sleep: { command: [process.execPath, echo, canary] },
   });
-  const ran = cli(['run', canary], { home });
+  const ran = cli(['run', 'echo'], { home });
   assert.equal(ran.payload.ok, true, ran.stdout);
   assert.equal(ran.payload.output, canary);
   assert.ok(JSON.stringify(cli(['op', ran.payload.op.id], { home }).payload).includes(canary));
-  assert.ok(JSON.stringify(cli(['history'], { home }).payload).includes(canary));
+  assert.equal(cli(['history'], { home }).payload.operations[0].actionId, 'echo');
   log(`configured output ${canary}`, 'run');
   assert.ok(JSON.stringify(cli(['logs'], { home }).payload).includes(canary));
   const doctor = cli(['doctor'], { home }).payload;
@@ -60,6 +83,7 @@ test('CLI export omits an echoed short argument while normal action and log inte
   const bundle = cli(['bundle'], { home }).payload;
   assert.equal(bundle.ok, true);
   assert.equal(JSON.stringify(bundle).includes(canary), false);
+  assert.equal(bundle.history.operations[0].actionId, 'echo', 'identifiers survive so the export still decodes');
   assert.ok(JSON.stringify(bundle.config).includes('<redacted>'));
   assert.ok(JSON.stringify(cli(['logs'], { home }).payload).includes(canary), 'export must not rewrite retained logs');
 }));

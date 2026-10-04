@@ -774,6 +774,32 @@ function diagnosticRedactor(...configs) {
   return walk;
 }
 
+/**
+ * Keys whose values a client decodes rather than reads: identifiers, enum
+ * words, versions, timestamps, hashes and the names a reply is about. A
+ * configured argument that happens to be a word like "restart" or "busy" is
+ * still redacted wherever it appears in prose, but rewriting it inside these
+ * turned an operation's kind into "re<redacted>" and a reason code into
+ * something no schema allows, and the bundle into a reply no client decodes.
+ */
+const VERBATIM_KEYS = new Set([
+  'agentVersion', 'system', 'reasonCode', 'deferredReason', 'action', 'outcome', 'state', 'phase', 'kind', 'mode', 'evidence', 'level', 'disposition',
+  'id', 'opId', 'service', 'target', 'actionId', 'systemId', 'hash', 'keyFingerprint', 'lineage', 'source', 'version', 'from', 'to',
+  'installed', 'latest', 'nightly', 'staged', 'channel', 'pendingVersion', 'replaced', 'floor', 'signed',
+  'requestedAt', 'startedAt', 'updatedAt', 'finishedAt', 'expiresAt', 'checkedAt', 'at', 'nextWindow', 'pauseUntil', 'generatedAt', 'days',
+  'controller', 'raw', 'meta', 'current', 'command', 'argument', 'accepts', 'name', 'os', 'node', 'unit', 'capabilities', 'launchChanges', 'path',
+]);
+
+/** Redact the free text of a reply with `redact`, leaving every value under VERBATIM_KEYS as it is. */
+export function redactReply(value, redact, key = null) {
+  if (key !== null && VERBATIM_KEYS.has(key)) return value;
+  if (Array.isArray(value)) return value.map((item) => redactReply(item, redact));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([name, inner]) => [name, redactReply(inner, redact, name)]));
+  }
+  return redact(value);
+}
+
 /** Keep executable names for diagnosis; every subsequent argument is private. */
 export function redactConfig(config) {
   if (!config) return null;
@@ -800,7 +826,7 @@ export async function buildBundle({ doctor, status, history, logs, config, rawCo
   void CONTRACT_VERSION;
   void os;
   const sanitize = diagnosticRedactor(config, rawConfig);
-  const evidence = sanitize({ doctor, status, history, logs });
+  const evidence = redactReply({ doctor, status, history, logs }, sanitize);
   return {
     generatedAt: new Date().toISOString(),
     ...evidence,
