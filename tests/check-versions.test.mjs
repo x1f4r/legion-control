@@ -74,8 +74,32 @@ test('the Android build bundles the agent of agent/package.json when nobody says
   const reading = await check(t, root => edit(root, gradle, 'providers.gradleProperty("legion.agentVersion").getOrElse("3.1.0")',
     'providers.gradleProperty("legion.agentVersion").getOrElse(agentPackageVersion(rootProject.file("../agent/package.json")))'));
   assert.deepEqual(reading, []);
+  // The way the Android build reads it: no default of its own, only the version in the file.
+  const fromFile = await check(t, root => edit(root, gradle, '.getOrElse("3.1.0")', `
+        .orElse(
+            providers.fileContents(rootProject.layout.projectDirectory.file("../agent/package.json")).asText.map { text ->
+                (groovy.json.JsonSlurper().parseText(text) as Map<*, *>)["version"] as? String
+                    ?: throw GradleException("agent/package.json does not say which version the agent is.")
+            },
+        )
+        .get()`));
+  assert.deepEqual(fromFile, []);
   const neither = await check(t, root => edit(root, gradle, '.getOrElse("3.1.0")', '.get()'));
   assert.deepEqual(neither.map(({ file, missing }) => ({ file, missing })), [{ file: gradle, missing: true }]);
+  // Saying so in a comment is not reading it: the comment is what stays behind when the read goes.
+  for (const comment of [
+    '    // The default comes from agent/package.json.\n',
+    '    /** Bundles the agent "../agent/package.json" names. */\n',
+    '    /**\n     * Bundles the agent "agent/package.json" names.\n     */\n',
+  ]) {
+    const said = await check(t, root => edit(root, gradle, '    val version = providers.gradleProperty("legion.agentVersion").getOrElse("3.1.0")',
+      `${comment}    val version = providers.gradleProperty("legion.agentVersion").get()`));
+    assert.deepEqual(said.map(({ file, missing }) => ({ file, missing })), [{ file: gradle, missing: true }], comment);
+  }
+  // Nor is a message that mentions the file, or a path to another package.json.
+  const mentioned = await check(t, root => edit(root, gradle, '.getOrElse("3.1.0")',
+    '.orElse(providers.fileContents(rootProject.layout.projectDirectory.file("../desktop/package.json")).asText.map { error("agent/package.json is not read here") }).get()'));
+  assert.deepEqual(mentioned.map(({ file, missing }) => ({ file, missing })), [{ file: gradle, missing: true }]);
 });
 
 test('the version floor is declared, x.y.z and at most the agent version', async (t) => {

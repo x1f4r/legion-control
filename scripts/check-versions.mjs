@@ -81,6 +81,11 @@ export const BUNDLE_LOOKUPS = [
 // the default either comes from agent/package.json as well or says the same version.
 const GRADLE = 'android/app/build.gradle.kts';
 const GRADLE_DEFAULT = /gradleProperty\("legion\.agentVersion"\)[^\n]*?getOrElse\("([^"]*)"\)/;
+// A Gradle file that reads agent/package.json names it in a Kotlin string, in its code. A comment
+// saying the default comes from agent/package.json is what stays behind when it no longer does, so
+// whole comment lines, where Gradle files keep their prose, are passed over.
+const GRADLE_READS_PACKAGE = /"[^"\n]*\bagent\/package\.json"/;
+const gradleCode = (text) => text.split('\n').filter(line => !/^\s*(?:\/\/|\/\*|\*)/.test(line)).join('\n');
 
 // The app version and build, as release.sh reads and bumps them. The Mac comes first because it
 // is what release.sh reads the current version from; the desktop project has no build number.
@@ -157,7 +162,7 @@ export async function checkVersions(root = repository) {
     const gradle = read(GRADLE);
     const fallback = gradle?.match(GRADLE_DEFAULT)?.[1];
     if (fallback !== undefined && fallback !== version) problem(GRADLE, `${GRADLE} bundles agent ${fallback} unless told otherwise, but agent/package.json says ${version}.`);
-    if (gradle !== null && fallback === undefined && !/package\.json/.test(gradle)) problem(GRADLE, `${GRADLE} names no default legion.agentVersion and does not read agent/package.json, so there is no telling which agent it bundles.`, { missing: true });
+    if (gradle !== null && fallback === undefined && !GRADLE_READS_PACKAGE.test(gradleCode(gradle))) problem(GRADLE, `${GRADLE} names no default legion.agentVersion and does not read agent/package.json, so there is no telling which agent it bundles.`, { missing: true });
   }
 
   for (const file of BUNDLE_LOOKUPS) {
