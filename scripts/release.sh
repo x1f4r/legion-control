@@ -294,6 +294,16 @@ TAGGED=0
 finish() {
 	local status=$?
 	cleanup_notes
+	if [ "$status" -ne 0 ] && [ "$COMMITTED" -eq 1 ] && [ "$TAGGED" -eq 0 ]; then
+		# The bump got as far as a commit and no further: tagging it failed. Nothing names that commit,
+		# no tag and no origin, so it is taken back and the bump with it. Left in place it would be a
+		# commit CI never saw, which the next run could neither bump again nor release as it is.
+		if [ "$(git -C "$ROOT" rev-parse -q --verify 'HEAD^')" = "$HEAD_SHA" ] && git -C "$ROOT" reset -q "$HEAD_SHA"; then
+			COMMITTED=0
+			say ""
+			say "The release commit was taken back, since it could not be tagged."
+		fi
+	fi
 	if [ "$BUMPED" -eq 1 ] && [ "$COMMITTED" -eq 0 ]; then
 		git -C "$ROOT" checkout -- "$PLIST_REL" "$GRADLE_REL" "$DESKTOP_REL" 2>/dev/null || true
 		say ""

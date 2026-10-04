@@ -241,6 +241,33 @@ test('a release puts every asset on a draft, then pushes main and the tag togeth
   assert.equal(fs.existsSync(path.join(repo, 'dist', 'release-notes.md')), true);
 });
 
+test('a release whose commit cannot be tagged takes the commit back, and the same command runs again', mac, (t) => {
+  const { git, originGit, gh, release, happened, notes } = releaseCheckout(t);
+  const base = git('rev-parse', 'HEAD');
+  // Tags are to be signed here, and the signing program refuses.
+  git('config', 'tag.gpgSign', 'true');
+  git('config', 'gpg.program', 'false');
+  const stopped = release('1.4.0', '--notes', notes);
+  // The status is git's own.
+  assert.notEqual(stopped.status, 0);
+  assert.match(stopped.stdout, /The release commit was taken back, since it could not be tagged\.\n\nThe version numbers were put back to 1\.3\.4 \(14\)\./);
+  // Nothing is tagged, so there is nothing for --resume to finish.
+  assert.doesNotMatch(stopped.stderr, /--resume/);
+  assert.deepEqual(happened(), BUILDS);
+  assert.equal(git('rev-parse', 'HEAD'), base);
+  assert.equal(git('status', '--porcelain'), '');
+  assert.equal(git('tag', '-l', 'v1.4.0'), '');
+  assert.equal(originGit('rev-parse', 'refs/heads/main'), base);
+  assert.equal(gh.get().releases.some(entry => entry.tagName === 'v1.4.0'), false);
+
+  git('config', '--unset', 'tag.gpgSign');
+  const again = release('1.4.0', '--notes', notes);
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(git('rev-parse', 'HEAD^'), base);
+  assert.equal(originGit('rev-parse', 'refs/tags/v1.4.0^{commit}'), git('rev-parse', 'HEAD'));
+  assert.equal(gh.get().releases.find(entry => entry.tagName === 'v1.4.0').isDraft, false);
+});
+
 test('a release that stopped after it was tagged is finished by --resume and by nothing else', mac, (t) => {
   const { git, originGit, gh, release, happened, manifest, notes } = releaseCheckout(t);
   const base = git('rev-parse', 'HEAD');
