@@ -19,7 +19,7 @@
     "base": "/home/me/.legion-control",
     "node": "24.9.0",
     "restrictedSession": true,
-    "floor": "3.1.0",
+    "floor": "3.0.1",
     "signed": true
   },
   "config": {

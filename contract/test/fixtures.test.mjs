@@ -139,6 +139,22 @@ defect('self-update claiming it installed without a verified signature',
     writeJson(file, data);
   });
 
+defect('a status fixture whose agent runs below its own floor',
+  /agent\.version [0-9.]+ is below agent\.floor 99\.0\.0/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'status.full.json');
+    const data = readJson(file);
+    data.agent.floor = '99.0.0';
+    writeJson(file, data);
+  });
+
+defect('a self-update refusal whose live agent is below the floor it names',
+  /current\.version [0-9.]+ is below floor 99\.0\.0/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'self-update.downgrade-needs-flag.json');
+    const data = readJson(file);
+    data.floor = '99.0.0';
+    writeJson(file, data);
+  });
+
 defect('a config-set refusal that does not say what the machine still holds',
   /missing required key "current"/, (dir) => {
     const file = path.join(dir, 'fixtures', 'config.set.conflict-divergent.json');

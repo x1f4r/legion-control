@@ -536,9 +536,44 @@ function checkFixtures(index) {
       fail(`fixtures/${entry.file}`, `index names ${entry.schema}, and a ${entry.command} reply of this shape is read with ${expectedSchema}`);
     }
     checkOutcomePresence(`fixtures/${entry.file}`, entry, data);
+    checkFloorAtMostVersion(`fixtures/${entry.file}`, data);
     pass();
   }
   return loaded;
+}
+
+/** An x.y.z version as three numbers, compared part by part. */
+const versionParts = (version) => version.split('.').map(Number);
+const isBelow = (a, b) => {
+  const [x, y] = [versionParts(a), versionParts(b)];
+  const index = x.findIndex((part, at) => part !== y[at]);
+  return index >= 0 && x[index] < y[index];
+};
+
+/**
+ * A fixture shows an agent that can run: the version floor it reports is at
+ * most the version it runs. A signed agent declares a floor no higher than
+ * itself and the launcher refuses a signed tree below the floor (v3.md section
+ * 13), so a status, bundle or self-update fixture that says otherwise shows a
+ * reply no agent sends in the normal course, and a client test written against
+ * it would learn the wrong thing. This is a rule for the fixtures only: a real
+ * agent can report a live tree below its floor (an unsigned tree is never
+ * floor-checked, and doctor's agent.floor check exists to say so), which is
+ * why checkReply() does not apply it.
+ */
+function checkFloorAtMostVersion(where, data) {
+  const pairs = [];
+  const agentPair = (label, agent) => {
+    if (agent !== null && typeof agent === 'object') pairs.push([`${label}.floor`, agent.floor, `${label}.version`, agent.version]);
+  };
+  agentPair('agent', data.agent);
+  agentPair('status.agent', data.status?.agent);
+  if (data.current !== null && typeof data.current === 'object') pairs.push(['floor', data.floor, 'current.version', data.current.version]);
+  for (const [floorAt, floor, versionAt, version] of pairs) {
+    if (typeof floor !== 'string' || typeof version !== 'string') continue;
+    if (isBelow(version, floor)) fail(where, `${versionAt} ${version} is below ${floorAt} ${floor}; an agent runs at or above its floor`);
+    else pass();
+  }
 }
 
 /** The actions rule 7 answers with exit 0 whatever `ok` says (v3.md section 1). */
