@@ -408,7 +408,7 @@ test('--resume refuses what it cannot finish, without sending anyone round to --
 });
 
 test('a release is refused before anything is built unless CI passed on the very commit origin has, and the version is new', mac, (t) => {
-  const { repo, git, gh, release, happened, notes } = releaseCheckout(t);
+  const { repo, git, originGit, gh, release, happened, pushFromElsewhere, notes } = releaseCheckout(t);
   const base = git('rev-parse', 'HEAD');
   const refused = (args, message) => {
     const result = release(...args);
@@ -436,6 +436,24 @@ test('a release is refused before anything is built unless CI passed on the very
   gh.set(state => ({ ...state, releases: [...state.releases, { tagName: 'v1.4.0', isDraft: true, isPrerelease: false, assets: [] }] }));
   refused(['1.4.0', '--notes', notes], /GitHub has a draft release v1\.4\.0, left by a run that stopped\. Finish that run with --resume/);
   gh.set(state => ({ ...state, releases: state.releases.filter(entry => entry.tagName !== 'v1.4.0') }));
+
+  // A tag on origin claims its version before any release is made of it.
+  originGit('tag', 'v1.4.0', base);
+  refused(['1.4.0', '--notes', notes], /tag v1\.4\.0 is already on origin\. Versions are not reused\./);
+  originGit('tag', '-d', 'v1.4.0');
+
+  // A build number is only known to be above the last release's if that one can be read.
+  const bare = originGit('commit-tree', '4b825dc642cb6eb9a060e54bf8d69288fbee4904', '-m', 'Before there was an Android app');
+  originGit('tag', 'v1.3.5', bare);
+  gh.set(state => ({ ...state, releases: [...state.releases, { tagName: 'v1.3.5', isDraft: false, isPrerelease: false, assets: [] }] }));
+  refused(['1.4.0', '--notes', notes], /cannot read the build number v1\.3\.5 went out with, so there is no telling whether 15 comes after it\./);
+  gh.set(state => ({ ...state, releases: state.releases.filter(entry => entry.tagName !== 'v1.3.5') }));
+  originGit('tag', '-d', 'v1.3.5');
+
+  // HEAD behind origin is not the commit a release would go out as.
+  pushFromElsewhere('A commit pushed from elsewhere');
+  refused(['1.4.0', '--notes', notes], /HEAD is 0 commit\(s\) ahead of origin\/main and 1 behind it\./);
+  git('push', '-q', '--force', 'origin', `${base}:refs/heads/main`);
 
   // A commit origin does not have yet is a commit CI has not checked.
   fs.writeFileSync(path.join(repo, 'unpushed.txt'), 'not on origin\n');
