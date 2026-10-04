@@ -118,7 +118,17 @@ android {
  */
 val copyAgentBundle by tasks.registering(Sync::class) {
     val dist = rootProject.layout.projectDirectory.dir("../dist")
-    val version = providers.gradleProperty("legion.agentVersion").getOrElse("3.0.1")
+    // agent/package.json is the one place the agent's version is written, and it is what names the
+    // tarball scripts/package-agent.mjs puts in dist. A second copy here went stale with every
+    // agent release and left the APK without the bundle it was built to carry.
+    val version = providers.gradleProperty("legion.agentVersion")
+        .orElse(
+            providers.fileContents(rootProject.layout.projectDirectory.file("../agent/package.json")).asText.map { text ->
+                (groovy.json.JsonSlurper().parseText(text) as Map<*, *>)["version"] as? String
+                    ?: throw GradleException("agent/package.json does not say which version the agent is.")
+            },
+        )
+        .get()
     from(dist) {
         include("legionctl-agent-$version.tgz")
         include("Legion-Control-agent-manifest.json")
