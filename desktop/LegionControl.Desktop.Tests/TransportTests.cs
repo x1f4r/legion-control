@@ -138,7 +138,7 @@ public class SshArgumentTests
         {
             Id = "pi",
             Name = "Pi",
-            Ssh = new SshTarget { Host = "atlas", IdentityFile = "/keys/one" },
+            Ssh = new SshTarget { Host = "beacon", IdentityFile = "/keys/one" },
             Endpoints = new[]
             {
                 new EndpointConfig { Id = "lan", Host = "192.168.1.5", User = "me", Kind = "lan" },
@@ -152,13 +152,13 @@ public class SshArgumentTests
 
         var perMachine = bindings with
         {
-            Machines = new Dictionary<string, MachineBinding> { ["pi"] = new("/keys/pi", "atlas-alias") },
+            Machines = new Dictionary<string, MachineBinding> { ["pi"] = new("/keys/pi", "beacon-alias") },
         };
         var routes = perMachine.RoutesFor(machine);
         Assert.All(routes, route => Assert.Equal("/keys/pi", route.Target.IdentityFile));
         // The private alias is dialled before anything the document names.
         Assert.Equal("alias", routes[0].Id);
-        Assert.Equal("atlas-alias", routes[0].Target.Host);
+        Assert.Equal("beacon-alias", routes[0].Target.Host);
     }
 
     [Fact]
@@ -170,7 +170,7 @@ public class SshArgumentTests
             Ssh = new SshTarget { Host = "legacy-alias" },
             Endpoints = new[]
             {
-                new EndpointConfig { Id = "lan", Host = "192.168.178.20", Kind = "lan" },
+                new EndpointConfig { Id = "lan", Host = "192.168.50.20", Kind = "lan" },
                 new EndpointConfig { Id = "remote", Host = "legion.example", Kind = "remote" },
             },
         };
@@ -258,8 +258,8 @@ public class HostKeyApprovalTests
         using var home = new TempHome();
         var custom = Path.Combine(home.Path, "custom pins");
         var runner = new FakeRunner(call => call.Has("-G")
-            ? FakeRunner.Ok($"hostname 192.168.178.20\nport 2222\nhostkeyalias tower-os\nuserknownhostsfile {custom}\nproxycommand none\n")
-            : call.Executable.Contains("keyscan") ? FakeRunner.Ok("[192.168.178.20]:2222 ssh-ed25519 AAAA-first\n")
+            ? FakeRunner.Ok($"hostname 192.168.50.20\nport 2222\nhostkeyalias tower-os\nuserknownhostsfile {custom}\nproxycommand none\n")
+            : call.Executable.Contains("keyscan") ? FakeRunner.Ok("[192.168.50.20]:2222 ssh-ed25519 AAAA-first\n")
             : call.Has("-l") ? FakeRunner.Ok("256 SHA256:first test") : FakeRunner.Ok(""));
         var route = new MachineRoute("lan", "LAN", new SshTarget { Host = "tower" }, null, "lan");
         var resolved = await HostKeys.ForRouteAsync(runner, route, custom);

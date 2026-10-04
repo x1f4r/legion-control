@@ -156,7 +156,7 @@ public class ReconcilerTests
         var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
         var (store, model, fake) = Build(home, mine);
         fake.Held = Documents.Make("setup-a", 4, new[] { mine.Hash }, "Peer edit");
-        fake.OnRead = () => File.WriteAllText(home.ConfigPath, mine.Text.Replace("Atlas", "Local offline edit"));
+        fake.OnRead = () => File.WriteAllText(home.ConfigPath, mine.Text.Replace("Beacon", "Local offline edit"));
         var reconciler = new Reconciler(store, Bindings.Empty);
         await model.RefreshAsync();
         Assert.IsType<ReconcileOutcome.Failed>(await reconciler.ReconcileAsync(model));
@@ -215,7 +215,7 @@ public class ReconcilerTests
     {
         using var home = new TempHome();
         var parent = Documents.Make("setup-a", 3, Array.Empty<string>());
-        var child = Documents.Make("setup-a", 4, new[] { parent.Hash }, "Atlas renamed");
+        var child = Documents.Make("setup-a", 4, new[] { parent.Hash }, "Beacon renamed");
         var (store, model, fake) = Build(home, child);
         fake.Held = parent;
         var reconciler = new Reconciler(store, Bindings.Empty);
@@ -234,7 +234,7 @@ public class ReconcilerTests
     {
         using var home = new TempHome();
         var mine = Documents.Make("setup-a", 4, Array.Empty<string>());
-        var theirs = Documents.Make("setup-a", 5, new[] { mine.Hash }, "Atlas from elsewhere");
+        var theirs = Documents.Make("setup-a", 5, new[] { mine.Hash }, "Beacon from elsewhere");
         var (store, model, fake) = Build(home, mine);
         fake.Held = theirs;
         var reconciler = new Reconciler(store, Bindings.Empty);
@@ -243,7 +243,7 @@ public class ReconcilerTests
         var outcome = await reconciler.ReconcileAsync(model);
         Assert.IsType<ReconcileOutcome.Adopted>(outcome);
         Assert.Equal(theirs.Hash, store.Document!.Hash);
-        Assert.Equal("Atlas from elsewhere", store.Config!.Machines[0].Name);
+        Assert.Equal("Beacon from elsewhere", store.Config!.Machines[0].Name);
         // The document that was replaced is still there to go back to.
         Assert.True(store.Ledger.Has(mine.Hash));
         Assert.Empty(fake.Pushes);
@@ -254,8 +254,8 @@ public class ReconcilerTests
     {
         using var home = new TempHome();
         var shared = Documents.Make("setup-a", 5, Array.Empty<string>());
-        var mine = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Atlas from here");
-        var theirs = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Atlas from there");
+        var mine = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from here");
+        var theirs = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from there");
         var (store, model, fake) = Build(home, mine);
         fake.Held = theirs;
         var reconciler = new Reconciler(store, Bindings.Empty);
@@ -274,8 +274,8 @@ public class ReconcilerTests
     {
         using var home = new TempHome();
         var shared = Documents.Make("setup-a", 5, Array.Empty<string>());
-        var mine = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Atlas from here", extra: "mine");
-        var theirs = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Atlas from there");
+        var mine = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from here", extra: "mine");
+        var theirs = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from there");
         var (store, model, fake) = Build(home, mine);
         store.Ledger.Remember(shared);
         fake.Held = theirs;
@@ -299,8 +299,8 @@ public class ReconcilerTests
     {
         using var home = new TempHome();
         var shared = Documents.Make("setup-a", 5, Array.Empty<string>());
-        var mine = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Atlas from here");
-        var theirs = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Atlas from there");
+        var mine = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from here");
+        var theirs = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from there");
         var (store, model, fake) = Build(home, mine);
         fake.Held = theirs;
         var reconciler = new Reconciler(store, Bindings.Empty);
@@ -309,7 +309,7 @@ public class ReconcilerTests
 
         Assert.Null(await reconciler.KeepMineAsync(model));
         Assert.Contains(theirs.Hash, store.Document!.Identity.Lineage);
-        Assert.Equal("Atlas from here", store.Config!.Machines[0].Name);
+        Assert.Equal("Beacon from here", store.Config!.Machines[0].Name);
 
         await model.RefreshAsync();
         Assert.IsType<ReconcileOutcome.Published>(await reconciler.ReconcileAsync(model));
@@ -411,8 +411,8 @@ public class SiteSenseTests
         {
           "version": 1,
           "sites": [
-            { "id": "attic", "lanPrefixes": [ "192.168.178." ] },
-            { "id": "flat",  "lanPrefixes": [ "192.168.178." ] }
+            { "id": "attic", "lanPrefixes": [ "192.168.50." ] },
+            { "id": "flat",  "lanPrefixes": [ "192.168.50." ] }
           ],
           "machines": [ { "id": "legion", "site": "attic", "wake": { "mac": "AA:BB:CC:DD:EE:FF" } } ]
         }
@@ -423,7 +423,7 @@ public class SiteSenseTests
     {
         // The router default that every second home uses. A prefix match cannot tell them apart,
         // and picking one would be a guess dressed up as a fact.
-        var presence = SitePresence.Decide(TwoHousesWithTheSameSubnet, Bindings.Empty, new[] { "192.168.178.34" });
+        var presence = SitePresence.Decide(TwoHousesWithTheSameSubnet, Bindings.Empty, new[] { "192.168.50.34" });
         Assert.Null(presence.SiteId);
         Assert.True(presence.IsAmbiguous);
         Assert.Contains("cannot be told", presence.Sentence);
@@ -434,7 +434,7 @@ public class SiteSenseTests
     public void APersonSayingWhereTheyAreSettlesIt()
     {
         var presence = SitePresence.Decide(TwoHousesWithTheSameSubnet,
-            new Bindings { CurrentSite = "flat" }, new[] { "192.168.178.34" });
+            new Bindings { CurrentSite = "flat" }, new[] { "192.168.50.34" });
         Assert.Equal("flat", presence.SiteId);
         Assert.True(presence.Confirmed);
         Assert.True(presence.CanReach("flat"));

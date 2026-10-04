@@ -6,7 +6,7 @@
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
-  "message": "rolled back to the previous signed agent 3.0.0; the outgoing build is kept at /home/x1f4r/.legion-control/agent.prev",
+  "message": "rolled back to the previous signed agent 3.0.0; the outgoing build is kept at /home/me/.legion-control/agent.prev",
   "action": "rolled-back",
   "current": {
     "version": "3.0.0",
@@ -15,7 +15,7 @@
   "staged": null,
   "previous": {
     "version": "3.0.0",
-    "path": "/home/x1f4r/.legion-control/agent.prev"
+    "path": "/home/me/.legion-control/agent.prev"
   },
   "manifest": {
     "schema": 1,
@@ -39,8 +39,8 @@
     "mode": "manual",
     "initiator": {
       "client": "mac",
-      "device": "roberts-macbook-pro",
-      "user": "x1f4r"
+      "device": "office-macbook-pro",
+      "user": "me"
     },
     "state": "finished",
     "phase": "done",

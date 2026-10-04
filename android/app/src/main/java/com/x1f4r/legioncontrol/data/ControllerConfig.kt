@@ -67,7 +67,7 @@ data class ControllerIdentity(
  * One place the machines live, so a controller can tell whether a broadcast could reach them.
  *
  * A prefix match is a hint and never a proof: two houses on the same router defaults have the same
- * private subnet, and an address starting with 192.168.178. says nothing about which of them this
+ * private subnet, and an address starting with 192.168.50. says nothing about which of them this
  * phone is standing in. Everything that consumes this treats several matches as "not sure", and
  * what actually authenticates a machine is its pinned host key, never its address.
  */

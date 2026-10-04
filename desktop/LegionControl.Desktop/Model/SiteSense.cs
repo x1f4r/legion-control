@@ -8,7 +8,7 @@ namespace LegionControl.Desktop.Model;
 /// Where this device appears to be, and how much that is worth.
 ///
 /// A private address prefix is a hint and never a proof. Two houses behind two stock routers have
-/// the same 192.168.178.0/24, so an address that matches a site tells you which subnet you are on
+/// the same 192.168.50.0/24, so an address that matches a site tells you which subnet you are on
 /// and nothing about which house. What proves which machine answered is the pinned host key, which
 /// is checked on every connection whatever this says.
 ///

@@ -20,9 +20,9 @@ public class EndToEndTests
           "controller": { "id": "setup-e2e", "revision": 1, "lineage": [] },
           "machines": [
             {
-              "id": "atlas",
-              "name": "Atlas",
-              "endpoints": [ { "id": "remote", "kind": "remote", "host": "atlas.example", "user": "me" } ],
+              "id": "beacon",
+              "name": "Beacon",
+              "endpoints": [ { "id": "remote", "kind": "remote", "host": "beacon.example", "user": "me" } ],
               "systems": [
                 { "id": "linux", "platform": "linux",
                   "agent": [ "node", "/home/me/.legion-control/agent/src/index.mjs" ] }
@@ -83,7 +83,7 @@ public class EndToEndTests
         var text = output.ToString();
 
         Assert.Equal(Runner.Ok, code);
-        Assert.Contains("Atlas (atlas)", text);
+        Assert.Contains("Beacon (beacon)", text);
         Assert.Contains("Raspberry Pi OS", text);
         Assert.Contains("contract 3", text);
         // The rows that matter are the honest ones: an update that is available, a service nothing
@@ -102,7 +102,7 @@ public class EndToEndTests
         File.WriteAllText(home.ConfigPath, Setup);
         var script = home.Write("fake-ssh.sh", """
             #!/bin/sh
-            echo "ssh: connect to host atlas.example port 22: No route to host" >&2
+            echo "ssh: connect to host beacon.example port 22: No route to host" >&2
             exit 255
             """);
         if (!OperatingSystem.IsWindows())
@@ -127,7 +127,7 @@ public class EndToEndTests
         using var _ = Environment(home, ssh);
 
         var output = new StringWriter();
-        var code = await Runner.RunAsync(new[] { "--command", "status", "--machine", "atlas", "--json" }, output);
+        var code = await Runner.RunAsync(new[] { "--command", "status", "--machine", "beacon", "--json" }, output);
         Assert.Equal(Runner.Ok, code);
         Assert.Contains("\"contract\": 3", output.ToString());
         Assert.Contains("\"monitored\"", output.ToString());
@@ -145,7 +145,7 @@ public class EndToEndTests
 
         var output = new StringWriter();
         var code = await Runner.RunAsync(
-            new[] { "--command", "restart", "--machine", "atlas", "--service", "t3", "--yes" }, output);
+            new[] { "--command", "restart", "--machine", "beacon", "--service", "t3", "--yes" }, output);
         Assert.Equal(Runner.Failed, code);
         Assert.Contains("working", output.ToString());
     }
@@ -163,7 +163,7 @@ public class EndToEndTests
         var output = new StringWriter();
         await Runner.RunAsync(new[] { "--reconcile-once" }, output);
         var text = output.ToString();
-        Assert.Contains("atlas", text);
+        Assert.Contains("beacon", text);
         Assert.Contains("This device holds revision", text);
     }
 }

@@ -28,7 +28,7 @@ struct Bindings: Codable, Sendable, Equatable {
     /// Which site this device believes it is at right now.
     ///
     /// A private-address prefix is a hint and never proof: two households behind stock routers both
-    /// live on 192.168.178, so matching a prefix says "this could be site A" and nothing more. This
+    /// live on 192.168.50, so matching a prefix says "this could be site A" and nothing more. This
     /// is the user's own answer, used only to order routes and to decide whether a direct magic
     /// packet is worth trying.
     var currentSite: String?

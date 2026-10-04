@@ -434,14 +434,14 @@ public class CliTests
         var code = await Runner.RunAsync(new[]
         {
             "--command", "bindings",
-            "--device", "Robert's tower",
+            "--device", "Desk tower",
             "--self", "tower",
             "--system", "linux",
             "--local-agent", "node /home/me/.legion-control/agent/src/index.mjs",
             "--site", "flat",
         }, output);
         Assert.Equal(Runner.Ok, code);
-        Assert.Contains("Robert's tower", output.ToString());
+        Assert.Contains("Desk tower", output.ToString());
         Assert.Contains("tower (linux)", output.ToString());
 
         // And it is on disk, where the next run reads it.
@@ -463,13 +463,13 @@ public class CliTests
             var exported = Path.Combine(home.Path, "exported.json");
             Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--out", exported }, read));
 
-            var edited = File.ReadAllText(exported).Replace("\"Atlas\"", "\"Atlas renamed\"");
+            var edited = File.ReadAllText(exported).Replace("\"Beacon\"", "\"Beacon renamed\"");
             File.WriteAllText(exported, edited);
 
             var write = new StringWriter();
             Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--in", exported }, write));
             Assert.Contains("revision 3", write.ToString());
-            Assert.Contains("Atlas renamed", File.ReadAllText(home.ConfigPath));
+            Assert.Contains("Beacon renamed", File.ReadAllText(home.ConfigPath));
         }
         finally
         {

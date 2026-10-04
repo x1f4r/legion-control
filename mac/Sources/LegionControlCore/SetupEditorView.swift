@@ -116,7 +116,7 @@ private struct SitesEditor: View {
             VStack(alignment: .leading, spacing: 10) {
                 LabelledField("Id", text: $draftId, placeholder: "home-a")
                 LabelledField("Name", text: $draftName, placeholder: "Attic house")
-                LabelledField("Address prefixes", text: $draftPrefixes, placeholder: "10.0.0., 192.168.178.")
+                LabelledField("Address prefixes", text: $draftPrefixes, placeholder: "10.0.0., 192.168.50.")
                 LabelledField("Broadcast", text: $draftBroadcast, placeholder: "10.0.0.255")
 
                 Button("Add the site") {

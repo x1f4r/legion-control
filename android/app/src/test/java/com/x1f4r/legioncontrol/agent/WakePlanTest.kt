@@ -21,14 +21,14 @@ class WakePlanTest {
     private val attic = SiteConfig(
         id = "attic-house",
         name = "Attic house",
-        lanPrefixes = listOf("192.168.178."),
-        broadcast = listOf("192.168.178.255"),
+        lanPrefixes = listOf("192.168.50."),
+        broadcast = listOf("192.168.50.255"),
     )
     private val flat = SiteConfig(
         id = "flat",
         name = "Flat",
-        lanPrefixes = listOf("192.168.178."),
-        broadcast = listOf("192.168.178.255"),
+        lanPrefixes = listOf("192.168.50."),
+        broadcast = listOf("192.168.50.255"),
     )
 
     private fun machine(
@@ -43,7 +43,7 @@ class WakePlanTest {
             Endpoint(
                 id = "lan",
                 kind = RouteKind.LAN,
-                host = "192.168.178.5",
+                host = "192.168.50.5",
                 port = 22,
                 user = "me",
                 systemHint = null,
@@ -57,7 +57,7 @@ class WakePlanTest {
     )
 
     private fun wakeTarget(
-        broadcasts: List<String> = listOf("192.168.178.255"),
+        broadcasts: List<String> = listOf("192.168.50.255"),
         lanPrefix: String? = null,
         site: String? = null,
         helpers: List<WakeHelper> = emptyList(),
@@ -65,7 +65,7 @@ class WakePlanTest {
         mac = "AA:BB:CC:DD:EE:FF",
         broadcasts = broadcasts,
         ports = listOf(9, 7),
-        probeHost = "192.168.178.5",
+        probeHost = "192.168.50.5",
         probePort = 22,
         lanPrefix = lanPrefix,
         siteId = site,
@@ -78,12 +78,12 @@ class WakePlanTest {
         val plan = planWake(
             target = target,
             sites = listOf(attic),
-            siteMatch = SiteMatch.Confirmed(attic, "192.168.178.31"),
+            siteMatch = SiteMatch.Confirmed(attic, "192.168.50.31"),
             machines = listOf(target),
-            localAddresses = listOf("192.168.178.31"),
+            localAddresses = listOf("192.168.50.31"),
         )
         assertTrue(plan is WakePlan.Direct)
-        assertEquals(listOf("192.168.178.255"), (plan as WakePlan.Direct).broadcasts)
+        assertEquals(listOf("192.168.50.255"), (plan as WakePlan.Direct).broadcasts)
         assertTrue(plan.why.contains("Attic house"))
     }
 
@@ -122,9 +122,9 @@ class WakePlanTest {
         val plan = planWake(
             target = target,
             sites = listOf(attic, flat),
-            siteMatch = SiteMatch.Ambiguous(listOf(attic, flat), "192.168.178.31"),
+            siteMatch = SiteMatch.Ambiguous(listOf(attic, flat), "192.168.50.31"),
             machines = listOf(target, machine("router", site = "attic-house")),
-            localAddresses = listOf("192.168.178.31"),
+            localAddresses = listOf("192.168.50.31"),
         )
         assertTrue(plan is WakePlan.ViaHelpers)
         assertTrue((plan as WakePlan.ViaHelpers).why.contains("more than one site"))
@@ -209,9 +209,9 @@ class WakePlanTest {
             target = target,
             // The site itself carries no broadcast either, so there is genuinely nowhere to send it.
             sites = listOf(attic.copy(broadcast = emptyList())),
-            siteMatch = SiteMatch.Confirmed(attic.copy(broadcast = emptyList()), "192.168.178.31"),
+            siteMatch = SiteMatch.Confirmed(attic.copy(broadcast = emptyList()), "192.168.50.31"),
             machines = listOf(target),
-            localAddresses = listOf("192.168.178.31"),
+            localAddresses = listOf("192.168.50.31"),
         )
         assertTrue(plan is WakePlan.ViaHelpers)
     }
@@ -222,10 +222,10 @@ class WakePlanTest {
         val plan = planWake(
             target = target,
             sites = listOf(attic),
-            siteMatch = SiteMatch.Confirmed(attic, "192.168.178.31"),
+            siteMatch = SiteMatch.Confirmed(attic, "192.168.50.31"),
             machines = listOf(target),
-            localAddresses = listOf("192.168.178.31"),
+            localAddresses = listOf("192.168.50.31"),
         )
-        assertEquals(listOf("192.168.178.255"), (plan as WakePlan.Direct).broadcasts)
+        assertEquals(listOf("192.168.50.255"), (plan as WakePlan.Direct).broadcasts)
     }
 }

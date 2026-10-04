@@ -7,7 +7,7 @@
     "name": "Raspberry Pi OS"
   },
   "node": "24.9.0",
-  "base": "/home/x1f4r/.legion-control",
+  "base": "/home/me/.legion-control",
   "os": "linux",
   "selfTest": {
     "ok": true,

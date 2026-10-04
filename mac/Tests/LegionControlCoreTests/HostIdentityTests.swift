@@ -22,7 +22,7 @@ struct HostIdentityTests {
     }
     func context(_ dir: URL, existing: [HostPublicKey] = []) -> HostIdentityContext {
         let known = dir.appending(path: "known_hosts")
-        return .init(address: "[tower-alias]:2222:2222", lookup: "tower-alias", scanHost: "192.168.178.20", port: 2222,
+        return .init(address: "[tower-alias]:2222:2222", lookup: "tower-alias", scanHost: "192.168.50.20", port: 2222,
                      knownHosts: known, pinFiles: [known: (try? Data(contentsOf: known)) ?? Data()], existing: existing)
     }
 
@@ -131,13 +131,13 @@ struct HostIdentityTests {
             if executable == "/usr/bin/ssh" {
                 #expect(arguments.first == "-G")
                 #expect(arguments.last == "private-alias")
-                return TransportTests.result(out: "hostname 192.168.178.20\nport 2222\nhostkeyalias shared-tower\nuserknownhostsfile \(known.path)\nglobalknownhostsfile /dev/null\n")
+                return TransportTests.result(out: "hostname 192.168.50.20\nport 2222\nhostkeyalias shared-tower\nuserknownhostsfile \(known.path)\nglobalknownhostsfile /dev/null\n")
             }
             #expect(arguments == ["-F", "shared-tower", "-f", known.path])
             return TransportTests.result(out: "# Host shared-tower found\n|1|hashed|entry \(key.id)\n")
         }
         #expect(result.lookup == "shared-tower")
-        #expect(result.scanHost == "192.168.178.20")
+        #expect(result.scanHost == "192.168.50.20")
         #expect(result.port == 2222)
         #expect(result.knownHosts == known)
         #expect(result.existing == [key])
@@ -147,7 +147,7 @@ struct HostIdentityTests {
     func externalProvider() async {
         await #expect(throws: HostIdentityFailure.self) {
             try await HostIdentityContext.resolve(.init(host: "alias", user: nil, port: nil, identityFile: nil)) { _, _, _ in
-                TransportTests.result(out: "hostname 192.168.178.20\nport 22\nproxycommand helper --connect\n")
+                TransportTests.result(out: "hostname 192.168.50.20\nport 22\nproxycommand helper --connect\n")
             }
         }
     }

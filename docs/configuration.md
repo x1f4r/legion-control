@@ -542,7 +542,7 @@ An action has **either** a `command` or a `wol` block, never both.
     "wol": {
       "mac": "AA:BB:CC:DD:EE:FF",
       // Where to send it. Usually the broadcast address of the LAN this machine is on.
-      "broadcast": ["192.168.178.255"],
+      "broadcast": ["192.168.50.255"],
       // Default [9, 7].
       "ports": [9, 7],
       // How many datagrams per address. Default 3, maximum 10. UDP is not reliable and a
@@ -633,7 +633,7 @@ below for where your key paths and ssh aliases go instead.
     "revision": 12,
     "updatedAt": "2026-09-05T09:00:00Z",
     "source": "mac",                       // which kind of client wrote it
-    "device": "Robert's MacBook",          // and which device, for the "who changed this" line
+    "device": "Office MacBook",          // and which device, for the "who changed this" line
     "lineage": ["9b1e…", "c712…"]          // hashes of the documents this one descends from
   },
 
@@ -641,9 +641,9 @@ below for where your key paths and ssh aliases go instead.
   "sites": [
     { "id": "flat", "name": "The flat",
       // A device whose own address starts with one of these is PROBABLY on this site.
-      "lanPrefixes": ["192.168.178."],
+      "lanPrefixes": ["192.168.50."],
       // Default broadcast for machines here, when a machine does not give its own.
-      "broadcast": ["192.168.178.255"] }
+      "broadcast": ["192.168.50.255"] }
   ],
 
   "machines": [
@@ -659,16 +659,16 @@ below for where your key paths and ssh aliases go instead.
       // trip guessing the other one.
       "endpoints": [
         { "id": "tailnet-linux", "kind": "remote", "host": "100.64.0.10", "port": 22, "user": "me", "system": "linux", "label": "Tailnet, Linux" },
-        { "id": "lan", "kind": "lan", "host": "192.168.178.40", "port": 22, "user": "me", "label": "Flat LAN" }
+        { "id": "lan", "kind": "lan", "host": "192.168.50.40", "port": 22, "user": "me", "label": "Flat LAN" }
       ],
 
       // Wake on LAN. Leave the block out for a machine that cannot be woken.
       "wake": {
         "mac": "AA:BB:CC:DD:EE:FF",
-        "broadcast": ["192.168.178.255"],
+        "broadcast": ["192.168.50.255"],
         "ports": [9, 7],
         // Polled after the packet, to tell when the machine is back.
-        "probe": { "host": "192.168.178.40", "port": 22 },
+        "probe": { "host": "192.168.50.40", "port": 22 },
         // Machines that can send the packet when you cannot, tried in order.
         // See "Waking from somewhere else".
         "helpers": [
@@ -748,14 +748,14 @@ reach this machine's LAN from where I am standing right now?*
 
 ```jsonc
 "sites": [
-  { "id": "flat",  "name": "The flat",   "lanPrefixes": ["192.168.178."], "broadcast": ["192.168.178.255"] },
-  { "id": "attic", "name": "Attic house", "lanPrefixes": ["192.168.178."], "broadcast": ["192.168.178.255"] }
+  { "id": "flat",  "name": "The flat",   "lanPrefixes": ["192.168.50."], "broadcast": ["192.168.50.255"] },
+  { "id": "attic", "name": "Attic house", "lanPrefixes": ["192.168.50."], "broadcast": ["192.168.50.255"] }
 ]
 ```
 
 Those two entries are not a mistake in the example. Consumer routers hand out the same private
-range everywhere, so being on `192.168.178.x` tells you almost nothing about *which*
-`192.168.178.x` you are on. Legion Control therefore treats a prefix match as a **hint and never
+range everywhere, so being on `192.168.50.x` tells you almost nothing about *which*
+`192.168.50.x` you are on. Legion Control therefore treats a prefix match as a **hint and never
 as proof**:
 
 - One site matches: that site is used, and the client says so.
@@ -795,7 +795,7 @@ with, in the helper's own agent config, a native wake action — no third-party 
 ```jsonc
 "actions": [
   { "id": "wake-tower", "name": "Wake the tower",
-    "wol": { "mac": "AA:BB:CC:DD:EE:FF", "broadcast": ["192.168.178.255"] } }
+    "wol": { "mac": "AA:BB:CC:DD:EE:FF", "broadcast": ["192.168.50.255"] } }
 ]
 ```
 
@@ -901,7 +901,7 @@ your real ssh setup.
 ```jsonc
 {
   // The name this device writes into controller.device when it edits the setup.
-  "deviceName": "Robert's tower",
+  "deviceName": "Desk tower",
 
   // Which machine in the shared document IS this device. Optional.
   "self": { "machine": "tower", "system": "windows" },
@@ -982,7 +982,7 @@ So the document carries the hashes of the documents it grew out of:
   "name": "Home setup",
   "revision": 12,
   "source": "mac",
-  "device": "Robert's MacBook",
+  "device": "Office MacBook",
   "lineage": ["9b1e…", "c712…", "0a44…"]
 }
 ```

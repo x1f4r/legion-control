@@ -29,7 +29,7 @@ class OperationReducerTest {
     ) = OperationRecord(
         id = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
         machineId = "pi",
-        machineName = "Atlas",
+        machineName = "Beacon",
         intent = OperationIntent(
             kind = kind,
             service = service,
@@ -38,7 +38,7 @@ class OperationReducerTest {
             force = force,
             whenIdle = whenIdle,
         ),
-        subjectName = service ?: target ?: actionId ?: "Atlas",
+        subjectName = service ?: target ?: actionId ?: "Beacon",
         initiator = "this phone",
         startedAt = at,
         updatedAt = at,
@@ -112,7 +112,7 @@ class OperationReducerTest {
             .reduce(OperationEvent.Dispatched(trackable = true, at = at))
             .reduce(
                 OperationEvent.TransportFailed(
-                    summary = "Atlas did not answer.",
+                    summary = "Beacon did not answer.",
                     detail = "connection refused",
                     stage = DispatchStage.NOT_STARTED,
                     at = at,
@@ -132,7 +132,7 @@ class OperationReducerTest {
             .reduce(OperationEvent.Dispatched(trackable = false, at = at))
             .reduce(
                 OperationEvent.TransportFailed(
-                    summary = "Atlas did not answer.",
+                    summary = "Beacon did not answer.",
                     detail = "connection reset",
                     stage = DispatchStage.AMBIGUOUS,
                     at = at,
@@ -160,7 +160,7 @@ class OperationReducerTest {
 
         assertEquals(TrackedState.OUTCOME_UNKNOWN, result.state)
         assertTrue(result.retryable)
-        assertTrue(result.summary.contains("Asking Atlas"))
+        assertTrue(result.summary.contains("Asking Beacon"))
     }
 
     @Test
@@ -315,7 +315,7 @@ class OperationReducerTest {
         assertTrue(told.summary.contains("Waiting to see it come back"))
 
         val seen = told.reduce(
-            OperationEvent.Resolved(OpAction.REBOOTED, "Atlas came back as windows.", at = at),
+            OperationEvent.Resolved(OpAction.REBOOTED, "Beacon came back as windows.", at = at),
         )
         assertEquals(TrackedState.FINISHED, seen.state)
         assertEquals(true, seen.succeeded)
@@ -448,7 +448,7 @@ class OperationReducerTest {
         val given = record()
             .reduce(OperationEvent.Dispatched(false, at))
             .reduce(OperationEvent.TransportFailed("lost", null, DispatchStage.AMBIGUOUS, at))
-            .reduce(OperationEvent.GaveUp("Atlas never settled it.", at))
+            .reduce(OperationEvent.GaveUp("Beacon never settled it.", at))
 
         assertEquals(TrackedState.OUTCOME_UNKNOWN, given.state)
         assertNull(given.succeeded)
@@ -489,7 +489,7 @@ class OperationReducerTest {
 
         result = result.reduce(OperationEvent.Note("another", at = at))
         assertEquals(3, result.log.size)
-        assertTrue(result.log.first().text.contains("Sent to Atlas"))
+        assertTrue(result.log.first().text.contains("Sent to Beacon"))
     }
 
     @Test

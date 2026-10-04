@@ -16,8 +16,8 @@
     "mode": "manual",
     "initiator": {
       "client": "desktop",
-      "device": "legion-cachy",
-      "user": "x1f4r"
+      "device": "legion-linux",
+      "user": "me"
     },
     "state": "finished",
     "phase": "done",

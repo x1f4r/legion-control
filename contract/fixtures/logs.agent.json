@@ -8,7 +8,7 @@
   },
   "source": "agent",
   "opId": null,
-  "path": "/home/x1f4r/.legion-control/legionctl.log",
+  "path": "/home/me/.legion-control/legionctl.log",
   "requested": 100,
   "returned": 6,
   "truncated": true,

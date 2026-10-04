@@ -8,7 +8,7 @@
 // here is written as one machine on one afternoon, because a fixture set with
 // four unrelated clocks in it reads as noise.
 //
-// The machine is a Raspberry Pi called atlas with three services on it: a T3
+// The machine is a Raspberry Pi called beacon with three services on it: a T3
 // server watched through its state database, a demo service watched through a
 // command, and a service nobody has described a busy probe for. That last one
 // is not padding: "nobody said" is a state the gate has to get right, and it is
@@ -85,25 +85,25 @@ const CONTROLLER_DOC = {
     revision: 12,
     updatedAt: T(-4200),
     source: 'mac',
-    device: "Robert's MacBook Pro",
+    device: "Office MacBook Pro",
     lineage: LINEAGE,
   },
   sites: [
-    { id: 'attic', name: 'Attic house', lanPrefixes: ['192.168.178.'], broadcast: ['192.168.178.255'] },
-    { id: 'flat', name: 'New flat', lanPrefixes: ['192.168.178.'], broadcast: ['192.168.178.255'] },
+    { id: 'attic', name: 'Attic house', lanPrefixes: ['192.168.50.'], broadcast: ['192.168.50.255'] },
+    { id: 'flat', name: 'New flat', lanPrefixes: ['192.168.50.'], broadcast: ['192.168.50.255'] },
   ],
   machines: [
     {
       id: 'pi',
-      name: 'Atlas',
+      name: 'Beacon',
       site: 'attic',
       alwaysOn: true,
       endpoints: [
-        { id: 'lan', kind: 'lan', host: '192.168.178.40', user: 'x1f4r', port: 22 },
-        { id: 'remote', kind: 'remote', host: 'atlas.example-tailnet.ts.net', user: 'x1f4r', port: 22 },
+        { id: 'lan', kind: 'lan', host: '192.168.50.40', user: 'me', port: 22 },
+        { id: 'remote', kind: 'remote', host: 'beacon.example-tailnet.ts.net', user: 'me', port: 22 },
       ],
       systems: [
-        { id: 'linux', name: 'Raspberry Pi OS', platform: 'linux', shell: 'posix', restricted: true, agent: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
+        { id: 'linux', name: 'Raspberry Pi OS', platform: 'linux', shell: 'posix', restricted: true, agent: ['node', '/home/me/.legion-control/agent/src/index.mjs'] },
       ],
     },
     {
@@ -112,15 +112,15 @@ const CONTROLLER_DOC = {
       site: 'attic',
       alwaysOn: false,
       endpoints: [
-        { id: 'lan-linux', kind: 'lan', host: '192.168.178.41', user: 'x1f4r', port: 22, system: 'linux' },
-        { id: 'remote-linux', kind: 'remote', host: 'legion-cachy.example-tailnet.ts.net', user: 'x1f4r', port: 22, system: 'linux' },
-        { id: 'remote-windows', kind: 'remote', host: 'legion-win.example-tailnet.ts.net', user: 'x1f4r', port: 22, system: 'windows' },
+        { id: 'lan-linux', kind: 'lan', host: '192.168.50.41', user: 'me', port: 22, system: 'linux' },
+        { id: 'remote-linux', kind: 'remote', host: 'legion-linux.example-tailnet.ts.net', user: 'me', port: 22, system: 'linux' },
+        { id: 'remote-windows', kind: 'remote', host: 'legion-windows.example-tailnet.ts.net', user: 'me', port: 22, system: 'windows' },
       ],
       wake: {
         mac: 'AA:BB:CC:DD:EE:FF',
-        broadcast: ['192.168.178.255'],
+        broadcast: ['192.168.50.255'],
         ports: [9, 7],
-        lanPrefix: '192.168.178.',
+        lanPrefix: '192.168.50.',
         // helpers is the ordered list; helper repeats the first entry so a 1.2
         // client still finds the one helper it knows how to read. A 1.2 client
         // does not do failover, and nothing here pretends it does.
@@ -131,8 +131,8 @@ const CONTROLLER_DOC = {
         ],
       },
       systems: [
-        { id: 'linux', name: 'CachyOS', platform: 'linux', shell: 'posix', agent: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
-        { id: 'windows', name: 'Windows 11', platform: 'windows', shell: 'powershell', agent: ['node', 'C:/Users/x1f4r/.legion-control/agent/src/index.mjs'] },
+        { id: 'linux', name: 'CachyOS', platform: 'linux', shell: 'posix', agent: ['node', '/home/me/.legion-control/agent/src/index.mjs'] },
+        { id: 'windows', name: 'Windows 11', platform: 'windows', shell: 'powershell', agent: ['node', 'C:/Users/me/.legion-control/agent/src/index.mjs'] },
       ],
     },
     {
@@ -140,9 +140,9 @@ const CONTROLLER_DOC = {
       name: 'Attic NAS',
       site: 'attic',
       alwaysOn: true,
-      endpoints: [{ id: 'lan', kind: 'lan', host: '192.168.178.10', user: 'x1f4r', port: 22 }],
+      endpoints: [{ id: 'lan', kind: 'lan', host: '192.168.50.10', user: 'me', port: 22 }],
       systems: [
-        { id: 'linux', name: 'Debian', platform: 'linux', shell: 'posix', agent: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
+        { id: 'linux', name: 'Debian', platform: 'linux', shell: 'posix', agent: ['node', '/home/me/.legion-control/agent/src/index.mjs'] },
       ],
     },
     {
@@ -151,16 +151,16 @@ const CONTROLLER_DOC = {
       site: 'flat',
       alwaysOn: false,
       endpoints: [
-        { id: 'lan', kind: 'lan', host: '192.168.178.20', user: 'x1f4r', port: 22 },
-        { id: 'remote', kind: 'remote', host: 'tower.example-tailnet.ts.net', user: 'x1f4r', port: 22 },
+        { id: 'lan', kind: 'lan', host: '192.168.50.20', user: 'me', port: 22 },
+        { id: 'remote', kind: 'remote', host: 'tower.example-tailnet.ts.net', user: 'me', port: 22 },
       ],
       wake: {
         mac: '11:22:33:44:55:66',
-        broadcast: ['192.168.178.255'],
+        broadcast: ['192.168.50.255'],
       },
       systems: [
-        { id: 'linux', name: 'CachyOS', platform: 'linux', shell: 'posix', agent: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
-        { id: 'windows', name: 'Windows 11', platform: 'windows', shell: 'cmd', agent: ['node', 'C:/Users/x1f4r/.legion-control/agent/src/index.mjs'] },
+        { id: 'linux', name: 'CachyOS', platform: 'linux', shell: 'posix', agent: ['node', '/home/me/.legion-control/agent/src/index.mjs'] },
+        { id: 'windows', name: 'Windows 11', platform: 'windows', shell: 'cmd', agent: ['node', 'C:/Users/me/.legion-control/agent/src/index.mjs'] },
       ],
     },
   ],
@@ -177,10 +177,10 @@ const H_CURRENT = canonicalHash(CONTROLLER_DOC_BYTES);
 const CONTROLLER_DOC_SIZE = Buffer.byteLength(CONTROLLER_DOC_BYTES, 'utf8');
 
 const INITIATOR = {
-  mac: { client: 'mac', device: 'roberts-macbook-pro', user: 'x1f4r' },
-  phone: { client: 'phone', device: 'pixel-8', user: 'x1f4r' },
-  desktop: { client: 'desktop', device: 'legion-cachy', user: 'x1f4r' },
-  scheduler: { client: 'cli', device: null, user: 'x1f4r' },
+  mac: { client: 'mac', device: 'office-macbook-pro', user: 'me' },
+  phone: { client: 'phone', device: 'pixel-8', user: 'me' },
+  desktop: { client: 'desktop', device: 'legion-linux', user: 'me' },
+  scheduler: { client: 'cli', device: null, user: 'me' },
 };
 
 // ---------------------------------------------------------------------------
@@ -741,7 +741,7 @@ const OP_SELF_UPDATE = record({
     ok: true,
     action: 'installed',
     reasonCode: null,
-    message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/x1f4r/.legion-control/agent.prev',
+    message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/me/.legion-control/agent.prev',
     from: '2.1.0',
     to: '3.0.0',
     exitCode: 0,
@@ -826,13 +826,13 @@ const OP_POSTCONDITION = record({
 
 function status({
   system = LINUX,
-  hostname = 'atlas',
+  hostname = 'beacon',
   services = [SERVICE_T3, SERVICE_DEMO, SERVICE_EDGE],
   timing = { budgetMs: 20000, elapsedMs: 2310, partial: false },
   agent = {
     version: AGENT,
     contract: 3,
-    base: '/home/x1f4r/.legion-control',
+    base: '/home/me/.legion-control',
     node: '24.9.0',
     restrictedSession: false,
     capabilities: ['setup-lineage', 'wol-action', 'configured-telemetry', 'service-config-admin'],
@@ -981,7 +981,7 @@ add('status.partial.json', {
   agent: {
     version: AGENT,
     contract: 3,
-    base: '/home/x1f4r/.legion-control',
+    base: '/home/me/.legion-control',
     node: '24.9.0',
     restrictedSession: true,
   },
@@ -1051,7 +1051,7 @@ add('status.no-services.json', {
   timing: { budgetMs: 20000, elapsedMs: 42, partial: false },
   notes: [
     'No configuration file was found, so this agent is running on inert defaults: no services, and automatic updates off.',
-    'Write /home/x1f4r/.legion-control/config.json to describe what this machine runs.',
+    'Write /home/me/.legion-control/config.json to describe what this machine runs.',
   ],
 }));
 
@@ -1783,11 +1783,11 @@ add('run.wol-ran.json', {
   description: 'A wake action on a helper. The agent sends the magic packets itself, so a Pi on the target LAN is a wake helper without a wakeonlan binary anywhere. Note what the output does NOT claim: packets were sent, not that anything woke up. Readiness is the authenticated poll that follows, because a UDP datagram is never evidence of a machine coming back.',
   tags: ['wake', 'helper', 'honesty'],
 }, {
-  ...envelope({ message: 'sent 6 packets to 192.168.178.255:9, 192.168.178.255:7' }),
+  ...envelope({ message: 'sent 6 packets to 192.168.50.255:9, 192.168.50.255:7' }),
   action: 'ran',
   id: 'wake-legion',
   exitCode: 0,
-  output: 'sent 6 packets to 192.168.178.255:9, 192.168.178.255:7',
+  output: 'sent 6 packets to 192.168.50.255:9, 192.168.50.255:7',
   detached: false,
   op: record({
     id: 'f28a4c60-7b13-4e95-8d02-6a1c39f7b504',
@@ -1807,9 +1807,9 @@ add('run.wol-ran.json', {
       ok: true,
       action: 'ran',
       reasonCode: null,
-      message: 'sent 6 packets to 192.168.178.255:9, 192.168.178.255:7',
+      message: 'sent 6 packets to 192.168.50.255:9, 192.168.50.255:7',
       exitCode: 0,
-      output: 'sent 6 packets to 192.168.178.255:9, 192.168.178.255:7',
+      output: 'sent 6 packets to 192.168.50.255:9, 192.168.50.255:7',
     },
     log: [{ at: T(-4), line: 'wol wake-legion: 3 repeats to 2 addresses for AA:BB:CC:DD:EE:FF' }],
   }),
@@ -1825,7 +1825,7 @@ add('run.wol-failed.json', {
   ...envelope({
     ok: false,
     reasonCode: 'internal',
-    message: 'no packets could be sent: 192.168.178.255:9 and 192.168.178.255:7 both failed with EACCES (the broadcast socket was refused)',
+    message: 'no packets could be sent: 192.168.50.255:9 and 192.168.50.255:7 both failed with EACCES (the broadcast socket was refused)',
   }),
   action: 'failed',
   id: 'wake-legion',
@@ -1849,11 +1849,11 @@ add('run.wol-failed.json', {
       ok: false,
       action: 'failed',
       reasonCode: 'internal',
-      message: 'no packets could be sent: 192.168.178.255:9 and 192.168.178.255:7 both failed with EACCES',
+      message: 'no packets could be sent: 192.168.50.255:9 and 192.168.50.255:7 both failed with EACCES',
       exitCode: 1,
       output: null,
     },
-    log: [{ at: T(-5), line: 'wol wake-legion: EACCES on 192.168.178.255:9' }],
+    log: [{ at: T(-5), line: 'wol wake-legion: EACCES on 192.168.50.255:9' }],
   }),
 });
 
@@ -2152,7 +2152,7 @@ add('logs.agent.json', {
   ...envelope(),
   source: 'agent',
   opId: null,
-  path: '/home/x1f4r/.legion-control/legionctl.log',
+  path: '/home/me/.legion-control/legionctl.log',
   requested: 100,
   returned: 6,
   truncated: true,
@@ -2191,11 +2191,11 @@ const DOCTOR_OK = {
   checks: [
     { id: 'config.parse', level: 'ok', summary: 'config.json parses', detail: '4.1 kB, read at 2026-09-05T14:00:00.000Z', fix: null },
     { id: 'config.validate', level: 'ok', summary: '3 services, 1 boot target, 2 actions', detail: null, fix: null },
-    { id: 'base.writable', level: 'ok', summary: '/home/x1f4r/.legion-control is writable', detail: null, fix: null },
+    { id: 'base.writable', level: 'ok', summary: '/home/me/.legion-control is writable', detail: null, fix: null },
     { id: 'node.version', level: 'ok', summary: 'node 24.9.0', detail: 'the agent needs 22 or newer', fix: null },
     { id: 'node.sqlite', level: 'ok', summary: 'node:sqlite is available', detail: 'needed by the t3-sqlite busy probe', fix: null },
     { id: 'npm.available', level: 'ok', summary: 'npm 11.6.0', detail: null, fix: null },
-    { id: 'npm.prefix', level: 'ok', summary: 'global prefix /home/x1f4r/.local', detail: null, fix: null },
+    { id: 'npm.prefix', level: 'ok', summary: 'global prefix /home/me/.local', detail: null, fix: null },
     { id: 'service.t3.process', level: 'ok', summary: 't3-code.service is active since 2026-09-03T14:10:00.000Z', detail: null, fix: null },
     { id: 'service.t3.health', level: 'ok', summary: 't3 answered 200 on 8081 in 8 ms', detail: null, fix: null },
     { id: 'service.t3.busy', level: 'ok', summary: 'the t3-sqlite probe read the state database', detail: '1 turn running', fix: null },
@@ -2242,7 +2242,7 @@ add('doctor.deep-failures.json', {
       detail: 'a service with no busy key counts as unmonitored, which blocks every disruptive action on this machine',
       fix: 'add a busy probe for edge, or set its busy.type to "none" if it is never busy',
     },
-    { id: 'base.writable', level: 'ok', summary: '/home/x1f4r/.legion-control is writable', detail: null, fix: null },
+    { id: 'base.writable', level: 'ok', summary: '/home/me/.legion-control is writable', detail: null, fix: null },
     { id: 'node.version', level: 'ok', summary: 'node 24.9.0', detail: null, fix: null },
     {
       id: 'node.sqlite',
@@ -2252,7 +2252,7 @@ add('doctor.deep-failures.json', {
       fix: 'install node 22.5 or newer from NodeSource, or change the t3 busy probe to a command probe',
     },
     { id: 'npm.available', level: 'ok', summary: 'npm 11.6.0', detail: null, fix: null },
-    { id: 'npm.prefix', level: 'ok', summary: 'global prefix /home/x1f4r/.local', detail: null, fix: null },
+    { id: 'npm.prefix', level: 'ok', summary: 'global prefix /home/me/.local', detail: null, fix: null },
     { id: 'service.t3.process', level: 'ok', summary: 't3-code.service is active', detail: null, fix: null },
     {
       id: 'service.t3.health',
@@ -2334,7 +2334,7 @@ add('bundle.json', {
     ...envelope(),
     source: 'agent',
     opId: null,
-    path: '/home/x1f4r/.legion-control/legionctl.log',
+    path: '/home/me/.legion-control/legionctl.log',
     requested: 200,
     returned: 2,
     truncated: true,
@@ -2355,9 +2355,9 @@ add('bundle.json', {
         package: 't3',
         channel: 'nightly',
         process: { type: 'systemd-user', unit: 't3-code.service' },
-        busy: { type: 't3-sqlite', home: '/home/x1f4r/.t3', staleHours: 12 },
+        busy: { type: 't3-sqlite', home: '/home/me/.t3', staleHours: 12 },
         health: { type: 'http', port: 8081, path: '/health' },
-        deploy: { identityFile: '<redacted>', host: 'atlas' },
+        deploy: { identityFile: '<redacted>', host: 'beacon' },
       },
     ],
   },
@@ -2377,7 +2377,7 @@ addDocument('controller-document.minimal.json', {
   tags: ['controller', 'compatibility'],
 }, {
   version: 1,
-  machines: [{ id: 'pi', name: 'Atlas', endpoints: [{ host: '192.168.178.40', user: 'x1f4r' }] }],
+  machines: [{ id: 'pi', name: 'Beacon', endpoints: [{ host: '192.168.50.40', user: 'me' }] }],
 });
 
 addDocument('controller-document.unknown-keys.json', {
@@ -2392,9 +2392,9 @@ addDocument('controller-document.unknown-keys.json', {
   machines: [
     {
       id: 'pi',
-      name: 'Atlas',
+      name: 'Beacon',
       futureMachineKey: ['anything', 'at', 'all'],
-      endpoints: [{ id: 'lan', host: '192.168.178.40', user: 'x1f4r', futureEndpointKey: 42 }],
+      endpoints: [{ id: 'lan', host: '192.168.50.40', user: 'me', futureEndpointKey: 42 }],
     },
   ],
 });
@@ -2431,7 +2431,7 @@ addDocument('controller-document.invalid-unknown-site.json', {
 }, {
   version: 1,
   controller: { id: SETUP_ID, revision: 1, lineage: [] },
-  sites: [{ id: 'attic', name: 'Attic house', lanPrefixes: ['192.168.178.'] }],
+  sites: [{ id: 'attic', name: 'Attic house', lanPrefixes: ['192.168.50.'] }],
   machines: [{ id: 'tower', name: 'Tower', site: 'flat' }],
 });
 
@@ -2457,7 +2457,7 @@ addDocument('controller-document.invalid-helper-mismatch.json', {
 }, {
   version: 1,
   machines: [
-    { id: 'pi', name: 'Atlas' },
+    { id: 'pi', name: 'Beacon' },
     { id: 'legion', name: 'Legion 7' },
     {
       id: 'tower',
@@ -2479,15 +2479,15 @@ addDocument('bindings.desktop-self.json', {
   description: 'What one device knows about itself: which machine it is, how to run its own agent without ssh, where its keys live, and which site the user says it is on. None of it is publishable, and none of it is a key — only where the keys are.',
   tags: ['bindings', 'peer', 'self-control'],
 }, {
-  deviceName: "Robert's tower",
+  deviceName: "Desk tower",
   self: { machine: 'tower', system: 'linux' },
-  localAgent: { argv: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
+  localAgent: { argv: ['node', '/home/me/.legion-control/agent/src/index.mjs'] },
   identityFile: '~/.ssh/legion-control_ed25519',
   knownHostsFile: '~/.config/legion-control/known_hosts',
   currentSite: 'flat',
   machines: {
-    legion: { identityFile: '~/.ssh/id_legion', sshAlias: 'legion-win-lan' },
-    pi: { sshAlias: 'atlas' },
+    legion: { identityFile: '~/.ssh/id_legion', sshAlias: 'legion-windows-lan' },
+    pi: { sshAlias: 'beacon' },
   },
 });
 
@@ -2508,9 +2508,9 @@ addDocument('bindings.invalid-local-agent-shell.json', {
   description: 'INVALID. There is no localAgent.shell. Local execution spawns the argv directly, so wrapping it in cmd or powershell would add a quoting layer between the client and the agent with no ssh anywhere on the path to need one.',
   tags: ['bindings', 'invalid'],
 }, {
-  deviceName: "Robert's tower",
+  deviceName: "Desk tower",
   self: { machine: 'tower' },
-  localAgent: { argv: ['node', 'C:/Users/x1f4r/.legion-control/agent/src/index.mjs'], shell: 'cmd' },
+  localAgent: { argv: ['node', 'C:/Users/me/.legion-control/agent/src/index.mjs'], shell: 'cmd' },
 });
 
 // -- config read and set -----------------------------------------------------
@@ -2521,7 +2521,7 @@ const CONTROLLER_META = {
   updatedAt: T(-4200),
   source: 'mac',
   lineage: LINEAGE,
-  device: "Robert's MacBook Pro",
+  device: "Office MacBook Pro",
   hash: H_CURRENT,
   bytes: CONTROLLER_DOC_SIZE,
 };
@@ -2601,7 +2601,7 @@ add('config.set.stored.json', {
   revision: 12,
   source: 'mac',
   lineage: LINEAGE,
-  device: "Robert's MacBook Pro",
+  device: "Office MacBook Pro",
 });
 
 add('config.set.fast-forward.json', {
@@ -2940,11 +2940,11 @@ add('self-update.installed.json', {
   description: 'A swap that happened. The signature was checked against the key this running agent was built with, every file hash matched, the staged tree passed its own self-test, and only then was anything renamed. The previous tree is kept.',
   tags: ['self-update', 'trust'],
 }, {
-  ...envelope({ message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/x1f4r/.legion-control/agent.prev' }),
+  ...envelope({ message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/me/.legion-control/agent.prev' }),
   action: 'installed',
   current: { version: '3.0.0', contract: 3 },
   staged: null,
-  previous: { version: '2.1.0', path: '/home/x1f4r/.legion-control/agent.prev' },
+  previous: { version: '2.1.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: {
     schema: 1,
     version: '3.0.0',
@@ -3015,9 +3015,9 @@ add('self-update.rolled-back.json', {
   description: 'A complete signed previous agent passed signature, file hashes and its own version/contract self-test before being restored; the outgoing signed build remains retained.',
   tags: ['self-update', 'recovery'],
 }, {
-  ...envelope({ message: 'rolled back to the previous signed agent 3.0.0; the outgoing build is kept at /home/x1f4r/.legion-control/agent.prev' }),
+  ...envelope({ message: 'rolled back to the previous signed agent 3.0.0; the outgoing build is kept at /home/me/.legion-control/agent.prev' }),
   action: 'rolled-back', current: { version: '3.0.0', contract: 3 }, staged: null,
-  previous: { version: '3.0.0', path: '/home/x1f4r/.legion-control/agent.prev' },
+  previous: { version: '3.0.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: { schema: 1, version: '3.0.0', contract: 3, files: 31, signatureVerified: true, keyFingerprint: KEY_FINGERPRINT },
   selfTest: { ok: true, exitCode: 0, output: '{"ok":true,"contract":3,"agentVersion":"3.0.0","selfTest":{"ok":true}}' },
   op: { ...OP_SELF_UPDATE, id: OPS.selfRollback, target: `rollback:${'2'.repeat(64)}`, from: '3.0.0', to: '3.0.0',
@@ -3031,7 +3031,7 @@ add('self-update.legacy-rollback-refused.json', {
 }, {
   ...envelope({ ok: false, reasonCode: 'signature-invalid', message: 'The previous agent is retained, but it is not a complete tree signed by the release key; restore it manually after independent verification.' }),
   action: 'failed', current: { version: '3.0.0', contract: 3 }, staged: null,
-  previous: { version: '2.1.0', path: '/home/x1f4r/.legion-control/agent.prev' },
+  previous: { version: '2.1.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: null, selfTest: null, op: null,
 });
 
@@ -3046,7 +3046,7 @@ add('version.json', {
 }, {
   ...envelope(),
   node: '24.9.0',
-  base: '/home/x1f4r/.legion-control',
+  base: '/home/me/.legion-control',
   os: 'linux',
 });
 
@@ -3059,7 +3059,7 @@ add('version.check.json', {
 }, {
   ...envelope(),
   node: '24.9.0',
-  base: '/home/x1f4r/.legion-control',
+  base: '/home/me/.legion-control',
   os: 'linux',
   selfTest: { ok: true, modules: 18, failed: [] },
 });
@@ -3072,7 +3072,7 @@ add('help.json', {
   tags: ['handshake'],
 }, {
   ...envelope(),
-  usage: 'node /home/x1f4r/.legion-control/agent/src/index.mjs <command> [args] [--flags]',
+  usage: 'node /home/me/.legion-control/agent/src/index.mjs <command> [args] [--flags]',
   commands: [
     { name: 'status', flags: ['--budget-ms <ms>'], mutates: false, summary: 'bounded snapshot with timing and partial flags' },
     { name: 'busy', flags: ['--budget-ms <ms>'], mutates: false, summary: 'aggregate busy plus per-service evidence' },
@@ -3186,7 +3186,7 @@ error('error.config-missing.json', 'config-missing',
     ...envelope({
       ok: false,
       reasonCode: 'config-missing',
-      message: 'there is no /home/x1f4r/.legion-control/config.json, so this machine has no services to update',
+      message: 'there is no /home/me/.legion-control/config.json, so this machine has no services to update',
     }),
     command: 'update',
     argument: null,
@@ -3282,7 +3282,7 @@ add('legacy-2x.status.json', {
   ok: true,
   os: 'linux',
   system: LINUX,
-  hostname: 'atlas',
+  hostname: 'beacon',
   agentVersion: '2.1.0',
   services: [LEGACY_SERVICE],
   busy: LEGACY_BUSY,

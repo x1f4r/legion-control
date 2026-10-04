@@ -7,7 +7,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class HostIdentitiesTest {
-    private val address = "192.168.178.20:2222"
+    private val address = "192.168.50.20:2222"
     private val systems = listOf(HostIdentitySystem("windows"), HostIdentitySystem("linux"))
     private fun key(algorithm: String, seed: Int): String {
         val bytes = ByteArrayOutputStream()
@@ -27,7 +27,7 @@ class HostIdentitiesTest {
         assertEquals(setOf(windows, linux), snapshot.trusted.toSet())
         assertThrows(IllegalArgumentException::class.java) { approve(second, key("ssh-rsa", 3), "linux") }
         assertEquals(2, snapshot.systems.size)
-        assertTrue(second.snapshot("192.168.178.20:22", emptyList()).trusted.isEmpty())
+        assertTrue(second.snapshot("192.168.50.20:22", emptyList()).trusted.isEmpty())
     }
 
     @Test fun `legacy multiple algorithms belong to one explicitly assigned OS`() {

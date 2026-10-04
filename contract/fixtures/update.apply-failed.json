@@ -21,8 +21,8 @@
     "mode": "manual",
     "initiator": {
       "client": "mac",
-      "device": "roberts-macbook-pro",
-      "user": "x1f4r"
+      "device": "office-macbook-pro",
+      "user": "me"
     },
     "state": "finished",
     "phase": "done",

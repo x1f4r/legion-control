@@ -13,7 +13,7 @@ namespace LegionControl.Desktop.Tests;
 internal static class Documents
 {
     public static ControllerDocument Make(
-        string setupId, long revision, IReadOnlyList<string> lineage, string machineName = "Atlas",
+        string setupId, long revision, IReadOnlyList<string> lineage, string machineName = "Beacon",
         string? extra = null)
     {
         var root = new JsonObject
@@ -89,8 +89,8 @@ public class LineageTests
     {
         // The whole reason revision numbers cannot decide this: both are revision 6.
         var parent = Documents.Make("setup-a", 5, Array.Empty<string>());
-        var mine = Documents.Make("setup-a", 6, new[] { parent.Hash }, "Atlas one");
-        var theirs = Documents.Make("setup-a", 6, new[] { parent.Hash }, "Atlas two");
+        var mine = Documents.Make("setup-a", 6, new[] { parent.Hash }, "Beacon one");
+        var theirs = Documents.Make("setup-a", 6, new[] { parent.Hash }, "Beacon two");
         Assert.NotEqual(mine.Hash, theirs.Hash);
         Assert.Equal(6, mine.Identity.RevisionNumber);
         Assert.Equal(6, theirs.Identity.RevisionNumber);
@@ -243,7 +243,7 @@ public class ConfigStoreTests
         raw["controller"]!["future"] = new JsonObject { ["nested"] = true };
         File.WriteAllText(home.ConfigPath, raw.ToJsonString());
         using var store = new ConfigStore(home.ConfigPath, watch: false);
-        var (edited, problem) = store.ApplyEdit(store.Document!.Text.Replace("Atlas", "Renamed"));
+        var (edited, problem) = store.ApplyEdit(store.Document!.Text.Replace("Beacon", "Renamed"));
         Assert.Null(problem);
         Assert.True(JsonNode.Parse(edited!.Text)!["controller"]!["future"]!["nested"]!.GetValue<bool>());
     }
@@ -264,7 +264,7 @@ public class ConfigStoreTests
     {
         using var home = new TempHome();
         File.WriteAllText(home.ConfigPath, """
-            { "version": 1, "machines": [ { "id": "pi", "name": "Atlas" } ] }
+            { "version": 1, "machines": [ { "id": "pi", "name": "Beacon" } ] }
             """);
         var store = new ConfigStore(home.ConfigPath, watch: false);
         Assert.NotNull(store.Document);
@@ -287,13 +287,13 @@ public class ConfigStoreTests
         var firstHash = store.Document.Hash;
 
         // Somebody edits the file in an editor and leaves the controller block alone.
-        var edited = File.ReadAllText(home.ConfigPath).Replace("\"Atlas\"", "\"Atlas renamed\"");
+        var edited = File.ReadAllText(home.ConfigPath).Replace("\"Beacon\"", "\"Beacon renamed\"");
         File.WriteAllText(home.ConfigPath, edited);
         store.Load();
 
         Assert.Equal(5, store.Document!.Identity.RevisionNumber);
         Assert.Equal(firstHash, store.Document.Identity.Lineage[0]);
-        Assert.Equal("Atlas renamed", store.Config!.Machines[0].Name);
+        Assert.Equal("Beacon renamed", store.Config!.Machines[0].Name);
         // The bytes that were replaced are still there to go back to.
         Assert.True(store.Ledger.Has(firstHash));
     }
@@ -342,12 +342,12 @@ public class ConfigStoreTests
 
         // The app is not running. The file changes.
         File.WriteAllText(home.ConfigPath,
-            File.ReadAllText(home.ConfigPath).Replace("\"Atlas\"", "\"Atlas edited offline\""));
+            File.ReadAllText(home.ConfigPath).Replace("\"Beacon\"", "\"Beacon edited offline\""));
 
         var after = new ConfigStore(home.ConfigPath, statePath, ledger, "tower", watch: false);
         Assert.Equal(8, after.Document!.Identity.RevisionNumber);
         Assert.Equal(appliedHash, after.Document.Identity.Lineage[0]);
-        Assert.Equal("Atlas edited offline", after.Config!.Machines[0].Name);
+        Assert.Equal("Beacon edited offline", after.Config!.Machines[0].Name);
         Assert.True(ledger.Has(appliedHash));
     }
 
@@ -477,14 +477,14 @@ public class DocumentFixtureTests
         using var home = new TempHome();
         var path = home.Write("bindings.json", Repo.ReadFixture("bindings.desktop-self.json"));
         var bindings = Bindings.Load(path);
-        Assert.Equal("Robert's tower", bindings.DeviceName);
+        Assert.Equal("Desk tower", bindings.DeviceName);
         Assert.Equal("tower", bindings.Self!.Machine);
-        Assert.Equal(new[] { "node", "/home/x1f4r/.legion-control/agent/src/index.mjs" }, bindings.LocalAgent);
+        Assert.Equal(new[] { "node", "/home/me/.legion-control/agent/src/index.mjs" }, bindings.LocalAgent);
         Assert.True(bindings.CanRunLocally("tower"));
         Assert.False(bindings.CanRunLocally("pi"));
         Assert.Equal("~/.ssh/id_legion", bindings.IdentityFor("legion", null));
         Assert.Equal("~/.ssh/legion-control_ed25519", bindings.IdentityFor("pi", null));
-        Assert.Equal("atlas", bindings.AliasFor("pi"));
+        Assert.Equal("beacon", bindings.AliasFor("pi"));
         Assert.Equal("flat", bindings.CurrentSite);
 
         var invalid = Value.Parse(Repo.ReadFixture("bindings.invalid-local-agent-shell.json"));
@@ -513,7 +513,7 @@ public class SetupMergeTests
           "version": 1,
           "controller": { "id": "setup-a", "revision": 1, "lineage": [] },
           "machines": [
-            { "id": "pi", "name": "Atlas", "endpoints": [ { "id": "lan", "host": "10.0.0.5" } ] },
+            { "id": "pi", "name": "Beacon", "endpoints": [ { "id": "lan", "host": "10.0.0.5" } ] },
             { "id": "tower", "name": "Tower" }
           ]
         }
@@ -523,7 +523,7 @@ public class SetupMergeTests
     public void KeepsBothSidesWhenTheyChangedDifferentThings()
     {
         var baseDocument = Document(Base);
-        var mine = Document(Base.Replace("\"Atlas\"", "\"Atlas renamed here\""));
+        var mine = Document(Base.Replace("\"Beacon\"", "\"Beacon renamed here\""));
         var theirs = Document(Base.Replace("\"Tower\"", "\"Tower renamed there\""));
 
         var differences = SetupMerge.Compare(mine, theirs, baseDocument);
@@ -533,7 +533,7 @@ public class SetupMergeTests
         Assert.DoesNotContain(differences, difference => difference.NeedsChoice);
 
         var merged = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, null, "device");
-        Assert.Contains("Atlas renamed here", merged.Text);
+        Assert.Contains("Beacon renamed here", merged.Text);
         Assert.Contains("Tower renamed there", merged.Text);
     }
 
@@ -541,8 +541,8 @@ public class SetupMergeTests
     public void AsksWhenBothSidesChangedTheSameThing()
     {
         var baseDocument = Document(Base);
-        var mine = Document(Base.Replace("\"Atlas\"", "\"Atlas mine\""));
-        var theirs = Document(Base.Replace("\"Atlas\"", "\"Atlas theirs\""));
+        var mine = Document(Base.Replace("\"Beacon\"", "\"Beacon mine\""));
+        var theirs = Document(Base.Replace("\"Beacon\"", "\"Beacon theirs\""));
 
         var differences = SetupMerge.Compare(mine, theirs, baseDocument);
         var contested = Assert.Single(differences);
@@ -551,17 +551,17 @@ public class SetupMergeTests
         // The default is theirs: the side already on the machines is not the one to overwrite by
         // accident.
         var byDefault = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, null, "device");
-        Assert.Contains("Atlas theirs", byDefault.Text);
+        Assert.Contains("Beacon theirs", byDefault.Text);
 
         var chosen = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument,
             new Dictionary<string, SetupChoice> { [contested.Key] = SetupChoice.Mine }, "device");
-        Assert.Contains("Atlas mine", chosen.Text);
+        Assert.Contains("Beacon mine", chosen.Text);
     }
 
     [Fact]
     public void WithoutACommonAncestorEveryDifferenceIsAQuestion()
     {
-        var mine = Document(Base.Replace("\"Atlas\"", "\"Atlas mine\""));
+        var mine = Document(Base.Replace("\"Beacon\"", "\"Beacon mine\""));
         var theirs = Document(Base.Replace("\"Tower\"", "\"Tower theirs\""));
         var differences = SetupMerge.Compare(mine, theirs, null);
         Assert.All(differences, difference => Assert.True(difference.NeedsChoice));
@@ -584,7 +584,7 @@ public class SetupMergeTests
     public void TheMergedDocumentDescendsFromBothAndIsValid()
     {
         var baseDocument = Document(Base);
-        var mine = Document(Base.Replace("\"Atlas\"", "\"Atlas mine\""));
+        var mine = Document(Base.Replace("\"Beacon\"", "\"Beacon mine\""));
         var theirs = Document(Base.Replace("\"Tower\"", "\"Tower theirs\""));
         var merged = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, null, "device");
         Assert.Contains(mine.Hash, merged.Identity.Lineage);

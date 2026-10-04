@@ -6,7 +6,7 @@
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
-  "usage": "node /home/x1f4r/.legion-control/agent/src/index.mjs <command> [args] [--flags]",
+  "usage": "node /home/me/.legion-control/agent/src/index.mjs <command> [args] [--flags]",
   "commands": [
     {
       "name": "status",

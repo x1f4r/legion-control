@@ -4,7 +4,7 @@ import Foundation
 /// Working out which of the setup's networks this device is on.
 ///
 /// The honest answer is usually "probably that one". A private address prefix is a hint, not proof:
-/// two households behind stock routers are both on 192.168.178, and a laptop that moves between
+/// two households behind stock routers are both on 192.168.50, and a laptop that moves between
 /// them sees the same addresses in both. So this reports what matches, says when more than one
 /// thing matches, and never picks a winner on its own.
 ///

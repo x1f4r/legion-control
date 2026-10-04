@@ -35,7 +35,7 @@ data class DeviceBindings(
      * Which site the user says this device is standing on.
      *
      * A hint for routing and waking, and never a proof. Two houses behind the same router model have
-     * the same private subnet, so an address that starts with 192.168.178. cannot tell them apart;
+     * the same private subnet, so an address that starts with 192.168.50. cannot tell them apart;
      * where several sites match, the app says it is not sure rather than picking the first. This is
      * how somebody settles that, and it is still only a hint: what authenticates a machine is its
      * pinned host key, never its address.

@@ -323,7 +323,7 @@ struct RouteBackoffTests {
     func addressCooldown() {
         let clock = Clock()
         let backoff = RouteBackoff(now: { clock.now() })
-        let target = SSHTarget(host: "192.168.178.20", user: "linux", port: 22, identityFile: nil)
+        let target = SSHTarget(host: "192.168.50.20", user: "linux", port: 22, identityFile: nil)
         let otherSystem = SSHTarget(host: target.host, user: "windows", port: nil, identityFile: nil)
         backoff.record(AgentFailure(.hostUnreachable, dispatch: .never), target: target)
         clock.advance(59)

@@ -6,7 +6,7 @@
     "revision": 12,
     "updatedAt": "2026-09-02T16:00:00.000Z",
     "source": "mac",
-    "device": "Robert's MacBook Pro",
+    "device": "Office MacBook Pro",
     "lineage": [
       "1c680fab2ecc79f4b1c2a06e4e3ed2f8a1d54c6f0b93e7a25c8d0f416b2e93a7",
       "1a5ee25ee34b2f9c07d61a8b45e0c3f27d9b8140a6532e7fc019d84b6a3e5027"
@@ -17,42 +17,42 @@
       "id": "attic",
       "name": "Attic house",
       "lanPrefixes": [
-        "192.168.178."
+        "192.168.50."
       ],
       "broadcast": [
-        "192.168.178.255"
+        "192.168.50.255"
       ]
     },
     {
       "id": "flat",
       "name": "New flat",
       "lanPrefixes": [
-        "192.168.178."
+        "192.168.50."
       ],
       "broadcast": [
-        "192.168.178.255"
+        "192.168.50.255"
       ]
     }
   ],
   "machines": [
     {
       "id": "pi",
-      "name": "Atlas",
+      "name": "Beacon",
       "site": "attic",
       "alwaysOn": true,
       "endpoints": [
         {
           "id": "lan",
           "kind": "lan",
-          "host": "192.168.178.40",
-          "user": "x1f4r",
+          "host": "192.168.50.40",
+          "user": "me",
           "port": 22
         },
         {
           "id": "remote",
           "kind": "remote",
-          "host": "atlas.example-tailnet.ts.net",
-          "user": "x1f4r",
+          "host": "beacon.example-tailnet.ts.net",
+          "user": "me",
           "port": 22
         }
       ],
@@ -65,7 +65,7 @@
           "restricted": true,
           "agent": [
             "node",
-            "/home/x1f4r/.legion-control/agent/src/index.mjs"
+            "/home/me/.legion-control/agent/src/index.mjs"
           ]
         }
       ]
@@ -79,24 +79,24 @@
         {
           "id": "lan-linux",
           "kind": "lan",
-          "host": "192.168.178.41",
-          "user": "x1f4r",
+          "host": "192.168.50.41",
+          "user": "me",
           "port": 22,
           "system": "linux"
         },
         {
           "id": "remote-linux",
           "kind": "remote",
-          "host": "legion-cachy.example-tailnet.ts.net",
-          "user": "x1f4r",
+          "host": "legion-linux.example-tailnet.ts.net",
+          "user": "me",
           "port": 22,
           "system": "linux"
         },
         {
           "id": "remote-windows",
           "kind": "remote",
-          "host": "legion-win.example-tailnet.ts.net",
-          "user": "x1f4r",
+          "host": "legion-windows.example-tailnet.ts.net",
+          "user": "me",
           "port": 22,
           "system": "windows"
         }
@@ -104,13 +104,13 @@
       "wake": {
         "mac": "AA:BB:CC:DD:EE:FF",
         "broadcast": [
-          "192.168.178.255"
+          "192.168.50.255"
         ],
         "ports": [
           9,
           7
         ],
-        "lanPrefix": "192.168.178.",
+        "lanPrefix": "192.168.50.",
         "helper": {
           "machine": "pi",
           "action": "wake-legion"
@@ -134,7 +134,7 @@
           "shell": "posix",
           "agent": [
             "node",
-            "/home/x1f4r/.legion-control/agent/src/index.mjs"
+            "/home/me/.legion-control/agent/src/index.mjs"
           ]
         },
         {
@@ -144,7 +144,7 @@
           "shell": "powershell",
           "agent": [
             "node",
-            "C:/Users/x1f4r/.legion-control/agent/src/index.mjs"
+            "C:/Users/me/.legion-control/agent/src/index.mjs"
           ]
         }
       ]
@@ -158,8 +158,8 @@
         {
           "id": "lan",
           "kind": "lan",
-          "host": "192.168.178.10",
-          "user": "x1f4r",
+          "host": "192.168.50.10",
+          "user": "me",
           "port": 22
         }
       ],
@@ -171,7 +171,7 @@
           "shell": "posix",
           "agent": [
             "node",
-            "/home/x1f4r/.legion-control/agent/src/index.mjs"
+            "/home/me/.legion-control/agent/src/index.mjs"
           ]
         }
       ]
@@ -185,22 +185,22 @@
         {
           "id": "lan",
           "kind": "lan",
-          "host": "192.168.178.20",
-          "user": "x1f4r",
+          "host": "192.168.50.20",
+          "user": "me",
           "port": 22
         },
         {
           "id": "remote",
           "kind": "remote",
           "host": "tower.example-tailnet.ts.net",
-          "user": "x1f4r",
+          "user": "me",
           "port": 22
         }
       ],
       "wake": {
         "mac": "11:22:33:44:55:66",
         "broadcast": [
-          "192.168.178.255"
+          "192.168.50.255"
         ]
       },
       "systems": [
@@ -211,7 +211,7 @@
           "shell": "posix",
           "agent": [
             "node",
-            "/home/x1f4r/.legion-control/agent/src/index.mjs"
+            "/home/me/.legion-control/agent/src/index.mjs"
           ]
         },
         {
@@ -221,7 +221,7 @@
           "shell": "cmd",
           "agent": [
             "node",
-            "C:/Users/x1f4r/.legion-control/agent/src/index.mjs"
+            "C:/Users/me/.legion-control/agent/src/index.mjs"
           ]
         }
       ]

@@ -3,11 +3,11 @@
   "machines": [
     {
       "id": "pi",
-      "name": "Atlas",
+      "name": "Beacon",
       "endpoints": [
         {
-          "host": "192.168.178.40",
-          "user": "x1f4r"
+          "host": "192.168.50.40",
+          "user": "me"
         }
       ]
     }

@@ -11,7 +11,7 @@ class ContractTest {
 
     @Test
     fun `a token is what the contract says it is`() {
-        listOf("t3", "legion-win", "a.b_c", "x1f4r@host", "C:\\Users\\me", "v1.2.3+build").forEach {
+        listOf("t3", "legion-windows", "a.b_c", "x1f4r@host", "C:\\Users\\me", "v1.2.3+build").forEach {
             assertTrue("$it should be a token", Contract.isToken(it))
         }
         listOf("", " ", "-leading", ".leading", "a b", "a;b", "a\$b", "a'b", "a\"b", "a|b").forEach {

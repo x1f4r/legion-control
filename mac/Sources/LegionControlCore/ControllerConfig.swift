@@ -66,7 +66,7 @@ struct ControllerConfig: Decodable, Sendable, Equatable {
 ///
 /// A site exists so the app can tell "I am on that network, I can send a magic packet myself" from
 /// "I am somewhere else and need a helper over there". Its address prefixes are a hint and never a
-/// proof: two households behind stock routers are both on 192.168.178, so a prefix that matches says
+/// proof: two households behind stock routers are both on 192.168.50, so a prefix that matches says
 /// this *could* be the site and nothing stronger. What proves which machine answered is the pinned
 /// host key, and that is checked on every connection whatever this says.
 struct Site: Decodable, Sendable, Equatable, Identifiable {

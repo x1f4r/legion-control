@@ -1,5 +1,5 @@
 {
-  "deviceName": "Robert's tower",
+  "deviceName": "Desk tower",
   "self": {
     "machine": "tower",
     "system": "linux"
@@ -7,7 +7,7 @@
   "localAgent": {
     "argv": [
       "node",
-      "/home/x1f4r/.legion-control/agent/src/index.mjs"
+      "/home/me/.legion-control/agent/src/index.mjs"
     ]
   },
   "identityFile": "~/.ssh/legion-control_ed25519",
@@ -16,10 +16,10 @@
   "machines": {
     "legion": {
       "identityFile": "~/.ssh/id_legion",
-      "sshAlias": "legion-win-lan"
+      "sshAlias": "legion-windows-lan"
     },
     "pi": {
-      "sshAlias": "atlas"
+      "sshAlias": "beacon"
     }
   }
 }

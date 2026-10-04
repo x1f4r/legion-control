@@ -16,7 +16,7 @@
   "agent": {
     "version": "3.0.0",
     "contract": 3,
-    "base": "/home/x1f4r/.legion-control",
+    "base": "/home/me/.legion-control",
     "node": "24.9.0",
     "restrictedSession": false,
     "capabilities": [
@@ -71,6 +71,6 @@
   },
   "notes": [
     "No configuration file was found, so this agent is running on inert defaults: no services, and automatic updates off.",
-    "Write /home/x1f4r/.legion-control/config.json to describe what this machine runs."
+    "Write /home/me/.legion-control/config.json to describe what this machine runs."
   ]
 }

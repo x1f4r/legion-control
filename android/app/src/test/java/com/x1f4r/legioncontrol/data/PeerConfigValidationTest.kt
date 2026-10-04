@@ -20,7 +20,7 @@ class PeerConfigValidationTest {
     private val base = """
         "machines": [
           {
-            "id": "pi", "name": "Atlas", "site": "home",
+            "id": "pi", "name": "Beacon", "site": "home",
             "endpoints": [{ "id": "lan", "kind": "lan", "host": "10.0.0.5", "port": 22, "user": "me" }],
             "systems": [{ "id": "linux", "platform": "linux", "agent": ["node", "a.mjs"] }]
           }

@@ -21,7 +21,7 @@ const helper = (machine, action) => ({ machine, action });
 const document = (overrides = {}) => ({
   version: 1,
   controller: { id: 'setup-3f9c2a71', revision: 1, lineage: [] },
-  machines: [{ id: 'pi', name: 'Atlas' }],
+  machines: [{ id: 'pi', name: 'Beacon' }],
   ...overrides,
 });
 
@@ -156,8 +156,8 @@ test('two sites may share a private subnet, and that is a warning, not an error'
   // longer identifies a site.
   const { errors, warnings } = checkControllerDocument(document({
     sites: [
-      { id: 'attic', lanPrefixes: ['192.168.178.'] },
-      { id: 'flat', lanPrefixes: ['192.168.178.'] },
+      { id: 'attic', lanPrefixes: ['192.168.50.'] },
+      { id: 'flat', lanPrefixes: ['192.168.50.'] },
     ],
     machines: [{ id: 'pi', site: 'attic' }, { id: 'tower', site: 'flat' }],
   }));
@@ -201,7 +201,7 @@ test('bindings name where a key is, never what it is', () => {
     identityFile: '~/.ssh/legion-control_ed25519',
     knownHostsFile: '~/.config/legion-control/known_hosts',
     currentSite: 'flat',
-    machines: { legion: { identityFile: '~/.ssh/id_legion', sshAlias: 'legion-win-lan' } },
+    machines: { legion: { identityFile: '~/.ssh/id_legion', sshAlias: 'legion-windows-lan' } },
   }), []);
   // Nothing that could hold key material has a home here.
   for (const leak of [{ privateKey: 'x' }, { identity: 'ssh-ed25519 AAAA' }, { password: 'x' }]) {

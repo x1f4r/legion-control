@@ -7,8 +7,8 @@ import com.x1f4r.legioncontrol.data.SiteConfig
  *
  * The honest answer is usually "probably". A site is recognised by the phone holding an address that
  * starts with one of its prefixes, and two houses behind the same router model have the same private
- * subnet: 192.168.178.0/24 is one router vendor's default and there are millions of them. An address that
- * starts with 192.168.178. is therefore evidence about which network this is and no evidence at all
+ * subnet: 192.168.50.0/24 is one router vendor's default and there are millions of them. An address that
+ * starts with 192.168.50. is therefore evidence about which network this is and no evidence at all
  * about which house it is in.
  *
  * So this never picks the first match. Where several sites match, the answer is [Ambiguous] and
