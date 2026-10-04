@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "internal",
   "message": "no packets could be sent: 192.168.50.255:9 and 192.168.50.255:7 both failed with EACCES (the broadcast socket was refused)",
+  "outcome": "failed",
   "action": "failed",
   "id": "wake-legion",
   "exitCode": 1,
@@ -40,7 +41,8 @@
       "reasonCode": "internal",
       "message": "no packets could be sent: 192.168.50.255:9 and 192.168.50.255:7 both failed with EACCES",
       "exitCode": 1,
-      "output": null
+      "output": null,
+      "outcome": "failed"
     },
     "log": [
       {
@@ -48,7 +50,8 @@
         "line": "wol wake-legion: EACCES on 192.168.50.255:9"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.0.1",
+    "systemId": "linux",
+    "outcome": "failed"
   }
 }

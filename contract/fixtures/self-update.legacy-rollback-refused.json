@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "signature-invalid",
   "message": "The previous agent is retained, but it is not a complete tree signed by the release key; restore it manually after independent verification.",
+  "outcome": "failed",
   "action": "failed",
   "current": {
     "version": "3.0.0",

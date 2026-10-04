@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "the update command for demo exited 0; there is no version to read back and no verify command, so nothing was checked",
+  "outcome": "succeeded",
   "action": "updated",
   "service": "demo",
   "from": null,
@@ -43,7 +44,8 @@
       "to": null,
       "exitCode": 0,
       "output": "pulled 3 objects\n",
-      "verified": false
+      "verified": false,
+      "outcome": "succeeded"
     },
     "log": [
       {
@@ -51,9 +53,10 @@
         "line": "no latestVersion and no verify command configured; --force given"
       }
     ],
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "systemId": "linux",
     "from": null,
-    "to": null
+    "to": null,
+    "outcome": "succeeded"
   }
 }

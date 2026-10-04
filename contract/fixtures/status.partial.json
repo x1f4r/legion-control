@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -14,11 +14,13 @@
     "partial": true
   },
   "agent": {
-    "version": "3.0.0",
+    "version": "3.0.1",
     "contract": 3,
     "base": "/home/me/.legion-control",
     "node": "24.9.0",
-    "restrictedSession": true
+    "restrictedSession": true,
+    "floor": "3.1.0",
+    "signed": true
   },
   "config": {
     "ok": true,
@@ -298,7 +300,8 @@
         "reasonCode": null,
         "requestedAt": "2026-09-05T14:00:00.000Z",
         "updatedAt": "2026-09-05T14:00:47.000Z",
-        "expiresAt": null
+        "expiresAt": null,
+        "outcome": "pending"
       }
     ],
     "queued": [],

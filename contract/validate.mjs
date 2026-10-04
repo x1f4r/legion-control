@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Checks the shared contract: node contract/validate.mjs
 //
-// Three passes, and each one exists because the other two cannot see the fault
-// it catches.
+// Four passes, and each one exists because the others cannot see the fault it
+// catches.
 //
 //   1. The schemas are linted against each other. A $ref that resolves to
 //      nothing and a keyword with a typo in it both make a schema that accepts
@@ -14,8 +14,13 @@
 //   3. The things a schema structurally cannot say are asserted in code: that a
 //      status' 2.x compatibility keys really do mirror its first service, that
 //      an operation's timestamps run forwards, that the doctor's counts match
-//      its checks, and that the canonical hash vectors reproduce byte for byte
-//      under an implementation written separately from the one that made them.
+//      its checks, that a stated outcome is the one the reducer gives, and that
+//      a config reply's text really is the document it reports the hash of.
+//   4. Every vector family the index lists is validated against its schema,
+//      counted against the index, and re-run through its reference
+//      implementation; then the checks this file has its own implementation for
+//      are repeated, because a vector checked only by the code that produced it
+//      checks nothing at all.
 //
 // No dependencies, deliberately: this runs in CI on three platforms and inside
 // four different toolchains, and a lockfile in contract/ would be one more thing
@@ -28,24 +33,44 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { reduceOutcome, recordInput } from './tools/outcome.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_DIR = path.join(HERE, 'schemas');
 const FIXTURE_DIR = path.join(HERE, 'fixtures');
 const INDEX_FILE = path.join(FIXTURE_DIR, 'index.json');
-const VECTOR_FILE = path.join(HERE, 'hash-vectors.json');
+const VECTOR_DIR = path.join(HERE, 'vectors');
+const VECTOR_INDEX_FILE = path.join(VECTOR_DIR, 'index.json');
 
-const failures = [];
-const warnings = [];
-let checks = 0;
+// Where failures go. main() reports into one sink for the whole run, and
+// checkReply() swaps in a fresh one for the length of a single reply so a
+// caller such as the agent's conformance test gets that reply's problems back
+// as a list instead of a process exit.
+let sink = { failures: [], warnings: [], checks: 0 };
 
 function fail(where, message) {
-  failures.push(`${where}: ${message}`);
+  sink.failures.push(`${where}: ${message}`);
 }
 
 function pass() {
-  checks += 1;
+  sink.checks += 1;
+}
+
+function warn(message) {
+  sink.warnings.push(message);
+}
+
+/** Run `check` against a fresh sink and hand that sink back. */
+function collecting(check) {
+  const saved = sink;
+  sink = { failures: [], warnings: [], checks: 0 };
+  try {
+    check();
+    return sink;
+  } finally {
+    sink = saved;
+  }
 }
 
 function readJson(file) {
@@ -109,14 +134,38 @@ function typeOf(value) {
   return typeof value;
 }
 
+/**
+ * Whether `value` is of the type a schema names. `expected` may be a list, as
+ * in `"type": ["object", "null"]`, which the shared document uses for its
+ * deprecated keys: reading it as one string would refuse every document that
+ * carries them.
+ */
 function matchesType(value, expected) {
+  if (Array.isArray(expected)) return expected.some((option) => matchesType(value, option));
   const actual = typeOf(value);
   if (expected === 'number') return actual === 'number' || actual === 'integer';
   return actual === expected;
 }
 
+/** Equality for const and enum, where the schema's own key order is the order that counts. */
 function deepEqual(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * JSON equality: objects by key set in any order, arrays element by element,
+ * strings, booleans and null by identity, numbers by value. This is the
+ * comparison contract/vectors/index.json tells every consumer to use, and the
+ * one a re-run reference is held to.
+ */
+function jsonEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) return a.length === b.length && a.every((item, index) => jsonEqual(item, b[index]));
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every((key) => Object.hasOwn(b, key) && jsonEqual(a[key], b[key]));
 }
 
 /**
@@ -149,7 +198,7 @@ function validate(schema, data, { file, at = '', errors = [] } = {}) {
   }
 
   if ('type' in schema && !matchesType(data, schema.type)) {
-    push(`expected ${schema.type}, got ${typeOf(data)}`);
+    push(`expected ${[schema.type].flat().join(' or ')}, got ${typeOf(data)}`);
   }
   if ('const' in schema && !deepEqual(data, schema.const)) {
     push(`expected ${JSON.stringify(schema.const)}, got ${JSON.stringify(data)}`);
@@ -322,8 +371,11 @@ function lintSchemas() {
         else pass();
       }
 
-      if ('type' in node && typeof node.type === 'string' && !TYPES.has(node.type)) {
-        fail(`schemas/${name}`, `${at}: "${node.type}" is not a JSON Schema type`);
+      // A key called "type" inside `properties` is a property name holding a
+      // schema, not the keyword, which is why only strings and lists count.
+      const declaredTypes = typeof node.type === 'string' ? [node.type] : Array.isArray(node.type) ? node.type : [];
+      for (const type of declaredTypes) {
+        if (!TYPES.has(type)) fail(`schemas/${name}`, `${at}: "${type}" is not a JSON Schema type`);
       }
 
       if ('pattern' in node) {
@@ -436,7 +488,7 @@ function checkFixtures(index) {
       loaded.delete(entry.file);
     } else {
       pass();
-      for (const warning of graph.warnings) warnings.push(`fixtures/${entry.file}: ${warning}`);
+      for (const warning of graph.warnings) warn(`fixtures/${entry.file}: ${warning}`);
     }
 
     // Everything below describes a reply. A document has no envelope, no exit
@@ -455,14 +507,79 @@ function checkFixtures(index) {
     if (data.contract !== declaredContract) {
       fail(`fixtures/${entry.file}`, `index says contract ${JSON.stringify(entry.contract)}, the fixture says ${JSON.stringify(data.contract ?? null)}`);
     }
-    if (entry.exitCode !== (entry.ok ? 0 : 1)) {
-      const allowed = ['accepted', 'deferred', 'queued', 'noop', 'conflict'];
-      if (!allowed.includes(data.action)) {
-        fail(`fixtures/${entry.file}`, `exit code ${entry.exitCode} does not follow from ok ${entry.ok}; only ${allowed.join(', ')} may differ`);
+    for (const key of ['action', 'reasonCode', 'outcome']) {
+      if (entry[key] !== (data[key] ?? null)) {
+        fail(`fixtures/${entry.file}`, `index says ${key} ${JSON.stringify(entry[key])}, the fixture says ${JSON.stringify(data[key] ?? null)}`);
       }
     }
+    if (entry.exitCode !== exitCodeOf(data)) {
+      fail(`fixtures/${entry.file}`, `index says exit code ${entry.exitCode}, and rule 7 gives ${exitCodeOf(data)}: 0 when ok is true or the action is one of ${OK_EXIT_ACTIONS.join(', ')}, 1 otherwise`);
+    }
+    // A client picks its decoder by schema, and the schema a reply needs follows
+    // from the command and the reply's own shape. An index that names another
+    // one would send the client's test down a path its production code never
+    // takes.
+    const expectedSchema = schemaForCommand(entry.command, data);
+    if (entry.schema !== expectedSchema) {
+      fail(`fixtures/${entry.file}`, `index names ${entry.schema}, and a ${entry.command} reply of this shape is read with ${expectedSchema}`);
+    }
+    checkOutcomePresence(`fixtures/${entry.file}`, entry, data);
+    pass();
   }
   return loaded;
+}
+
+/** The actions rule 7 answers with exit 0 whatever `ok` says (v3.md section 1). */
+const OK_EXIT_ACTIONS = ['accepted', 'already-running', 'queued', 'deferred', 'noop', 'conflict'];
+
+/** The exit code rule 7 gives a reply. Written here apart from the generator, so the index is checked rather than echoed. */
+function exitCodeOf(reply) {
+  return reply.ok === true || OK_EXIT_ACTIONS.includes(reply.action) ? 0 : 1;
+}
+
+/**
+ * The schema a reply to `command` validates against. A refusal that carries
+ * the refusal shape (a `command` and no `action`) is an error reply whatever
+ * command it answers, and a reply with no `contract` is from a 2.x agent.
+ */
+function schemaForCommand(command, reply) {
+  if (reply.contract === undefined) return command === 'status' ? 'legacy-2x-status.schema.json'
+    : command === 'config' ? 'legacy-2x-config.schema.json' : 'legacy-2x-mutation.schema.json';
+  if (reply.ok === false && 'command' in reply && !('action' in reply)) return 'error.schema.json';
+  if (command === 'config') return 'config-read.schema.json';
+  if (command === 'config meta') return 'config-meta.schema.json';
+  if (command === 'config set') return 'config-set.schema.json';
+  if (['policy', 'policy set', 'auto-update'].includes(command)) return 'policy.schema.json';
+  if (command.startsWith('service-config')) return 'service-config.schema.json';
+  return `${command}.schema.json`;
+}
+
+/**
+ * Whether a fixture answers a mutating invocation (v3.md section 5.6): the
+ * replies that carry `outcome` from agent 3.1.0 on. A dry-run cycle and
+ * `self-update --check` change nothing, so they carry none.
+ */
+function isMutatingReply(command, reply) {
+  if (['update', 'restart', 'boot', 'sleep', 'run', 'cancel', 'auto-update', 'config set', 'policy set', 'service-config set'].includes(command)) return true;
+  if (command === 'cycle') return reply.dryRun !== true;
+  if (command === 'self-update') return reply.action !== 'checked';
+  return false;
+}
+
+/**
+ * A 3.1.0 reply to a mutating invocation states its outcome, and a reply that
+ * changed nothing does not. Fixtures that model an older agent say so with the
+ * agent-3.0 tag and are exempt from the first half.
+ */
+function checkOutcomePresence(where, entry, data) {
+  if (data.contract !== 3) return;
+  const mutating = isMutatingReply(entry.command, data);
+  if (mutating && !('outcome' in data) && !(entry.tags ?? []).includes('agent-3.0')) {
+    fail(where, `a ${entry.command} reply from agent 3.1.0 carries outcome (section 5.6), and this one does not; state it, or tag the fixture agent-3.0 if it models an older agent`);
+  }
+  if (!mutating && 'outcome' in data) {
+    fail(where, `a ${entry.command} reply changes nothing, so it carries no outcome`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +621,13 @@ function checkControllerDocument(document) {
     for (const system of machine.systems ?? []) {
       if (systemIds.has(system.id)) errors.push(`${machine.id}: two systems share the id "${system.id}"`);
       systemIds.add(system.id);
+      // The argv-item guard's limit is 4096 UTF-8 bytes. A schema can only
+      // count characters, so the bytes are counted here.
+      for (const item of Array.isArray(system.agent) ? system.agent : []) {
+        if (typeof item === 'string' && Buffer.byteLength(item, 'utf8') > 4096) {
+          errors.push(`${machine.id}/${system.id}: an agent argv item is ${Buffer.byteLength(item, 'utf8')} UTF-8 bytes, over the 4096 every dispatcher and client allows`);
+        }
+      }
     }
   }
 
@@ -820,6 +944,195 @@ function checkCrossReferences(loaded) {
 }
 
 // ---------------------------------------------------------------------------
+// Outcomes. A stated outcome is a second statement of what the fields beside
+// it already say, so it is held to the reducer of v3.md section 5.6: equal to
+// what the reducer gives without it, or `unknown` where the reducer says
+// `failed`. That is the one direction a producer that knows more is allowed to
+// move it, and it is never more optimistic than the function.
+// ---------------------------------------------------------------------------
+
+let outcomesCompared = 0;
+
+function without(object, key) {
+  const { [key]: _omitted, ...rest } = object;
+  return rest;
+}
+
+function checkStatedOutcome(where, label, stated, derived) {
+  outcomesCompared += 1;
+  if (stated === derived || (stated === 'unknown' && derived === 'failed')) {
+    pass();
+    return;
+  }
+  fail(where, `${label} is ${JSON.stringify(stated)}, and the reducer of section 5.6 gives ${JSON.stringify(derived)} for the fields beside it; only failed may be stated as unknown`);
+}
+
+/** Every operation record and summary inside `value`, wherever a reply nests them. */
+function forEachOperation(value, at, visit) {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => forEachOperation(item, `${at}[${index}]`, visit));
+    return;
+  }
+  if (value === null || typeof value !== 'object') return;
+  const isOperation = typeof value.id === 'string' && typeof value.kind === 'string'
+    && typeof value.state === 'string' && typeof value.requestedAt === 'string';
+  if (isOperation) visit(at, value, 'result' in value ? 'record' : 'summary');
+  for (const [key, child] of Object.entries(value)) {
+    if (isOperation && key === 'result') continue;
+    forEachOperation(child, `${at}/${key}`, visit);
+  }
+}
+
+function checkRecordOutcome(where, op) {
+  const result = op.result !== null && typeof op.result === 'object' ? op.result : null;
+  if ('outcome' in op) {
+    const bare = { ...without(op, 'outcome'), result: result === null ? null : without(result, 'outcome') };
+    checkStatedOutcome(where, `op ${op.id} outcome`, op.outcome, reduceOutcome(recordInput(bare)));
+  }
+  if (result !== null && 'outcome' in result) {
+    checkStatedOutcome(where, `op ${op.id} result.outcome`, result.outcome, reduceOutcome(without(result, 'outcome')));
+  }
+  // A finished record is reduced from either field, so the two must say the
+  // same thing, and one of them alone is a record half written.
+  if (op.state === 'finished' && ('outcome' in op || (result !== null && 'outcome' in result))) {
+    if (op.outcome !== result?.outcome) {
+      fail(where, `op ${op.id} states outcome ${JSON.stringify(op.outcome)} and its result ${JSON.stringify(result?.outcome)}; a finished record states the same outcome in both places`);
+    } else {
+      pass();
+    }
+  }
+}
+
+function checkOutcomes(where, data) {
+  if ('outcome' in data) checkStatedOutcome(where, 'outcome', data.outcome, reduceOutcome(without(data, 'outcome')));
+  forEachOperation(data, '', (at, operation, form) => {
+    if (form === 'record') checkRecordOutcome(`${where}${at}`, operation);
+    else if ('outcome' in operation) {
+      checkStatedOutcome(`${where}${at}`, `summary ${operation.id} outcome`, operation.outcome, reduceOutcome(without(operation, 'outcome')));
+    }
+  });
+}
+
+/**
+ * A config reply's `raw` is the document it reports the hash of: null exactly
+ * when there is no document, otherwise canonical text whose UTF-8 length is
+ * `bytes`, whose sha256 is `hash`, and which parses to `controller`. A client
+ * adopts these bytes as they are, so any one of the four being false makes it
+ * adopt something other than what the machine holds.
+ */
+function checkConfigText(where, reply) {
+  if (!('raw' in reply)) return;
+  if ((reply.raw === null) !== (reply.controller === null)) {
+    fail(where, `raw is ${reply.raw === null ? 'null' : 'text'} and controller is ${reply.controller === null ? 'null' : 'a document'}; raw is null exactly when controller is`);
+    return;
+  }
+  if (typeof reply.raw !== 'string') {
+    pass();
+    return;
+  }
+  const bytes = Buffer.from(reply.raw, 'utf8');
+  if (bytes.length !== reply.bytes) fail(where, `bytes is ${reply.bytes} and raw is ${bytes.length} bytes of UTF-8`);
+  if (bytes.length > 1048576) fail(where, `raw is ${bytes.length} bytes, over the 1048576 a stored document may be`);
+  const hash = crypto.createHash('sha256').update(bytes).digest('hex');
+  if (hash !== reply.hash) fail(where, `the sha256 of raw is ${hash} and the reply reports ${reply.hash}; a client adopting raw would adopt a document under the wrong hash`);
+  const canonical = canonicalBytesAgain(bytes);
+  if (canonical === null || Buffer.compare(canonical, bytes) !== 0) {
+    fail(where, 'raw is not in canonical form, so it is not the bytes the agent stores');
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(reply.raw);
+  } catch (error) {
+    fail(where, `raw does not parse: ${error.message}`);
+    return;
+  }
+  if (!jsonEqual(parsed, reply.controller)) fail(where, 'raw parses to a different document from controller');
+  else pass();
+}
+
+/**
+ * A `busy` reply's counts and aggregate follow from the services it reports,
+ * as the status aggregate does in checkStatus. In the one-service shape there
+ * is at most one service to count, and none at all is an answer of its own:
+ * nothing to protect, so monitored, idle and known, never the shape of a
+ * service nobody described.
+ */
+function checkBusy(where, data) {
+  if (Array.isArray(data.services)) {
+    const monitored = data.services.filter((service) => service.monitored).length;
+    if (data.monitoredServices !== monitored || data.unmonitoredServices !== data.services.length - monitored) {
+      fail(where, `busy counts say ${data.monitoredServices}/${data.unmonitoredServices}, the services say ${monitored}/${data.services.length - monitored}`);
+    }
+    if (data.busy !== data.services.some((service) => service.busy)) fail(where, `the aggregate says busy ${data.busy} and the services do not`);
+    if (data.unknown !== data.services.some((service) => service.unknown)) fail(where, `the aggregate says unknown ${data.unknown} and the services do not`);
+    pass();
+    return;
+  }
+  const counted = data.monitoredServices + data.unmonitoredServices;
+  if (counted > 1) fail(where, `the one-service shape counts ${counted} services`);
+  else if (counted === 1 && data.monitoredServices !== (data.monitored ? 1 : 0)) {
+    fail(where, `the one service is ${data.monitored ? '' : 'not '}monitored and the counts say ${data.monitoredServices}/${data.unmonitoredServices}`);
+  } else if (counted === 0 && (data.evidence !== 'none' || !data.monitored || data.busy || data.unknown)) {
+    fail(where, 'a machine with no services answers monitored true, busy false, unknown false and evidence "none"');
+  } else {
+    pass();
+  }
+}
+
+/**
+ * The rules a schema cannot express about one reply. The fixture pass runs it
+ * on every reply fixture, and checkReply() runs it on a reply an agent really
+ * produced.
+ */
+function replySemantics(where, data) {
+  if (typeof data.monitoredServices === 'number' && typeof data.unmonitoredServices === 'number') checkBusy(where, data);
+  if (data.op) checkOperationRecord(where, data.op);
+  if (data.operations && !Array.isArray(data.operations) && data.services) checkStatus(where, data);
+  if (data.checks && data.counts) checkDoctor(where, data);
+  if (data.status && data.doctor && data.history) {
+    checkStatus(`${where}/status`, data.status);
+    checkDoctor(`${where}/doctor`, data.doctor);
+  }
+  if (data.source && Array.isArray(data.lines)) {
+    if (data.returned !== data.lines.length) fail(where, `returned is ${data.returned} and there are ${data.lines.length} lines`);
+    else pass();
+  }
+  if (Array.isArray(data.operations)) {
+    if (data.returned !== data.operations.length) fail(where, `returned is ${data.returned} and there are ${data.operations.length} operations`);
+    if (data.returned > data.limit) fail(where, `returned ${data.returned} with a limit of ${data.limit}`);
+    const times = data.operations.map((operation) => Date.parse(operation.requestedAt));
+    for (let index = 1; index < times.length; index += 1) {
+      if (times[index] > times[index - 1]) fail(where, 'history is not newest first');
+    }
+    pass();
+  }
+  if (Array.isArray(data.children)) {
+    const services = data.children.map((child) => child.service);
+    if (new Set(services).size !== services.length) fail(where, 'a cycle acted on the same service twice');
+    else pass();
+  }
+  checkConfigText(where, data);
+  checkOutcomes(where, data);
+}
+
+/**
+ * Check one reply as the contract does a fixture: against `schemaName`, then
+ * against the rules a schema cannot express. Returns the problems, as lines,
+ * and an empty list when the reply holds. The agent's conformance test runs
+ * every reply its commands really produce through this.
+ */
+function checkReply(schemaName, data, { where = schemaName } = {}) {
+  if (registry.size === 0) loadSchemas();
+  const schema = registry.get(schemaName);
+  if (schema === undefined) return [`${where}: there is no schema named ${schemaName}`];
+  const { errors } = validate(schema, data, { file: schemaName });
+  // As in the fixture pass, the semantic rules read fields the schema has just
+  // said are missing, so a reply gets one list or the other.
+  if (errors.length > 0) return errors.map((error) => `${where}: ${error}`);
+  return collecting(() => replySemantics(where, data)).failures;
+}
+
+// ---------------------------------------------------------------------------
 // The canonical hash, implemented again.
 //
 // Written over bytes rather than over a decoded string, and not shared with
@@ -885,13 +1198,28 @@ function canonicalBytesAgain(buffer) {
   return Buffer.from([...out.slice(head, tail), 0x0a]);
 }
 
-function checkHashVectors() {
-  const vectors = readJson(VECTOR_FILE);
+/**
+ * Why a document is refused before it is stored or sent (v3.md section 12),
+ * again over bytes: the first of too-large, invalid-utf8, empty and
+ * not-a-json-object that applies, or null.
+ */
+function rejectionAgain(input) {
+  if (input.length > 1048576) return 'too-large';
+  const canonical = canonicalBytesAgain(input);
+  if (canonical === null) return 'invalid-utf8';
+  if (canonical.length === 1) return 'empty';
+  try {
+    const parsed = JSON.parse(canonical.toString('utf8'));
+    const isDocument = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      && typeof parsed.version === 'number' && Array.isArray(parsed.machines);
+    return isDocument ? null : 'not-a-json-object';
+  } catch {
+    return 'not-a-json-object';
+  }
+}
 
-  const { errors } = validate(registry.get('hash-vectors.schema.json'), vectors, { file: 'hash-vectors.schema.json' });
-  for (const error of errors) fail('hash-vectors.json', error);
-  if (errors.length === 0) pass();
-
+/** The hash family's own checks, over the parsed hash-vectors.json. Its schema is checked with the other families. */
+function checkHashVectors(vectors) {
   const names = new Set();
   for (const vector of vectors.vectors) {
     const where = `hash-vectors.json/${vector.name}`;
@@ -901,6 +1229,18 @@ function checkHashVectors() {
     const input = Buffer.from(vector.inputBase64, 'base64');
     if (input.length !== vector.inputBytes) {
       fail(where, `inputBytes says ${vector.inputBytes}, the base64 decodes to ${input.length}`);
+    }
+
+    // The order the rules apply in is the whole of the rule: a document that
+    // breaks two of them is refused for the first, on every side.
+    if (vector.accepted !== (vector.reject === null)) {
+      fail(where, `accepted is ${vector.accepted} and reject is ${JSON.stringify(vector.reject)}; a vector is refused exactly when it says why`);
+    }
+    const reject = rejectionAgain(input);
+    if (reject !== vector.reject) {
+      fail(where, `reject is ${JSON.stringify(vector.reject)}, and section 12 refuses these bytes first for ${JSON.stringify(reject)}`);
+    } else {
+      pass();
     }
 
     const canonical = canonicalBytesAgain(input);
@@ -1009,6 +1349,30 @@ function checkSetupHashAgrees() {
     } else {
       pass();
     }
+    // raw is the stored canonical text, and that text is the document fixture,
+    // byte for byte: the four rules of a config reply's raw (null with
+    // controller, length, hash, parse) hold for it only if it is.
+    if (typeof data.raw !== 'string') {
+      fail('fixtures/config.read.json', 'carries no raw; a 3.1.0 read returns the stored text, and clients adopt that, never controller re-serialised');
+    } else if (data.raw !== bytes.toString('utf8')) {
+      fail('fixtures/config.read.json', 'raw is not the text of controller-document.sites-helpers.json, the document it reports the hash of');
+    } else {
+      checkConfigText('fixtures/config.read.json', data);
+    }
+  }
+
+  // An agent before 3.1.0 sends no raw. The fallback a client uses then is to
+  // rebuild two-space JSON in received key order and adopt only on a matching
+  // hash; the fixture that models that reply has to be one the fallback adopts,
+  // or it teaches a client that the fallback never works.
+  const older = path.join(FIXTURE_DIR, 'config.read-without-raw.json');
+  if (fs.existsSync(older)) {
+    const data = readJson(older);
+    const rebuilt = canonicalBytesAgain(Buffer.from(`${JSON.stringify(data.controller, null, 2)}\n`, 'utf8'));
+    const rebuiltHash = rebuilt === null ? null : crypto.createHash('sha256').update(rebuilt).digest('hex');
+    if ('raw' in data) fail('fixtures/config.read-without-raw.json', 'carries raw, which no agent before 3.1.0 sends');
+    else if (rebuiltHash !== data.hash) fail('fixtures/config.read-without-raw.json', `rebuilding controller gives ${rebuiltHash}, not the reported ${data.hash}`);
+    else pass();
   }
 }
 
@@ -1033,10 +1397,12 @@ function checkCoverage(index, loaded) {
   const codes = new Set();
   const kinds = new Set();
   const phases = new Set();
+  const outcomes = new Set();
   for (const data of loaded.values()) {
     collect(data, 'reasonCode', codes);
     collect(data, 'kind', kinds);
     collect(data, 'phase', phases);
+    collect(data, 'outcome', outcomes);
   }
 
   const declared = registry.get('common.schema.json').$defs.reasonCode.enum;
@@ -1049,7 +1415,7 @@ function checkCoverage(index, loaded) {
   }
   for (const code of exempt.keys()) {
     if (!declared.includes(code)) fail('fixtures/index.json', `coverageExemptions names "${code}", which is not a reason code`);
-    if (codes.has(code)) warnings.push(`fixtures/index.json: "${code}" is exempted from coverage and is covered anyway; drop the exemption`);
+    if (codes.has(code)) warn(`fixtures/index.json: "${code}" is exempted from coverage and is covered anyway; drop the exemption`);
   }
 
   const declaredKinds = registry.get('common.schema.json').$defs.opKind.enum;
@@ -1060,8 +1426,17 @@ function checkCoverage(index, loaded) {
     pass();
   }
 
+  // An outcome no fixture shows is one no client has decided anything from.
+  const declaredOutcomes = registry.get('common.schema.json').$defs.outcome.enum;
+  const missingOutcomes = declaredOutcomes.filter((outcome) => !outcomes.has(outcome));
+  if (missingOutcomes.length > 0) {
+    fail('fixtures/index.json', `no fixture shows these outcomes: ${missingOutcomes.join(', ')}`);
+  } else {
+    pass();
+  }
+
   const commands = new Set(index.fixtures.map((entry) => entry.command));
-  const required = ['status', 'busy', 'update', 'restart', 'boot', 'sleep', 'run', 'cycle', 'op', 'cancel', 'history', 'logs', 'doctor', 'bundle', 'config', 'config set', 'policy', 'self-update', 'version', 'help'];
+  const required = ['status', 'busy', 'update', 'restart', 'boot', 'sleep', 'run', 'cycle', 'op', 'cancel', 'history', 'logs', 'doctor', 'bundle', 'config', 'config meta', 'config set', 'policy', 'self-update', 'version', 'help'];
   const missingCommands = required.filter((command) => !commands.has(command));
   if (missingCommands.length > 0) {
     fail('fixtures/index.json', `no fixture for: ${missingCommands.join(', ')}`);
@@ -1074,7 +1449,260 @@ function checkCoverage(index, loaded) {
 
 // ---------------------------------------------------------------------------
 
-function main() {
+// ---------------------------------------------------------------------------
+// Pass 4: the vectors.
+//
+// contract/vectors/index.json names every family, the file it lives in, the
+// schema it validates against, its reference implementation and how many cases
+// each consumer runs. A consumer trusts those counts to tell it whether it ran
+// everything, so the index and the files are held to each other exactly; then
+// each case is run again through the reference, and each family is checked
+// once more by code in this file that shares nothing with the reference.
+// ---------------------------------------------------------------------------
+
+const CONSUMERS = ['agent', 'mac', 'desktop', 'android'];
+
+/** contract/vectors/index.json, parsed. */
+function loadVectorIndex() {
+  return readJson(VECTOR_INDEX_FILE);
+}
+
+function checkVectorIndex(index) {
+  const where = 'vectors/index.json';
+  const { errors } = validate(registry.get('vector-index.schema.json'), index, { file: 'vector-index.schema.json' });
+  for (const error of errors) fail(where, error);
+  if (errors.length > 0) return false;
+  pass();
+
+  // Exactly the files that are there, the way the fixture index is held to its
+  // directory: a family file nobody lists is a family no consumer runs.
+  const listed = index.families.map((family) => family.file);
+  const onDisk = fs.readdirSync(VECTOR_DIR)
+    .filter((name) => name.endsWith('.json') && name !== 'index.json')
+    .map((name) => `vectors/${name}`);
+  if (fs.existsSync(path.join(HERE, 'hash-vectors.json'))) onDisk.push('hash-vectors.json');
+  for (const file of onDisk) {
+    if (!listed.includes(file)) fail(where, `${file} is on disk and not in the index, so no consumer will run it`);
+  }
+  for (const file of listed) {
+    if (!onDisk.includes(file)) fail(where, `the index names ${file}, which does not exist`);
+  }
+  if (!listed.includes('hash-vectors.json')) {
+    fail(where, 'hash-vectors.json is not listed; the hash family is listed like every other family');
+  }
+  if (new Set(listed).size !== listed.length) fail(where, 'the same file is listed twice');
+  const names = index.families.map((family) => family.family);
+  if (new Set(names).size !== names.length) fail(where, 'a family is listed twice');
+  for (const family of index.families) {
+    for (const key of ['reference', 'generator']) {
+      if (!fs.existsSync(path.join(HERE, family[key]))) fail(where, `${family.family}: its ${key} ${family[key]} does not exist`);
+    }
+    if (!registry.has(family.schema)) fail(where, `${family.family}: its schema ${family.schema} does not exist`);
+  }
+  pass();
+  return true;
+}
+
+/**
+ * The cases of a family file by group, in the one shape the checks below read.
+ * In the flat layout each vector is its own input and the four fields every
+ * implementation reproduces are its expectation, and every listed consumer
+ * runs every vector.
+ */
+function casesByGroup(entry, data) {
+  if (entry.layout === 'flat') {
+    if (!Array.isArray(data.vectors)) return null;
+    const consumers = Object.keys(entry.groups[0]?.consumers ?? {});
+    return new Map([[entry.groups[0]?.group ?? 'vectors', data.vectors.map((vector) => ({
+      name: vector.name,
+      consumers,
+      tags: vector.tags ?? [],
+      input: vector,
+      expect: { canonicalBase64: vector.canonicalBase64, sha256: vector.sha256, accepted: vector.accepted, reject: vector.reject },
+    }))]]);
+  }
+  if (data.groups === null || typeof data.groups !== 'object' || Array.isArray(data.groups)) return null;
+  const groups = new Map();
+  for (const [group, cases] of Object.entries(data.groups)) {
+    groups.set(group, Array.isArray(cases) ? cases.filter((entry) => entry !== null && typeof entry === 'object') : []);
+  }
+  return groups;
+}
+
+function countConsumers(cases) {
+  const counts = {};
+  for (const consumer of CONSUMERS) {
+    const count = cases.filter((entry) => Array.isArray(entry.consumers) && entry.consumers.includes(consumer)).length;
+    if (count > 0) counts[consumer] = count;
+  }
+  return counts;
+}
+
+function unsafeNumbers(value, at, found = []) {
+  if (typeof value === 'number' && !Number.isSafeInteger(value)) found.push(`${at}: ${value}`);
+  else if (Array.isArray(value)) value.forEach((item, index) => unsafeNumbers(item, `${at}[${index}]`, found));
+  else if (value !== null && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) unsafeNumbers(child, `${at}.${key}`, found);
+  }
+  return found;
+}
+
+/**
+ * The checks each family gets from code that is not its reference. A family
+ * the index lists and this table does not is a failure: a vector checked only
+ * by the code that produced it checks nothing at all.
+ */
+const INDEPENDENT = {
+  hash: (where, data) => checkHashVectors(data),
+
+  // Each value against the schema definition the group is named after, through
+  // this file's own validator rather than the reference's regular expression.
+  identifiers: (where, data, groups) => {
+    for (const [group, cases] of groups) {
+      const schema = { $ref: `common.schema.json#/$defs/${group}` };
+      for (const entry of cases) {
+        const valid = validate(schema, entry.input?.value, { file: 'common.schema.json' }).errors.length === 0;
+        if (valid !== entry.expect?.valid) {
+          fail(`${where}/${group}/${entry.name}`, `common.schema.json#/$defs/${group} says ${valid ? 'valid' : 'invalid'} and the vector says ${entry.expect?.valid ? 'valid' : 'invalid'}`);
+        } else {
+          pass();
+        }
+      }
+    }
+  },
+
+  // The reducer is also held to every outcome a fixture states, in pass 3. A
+  // run in which nothing was compared there would make that check vacuous.
+  outcome: (where) => {
+    if (outcomesCompared === 0) fail(where, 'no fixture outcome was compared with the reducer, so the outcome family was checked by its own reference only');
+    else pass();
+  },
+};
+
+/**
+ * Rules that tie one family to the schemas the fixtures are held to. Each
+ * applies once its family is in the index.
+ */
+function checkCrossFamilyInvariants(families) {
+  const transport = families.get('transport');
+  if (!transport) return;
+  const verdict = (ref, value) => validate({ $ref: ref }, value, { file: 'common.schema.json' }).errors.length === 0;
+  for (const entry of transport.groups.get('hosts') ?? []) {
+    const where = `vectors/transport.json/hosts/${entry.name}`;
+    const guarded = verdict('common.schema.json#/$defs/sshHostGuard', entry.input?.value);
+    if (entry.expect?.valid === true && !guarded) fail(where, 'a dialable host must also pass sshHostGuard, or the agent refuses a document every client would dial');
+    if ((entry.tags ?? []).includes('injection') && guarded) fail(where, 'an injection host passes sshHostGuard, so a document carrying it would be stored');
+    pass();
+  }
+  for (const entry of transport.groups.get('users') ?? []) {
+    const guarded = verdict('common.schema.json#/$defs/sshUser', entry.input?.value);
+    if (guarded !== entry.expect?.valid) fail(`vectors/transport.json/users/${entry.name}`, `sshUser says ${guarded} and the vector says ${entry.expect?.valid}`);
+    else pass();
+  }
+  for (const entry of transport.groups.get('ports') ?? []) {
+    const guarded = verdict('controller-document.schema.json#/$defs/endpoint/properties/port', entry.input?.value);
+    if (guarded !== entry.expect?.valid) fail(`vectors/transport.json/ports/${entry.name}`, `the endpoint port rule says ${guarded} and the vector says ${entry.expect?.valid}`);
+    else pass();
+  }
+}
+
+async function checkVectorFamilies(index) {
+  const families = new Map();
+  let cases = 0;
+  for (const entry of index.families) {
+    const where = entry.file;
+    const file = path.join(HERE, entry.file);
+    if (!fs.existsSync(file) || !registry.has(entry.schema)) continue;
+
+    let data;
+    try {
+      data = readJson(file);
+    } catch (error) {
+      fail(where, `does not parse: ${error.message}`);
+      continue;
+    }
+    const { errors } = validate(registry.get(entry.schema), data, { file: entry.schema });
+    for (const error of errors) fail(where, error);
+    if (errors.length === 0) pass();
+
+    const groups = casesByGroup(entry, data);
+    if (groups === null) continue;
+    if (entry.layout === 'groups') {
+      for (const key of ['family', 'section', 'reference']) {
+        if (data[key] !== entry[key]) fail(where, `says ${key} ${JSON.stringify(data[key])} and the index says ${JSON.stringify(entry[key])}`);
+      }
+    }
+
+    // The counts a consumer compares its own run with.
+    const present = [...groups.keys()];
+    const listed = entry.groups.map((group) => group.group);
+    if (!jsonEqual(present, listed)) fail(where, `holds the groups ${present.join(', ')} and the index lists ${listed.join(', ')}`);
+    for (const group of entry.groups) {
+      const groupCases = groups.get(group.group) ?? [];
+      if (groupCases.length !== group.cases) fail(where, `${group.group} holds ${groupCases.length} cases and the index says ${group.cases}`);
+      const counts = countConsumers(groupCases);
+      if (!jsonEqual(counts, group.consumers)) {
+        fail(where, `${group.group}: the cases name ${JSON.stringify(counts)} and the index says ${JSON.stringify(group.consumers)}; a consumer that runs a different number of cases than the index says fails`);
+      } else {
+        pass();
+      }
+    }
+
+    // One name, one case, across the whole family.
+    const seen = new Set();
+    for (const [group, groupCases] of groups) {
+      for (const entryCase of groupCases) {
+        if (seen.has(entryCase.name)) fail(`${where}/${group}/${entryCase.name}`, 'the name is used twice in the family');
+        seen.add(entryCase.name);
+        const unsafe = unsafeNumbers(entryCase.expect, 'expect');
+        if (unsafe.length > 0) fail(`${where}/${group}/${entryCase.name}`, `not a safe integer at ${unsafe.join(', ')}; four languages compare these numbers as integers`);
+      }
+    }
+
+    let reference;
+    try {
+      reference = await import(pathToFileURL(path.join(HERE, entry.reference)).href);
+    } catch (error) {
+      fail(where, `its reference ${entry.reference} does not load: ${error.message}`);
+      continue;
+    }
+    if (!Array.isArray(reference.FAMILIES) || !reference.FAMILIES.includes(entry.family) || typeof reference.run !== 'function') {
+      fail(where, `${entry.reference} does not export run() with ${entry.family} in FAMILIES`);
+      continue;
+    }
+    for (const [group, groupCases] of groups) {
+      for (const entryCase of groupCases) {
+        cases += 1;
+        let actual;
+        try {
+          actual = reference.run(group, structuredClone(entryCase.input));
+        } catch (error) {
+          fail(`${where}/${group}/${entryCase.name}`, `the reference throws: ${error.message}`);
+          continue;
+        }
+        if (!jsonEqual(actual, entryCase.expect)) {
+          fail(`${where}/${group}/${entryCase.name}`, `${entry.reference} gives ${JSON.stringify(actual)} and the file says ${JSON.stringify(entryCase.expect)}`);
+        } else {
+          pass();
+        }
+      }
+    }
+
+    const independent = INDEPENDENT[entry.family];
+    if (independent === undefined) {
+      fail(where, `validate.mjs has no independent check for the ${entry.family} family; a family checked only by its own reference checks nothing`);
+    } else {
+      independent(where, data, groups);
+    }
+    families.set(entry.family, { data, groups });
+  }
+  checkCrossFamilyInvariants(families);
+  return { families: families.size, cases };
+}
+
+// ---------------------------------------------------------------------------
+
+async function main() {
   loadSchemas();
   if (registry.size === 0) {
     process.stderr.write('contract/schemas holds no schemas\n');
@@ -1085,40 +1713,24 @@ function main() {
 
   const index = readJson(INDEX_FILE);
   const loaded = checkFixtures(index);
-
-  for (const [name, data] of loaded) {
-    const where = `fixtures/${name}`;
-    if (data.op) checkOperationRecord(where, data.op);
-    if (data.operations && !Array.isArray(data.operations) && data.services) checkStatus(where, data);
-    if (data.checks && data.counts) checkDoctor(where, data);
-    if (data.status && data.doctor && data.history) {
-      checkStatus(`${where}/status`, data.status);
-      checkDoctor(`${where}/doctor`, data.doctor);
-    }
-    if (data.source && Array.isArray(data.lines)) {
-      if (data.returned !== data.lines.length) fail(where, `returned is ${data.returned} and there are ${data.lines.length} lines`);
-      else pass();
-    }
-    if (Array.isArray(data.operations)) {
-      if (data.returned !== data.operations.length) fail(where, `returned is ${data.returned} and there are ${data.operations.length} operations`);
-      if (data.returned > data.limit) fail(where, `returned ${data.returned} with a limit of ${data.limit}`);
-      const times = data.operations.map((operation) => Date.parse(operation.requestedAt));
-      for (let index = 1; index < times.length; index += 1) {
-        if (times[index] > times[index - 1]) fail(where, 'history is not newest first');
-      }
-      pass();
-    }
-    if (Array.isArray(data.children)) {
-      const services = data.children.map((child) => child.service);
-      if (new Set(services).size !== services.length) fail(where, 'a cycle acted on the same service twice');
-      else pass();
-    }
-  }
+  for (const [name, data] of loaded) replySemantics(`fixtures/${name}`, data);
 
   checkCrossReferences(loaded);
   checkSetupHashAgrees();
-  checkHashVectors();
   const coverage = checkCoverage(index, loaded);
+
+  let vectors = { families: 0, cases: 0 };
+  if (!fs.existsSync(VECTOR_INDEX_FILE)) {
+    fail('vectors/index.json', 'is missing; it lists every vector family, the hash vectors included (run node contract/tools/generate.mjs)');
+  } else {
+    let vectorIndex = null;
+    try {
+      vectorIndex = loadVectorIndex();
+    } catch (error) {
+      fail('vectors/index.json', `does not parse: ${error.message}`);
+    }
+    if (vectorIndex !== null && checkVectorIndex(vectorIndex)) vectors = await checkVectorFamilies(vectorIndex);
+  }
 
   const out = process.stdout;
   const documents = index.fixtures.filter((entry) => entry.kind === 'document').length;
@@ -1126,21 +1738,25 @@ function main() {
   out.write(
     `contract v3: ${registry.size} schemas, ${index.fixtures.length} fixtures `
     + `(${index.fixtures.length - documents} replies, ${documents} documents, ${refused} of them expected to be refused), `
-    + `${coverage.codes}/${coverage.declared} reason codes shown, ${checks} checks\n`,
+    + `${coverage.codes}/${coverage.declared} reason codes shown, `
+    + `${vectors.families} vector families with ${vectors.cases} cases, ${sink.checks} checks\n`,
   );
-  for (const warning of warnings) out.write(`  warning  ${warning}\n`);
-  if (failures.length === 0) {
+  for (const warning of sink.warnings) out.write(`  warning  ${warning}\n`);
+  if (sink.failures.length === 0) {
     out.write('everything holds\n');
     return;
   }
-  out.write(`\n${failures.length} problem${failures.length === 1 ? '' : 's'}:\n`);
-  for (const failure of failures) out.write(`  ${failure}\n`);
+  out.write(`\n${sink.failures.length} problem${sink.failures.length === 1 ? '' : 's'}:\n`);
+  for (const failure of sink.failures) out.write(`  ${failure}\n`);
   process.exitCode = 1;
 }
 
 // Importable so contract/test can exercise the validator itself. A checking tool
 // nobody checks is a tool that quietly stops checking.
-export { validate, resolveRef, loadSchemas, registry, checkControllerDocument, canonicalBytesAgain, isValidUtf8Bytes };
+export {
+  validate, resolveRef, loadSchemas, registry, checkControllerDocument, canonicalBytesAgain, isValidUtf8Bytes,
+  checkReply, reduceOutcome, schemaForCommand, jsonEqual, loadVectorIndex,
+};
 
 // Compared through realpath, not through resolve. On macOS /var and /tmp are
 // symlinks into /private, so the path a caller types and the path import.meta.url
@@ -1158,4 +1774,9 @@ function invokedDirectly() {
   return real(process.argv[1]) === real(fileURLToPath(import.meta.url));
 }
 
-if (invokedDirectly()) main();
+if (invokedDirectly()) {
+  main().catch((error) => {
+    process.stderr.write(`contract/validate.mjs failed: ${error.stack ?? error.message}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vector-index.schema.json",
+  "title": "contract/vectors/index.json",
+  "description": "The list of vector families every implementation runs, and how many cases each consumer must run per group. A consumer reads this first, runs exactly the groups that name it with exactly one adapter each, and fails when a file is missing or when it ran a different number of cases than its count here. The $defs below are shared by every family schema.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "contract": { "const": 3 },
+    "loading": { "$ref": "common.schema.json#/$defs/text" },
+    "comparison": { "$ref": "common.schema.json#/$defs/text" },
+    "families": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/family" }
+    }
+  },
+  "required": ["contract", "loading", "comparison", "families"],
+  "additionalProperties": false,
+  "$defs": {
+    "family": {
+      "type": "object",
+      "properties": {
+        "family": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "file": {
+          "description": "Relative to contract/.",
+          "type": "string",
+          "pattern": "^(?:hash-vectors\\.json|vectors/[a-z0-9-]+\\.json)$"
+        },
+        "schema": {
+          "description": "The schema in contract/schemas the file validates against.",
+          "type": "string",
+          "pattern": "^[a-z0-9-]+\\.schema\\.json$"
+        },
+        "layout": {
+          "description": "groups: the file holds groups of cases {name, purpose, consumers, tags, input, expect}. flat: the file is one array of vectors, each its own input; only the hash family has it.",
+          "enum": ["groups", "flat"]
+        },
+        "section": {
+          "description": "The section of v3.md the family pins.",
+          "type": "string",
+          "pattern": "^[0-9]+(?:\\.[0-9]+)*$"
+        },
+        "reference": {
+          "description": "The zero-dependency reference implementation, relative to contract/. It exports FAMILIES and run(group, input).",
+          "type": "string",
+          "pattern": "^tools/[a-z0-9-]+\\.mjs$"
+        },
+        "generator": {
+          "description": "Where the cases are stated by hand, relative to contract/.",
+          "type": "string",
+          "pattern": "^tools/(?:vectors/)?[a-z0-9.-]+\\.mjs$"
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/group" }
+        }
+      },
+      "required": ["family", "file", "schema", "layout", "section", "reference", "generator", "groups"],
+      "additionalProperties": false
+    },
+    "group": {
+      "type": "object",
+      "properties": {
+        "group": {
+          "type": "string",
+          "pattern": "^[a-z][A-Za-z0-9]*$"
+        },
+        "cases": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "consumers": {
+          "description": "How many of the group's cases each consumer runs. A consumer missing here runs none of them and has no adapter for the group.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/consumer" },
+          "additionalProperties": { "type": "integer", "minimum": 1 },
+          "minProperties": 1
+        }
+      },
+      "required": ["group", "cases", "consumers"],
+      "additionalProperties": false
+    },
+    "consumer": {
+      "enum": ["agent", "mac", "desktop", "android"]
+    },
+    "consumers": {
+      "description": "Who must run a case.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/consumer" },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "caseName": {
+      "description": "Unique within its family.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "purpose": {
+      "description": "Why the case exists, in a sentence a person can act on when it fails.",
+      "type": "string",
+      "minLength": 20
+    },
+    "tags": {
+      "description": "What a case is for. finding:<code> names the review finding it pins; injection and agent-enforced are reserved for the transport and setup-acceptance families.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(?:[-:.][a-z0-9]+)*$"
+      },
+      "uniqueItems": true
+    }
+  }
+}

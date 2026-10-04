@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -36,7 +36,8 @@
       "message": "the machine came back on Windows 11, booted at 2026-09-03T14:07:00.000Z, which is after the reboot was ordered",
       "exitCode": 0,
       "output": null,
-      "verified": true
+      "verified": true,
+      "outcome": "succeeded"
     },
     "log": [
       {
@@ -52,7 +53,8 @@
         "line": "recovery: uptime 42s and the running system is windows, so the transition happened"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.0.1",
+    "systemId": "linux",
+    "outcome": "succeeded"
   }
 }

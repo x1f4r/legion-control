@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "latest-unknown",
   "message": "the newest version of t3 could not be looked up (npm registry timed out after 10000 ms), so there is nothing to compare 0.0.36-nightly.20260904 against",
+  "outcome": "failed",
   "action": "failed",
   "service": "t3",
   "from": "0.0.36-nightly.20260904",

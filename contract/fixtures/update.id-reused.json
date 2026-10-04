@@ -1,0 +1,15 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.1",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "bad-argument",
+  "message": "--op 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3 already names an update of t3; send a new id for an update of demo",
+  "outcome": "failed",
+  "command": "update",
+  "argument": "--op",
+  "error": "--op 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3 already names a different request"
+}

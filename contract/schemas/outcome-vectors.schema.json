@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "outcome-vectors.schema.json",
+  "title": "contract/vectors/outcome.json",
+  "description": "The outcome reducer of v3.md section 5.6, as cases. reduce feeds it the fields it reads; records feeds it whole operation records and summaries. This file is also the template every family schema follows: family, section and reference are constants, groups lists exactly the family's groups, and cases, inputs and expectations admit no key they do not name.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "family": { "const": "outcome" },
+    "contract": { "const": 3 },
+    "section": { "const": "5.6" },
+    "reference": { "const": "tools/outcome.mjs" },
+    "notes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/text" } },
+    "groups": {
+      "type": "object",
+      "properties": {
+        "reduce": { "type": "array", "minItems": 50, "items": { "$ref": "#/$defs/reduceCase" } },
+        "records": { "type": "array", "minItems": 10, "items": { "$ref": "#/$defs/recordsCase" } }
+      },
+      "required": ["reduce", "records"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["family", "contract", "section", "reference", "notes", "groups"],
+  "additionalProperties": false,
+  "$defs": {
+    "reduceCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "description": "Only the fields the reducer reads. A key that is absent here is absent from the object the reducer is given.",
+          "type": "object",
+          "properties": {
+            "outcome": { "type": "string" },
+            "state": { "type": "string" },
+            "ok": { "anyOf": [{ "type": "boolean" }, { "type": "null" }] },
+            "action": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+            "reasonCode": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+          },
+          "additionalProperties": false
+        },
+        "expect": { "$ref": "#/$defs/expect" }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "recordsCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "kind": { "enum": ["record", "summary"] },
+            "value": {
+              "description": "A whole operation record or summary as an agent sends it. Not held to common.schema.json: some cases carry an outcome no version defines, which is what they test.",
+              "type": "object"
+            }
+          },
+          "required": ["kind", "value"],
+          "additionalProperties": false
+        },
+        "expect": { "$ref": "#/$defs/expect" }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "expect": {
+      "type": "object",
+      "properties": {
+        "outcome": { "$ref": "common.schema.json#/$defs/outcome" }
+      },
+      "required": ["outcome"],
+      "additionalProperties": false
+    }
+  }
+}

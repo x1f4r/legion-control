@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "the queued boot into windows was cancelled before it ran",
+  "outcome": "succeeded",
   "id": "8c3a5f60-1d29-4b74-a8e3-5f0c7b91d642",
   "action": "cancelled",
   "op": {
@@ -37,7 +38,8 @@
       "reasonCode": "cancelled",
       "message": "the queued boot into windows was cancelled before it ran",
       "exitCode": null,
-      "output": null
+      "output": null,
+      "outcome": "deferred"
     },
     "log": [
       {
@@ -49,7 +51,8 @@
         "line": "cancelled by phone"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.0.1",
+    "systemId": "linux",
+    "outcome": "deferred"
   }
 }

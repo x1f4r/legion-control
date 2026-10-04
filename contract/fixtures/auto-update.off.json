@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "automatic updates are off for this machine; a manual update still runs",
+  "outcome": "succeeded",
   "service": null,
   "updates": {
     "automatic": false,

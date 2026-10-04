@@ -70,3 +70,57 @@ export function canonicalBytes(bytes) {
 export function canonicalHash(bytes) {
   return crypto.createHash('sha256').update(canonicalBytes(bytes)).digest('hex');
 }
+
+/** The most a setup document may be, counted on the bytes as given. */
+export const MAX_DOCUMENT_BYTES = 1048576;
+
+/**
+ * Why a document is refused before anything is stored or sent, or null when it
+ * is not (v3.md section 12).
+ *
+ * The first rule that applies answers, in this order: too-large, invalid-utf8,
+ * empty, not-a-json-object. Size is judged on the bytes as given, because that
+ * is what was read off the wire; everything after it is judged on the canonical
+ * bytes, so a byte order mark or a blank line around the document never makes
+ * it unparseable. A second byte order mark is content, not decoration: the rule
+ * strips exactly one, the text then starts with U+FEFF, and it is refused.
+ */
+export function rejection(bytes) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  if (buffer.length > MAX_DOCUMENT_BYTES) return 'too-large';
+  if (!isValidUtf8(buffer)) return 'invalid-utf8';
+  const canonical = canonicalBytes(buffer);
+  if (canonical.length === 1) return 'empty';
+  let parsed;
+  try {
+    // Buffer#toString keeps a leading U+FEFF and JSON.parse refuses it, which is
+    // exactly the behaviour the rule asks for.
+    parsed = JSON.parse(canonical.toString('utf8'));
+  } catch {
+    return 'not-a-json-object';
+  }
+  const isDocument = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+    && typeof parsed.version === 'number' && Array.isArray(parsed.machines);
+  return isDocument ? null : 'not-a-json-object';
+}
+
+// ---------------------------------------------------------------------------
+// The reference interface of the `hash` vector family (contract/vectors/index.json).
+// Its file keeps the flat layout it always had: each vector is its own input,
+// and the four fields below are what every implementation must reproduce.
+// ---------------------------------------------------------------------------
+
+export const FAMILIES = ['hash'];
+
+export function run(group, input) {
+  if (group !== 'vectors') throw new Error(`the hash family has no group "${group}"`);
+  const buffer = Buffer.from(input.inputBase64, 'base64');
+  const valid = isValidUtf8(buffer);
+  const reject = rejection(buffer);
+  return {
+    canonicalBase64: valid ? canonicalBytes(buffer).toString('base64') : null,
+    sha256: valid ? canonicalHash(buffer) : null,
+    accepted: reject === null,
+    reject,
+  };
+}

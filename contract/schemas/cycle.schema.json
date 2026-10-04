@@ -46,8 +46,17 @@
         "cycled",
         "skipped",
         "failed",
-        "conflict"
+        "conflict",
+        "already-running"
       ]
+    },
+    "replayed": {
+      "description": "Set on a reply that returns an existing record for the same --op id instead of starting a cycle.",
+      "type": "boolean"
+    },
+    "detached": {
+      "description": "On a replay of a running record (already-running): the record's own detached, copied.",
+      "type": "boolean"
     },
     "dryRun": {
       "type": "boolean"

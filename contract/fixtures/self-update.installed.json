@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "agent 3.0.0 is installed and 2.1.0 is kept at /home/me/.legion-control/agent.prev",
+  "outcome": "succeeded",
   "action": "installed",
   "current": {
     "version": "3.0.0",
@@ -60,7 +61,8 @@
       "from": "2.1.0",
       "to": "3.0.0",
       "exitCode": 0,
-      "output": null
+      "output": null,
+      "outcome": "succeeded"
     },
     "log": [
       {
@@ -80,9 +82,10 @@
         "line": "agent.new swapped in, previous tree kept"
       }
     ],
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "systemId": "linux",
     "from": "2.1.0",
-    "to": "3.0.0"
+    "to": "3.0.0",
+    "outcome": "succeeded"
   }
 }

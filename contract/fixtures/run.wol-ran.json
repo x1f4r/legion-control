@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "sent 6 packets to 192.168.50.255:9, 192.168.50.255:7",
+  "outcome": "succeeded",
   "action": "ran",
   "id": "wake-legion",
   "exitCode": 0,
@@ -40,7 +41,8 @@
       "reasonCode": null,
       "message": "sent 6 packets to 192.168.50.255:9, 192.168.50.255:7",
       "exitCode": 0,
-      "output": "sent 6 packets to 192.168.50.255:9, 192.168.50.255:7"
+      "output": "sent 6 packets to 192.168.50.255:9, 192.168.50.255:7",
+      "outcome": "succeeded"
     },
     "log": [
       {
@@ -48,7 +50,8 @@
         "line": "wol wake-legion: 3 repeats to 2 addresses for AA:BB:CC:DD:EE:FF"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.0.1",
+    "systemId": "linux",
+    "outcome": "succeeded"
   }
 }

@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "internal",
   "message": "the staged agent 3.0.0 failed its self-test (node:sqlite is not available in node 20.11.1), so nothing was swapped and 2.1.0 is still running",
+  "outcome": "failed",
   "action": "failed",
   "current": {
     "version": "2.1.0",

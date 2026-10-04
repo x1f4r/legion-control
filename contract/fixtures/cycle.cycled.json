@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "3 services walked: 1 updated, 2 deferred",
+  "outcome": "succeeded",
   "action": "cycled",
   "dryRun": false,
   "op": {
@@ -37,7 +38,8 @@
       "reasonCode": null,
       "message": "3 services walked: 1 updated, 2 deferred",
       "exitCode": 0,
-      "output": null
+      "output": null,
+      "outcome": "succeeded"
     },
     "log": [
       {
@@ -57,7 +59,7 @@
         "line": "cycle done"
       }
     ],
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "systemId": "linux",
     "children": [
       {
@@ -67,7 +69,7 @@
         "reasonCode": null
       },
       {
-        "opId": "d35b8e04-7c91-4a26-b5f8-0e3a7d192c64",
+        "opId": null,
         "service": "demo",
         "action": "deferred",
         "reasonCode": "policy-off"
@@ -78,7 +80,8 @@
         "action": "deferred",
         "reasonCode": "busy-unknown"
       }
-    ]
+    ],
+    "outcome": "succeeded"
   },
   "children": [
     {
@@ -88,7 +91,7 @@
       "reasonCode": null
     },
     {
-      "opId": "d35b8e04-7c91-4a26-b5f8-0e3a7d192c64",
+      "opId": null,
       "service": "demo",
       "action": "deferred",
       "reasonCode": "policy-off"

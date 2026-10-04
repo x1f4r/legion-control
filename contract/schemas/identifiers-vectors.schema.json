@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "identifiers-vectors.schema.json",
+  "title": "contract/vectors/identifiers.json",
+  "description": "The identifier grammars of v3.md section 1, rule 5, as cases. Each group is named after the common.schema.json $defs entry it pins, and each case is one string and whether it is valid.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "family": { "const": "identifiers" },
+    "contract": { "const": 3 },
+    "section": { "const": "1" },
+    "reference": { "const": "tools/identifiers.mjs" },
+    "notes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/text" } },
+    "groups": {
+      "type": "object",
+      "properties": {
+        "token": { "$ref": "#/$defs/cases" },
+        "configuredId": { "$ref": "#/$defs/cases" },
+        "setupId": { "$ref": "#/$defs/cases" },
+        "opId": { "$ref": "#/$defs/cases" },
+        "duration": { "$ref": "#/$defs/cases" },
+        "clockTime": { "$ref": "#/$defs/cases" },
+        "sha256": { "$ref": "#/$defs/cases" }
+      },
+      "required": ["token", "configuredId", "setupId", "opId", "duration", "clockTime", "sha256"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["family", "contract", "section", "reference", "notes", "groups"],
+  "additionalProperties": false,
+  "$defs": {
+    "cases": {
+      "type": "array",
+      "minItems": 6,
+      "items": { "$ref": "#/$defs/case" }
+    },
+    "case": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "value": { "type": "string" }
+          },
+          "required": ["value"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "valid": { "type": "boolean" }
+          },
+          "required": ["valid"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    }
+  }
+}

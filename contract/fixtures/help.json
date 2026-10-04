@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -175,7 +175,8 @@
         "--install",
         "--rollback",
         "--check",
-        "--stdin"
+        "--stdin",
+        "--allow-downgrade"
       ],
       "mutates": true,
       "summary": "signed agent replacement, keeping the previous tree"

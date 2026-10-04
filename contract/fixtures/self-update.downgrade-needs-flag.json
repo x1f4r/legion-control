@@ -1,0 +1,30 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.1",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "bad-argument",
+  "message": "agent 3.0.0 is older than the floor 3.1.0; nothing was staged. Repeat with --allow-downgrade from an unrestricted session to go back deliberately",
+  "outcome": "failed",
+  "action": "failed",
+  "current": {
+    "version": "3.0.1",
+    "contract": 3
+  },
+  "floor": "3.1.0",
+  "staged": null,
+  "previous": null,
+  "manifest": {
+    "schema": 1,
+    "version": "3.0.0",
+    "contract": 3,
+    "files": 31,
+    "signatureVerified": true,
+    "keyFingerprint": "8f2b6d41c0973ea5b8de10f47c26935ab0d84e7f1c53920684bfae7d3506c19b"
+  },
+  "selfTest": null,
+  "op": null
+}

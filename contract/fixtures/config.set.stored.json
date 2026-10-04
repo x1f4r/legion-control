@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "stored revision 12 of setup-3f9c2a71, 5071 bytes",
+  "outcome": "succeeded",
   "action": "stored",
   "hash": "81a6d710365ad9a0289cff90310898e22c04795134d6de67f58b207b3938e7a4",
   "bytes": 5071,

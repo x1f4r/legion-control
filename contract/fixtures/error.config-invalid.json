@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "config-invalid",
   "message": "config.json does not parse, so nothing on this machine will be changed until it does; status still works and reads from config.last-good.json",
+  "outcome": "failed",
   "command": "update",
   "argument": null,
   "problems": [

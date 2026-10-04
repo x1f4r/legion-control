@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -37,7 +37,8 @@
       "from": "1.4.2",
       "to": "1.4.2",
       "exitCode": 1,
-      "output": null
+      "output": null,
+      "outcome": "failed"
     },
     "log": [
       {
@@ -53,9 +54,10 @@
         "line": "rolled back to 1.4.2, health 200"
       }
     ],
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "systemId": "linux",
     "from": "1.4.2",
-    "to": "1.4.2"
+    "to": "1.4.2",
+    "outcome": "failed"
   }
 }

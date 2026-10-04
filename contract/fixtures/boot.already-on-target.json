@@ -1,13 +1,14 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "windows",
     "name": "Windows 11"
   },
   "reasonCode": "already-on-target",
   "message": "this machine is already running Windows 11",
+  "outcome": "succeeded",
   "action": "noop",
   "target": "windows",
   "op": null

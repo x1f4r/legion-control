@@ -1,0 +1,22 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.0.1",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "config-invalid",
+  "message": "the document breaks 1 rule of the setup document, so nothing was written; the first is machines[0].endpoints[0].host",
+  "outcome": "failed",
+  "hash": null,
+  "bytes": 0,
+  "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+  "revision": 4,
+  "problems": [
+    {
+      "path": "machines[0].endpoints[0].host",
+      "message": "is not a host name or an address, so no client may hand it to ssh"
+    }
+  ]
+}

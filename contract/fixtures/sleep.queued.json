@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "the machine will suspend on the next idle cycle, or the request is dropped at 2026-09-05T16:00:00.000Z",
+  "outcome": "pending",
   "action": "queued",
   "replaced": null,
   "op": {
@@ -38,7 +39,8 @@
         "line": "queued until idle, expires in 2h"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.0.1",
+    "systemId": "linux",
+    "outcome": "pending"
   }
 }

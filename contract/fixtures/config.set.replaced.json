@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "setup setup-3f9c2a71 replaced by setup-8b04d193 revision 4, 198 bytes",
+  "outcome": "succeeded",
   "action": "replaced",
   "hash": "4a88b8efec1592c0d3b7615ae820f4c96d1e037b58a2c94f6013e7d58b2a06cf",
   "bytes": 198,

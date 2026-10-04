@@ -11,53 +11,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const CONTRACT = path.join(HERE, '..');
-
-function runValidate(dir) {
-  try {
-    const stdout = execFileSync(process.execPath, [path.join(dir, 'validate.mjs')], { encoding: 'utf8' });
-    return { ok: true, output: stdout };
-  } catch (error) {
-    return { ok: false, output: `${error.stdout ?? ''}${error.stderr ?? ''}` };
-  }
-}
-
-/** A throwaway copy of contract/, so a broken fixture never touches the tree. */
-function scratch() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-contract-'));
-  fs.cpSync(CONTRACT, dir, { recursive: true });
-  return dir;
-}
-
-const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
-const writeJson = (file, value) => fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
-
-/**
- * Break one thing, and assert the check notices.
- *
- * `expect` is matched against the output so a test cannot pass because the
- * validator failed for some unrelated reason.
- */
-function defect(name, expect, breakIt) {
-  test(`caught: ${name}`, () => {
-    const dir = scratch();
-    try {
-      breakIt(dir);
-      const result = runValidate(dir);
-      assert.equal(result.ok, false, `nothing caught "${name}"`);
-      assert.match(result.output, expect);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-}
+import { CONTRACT, defect, readJson, runValidate, writeJson } from './support.mjs';
 
 test('the contract as committed passes its own check', () => {
   const result = runValidate(CONTRACT);
@@ -86,7 +42,7 @@ test('every peer-amendment fixture the client workers were promised is present',
   for (const required of [
     'config set/stored', 'config set/noop', 'config set/fast-forward', 'config set/stale-revision',
     'config set/conflict-divergent', 'config set/conflict-other-id', 'config set/replaced',
-    'config/meta-with-lineage', 'run/wol-ran',
+    'config meta/meta-with-lineage', 'run/wol-ran',
     'controller-document.schema.json/sites-helpers',
     'controller-document.schema.json/invalid-helper-cycle',
     'bindings.schema.json/desktop-self',
@@ -285,5 +241,155 @@ defect('an index entry that disagrees with the fixture it names',
     const file = path.join(dir, 'fixtures', 'index.json');
     const data = readJson(file);
     data.fixtures.find((entry) => entry.file === 'status.full.json').ok = false;
+    writeJson(file, data);
+  });
+
+// --- the additions of agent 3.1.0 -------------------------------------------
+
+test('every reply fixture of a mutating command states its outcome, and no other does', () => {
+  const index = readJson(path.join(CONTRACT, 'fixtures', 'index.json'));
+  const outcomes = new Set();
+  for (const entry of index.fixtures) {
+    if (entry.kind !== 'reply') {
+      assert.equal(entry.outcome, null, `${entry.file} is a document and has no outcome`);
+      continue;
+    }
+    const data = readJson(path.join(CONTRACT, 'fixtures', entry.file));
+    assert.equal(entry.outcome, data.outcome ?? null, `${entry.file}: the index and the fixture disagree about outcome`);
+    if (data.outcome) outcomes.add(data.outcome);
+  }
+  assert.deepEqual([...outcomes].sort(), ['deferred', 'failed', 'pending', 'succeeded', 'unknown']);
+});
+
+test('config.read.json carries the stored text, and the fallback fixture carries none', () => {
+  const read = readJson(path.join(CONTRACT, 'fixtures', 'config.read.json'));
+  const text = fs.readFileSync(path.join(CONTRACT, 'fixtures', 'controller-document.sites-helpers.json'), 'utf8');
+  assert.equal(read.raw, text);
+  assert.equal(Buffer.byteLength(read.raw, 'utf8'), read.bytes);
+  assert.equal(createHash('sha256').update(read.raw).digest('hex'), read.hash);
+  const older = readJson(path.join(CONTRACT, 'fixtures', 'config.read-without-raw.json'));
+  assert.equal('raw' in older, false);
+  assert.equal(older.agentVersion, '3.0.1');
+});
+
+defect('a raw that is not the document the reply reports the hash of',
+  /the sha256 of raw is/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'config.read.json');
+    const data = readJson(file);
+    data.raw = data.raw.replace('"Home setup"', '"Home setup!"');
+    data.bytes = Buffer.byteLength(data.raw, 'utf8');
+    writeJson(file, data);
+  });
+
+defect('a raw beside a null controller',
+  /raw: expected null, got string/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'config.read-empty.json');
+    const data = readJson(file);
+    data.raw = '{"version":1,"machines":[]}\n';
+    writeJson(file, data);
+  });
+
+defect('an outcome more optimistic than the reducer',
+  /the reducer of section 5\.6 gives "unknown"/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'run.timed-out.json');
+    const data = readJson(file);
+    data.outcome = 'failed';
+    writeJson(file, data);
+  });
+
+defect('a record whose outcome and result disagree',
+  /a finished record states the same outcome in both places/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'op.finished-rolled-back.json');
+    const data = readJson(file);
+    data.op.outcome = 'unknown';
+    writeJson(file, data);
+  });
+
+defect('a mutating reply that states no outcome',
+  /carries outcome \(section 5\.6\), and this one does not/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'update.deferred-busy.json');
+    const data = readJson(file);
+    delete data.outcome;
+    writeJson(file, data);
+    const indexFile = path.join(dir, 'fixtures', 'index.json');
+    const index = readJson(indexFile);
+    index.fixtures.find((entry) => entry.file === 'update.deferred-busy.json').outcome = null;
+    writeJson(indexFile, index);
+  });
+
+defect('an outcome on a reply that changes nothing',
+  /changes nothing, so it carries no outcome/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'busy.idle.json');
+    const data = readJson(file);
+    data.outcome = 'succeeded';
+    writeJson(file, data);
+    const indexFile = path.join(dir, 'fixtures', 'index.json');
+    const index = readJson(indexFile);
+    index.fixtures.find((entry) => entry.file === 'busy.idle.json').outcome = 'succeeded';
+    writeJson(indexFile, index);
+  });
+
+defect('an index exit code that rule 7 does not give',
+  /index says exit code 1, and rule 7 gives 0/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'index.json');
+    const data = readJson(file);
+    data.fixtures.find((entry) => entry.file === 'update.replayed.json').exitCode = 1;
+    writeJson(file, data);
+  });
+
+defect('an index entry naming a schema the command is not read with',
+  /a config reply of this shape is read with config-read\.schema\.json/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'index.json');
+    const data = readJson(file);
+    data.fixtures.find((entry) => entry.file === 'config.meta.json').command = 'config';
+    writeJson(file, data);
+  });
+
+defect('a cycle child with no record that was not a deferral',
+  /expected "deferred"/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'cycle.cycled.json');
+    const data = readJson(file);
+    data.children[0].opId = null;
+    data.op.children[0].opId = null;
+    writeJson(file, data);
+  });
+
+defect('launchChanges on a refusal that is not restricted',
+  /no value is allowed here/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'config.set.conflict-divergent.json');
+    const data = readJson(file);
+    data.launchChanges = ['machines[tower].systems[linux]'];
+    writeJson(file, data);
+  });
+
+defect('a launch path in a form no client can find',
+  /does not match/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'config.set.restricted-launch.json');
+    const data = readJson(file);
+    data.launchChanges = ['machines.tower.systems.linux'];
+    writeJson(file, data);
+  });
+
+defect('a guard fixture that the host guard no longer refuses',
+  /the index expects this to be refused/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'controller-document.invalid-host.json');
+    const data = readJson(file);
+    data.machines[0].endpoints[0].host = 'desk-tower.local';
+    writeJson(file, data);
+  });
+
+defect('busy counts that do not follow from the services',
+  /busy counts say 3\/1, the services say 2\/1/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'busy.several-services.json');
+    const data = readJson(file);
+    data.monitoredServices = 3;
+    writeJson(file, data);
+  });
+
+defect('a machine with no services that reports a service nobody described',
+  /a machine with no services answers monitored true/, (dir) => {
+    const file = path.join(dir, 'fixtures', 'busy.no-services.json');
+    const data = readJson(file);
+    Object.assign(data, { evidence: 'command', reason: 'idle' });
     writeJson(file, data);
   });

@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -10,7 +10,7 @@
   "doctor": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
@@ -182,7 +182,7 @@
   "status": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
@@ -195,7 +195,7 @@
       "partial": false
     },
     "agent": {
-      "version": "3.0.0",
+      "version": "3.0.1",
       "contract": 3,
       "base": "/home/me/.legion-control",
       "node": "24.9.0",
@@ -205,7 +205,9 @@
         "wol-action",
         "configured-telemetry",
         "service-config-admin"
-      ]
+      ],
+      "floor": "3.1.0",
+      "signed": true
     },
     "config": {
       "ok": true,
@@ -513,7 +515,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-05T14:00:00.000Z",
           "updatedAt": "2026-09-05T14:00:47.000Z",
-          "expiresAt": null
+          "expiresAt": null,
+          "outcome": "pending"
         }
       ],
       "queued": [
@@ -530,7 +533,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-05T13:57:00.000Z",
           "updatedAt": "2026-09-05T13:57:00.000Z",
-          "expiresAt": "2026-09-05T17:57:00.000Z"
+          "expiresAt": "2026-09-05T17:57:00.000Z",
+          "outcome": "pending"
         }
       ],
       "recent": [
@@ -547,7 +551,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-05T13:30:00.000Z",
           "updatedAt": "2026-09-05T13:30:02.000Z",
-          "expiresAt": null
+          "expiresAt": null,
+          "outcome": "succeeded"
         },
         {
           "id": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
@@ -562,7 +567,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-04T13:59:00.000Z",
           "updatedAt": "2026-09-04T14:00:00.000Z",
-          "expiresAt": null
+          "expiresAt": null,
+          "outcome": "succeeded"
         },
         {
           "id": "7c5b3d92-4e18-4a6f-b273-9d0e1f8a5c46",
@@ -577,7 +583,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-05T02:00:00.000Z",
           "updatedAt": "2026-09-05T02:02:00.000Z",
-          "expiresAt": null
+          "expiresAt": null,
+          "outcome": "succeeded"
         }
       ]
     },
@@ -612,7 +619,7 @@
   "history": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
@@ -631,7 +638,8 @@
         "reasonCode": null,
         "requestedAt": "2026-09-05T14:00:00.000Z",
         "updatedAt": "2026-09-05T14:00:47.000Z",
-        "expiresAt": null
+        "expiresAt": null,
+        "outcome": "pending"
       },
       {
         "id": "a1f8c3d7-2b46-4e58-90ca-7d1b4f62e830",
@@ -646,7 +654,8 @@
         "reasonCode": null,
         "requestedAt": "2026-09-05T13:30:00.000Z",
         "updatedAt": "2026-09-05T13:30:02.000Z",
-        "expiresAt": null
+        "expiresAt": null,
+        "outcome": "succeeded"
       },
       {
         "id": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
@@ -661,7 +670,8 @@
         "reasonCode": null,
         "requestedAt": "2026-09-04T13:59:00.000Z",
         "updatedAt": "2026-09-04T14:00:00.000Z",
-        "expiresAt": null
+        "expiresAt": null,
+        "outcome": "succeeded"
       }
     ],
     "limit": 200,
@@ -675,7 +685,7 @@
   "logs": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"

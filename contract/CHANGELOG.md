@@ -4,6 +4,113 @@ The wire contract between the clients and the agent. Within a major contract
 number, keys are only ever added — never renamed, never retyped, never removed.
 A client decodes with every field optional.
 
+## 3 — agent 3.1.0, clients 1.4.0
+
+Contract stays 3 and the setup document stays `"version": 1`. Every wire change
+only adds keys, and a client recognises each one by its presence, never by
+comparing versions (v3.md section 1, "Additions in agent 3.1.0").
+
+### Added
+
+- **`outcome`** on every reply to a mutating invocation, on every operation
+  record (`op.outcome`, and `result.outcome` once finished) and on every
+  summary: `succeeded`, `failed`, `deferred`, `pending` or `unknown`, the field
+  a client decides on (section 5.6). When it is absent a client reduces it with
+  the one function of section 5.6, `contract/tools/outcome.mjs`.
+- **`raw` on `config`**: the stored document as text, exactly the canonical
+  bytes `hash` covers, null exactly when `controller` is. `bytes` is its UTF-8
+  length. Clients hash and adopt `raw` and never re-serialise `controller`.
+- **The version floor.** `status.agent.floor` and `floor` on every
+  `self-update` reply; `self-update --allow-downgrade`. A signed agent declares
+  `legionControl.agentFloor`; a restricted session only moves the agent forward,
+  and an unrestricted one needs the flag to go below the floor (section 13).
+- `status.agent.signed`: whether the running tree carries its signed manifest.
+- Doctor checks `agent.floor`, `agent.signed`, `files.private` and `ssh.shell`.
+- `problems: [{path, message}]` on a `config-invalid` refusal of `config set`.
+- `config set` refusal codes `lock-held`, `restricted` and `internal`, which the
+  agent already sent and the schema did not allow.
+- The guard grammars in `common.schema.json`: `sshHostGuard`, `sshUser`,
+  `agentArgItem`, `githubRepo` and `launchPath`.
+
+### Changed
+
+- **The agent checks a document before `config set` stores it** (section 9.4):
+  size, UTF-8 and parse on the canonical bytes, then a repeated member name,
+  then the `controller` block and the flags, the acceptance table, and the
+  document's structure, refused as `config-invalid` with `problems`. Agents
+  before 3.1.0 stored whatever parsed, so clients check before they publish.
+- **Replies to a restricted session are redacted**: configured command
+  arguments, credential-named values and credentials in configured URLs become
+  `<redacted>` in free text. Identifiers, enum values, hashes, paths and the
+  setup document are never altered. A failed command is named by its
+  executable in every session, and an unparseable `config.json` by line and
+  column.
+- `controller-document.schema.json` holds hosts, users, argv items and the
+  update repository to the guard grammars, types the deprecated `machine.ssh`,
+  and allows an empty `agent`, which means the system is not driven.
+
+### Fixed (agent replies)
+
+Where the fixtures, the schemas and this contract agreed and the agent did
+not, the agent now answers as they say.
+
+- `op` with an unknown id answers `not-configured` with `op: null`, not
+  `bad-argument` with extra keys. A client treats a present `op: null` as "no
+  record" under either code.
+- `logs --op` with an unknown id answers `not-configured`, naming `--op`.
+- `cancel` with an unknown id answers `not-configured` in the refusal shape,
+  not `action: "failed"`.
+- `busy` on a machine with no services answers `monitored: true`,
+  `evidence: "none"`, both counts 0.
+- A service whose `busy.type` is `none` is monitored.
+- A replay of a running operation answers `action: "already-running"` with
+  `ok: true`, `replayed: true` and the record's `detached`, never `accepted`.
+  `cycle` and `self-update` gain `already-running`.
+- A lock `conflict` answers `ok: true`.
+- A finished record's `result.ok` is true exactly when its `reasonCode` is
+  null.
+- `cancel` of a running operation answers `already-running`.
+- `--detach` replies carry every key of their command's shape, and a fresh
+  record has a phase.
+- `cycle --dry-run` answers `skipped`.
+- A cycle child deferred by policy has `opId: null`; only a deferral may.
+- An `--op` id reused with another intent is refused with `bad-argument`
+  naming `--op`, never replayed and never reported as a lock `conflict`.
+- A `config set` refused by the operation lock exits 1, with outcome
+  `deferred`.
+
+### Client rules
+
+- Decide on `outcome`; reduce it with section 5.6 when it is absent or unknown.
+  `pending` is polled with `op ID --wait 20`, the terminal outcomes stop
+  polling, and `unknown` is never resent automatically.
+- Hash and adopt `config.raw`. Without it, rebuild two-space JSON in received
+  key order and adopt only on a matching hash, otherwise decline.
+- Never send `--allow-downgrade` to an agent whose status carries no `floor`,
+  and only after a person decided to go back.
+
+### Conformance
+
+- `contract/vectors/index.json` lists the vector families, the hash vectors
+  included, with the cases each consumer runs per group: `hash`,
+  `identifiers`, `outcome`, `transport`, `setup-acceptance`, `launch`,
+  `setup-reconcile`, `setup-merge` and `wake`. Each family has a schema, a
+  zero-dependency reference in `contract/tools`, and cases whose expectations
+  are produced by the reference and stated by hand; generation refuses a case
+  where the two disagree.
+- `node contract/tools/generate.mjs [--check]` is the one entry point for every
+  generated file. `--check` fails on a stale, missing or extra byte.
+- The fixture index carries `outcome`, the `exitCode` rule 7 gives, and
+  `config meta` as a command of its own.
+- Clients walk the fixture index and the vector index; a missing corpus is a
+  failure, never a skip.
+- The agent decides `config set` acceptance on the canonical bytes, so a byte
+  order mark or surrounding whitespace no longer makes a document unparseable.
+  The hash vector `double-bom` pins that exactly one leading byte order mark
+  is stripped.
+
+---
+
 ## 3 — agent 3.0.0, clients 1.3.0
 
 The first contract with durable operations, a real policy model and a setup that

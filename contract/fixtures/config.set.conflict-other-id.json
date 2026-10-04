@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "controller-conflict",
   "message": "this machine holds setup setup-3f9c2a71 and the document offered is setup setup-8b04d193; --replace is needed, and somebody has to decide",
+  "outcome": "failed",
   "hash": null,
   "bytes": 0,
   "id": "setup-8b04d193-6c27-4a51-83ef-90b7d2c46e15",

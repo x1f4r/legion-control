@@ -72,6 +72,21 @@
           },
           "maxItems": 8,
           "uniqueItems": true
+        },
+        "floor": {
+          "description": "From agent 3.1.0 on: the version floor, the oldest agent this machine may be replaced by (v3.md section 13). Null when the floor file cannot be read. Absent from older agents, which have no downgrade protection; a client never sends --allow-downgrade to an agent that does not report it.",
+          "anyOf": [
+            {
+              "$ref": "common.schema.json#/$defs/semver"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signed": {
+          "description": "From agent 3.1.0 on: whether the running tree carries both MANIFEST.json and MANIFEST.json.sig. Absent means unknown.",
+          "type": "boolean"
         }
       },
       "required": [

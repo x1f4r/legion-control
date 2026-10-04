@@ -1,7 +1,7 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "freebsd",
     "name": "FreeBSD"

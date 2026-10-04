@@ -22,6 +22,7 @@
   "notes": [
     "inputBase64 is base64 of the raw input bytes; canonicalBase64 is base64 of the bytes after the steps above. Both are base64 because a JSON string cannot carry a lone CR or an invalid byte.",
     "accepted is whether the agent stores the document at all. A vector with accepted false still has a hash when its bytes are valid UTF-8, because canonicalisation happens before the document is inspected; the store then refuses it and the hash is never published.",
+    "reject is the first of these that applies, in this order: too-large (more than 1048576 bytes as given), invalid-utf8, empty (the canonical bytes are a single LF), not-a-json-object (the canonical text does not parse as a JSON object with a numeric version and an array machines). It is null exactly when accepted is true.",
     "A client that implements this rule correctly reproduces canonicalBase64 and sha256 for every vector, and refuses every vector whose sha256 is null."
   ],
   "vectors": [
@@ -255,6 +256,20 @@
       "sha256": null,
       "accepted": false,
       "reject": "invalid-utf8"
+    },
+    {
+      "name": "double-bom",
+      "purpose": "Two byte order marks in front of the baseline document. The rule strips exactly one, so the canonical bytes still begin with U+FEFF and the text is not a JSON object: refused. A decoder that drops a BOM on its own before the rule strips another (Foundation's String(data:encoding:) does) lands on the plain hash and stores a document every other side refuses.",
+      "inputBase64": "77u/77u/ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJiZWFjb24iLAogICAgICAibmFtZSI6ICJCZWFjb24iLAogICAgICAiZW5kcG9pbnRzIjogW3sgImhvc3QiOiAiMTAwLjExMy42NS4yIiwgInVzZXIiOiAibWUiLCAicG9ydCI6IDIyIH1dCiAgICB9CiAgXQp9",
+      "inputBytes": 177,
+      "canonicalBase64": "77u/ewogICJ2ZXJzaW9uIjogMSwKICAibWFjaGluZXMiOiBbCiAgICB7CiAgICAgICJpZCI6ICJiZWFjb24iLAogICAgICAibmFtZSI6ICJCZWFjb24iLAogICAgICAiZW5kcG9pbnRzIjogW3sgImhvc3QiOiAiMTAwLjExMy42NS4yIiwgInVzZXIiOiAibWUiLCAicG9ydCI6IDIyIH1dCiAgICB9CiAgXQp9Cg==",
+      "canonicalBytes": 175,
+      "sha256": "e4c892277ea118ae164c77c32785ffb55a7bae259c2e9ff4185b6ba0309dc34f",
+      "accepted": false,
+      "reject": "not-a-json-object",
+      "tags": [
+        "finding:c13"
+      ]
     }
   ]
 }

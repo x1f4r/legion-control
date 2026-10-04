@@ -20,7 +20,7 @@
     "notes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "vectors": {
       "type": "array",
-      "minItems": 15,
+      "minItems": 22,
       "items": {
         "type": "object",
         "properties": {
@@ -39,6 +39,10 @@
           },
           "reject": {
             "anyOf": [{ "enum": ["invalid-utf8", "not-a-json-object", "empty", "too-large"] }, { "type": "null" }]
+          },
+          "tags": {
+            "description": "What a vector is for, as on the cases of the other families; present where there is something to say.",
+            "$ref": "vector-index.schema.json#/$defs/tags"
           }
         },
         "required": ["name", "purpose", "inputBase64", "inputBytes", "canonicalBase64", "canonicalBytes", "sha256", "accepted", "reject"],

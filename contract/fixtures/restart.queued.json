@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "t3 will be restarted on the next idle cycle, or dropped at 2026-09-05T17:57:00.000Z",
+  "outcome": "pending",
   "action": "queued",
   "service": "t3",
   "replaced": null,
@@ -39,7 +40,8 @@
         "line": "queued until idle, expires in 4h"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.0.1",
+    "systemId": "linux",
+    "outcome": "pending"
   }
 }

@@ -43,6 +43,10 @@
     "replayed": {
       "type": "boolean"
     },
+    "detached": {
+      "description": "On a replay of a running record (already-running): the record's own detached, copied.",
+      "type": "boolean"
+    },
     "replaced": {
       "$ref": "common.schema.json#/$defs/opIdOrNull"
     },

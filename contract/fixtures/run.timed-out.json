@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "timed-out",
   "message": "flush-cache did not finish within 120 s and was killed; whether it changed anything before that is not known",
+  "outcome": "unknown",
   "action": "failed",
   "id": "flush-cache",
   "exitCode": null,
@@ -40,7 +41,8 @@
       "reasonCode": "timed-out",
       "message": "flush-cache did not finish within 120 s and was killed",
       "exitCode": null,
-      "output": "clearing 41 GB\n"
+      "output": "clearing 41 GB\n",
+      "outcome": "unknown"
     },
     "log": [
       {
@@ -48,7 +50,8 @@
         "line": "run flush-cache, timeout 120 s"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.0.1",
+    "systemId": "linux",
+    "outcome": "unknown"
   }
 }

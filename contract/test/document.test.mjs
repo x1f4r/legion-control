@@ -220,3 +220,60 @@ test('there is no localAgent.shell', () => {
 test('an empty bindings file is valid: a device with none behaves as it did before', () => {
   assert.deepEqual(schemaErrors(BINDINGS_SCHEMA, {}), []);
 });
+
+// --- the guard grammars ----------------------------------------------------
+
+const guard = (name) => ({ $ref: `common.schema.json#/$defs/${name}` });
+
+test('a host is a name or an address, and nothing ssh or known_hosts reads as syntax', () => {
+  for (const host of ['desk-tower', 'desk-tower.local', 'office-macbook-pro.example.ts.net', 'my_alias', '192.0.2.10', '100.64.0.10', '2001:db8::10', '::1', '::ffff:192.0.2.1', 'desk-tower.local.']) {
+    assert.deepEqual(schemaErrors(guard('sshHostGuard'), host), [], host);
+  }
+  for (const host of ['', '-oProxyCommand=x', 'victim.example,*', '*.example', 'host name', 'host;id', '[::1]', 'ssh://h', 'me@h', 'desk-tower\n']) {
+    assert.ok(schemaErrors(guard('sshHostGuard'), host).length > 0, JSON.stringify(host));
+  }
+});
+
+test('a user is an account name, local or domain, and never syntax', () => {
+  for (const user of ['me', 'john.smith', '_svc', 'me@outlook.com', 'AzureAD\\me', 'John Smith', 'a']) {
+    assert.deepEqual(schemaErrors(guard('sshUser'), user), [], user);
+  }
+  for (const user of ['', '-o', 'me;id', 'me$(x)', "me'x", 'John  Smith', 'John -x', ' me', 'me ', 'me\\', 'me@', 'a'.repeat(65), 'mé', 'me\n']) {
+    assert.ok(schemaErrors(guard('sshUser'), user).length > 0, JSON.stringify(user));
+  }
+});
+
+test('an argv item is not empty and holds no control character', () => {
+  for (const item of ['node', '/home/me/.legion-control/bin/launcher.mjs', 'C:\\Program Files\\nodejs\\node.exe', 'naïve']) {
+    assert.deepEqual(schemaErrors(guard('agentArgItem'), item), [], item);
+  }
+  for (const item of ['', 'a\u0007b', 'a\nb', 'tab\there', 'del\u007f']) {
+    assert.ok(schemaErrors(guard('agentArgItem'), item).length > 0, JSON.stringify(item));
+  }
+  const tooManyBytes = { version: 1, machines: [{ id: 'tower', systems: [{ id: 'linux', agent: ['node', 'é'.repeat(2049)] }] }] };
+  assert.match(checkControllerDocument(tooManyBytes).errors.join(' '), /4098 UTF-8 bytes/);
+});
+
+test('a repository is owner/name, and . and .. are not names', () => {
+  for (const repo of ['x1f4r/legion-control', 'owner/name.js', 'a/b', 'Owner-1/.hidden']) {
+    assert.deepEqual(schemaErrors(guard('githubRepo'), repo), [], repo);
+  }
+  for (const repo of ['owner/..', 'owner/.', 'owner', '/name', 'owner/name/extra', '-owner/name', 'owner-/name', 'owner/na me']) {
+    assert.ok(schemaErrors(guard('githubRepo'), repo).length > 0, repo);
+  }
+});
+
+test('a launch path names one of the four places a launch value lives', () => {
+  for (const at of ['machines[tower].systems[linux]', 'machines[tower].ssh.identityFile', 'appUpdates.githubRepo', 'local', 'machines[a/b].systems[c:d]']) {
+    assert.deepEqual(schemaErrors(guard('launchPath'), at), [], at);
+  }
+  for (const at of ['machines.tower.systems.linux', 'machines[tower]', 'machines[].systems[linux]', 'local.agent', 'machines[tower].systems[linux].agent']) {
+    assert.ok(schemaErrors(guard('launchPath'), at).length > 0, at);
+  }
+});
+
+test('an empty agent is a system that is not driven, not a broken document', () => {
+  assert.deepEqual(schemaErrors(DOC_SCHEMA, document({ machines: [{ id: 'tower', systems: [{ id: 'linux', agent: [] }] }] })), []);
+  assert.ok(schemaErrors(DOC_SCHEMA, document({ machines: [{ id: 'tower', systems: [{ id: 'linux', agent: ['node', ''] }] }] })).length > 0);
+  assert.ok(schemaErrors(DOC_SCHEMA, document({ machines: [{ id: 'tower', ssh: { host: '-oProxyCommand=x' } }] })).length > 0);
+});

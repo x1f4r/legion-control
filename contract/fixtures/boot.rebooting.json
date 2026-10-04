@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "BootNext set to 0002 (Windows 11) and read back; reboot scheduled in 3 seconds",
+  "outcome": "pending",
   "action": "rebooting",
   "target": "windows",
   "armed": true,
@@ -43,7 +44,8 @@
         "line": "reboot scheduled"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.0.1",
+    "systemId": "linux",
+    "outcome": "pending"
   }
 }

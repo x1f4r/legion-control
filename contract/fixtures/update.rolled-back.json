@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.0.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "rolled-back",
   "message": "demo 1.5.0 would not answer its health check, so 1.4.2 was put back and is running",
+  "outcome": "failed",
   "action": "rolled-back",
   "service": "demo",
   "from": "1.4.2",
@@ -42,7 +43,8 @@
       "from": "1.4.2",
       "to": "1.4.2",
       "exitCode": 1,
-      "output": null
+      "output": null,
+      "outcome": "failed"
     },
     "log": [
       {
@@ -58,9 +60,10 @@
         "line": "rolled back to 1.4.2, health 200"
       }
     ],
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.0.1",
     "systemId": "linux",
     "from": "1.4.2",
-    "to": "1.4.2"
+    "to": "1.4.2",
+    "outcome": "failed"
   }
 }
