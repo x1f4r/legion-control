@@ -89,13 +89,25 @@ ZIPALIGN="$SDK_DIR/build-tools/$BUILD_TOOLS_DIR/zipalign"
 # Signing key
 # ---------------------------------------------------------------------------
 
+# The agent the APK carries is the one agent/package.json describes, the file the agent itself
+# reads its version from, so a new agent needs no edit here.
+AGENT_PACKAGE="$HERE/../agent/package.json"
+AGENT_VERSION="$(sed -n 's|^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$AGENT_PACKAGE" 2>/dev/null | head -1)"
+printf '%s' "$AGENT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+	|| die "could not read an x.y.z agent version from $AGENT_PACKAGE."
+
 # Signing a distributable build requires the complete signed agent bundle.
-for artifact in legionctl-agent-3.0.1.tgz Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig; do
+for artifact in "legionctl-agent-$AGENT_VERSION.tgz" Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig; do
     if [ ! -s "$HERE/../dist/$artifact" ]; then
         printf 'ERROR: missing signed agent artifact: %s. Run scripts/package-agent.mjs first.\n' "$artifact" >&2
         exit 1
     fi
 done
+# The app finds the tarball by the name its signed manifest gives, so a manifest left over from
+# another agent would point it at a file the APK does not carry.
+MANIFEST_AGENT="$(sed -n 's|.*"agentVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$HERE/../dist/Legion-Control-agent-manifest.json" | head -1)"
+[ "$MANIFEST_AGENT" = "$AGENT_VERSION" ] \
+	|| die "dist/Legion-Control-agent-manifest.json is for agent ${MANIFEST_AGENT:-unknown}, not $AGENT_VERSION. Run scripts/package-agent.mjs again."
 
 # The directory is shared with the agent tree the Mac installer deploys, so its mode is left alone
 # and the two files are locked down individually instead.
@@ -138,7 +150,9 @@ if [ "$DO_CLEAN" -eq 1 ]; then
 fi
 
 say "Building the release APK with the wrapper (Gradle $( sed -n 's/.*gradle-\([0-9.]*\)-bin\.zip/\1/p' "$HERE/gradle/wrapper/gradle-wrapper.properties" 2>/dev/null | head -1 ), JDK 21)"
-( cd "$HERE" && ./gradlew --no-daemon assembleRelease )
+# legion.agentVersion tells app/build.gradle.kts which bundle to copy out of dist/, so it does not
+# fall back on a version of its own.
+( cd "$HERE" && ./gradlew --no-daemon assembleRelease "-Plegion.agentVersion=$AGENT_VERSION" )
 
 # What AGP leaves behind depends on whether app/build.gradle.kts declares a signingConfig for the
 # release build type. Without one it writes app-release-unsigned.apk and this script signs it. With
