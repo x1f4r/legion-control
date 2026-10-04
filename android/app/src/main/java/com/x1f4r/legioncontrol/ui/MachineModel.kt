@@ -1411,7 +1411,7 @@ interface FleetContext {
     val deviceName: String
 
     /** The signed agent bundle this build carries, or null with a reason. */
-    val agentBundle: java.io.File?
+    val agentBundle: com.x1f4r.legioncontrol.agent.SignedTarball?
     val agentBundleProblem: String?
 
     fun client(machineId: String): MachineClient?

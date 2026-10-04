@@ -236,7 +236,11 @@ class AgentBootstrapTest {
     private val operation = "0a1b2c3d"
     private val layout = AgentBootstrap.Layout("/home/me/.legion-control", listOf("/usr/bin/node"))
 
-    private fun tarball(): File = folder.newFile("legionctl-agent-3.1.0.tgz").apply { writeBytes(ByteArray(1234) { it.toByte() }) }
+    /** A tarball as a verified bundle hands it over: the file, and the hash and size its signature gave. */
+    private fun tarball(size: Long = 1234): SignedTarball {
+        val file = folder.newFile("legionctl-agent-3.1.0.tgz").apply { writeBytes(ByteArray(1234) { it.toByte() }) }
+        return SignedTarball(file, sha256Hex(file.readBytes()), size)
+    }
 
     private fun client(transport: CommandTransport): AgentClient {
         val machine = Machine(
@@ -264,7 +268,7 @@ class AgentBootstrapTest {
         assertEquals(listOf("run", "upload", "run"), transport.events)
 
         val remote = "/home/me/.legion-control/incoming/legion-bootstrap-$operation.tgz"
-        assertEquals(listOf(archive.path to remote), transport.uploads)
+        assertEquals(listOf(archive.file.path to remote), transport.uploads)
         assertEquals(
             buildRemoteCommand(RemoteShell.POSIX, listOf("/usr/bin/node", "-e", AgentBootstrap.onCommandLine(AgentBootstrap.PREPARE), "--", "/home/me/.legion-control")),
             transport.lines[0],
@@ -274,11 +278,39 @@ class AgentBootstrapTest {
                 RemoteShell.POSIX,
                 listOf(
                     "/usr/bin/node", "-e", AgentBootstrap.onCommandLine(AgentBootstrap.INSTALL), "--",
-                    "/home/me/.legion-control", remote, sha256Hex(archive.readBytes()), "1234", operation,
+                    "/home/me/.legion-control", remote, archive.sha256, "1234", operation,
                 ),
             ),
             transport.lines[1],
         )
+    }
+
+    @Test
+    fun `the install checks the upload against the signed hash, not one read back from the file`() = runBlocking {
+        // Every screen loads the bundle and writes it to the same cache path. Hashed again at install
+        // time, a file being rewritten underneath was sent with its own hash, and the far side's
+        // check passed whatever arrived.
+        val signedHash = "ab".repeat(32)
+        val archive = tarball().copy(sha256 = signedHash)
+        val transport = Recorder({ line -> if (isPrepare(line)) prepared else installed })
+        client(transport).bootstrapLegacy(linux, layout, archive, operation)
+
+        val install = transport.lines.last()
+        assertTrue(install.contains(" $signedHash 1234 $operation"))
+        assertFalse(install.contains(sha256Hex(archive.file.readBytes())))
+    }
+
+    @Test
+    fun `a bundle file that is not the signed size is refused before anything is sent`() = runBlocking {
+        val transport = Recorder({ prepared })
+        try {
+            client(transport).bootstrapLegacy(linux, layout, tarball(size = 2048), operation)
+            fail("a file that is not the signed size has to stop the bootstrap")
+        } catch (stopped: AgentFailure.BootstrapStopped) {
+            assertEquals(DispatchStage.NOT_STARTED, stopped.dispatch)
+            assertTrue(stopped.detail!!.contains("2048"))
+        }
+        assertTrue(transport.events.isEmpty())
     }
 
     @Test

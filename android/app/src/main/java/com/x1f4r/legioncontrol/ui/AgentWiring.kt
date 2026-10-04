@@ -21,6 +21,7 @@ import com.x1f4r.legioncontrol.agent.MachineControl
 import com.x1f4r.legioncontrol.agent.OpRecord
 import com.x1f4r.legioncontrol.agent.PolicyPatch
 import com.x1f4r.legioncontrol.agent.SetupProvenance
+import com.x1f4r.legioncontrol.agent.SignedTarball
 import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.agent.readControllerReply
 import com.x1f4r.legioncontrol.agent.resolveSystem
@@ -39,7 +40,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import java.io.File
 
 /**
  * The one seam between the screen and the transport.
@@ -370,14 +370,14 @@ private class WiredMachineClient(
      * received. Anything else is refused before a byte is sent.
      */
     override suspend fun installAgent(
-        tarball: File,
+        tarball: SignedTarball,
         operationId: String?,
     ): Result<AgentActionResult> {
         val status = wiring.agent.lastStatus
         val system = status?.let { machine.resolveSystem(it.systemId, it.systemName, it.osName) }
         return when (val path = AgentDeploymentPath.decide(wiring.agent.abilities, status, system)) {
             AgentDeploymentPath.Stdin ->
-                attempt { wiring.agent.selfUpdateFromStdin(tarball, operationId) }
+                attempt { wiring.agent.selfUpdateFromStdin(tarball.file, operationId) }
 
             is AgentDeploymentPath.UploadAndInstall ->
                 attempt { wiring.agent.bootstrapLegacy(path.system, path.layout, tarball, operationId) }

@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentBundle
+import com.x1f4r.legioncontrol.agent.SignedTarball
 import com.x1f4r.legioncontrol.agent.AgentAction
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.Contract
@@ -42,7 +43,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -112,7 +112,7 @@ class AppModel(
     private var addresses: List<String> = emptyList()
 
     /** The signed agent bundle this build carries, once it has been checked. */
-    var agentBundle: File? by mutableStateOf(null)
+    var agentBundle: SignedTarball? by mutableStateOf(null)
         private set
     var agentBundleVersion: String? by mutableStateOf(null)
         private set
@@ -196,7 +196,7 @@ class AppModel(
         override val siteMatch: SiteMatch get() = this@AppModel.siteMatch
         override val localAddresses: List<String> get() = addresses
         override val deviceName: String get() = services.deviceName()
-        override val agentBundle: File? get() = this@AppModel.agentBundle
+        override val agentBundle: SignedTarball? get() = this@AppModel.agentBundle
         override val agentBundleProblem: String? get() = this@AppModel.agentBundleProblem
 
         override fun client(machineId: String): MachineClient? =

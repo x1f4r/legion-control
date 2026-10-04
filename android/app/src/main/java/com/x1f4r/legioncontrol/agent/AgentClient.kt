@@ -1,7 +1,6 @@
 package com.x1f4r.legioncontrol.agent
 
 import com.x1f4r.legioncontrol.data.MachineHints
-import com.x1f4r.legioncontrol.data.sha256Hex
 import com.x1f4r.legioncontrol.net.CommandOutcome
 import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
@@ -12,7 +11,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.JsonObject
 import java.io.File
-import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
 /** An answer, plus how it was obtained, because the UI is expected to show the route it used. */
@@ -561,9 +559,11 @@ class AgentClient(
      * Three steps on one address, all with [system]'s own interpreter: [AgentBootstrap.PREPARE]
      * checks [layout]'s base holds an installed agent, the archive goes over SFTP into its
      * `incoming/`, and [AgentBootstrap.INSTALL] checks the upload's size and SHA-256 against the ones
-     * sent from here before tar reads a byte of it. Only the last step changes anything, so a failure
-     * before it is [AgentFailure.BootstrapStopped], which is a definite "nothing was installed"; a
-     * failure of the last step is read like any other mutation.
+     * sent from here before tar reads a byte of it. Those are the signed ones [tarball] carries,
+     * never read back from its file, so what the far side checks is what the signature vouches for.
+     * Only the last step changes anything, so a failure before it is [AgentFailure.BootstrapStopped],
+     * which is a definite "nothing was installed"; a failure of the last step is read like any other
+     * mutation.
      *
      * The caller has already been through [AgentDeploymentPath.decide]: this only ever runs for an
      * authenticated 2.x status on a POSIX system with a recognised base and an unrestricted key.
@@ -571,7 +571,7 @@ class AgentClient(
     suspend fun bootstrapLegacy(
         system: MachineSystem,
         layout: AgentBootstrap.Layout,
-        tarball: File,
+        tarball: SignedTarball,
         operationId: String?,
     ): AgentReply<AgentActionResult> {
         val operation = operationId?.takeIf { Contract.isOpId(it) }
@@ -580,13 +580,13 @@ class AgentClient(
         // and the install has to run where the upload is. The route that answered last leads.
         val endpoint = routes.candidates().firstOrNull { Addresses.isDialable(it.host, it.user, it.port) }
             ?: throw AgentFailure.Unreachable(machine.name, routes.probeSummary(), reason = FailureKind.NO_ROUTE)
-        val (sha256, size) = try {
-            withContext(Dispatchers.IO) { sha256Hex(tarball.readBytes()) to tarball.length() }
-        } catch (failure: IOException) {
+        // A file that is not the signed size is not the signed file, and is refused before anything
+        // is sent. One that changes after this is refused by the install, against the signed hash.
+        val onDisk = withContext(Dispatchers.IO) { tarball.file.length() }
+        if (onDisk != tarball.size) {
             throw AgentFailure.BootstrapStopped(
                 "The agent upgrade on ${machine.name} stopped before anything was installed.",
-                "The signed bundle could not be read on this phone: ${failure.message}",
-                failure,
+                "The signed bundle on this phone is $onDisk bytes and its signed manifest says ${tarball.size}.",
             )
         }
         val archive = AgentBootstrap.archivePath(layout, operation)
@@ -604,7 +604,7 @@ class AgentClient(
             if (prepared.value.ok != true) {
                 throw AgentFailure.Reported(prepared.value.message ?: "The preflight did not answer ok.")
             }
-            transport.upload(endpoint, tarball, archive, SELF_UPDATE_TIMEOUT_MILLIS)
+            transport.upload(endpoint, tarball.file, archive, SELF_UPDATE_TIMEOUT_MILLIS)
         } catch (failure: AgentFailure) {
             throw AgentFailure.BootstrapStopped(
                 "The agent upgrade on ${machine.name} stopped before anything was installed.",
@@ -618,7 +618,7 @@ class AgentClient(
             SELF_UPDATE_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
             CommandSafety.MUTATION,
-            overrideArgv = AgentBootstrap.installArgv(layout, archive, sha256, size, operation),
+            overrideArgv = AgentBootstrap.installArgv(layout, archive, tarball.sha256, tarball.size, operation),
             only = endpoint,
             onlySystem = system,
         )

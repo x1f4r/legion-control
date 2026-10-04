@@ -25,11 +25,11 @@ import java.io.File
  */
 class AgentBundle private constructor(
     /** The tarball, copied out of assets into cache so it has a path and a stream. */
-    val tarball: File,
+    val tarball: SignedTarball,
     val manifest: VerifiedManifest,
     val version: String,
 ) {
-    val fileName: String get() = tarball.name
+    val fileName: String get() = tarball.file.name
 
     /** What to call it on screen. */
     fun describe(): String = "control agent $version, signed"
@@ -37,6 +37,8 @@ class AgentBundle private constructor(
     companion object {
         /** Where the release build puts the three files. */
         private const val ASSET_DIR = "agent"
+
+        private const val STAGING_SUFFIX = ".new"
 
         /**
          * Reads and verifies the bundle, or explains why there is not one.
@@ -105,19 +107,53 @@ class AgentBundle private constructor(
             }
 
             // Written out only after every check has passed. A file on disk is a file something can
-            // send, and one that failed verification should never exist as a path at all.
+            // send, and one that failed verification should never exist as a path at all. Written
+            // beside the name and renamed onto it, because every screen loads the bundle, and one
+            // loading it while another uploads it must never leave a half-written file to read.
             val directory = File(context.cacheDir, "agent-bundle").apply { mkdirs() }
-            directory.listFiles()?.forEach { it.delete() }
             val file = File(directory, tarballName)
-            file.writeBytes(bytes)
+            val staging = File.createTempFile(tarballName, STAGING_SUFFIX, directory)
+            staging.writeBytes(bytes)
+            if (!staging.renameTo(file)) {
+                staging.delete()
+                return@withContext Result.failure(
+                    AgentBundleMissing("The bundled $tarballName could not be written out to be sent."),
+                )
+            }
+            // Another version's file goes. One that another load is still writing does not.
+            directory.listFiles()
+                ?.filter { it.name != tarballName && !it.name.endsWith(STAGING_SUFFIX) }
+                ?.forEach { it.delete() }
 
-            Result.success(AgentBundle(file, verified, agentVersion))
+            // What the signature vouches for, which is what the install is checked against: the
+            // signed size, or when the manifest gives none, that of the bytes the signed hash matched.
+            val signed = SignedTarball(
+                file = file,
+                sha256 = artifact.sha256.lowercase(),
+                size = artifact.size.takeIf { it > 0 } ?: bytes.size.toLong(),
+            )
+            Result.success(AgentBundle(signed, verified, agentVersion))
         }
     }
 }
 
 /** There is no usable bundle, and this is the sentence to show instead of an install action. */
 class AgentBundleMissing(override val message: String) : Exception(message)
+
+/**
+ * The agent tarball on this phone, with the size and SHA-256 its signed manifest vouches for.
+ *
+ * [sha256] and [size] are what was verified, not whatever [file] holds when it is next read. The
+ * bootstrap's install step checks the upload against them on the far side, and that check is worth
+ * something only while it is tied to the signature: hashed again from the file at install time, a
+ * file being rewritten underneath would be sent with its own hash and pass.
+ */
+data class SignedTarball(
+    val file: File,
+    /** Lowercase hex, as the install script compares it. */
+    val sha256: String,
+    val size: Long,
+)
 
 /**
  * How to get a signed agent onto one machine, or why it cannot be done from here.

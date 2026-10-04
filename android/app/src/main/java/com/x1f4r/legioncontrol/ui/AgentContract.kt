@@ -18,6 +18,7 @@ import com.x1f4r.legioncontrol.agent.MachineSystem
 import com.x1f4r.legioncontrol.agent.OpRecord
 import com.x1f4r.legioncontrol.agent.PolicyPatch
 import com.x1f4r.legioncontrol.agent.SetupProvenance
+import com.x1f4r.legioncontrol.agent.SignedTarball
 import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
@@ -30,7 +31,6 @@ import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.net.RouteKind
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
-import java.io.File
 
 /**
  * The shape the screen expects from the transport.
@@ -246,7 +246,7 @@ interface MachineClient {
     suspend fun hasWakeProxy(): Boolean
 
     /** Puts a signed agent bundle on the machine and installs it. */
-    suspend fun installAgent(tarball: File, operationId: String?): Result<AgentActionResult>
+    suspend fun installAgent(tarball: SignedTarball, operationId: String?): Result<AgentActionResult>
 
     /** Adds an offered host key to the ones trusted for an address. The keys already there stay. */
     fun configureHostSystems(address: String, systems: List<com.x1f4r.legioncontrol.data.HostIdentitySystem>, revision: Long)
