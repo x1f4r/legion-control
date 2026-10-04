@@ -366,15 +366,10 @@ struct MaintenanceWindow: Codable, Sendable, Equatable, Identifiable {
         return from > to
     }
 
-    /// Whether the two ends look like `HH:MM` at all. The agent validates properly; this only keeps
-    /// the app from sending something obviously wrong.
+    /// Whether the two ends are `HH:MM` in the contract's grammar. The agent validates as well; this
+    /// keeps the app from sending something the agent would refuse.
     var looksValid: Bool {
-        func valid(_ value: String?) -> Bool {
-            guard let value, value.count == 5, value[value.index(value.startIndex, offsetBy: 2)] == ":" else { return false }
-            let parts = value.split(separator: ":")
-            guard parts.count == 2, let hour = Int(parts[0]), let minute = Int(parts[1]) else { return false }
-            return (0...23).contains(hour) && (0...59).contains(minute)
-        }
+        func valid(_ value: String?) -> Bool { value.map(AgentToken.isValidClockTime) ?? false }
         guard valid(from), valid(to), from != to else { return false }
         return effectiveDays.allSatisfy { Self.allDays.contains($0) }
     }

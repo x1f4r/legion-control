@@ -746,9 +746,7 @@ struct ControllerIdentity: Codable, Sendable, Equatable {
         guard let lineage else { return true }
         guard lineage.count <= Self.lineageLimit else { return false }
         guard Set(lineage).count == lineage.count else { return false }
-        return lineage.allSatisfy { hash in
-            hash.count == 64 && hash.allSatisfy { $0.isHexDigit && !$0.isUppercase }
-        }
+        return lineage.allSatisfy(AgentToken.isValidHash)
     }
 
     /// The identity for a document derived from this one.

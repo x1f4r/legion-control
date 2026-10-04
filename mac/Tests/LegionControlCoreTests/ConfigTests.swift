@@ -131,6 +131,21 @@ struct ConfigTests {
         """
         let decoded = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8))
         #expect(throws: ConfigProblem.self) { _ = try decoded.validated() }
+
+        // Swift's own idea of a hex digit takes the fullwidth letters too; the contract's does not.
+        let fullwidth = String(repeating: "a", count: 63) + "\u{FF41}"
+        let wide = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.replacingOccurrences(of: "short", with: fullwidth).utf8))
+        #expect(throws: ConfigProblem.self) { _ = try wide.validated() }
+        let plain = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.replacingOccurrences(of: "short", with: String(repeating: "a", count: 64)).utf8))
+        #expect(throws: Never.self) { _ = try plain.validated() }
+    }
+
+    @Test("a maintenance window end is HH:MM in ASCII digits, nothing that only parses like one")
+    func clockTimes() {
+        #expect(MaintenanceWindow(from: "02:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "+1:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "\u{0660}\u{0662}:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "24:00", to: "04:00").looksValid)
     }
 
     @Test("a wake path that cannot work is a warning, not a refusal")
