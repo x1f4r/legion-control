@@ -341,6 +341,63 @@ public class HostKeyApprovalTests
         Assert.DoesNotContain("AAAA-second", File.ReadAllText(keys.KnownHostsPath));
     }
 
+    [Fact]
+    public async Task TheHostIsHandedToKeyscanAfterTheEndOfItsOptions()
+    {
+        using var home = new TempHome();
+        var (keys, runner) = Harness(home, () => First);
+        await keys.OfferAsync("10.0.0.7", 2222);
+        var scan = Assert.Single(runner.Calls, call => call.Executable.Contains("keyscan", StringComparison.Ordinal));
+        Assert.Equal(new[] { "-T", "5", "-p", "2222", "--", "10.0.0.7" }, scan.Arguments);
+    }
+
+    [Theory]
+    [InlineData("victim.example,*")]
+    [InlineData("-oProxyCommand=x")]
+    [InlineData("*.example")]
+    [InlineData("host name")]
+    public async Task AHostOutsideTheDialGrammarIsNeverScannedOrPinned(string host)
+    {
+        // On OpenSSH before 9.6 a pin for `victim.example,*` is a pin for every host there is.
+        using var home = new TempHome();
+        var (keys, runner) = Harness(home, () => First);
+        var failed = Assert.IsType<TrustOutcome.Failed>(await keys.OfferAsync(host, 22));
+        Assert.Contains("Manual SSH enrollment needed", failed.Sentence);
+        Assert.Empty(runner.Calls);
+
+        var forged = new HostKeyOffer(host, 22, new[] { "256 SHA256:test" }, new[] { $"{host} ssh-ed25519 AAAA-first" }, 0,
+            Systems, Array.Empty<HostPublicKey>(), Array.Empty<string>());
+        Assert.IsType<TrustOutcome.Failed>(await keys.PinAsync(forged, "windows", Systems));
+        Assert.False(File.Exists(keys.KnownHostsPath));
+    }
+
+    [Theory]
+    [InlineData("hostname x,*\nport 22\n")]
+    [InlineData("hostname tower.example\nport 22\nhostkeyalias *\n")]
+    [InlineData("hostname tower.example\nport 0\n")]
+    public async Task WhatSshReportsForTheRouteHasToPassTheDialGrammarBeforeAnythingIsPinned(string effective)
+    {
+        using var home = new TempHome();
+        var runner = new FakeRunner(call => call.Has("-G")
+            ? FakeRunner.Ok(effective + $"userknownhostsfile {Path.Combine(home.Path, "pins")}\nproxycommand none\n")
+            : FakeRunner.Ok(""));
+        var route = new MachineRoute("lan", "LAN", new SshTarget { Host = "tower" }, null, "lan");
+        var resolved = await HostKeys.ForRouteAsync(runner, route, null);
+        Assert.Null(resolved.Keys);
+        Assert.Contains("Manual SSH enrollment needed", resolved.Problem);
+        Assert.Single(runner.Calls);
+    }
+
+    [Fact]
+    public async Task AConfiguredHostOutsideTheDialGrammarIsNotEvenAskedAbout()
+    {
+        var runner = new FakeRunner(_ => FakeRunner.Ok(""));
+        var route = new MachineRoute("lan", "LAN", new SshTarget { Host = "-oProxyCommand=x" }, null, "lan");
+        var resolved = await HostKeys.ForRouteAsync(runner, route, null);
+        Assert.Null(resolved.Keys);
+        Assert.NotNull(resolved.Problem);
+        Assert.Empty(runner.Calls);
+    }
 }
 
 /// What the transport concludes from what a command printed.
