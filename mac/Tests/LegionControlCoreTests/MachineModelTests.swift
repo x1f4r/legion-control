@@ -192,6 +192,38 @@ struct MachineModelTests {
         #expect(model.sidebarSummary.contains("agent too old"))
         // The one service it looks after is still drawn.
         #expect(model.services.count == 1)
+        // And a POSIX login can be sent the upgrade.
+        #expect(model.legacyInstallRefusal == nil)
+    }
+
+    @Test("a 2.x agent behind a cmd login is not offered the upgrade, and is told why first")
+    func legacyCmdUpgradeIsRefusedUpFront() async throws {
+        let windows = Machine(
+            id: "tower", name: "Tower",
+            endpoints: [Endpoint(id: "lan", kind: "lan", host: "10.0.0.5", user: "me")],
+            systems: [SystemConfig(id: "windows", name: "Windows", platform: .windows,
+                                   agent: ["C:\\node.exe", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"])]
+        )
+        let runner = FakeRunner()
+        // cmd quotes every word, the verb included.
+        runner.answer("\"status\"", json: #"{ "ok": true, "agentVersion": "2.1.0", "os": "windows" }"#)
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var agent = RemoteAgent(machine: windows)
+        agent.logDirectory = directory.appending(path: "ssh-logs")
+        agent.runner = { _, arguments, _, _ in runner.run(arguments) }
+        let model = MachineModel(machine: windows, agent: agent)
+
+        await model.refresh(userInitiated: false)
+        #expect(model.needsAgentUpgrade)
+        let refusal = try #require(model.legacyInstallRefusal)
+        #expect(refusal.contains("cmd"))
+        // Nothing is staged or sent, and no installation base is asked for.
+        let sent = runner.sentCommands.count
+        let resolution = await model.installOverLegacyAgent(Data("archive".utf8), operation: AgentToken.newOperationId(), version: "3.1.0")
+        #expect(resolution.state == .failed)
+        #expect(resolution.summary == refusal)
+        #expect(runner.sentCommands.count == sent)
     }
 
     @Test("a successful background refresh clears its stale transport failure")

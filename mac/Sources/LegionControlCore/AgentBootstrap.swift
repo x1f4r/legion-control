@@ -155,8 +155,30 @@ enum AgentBootstrap {
         return "\"" + path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
+    /// Why a machine's 2.x agent cannot be upgraded from here, or nil when it can.
+    ///
+    /// Both scripts go over ssh in the system's own grammar, and both contain `!`, which section
+    /// 15.2 of the contract refuses for cmd because cmd can expand it even inside quotes. Before 1.4
+    /// this Mac wrote every Windows line for PowerShell and the bootstrap reached them; with cmd the
+    /// Windows default it cannot, and that is said before the install is offered rather than after
+    /// the archive has been staged. Carrying the scripts some other way would change bytes every
+    /// client sends identically, which is the contract's decision to make, not this app's.
+    static func remoteRefusal(system: SystemConfig, restrictedSession: Bool) -> String? {
+        if system.isRestricted || restrictedSession {
+            return "A restricted legacy key cannot upload a bootstrap. Use an administrator connection."
+        }
+        switch system.grammar {
+        case .success(.posix), .success(.powershell):
+            return nil
+        case .success(.cmd), .success(.dispatch):
+            return "The upgrade from a 2.x agent cannot be sent to \(system.name) in cmd: its scripts contain !, which cmd expands even inside quotes. Install the new agent on the machine itself, or set shell to powershell if this account logs in to PowerShell."
+        case .failure(let refusal):
+            return "\(system.name) is never sent anything. \(refusal.message)"
+        }
+    }
+
     static func installRemote(payload: Data, operation: String, layout: Layout, system: SystemConfig, target: SSHTarget) async throws -> AgentActionResult {
-        guard !system.isRestricted else { throw Failure(message: "A restricted legacy key cannot upload a bootstrap. Use an administrator connection.") }
+        if let refusal = remoteRefusal(system: system, restrictedSession: false) { throw Failure(message: refusal) }
         let archive = try await stagedArchive(payload, operation: operation)
         defer { try? FileManager.default.removeItem(at: archive) }
         let remoteArchive = layout.path("incoming/legion-bootstrap-\(operation).tgz").replacingOccurrences(of: "\\", with: "/")

@@ -25,6 +25,35 @@ struct AgentBootstrapTests {
         #expect(!AgentBootstrap.isAuthenticatedLegacy(try status("{}")))
     }
 
+    @Test("the upgrade over ssh is offered only where its scripts can be written, and says why not")
+    func bootstrapGrammarGate() throws {
+        // Both scripts contain !, which cmd can expand even inside quotes, so a cmd login, now the
+        // Windows default, cannot be sent them. Saying so up front beats a refusal after the user
+        // has confirmed and the archive has been staged.
+        func system(_ platform: Platform, shell: String?, restricted: Bool? = nil) -> SystemConfig {
+            SystemConfig(id: "s", name: "Tower", platform: platform,
+                         agent: platform == .windows ? ["C:\\node.exe", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"]
+                                                     : ["/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs"],
+                         shell: shell, restricted: restricted)
+        }
+        for allowed in [system(.linux, shell: nil), system(.mac, shell: "posix"), system(.windows, shell: "powershell")] {
+            #expect(AgentBootstrap.remoteRefusal(system: allowed, restrictedSession: false) == nil, "\(allowed.grammar)")
+            // And what the gate lets through really can be written in that grammar.
+            let layout = try AgentBootstrap.layout(argv: allowed.agent)
+            for script in [AgentBootstrap.prepareScript, AgentBootstrap.installScript] {
+                var carrier = allowed
+                carrier.agent = layout.prefix + ["-e", AgentBootstrap.oneLine(script), "--", layout.base]
+                #expect(throws: Never.self) { try RemoteCommand(system: carrier, arguments: []).commandLine() }
+            }
+        }
+        let cmd = try #require(AgentBootstrap.remoteRefusal(system: system(.windows, shell: nil), restrictedSession: false))
+        #expect(cmd.contains("cmd"))
+        #expect(AgentBootstrap.remoteRefusal(system: system(.windows, shell: "cmd"), restrictedSession: false) == cmd)
+        #expect(AgentBootstrap.remoteRefusal(system: system(.windows, shell: "pwsh"), restrictedSession: false) != nil)
+        #expect(AgentBootstrap.remoteRefusal(system: system(.linux, shell: nil, restricted: true), restrictedSession: false) != nil)
+        #expect(AgentBootstrap.remoteRefusal(system: system(.linux, shell: nil), restrictedSession: true) != nil)
+    }
+
     func fixture() async throws -> (URL, URL, Data) {
         let dir = FileManager.default.temporaryDirectory.appending(path: "bootstrap-\(UUID().uuidString)")
         let source = dir.appending(path: "source/agent/src")

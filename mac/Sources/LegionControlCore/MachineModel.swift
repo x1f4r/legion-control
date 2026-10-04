@@ -861,9 +861,17 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
 
     // MARK: - Trusted agent deployment
 
+    /// Why the bundled agent cannot be installed over this machine's 2.x agent, or nil when it can,
+    /// or when the agent is new enough to take it on stdin. Shown before the install is offered.
+    var legacyInstallRefusal: String? {
+        guard let status, AgentBootstrap.isAuthenticatedLegacy(status), let system = commandableSystem else { return nil }
+        return AgentBootstrap.remoteRefusal(system: system, restrictedSession: status.isRestrictedSession)
+    }
+
     /// A 2.x agent cannot take the payload on stdin, so the bootstrap is uploaded over the route
     /// the last call went over and run there.
     func installOverLegacyAgent(_ payload: Data, operation: String, version: String) async -> ActionResolution {
+        if let refusal = legacyInstallRefusal { return .init(state: .failed, summary: refusal) }
         guard let system = commandableSystem, let route = lastRoute,
               let layout = AgentBootstrap.chooseLayout(argv: system.agent) else {
             return .init(state: .cancelled, summary: "The legacy agent upgrade was cancelled; no installation was attempted.")
