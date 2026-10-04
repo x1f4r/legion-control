@@ -545,15 +545,31 @@ public sealed record SystemConfig
 {
     public string Id { get; init; } = "";
     public string Name { get; init; } = "";
+    /// The platform, read leniently: a document that says `win` still finds the Windows system to
+    /// boot into. Never what decides a grammar for a system read from a document; see
+    /// [PlatformAsWritten].
     public Platform Platform { get; init; } = Platform.Linux;
+    /// The `platform` the document names, exactly as it is written, or null when it names none or
+    /// names it with anything but a string. A system built here, from a form or a template, has
+    /// none either, and its grammar is worked out from [Platform].
+    ///
+    /// The grammar reads this rather than [Platform] because to every client only the string
+    /// "windows" is Windows. Reading `win` or ` Windows ` as Windows here would quote for cmd a
+    /// line that every other client, and this device's own launch record, writes for a POSIX
+    /// shell.
+    public string? PlatformAsWritten { get; init; }
     /// The exact argv run over ssh, quoted for that system's shell on the way out. In the model the
     /// machines are driven from, this is the argv [LaunchGate] approved, and empty when there is none.
     public IReadOnlyList<string> Agent { get; init; } = Array.Empty<string>();
     public string? Symbol { get; init; }
-    /// The `shell` the document names, exactly as it is written, or null when it names none.
+    /// The `shell` the document names, exactly as it is written, or null when it names none. A
+    /// value that is not a string is kept as its JSON text, which can never spell one of the three
+    /// shell names.
     ///
     /// Kept raw rather than parsed, because a value this app does not know is not a shell to
-    /// guess at: the system's grammar is then refused (`unknown-shell`) and it is not driven. The
+    /// guess at: the system's grammar is then refused (`unknown-shell`) and it is not driven. That
+    /// goes for `shell: 5` as much as for `shell: "pwsh"`; reading the number as no shell at all
+    /// would quote for the platform's default shell a system every other client refuses. The
     /// only system that needs one at all is a Windows one whose OpenSSH DefaultShell has been
     /// pointed at PowerShell.
     public string? Shell { get; init; }
@@ -575,7 +591,7 @@ public sealed record SystemConfig
     /// grammar it approved here, and without one it is worked out from the fields above.
     public CommandGrammar Grammar
     {
-        get => _grammar ?? RemoteShells.Resolve(Platform.Wire(), Shell, Restricted, restrictedSession: false, Agent.Count);
+        get => _grammar ?? RemoteShells.Resolve(PlatformAsWritten ?? Platform.Wire(), Shell, Restricted, restrictedSession: false, Agent.Count);
         init => _grammar = value;
     }
 
@@ -585,17 +601,27 @@ public sealed record SystemConfig
         ? RemoteShells.Resolve(null, null, restricted: true, restrictedSession: true, Agent.Count)
         : Grammar;
 
+    /// A system as the document writes it. The three fields a grammar is worked out from go in the
+    /// way [LaunchProjection] reads them, so a system that is not gated is quoted exactly as the
+    /// launch record would have it: only the string "windows" is Windows, only true is
+    /// restricted, and a shell that is there but not a string is no shell this app knows.
     public static SystemConfig From(Value json)
     {
-        var platform = Platforms.Parse(json["platform"].AsText()) ?? Platform.Linux;
+        var written = json["platform"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["platform"].Raw.GetString() : null;
+        // Anything but a string is no platform, and Linux, whose default grammar is the one the
+        // contract gives a system that names none.
+        var platform = Platforms.Parse(written) ?? Platform.Linux;
+        var shell = json["shell"];
         return new SystemConfig
         {
             Id = json["id"].AsText() ?? "",
             Platform = platform,
+            PlatformAsWritten = written,
             Name = json["name"].AsText() ?? platform.DefaultName(),
             Agent = AgentArgv(json["agent"]),
             Symbol = json["symbol"].AsText(),
-            Shell = json["shell"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["shell"].Raw.GetString() : null,
+            Shell = !shell.Exists ? null
+                : shell.Raw.ValueKind == System.Text.Json.JsonValueKind.String ? shell.Raw.GetString() : shell.Raw.GetRawText(),
             Restricted = json["restricted"].Raw.ValueKind == System.Text.Json.JsonValueKind.True,
         };
     }

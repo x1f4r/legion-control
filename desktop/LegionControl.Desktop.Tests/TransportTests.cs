@@ -124,6 +124,44 @@ public class RemoteShellTests
         Assert.Equal("unknown-shell", Assert.Throws<CommandLineRefusal>(() => new RemoteCommand(unknown, new[] { "status" }).CommandLine).Code);
     }
 
+    [Theory]
+    [InlineData("\"platform\": \"windows\", \"shell\": 5", "refused:unknown-shell")]
+    [InlineData("\"platform\": \"windows\", \"shell\": true", "refused:unknown-shell")]
+    [InlineData("\"platform\": \"windows\", \"shell\": {}", "refused:unknown-shell")]
+    [InlineData("\"platform\": \"windows\", \"shell\": null", "cmd")]
+    [InlineData("\"platform\": \"win\"", "posix")]
+    [InlineData("\"platform\": \"WINDOWS\"", "posix")]
+    [InlineData("\"platform\": \" windows \"", "posix")]
+    [InlineData("\"platform\": 5", "posix")]
+    public void ASystemThatIsNotGatedIsQuotedAsTheLaunchRecordReadsIt(string fields, string grammar)
+    {
+        // The launch gate writes the grammar it approved into every system it drives, so this is
+        // only the fallback. It still reads the fields as every other client does: a shell that is
+        // not a string is no shell this app knows, and only the string "windows" is Windows.
+        var text = $$"""
+            { "version": 1, "machines": [ { "id": "tower", "systems": [
+              { "id": "system", {{fields}}, "agent": [ "node", "C:/agent.mjs" ] } ] } ] }
+            """;
+        var system = ControllerConfig.From(Value.Parse(text)).Machine("tower")!.Systems[0];
+        Assert.Equal(grammar, system.Grammar.Wire);
+        Assert.Equal(grammar, LaunchProjection.Of(text).TupleAt("tower", "system")!.Grammar);
+    }
+
+    [Fact]
+    public void ALenientPlatformStillFindsTheSystemToBootButNeverPicksItsGrammar()
+    {
+        var machine = ControllerConfig.From(Value.Parse("""
+            { "version": 1, "machines": [ { "id": "tower", "systems": [
+              { "id": "linux", "platform": "linux", "agent": [ "node", "/agent.mjs" ] },
+              { "id": "windows", "platform": "Win", "agent": [ "node", "C:/agent.mjs" ] } ] } ] }
+            """)).Machine("tower")!;
+        var windows = machine.SystemFor(Platform.Windows)!;
+        Assert.Equal("windows", windows.Id);
+        Assert.Equal(RemoteShell.Posix, windows.Grammar.Shell);
+        // A system built here names its platform with the enum alone, and that decides.
+        Assert.Equal(RemoteShell.Cmd, new SystemConfig { Id = "windows", Platform = Platform.Windows, Agent = new[] { "node", "C:/agent.mjs" } }.Grammar.Shell);
+    }
+
     [Fact]
     public void TheAgentArgvIsReadExactlyAndNeverQuietlyShortened()
     {

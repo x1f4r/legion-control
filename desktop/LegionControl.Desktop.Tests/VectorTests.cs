@@ -34,9 +34,7 @@ public class VectorTests
 
             ["transport/grammars"] = input =>
             {
-                var grammar = RemoteShells.Resolve(Text(input["platform"]), Text(input["shell"]),
-                    input["restricted"]?.GetValueKind() == JsonValueKind.True,
-                    input["restrictedSession"]!.GetValue<bool>(), input["agentLength"]!.GetValue<int>());
+                var grammar = Configured(input).GrammarOn(input["restrictedSession"]!.GetValue<bool>());
                 return new JsonObject { ["grammar"] = grammar.Shell?.Wire(), ["refusal"] = grammar.Refusal };
             },
             ["transport/commandLines"] = input =>
@@ -187,6 +185,31 @@ public class VectorTests
         if (endpoint != legacy)
             throw new InvalidOperationException($"an endpoint and the ssh block read {field} {value?.ToJsonString()} differently");
         return endpoint;
+    }
+
+    /// A system with the vector's platform, shell, restricted and agent length, read out of a
+    /// document the way the app reads one: into the model a command is quoted from, and into the
+    /// launch record this device approves. The two have to agree. A resolver called with the
+    /// fields as given would pass these vectors while the reader that ships quoted the system
+    /// some other way, so the fields go through the reader.
+    private static SystemConfig Configured(JsonNode input)
+    {
+        var length = input["agentLength"]!.GetValue<int>();
+        var system = new JsonObject
+        {
+            ["id"] = "system",
+            ["platform"] = input["platform"]?.DeepClone(),
+            ["shell"] = input["shell"]?.DeepClone(),
+            ["restricted"] = input["restricted"]?.DeepClone(),
+            ["agent"] = new JsonArray(Enumerable.Range(0, length).Select(index => (JsonNode)$"/agent/{index}.mjs").ToArray()),
+        };
+        var machine = new JsonObject { ["id"] = "tower", ["systems"] = new JsonArray(system) };
+        var text = new JsonObject { ["version"] = 1, ["machines"] = new JsonArray(machine) }.ToJsonString();
+        var configured = ControllerConfig.From(Value.Parse(text)).Machine("tower")!.Systems.Single();
+        // A system with no agent records no grammar at all: nothing runs on it.
+        if (length > 0 && configured.Grammar.Wire != LaunchProjection.Of(text).TupleAt("tower", "system")!.Grammar)
+            throw new InvalidOperationException($"the model and the launch record read {system.ToJsonString()} differently");
+        return configured;
     }
 
     /// The review, what runs, and what agent 3.1.0 answers a restricted push, all through the gate
