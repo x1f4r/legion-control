@@ -59,9 +59,11 @@ public sealed class RemoteAgent
     public string? KnownHostsFile { get; init; }
     /// Where ssh writes its own log for each attempt.
     public string SshLogDirectory { get; init; } = AppPaths.SshLogDirectory;
-    /// The routes whose last authenticated status said this key runs in a restricted session.
-    /// Every system is driven through the dispatcher there, whatever the document says.
-    public IReadOnlySet<string> RestrictedRoutes { get; init; } = new HashSet<string>();
+    /// Each route with the system whose last authenticated status over it said this key runs in
+    /// a restricted session. That system is driven through the dispatcher there, whatever the
+    /// document says; the other systems on the same address are not.
+    public IReadOnlySet<(string Route, string System)> RestrictedSessions { get; init; } =
+        new HashSet<(string Route, string System)>();
     /// The clock the whole command's deadline is kept by.
     public TimeProvider Time { get; init; } = TimeProvider.System;
 
@@ -326,7 +328,8 @@ public sealed class RemoteAgent
 
             AttemptReading reading;
             AgentFailure failure;
-            var (line, refused) = LineFor(attempt, new RemoteCommand(attempt.System, argv, RestrictedRoutes.Contains(attempt.Route.Id)));
+            var (line, refused) = LineFor(attempt, new RemoteCommand(attempt.System, argv,
+                RestrictedSessions.Contains((attempt.Route.Id, attempt.System.Id))));
             if (refused is not null)
             {
                 // Refused here, before anything was started: nothing left this device.

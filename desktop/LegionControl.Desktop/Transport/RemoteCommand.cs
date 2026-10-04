@@ -11,8 +11,8 @@ public sealed record RemoteCommand(SystemConfig System, IReadOnlyList<string> Ar
     /// The whole argv, agent first.
     public IReadOnlyList<string> Argv => System.Agent.Concat(Arguments).ToList();
 
-    /// The grammar the line is written in. [RestrictedSession] is what the last status over the
-    /// route said about this key, and it can only ever move the line to the dispatcher.
+    /// The grammar the line is written in. [RestrictedSession] is what this system's last status
+    /// over the route said about this key, and it can only ever move the line to the dispatcher.
     public CommandGrammar Grammar => System.GrammarOn(RestrictedSession);
 
     /// The single string ssh is given, written for whatever parses it on the far side. Throws a

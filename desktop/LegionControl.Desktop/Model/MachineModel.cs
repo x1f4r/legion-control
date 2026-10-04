@@ -844,7 +844,7 @@ public sealed class MachineModel
         return new RemoteAgent(Machine, _runner, routes)
         {
             KnownHostsFile = Bindings.KnownHosts,
-            RestrictedRoutes = Routes.RestrictedRoutes,
+            RestrictedSessions = Routes.RestrictedSessions,
         };
     }
 

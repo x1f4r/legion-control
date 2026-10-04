@@ -1011,6 +1011,44 @@ public class RetryTests
     }
 
     [Fact]
+    public async Task ARestrictedKeyOnOneSystemLeavesTheOtherSystemOnTheSameAddressAlone()
+    {
+        // A dual boot machine answers on one address under both systems, and only the Linux key
+        // is restricted. After a reboot into Windows, a mark kept for the address alone wrote every
+        // Windows line for the dispatcher, cmd could not run any of them, and no status ever got
+        // through to clear the mark: the machine stayed unreachable until the app restarted.
+        using var home = new TempHome();
+        var machine = TwoRoutes with { Endpoints = new[] { TwoRoutes.Endpoints[0] with { System = null } } };
+        var windowsIsUp = false;
+        var runner = new FakeRunner(call =>
+        {
+            if (!windowsIsUp)
+            {
+                return FakeRunner.Ok("""
+                    {"ok":true,"contract":3,"agentVersion":"3.0.0","system":{"id":"linux"},"agent":{"restrictedSession":true}}
+                    """);
+            }
+            // cmd runs only its own grammar, which is the one with the @ in front.
+            return call.RemoteCommand.StartsWith("@\"", StringComparison.Ordinal)
+                ? FakeRunner.Ok("""{"ok":true,"contract":3,"agentVersion":"3.0.0","system":{"id":"windows"}}""")
+                : FakeRunner.Text("", "The system cannot find the path specified.", 1);
+        });
+        var model = new MachineModel(machine, runner, new OperationTracker(Path.Combine(home.Path, "operations.json")));
+        await model.RefreshAsync();
+        Assert.Equal("linux", model.Status?.SystemId);
+
+        windowsIsUp = true;
+        runner.Calls.Clear();
+        await model.RefreshAsync();
+        Assert.Null(model.Failure);
+        Assert.Equal("windows", model.Status?.SystemId);
+        Assert.Equal(2, runner.Calls.Count);
+        Assert.StartsWith("@\"node\" \"C:/agent.mjs\" \"status\"", runner.Calls[1].RemoteCommand);
+        // Linux is still restricted on that address, and only Linux.
+        Assert.Equal(("lan", "linux"), Assert.Single(model.Routes.RestrictedSessions));
+    }
+
+    [Fact]
     public async Task AMachineWithNoAddressSaysSoRatherThanTryingNothingQuietly()
     {
         var agent = new RemoteAgent(new MachineConfig { Id = "x", Name = "X", Systems = new[] { Linux } },
