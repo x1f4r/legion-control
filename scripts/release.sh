@@ -200,9 +200,12 @@ sign_release() {
 # taken again: --resume works out which of them a stopped run got through.
 
 PUBLISHED=0
-# Set once origin has the tag. The push was atomic, so origin took main with it, and from then on the
-# version is taken whatever happens to the release: the only way left is to finish it.
+# Set once origin has the tag. From then on the version is taken whatever happens to the release:
+# the only way left is to finish it.
 PUSHED=0
+# Set by --resume when origin has the tag and its main does not have the release commit yet,
+# because the tag got there on its own rather than in the atomic push below.
+MAIN_BEHIND=0
 
 # Every asset of the release: what the builds leave in dist/, then the release manifest signed over
 # them, which is the one part --resume makes again.
@@ -241,14 +244,19 @@ publish() {
 	say "$DRAFT_SAYS"
 
 	step "Pushing main and $TAG"
-	if [ "$PUSHED" -eq 1 ]; then
-		# Pushing main again would be refused once it has moved on, and there is nothing to push: the
-		# push that put the tag there put main there too.
-		say "origin has $TAG already, and main with it, from the run that stopped."
-	else
+	if [ "$PUSHED" -eq 0 ]; then
 		# Atomic: origin takes both refs or neither, so it never has the release commit without its tag.
 		git -C "$ROOT" push --atomic origin "refs/heads/main:refs/heads/main" "refs/tags/$TAG:refs/tags/$TAG"
 		PUSHED=1
+	elif [ "$MAIN_BEHIND" -eq 1 ]; then
+		# The tag got to origin on its own. Main follows it now, by the one commit --resume found it
+		# short of, so the bump is on main before anyone is offered the release.
+		git -C "$ROOT" push origin "$RELEASE_COMMIT:refs/heads/main"
+		say "origin had $TAG already, and main has $RELEASE_COMMIT now as well."
+	else
+		# Pushing main again would be refused once it has moved on, and there is nothing to push:
+		# --resume found the release commit on origin's main.
+		say "origin has $TAG already, and main has $RELEASE_COMMIT."
 	fi
 	[ "$(remote_tag)" = "$(git -C "$ROOT" rev-parse "refs/tags/$TAG")" ] \
 		|| die "origin does not have the tag $TAG that was just pushed, so the draft was not published."
@@ -304,7 +312,8 @@ trap finish EXIT
 # Origin is asked first. Until it has the tag, nothing of the release is public, and a release that
 # cannot be finished can still be cut again. Once it has it, the version is taken and the release
 # is only ever finished: from the tag, whatever main has done since, checked out on its own if main
-# has moved on here as well.
+# has moved on here as well. Origin's main has to have the release commit all the same, since the
+# bump is in it, and a tag that got to origin without it has main pushed after it.
 
 if [ "$RESUME" -eq 1 ]; then
 	step "Picking up $TAG"
@@ -331,14 +340,25 @@ if [ "$RESUME" -eq 1 ]; then
 	[ "$VERSION_NOW" = "$VERSION" ] || die "$TAG is at a commit whose projects say $VERSION_NOW, not $VERSION."
 	node "$ROOT/scripts/check-versions.mjs"
 
-	# What is left to push has to go on top of origin's main as it is now. Once origin has the tag
-	# there is nothing left to push, and main moving on since is no concern of this release.
+	git -C "$ROOT" fetch --quiet --no-tags origin main || die "cannot fetch main from origin."
 	if [ "$PUSHED" -eq 0 ]; then
-		git -C "$ROOT" fetch --quiet --no-tags origin main || die "cannot fetch main from origin."
+		# What is left to push has to go on top of origin's main as it is now.
 		git -C "$ROOT" merge-base --is-ancestor origin/main HEAD \
 			|| die "origin/main has moved on to commits $TAG does not have, so the release commit cannot be pushed as it is. Delete the draft and the tag, update main and release again."
 		AHEAD="$(git -C "$ROOT" rev-list --count origin/main..HEAD)"
 		[ "$AHEAD" -le 1 ] || die "HEAD is $AHEAD commits ahead of origin/main. A release pushes one commit at most, its version bump."
+	elif ! git -C "$ROOT" merge-base --is-ancestor "$RELEASE_COMMIT" origin/main; then
+		# This script pushes main and the tag in one atomic push, so the tag got to origin some other
+		# way, on its own. Main moving on since is no concern of this release, but main without the
+		# release commit is: the bump is in it, and without it the next release from main would bump
+		# to this one's build number again and be refused for it.
+		git -C "$ROOT" merge-base --is-ancestor origin/main "$RELEASE_COMMIT" \
+			|| die "origin has $TAG, but its main does not have $RELEASE_COMMIT, the commit $TAG is at, and has moved on to commits $TAG does not have. Merge the tag into origin's main and push that (git checkout --detach origin/main, git merge $TAG, git push origin HEAD:refs/heads/main), then run this again from the tag: git checkout $TAG."
+		BEHIND="$(git -C "$ROOT" rev-list --count "origin/main..$RELEASE_COMMIT")"
+		[ "$BEHIND" -le 1 ] \
+			|| die "origin has $TAG, but its main is $BEHIND commits behind $RELEASE_COMMIT, the commit $TAG is at, and a release pushes one commit at most, its version bump. Find out where the others came from; if main is to have them all: git push origin $RELEASE_COMMIT:refs/heads/main, then run this again."
+		say "origin has $TAG, and its main is one commit short of it: main follows once the draft holds every asset."
+		MAIN_BEHIND=1
 	fi
 
 	RELEASES="$(gh release list --limit 1000 --json tagName,isDraft,isPrerelease)" || die "gh could not list the releases."

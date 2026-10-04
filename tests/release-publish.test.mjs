@@ -299,7 +299,7 @@ test('--resume creates the draft from the kept notes when there was none, and on
   const published = release('1.4.0', '--resume');
   assert.equal(published.status, 0, published.stderr);
   // Main and the tag are on origin already, so nothing is pushed and the hook hears nothing.
-  assert.match(published.stdout, /origin has v1\.4\.0 already, and main with it, from the run that stopped\./);
+  assert.match(published.stdout, new RegExp(`origin has v1\\.4\\.0 already, and main has ${git('rev-parse', 'HEAD')}\\.`));
   assert.deepEqual(happened(), ['verify-desktop-artifacts 1.4.0', 'gh release edit v1.4.0 draft=false']);
   assert.equal(gh.get().releases.find(entry => entry.tagName === 'v1.4.0').isDraft, false);
 });
@@ -373,6 +373,79 @@ test('--resume says when dist/ no longer holds the release, and how to go on fro
   assert.match(lost.stderr, /dist\/ no longer holds Legion-Control-android-arm64\.apk, built for v1\.4\.0, and --resume builds nothing\. origin has v1\.4\.0 already, so the version cannot be cut again: build them at v1\.4\.0 by hand into dist\//);
   assert.doesNotMatch(lost.stderr, /git tag -d|gh release delete/);
   assert.deepEqual(pushed.happened(), []);
+});
+
+test('a tag that got to origin on its own is not published until origin\'s main has the commit it is at', mac, (t) => {
+  // The run stops before its draft, and the tag is pushed by hand, without main.
+  const tagPushedAlone = (checkout) => {
+    checkout.gh.set(state => ({ ...state, fail: { create: 'before' } }));
+    assert.equal(checkout.release('1.4.0', '--notes', checkout.notes).status, 1);
+    checkout.gh.set(state => ({ ...state, fail: {} }));
+    checkout.git('push', '-q', 'origin', 'refs/tags/v1.4.0');
+    return checkout.git('rev-parse', 'refs/tags/v1.4.0^{commit}');
+  };
+  const draftOf = (checkout) => checkout.gh.get().releases.find(entry => entry.tagName === 'v1.4.0');
+
+  // Main one commit short of it, the bump: main follows the tag once the draft is filled, and only
+  // then is the release published.
+  const behind = releaseCheckout(t);
+  const base = behind.git('rev-parse', 'HEAD');
+  const tagged = tagPushedAlone(behind);
+  assert.equal(behind.originGit('rev-parse', 'refs/heads/main'), base);
+  const resumed = behind.release('1.4.0', '--resume');
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.match(resumed.stdout, /origin has v1\.4\.0, and its main is one commit short of it: main follows once the draft holds every asset\./);
+  assert.match(resumed.stdout, new RegExp(`origin had v1\\.4\\.0 already, and main has ${tagged} now as well\\.`));
+  assert.deepEqual(behind.happened(), [
+    'verify-desktop-artifacts 1.4.0',
+    'gh release create v1.4.0 draft=true target=main assets=10',
+    'push refs/heads/main',
+    'gh release edit v1.4.0 draft=false',
+  ]);
+  assert.equal(behind.originGit('rev-parse', 'refs/heads/main'), tagged);
+  assert.equal(draftOf(behind).isDraft, false);
+
+  // Main moved on without it: nothing is published until the tag is merged into it, and the way the
+  // refusal gives is one that works.
+  const movedOn = releaseCheckout(t);
+  const movedOnTag = tagPushedAlone(movedOn);
+  movedOn.pushFromElsewhere('A commit pushed from elsewhere');
+  const refused = movedOn.release('1.4.0', '--resume');
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, new RegExp(`origin has v1\\.4\\.0, but its main does not have ${movedOnTag}, the commit v1\\.4\\.0 is at, and has moved on to commits v1\\.4\\.0 does not have\\. Merge the tag into origin's main and push that \\(git checkout --detach origin/main, git merge v1\\.4\\.0, git push origin HEAD:refs/heads/main\\), then run this again from the tag: git checkout v1\\.4\\.0\\.`));
+  assert.doesNotMatch(refused.stderr, /is on origin and not published yet|and main has/);
+  assert.deepEqual(movedOn.happened(), []);
+  assert.equal(draftOf(movedOn), undefined);
+  movedOn.git('checkout', '-q', '--detach', 'origin/main');
+  movedOn.git('merge', '-q', '--no-edit', 'v1.4.0');
+  movedOn.git('push', '-q', 'origin', 'HEAD:refs/heads/main');
+  movedOn.git('checkout', '-q', 'v1.4.0');
+  const merged = movedOn.release('1.4.0', '--resume');
+  assert.equal(merged.status, 0, merged.stderr);
+  assert.match(merged.stdout, new RegExp(`origin has v1\\.4\\.0 already, and main has ${movedOnTag}\\.`));
+  assert.deepEqual(movedOn.happened(), [
+    'verify-desktop-artifacts 1.4.0',
+    'gh release create v1.4.0 draft=true target=main assets=10',
+    'gh release edit v1.4.0 draft=false',
+  ]);
+  assert.equal(draftOf(movedOn).isDraft, false);
+
+  // More than the bump short of it is more than a release pushes: it is refused, with the push that
+  // would put it right if it is meant to.
+  const farBehind = releaseCheckout(t);
+  const before = farBehind.git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(farBehind.repo, 'reviewed.txt'), 'a reviewed commit\n');
+  farBehind.git('add', 'reviewed.txt');
+  farBehind.git('commit', '-qm', 'Reviewed');
+  farBehind.git('push', '-q', 'origin', 'main');
+  farBehind.gh.set(state => ({ ...state, runs: [farBehind.gh.passed(farBehind.git('rev-parse', 'HEAD'))] }));
+  const farTag = tagPushedAlone(farBehind);
+  farBehind.git('push', '-q', '--force', 'origin', `${before}:refs/heads/main`);
+  const tooFar = farBehind.release('1.4.0', '--resume');
+  assert.equal(tooFar.status, 1);
+  assert.match(tooFar.stderr, new RegExp(`origin has v1\\.4\\.0, but its main is 2 commits behind ${farTag}, the commit v1\\.4\\.0 is at, and a release pushes one commit at most, its version bump\\. .*git push origin ${farTag}:refs/heads/main, then run this again\\.`));
+  assert.deepEqual(farBehind.happened(), []);
+  assert.equal(farBehind.originGit('rev-parse', 'refs/heads/main'), before);
 });
 
 test('--resume refuses what it cannot finish, without sending anyone round to --resume again', mac, (t) => {
