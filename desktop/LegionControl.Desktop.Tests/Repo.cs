@@ -14,9 +14,30 @@ public static class Repo
 {
     public static string Root { get; } = Find();
 
-    public static string Fixtures => Path.Combine(Root, "contract", "fixtures");
+    public static string Contract => Path.Combine(Root, "contract");
 
-    public static string HashVectors => Path.Combine(Root, "contract", "hash-vectors.json");
+    public static string Fixtures => Path.Combine(Contract, "fixtures");
+
+    public static string Vectors => Path.Combine(Contract, "vectors");
+
+    public static string HashVectors => Path.Combine(Contract, "hash-vectors.json");
+
+    /// The index every vector runner starts from: which families exist and how many cases each
+    /// consumer runs of each group.
+    public static string VectorIndex => Path.Combine(Vectors, "index.json");
+
+    public static string FixtureIndex => Path.Combine(Fixtures, "index.json");
+
+    /// A file of the shared corpus, by its path relative to contract/. A corpus that is missing is
+    /// a failure, never a skip: a runner that quietly runs nothing passes for the wrong reason.
+    public static string ReadContract(string relative)
+    {
+        var path = Path.Combine(Contract, relative);
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"{path} is missing: the shared contract corpus is required.", path);
+        return File.ReadAllText(path);
+    }
+
 
     public static string TrustFixtures => Path.Combine(Root, "tests", "fixtures", "trust");
 
