@@ -40,6 +40,7 @@ import java.security.KeyPairGenerator
 import java.security.KeyStoreException
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * The ssh transport against an sshj client that never opens a socket.
@@ -92,6 +93,7 @@ class SshTransportTest {
     private fun transport(
         capBytes: Int = SshTransport.OUTPUT_CAP_BYTES,
         keys: suspend () -> KeyProvider = { proxy(KeyProvider::class.java) { _, _ -> error("the fake client never asks for the key") } },
+        clock: () -> Long = { System.nanoTime() / 1_000_000L },
         client: (Config) -> FakeClient,
     ) = SshTransport(
         keys = keys,
@@ -99,6 +101,7 @@ class SshTransportTest {
         machineName = "Tower",
         newClient = { config -> client(config).also { clients += it } },
         outputCapBytes = capBytes,
+        clock = clock,
     )
 
     private fun session(exec: (String) -> Session.Command): Session = proxy(Session::class.java) { name, args ->
@@ -288,6 +291,30 @@ class SshTransportTest {
         assertTrue(outcome.timedOut)
         assertEquals("still working", outcome.stdout)
         assertEquals(null, outcome.exitStatus)
+    }
+
+    @Test
+    fun `a slow handshake leaves the command only what is left of the attempt`() = runBlocking {
+        // One attempt has one budget, handshake included (contract section 15.5, step 4). The
+        // command's watchdog used to start over at the full budget once the handshake was done, so
+        // a status whose handshake was slow ran for nearly twice what it was given. Here the
+        // handshake takes 4.7 of the 5 seconds on the transport's clock and none on the real one,
+        // which leaves the command 300 ms.
+        val now = AtomicLong(0L)
+        val stdout = HangingStream("still working".toByteArray())
+        val ssh = transport(clock = { now.get() }) { config ->
+            FakeClient(
+                config,
+                onConnect = { now.addAndGet(4_700L) },
+                onSession = { session { command(stdout, exit = null) } },
+                onClose = { stdout.release() },
+            )
+        }
+        val started = System.nanoTime()
+        val outcome = ssh.run(endpoint, "status", 5_000L)
+        val tookMillis = (System.nanoTime() - started) / 1_000_000L
+        assertTrue(outcome.timedOut)
+        assertTrue("the command ran $tookMillis ms of an attempt that had 300 ms left", tookMillis < 2_500L)
     }
 
     @Test

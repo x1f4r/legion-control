@@ -56,6 +56,12 @@ class SshTransport internal constructor(
     private val newClient: (Config) -> SSHClient = ::SSHClient,
     /** How much of each output stream is kept. Smaller in tests, and only there. */
     private val outputCapBytes: Int = OUTPUT_CAP_BYTES,
+    /**
+     * Milliseconds, for what the handshake left of an attempt. Replaced in tests, and only there.
+     * Monotonic for the reason the client's deadline is: a clock set by the network mid-attempt
+     * would hand the command time the attempt does not have.
+     */
+    private val clock: () -> Long = { System.nanoTime() / 1_000_000L },
 ) : CommandTransport {
 
     constructor(identity: DeviceIdentity, hostKeys: HostKeyStore, machineName: String) : this(
@@ -80,6 +86,7 @@ class SshTransport internal constructor(
         timeoutMillis: Long,
         stdin: StdinSource?,
     ): CommandOutcome {
+        val started = clock()
         refuseUndialable(endpoint)
         return withContext(Dispatchers.IO) {
             val config = DefaultConfig().apply {
@@ -119,7 +126,11 @@ class SshTransport internal constructor(
 
                     client.connection.keepAlive.keepAliveInterval = KEEP_ALIVE_SECONDS
 
-                    exec(client, endpoint, command, timeoutMillis, dispatched, stdin)
+                    // One attempt has one budget, and the handshake has already spent some of it.
+                    // Given the whole amount again, a status whose handshake was slow ran for nearly
+                    // twice what the caller had left, past the one deadline the walk keeps.
+                    val remaining = (timeoutMillis - (clock() - started)).coerceAtLeast(1L)
+                    exec(client, endpoint, command, remaining, dispatched, stdin)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: AgentFailure) {
@@ -309,7 +320,7 @@ class SshTransport internal constructor(
         client: SSHClient,
         endpoint: Endpoint,
         command: String,
-        timeoutMillis: Long,
+        remainingMillis: Long,
         dispatched: AtomicBoolean,
         stdin: StdinSource?,
     ): CommandOutcome = coroutineScope {
@@ -330,15 +341,15 @@ class SshTransport internal constructor(
             )
         }
 
-        // The command's own wall clock, and the only thing that actually bounds it. The socket read
-        // timeout cannot: a link that is up but carrying a command that never finishes stays busy
-        // forever, and the read the two drains below are parked in never returns. Same shape as the
-        // handshake watchdog, for the same reason, because a blocking read only ends when someone
-        // else closes the socket.
+        // The command's own wall clock, set to what the handshake left of the attempt, and the only
+        // thing that actually bounds it. The socket read timeout cannot: a link that is up but
+        // carrying a command that never finishes stays busy forever, and the read the two drains
+        // below are parked in never returns. Same shape as the handshake watchdog, for the same
+        // reason, because a blocking read only ends when someone else closes the socket.
         val finished = CompletableDeferred<Unit>()
         val timedOut = AtomicBoolean(false)
         val watchdog = launch {
-            if (withTimeoutOrNull(timeoutMillis) { finished.await() } == null) {
+            if (withTimeoutOrNull(remainingMillis) { finished.await() } == null) {
                 timedOut.set(true)
                 closeQuietly(client)
             }
@@ -368,7 +379,7 @@ class SshTransport internal constructor(
                 stdout.await() to stderr.await()
             }
 
-            runCatching { process.join(timeoutMillis, TimeUnit.MILLISECONDS) }
+            runCatching { process.join(remainingMillis, TimeUnit.MILLISECONDS) }
             // No exit status is normal rather than an error: boot prints its JSON and then takes the
             // machine down while the channel is still open, so the reply is all we are going to get.
             CommandOutcome(
