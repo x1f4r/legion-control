@@ -166,6 +166,33 @@ test('a copy that moved is reported rather than passed over', async (t) => {
   assert.deepEqual(config.map(({ file, missing }) => ({ file, missing })), [{ file: 'agent/src/config.mjs', missing: true }]);
 });
 
+// scripts/check.sh agent in a scratch checkout of the version tree, with an npm and a node that
+// only note what they were asked to run, except that node runs the version check for real. That
+// line of check.sh is what puts the check into CI and the release preflight.
+function checkAgent(t, change) {
+  const root = tree(t, change);
+  for (const file of ['check.sh', 'check-versions.mjs']) fs.copyFileSync(path.join(repository, 'scripts', file), path.join(root, 'scripts', file));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-check-bin-'));
+  t.after(() => fs.rmSync(bin, { recursive: true, force: true }));
+  const calls = path.join(bin, 'calls');
+  const stub = (name, rest = '') => fs.writeFileSync(path.join(bin, name), `#!/bin/sh\nprintf '%s\\n' "${name} $*" >> "$LEGION_TEST_CALLS"\n${rest}`, { mode: 0o755 });
+  stub('npm');
+  stub('node', '[ "$1" = scripts/check-versions.mjs ] && exec "$LEGION_TEST_NODE" "$@"\nexit 0\n');
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, LEGION_TEST_CALLS: calls, LEGION_TEST_NODE: process.execPath };
+  const result = spawnSync('bash', [path.join(root, 'scripts', 'check.sh'), 'agent'], { encoding: 'utf8', env });
+  return { ...result, calls: fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n') : [] };
+}
+
+test('the agent check of scripts/check.sh fails when a copy of a version disagrees', { skip: process.platform === 'win32' }, (t) => {
+  const agreeing = checkAgent(t);
+  assert.equal(agreeing.status, 0, agreeing.stderr);
+  assert.ok(agreeing.calls.includes('node scripts/check-versions.mjs'), agreeing.calls.join('\n'));
+  assert.match(agreeing.stdout, /Versions agree: agent 3\.1\.0 \(floor 3\.1\.0\), app 1\.3\.4 \(build 14\)\./);
+  const stale = checkAgent(t, root => edit(root, AGENT_COPIES[2].file, '"3.1.0"', '"3.0.1"'));
+  assert.equal(stale.status, 1, stale.stdout);
+  assert.match(stale.stderr, /BUNDLED_AGENT_VERSION = "3\.0\.1", but agent\/package\.json says 3\.1\.0/);
+});
+
 test('this repository has every copy where the check looks, and its builds follow agent/package.json', async () => {
   const { problems } = await checkVersions(repository);
   assert.deepEqual(problems.filter(problem => problem.missing), []);
