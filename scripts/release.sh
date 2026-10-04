@@ -107,7 +107,12 @@ command -v node >/dev/null 2>&1 || die "no node, and every check and signature b
 [ -f "$GRADLE" ] || die "no $GRADLE_REL."
 
 BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
-[ "$BRANCH" = "main" ] || die "on branch $BRANCH. A release is cut from main, because the tag has to point at what everyone else will get."
+require_main() {
+	[ "$BRANCH" = "main" ] || die "on branch $BRANCH. A release is cut from main, because the tag has to point at what everyone else will get."
+}
+# --resume asks once it knows whether main is still to be pushed: a release origin already has the
+# tag of is finished from the tag, wherever main is by then.
+[ "$RESUME" -eq 1 ] || require_main
 
 [ -z "$(git -C "$ROOT" status --porcelain)" ] \
 	|| die "the working tree has changes in it. The release commit is meant to be the version bump and nothing else, so commit or stash what is there first."
@@ -195,6 +200,9 @@ sign_release() {
 # taken again: --resume works out which of them a stopped run got through.
 
 PUBLISHED=0
+# Set once origin has the tag. The push was atomic, so origin took main with it, and from then on the
+# version is taken whatever happens to the release: the only way left is to finish it.
+PUSHED=0
 
 draft_holds_everything() {
 	local view
@@ -227,8 +235,15 @@ publish() {
 	say "$DRAFT_SAYS"
 
 	step "Pushing main and $TAG"
-	# Atomic: origin takes both refs or neither, so it never has the release commit without its tag.
-	git -C "$ROOT" push --atomic origin "refs/heads/main:refs/heads/main" "refs/tags/$TAG:refs/tags/$TAG"
+	if [ "$PUSHED" -eq 1 ]; then
+		# Pushing main again would be refused once it has moved on, and there is nothing to push: the
+		# push that put the tag there put main there too.
+		say "origin has $TAG already, and main with it, from the run that stopped."
+	else
+		# Atomic: origin takes both refs or neither, so it never has the release commit without its tag.
+		git -C "$ROOT" push --atomic origin "refs/heads/main:refs/heads/main" "refs/tags/$TAG:refs/tags/$TAG"
+		PUSHED=1
+	fi
 	[ "$(remote_tag)" = "$(git -C "$ROOT" rev-parse "refs/tags/$TAG")" ] \
 		|| die "origin does not have the tag $TAG that was just pushed, so the draft was not published."
 
@@ -262,7 +277,11 @@ finish() {
 		say "The version numbers were put back to $OLD_VERSION ($OLD_BUILD)."
 	fi
 	if [ "$status" -ne 0 ] && [ "$TAGGED" -eq 1 ] && [ "$PUBLISHED" -eq 0 ]; then
-		printf '\n%s is tagged here and not out yet. Once what stopped it is put right, finish it with:\n' "$TAG" >&2
+		if [ "$PUSHED" -eq 1 ]; then
+			printf '\n%s is on origin and not published yet. Once what stopped it is put right, finish it with:\n' "$TAG" >&2
+		else
+			printf '\n%s is tagged here and not out yet. Once what stopped it is put right, finish it with:\n' "$TAG" >&2
+		fi
 		printf '    ./scripts/release.sh %s --resume\n' "$VERSION" >&2
 	fi
 }
@@ -275,6 +294,11 @@ trap finish EXIT
 # Nothing is built again. The release is the tag, the commit it is at and the artifacts in dist/;
 # this checks they still belong together, signs the manifest again (the same bytes: Ed25519 is
 # deterministic and so is the manifest), and takes whichever of draft, push and publish is left.
+#
+# Origin is asked first. Until it has the tag, nothing of the release is public, and a release that
+# cannot be finished can still be cut again. Once it has it, the version is taken and the release
+# is only ever finished: from the tag, whatever main has done since, checked out on its own if main
+# has moved on here as well.
 
 if [ "$RESUME" -eq 1 ]; then
 	step "Picking up $TAG"
@@ -282,22 +306,33 @@ if [ "$RESUME" -eq 1 ]; then
 	git -C "$ROOT" rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
 		|| die "there is no tag $TAG here, so there is nothing to resume. A run that stops before it tags puts the version numbers back; run it again without --resume."
 	RELEASE_COMMIT="$(git -C "$ROOT" rev-parse "refs/tags/$TAG^{commit}")"
-	[ "$RELEASE_COMMIT" = "$(git -C "$ROOT" rev-parse HEAD)" ] \
-		|| die "HEAD is not $RELEASE_COMMIT, the commit $TAG is at. Go back to it, or delete the tag (and its draft, if there is one) and release again."
+
+	ORIGIN_TAG="$(remote_tag)" || die "cannot ask origin whether it has $TAG."
+	if [ -n "$ORIGIN_TAG" ] && [ "$ORIGIN_TAG" != "$(git -C "$ROOT" rev-parse "refs/tags/$TAG")" ]; then
+		die "origin has a tag $TAG that is not the one here. Find out where it came from before anything is published."
+	fi
+	[ -z "$ORIGIN_TAG" ] || PUSHED=1
+
+	if [ "$RELEASE_COMMIT" != "$(git -C "$ROOT" rev-parse HEAD)" ]; then
+		[ "$PUSHED" -eq 0 ] \
+			|| die "HEAD is not $RELEASE_COMMIT, the commit $TAG is at. origin has $TAG already, so the version is taken and the release can only be finished, from the tag: git checkout $TAG, then run this again."
+		die "HEAD is not $RELEASE_COMMIT, the commit $TAG is at. Go back to it, or delete the tag (and its draft, if there is one) and release again."
+	fi
+	[ "$PUSHED" -eq 1 ] || require_main
 
 	VERSION_NOW="$(plist_get CFBundleShortVersionString)"
 	BUILD_NUMBER="$(plist_get CFBundleVersion)"
 	[ "$VERSION_NOW" = "$VERSION" ] || die "$TAG is at a commit whose projects say $VERSION_NOW, not $VERSION."
 	node "$ROOT/scripts/check-versions.mjs"
 
-	git -C "$ROOT" fetch --quiet --no-tags origin main || die "cannot fetch main from origin."
-	git -C "$ROOT" merge-base --is-ancestor origin/main HEAD \
-		|| die "origin/main has moved on to commits $TAG does not have, so the release commit cannot be pushed as it is. Delete the draft and the tag, update main and release again."
-	AHEAD="$(git -C "$ROOT" rev-list --count origin/main..HEAD)"
-	[ "$AHEAD" -le 1 ] || die "HEAD is $AHEAD commits ahead of origin/main. A release pushes one commit at most, its version bump."
-	ORIGIN_TAG="$(remote_tag)"
-	if [ -n "$ORIGIN_TAG" ] && [ "$ORIGIN_TAG" != "$(git -C "$ROOT" rev-parse "refs/tags/$TAG")" ]; then
-		die "origin has a tag $TAG that is not the one here. Find out where it came from before anything is published."
+	# What is left to push has to go on top of origin's main as it is now. Once origin has the tag
+	# there is nothing left to push, and main moving on since is no concern of this release.
+	if [ "$PUSHED" -eq 0 ]; then
+		git -C "$ROOT" fetch --quiet --no-tags origin main || die "cannot fetch main from origin."
+		git -C "$ROOT" merge-base --is-ancestor origin/main HEAD \
+			|| die "origin/main has moved on to commits $TAG does not have, so the release commit cannot be pushed as it is. Delete the draft and the tag, update main and release again."
+		AHEAD="$(git -C "$ROOT" rev-list --count origin/main..HEAD)"
+		[ "$AHEAD" -le 1 ] || die "HEAD is $AHEAD commits ahead of origin/main. A release pushes one commit at most, its version bump."
 	fi
 
 	RELEASES="$(gh release list --limit 1000 --json tagName,isDraft,isPrerelease)" || die "gh could not list the releases."

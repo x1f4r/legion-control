@@ -177,7 +177,19 @@ for archive in Legion-Control-linux-x64.tar.gz Legion-Control-linux-arm64.tar.gz
   };
   const happened = () => fs.readFileSync(events, 'utf8').trim().split('\n').filter(Boolean);
   const manifest = () => verifyManifest(path.join(repo, 'dist', 'Legion-Control-manifest.json'), path.join(repo, 'dist', 'Legion-Control-manifest.json.sig'), path.join(repo, 'contract', 'release-public-key.pem'));
-  return { root, repo, git, originGit, gh, release, happened, manifest, notes: path.join(root, 'notes.md') };
+  // Someone else's commit, made in a clone of their own and pushed to origin's main.
+  const pushFromElsewhere = (subject) => {
+    const elsewhere = fs.mkdtempSync(path.join(root, 'elsewhere '));
+    const clone = spawnSync('git', ['clone', '-q', origin, elsewhere], { encoding: 'utf8', env });
+    assert.equal(clone.status, 0, clone.stderr);
+    const elsewhereGit = gitIn(elsewhere);
+    fs.writeFileSync(path.join(elsewhere, 'elsewhere.txt'), subject + '\n');
+    elsewhereGit('add', 'elsewhere.txt');
+    elsewhereGit('commit', '-qm', subject);
+    elsewhereGit('push', '-q', 'origin', 'HEAD:refs/heads/main');
+    return elsewhereGit('rev-parse', 'HEAD');
+  };
+  return { root, repo, git, originGit, gh, release, happened, manifest, pushFromElsewhere, notes: path.join(root, 'notes.md') };
 }
 
 const BUILDS = ['check.sh all', 'package-agent', 'mac/build.sh --no-install --require-agent', 'android/build-apk.sh --require-agent', 'desktop/build.sh --require-agent', 'verify-desktop-artifacts 1.4.0'];
@@ -286,19 +298,60 @@ test('--resume creates the draft from the kept notes when there was none, and on
   gh.set(state => ({ ...state, fail: {} }));
   const published = release('1.4.0', '--resume');
   assert.equal(published.status, 0, published.stderr);
-  // Main and the tag are on origin already, so the push changes nothing and the hook hears nothing.
+  // Main and the tag are on origin already, so nothing is pushed and the hook hears nothing.
+  assert.match(published.stdout, /origin has v1\.4\.0 already, and main with it, from the run that stopped\./);
   assert.deepEqual(happened(), ['verify-desktop-artifacts 1.4.0', 'gh release edit v1.4.0 draft=false']);
   assert.equal(gh.get().releases.find(entry => entry.tagName === 'v1.4.0').isDraft, false);
 });
 
+test('once origin has the tag, --resume only publishes, from the tag, whatever main has done since', mac, (t) => {
+  const { git, originGit, gh, release, happened, pushFromElsewhere, notes } = releaseCheckout(t);
+  const neverDeleted = /delete the tag|git tag -d|gh release delete/;
+
+  // Main and the tag go out together, and then publishing fails: a public tag, and a draft.
+  gh.set(state => ({ ...state, fail: { publish: true } }));
+  const stopped = release('1.4.0', '--notes', notes);
+  assert.equal(stopped.status, 1);
+  assert.match(stopped.stderr, /v1\.4\.0 is on origin and not published yet\. .*\n {4}\.\/scripts\/release\.sh 1\.4\.0 --resume/);
+  const tagged = git('rev-parse', 'refs/tags/v1.4.0^{commit}');
+  assert.equal(originGit('rev-parse', 'refs/tags/v1.4.0^{commit}'), tagged);
+
+  // Main moves on before anyone gets back to it. Pushing main again would be refused now, and the
+  // tag is out of reach of deleting, so only the publishing is tried again.
+  const later = pushFromElsewhere('A commit after the release');
+  const failedAgain = release('1.4.0', '--resume');
+  assert.equal(failedAgain.status, 1);
+  assert.deepEqual(happened(), ['verify-desktop-artifacts 1.4.0', 'gh release edit v1.4.0 draft=false']);
+  assert.match(failedAgain.stderr, /v1\.4\.0 is on origin and not published yet\./);
+  assert.doesNotMatch(failedAgain.stderr, neverDeleted);
+
+  // With main pulled here as well, HEAD is not the release any more, and the way on is the tag.
+  git('pull', '-q', '--ff-only', 'origin', 'main');
+  const moved = release('1.4.0', '--resume');
+  assert.equal(moved.status, 1);
+  assert.match(moved.stderr, new RegExp(`HEAD is not ${tagged}, the commit v1\\.4\\.0 is at\\. origin has v1\\.4\\.0 already, .*git checkout v1\\.4\\.0, then run this again\\.`));
+  assert.doesNotMatch(moved.stderr, neverDeleted);
+  assert.deepEqual(happened(), []);
+
+  gh.set(state => ({ ...state, fail: {} }));
+  git('checkout', '-q', 'v1.4.0');
+  const published = release('1.4.0', '--resume');
+  assert.equal(published.status, 0, published.stderr);
+  assert.deepEqual(happened(), ['verify-desktop-artifacts 1.4.0', 'gh release edit v1.4.0 draft=false']);
+  assert.equal(gh.get().releases.find(entry => entry.tagName === 'v1.4.0').isDraft, false);
+  assert.equal(originGit('rev-parse', 'refs/heads/main'), later);
+  assert.equal(originGit('rev-parse', 'refs/tags/v1.4.0^{commit}'), tagged);
+});
+
 test('--resume refuses what it cannot finish, without sending anyone round to --resume again', mac, (t) => {
-  const { repo, git, release, happened } = releaseCheckout(t);
+  const { repo, git, originGit, release, happened } = releaseCheckout(t);
   const refused = (args, message) => {
     const result = release(...args);
     assert.equal(result.status, 1, result.stdout);
     assert.match(result.stderr, message);
-    assert.doesNotMatch(result.stderr, /is tagged here and not out yet/);
+    assert.doesNotMatch(result.stderr, /is tagged here and not out yet|is on origin and not published yet/);
     assert.deepEqual(happened(), []);
+    return result;
   };
   refused(['1.4.0', '--resume'], /there is no tag v1\.4\.0 here, so there is nothing to resume\./);
   refused(['1.4.0', '--resume', '--dry-run'], /--resume finishes v1\.4\.0 the way it was started, so it takes neither --dry-run nor --tag-head\./);
@@ -308,7 +361,18 @@ test('--resume refuses what it cannot finish, without sending anyone round to --
   fs.writeFileSync(path.join(repo, 'later.txt'), 'a commit after the tag\n');
   git('add', 'later.txt');
   git('commit', '-qm', 'Later');
-  refused(['1.4.0', '--resume'], new RegExp(`HEAD is not ${tagged}, the commit v1\\.4\\.0 is at\\.`));
+  // Only a tag origin does not have yet can still be deleted.
+  refused(['1.4.0', '--resume'], new RegExp(`HEAD is not ${tagged}, the commit v1\\.4\\.0 is at\\. Go back to it, or delete the tag`));
+
+  // A v1.4.0 on origin that is another tag object is not this release's, whatever it points at.
+  originGit('tag', 'v1.4.0', tagged);
+  refused(['1.4.0', '--resume'], /origin has a tag v1\.4\.0 that is not the one here\. Find out where it came from before anything is published\./);
+  originGit('tag', '-d', 'v1.4.0');
+
+  // This very tag on origin is public, and the way on is the tag, never deleting it.
+  git('push', '-q', 'origin', 'refs/tags/v1.4.0');
+  const pushed = refused(['1.4.0', '--resume'], new RegExp(`HEAD is not ${tagged}, the commit v1\\.4\\.0 is at\\. origin has v1\\.4\\.0 already, so the version is taken and the release can only be finished, from the tag: git checkout v1\\.4\\.0, then run this again\\.`));
+  assert.doesNotMatch(pushed.stderr, /delete/);
 });
 
 test('a release is refused before anything is built unless CI passed on the very commit origin has, and the version is new', mac, (t) => {
