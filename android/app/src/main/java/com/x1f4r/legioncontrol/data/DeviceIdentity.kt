@@ -15,6 +15,7 @@ import net.schmizz.sshj.common.KeyType
 import net.schmizz.sshj.userauth.keyprovider.KeyProvider
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.PublicKey
@@ -59,15 +60,31 @@ class SshIdentity internal constructor(
  * The private half never leaves app private storage and is wrapped by a key in the Android keystore,
  * so a copy of the file on its own is not usable. There is deliberately no way to export it.
  */
-class DeviceIdentity(context: Context) {
-    private val appContext = context.applicationContext
-    private val keyFile = File(File(appContext.filesDir, "ssh"), "identity.ed25519")
+class DeviceIdentity internal constructor(
+    private val keyFile: File,
+    private val vault: KeyVault,
+    /** The comment at the end of the authorized_keys line. */
+    private val comment: () -> String,
+    private val clock: () -> Long = System::currentTimeMillis,
+) {
+    constructor(context: Context) : this(
+        keyFile = File(File(context.applicationContext.filesDir, "ssh"), "identity.ed25519"),
+        vault = KeyVault.android,
+        comment = ::deviceComment,
+    )
+
+    private val changeFile = File(keyFile.parentFile, "${keyFile.name}.changed")
     private val mutex = Mutex()
 
     @Volatile
     private var cached: SshIdentity? = null
 
-    /** Loads the key, generating it the first time. Cheap after the first call. */
+    /**
+     * Loads the key, generating it the first time. Cheap after the first call.
+     *
+     * Throws [DeviceKeyUnavailable] when the key is there and could not be read this time. Nothing
+     * is cached then, so the next call reads it again.
+     */
     suspend fun identity(): SshIdentity {
         cached?.let { return it }
         return mutex.withLock {
@@ -75,13 +92,53 @@ class DeviceIdentity(context: Context) {
         }
     }
 
-    private fun loadOrCreate(): SshIdentity {
-        val seed = storedSeed() ?: newSeed().also { KeyVault.write(keyFile, it) }
+    /**
+     * When the key was last replaced because the old one could no longer be opened, until somebody
+     * has said they saw it. Null when it never was.
+     */
+    suspend fun change(): KeyChange? = withContext(Dispatchers.IO) { readChange() }
+
+    /** Stops reporting [change]. The key itself is not touched. */
+    suspend fun acknowledgeChange() {
+        withContext(Dispatchers.IO) { changeFile.delete() }
+    }
+
+    /**
+     * The seed on disk, or a new one, and only ever a new one on a finding that cannot change.
+     *
+     * Two findings make a new key. There is no file, which is the first run. Or there is a file and
+     * it can never be opened again: the keystore has no key to open it with or the key it has does
+     * not authenticate it, which is what a keystore reset or storage restored underneath the app
+     * leaves behind. The old private key is unrecoverable in both, and failing forever would fail
+     * the one screen that shows the public key, which is the screen the user needs to recover.
+     *
+     * Everything else is an error that may not happen next time: a read that failed, a keystore that
+     * did not answer. That is thrown, and the file stays exactly as it was. The previous version
+     * caught every exception here and wrote a new key over the old one, so a keystore that was busy
+     * for a moment cut the phone off from every machine that trusted it.
+     *
+     * Held under one lock for the whole process, because a phone has one key file and the screen,
+     * the debug bridge and a recreated activity each build their own [DeviceIdentity]. Two of them
+     * finding no key at once would otherwise each write one, and the first would go on using a key
+     * that is no longer the one on disk.
+     */
+    private fun loadOrCreate(): SshIdentity = synchronized(CREATION) {
+        val seed = try {
+            when (val stored = vault.read(keyFile)) {
+                is Unsealed.Opened -> stored.secret.takeIf { it.size == SEED_BYTES }
+                    ?: replace("the file that holds it does not hold an ed25519 key")
+
+                Unsealed.Absent -> newSeed().also { vault.write(keyFile, it) }
+                is Unsealed.Lost -> replace(stored.reason)
+            }
+        } catch (failure: Exception) {
+            throw DeviceKeyUnavailable(failure)
+        }
 
         val curve = EdDSANamedCurveTable.ED_25519_CURVE_SPEC
         val privateSpec = EdDSAPrivateKeySpec(seed, curve)
         val publicSpec = EdDSAPublicKeySpec(privateSpec.a, curve)
-        return SshIdentity(
+        SshIdentity(
             publicKey = EdDSAPublicKey(publicSpec),
             privateKey = EdDSAPrivateKey(privateSpec),
             comment = comment(),
@@ -89,28 +146,27 @@ class DeviceIdentity(context: Context) {
     }
 
     /**
-     * The stored seed, or null if there is nothing usable on disk.
+     * A new key in place of one that can never be opened again.
      *
-     * Null covers "never generated" and "there is a file and it cannot be turned back into a key",
-     * and they are deliberately the same answer. The second case happens when the Android keystore
-     * entry that wraps the file is gone: a restore onto a new phone, storage cleared underneath the
-     * app, a keystore reset. The old private key is unrecoverable in every one of those, so the only
-     * question is whether the app generates a new one or refuses to work forever.
-     *
-     * It has to generate. Failing here does not fail one call, it fails every call including the
-     * screen that shows the public key, which is the one screen the user needs in order to recover.
-     * A fresh key lands the app in "this key is not authorised yet", which is a state it already
-     * knows how to explain and the user already knows how to fix.
+     * The change is written down first, so a process that dies anywhere in here still tells the
+     * user next time; the old file is moved aside rather than written over; and only then is a new
+     * key written where it was.
      */
-    private fun storedSeed(): ByteArray? {
-        val seed = try {
-            KeyVault.read(keyFile)
-        } catch (_: Exception) {
-            null
-        } ?: return null
+    private fun replace(reason: String): ByteArray {
+        changeFile.parentFile?.mkdirs()
+        changeFile.writeText("${clock()}\n$reason\n")
+        vault.setAside(keyFile, clock())
+        return newSeed().also { vault.write(keyFile, it) }
+    }
 
-        if (seed.size != SEED_BYTES) return null
-        return seed
+    private fun readChange(): KeyChange? {
+        if (!changeFile.exists()) return null
+        val lines = changeFile.readText().lines()
+        // A note cut short is still a note that the key changed, and that is the part that matters.
+        return KeyChange(
+            at = lines.firstOrNull()?.trim()?.toLongOrNull() ?: changeFile.lastModified(),
+            reason = lines.getOrNull(1)?.trim().orEmpty(),
+        )
     }
 
     /**
@@ -119,18 +175,48 @@ class DeviceIdentity(context: Context) {
      */
     private fun newSeed(): ByteArray = ByteArray(SEED_BYTES).also { SecureRandom().nextBytes(it) }
 
-    private fun comment(): String {
-        val device = "${Build.MANUFACTURER} ${Build.MODEL}"
-            .trim()
-            .replace(Regex("[^A-Za-z0-9._-]+"), "-")
-            .trim('-')
-            .ifEmpty { "android" }
-        return "legion-control@$device"
-    }
-
     private companion object {
         const val SEED_BYTES = 32
+
+        /** One per process: see [loadOrCreate]. */
+        val CREATION = Any()
     }
+}
+
+/**
+ * This phone's key was replaced, because the one before could no longer be opened.
+ *
+ * Worth telling the user in so many words. Every machine that accepted the old key refuses the new
+ * one until its line is added, and "not authorised" on its own reads like something changed on the
+ * machine rather than on the phone.
+ */
+data class KeyChange(
+    /** Milliseconds since the epoch. */
+    val at: Long,
+    /** Why the old key could not be opened, as a clause: "the Android keystore no longer has ...". */
+    val reason: String,
+)
+
+/**
+ * This phone's key is on the phone and could not be read just now.
+ *
+ * Nothing was replaced. The next attempt reads the same file again, and an error from the keystore
+ * or the disk is far more often a moment than a loss.
+ */
+class DeviceKeyUnavailable(cause: Throwable) : IOException(
+    "This phone's key could not be read just now. Nothing was replaced, and it is read again on " +
+        "the next try. (${cause.message?.takeIf { it.isNotBlank() } ?: cause::class.java.simpleName})",
+    cause,
+)
+
+/** "legion-control@<maker>-<model>", which is how the line is recognised in authorized_keys. */
+private fun deviceComment(): String {
+    val device = "${Build.MANUFACTURER} ${Build.MODEL}"
+        .trim()
+        .replace(Regex("[^A-Za-z0-9._-]+"), "-")
+        .trim('-')
+        .ifEmpty { "android" }
+    return "legion-control@$device"
 }
 
 /**

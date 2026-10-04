@@ -168,6 +168,33 @@ sealed class AgentFailure(
         override val kind: FailureKind get() = FailureKind.TIMED_OUT
     }
 
+    /**
+     * This phone's own key could not be read, so nothing was sent.
+     *
+     * Kept apart from a machine that did not answer, because the fix is on this side: the key is
+     * still there and the next attempt reads it again. Route level and never sent, as an ssh client
+     * that could not be started is in section 15.4, so the walk tries the next address, which reads
+     * the key once more.
+     */
+    class KeyUnavailable(cause: Throwable) : AgentFailure(
+        "This phone's key could not be read just now. Nothing was sent.",
+        generateSequence(cause) { it.cause }.last().let { it.message ?: it::class.java.simpleName },
+        cause,
+    ) {
+        override val kind: FailureKind get() = FailureKind.LAUNCH_FAILED
+    }
+
+    /**
+     * A legacy bootstrap stopped before its install step was sent.
+     *
+     * The preflight refused the installation base, or the archive did not arrive. Only the install
+     * step changes anything on the far side, so nothing was installed and pressing it again cannot
+     * install twice. Whatever an earlier step left behind is refused by the install's own checks: a
+     * partial upload does not have the size or the hash it is run with.
+     */
+    class BootstrapStopped(summary: String, detail: String?, cause: Throwable? = null) :
+        AgentFailure(summary, detail, cause)
+
     /** Bootstrap layouts were exhausted; installation state is still unknown. */
     class DiscoveryFailed(detail: String?) : AgentFailure(
         "Could not locate or start the control agent on that machine.",

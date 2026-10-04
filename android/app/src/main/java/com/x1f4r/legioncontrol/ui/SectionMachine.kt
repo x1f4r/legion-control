@@ -96,7 +96,7 @@ fun MachineSection(model: MachineModel, app: AppModel) {
     servicePage?.let { page -> DetailSheet(page.name, { servicePage = null }) { ServiceSection(model, page) } }
     sheet?.let { title -> DetailSheet(title, { sheet = null }) {
         when (title) {
-            "Authorize this device" -> AuthorisationScreen(app.publicKey, model.machine.systems, model.statusDetail) { model.refreshNow() }
+            "Authorize this device" -> AuthorisationScreen(app.publicKey, model.machine.systems, model.statusDetail, keyChanged = app.keyChange != null) { model.refreshNow() }
             "Activity" -> OperationsBlock(model)
             "Diagnostics" -> DiagnosticsBlock(model)
             "Telemetry" -> ConfiguredMetricsBlock(model.status?.metrics.orEmpty())

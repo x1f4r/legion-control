@@ -26,6 +26,7 @@ import com.x1f4r.legioncontrol.agent.readControllerReply
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -53,6 +54,10 @@ private class WiredServices(private val control: LegionControl) : ControlService
     override suspend fun publicKey(): String = control.identity.identity().authorizedKeysLine
 
     override suspend fun keyFingerprint(): String = control.identity.identity().fingerprint
+
+    override suspend fun keyChange(): KeyChange? = control.identity.change()
+
+    override suspend fun acknowledgeKeyChange() = control.identity.acknowledgeChange()
 
     override val config: StateFlow<ControllerConfig?> get() = control.config.config
 

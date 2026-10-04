@@ -20,6 +20,7 @@ import com.x1f4r.legioncontrol.agent.provenanceOf
 import com.x1f4r.legioncontrol.agent.shouldAskForMeta
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.EXAMPLE_CONTROLLER_CONFIG
+import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.agent.SetupChangePreview
 import com.x1f4r.legioncontrol.data.SetupMerge
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -32,6 +33,7 @@ import com.x1f4r.legioncontrol.data.advisories
 import com.x1f4r.legioncontrol.data.SiteConfig
 import com.x1f4r.legioncontrol.net.SiteMatch
 import com.x1f4r.legioncontrol.net.matchSite
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -91,6 +93,14 @@ class AppModel(
     var publicKey: String by mutableStateOf("")
         private set
     var keyFingerprint: String by mutableStateOf("")
+        private set
+
+    /** Why this phone's key could not be read the last time it was asked for. Nothing was replaced. */
+    var keyProblem: String? by mutableStateOf(null)
+        private set
+
+    /** This phone's key was replaced because the old one could no longer be opened, until seen. */
+    var keyChange: KeyChange? by mutableStateOf(null)
         private set
 
     var now: Long by mutableStateOf(System.currentTimeMillis())
@@ -261,12 +271,7 @@ class AppModel(
 
     fun startPolling() {
         polling = true
-        if (publicKey.isEmpty()) {
-            scope.launch {
-                publicKey = runCatching { services.publicKey() }.getOrDefault("")
-                keyFingerprint = runCatching { services.keyFingerprint() }.getOrDefault("")
-            }
-        }
+        if (publicKey.isEmpty()) loadKey()
         machines.forEach { it.startPolling() }
         // Anything that was in flight when the app was last closed is picked up rather than assumed.
         operations.resume(clients)
@@ -279,6 +284,40 @@ class AppModel(
                 }
             }
         }
+    }
+
+    /**
+     * Reads this phone's key, and whether it was replaced.
+     *
+     * A key that could not be read is said so, rather than drawn as one that has not been generated
+     * yet: it is there, nothing replaced it, and this is asked again on the next return to the app
+     * or a press of Try again.
+     */
+    fun loadKey() {
+        scope.launch {
+            try {
+                publicKey = services.publicKey()
+                keyFingerprint = services.keyFingerprint()
+                keyProblem = null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                keyProblem = failure.message ?: "This phone's key could not be read just now."
+            }
+            keyChange = try {
+                services.keyChange()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                keyChange
+            }
+        }
+    }
+
+    /** The user has seen that the key changed and has the new one. */
+    fun acknowledgeKeyChange() {
+        keyChange = null
+        scope.launch { runCatching { services.acknowledgeKeyChange() } }
     }
 
     fun stopPolling() {

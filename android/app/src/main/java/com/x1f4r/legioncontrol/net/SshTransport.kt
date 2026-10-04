@@ -219,8 +219,18 @@ class SshTransport internal constructor(
     }
 
     private suspend fun authenticate(client: SSHClient, endpoint: Endpoint, handshakeExpired: AtomicBoolean) {
+        // Read apart from the authentication itself, because a key this phone could not read is a
+        // fact about the phone. Folded into the generic translation below it read as the machine not
+        // answering, and sent the user looking at the network.
+        val key = try {
+            keys()
+        } catch (failure: CancellationException) {
+            throw failure
+        } catch (failure: Exception) {
+            throw AgentFailure.KeyUnavailable(failure)
+        }
         try {
-            client.authPublickey(endpoint.user, keys())
+            client.authPublickey(endpoint.user, key)
         } catch (failure: CancellationException) {
             throw failure
         } catch (failure: UserAuthException) {

@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.BuildConfig
 import com.x1f4r.legioncontrol.agent.MachineSystem
 import com.x1f4r.legioncontrol.data.DeviceBindings
+import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.net.AppUpdates
 import java.io.File
 
@@ -265,6 +266,18 @@ private fun DeviceKeyBlock(app: AppModel) {
 
     SectionHeading("This phone's key")
 
+    app.keyChange?.let { change ->
+        KeyChangedNotice(app, change, systems)
+        return
+    }
+    app.keyProblem?.takeIf { app.publicKey.isBlank() }?.let { problem ->
+        StatusLine(Mark.Attention, problem)
+        Actions {
+            PlainAction("Try again", enabled = true) { app.loadKey() }
+        }
+        return
+    }
+
     if (showKey) {
         ExplanationText(
             "This phone has a key of its own. It has to be in authorized_keys on " +
@@ -298,6 +311,37 @@ private fun DeviceKeyBlock(app: AppModel) {
         Actions {
             PlainAction("Show this phone's key", enabled = true) { showKey = true }
         }
+    }
+}
+
+/**
+ * The key was replaced, said in so many words and with the new key right there.
+ *
+ * Every machine that accepted the old key refuses this one until its line is added, and on a
+ * machine page that reads like something changed over there. This is the one place that can say
+ * what actually happened, so it stays until the user says they have it.
+ */
+@Composable
+private fun KeyChangedNotice(app: AppModel, change: KeyChange, systems: List<MachineSystem>) {
+    StatusLine(Mark.Attention, "This phone's key changed on ${localTime(change.at)}.")
+    Spacer(Modifier.height(6.dp))
+    ExplanationText(
+        listOfNotNull(
+            change.reason.takeIf { it.isNotBlank() }?.let { "The old one could not be opened: $it." },
+            "Add the new key below to authorized_keys on ${systemsSentence(systems)}. The line for " +
+                "the old key can come out; nothing can use it any more.",
+        ).joinToString(" "),
+    )
+    Spacer(Modifier.height(10.dp))
+    AuthorizedKeysPaths()
+    Spacer(Modifier.height(14.dp))
+    PublicKeyBlock(app.publicKey)
+    app.keyFingerprint.takeIf { it.isNotBlank() }?.let {
+        Spacer(Modifier.height(6.dp))
+        CommandText(it)
+    }
+    Actions {
+        PlainAction("Done", enabled = true) { app.acknowledgeKeyChange() }
     }
 }
 

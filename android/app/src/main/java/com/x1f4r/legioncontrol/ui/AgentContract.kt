@@ -22,6 +22,7 @@ import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -257,6 +258,12 @@ interface ControlServices {
 
     /** This phone's key fingerprint, for comparing by eye. */
     suspend fun keyFingerprint(): String
+
+    /** When this phone's key was replaced because the old one could no longer be opened, until seen. */
+    suspend fun keyChange(): KeyChange?
+
+    /** The user has seen [keyChange]. */
+    suspend fun acknowledgeKeyChange()
 
     /** The configuration in force, or null when there is none. */
     val config: StateFlow<ControllerConfig?>
