@@ -6,9 +6,12 @@ A client decodes with every field optional.
 
 ## 3 — agent 3.1.0, clients 1.4.0
 
-Contract stays 3 and the setup document stays `"version": 1`. Every wire change
-only adds keys, and a client recognises each one by its presence, never by
-comparing versions (v3.md section 1, "Additions in agent 3.1.0").
+Contract stays 3 and the setup document stays `"version": 1`. Every reply
+change only adds keys or brings a reply in line with the fixtures, and a client
+recognises each added key by its presence, never by comparing versions (v3.md
+section 1, "Additions in agent 3.1.0"). The setup document's guard grammars now
+refuse values that ssh, a shell or known_hosts would read as syntax, so a few
+documents the 3.0 schema allowed are refused (see Changed).
 
 ### Added
 
@@ -19,11 +22,13 @@ comparing versions (v3.md section 1, "Additions in agent 3.1.0").
   the one function of section 5.6, `contract/tools/outcome.mjs`.
 - **`raw` on `config`**: the stored document as text, exactly the canonical
   bytes `hash` covers, null exactly when `controller` is. `bytes` is its UTF-8
-  length. Clients hash and adopt `raw` and never re-serialise `controller`.
+  length. Clients hash and adopt `raw` and never re-serialise `controller`. A
+  `config` reply is at most 4 MiB of stdout (section 4).
 - **The version floor.** `status.agent.floor` and `floor` on every
   `self-update` reply; `self-update --allow-downgrade`. A signed agent declares
-  `legionControl.agentFloor`; a restricted session only moves the agent forward,
-  and an unrestricted one needs the flag to go below the floor (section 13).
+  `legionControl.agentFloor`. A restricted session only installs forward or rolls
+  back to a tree at or above the floor, and an unrestricted one needs the flag
+  to go below the live version or the floor (section 13).
 - `status.agent.signed`: whether the running tree carries its signed manifest.
 - Doctor checks `agent.floor`, `agent.signed`, `files.private` and `ssh.shell`.
 - `problems: [{path, message}]` on a `config-invalid` refusal of `config set`.
@@ -58,13 +63,29 @@ comparing versions (v3.md section 1, "Additions in agent 3.1.0").
   column.
 - `controller-document.schema.json` holds hosts, users, argv items and the
   update repository to the guard grammars, types the deprecated `machine.ssh`,
-  and allows an empty `agent`, which means the system is not driven.
+  and allows an empty `agent`, which means the system is not driven. A document
+  the 3.0 schema allowed, one with a non-ASCII or `$`-suffixed login name for
+  example, is now refused by peer intake and by `config set`, and agent 3.1.0
+  refuses some pushes a 3.0.x agent stored with `config-invalid` or
+  `restricted`.
 - **The agent reads launch values in restricted sessions.** It compares a pushed
   document's launch values with the ones the held document carries, by the rules
   of section 9.9; unrestricted sessions are never refused for them.
 - Rule 5 of section 1 now points at section 15: an argv is serialised for its
   system's grammar exactly as that section specifies, and a system restricted on
-  the route uses the dispatcher grammar on every platform.
+  the route uses the dispatcher grammar on every platform. It also states how
+  every pattern of the contract matches: the whole input, ASCII classes only,
+  and U+000A or U+000D refused first.
+- The `cycle` and `self-update` schemas allow the action `already-running` and
+  the `detached` copied onto a replay, which is how agent 3.1.0 answers a
+  replay of a running record (section 5.5).
+- A cycle child deferred by policy may have `opId: null`; only a deferral may.
+  3.0.x agents already sent it, and the schema now allows it.
+- **Process evidence.** A process probe whose `error` is set or whose `state` is
+  `unknown` is not evidence that the process stopped: no running turn is
+  abandoned and the stop guard holds (section 6). A recovery obligation clears
+  only on a positive running reading or a successful start; a failed or
+  unreadable probe keeps it and says why (section 5.5).
 
 ### Fixed (agent replies)
 
@@ -82,15 +103,14 @@ not, the agent now answers as they say.
 - A service whose `busy.type` is `none` is monitored.
 - A replay of a running operation answers `action: "already-running"` with
   `ok: true`, `replayed: true` and the record's `detached`, never `accepted`.
-  `cycle` and `self-update` gain `already-running`.
 - A lock `conflict` answers `ok: true`.
 - A finished record's `result.ok` is true exactly when its `reasonCode` is
   null.
-- `cancel` of a running operation answers `already-running`.
+- `cancel` of a running operation answers `conflict` with
+  `reasonCode: "already-running"`, not `operation-in-progress`.
 - `--detach` replies carry every key of their command's shape, and a fresh
   record has a phase.
 - `cycle --dry-run` answers `skipped`.
-- A cycle child deferred by policy has `opId: null`; only a deferral may.
 - An `--op` id reused with another intent is refused with `bad-argument`
   naming `--op`, never replayed and never reported as a lock `conflict`.
 - A `config set` refused by the operation lock exits 1, with outcome
@@ -98,20 +118,27 @@ not, the agent now answers as they say.
 
 ### Client rules
 
-- Decide on `outcome`; reduce it with section 5.6 when it is absent or unknown.
-  `pending` is polled with `op ID --wait 20`, the terminal outcomes stop
-  polling, and `unknown` is never resent automatically.
+- Decide on `outcome`; reduce it with section 5.6 when it is absent or a value
+  the client does not know. `pending` is polled with `op ID --wait 20`, the
+  terminal outcomes stop polling, and `unknown` is never resent automatically.
 - Hash and adopt `config.raw`. Without it, rebuild two-space JSON in received
   key order and adopt only on a matching hash, otherwise decline.
+- Before publishing, pasting, importing or adopting a document, refuse it for the
+  first of `too-large`, `invalid-utf8`, `empty` and `not-a-json-object`, the
+  last two decided on the canonical bytes (section 12).
+- `process.running` is evidence only when `process.error` is null; otherwise the
+  client shows the process as unknown (section 8).
 - Never send `--allow-downgrade` to an agent whose status carries no `floor`,
   and only after a person decided to go back.
 - **Launch values need local approval** (section 9.9). A system's
   `{agent, grammar}`, `machine.ssh.identityFile`, `appUpdates.githubRepo` and
   `local` are applied with the document and run only once this device approved
-  them; until then the value last approved at that place runs, or nothing.
-  Approve, a local edit, enrolment after a summary of every launch value, and
-  the first start of a 1.4 client approve; replication never does. The launcher
-  migration under the same base and grammar is accepted without asking.
+  them; until then the value last approved at that place runs (the built-in
+  repository for `githubRepo`), or nothing, and a recorded value that could not
+  run itself counts as none. Approve, a local edit, enrolment after a summary of
+  every launch value, and the first start of a 1.4 client approve; replication
+  never does. The launcher migration under the same base and grammar is
+  accepted without asking.
 - **Command lines and retry safety** (section 15). The grammar is `dispatch`
   when the system is restricted on the route, else its `shell`, else `posix`, or
   `cmd` on Windows; it is never inferred and a line is never retried in another
@@ -141,9 +168,12 @@ not, the agent now answers as they say.
   or `config-invalid` is held until the hash changes or a person asks. A merge
   goes entry by entry: it asks about a deletion against an edit, keeps endpoints
   without an id and unknown keys, inserts what theirs added after its
-  predecessor, and never rewrites a number. A device whose applied document
-  breaks `unknown-site` or a `helper-` rule still merges, and only a result
-  section 9.7 accepts is written.
+  predecessor, and never rewrites a number. Theirs' n-th endpoint without an id
+  stands for the result's n-th when it places what theirs added. A top-level key
+  that begins with `"`, `controller.`, `sites[` or `machines[` is an entry
+  written inside double quotes, so a difference's `entry` may be quoted. A
+  device whose applied document breaks only `unknown-site` or a `helper-` rule
+  still merges, and only a result section 9.7 accepts is written.
 - **A client older than its agent** keeps using the highest contract it
   implements and says so once (section 1, rule 9). Nothing on the wire changes.
 - **Sites and wake are normative** (sections 10.1 and 10.2), with one
@@ -157,7 +187,9 @@ not, the agent now answers as they say.
   Android never a VPN network or one blocked for the app. `currentSite` counts
   only while one of its site's prefixes matches or the site has none. Exactly one
   matching site is effective; several are ambiguous and none is picked.
-- **Direct wake** sends to `wake.broadcast`, else the site's `broadcast`, else
+- **Direct wake** needs a `wake.mac` and the target on this device's network;
+  otherwise the direct step is skipped as `no-mac`, `ambiguous`, `unplaced` or
+  `elsewhere`. It sends to `wake.broadcast`, else the site's `broadcast`, else
   the directed broadcast of the placing address when its prefix length is known
   and at most 30, else 255.255.255.255. Only dotted IPv4 counts and names are
   never resolved. Ports are 1–65535, else 9 and 7, and every address and port
