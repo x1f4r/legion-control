@@ -70,9 +70,11 @@ class AppModel(
      * The scope changes run on.
      *
      * Deliberately not tied to the screen. Polling stops when the app is put away; an update that
-     * was asked for does not, because locking the phone is not withdrawing the request.
+     * was asked for does not, because locking the phone is not withdrawing the request. A failure
+     * nothing caught is logged rather than allowed to end the process.
      */
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler("AppModel"))
     private var clockJob: Job? = null
     private var polling = false
 

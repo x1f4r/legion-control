@@ -42,7 +42,8 @@ class AppUpdateModel(
     private val repo: () -> String,
 ) {
     private val app = context.applicationContext
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler("AppUpdateModel"))
 
     private val schedule = UpdateCheckSchedule()
     private var foregroundJob: Job? = null
