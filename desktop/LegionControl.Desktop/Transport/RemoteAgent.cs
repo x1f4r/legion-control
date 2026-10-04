@@ -407,6 +407,7 @@ public sealed class RemoteAgent
             failure.Detail, failure.TimeoutSeconds, failure.RouteId)
         {
             FailedRouteIds = failedRoutes,
+            Cancelled = failure.Cancelled,
         };
     }
 
@@ -445,7 +446,10 @@ public sealed class RemoteAgent
                 launchFailure);
         }
         throw new AgentFailure(reading.Kind!.Value, reading.Dispatch, local.System, route.Label,
-            Condense(result.FailureText), reading.Kind == FailureKind.TimedOut ? (int)timeout.TotalSeconds : 0);
+            Condense(result.FailureText), reading.Kind == FailureKind.TimedOut ? (int)timeout.TotalSeconds : 0)
+        {
+            Cancelled = reading.Kind == FailureKind.TimedOut && result.Cancelled,
+        };
     }
 
     /// What one ssh attempt's result says when it is not a reply, or null when it is one. The
@@ -458,7 +462,10 @@ public sealed class RemoteAgent
 
     private static AgentFailure Failure(AttemptReading reading, CommandResult result, Attempt attempt, int timeoutSeconds) =>
         new(reading.Kind!.Value, reading.Dispatch, attempt.System, attempt.Route.Label, Condense(result.FailureText),
-            reading.Kind == FailureKind.TimedOut ? timeoutSeconds : 0, attempt.Route.Id);
+            reading.Kind == FailureKind.TimedOut ? timeoutSeconds : 0, attempt.Route.Id)
+        {
+            Cancelled = reading.Kind == FailureKind.TimedOut && result.Cancelled,
+        };
 
     /// Which of two failures is the one worth telling the user about.
     ///

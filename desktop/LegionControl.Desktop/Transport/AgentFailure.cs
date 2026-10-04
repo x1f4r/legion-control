@@ -72,6 +72,10 @@ public sealed class AgentFailure : Exception
     public string Detail { get; }
     public Dispatch Dispatch { get; }
     public int TimeoutSeconds { get; }
+    /// This app ended the command because it was asked to, not because time ran out. Only ever
+    /// with [FailureKind.TimedOut]: a cancelled command is exactly as unknown as one that ran out
+    /// of time, so the kind and the dispatch stay those of a timeout and only the words change.
+    public bool Cancelled { get; init; }
 
     public AgentFailure(
         FailureKind kind,
@@ -107,6 +111,7 @@ public sealed class AgentFailure : Exception
             $"The host key for {machine} is not one already approved for this address, so ssh refused to connect and nothing was run. On a dual boot machine this may be the other configured system answering.",
         FailureKind.HostKeyUnknown =>
             $"{machine} is not in known_hosts. Check the fingerprint and trust it before this app will talk to it.",
+        FailureKind.TimedOut when Cancelled => $"The command to {machine} was cancelled before it answered. Whether it ran is not known.",
         FailureKind.TimedOut => $"{machine} did not answer within {TimeoutSeconds} seconds. Whether the command ran is not known.",
         FailureKind.LinkLost => $"The connection to {machine} dropped. Whether the command ran is not known.",
         FailureKind.InterpreterMissing => $"The interpreter the document names for {System?.Name ?? machine} is not on that system.",
@@ -135,6 +140,7 @@ public sealed class AgentFailure : Exception
         FailureKind.AuthenticationFailed => "key rejected",
         FailureKind.HostKeyChanged => "host key changed",
         FailureKind.HostKeyUnknown => "host key not known",
+        FailureKind.TimedOut when Cancelled => "cancelled before it answered",
         FailureKind.TimedOut => $"timed out after {TimeoutSeconds}s",
         FailureKind.LinkLost => "connection dropped",
         FailureKind.InterpreterMissing => "interpreter missing",

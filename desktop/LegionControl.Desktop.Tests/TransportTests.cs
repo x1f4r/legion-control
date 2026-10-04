@@ -677,6 +677,29 @@ public class RetryTests
         Assert.Single(runner.Calls);
     }
 
+    [Fact]
+    public async Task ACancelledMutationIsAsUnknownAsATimeoutAndSaysItWasCancelled()
+    {
+        // Retry safety reads the kind and the dispatch, and those stay a timeout's. The words do
+        // not: "did not answer within 45 seconds" about a command somebody cancelled after two is
+        // a sentence about a different event.
+        using var home = new TempHome();
+        var runner = new FakeRunner(_ => new CommandResult { ExitCode = -1, TimedOut = true, Cancelled = true });
+        var failure = await Assert.ThrowsAsync<AgentFailure>(() =>
+            new RemoteAgent(TwoRoutes, runner).MutateAsync(new[] { "restart" }, TimeSpan.FromSeconds(45)));
+        Assert.Single(runner.Calls);
+        Assert.Equal(FailureKind.TimedOut, failure.Kind);
+        Assert.Equal(Dispatch.Unknown, failure.Dispatch);
+        Assert.True(failure.Cancelled);
+        Assert.Equal("The command to Legion was cancelled before it answered. Whether it ran is not known.", failure.Sentence("Legion"));
+        Assert.Equal("cancelled before it answered", failure.ShortReason);
+
+        var timedOut = RemoteAgent.Classify(FakeRunner.TimedOutResult(), new Attempt(TwoRoutes.Routes[0], Linux), 45)!;
+        Assert.False(timedOut.Cancelled);
+        Assert.Equal("Legion did not answer within 45 seconds. Whether the command ran is not known.", timedOut.Sentence("Legion"));
+        Assert.Equal("timed out after 45s", timedOut.ShortReason);
+    }
+
     private static readonly SystemConfig Linux = new() { Id = "linux", Agent = new[] { "node", "/agent.mjs" } };
     private static readonly SystemConfig Windows = new()
     {
