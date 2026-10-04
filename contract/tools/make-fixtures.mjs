@@ -3163,6 +3163,12 @@ add('auto-update.off.json', {
 
 const KEY_FINGERPRINT = '8f2b6d41c0973ea5b8de10f47c26935ab0d84e7f1c53920684bfae7d3506c19b';
 
+// Every self-update reply from agent 3.1.0 on states `floor` (contract section
+// 13). The trees the fixtures up to the downgrade ones show are 2.1.0 and
+// 3.0.0, which declare no floor, and nothing has recorded one, so no floor is
+// in effect and the reply says null. The downgrade fixtures show a 3.1.0 tree
+// and the floor it declares.
+
 add('self-update.check.json', {
   command: 'self-update',
   variant: 'check',
@@ -3173,6 +3179,7 @@ add('self-update.check.json', {
   ...envelope({ message: 'agent 2.1.0 is installed, contract 2; the bundled agent is 3.0.0' }),
   action: 'checked',
   current: { version: '2.1.0', contract: 2 },
+  floor: null,
   staged: null,
   previous: null,
   manifest: null,
@@ -3191,6 +3198,7 @@ add('self-update.installed.json', {
   ...envelope({ message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/me/.legion-control/agent.prev', outcome: 'succeeded' }),
   action: 'installed',
   current: { version: '3.0.0', contract: 3 },
+  floor: null,
   staged: null,
   previous: { version: '2.1.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: {
@@ -3220,6 +3228,7 @@ add('self-update.signature-invalid.json', {
   }),
   action: 'failed',
   current: { version: '2.1.0', contract: 2 },
+  floor: null,
   staged: null,
   previous: null,
   manifest: null,
@@ -3242,6 +3251,7 @@ add('self-update.self-test-failed.json', {
   }),
   action: 'failed',
   current: { version: '2.1.0', contract: 2 },
+  floor: null,
   staged: null,
   previous: null,
   manifest: {
@@ -3266,7 +3276,7 @@ add('self-update.rolled-back.json', {
   tags: ['self-update', 'recovery'],
 }, {
   ...envelope({ message: 'rolled back to the previous signed agent 3.0.0; the outgoing build is kept at /home/me/.legion-control/agent.prev', outcome: 'succeeded' }),
-  action: 'rolled-back', current: { version: '3.0.0', contract: 3 }, staged: null,
+  action: 'rolled-back', current: { version: '3.0.0', contract: 3 }, floor: null, staged: null,
   previous: { version: '3.0.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: { schema: 1, version: '3.0.0', contract: 3, files: 31, signatureVerified: true, keyFingerprint: KEY_FINGERPRINT },
   selfTest: { ok: true, exitCode: 0, output: '{"ok":true,"contract":3,"agentVersion":"3.0.0","selfTest":{"ok":true}}' },
@@ -3280,7 +3290,7 @@ add('self-update.legacy-rollback-refused.json', {
   tags: ['self-update', 'trust', 'legacy'],
 }, {
   ...envelope({ ok: false, reasonCode: 'signature-invalid', message: 'The previous agent is retained, but it is not a complete tree signed by the release key; restore it manually after independent verification.', outcome: 'failed' }),
-  action: 'failed', current: { version: '3.0.0', contract: 3 }, staged: null,
+  action: 'failed', current: { version: '3.0.0', contract: 3 }, floor: null, staged: null,
   previous: { version: '2.1.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: null, selfTest: null, op: null,
 });

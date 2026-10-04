@@ -126,12 +126,25 @@ export function readJsonStore(file) {
  * directory fsync makes the rename durable rather than merely ordered.
  */
 export function writeJsonAtomic(file, value) {
+  return writeAtomic(file, `${JSON.stringify(value, null, 2)}\n`, 0o666);
+}
+
+/**
+ * The same atomic write for exact bytes that only this user may read: the temp
+ * file is created 0600, so the rename puts a private file in place rather than
+ * one a later chmod has to catch up with.
+ */
+export function writePrivateAtomic(file, data) {
+  return writeAtomic(file, data, 0o600);
+}
+
+function writeAtomic(file, data, mode) {
   ensureDir(path.dirname(file));
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
   try {
-    const fd = fs.openSync(tmp, 'wx');
+    const fd = fs.openSync(tmp, 'wx', mode);
     try {
-      fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+      fs.writeFileSync(fd, data);
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);

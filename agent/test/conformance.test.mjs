@@ -635,11 +635,19 @@ test('self-update conforms for a bad bundle, an empty rollback and restricted sh
     oneService(home);
     const junk = path.join(home, 'junk.tar.gz');
     fs.writeFileSync(junk, 'not a signed bundle');
-    invoke(home, ['self-update', '--check', '--from', junk]);
-    assert.equal(invoke(home, ['self-update', '--from', junk]).outcome, 'failed');
-    assert.equal(invoke(home, ['self-update', '--rollback']).outcome, 'failed');
+    // Every self-update reply states the version floor (contract section 13).
+    const floored = (reply) => {
+      assert.ok('floor' in reply, `${reply.message}: a self-update reply states the floor`);
+      return reply;
+    };
+    floored(invoke(home, ['self-update', '--check', '--from', junk]));
+    assert.equal(floored(invoke(home, ['self-update', '--from', junk])).outcome, 'failed');
+    assert.equal(floored(invoke(home, ['self-update', '--rollback'])).outcome, 'failed');
+    assert.equal(floored(invoke(home, ['self-update', '--rollback', '--allow-downgrade'])).reasonCode, 'not-configured');
     assert.equal(invoke(home, ['self-update', '--from', junk], { restricted: true }).outcome, 'failed');
     invoke(home, ['self-update', '--check', '--stdin', '--install=1'], { restricted: true, stdin: 'not a bundle' });
+    assert.equal(invoke(home, ['self-update', '--rollback', '--allow-downgrade'], { restricted: true }).reasonCode, 'restricted');
+    assert.equal(invoke(home, ['self-update', '--rollback', '--allow-downgrade'], { env: { LEGIONCTL_RESTRICTED: '1' } }).reasonCode, 'restricted');
   });
 });
 

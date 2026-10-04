@@ -141,7 +141,9 @@ function stableEntryAlias(entry) {
  * allowing the upload does not allow running what was uploaded.
  *
  * `self-update --from PATH` and `--install` are refused: both would run a tree
- * whose provenance is a path this same session chose.
+ * whose provenance is a path this same session chose. So is `--allow-downgrade`:
+ * a restricted key only ever moves the agent forward, or back to a signed agent
+ * at or above the version floor (contract section 13).
  */
 export const RESTRICTED_COMMANDS = new Set([
   'status',
@@ -173,6 +175,9 @@ function refuseRestrictedShape(command, rest) {
     if (rest.includes('--install')) return 'self-update --install runs a tree this session provided, so it is not available to a restricted key';
     if (rest.some((token) => token === '--from' || token.startsWith('--from='))) {
       return 'self-update --from runs a tree from a path this session chose; a restricted key uploads with --stdin instead';
+    }
+    if (rest.some((token) => token === '--allow-downgrade' || token.startsWith('--allow-downgrade='))) {
+      return 'self-update --allow-downgrade takes the agent below the installed one or the version floor, which only an unrestricted session may decide';
     }
     if (!rest.includes('--stdin') && !rest.includes('--check') && !rest.includes('--rollback')) {
       return 'self-update from a restricted key needs --stdin, --check or --rollback';

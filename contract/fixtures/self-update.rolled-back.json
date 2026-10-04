@@ -13,6 +13,7 @@
     "version": "3.0.0",
     "contract": 3
   },
+  "floor": null,
   "staged": null,
   "previous": {
     "version": "3.0.0",

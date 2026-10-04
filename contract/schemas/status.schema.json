@@ -74,7 +74,7 @@
           "uniqueItems": true
         },
         "floor": {
-          "description": "From agent 3.1.0 on: the version floor, the oldest agent this machine may be replaced by (v3.md section 13). Null when the floor file cannot be read. Absent from older agents, which have no downgrade protection; a client never sends --allow-downgrade to an agent that does not report it.",
+          "description": "From agent 3.1.0 on: the version floor, the oldest agent this machine may be replaced by (v3.md section 13). Null when the agent can state none: the floor file cannot be read, or there is no floor file and the live tree declares no floor (a 2.x or 3.0.x tree). Absent from older agents, which have no downgrade protection; a client never sends --allow-downgrade to an agent that does not report it.",
           "anyOf": [
             {
               "$ref": "common.schema.json#/$defs/semver"

@@ -1,95 +1,21 @@
 import assert from 'node:assert/strict';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { spawn, spawnSync } from 'node:child_process';
-import zlib from 'node:zlib';
 import test from 'node:test';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import { readBundle, resolveBootstrapLayout, selfTest } from '../src/selfupdate.mjs';
 import { acquireOperationLock } from '../src/lock.mjs';
+import { AGENT, bundleTree, isolatedModule, patchTrust, signingPair, signTree } from './signing.mjs';
 
-const AGENT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CURRENT_VERSION = JSON.parse(fs.readFileSync(path.join(AGENT, 'package.json'), 'utf8')).version;
 
 /** A copy of the agent source as a tree, package.json included, in `root`. */
 function copyAgentSource(root) {
   fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
   fs.copyFileSync(path.join(AGENT, 'package.json'), path.join(root, 'package.json'));
-}
-
-function signingPair() { return crypto.generateKeyPairSync('ed25519'); }
-const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
-
-function signTree(dir, privateKey) {
-  const files = [];
-  const walk = (relative) => {
-    const absolute = path.join(dir, relative);
-    for (const name of fs.readdirSync(absolute).sort()) {
-      const child = path.posix.join(relative, name);
-      const stat = fs.lstatSync(path.join(dir, child));
-      if (stat.isDirectory()) walk(child);
-      else if (child !== 'MANIFEST.json' && child !== 'MANIFEST.json.sig') {
-        const bytes = fs.readFileSync(path.join(dir, child));
-        files.push({ path: child, sha256: sha(bytes), size: bytes.length });
-      }
-    }
-  };
-  for (const relative of ['src', 'install']) if (fs.existsSync(path.join(dir, relative))) walk(relative);
-  for (const relative of ['package.json']) {
-    if (!fs.existsSync(path.join(dir, relative))) continue;
-    const bytes = fs.readFileSync(path.join(dir, relative));
-    files.push({ path: relative, sha256: sha(bytes), size: bytes.length });
-  }
-  files.sort((a, b) => a.path.localeCompare(b.path));
-  const version = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
-  const manifest = Buffer.from(`${JSON.stringify({ schema: 1, version, contract: 3, files }, null, 2)}\n`);
-  fs.writeFileSync(path.join(dir, 'MANIFEST.json'), manifest);
-  fs.writeFileSync(path.join(dir, 'MANIFEST.json.sig'), `${crypto.sign(null, manifest, privateKey).toString('base64')}\n`);
-}
-
-function patchTrust(src, publicKey) {
-  const file = path.join(src, 'trust.mjs');
-  const pemBody = publicKey.export({ type: 'spki', format: 'pem' }).toString().split('\n')[1];
-  const original = fs.readFileSync(file, 'utf8');
-  fs.writeFileSync(file, original.replace(/  'MCowBQYDK2VwAyEA[^']+',/, `  '${pemBody}',`));
-}
-
-function bundleTree(directory) {
-  const parts = [];
-  const walk = (relative = '') => {
-    for (const name of fs.readdirSync(path.join(directory, relative))) {
-      const child = relative ? `${relative}/${name}` : name;
-      if (fs.statSync(path.join(directory, child)).isDirectory()) { walk(child); continue; }
-      const bytes = fs.readFileSync(path.join(directory, child));
-      const header = Buffer.alloc(512);
-      header.write(`agent/${child}`, 0, 100);
-      header.write('0000644\0', 100);
-      header.write(`${bytes.length.toString(8).padStart(11, '0')}\0`, 124);
-      header.write('        ', 148);
-      header.write('0', 156);
-      header.write('ustar\0', 257);
-      header.write('00', 263);
-      const checksum = header.reduce((sum, byte) => sum + byte, 0);
-      header.write(`${checksum.toString(8).padStart(6, '0')}\0 `, 148);
-      parts.push(header, bytes, Buffer.alloc((512 - bytes.length % 512) % 512));
-    }
-  };
-  walk();
-  return zlib.gzipSync(Buffer.concat([...parts, Buffer.alloc(1024)]));
-}
-
-async function isolatedModule() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-selfupdate-module-'));
-  const src = path.join(root, 'src');
-  fs.cpSync(path.join(AGENT, 'src'), src, { recursive: true });
-  fs.copyFileSync(path.join(AGENT, 'package.json'), path.join(root, 'package.json'));
-  const pair = signingPair();
-  patchTrust(src, pair.publicKey);
-  const module = await import(`${pathToFileURL(path.join(src, 'selfupdate.mjs')).href}?${Date.now()}-${Math.random()}`);
-  return { root, src, pair, module };
 }
 
 test('stdin has an idle deadline and closes the readable', async () => {

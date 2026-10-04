@@ -25,7 +25,9 @@ documents the 3.0 schema allowed are refused (see Changed).
   length. Clients hash and adopt `raw` and never re-serialise `controller`. A
   `config` reply is at most 4 MiB of stdout (section 4).
 - **The version floor.** `status.agent.floor` and `floor` on every
-  `self-update` reply; `self-update --allow-downgrade`. A signed agent declares
+  `self-update` reply, `null` when the agent can state none (an unreadable
+  floor file, or none recorded under a 2.x or 3.0.x live tree);
+  `self-update --allow-downgrade`. A signed agent declares
   `legionControl.agentFloor`. A restricted session only installs forward or rolls
   back to a tree at or above the floor, and an unrestricted one needs the flag
   to go below the live version or the floor (section 13).

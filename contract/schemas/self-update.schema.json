@@ -73,7 +73,7 @@
       ]
     },
     "floor": {
-      "description": "From agent 3.1.0 on, on every self-update reply: the version floor that applied (v3.md section 13), or null when the floor file cannot be read.",
+      "description": "From agent 3.1.0 on, on every self-update reply: the version floor in effect once the command is done (v3.md section 13). Null when the agent can state none: the floor file cannot be read, or there is no floor file and the live tree declares no floor (a 2.x or 3.0.x tree).",
       "anyOf": [
         {
           "$ref": "common.schema.json#/$defs/semver"

@@ -27,6 +27,7 @@ import { CONTRACT_VERSION } from './contract.mjs';
 import { selectSleepCommand } from './boot.mjs';
 import { readController } from './controller.mjs';
 import { checkEndpoint } from './endpoint.mjs';
+import { effectiveFloor, floorPath, isOlder } from './floor.mjs';
 import { currentHolder } from './lock.mjs';
 import { checkServiceBusy } from './probes/busy.mjs';
 import { checkHealth } from './probes/health.mjs';
@@ -269,6 +270,55 @@ function environmentChecks() {
     ),
   );
 
+  return checks;
+}
+
+/** The agent itself: the version floor it is held to (contract section 13). */
+function agentChecks() {
+  const checks = [];
+  const floor = effectiveFloor();
+  const file = floorPath();
+  if (floor.unreadable) {
+    checks.push(
+      check(
+        'agent.floor',
+        'warn',
+        'the version floor cannot be read',
+        `${floor.error}. Until it can, a restricted key cannot roll the agent back${floor.version ? `, and only the floor ${floor.version} the live agent declares is enforced` : ''}`,
+        `write the floor this machine should keep into ${file} as {"schema":1,"version":"x.y.z"}, at most the installed ${floor.live}; an unrestricted self-update with --allow-downgrade also rewrites it`,
+      ),
+    );
+  } else if (floor.version === null) {
+    checks.push(
+      check(
+        'agent.floor',
+        'warn',
+        'no version floor is in effect',
+        `the live agent ${floor.live} declares none and ${file} does not exist, so any signed agent may replace it, an older one included`,
+        'install a signed agent 3.1.0 or later; it declares a floor and records it when it installs',
+      ),
+    );
+  } else if (isOlder(floor.live, floor.version)) {
+    checks.push(
+      check(
+        'agent.floor',
+        'fail',
+        `agent ${floor.live} is below the version floor ${floor.version}`,
+        `the stable launcher refuses to run a signed agent below the floor recorded in ${file}`,
+        `install a signed agent at or above ${floor.version}, or go back deliberately from an unrestricted session with self-update --allow-downgrade, which lowers the floor`,
+      ),
+    );
+  } else {
+    checks.push(
+      check(
+        'agent.floor',
+        'ok',
+        `version floor ${floor.version}`,
+        `agent ${floor.live} can be replaced only by a signed agent at or above it, unless an unrestricted session goes back deliberately`,
+        null,
+      ),
+    );
+  }
   return checks;
 }
 
@@ -632,7 +682,7 @@ export async function runDoctor(loaded, { service = null, deep = false } = {}) {
   const startedAt = Date.now();
   const raw = readJsonDocument(loaded.path ?? configPath());
   const sanitize = diagnosticRedactor(loaded.config, raw.state === 'ok' ? raw.value : null);
-  const checks = [...configChecks(loaded), ...environmentChecks()];
+  const checks = [...configChecks(loaded), ...environmentChecks(), ...agentChecks()];
 
   const config = loaded.config;
   if (config) {

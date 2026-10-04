@@ -5,7 +5,9 @@
 // scheduled run or a restricted SSH command repair the one dangerous crash
 // gap in a self-update: the old tree has been parked but the new tree has not
 // yet reached the live name. It never imports code from a candidate tree while
-// deciding what to recover.
+// deciding what to recover. And it refuses to run a signed tree below the
+// version floor recorded beside it, so an old release that was put back by any
+// route other than a deliberate downgrade does not start.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -158,6 +160,44 @@ function safeRelative(relative) {
   return relative.split('/').every((part) => part && part !== '.' && part !== '..' && !/[\\:<\>"|?*\x00-\x1f]/.test(part) && !/[. ]$/.test(part));
 }
 
+/**
+ * The version floor recorded in <base>/agent-floor.json (contract section 13),
+ * read here rather than imported for the same reason as everything else in this
+ * file. `{ version }` is null when there is no file; `error` says there is one
+ * whose floor cannot be read.
+ */
+export function readRecordedFloor(installBase = base) {
+  const file = path.join(installBase, 'agent-floor.json');
+  let bytes;
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.size > 64 * 1024) return { file, version: null, error: `${file} is not a small regular file` };
+    bytes = fs.readFileSync(file);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { file, version: null, error: null };
+    return { file, version: null, error: `${file} cannot be read: ${error.message}` };
+  }
+  try {
+    const recorded = JSON.parse(bytes.toString('utf8'));
+    if (recorded?.schema === 1 && typeof recorded.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+$/.test(recorded.version)) return { file, version: recorded.version, error: null };
+  } catch { /* said below, without echoing the text */ }
+  return { file, version: null, error: `${file} does not hold {"schema":1,"version":"x.y.z"}` };
+}
+
+/**
+ * Whether a signed agent `version` is below the `recorded` floor. A version
+ * that cannot be compared with a recorded floor is not shown to be at or above
+ * it, so it counts as below.
+ */
+export function belowRecordedFloor(version, recorded) {
+  if (recorded.version === null) return false;
+  const parse = (text) => /^([0-9]+)\.([0-9]+)\.([0-9]+)/.exec(String(text))?.slice(1, 4).map(Number) ?? null;
+  const [running, floor] = [parse(version), parse(recorded.version)];
+  if (!running) return true;
+  const index = running.findIndex((part, at) => part !== floor[at]);
+  return index !== -1 && running[index] < floor[index];
+}
+
 /** Verify a signed installed tree without loading any code from that tree. */
 export function verifyInstalledTree(directory) {
   const manifestFile = path.join(directory, 'MANIFEST.json');
@@ -228,6 +268,18 @@ export function main(argv = process.argv.slice(2)) {
 
   const verified = verifyInstalledTree(live);
   if (!verified.ok) throw new Error(`refusing to execute the agent: ${verified.error}`);
+  // A signed tree below the floor never runs, whoever put it there. An unsigned
+  // tree is a source checkout or a legacy install with no floor to be held to.
+  // A floor file that cannot be read only warns: refusing on it would stop the
+  // one way a client has in, and the agent itself holds an unreadable floor
+  // against anything that would go back.
+  if (verified.signed) {
+    const recorded = readRecordedFloor();
+    if (recorded.error) process.stderr.write(`Legion Control launcher: the version floor was not checked: ${recorded.error}\n`);
+    if (belowRecordedFloor(verified.manifest.version, recorded)) {
+      throw new Error(`refusing to execute agent ${verified.manifest.version}: it is below the version floor ${recorded.version} recorded in ${recorded.file}; install a signed agent at or above ${recorded.version}`);
+    }
+  }
 
   const result = spawnSync(process.execPath, [entry(live), ...argv], { cwd: base, env: process.env, stdio: 'inherit' });
   if (result.error) throw result.error;

@@ -12,6 +12,7 @@
     "version": "2.1.0",
     "contract": 2
   },
+  "floor": null,
   "staged": null,
   "previous": null,
   "manifest": null,

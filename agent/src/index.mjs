@@ -49,6 +49,7 @@ import {
 import { runAction } from './actions.mjs';
 import { MAX_CONTROLLER_BYTES, readController, readControllerMeta, storeController } from './controller.mjs';
 import { buildBundle, runDoctor } from './doctor.mjs';
+import { reportedFloor } from './floor.mjs';
 import { acquireOperationLock } from './lock.mjs';
 import { log, readLogLines } from './log.mjs';
 import {
@@ -127,7 +128,7 @@ const COMMANDS = {
     summary: 'the stored setup document; "config set" replaces it from stdin, "config meta" reads its identity',
   },
   'self-update': {
-    flags: ['stdin', 'install', 'rollback', 'check'],
+    flags: ['stdin', 'install', 'rollback', 'check', 'allow-downgrade'],
     options: ['from', 'op'],
     mutates: true,
     summary: 'replace this agent from a signed bundle',
@@ -1164,11 +1165,20 @@ async function commandSelfUpdate(config, flags, options) {
   if ((flags.has('stdin') && options.has('from')) || (flags.has('rollback') && (flags.has('stdin') || options.has('from')))) {
     return badArgument('self-update accepts one bundle source; --rollback does not take a bundle', { command: 'self-update' });
   }
+  // Going below the installed agent or the version floor is a decision only an
+  // unrestricted session makes (contract section 13). The dispatcher already
+  // refuses the flag; this holds however else a restricted session got here.
+  if (flags.has('allow-downgrade') && process.env.LEGIONCTL_RESTRICTED === '1') {
+    const message = 'self-update --allow-downgrade takes the agent below the installed one or the version floor, which a restricted key may not do';
+    return refuse(REASON.restricted, message, { command: 'self-update', argument: '--allow-downgrade', error: message });
+  }
+  const allowDowngrade = flags.has('allow-downgrade');
 
   if (flags.has('check')) {
     const result = await checkBundle({ from: options.get('from') ?? null, stdin: flags.has('stdin') });
     return mutationReply(result, {
       current: { version: AGENT_VERSION, contract: CONTRACT_VERSION },
+      floor: reportedFloor(),
       staged: null,
       previous: null,
       manifest: result.manifest,
@@ -1179,9 +1189,10 @@ async function commandSelfUpdate(config, flags, options) {
   }
 
   if (flags.has('rollback')) {
-    const result = await runRollback(config, operationOptions(flags, options));
+    const result = await runRollback(config, { ...operationOptions(flags, options), allowDowngrade });
     return mutationReply(result, {
       current: result.current,
+      floor: reportedFloor(),
       staged: result.staged ?? null,
       previous: result.previous ?? null,
       manifest: result.manifest ?? null,
@@ -1191,9 +1202,10 @@ async function commandSelfUpdate(config, flags, options) {
   }
 
   if (flags.has('install')) {
-    const result = await runBootstrapInstall(config, operationOptions(flags, options));
+    const result = await runBootstrapInstall(config, { ...operationOptions(flags, options), allowDowngrade });
     return mutationReply(result, {
       current: result.current,
+      floor: reportedFloor(),
       staged: result.staged ?? null,
       previous: result.previous ?? null,
       manifest: result.manifest ?? null,
@@ -1207,9 +1219,10 @@ async function commandSelfUpdate(config, flags, options) {
     return badArgument('self-update needs --from PATH, --stdin, --check or --rollback', { command: 'self-update' });
   }
 
-  const result = await runSelfUpdate(config, { from, stdin: flags.has('stdin'), ...operationOptions(flags, options) });
+  const result = await runSelfUpdate(config, { from, stdin: flags.has('stdin'), ...operationOptions(flags, options), allowDowngrade });
   return mutationReply(result, {
     current: result.current,
+    floor: reportedFloor(),
     staged: result.staged ?? null,
     previous: result.previous ?? null,
     manifest: result.manifest ?? null,
@@ -1342,7 +1355,7 @@ async function commandVersion(flags, loaded) {
     // before swapping anything.
     const modules = [
       'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'boot.mjs', 'config.mjs', 'contract.mjs', 'controller.mjs',
-      'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'http.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
+      'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
       'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
       'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs',
       'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'scheduler.mjs',

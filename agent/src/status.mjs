@@ -38,6 +38,7 @@ import { CONTRACT_VERSION } from './contract.mjs';
 import { listActions } from './actions.mjs';
 import { bootTargets } from './boot.mjs';
 import { readController } from './controller.mjs';
+import { reportedFloor } from './floor.mjs';
 import { checkHealth, healthPort } from './probes/health.mjs';
 import { probeProcessAsync } from './probes/process.mjs';
 import { collectTelemetry } from './probes/telemetry.mjs';
@@ -249,6 +250,9 @@ export async function buildStatus(loaded, { budgetMs = DEFAULT_STATUS_BUDGET_MS 
     node: process.versions.node,
     restrictedSession: process.env.LEGIONCTL_RESTRICTED === '1',
     capabilities: ['setup-lineage', 'wol-action', 'configured-telemetry', 'service-config-admin'],
+    // The oldest agent this machine may be replaced by (contract section 13).
+    // A client offers to go back only to an agent that reports a floor.
+    floor: reportedFloor(),
   };
 
   const configBlock = {

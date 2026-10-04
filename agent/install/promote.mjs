@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { commitInstallSwap, recoverAgentSwap } from '../src/agent-swap.mjs';
-import { verifyInstalledTree } from './launcher.mjs';
+import { belowRecordedFloor, readRecordedFloor, verifyInstalledTree } from './launcher.mjs';
 
 const [baseArgument, stageArgument] = process.argv.slice(2);
 if (!baseArgument || !stageArgument || !path.isAbsolute(baseArgument) || !path.isAbsolute(stageArgument)) {
@@ -31,6 +31,14 @@ try {
   if (!recovered.ok) throw new Error(recovered.error);
   const verified = verifyInstalledTree(stage);
   if (!verified.ok) throw new Error(`staged agent verification failed: ${verified.error}`);
+  // The stable launcher refuses a signed agent below the recorded version
+  // floor, so promoting one would leave an install that does not start.
+  if (verified.signed) {
+    const recorded = readRecordedFloor(base);
+    if (belowRecordedFloor(verified.manifest.version, recorded)) {
+      throw new Error(`the staged agent ${verified.manifest.version} is below the version floor ${recorded.version} recorded in ${recorded.file}, so the launcher would refuse to run it; install a signed agent at or above ${recorded.version}, or lower that floor deliberately first`);
+    }
+  }
   const ready = path.join(base, 'agent.new');
   if (fs.existsSync(ready)) throw new Error(`${ready} is retained from an earlier update; inspect it before reinstalling`);
   fs.renameSync(stage, ready);
