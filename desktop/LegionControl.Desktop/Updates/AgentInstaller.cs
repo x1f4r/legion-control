@@ -212,7 +212,7 @@ public sealed class AgentInstaller(IProcessRunner runner)
             new[] { interpreter, $"{basePath}/incoming/agent/src/index.mjs", "self-update", "--install" },
             TimeSpan.FromMinutes(5), cancellationToken);
 
-        var json = RemoteAgent.ExtractJsonObject(install.StandardOutput);
+        var json = install.StandardOutputTruncated ? null : RemoteAgent.ExtractJsonObject(install.StandardOutput);
         if (json is null)
         {
             return install.TimedOut

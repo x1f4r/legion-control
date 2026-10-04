@@ -302,7 +302,8 @@ public sealed class RemoteAgent
             // Look for the reply before classifying failures: `boot` prints its JSON and then pulls
             // the machine out from under ssh, so a non-zero exit with a good reply still means the
             // agent spoke.
-            var extracted = ExtractJsonObject(result.StandardOutput);
+            // Output that was cut off is never a reply, however much of one it seems to hold.
+            var extracted = result.StandardOutputTruncated ? null : ExtractJsonObject(result.StandardOutput);
             if (extracted is not null)
             {
                 return new AgentReply<string>(extracted, attempt.System, attempt.Route, tried);
@@ -369,7 +370,7 @@ public sealed class RemoteAgent
             input,
             cancellationToken);
 
-        var extracted = ExtractJsonObject(result.StandardOutput);
+        var extracted = result.StandardOutputTruncated ? null : ExtractJsonObject(result.StandardOutput);
         if (extracted is not null) return new AgentReply<string>(extracted, local.System, route, 1);
 
         if (result.LaunchFailure is { } launchFailure)

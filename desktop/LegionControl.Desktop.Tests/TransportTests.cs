@@ -577,6 +577,22 @@ public class RetryTests
     }
 
     [Fact]
+    public async Task OutputThatWasCutOffIsNotTakenAsAReply()
+    {
+        // The part that was kept starts with a whole reply. The part that was thrown away could
+        // have said anything, so the agent's account of what happened is not known.
+        using var home = new TempHome();
+        var runner = new FakeRunner(_ => new CommandResult
+        {
+            ExitCode = 0, StandardOutput = "{\"ok\":true,\"contract\":3,\"action\":\"restarted\"}", StandardOutputTruncated = true,
+        });
+        var failure = await Assert.ThrowsAsync<AgentFailure>(() =>
+            new RemoteAgent(TwoRoutes, runner).MutateAsync(new[] { "restart" }, TimeSpan.FromSeconds(30)));
+        Assert.Equal(Dispatch.Unknown, failure.Dispatch);
+        Assert.Single(runner.Calls);
+    }
+
+    [Fact]
     public async Task AMutationIsTriedElsewhereWhenNothingCanHaveRun()
     {
         var answered = false;

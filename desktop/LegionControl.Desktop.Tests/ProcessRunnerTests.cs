@@ -83,6 +83,16 @@ public class ProcessRunnerTests
     }
 
     [Fact]
+    public async Task OutputPastTheCapIsDiscardedRatherThanKeptWithoutLimit()
+    {
+        var script = "process.stdout.write('{\"ok\":true}');process.stdout.write('x'.repeat(17*1024*1024));";
+        var result = await new ProcessRunner().RunAsync("node", new[] { "-e", script }, TimeSpan.FromSeconds(30));
+        Assert.True(result.Succeeded, result.FailureText);
+        Assert.True(result.StandardOutputTruncated);
+        Assert.Equal(16 * 1024 * 1024, result.StandardOutput.Length);
+    }
+
+    [Fact]
     public async Task ThePipesAreClosedEvenWhenAGrandchildStillHoldsThem()
     {
         // The grandchild's EPIPE is how this test sees this side's end of the pipe close. Windows

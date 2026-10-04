@@ -18,6 +18,9 @@ public sealed record CommandResult
     /// differently to the person reading about it.
     public bool Cancelled { get; init; }
     public string? LaunchFailure { get; init; }
+    /// More came out than is kept, and the rest was discarded. Output that was cut off can never be
+    /// read as a reply, however much of one it seems to hold.
+    public bool StandardOutputTruncated { get; init; }
 
     public bool Succeeded => ExitCode == 0 && !TimedOut && LaunchFailure is null;
 
@@ -207,12 +210,13 @@ public sealed class ProcessRunner : IAgentProcessRunner
         // command is long finished.
         output.Close();
         errors.Close();
-        Trace($"return stdoutChars={output.Text.Length} stderrChars={errors.Text.Length}");
+        Trace($"return stdoutChars={output.Text.Length} stderrChars={errors.Text.Length} truncated={output.Truncated}");
         return new CommandResult
         {
             ExitCode = process.HasExited ? process.ExitCode : -1,
             StandardOutput = output.Text,
             StandardError = errors.Text,
+            StandardOutputTruncated = output.Truncated,
             TimedOut = timedOut,
             Cancelled = cancelled,
         };
@@ -232,13 +236,21 @@ public sealed class ProcessRunner : IAgentProcessRunner
         }
     }
 
+    /// One output stream, kept up to [Limit] characters.
+    ///
+    /// The rest is read and thrown away rather than left in the pipe: a child that cannot write
+    /// blocks, and a blocked child is a timeout that says nothing. Sixteen Mi characters is far more
+    /// than any agent reply, so a stream that reaches it is not one this app could have read anyway.
     private sealed class OutputCapture
     {
+        public const int Limit = 16 * 1024 * 1024;
         private readonly StringBuilder _text = new();
         private readonly object _gate = new();
         private readonly StreamReader _reader;
+        private bool _truncated;
         public Task Completion { get; }
         public string Text { get { lock (_gate) return _text.ToString(); } }
+        public bool Truncated { get { lock (_gate) return _truncated; } }
         public OutputCapture(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing = null)
         {
             _reader = reader;
@@ -260,7 +272,12 @@ public sealed class ProcessRunner : IAgentProcessRunner
                 {
                     var read = await reader.ReadAsync(buffer, token).ConfigureAwait(false);
                     if (read == 0) { trace("EOF"); return; }
-                    lock (_gate) _text.Append(buffer, 0, read);
+                    lock (_gate)
+                    {
+                        var kept = Math.Min(read, Limit - _text.Length);
+                        _text.Append(buffer, 0, kept);
+                        if (kept < read) _truncated = true;
+                    }
                     trace($"read chars={read}");
                     framing?.Append(buffer.AsSpan(0, read));
                 }
