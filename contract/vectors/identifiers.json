@@ -260,7 +260,7 @@
           "newline"
         ],
         "input": {
-          "value": "demo "
+          "value": "demo\u2028"
         },
         "expect": {
           "valid": false

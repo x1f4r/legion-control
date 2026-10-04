@@ -23,9 +23,19 @@ export function at(minutes, seconds = 0, millis = 0) {
   return new Date(base + minutes * 60000 + seconds * 1000 + millis).toISOString();
 }
 
+// Characters that change how text reads without being visible themselves: DEL
+// and the C1 controls, zero-width and bidirectional formatting characters, the
+// line and paragraph separators, the byte order mark. Some vectors exist to
+// carry exactly these, and a person reviewing a generated file has to be able
+// to see them, so they are written as \u escapes. JSON.stringify escapes the
+// C0 controls itself, and outside strings JSON is ASCII, so this only ever
+// rewrites the inside of a string, into the same string.
+const INVISIBLE = /[\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g;
+
 /** The text every generator writes for a JSON value: two-space indentation, LF, one final newline. */
 export function documentText(value) {
-  return `${JSON.stringify(value, null, 2)}\n`;
+  const text = JSON.stringify(value, null, 2).replace(INVISIBLE, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  return `${text}\n`;
 }
 
 /**

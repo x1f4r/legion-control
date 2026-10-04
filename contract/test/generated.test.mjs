@@ -82,6 +82,16 @@ drift('a hash vector whose stated verdict the reference disagrees with',
     fs.writeFileSync(file, source.replace(find, "    '',\n    { accepted: false, reject: 'not-a-json-object' },"));
   });
 
+test('a generated file shows every invisible character as an escape', () => {
+  // Vectors carry bidirectional overrides, zero-width spaces and byte order
+  // marks on purpose. Written raw, a reviewer reading the file sees nothing
+  // where they are, and a diff that adds one looks like no change at all.
+  const invisible = /[\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
+  for (const relative of managedOnDisk(CONTRACT)) {
+    assert.doesNotMatch(fs.readFileSync(path.join(CONTRACT, relative), 'utf8'), invisible, relative);
+  }
+});
+
 test('a write brings a drifted tree back, and a second run changes nothing', () => {
   const dir = scratch();
   try {
