@@ -236,12 +236,12 @@
       "groups": [
         {
           "group": "documents",
-          "cases": 78,
+          "cases": 82,
           "consumers": {
-            "agent": 69,
-            "mac": 78,
-            "desktop": 78,
-            "android": 78
+            "agent": 72,
+            "mac": 82,
+            "desktop": 82,
+            "android": 82
           }
         }
       ]

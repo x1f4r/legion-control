@@ -103,6 +103,10 @@ const errorCases = [
     document.machines[1].wake = { mac: '02:00:00:00:00:02', helper: helper('tower', 'wake-pi') };
   }), refused('helper-cycle'),
   'The same ring written only with the singular helper key, as a 1.2 editor writes it. The alias is a helper too.', [ENFORCED]),
+  peer('helper-self-beside-empty-helpers', tower((document) => {
+    first(document).wake = { mac: '02:00:00:00:00:01', helper: helper('tower'), helpers: [] };
+  }), refused('helper-self'),
+  'The alias beside an empty helpers list still names a helper, because a 1.2 client runs it. Reading helpers ?? [helper] skips it and stores a document every client refuses.', [ENFORCED]),
 ];
 
 const machine = (n) => ({
@@ -194,8 +198,16 @@ const warningCases = [
   'The deprecated machine.ssh host is held to the dial grammar too; with it the machine has a host, so it is not missing endpoints.', ['finding:t5']),
   peer('warn-wake-no-mac', towerAndPi((document) => { first(document).wake = { helper: helper('pi'), helpers: [helper('pi')] }; }), accepted('wake-no-mac'),
     'A wake block with helpers and no MAC: helpers still work, direct wake does not.'),
+  peer('warn-wake-no-mac-at-site', tower((document) => {
+    document.sites = [{ id: 'home', name: 'Home', lanPrefixes: ['192.168.1.'] }];
+    first(document).site = 'home';
+    first(document).wake = { ports: [9] };
+  }), accepted('wake-no-mac'),
+  'A wake block at a site with no broadcast anywhere, and no MAC address: nothing is woken directly, so no broadcast is defaulted either.'),
   peer('warn-wake-unplaced', tower((document) => { first(document).wake = { mac: '02:00:00:00:00:01' }; }), accepted('wake-unplaced'),
     'A MAC address with no site, no lanPrefix and no helper: no client can tell when it is on the machine\'s network.'),
+  peer('warn-wake-lan-prefix-invalid', tower((document) => { first(document).wake = { mac: '02:00:00:00:00:01', lanPrefix: '192.168.1.5' }; }), accepted('prefix-invalid', 'wake-unplaced'),
+    'A wake.lanPrefix that is a full address never matches, so it places nothing: the block is as unplaced as one without lanPrefix.'),
   peer('warn-wake-broadcast-defaulted', tower((document) => { first(document).wake = { mac: '02:00:00:00:00:01', lanPrefix: '192.168.1.' }; }), accepted('wake-broadcast-defaulted'),
     'A machine that can be woken directly with no broadcast address: clients derive one, which Android used to refuse outright.', ['finding:c3']),
   peer('warn-helper-alias-unused', towerAndPi((document) => {
@@ -262,6 +274,9 @@ const intakeCases = [
   acceptance('local-controller-without-id', 'local', tower((document) => { document.controller = { name: 'Home setup', source: 'phone' }; }),
     { valid: true, errors: [], assignsIdentity: true, keep: true },
     'A controller block without an id is given one too, keeping its other keys.'),
+  acceptance('local-controller-id-null', 'local', tower((document) => { document.controller = { id: null, name: 'Home setup', source: 'phone' }; }),
+    { valid: true, errors: [], assignsIdentity: true, keep: true },
+    'An id of null is no id: an editor that clears the field writes null, and the document is given an identity rather than refused for it.'),
   acceptance('local-identity-then-checked', 'local', tower((document) => {
     delete document.controller;
     document.machines.push(copyOf(first(document)));

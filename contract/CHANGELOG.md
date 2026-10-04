@@ -126,7 +126,9 @@ not, the agent now answers as they say.
   exactly the documents `contract/tools/document-rules.mjs` accepts, under peer,
   local or applied intake. What a client cannot use is a warning with a code,
   never a refusal, and the document this device already applies is never refused
-  while section 12 accepts its bytes.
+  while section 12 accepts its bytes. `wake.helper` is a helper even beside an
+  empty `wake.helpers`, where `validate.mjs` used to skip it, so the alias is
+  held to `helper-self`, `helper-unknown` and `helper-cycle`.
 
 ### Conformance
 

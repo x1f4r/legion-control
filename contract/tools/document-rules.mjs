@@ -150,7 +150,7 @@ function helpersOf(machine) {
  * of a repeated name counts (the first, the last, or an error), so a document
  * that repeats one means different things on different devices, and nothing
  * after this check can be trusted. `text` must be valid JSON; names are
- * compared after decoding, so `"a"` and `"a"` are the same name.
+ * compared after decoding, so `"\u0061"` and `"a"` are the same name.
  */
 export function findRepeatedMember(text) {
   const stack = [];

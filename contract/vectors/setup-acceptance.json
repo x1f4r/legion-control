@@ -301,6 +301,32 @@
         }
       },
       {
+        "name": "helper-self-beside-empty-helpers",
+        "purpose": "The alias beside an empty helpers list still names a helper, because a 1.2 client runs it. Reading helpers ?? [helper] skips it and stores a document every client refuses.",
+        "consumers": [
+          "agent",
+          "mac",
+          "desktop",
+          "android"
+        ],
+        "tags": [
+          "agent-enforced"
+        ],
+        "input": {
+          "intake": "peer",
+          "text": "{\n  \"version\": 1,\n  \"controller\": {\n    \"id\": \"setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846\",\n    \"revision\": 3,\n    \"lineage\": []\n  },\n  \"machines\": [\n    {\n      \"id\": \"tower\",\n      \"name\": \"Tower\",\n      \"endpoints\": [\n        {\n          \"id\": \"lan\",\n          \"kind\": \"lan\",\n          \"host\": \"desk-tower.local\",\n          \"user\": \"me\",\n          \"port\": 22\n        }\n      ],\n      \"systems\": [\n        {\n          \"id\": \"linux\",\n          \"name\": \"Linux\",\n          \"platform\": \"linux\",\n          \"shell\": \"posix\",\n          \"agent\": [\n            \"/usr/bin/node\",\n            \"/home/me/.legion-control/bin/launcher.mjs\"\n          ]\n        }\n      ],\n      \"wake\": {\n        \"mac\": \"02:00:00:00:00:01\",\n        \"helper\": {\n          \"machine\": \"tower\",\n          \"action\": \"wake-tower\"\n        },\n        \"helpers\": []\n      }\n    }\n  ]\n}\n"
+        },
+        "expect": {
+          "valid": false,
+          "errors": [
+            "helper-self"
+          ],
+          "warnings": [],
+          "assignsIdentity": false,
+          "keep": false
+        }
+      },
+      {
         "name": "schema-version-2",
         "purpose": "version stays 1: a bump would make every 1.2 client refuse documents for keys it can ignore.",
         "consumers": [
@@ -1145,6 +1171,30 @@
         }
       },
       {
+        "name": "warn-wake-no-mac-at-site",
+        "purpose": "A wake block at a site with no broadcast anywhere, and no MAC address: nothing is woken directly, so no broadcast is defaulted either.",
+        "consumers": [
+          "agent",
+          "mac",
+          "desktop",
+          "android"
+        ],
+        "tags": [],
+        "input": {
+          "intake": "peer",
+          "text": "{\n  \"version\": 1,\n  \"controller\": {\n    \"id\": \"setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846\",\n    \"revision\": 3,\n    \"lineage\": []\n  },\n  \"machines\": [\n    {\n      \"id\": \"tower\",\n      \"name\": \"Tower\",\n      \"endpoints\": [\n        {\n          \"id\": \"lan\",\n          \"kind\": \"lan\",\n          \"host\": \"desk-tower.local\",\n          \"user\": \"me\",\n          \"port\": 22\n        }\n      ],\n      \"systems\": [\n        {\n          \"id\": \"linux\",\n          \"name\": \"Linux\",\n          \"platform\": \"linux\",\n          \"shell\": \"posix\",\n          \"agent\": [\n            \"/usr/bin/node\",\n            \"/home/me/.legion-control/bin/launcher.mjs\"\n          ]\n        }\n      ],\n      \"site\": \"home\",\n      \"wake\": {\n        \"ports\": [\n          9\n        ]\n      }\n    }\n  ],\n  \"sites\": [\n    {\n      \"id\": \"home\",\n      \"name\": \"Home\",\n      \"lanPrefixes\": [\n        \"192.168.1.\"\n      ]\n    }\n  ]\n}\n"
+        },
+        "expect": {
+          "valid": true,
+          "errors": [],
+          "warnings": [
+            "wake-no-mac"
+          ],
+          "assignsIdentity": false,
+          "keep": true
+        }
+      },
+      {
         "name": "warn-wake-unplaced",
         "purpose": "A MAC address with no site, no lanPrefix and no helper: no client can tell when it is on the machine's network.",
         "consumers": [
@@ -1162,6 +1212,31 @@
           "valid": true,
           "errors": [],
           "warnings": [
+            "wake-unplaced"
+          ],
+          "assignsIdentity": false,
+          "keep": true
+        }
+      },
+      {
+        "name": "warn-wake-lan-prefix-invalid",
+        "purpose": "A wake.lanPrefix that is a full address never matches, so it places nothing: the block is as unplaced as one without lanPrefix.",
+        "consumers": [
+          "agent",
+          "mac",
+          "desktop",
+          "android"
+        ],
+        "tags": [],
+        "input": {
+          "intake": "peer",
+          "text": "{\n  \"version\": 1,\n  \"controller\": {\n    \"id\": \"setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846\",\n    \"revision\": 3,\n    \"lineage\": []\n  },\n  \"machines\": [\n    {\n      \"id\": \"tower\",\n      \"name\": \"Tower\",\n      \"endpoints\": [\n        {\n          \"id\": \"lan\",\n          \"kind\": \"lan\",\n          \"host\": \"desk-tower.local\",\n          \"user\": \"me\",\n          \"port\": 22\n        }\n      ],\n      \"systems\": [\n        {\n          \"id\": \"linux\",\n          \"name\": \"Linux\",\n          \"platform\": \"linux\",\n          \"shell\": \"posix\",\n          \"agent\": [\n            \"/usr/bin/node\",\n            \"/home/me/.legion-control/bin/launcher.mjs\"\n          ]\n        }\n      ],\n      \"wake\": {\n        \"mac\": \"02:00:00:00:00:01\",\n        \"lanPrefix\": \"192.168.1.5\"\n      }\n    }\n  ]\n}\n"
+        },
+        "expect": {
+          "valid": true,
+          "errors": [],
+          "warnings": [
+            "prefix-invalid",
             "wake-unplaced"
           ],
           "assignsIdentity": false,
@@ -1519,6 +1594,27 @@
         "input": {
           "intake": "local",
           "text": "{\n  \"version\": 1,\n  \"controller\": {\n    \"name\": \"Home setup\",\n    \"source\": \"phone\"\n  },\n  \"machines\": [\n    {\n      \"id\": \"tower\",\n      \"name\": \"Tower\",\n      \"endpoints\": [\n        {\n          \"id\": \"lan\",\n          \"kind\": \"lan\",\n          \"host\": \"desk-tower.local\",\n          \"user\": \"me\",\n          \"port\": 22\n        }\n      ],\n      \"systems\": [\n        {\n          \"id\": \"linux\",\n          \"name\": \"Linux\",\n          \"platform\": \"linux\",\n          \"shell\": \"posix\",\n          \"agent\": [\n            \"/usr/bin/node\",\n            \"/home/me/.legion-control/bin/launcher.mjs\"\n          ]\n        }\n      ]\n    }\n  ]\n}\n"
+        },
+        "expect": {
+          "valid": true,
+          "errors": [],
+          "warnings": [],
+          "assignsIdentity": true,
+          "keep": true
+        }
+      },
+      {
+        "name": "local-controller-id-null",
+        "purpose": "An id of null is no id: an editor that clears the field writes null, and the document is given an identity rather than refused for it.",
+        "consumers": [
+          "mac",
+          "desktop",
+          "android"
+        ],
+        "tags": [],
+        "input": {
+          "intake": "local",
+          "text": "{\n  \"version\": 1,\n  \"controller\": {\n    \"id\": null,\n    \"name\": \"Home setup\",\n    \"source\": \"phone\"\n  },\n  \"machines\": [\n    {\n      \"id\": \"tower\",\n      \"name\": \"Tower\",\n      \"endpoints\": [\n        {\n          \"id\": \"lan\",\n          \"kind\": \"lan\",\n          \"host\": \"desk-tower.local\",\n          \"user\": \"me\",\n          \"port\": 22\n        }\n      ],\n      \"systems\": [\n        {\n          \"id\": \"linux\",\n          \"name\": \"Linux\",\n          \"platform\": \"linux\",\n          \"shell\": \"posix\",\n          \"agent\": [\n            \"/usr/bin/node\",\n            \"/home/me/.legion-control/bin/launcher.mjs\"\n          ]\n        }\n      ]\n    }\n  ]\n}\n"
         },
         "expect": {
           "valid": true,
