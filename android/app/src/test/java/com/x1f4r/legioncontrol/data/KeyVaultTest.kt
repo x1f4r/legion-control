@@ -244,6 +244,34 @@ class KeyVaultTest {
     }
 
     @Test
+    fun `a file the file system could not look up is an error, not an absent one`() {
+        // File.exists() is false for any look that failed, and that read as "nothing was ever
+        // written here", which is a first run and a new key. Only "no such file" is no file. Here
+        // the directory the key lives in is a plain file, so the look fails with something else.
+        val notADirectory = File(folder.root, "elsewhere").apply { writeText("not a directory") }
+        val unreachable = File(notADirectory, "identity.ed25519")
+        assertFalse("File.exists() calls this missing", unreachable.exists())
+
+        val keys = FakeKeys()
+        val vault = vault(keys)
+        try {
+            vault.read(unreachable)
+            fail("a look that failed has to be an error")
+        } catch (_: java.io.IOException) {
+        }
+        try {
+            vault.isAbsent(unreachable)
+            fail("a look that failed says nothing about whether the file is there")
+        } catch (_: java.io.IOException) {
+        }
+        assertEquals(0, keys.finds)
+
+        assertTrue(vault.isAbsent(file()))
+        vault.write(file(), secret)
+        assertFalse(vault.isAbsent(file()))
+    }
+
+    @Test
     fun `setting a file aside keeps it whole under a new name`() {
         val vault = vault(FakeKeys())
         vault.write(file(), secret)

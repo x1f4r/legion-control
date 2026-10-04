@@ -15,6 +15,7 @@ import net.schmizz.sshj.common.KeyType
 import net.schmizz.sshj.userauth.keyprovider.KeyProvider
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
 import java.security.PrivateKey
@@ -126,7 +127,7 @@ class DeviceIdentity internal constructor(
             // Still unreadable, which is what the person was told before they asked.
         }
         return try {
-            if (keyFile.exists()) {
+            if (!vault.isAbsent(keyFile)) {
                 replace("reading it kept failing, and a new one was asked for", newWrappingKey = true)
             } else {
                 // Nothing to set aside: none was ever written, or a replacement before this one
@@ -200,12 +201,16 @@ class DeviceIdentity internal constructor(
      * The change is written down first, so a process that dies anywhere in here still tells the
      * user next time; the old file is moved aside rather than written over, under the time the note
      * carries; and only then is a new key written where it was. A note whose file was never moved is
-     * not a change, and [readChange] drops it.
+     * not a change, and [readChange] drops it. The note is on the disk before the move, so a phone
+     * that loses power just after it does not keep the move and lose what it was about.
      */
     private fun replace(reason: String, newWrappingKey: Boolean = false): ByteArray {
         val at = clock()
         changeFile.parentFile?.mkdirs()
-        changeFile.writeText("$at\n$reason\n")
+        FileOutputStream(changeFile).use { out ->
+            out.write("$at\n$reason\n".toByteArray())
+            out.fd.sync()
+        }
         vault.setAside(keyFile, at)
         return newSeed().also { vault.write(keyFile, it, newKey = newWrappingKey) }
     }

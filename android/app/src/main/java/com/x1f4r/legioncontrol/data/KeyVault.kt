@@ -7,7 +7,10 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.KeyStore
 import java.security.KeyStoreException
 import javax.crypto.AEADBadTagException
@@ -131,8 +134,13 @@ internal class KeyVault(
 
     /** Reads and unwraps [file]. Throws when the answer could still change: see [Unsealed.Lost]. */
     fun read(file: File): Unsealed {
-        if (!file.exists()) return Unsealed.Absent
-        val sealed = file.readBytes()
+        val sealed = try {
+            Files.readAllBytes(file.toPath())
+        } catch (_: NoSuchFileException) {
+            // Absent only on the file system's word, as in [isAbsent]. Any other failure to read
+            // goes to the caller as it is, whatever File.exists would have said about the file.
+            return Unsealed.Absent
+        }
         // Every write is a complete file renamed into place, so a file too short to hold a nonce and
         // a tag was never written by this class, and no key will ever open it.
         if (sealed.size < IV_BYTES + TAG_BITS / 8) {
@@ -166,6 +174,22 @@ internal class KeyVault(
      * keystore said several times that there is none, and a key that answers now was only slow.
      */
     fun hasKey(): Boolean = keys.find() != null
+
+    /**
+     * Whether [file] is certainly not there: the file system said there is no such file.
+     *
+     * Not [File.exists], which answers false just as readily when the look itself failed: a
+     * directory that could not be searched, storage that is not there yet, an I/O error. Each of
+     * those would have read as a first run, and a first run writes a new key where the old one is.
+     * A look that fails for any reason other than "no such file" is thrown, like every other error
+     * here.
+     */
+    fun isAbsent(file: File): Boolean = try {
+        Files.readAttributes(file.toPath(), BasicFileAttributes::class.java)
+        false
+    } catch (_: NoSuchFileException) {
+        true
+    }
 
     /**
      * Wraps [secret] and writes it to [file], creating the parent directory.

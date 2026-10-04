@@ -88,6 +88,26 @@ class DeviceIdentityTest {
     }
 
     @Test
+    fun `a key file that could not even be looked up is surfaced, and no key is made`() = runBlocking {
+        // File.exists() answered false for a look that failed, and that was a first run: a new
+        // wrapping key, and a new key file written where the old one may well still be.
+        File(folder.root, "ssh").writeText("not a directory")
+        try {
+            identity().identity()
+            fail("a look that failed has to be an error")
+        } catch (expected: DeviceKeyUnavailable) {
+            assertTrue(expected.message!!.contains("Nothing was replaced"))
+        }
+        try {
+            identity().replaceUnreadable()
+            fail("even a replacement somebody asked for needs to know whether there is a file to set aside")
+        } catch (_: DeviceKeyUnavailable) {
+        }
+        assertEquals(0, keys.created)
+        assertEquals(0, keys.finds)
+    }
+
+    @Test
     fun `a wrapping key that is gone makes a new key, keeps the old file, and says so`() = runBlocking {
         val original = identity().identity().authorizedKeysLine
         val before = keyFile.readBytes()
