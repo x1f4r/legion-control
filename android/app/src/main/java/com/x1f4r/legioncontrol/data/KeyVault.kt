@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.data
 
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import java.io.File
 import java.io.FileOutputStream
@@ -27,11 +28,15 @@ internal sealed interface Unsealed {
      * There is a file, and it can never be opened again. [reason] says why, for a person.
      *
      * Only findings that are permanent get here: the keystore has no key to open it with, the key it
-     * has does not authenticate it, or the file is too short to have been written by [KeyVault]. A
-     * keystore that fails to answer, or a read that fails, is none of these and is thrown instead,
-     * because the file is still good and the next attempt may well open it.
+     * has does not authenticate it or can never be used again, or the file is too short to have been
+     * written by [KeyVault]. A keystore that fails to answer, or a read that fails, is none of these
+     * and is thrown instead, because the file is still good and the next attempt may well open it.
+     *
+     * [keyMissing] is the first of those, and the one a moment can still prove wrong: the keystore
+     * only said, a few times over, that it has no key. A caller asks [KeyVault.hasKey] once more
+     * before it moves anything, and reads the file again when the key has turned up.
      */
-    data class Lost(val reason: String) : Unsealed
+    data class Lost(val reason: String, val keyMissing: Boolean = false) : Unsealed
 }
 
 /**
@@ -48,7 +53,12 @@ internal interface WrappingKeys {
      */
     fun find(): SecretKey?
 
-    /** Makes the wrapping key. Only ever called after [find] answered null. */
+    /**
+     * Makes the wrapping key, in place of whatever is under its name.
+     *
+     * Only ever called when the keystore has said firmly that there is none, when the one it has can
+     * never be used again, or when a person asked for a new key.
+     */
     fun create(): SecretKey
 }
 
@@ -108,8 +118,9 @@ internal class KeystoreWrappingKeys(
  *
  * The rule this class is built around is that an error is never evidence. A secret is only ever
  * reported [Unsealed.Lost] on a finding that cannot change, and a wrapping key is only ever made when
- * the keystore said there is none. Everything else is thrown, the file stays exactly as it was, and
- * the next attempt reads it again. The previous version caught every exception on the way in and
+ * the keystore said there is none, said the one it has can never be used again, or a person asked
+ * for one. Everything else is thrown, the file stays exactly as it was, and the next attempt reads
+ * it again. The previous version caught every exception on the way in and
  * made a new key on the way out, so one keystore hiccup replaced the phone's ssh key for good.
  */
 internal class KeyVault(
@@ -128,10 +139,16 @@ internal class KeyVault(
             return Unsealed.Lost("the file that holds it is too short to be a sealed key")
         }
         val key = confirmedKey()
-            ?: return Unsealed.Lost("the Android keystore no longer has the key that protected it")
+            ?: return Unsealed.Lost("the Android keystore no longer has the key that protected it", keyMissing = true)
 
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, sealed, 0, IV_BYTES))
+        try {
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, sealed, 0, IV_BYTES))
+        } catch (_: KeyPermanentlyInvalidatedException) {
+            // The keystore's own word that this key will never be used again, for anything. That is
+            // as final as a tag that does not verify, and asking again does not change it.
+            return Unsealed.Lost("the Android keystore says the key that protected it can never be used again")
+        }
         return try {
             Unsealed.Opened(cipher.doFinal(sealed, IV_BYTES, sealed.size - IV_BYTES))
         } catch (_: AEADBadTagException) {
@@ -142,15 +159,35 @@ internal class KeyVault(
     }
 
     /**
+     * Whether the keystore has the wrapping key right now. One look, and it throws when the keystore
+     * cannot say.
+     *
+     * For the last look before a secret that was [Unsealed.Lost] for want of a key is replaced: the
+     * keystore said several times that there is none, and a key that answers now was only slow.
+     */
+    fun hasKey(): Boolean = keys.find() != null
+
+    /**
      * Wraps [secret] and writes it to [file], creating the parent directory.
+     *
+     * Sealed with the wrapping key there is, and a new one is made only when the keystore has said
+     * there is none as many times as [read] needs before it calls a secret lost. Making one replaces
+     * whatever is under its name, so one look is not enough here either: a key that was only slow to
+     * answer would be written over, and with it the only key that could open the file it seals. With
+     * [newKey] a new wrapping key is made whatever the keystore says, which is for a person replacing
+     * a key that cannot be read, and for nothing else.
      *
      * The bytes are on the disk before the name points at them, so a phone that loses power at any
      * moment is left with the old file or the new one and never with a name that points at nothing.
      */
-    fun write(file: File, secret: ByteArray) {
-        val key = synchronized(CREATION) { keys.find() ?: keys.create() }
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, key)
+    fun write(file: File, secret: ByteArray, newKey: Boolean = false) {
+        val cipher = try {
+            encrypting(if (newKey) newWrappingKey() else wrappingKey())
+        } catch (_: KeyPermanentlyInvalidatedException) {
+            // The key under the name can never be used again, for this or for anything else, so a new
+            // one in its place takes nothing away that could still open a file.
+            encrypting(newWrappingKey())
+        }
         val body = cipher.doFinal(secret)
         // The IV is generated by the keystore and is required to be unique per encryption, so it is
         // written in front of the ciphertext rather than stored separately.
@@ -173,9 +210,10 @@ internal class KeyVault(
     /**
      * Moves a file that can no longer be opened out of the way, and keeps it.
      *
-     * Kept rather than deleted because "can no longer be opened" is this app's reading of a keystore
-     * it does not control. Should the key that wrote it ever come back, the file is still there to
-     * be opened by hand; deleted, it would not be.
+     * Kept rather than deleted so that replacing a key is never also destroying one: the moved file
+     * shows what was there and when, for anyone working out why this phone's key changed. It is not
+     * a way back. The key that could have opened it is gone, unusable or never matched it, and a
+     * wrapping key never leaves the keystore to be tried anywhere else.
      */
     fun setAside(file: File, now: Long): File {
         val aside = File(file.parentFile, "${file.name}.lost-$now")
@@ -199,6 +237,14 @@ internal class KeyVault(
         }
         return null
     }
+
+    /** The wrapping key there is, or a new one when the keystore is sure there is none. */
+    private fun wrappingKey(): SecretKey = synchronized(CREATION) { confirmedKey() ?: keys.create() }
+
+    private fun newWrappingKey(): SecretKey = synchronized(CREATION) { keys.create() }
+
+    private fun encrypting(key: SecretKey): Cipher =
+        Cipher.getInstance(TRANSFORMATION).apply { init(Cipher.ENCRYPT_MODE, key) }
 
     /**
      * Makes a rename durable as well as atomic. Best effort: the rename has already happened, and a

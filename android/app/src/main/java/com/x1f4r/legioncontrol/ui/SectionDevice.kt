@@ -12,10 +12,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -32,6 +34,7 @@ import com.x1f4r.legioncontrol.agent.MachineSystem
 import com.x1f4r.legioncontrol.data.DeviceBindings
 import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.net.AppUpdates
+import com.x1f4r.legioncontrol.ui.theme.LocalStatusColors
 import java.io.File
 
 /**
@@ -263,19 +266,32 @@ private fun NotificationsBlock(app: AppModel) {
 @Composable
 private fun DeviceKeyBlock(app: AppModel) {
     var showKey by rememberSaveable { mutableStateOf(false) }
+    var confirmReplace by rememberSaveable { mutableStateOf(false) }
     val systems = app.machines.flatMap { it.machine.systems }
 
     SectionHeading("This phone's key")
 
-    app.keyChange?.let { change ->
-        KeyChangedNotice(app, change, systems)
-        return
-    }
+    // Before the change notice, which is about a new key and has nothing to show until one reads.
     app.keyProblem?.takeIf { app.publicKey.isBlank() }?.let { problem ->
         StatusLine(Mark.Attention, problem)
         Actions {
             PlainAction("Try again", enabled = true) { app.loadKey() }
+            PlainAction("Replace this phone's key", enabled = true, destructive = true) { confirmReplace = true }
         }
+        if (confirmReplace) {
+            ReplaceKeyDialog(
+                systems = systems,
+                onDismiss = { confirmReplace = false },
+                onConfirm = {
+                    confirmReplace = false
+                    app.replaceUnreadableKey()
+                },
+            )
+        }
+        return
+    }
+    app.keyChange?.let { change ->
+        KeyChangedNotice(app, change, systems)
         return
     }
 
@@ -344,6 +360,36 @@ private fun KeyChangedNotice(app: AppModel, change: KeyChange, systems: List<Mac
     Actions {
         PlainAction("Done", enabled = true) { app.acknowledgeKeyChange() }
     }
+}
+
+/**
+ * The way out of a key that never reads, asked as a question because it cannot be taken back.
+ *
+ * Retrying is always the first answer, and this app never replaces a key on its own for an error
+ * that might pass. Some do not pass, and without this the only way out was clearing the app's data,
+ * which also takes the setup, the bindings, the pinned host keys and the approvals with it.
+ */
+@Composable
+private fun ReplaceKeyDialog(systems: List<MachineSystem>, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Replace this phone's key?") },
+        text = {
+            Text(
+                "Only when trying again keeps failing. The phone gets a new key, which is refused " +
+                    "wherever the old one was accepted until it is added to authorized_keys on " +
+                    "${systemsSentence(systems)}. The old key cannot be brought back.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Replace it", color = LocalStatusColors.current.bad)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 // MARK: - The setup

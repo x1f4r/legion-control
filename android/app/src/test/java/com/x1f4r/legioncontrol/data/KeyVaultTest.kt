@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.data
 
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -27,10 +28,10 @@ import javax.crypto.SecretKey
 /**
  * What the vault calls a lost secret, and what it calls an error.
  *
- * The line between the two is the whole of the A2 fix. A lost secret is replaced; an error is thrown
- * and the file is left exactly as it was. The previous version put every exception on the first side
- * of that line, and made a fresh wrapping key whenever the keystore did not hand one over, so a
- * keystore that was busy for a moment replaced the phone's key for good.
+ * The line between the two is the whole of the vault's safety. A lost secret is replaced; an error is
+ * thrown and the file is left exactly as it was. The previous version put every exception on the
+ * first side of that line, and made a fresh wrapping key whenever the keystore did not hand one
+ * over, so a keystore that was busy for a moment replaced the phone's key for good.
  */
 class KeyVaultTest {
 
@@ -41,6 +42,7 @@ class KeyVaultTest {
     internal class FakeKeys : WrappingKeys {
         var key: SecretKey? = null
         var failure: Exception? = null
+        var creationFailure: Exception? = null
 
         /** Answers given before the real one, for a keystore that says "none" while it is busy. */
         val script = ArrayDeque<SecretKey?>()
@@ -55,9 +57,20 @@ class KeyVaultTest {
         }
 
         override fun create(): SecretKey {
+            creationFailure?.let { throw it }
             created += 1
             return aesKey().also { key = it }
         }
+    }
+
+    /**
+     * A key the keystore still hands over and will never use again, which Android reports when a
+     * cipher is initialised with it.
+     */
+    internal class InvalidatedKey : SecretKey {
+        override fun getAlgorithm(): String = "AES"
+        override fun getFormat(): String = "RAW"
+        override fun getEncoded(): ByteArray = throw KeyPermanentlyInvalidatedException()
     }
 
     private fun vault(keys: WrappingKeys, pauses: MutableList<Long> = mutableListOf()) =
@@ -94,12 +107,72 @@ class KeyVaultTest {
         val vault = vault(keys, pauses)
         vault.write(file(), secret)
         keys.key = null
+        keys.finds = 0
+        pauses.clear()
 
         val read = vault.read(file())
         assertTrue(read is Unsealed.Lost)
         assertTrue((read as Unsealed.Lost).reason.contains("keystore"))
-        assertEquals(KeyVault.ABSENCE_CHECKS + 1, keys.finds)
+        assertTrue("the one finding a later look can still overturn", read.keyMissing)
+        assertEquals(KeyVault.ABSENCE_CHECKS, keys.finds)
         assertEquals(KeyVault.ABSENCE_CHECKS - 1, pauses.size)
+    }
+
+    @Test
+    fun `a write makes a wrapping key only after the keystore said more than once there is none`() {
+        // The write after a lost secret looked once, and a keystore that was only slow to answer had
+        // its key replaced under the same name, which is the only key that could open the old file.
+        val keys = FakeKeys()
+        val vault = vault(keys)
+        vault.write(file(), secret)
+        val wrapping = keys.key
+        keys.script.addLast(null)
+        keys.script.addLast(null)
+
+        vault.write(file(), ByteArray(32) { 7 })
+        assertEquals("the key that answered third time is the key", 1, keys.created)
+        assertSame(wrapping, keys.key)
+        assertArrayEquals(ByteArray(32) { 7 }, (vault.read(file()) as Unsealed.Opened).secret)
+    }
+
+    @Test
+    fun `a key the keystore says can never be used again is a lost secret`() {
+        val keys = FakeKeys()
+        val vault = vault(keys)
+        vault.write(file(), secret)
+        keys.key = InvalidatedKey()
+
+        val read = vault.read(file())
+        assertTrue(read is Unsealed.Lost)
+        assertTrue((read as Unsealed.Lost).reason.contains("never be used again"))
+        assertFalse("the keystore had a key, and said it is dead", read.keyMissing)
+    }
+
+    @Test
+    fun `a write over a key that can never be used again seals with a new one`() {
+        // Otherwise the replacement of a secret lost this way fails on its own write, and so does
+        // every first run after it: the phone would never have a key again.
+        val keys = FakeKeys()
+        val vault = vault(keys)
+        keys.key = InvalidatedKey()
+
+        vault.write(file(), secret)
+        assertEquals(1, keys.created)
+        assertArrayEquals(secret, (vault.read(file()) as Unsealed.Opened).secret)
+    }
+
+    @Test
+    fun `a new wrapping key on request is made even while the keystore cannot answer`() {
+        // The way out of a key that is listed and never handed over, and only when a person asked.
+        val keys = FakeKeys()
+        val vault = vault(keys)
+        vault.write(file(), secret)
+        keys.failure = KeyStoreException("the keystore lists the key and did not hand it over")
+
+        vault.write(file(), ByteArray(32) { 9 }, newKey = true)
+        assertEquals(2, keys.created)
+        keys.failure = null
+        assertArrayEquals(ByteArray(32) { 9 }, (vault.read(file()) as Unsealed.Opened).secret)
     }
 
     @Test

@@ -265,6 +265,12 @@ interface ControlServices {
     /** The user has seen [keyChange]. */
     suspend fun acknowledgeKeyChange()
 
+    /**
+     * Makes this phone a new key because the old one keeps failing to read, and only because the
+     * user confirmed it. A key that reads by now is kept.
+     */
+    suspend fun replaceUnreadableKey()
+
     /** The configuration in force, or null when there is none. */
     val config: StateFlow<ControllerConfig?>
 

@@ -60,6 +60,10 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override suspend fun acknowledgeKeyChange() = control.identity.acknowledgeChange()
 
+    override suspend fun replaceUnreadableKey() {
+        control.identity.replaceUnreadable()
+    }
+
     override val config: StateFlow<ControllerConfig?> get() = control.config.config
 
     override val configText: StateFlow<String> get() = control.config.text

@@ -314,6 +314,27 @@ class AppModel(
         }
     }
 
+    /**
+     * Replaces a key that keeps failing to read, once the user has confirmed it.
+     *
+     * Never done on the app's own say: every machine that trusted the old key stops accepting this
+     * phone. What follows is the same as after any replacement, the new key and a note saying it
+     * changed; a key that read by the time this ran is kept, and nothing is said.
+     */
+    fun replaceUnreadableKey() {
+        scope.launch {
+            try {
+                services.replaceUnreadableKey()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                keyProblem = failure.message ?: "A new key for this phone could not be made just now."
+                return@launch
+            }
+            loadKey()
+        }
+    }
+
     /** The user has seen that the key changed and has the new one. */
     fun acknowledgeKeyChange() {
         keyChange = null

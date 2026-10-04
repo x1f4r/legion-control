@@ -96,7 +96,7 @@ class DeviceIdentity internal constructor(
      * When the key was last replaced because the old one could no longer be opened, until somebody
      * has said they saw it. Null when it never was.
      */
-    suspend fun change(): KeyChange? = withContext(Dispatchers.IO) { readChange() }
+    suspend fun change(): KeyChange? = withContext(Dispatchers.IO) { synchronized(CREATION) { readChange() } }
 
     /** Stops reporting [change]. The key itself is not touched. */
     suspend fun acknowledgeChange() {
@@ -104,13 +104,49 @@ class DeviceIdentity internal constructor(
     }
 
     /**
+     * Replaces this phone's key because a person asked for it, after it could not be read.
+     *
+     * The way out of a key that fails every time for a reason no retry changes: a wrapping key the
+     * keystore damaged and still hands over, or one it lists and never hands over. This app never
+     * calls it on its own, because it cuts the phone off from every machine that trusted the old key,
+     * and that waits for somebody who has been told so. The file is read once more first, and a key
+     * that reads now is kept. Otherwise the old file is set aside, as any replacement does, and the
+     * new key is sealed with a new wrapping key, because the one there is may be the thing that broke.
+     */
+    suspend fun replaceUnreadable(): SshIdentity = mutex.withLock {
+        cached ?: withContext(Dispatchers.IO) {
+            synchronized(CREATION) { identityFrom(readOrReplace()) }
+        }.also { cached = it }
+    }
+
+    private fun readOrReplace(): ByteArray {
+        try {
+            return seed()
+        } catch (_: Exception) {
+            // Still unreadable, which is what the person was told before they asked.
+        }
+        return try {
+            if (keyFile.exists()) {
+                replace("reading it kept failing, and a new one was asked for", newWrappingKey = true)
+            } else {
+                // Nothing to set aside: none was ever written, or a replacement before this one
+                // moved it and its note still says so.
+                newSeed().also { vault.write(keyFile, it, newKey = true) }
+            }
+        } catch (failure: Exception) {
+            throw DeviceKeyUnavailable(failure, replacing = true)
+        }
+    }
+
+    /**
      * The seed on disk, or a new one, and only ever a new one on a finding that cannot change.
      *
      * Two findings make a new key. There is no file, which is the first run. Or there is a file and
-     * it can never be opened again: the keystore has no key to open it with or the key it has does
-     * not authenticate it, which is what a keystore reset or storage restored underneath the app
-     * leaves behind. The old private key is unrecoverable in both, and failing forever would fail
-     * the one screen that shows the public key, which is the screen the user needs to recover.
+     * it can never be opened again: the keystore has no key to open it with, or the key it has does
+     * not authenticate it or can never be used again, which is what a keystore reset or storage
+     * restored underneath the app leaves behind. The old private key is unrecoverable in all of
+     * these, and failing forever would fail the one screen that shows the public key, which is the
+     * screen the user needs to recover.
      *
      * Everything else is an error that may not happen next time: a read that failed, a keystore that
      * did not answer. That is thrown, and the file stays exactly as it was. The previous version
@@ -124,21 +160,34 @@ class DeviceIdentity internal constructor(
      */
     private fun loadOrCreate(): SshIdentity = synchronized(CREATION) {
         val seed = try {
-            when (val stored = vault.read(keyFile)) {
-                is Unsealed.Opened -> stored.secret.takeIf { it.size == SEED_BYTES }
-                    ?: replace("the file that holds it does not hold an ed25519 key")
-
-                Unsealed.Absent -> newSeed().also { vault.write(keyFile, it) }
-                is Unsealed.Lost -> replace(stored.reason)
-            }
+            seed()
         } catch (failure: Exception) {
             throw DeviceKeyUnavailable(failure)
         }
+        identityFrom(seed)
+    }
 
+    private fun seed(): ByteArray {
+        var stored = vault.read(keyFile)
+        if (stored is Unsealed.Lost && stored.keyMissing && vault.hasKey()) {
+            // The keystore said a few times over that it had no key, and has one now. It was only
+            // slow, and the file is read again with the key rather than set aside.
+            stored = vault.read(keyFile)
+        }
+        return when (stored) {
+            is Unsealed.Opened -> stored.secret.takeIf { it.size == SEED_BYTES }
+                ?: replace("the file that holds it does not hold an ed25519 key")
+
+            Unsealed.Absent -> newSeed().also { vault.write(keyFile, it) }
+            is Unsealed.Lost -> replace(stored.reason)
+        }
+    }
+
+    private fun identityFrom(seed: ByteArray): SshIdentity {
         val curve = EdDSANamedCurveTable.ED_25519_CURVE_SPEC
         val privateSpec = EdDSAPrivateKeySpec(seed, curve)
         val publicSpec = EdDSAPublicKeySpec(privateSpec.a, curve)
-        SshIdentity(
+        return SshIdentity(
             publicKey = EdDSAPublicKey(publicSpec),
             privateKey = EdDSAPrivateKey(privateSpec),
             comment = comment(),
@@ -149,22 +198,42 @@ class DeviceIdentity internal constructor(
      * A new key in place of one that can never be opened again.
      *
      * The change is written down first, so a process that dies anywhere in here still tells the
-     * user next time; the old file is moved aside rather than written over; and only then is a new
-     * key written where it was.
+     * user next time; the old file is moved aside rather than written over, under the time the note
+     * carries; and only then is a new key written where it was. A note whose file was never moved is
+     * not a change, and [readChange] drops it.
      */
-    private fun replace(reason: String): ByteArray {
+    private fun replace(reason: String, newWrappingKey: Boolean = false): ByteArray {
+        val at = clock()
         changeFile.parentFile?.mkdirs()
-        changeFile.writeText("${clock()}\n$reason\n")
-        vault.setAside(keyFile, clock())
-        return newSeed().also { vault.write(keyFile, it) }
+        changeFile.writeText("$at\n$reason\n")
+        vault.setAside(keyFile, at)
+        return newSeed().also { vault.write(keyFile, it, newKey = newWrappingKey) }
     }
 
+    /**
+     * The note [replace] left, when the file it was about was in fact moved aside.
+     *
+     * The note is written before the move, so a move that failed or never happened leaves a note
+     * about a key that is still the key. Reported, that would send the user to replace a line in
+     * every authorized_keys for nothing; it is deleted instead.
+     */
     private fun readChange(): KeyChange? {
         if (!changeFile.exists()) return null
         val lines = changeFile.readText().lines()
-        // A note cut short is still a note that the key changed, and that is the part that matters.
+        val at = lines.firstOrNull()?.trim()?.toLongOrNull()
+        // A note cut short is still a note that the key changed, and that is the part that matters:
+        // it counts as long as anything was ever moved aside.
+        val moved = if (at != null) {
+            File(keyFile.parentFile, "${keyFile.name}.lost-$at").exists()
+        } else {
+            keyFile.parentFile?.list()?.any { it.startsWith("${keyFile.name}.lost-") } == true
+        }
+        if (!moved) {
+            changeFile.delete()
+            return null
+        }
         return KeyChange(
-            at = lines.firstOrNull()?.trim()?.toLongOrNull() ?: changeFile.lastModified(),
+            at = at ?: changeFile.lastModified(),
             reason = lines.getOrNull(1)?.trim().orEmpty(),
         )
     }
@@ -201,13 +270,21 @@ data class KeyChange(
  * This phone's key is on the phone and could not be read just now.
  *
  * Nothing was replaced. The next attempt reads the same file again, and an error from the keystore
- * or the disk is far more often a moment than a loss.
+ * or the disk is far more often a moment than a loss. With [replacing], it was a replacement a
+ * person asked for that did not finish, and the sentence says that instead.
  */
-class DeviceKeyUnavailable(cause: Throwable) : IOException(
-    "This phone's key could not be read just now. Nothing was replaced, and it is read again on " +
-        "the next try. (${cause.message?.takeIf { it.isNotBlank() } ?: cause::class.java.simpleName})",
+class DeviceKeyUnavailable(cause: Throwable, replacing: Boolean = false) : IOException(
+    if (replacing) {
+        "A new key for this phone could not be made just now. (${briefly(cause)})"
+    } else {
+        "This phone's key could not be read just now. Nothing was replaced, and it is read again on " +
+            "the next try. (${briefly(cause)})"
+    },
     cause,
 )
+
+private fun briefly(cause: Throwable): String =
+    cause.message?.takeIf { it.isNotBlank() } ?: cause::class.java.simpleName
 
 /** "legion-control@<maker>-<model>", which is how the line is recognised in authorized_keys. */
 private fun deviceComment(): String {

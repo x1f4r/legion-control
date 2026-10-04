@@ -6,6 +6,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -118,6 +119,100 @@ class DeviceIdentityTest {
         assertNotEquals(original, replaced.identity().authorizedKeysLine)
         assertNotNull(replaced.change())
         assertEquals(1, lostFiles().size)
+    }
+
+    @Test
+    fun `a wrapping key the keystore says can never be used again makes a new key and says so`() = runBlocking {
+        // The keystore hands the key over and refuses every use of it. Thrown as an error, it failed
+        // every attempt for good, and the screen only ever offered to try again.
+        val original = identity().identity().authorizedKeysLine
+        keys.key = KeyVaultTest.InvalidatedKey()
+
+        val replaced = identity(now = NOW + 1)
+        assertNotEquals(original, replaced.identity().authorizedKeysLine)
+        assertEquals(listOf("identity.ed25519.lost-${NOW + 1}"), lostFiles())
+        assertTrue(replaced.change()!!.reason.contains("never be used again"))
+        assertEquals("the dead key is replaced, once", 2, keys.created)
+        assertEquals(replaced.identity().authorizedKeysLine, identity(now = NOW + 2).identity().authorizedKeysLine)
+    }
+
+    @Test
+    fun `a keystore that finds its key at the last look keeps the key it has`() = runBlocking {
+        // Three answers of "none" make the file lost, and the key is looked for once more before
+        // anything is moved. Found then, the absence was the keystore being slow.
+        val original = identity().identity().authorizedKeysLine
+        repeat(KeyVault.ABSENCE_CHECKS) { keys.script.addLast(null) }
+
+        val fresh = identity(now = NOW + 1)
+        assertEquals(original, fresh.identity().authorizedKeysLine)
+        assertTrue(lostFiles().isEmpty())
+        assertNull(fresh.change())
+        assertEquals(1, keys.created)
+    }
+
+    @Test
+    fun `a note whose file was never moved aside is not a change`() = runBlocking {
+        // The note is written before the move. A move that failed, or a process that died between
+        // the two, leaves the old file in place and a note about a key that is still the key.
+        val original = identity().identity().authorizedKeysLine
+        File(keyFile.parentFile, "identity.ed25519.changed").writeText("${NOW + 5}\nthe keystore was slow\n")
+
+        val fresh = identity()
+        assertNull(fresh.change())
+        assertFalse(File(keyFile.parentFile, "identity.ed25519.changed").exists())
+        assertEquals(original, fresh.identity().authorizedKeysLine)
+    }
+
+    @Test
+    fun `a replacement whose new key could not be written still says the key changed`() = runBlocking {
+        identity().identity()
+        keys.key = null
+        keys.creationFailure = KeyStoreException("keystore is not ready")
+        try {
+            identity(now = NOW + 1).identity()
+            fail("a new key that could not be sealed has to be an error")
+        } catch (_: DeviceKeyUnavailable) {
+        }
+
+        // The old file is aside, so whatever key comes next is a new one, and the note stands.
+        keys.creationFailure = null
+        val next = identity(now = NOW + 2)
+        next.identity()
+        assertEquals(NOW + 1, next.change()!!.at)
+    }
+
+    @Test
+    fun `a key that keeps failing to read is replaced when the user asks, with a new wrapping key`() = runBlocking {
+        val original = identity().identity().authorizedKeysLine
+        keys.failure = KeyStoreException("the keystore lists the key and did not hand it over")
+        val stuck = identity(now = NOW + 1)
+        try {
+            stuck.identity()
+            fail("an unreadable key is an error until somebody asks for a new one")
+        } catch (_: DeviceKeyUnavailable) {
+        }
+        assertTrue("nothing is replaced on the app's own say", lostFiles().isEmpty())
+
+        val line = stuck.replaceUnreadable().authorizedKeysLine
+        assertNotEquals(original, line)
+        assertEquals(line, stuck.identity().authorizedKeysLine)
+        assertEquals(listOf("identity.ed25519.lost-${NOW + 1}"), lostFiles())
+        assertEquals(2, keys.created)
+        assertTrue(stuck.change()!!.reason.contains("asked for"))
+
+        // A keystore that has the new key under its name hands that one over from now on.
+        keys.failure = null
+        assertEquals(line, identity(now = NOW + 2).identity().authorizedKeysLine)
+    }
+
+    @Test
+    fun `asking for a new key when the old one reads again keeps the old one`() = runBlocking {
+        val original = identity().identity().authorizedKeysLine
+        val fresh = identity(now = NOW + 1)
+        assertEquals(original, fresh.replaceUnreadable().authorizedKeysLine)
+        assertTrue(lostFiles().isEmpty())
+        assertNull(fresh.change())
+        assertEquals(1, keys.created)
     }
 
     @Test
