@@ -23,7 +23,8 @@ struct AppModelTests {
             bindings: bindings ?? BindingsStore(url: home.appending(path: "absent-bindings.json")),
             operations: OperationStore(url: home.appending(path: "operations.json")),
             appUpdates: AppUpdateModel(preferences: FilePreferences(url: home.appending(path: "preferences.json")),
-                                       installedVersion: "1.4.0")
+                                       installedVersion: "1.4.0"),
+            remembered: .inMemory()
         )
     }
 
@@ -62,6 +63,16 @@ struct AppModelTests {
         #expect(app.machine(id: "tower") === tower)
         #expect(pi.machine.name == "Pi in the hall")
         #expect(pi.machine.endpoints.first?.host == "192.0.2.6")
+    }
+
+    @Test("every machine model writes into the app's one remembered store")
+    func machinesShareRememberedSettings() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try Self.app(Self.twoMachines, in: home)
+
+        #expect(app.machines.count == 2)
+        #expect(app.machines.allSatisfy { $0.remembered === app.remembered })
     }
 
     @Test("a failure on this device reaches the panel's notice, as one on a machine does")

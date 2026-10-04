@@ -573,7 +573,7 @@ struct MachineModelTests {
         #expect(!runner.sentCommands.contains { $0.contains("bad id") })
     }
 
-    // MARK: - Setup edits
+    // MARK: - Setup edits and remembered settings
 
     /// Holds one scripted command until the test lets it go.
     final class Gate: @unchecked Sendable {
@@ -659,6 +659,39 @@ struct MachineModelTests {
         // can be commanded.
         #expect(model.currentSystem?.id == "linux")
         #expect(model.commandableSystem == nil)
+    }
+
+    @Test("every machine writes into one remembered store, so none erases another's reading")
+    func rememberedSettingsAreShared() async throws {
+        // Each model used to load its own copy at launch and write the whole of it back, so the last
+        // one to write wiped what the others had recorded since.
+        var saved: [String: RememberedSystem] = [:]
+        let remembered = RememberedSettings(systems: [:], save: { saved = $0 })
+
+        let piRunner = FakeRunner()
+        piRunner.answer("status", json: Self.onlineStatus)
+        var piAgent = RemoteAgent(machine: Self.machine())
+        piAgent.runner = { _, arguments, _, _ in piRunner.run(arguments) }
+        let pi = MachineModel(machine: Self.machine(), agent: piAgent, remembered: remembered)
+
+        var towerMachine = Self.machine()
+        towerMachine.id = "tower"
+        towerMachine.name = "Tower"
+        let towerRunner = FakeRunner()
+        towerRunner.answer("status", json: Self.onlineStatus.replacingOccurrences(of: #""hostname": "pi""#,
+                                                                                  with: #""autoUpdate": true, "hostname": "tower""#))
+        var towerAgent = RemoteAgent(machine: towerMachine)
+        towerAgent.runner = { _, arguments, _, _ in towerRunner.run(arguments) }
+        let tower = MachineModel(machine: towerMachine, agent: towerAgent, remembered: remembered)
+
+        await pi.refresh(userInitiated: false)
+        await tower.refresh(userInitiated: false)
+
+        #expect(Set(saved.keys) == ["pi/linux", "tower/linux"])
+        #expect(saved["tower/linux"]?.autoUpdate == true)
+        #expect(saved["pi/linux"]?.checkedAt != nil)
+        #expect(pi.autoUpdateCheckedAt(for: Self.machine().systems[0]) != nil)
+        #expect(tower.autoUpdateValue(for: towerMachine.systems[0]) == true)
     }
 
     // MARK: - Notes and evidence

@@ -4,12 +4,11 @@ import Observation
 /// One configured machine: what it is running, what its services are doing, and everything that can
 /// be done to it.
 ///
-/// There is one of these per machine in the config, each with its own link state, its own poll and
-/// its own remembered settings. Nothing about one machine is ever read off another. What it shares
-/// with the local Mac — how an action is sent and written down, how the setup is shared, every verb
-/// in between — is in AgentDevice.swift; this file is the part only a machine over ssh has: routes,
-/// host keys, the link, and waking, sleeping and booting something that is not the device the app
-/// runs on.
+/// There is one of these per machine in the config, each with its own link state and its own poll.
+/// Nothing about one machine is ever read off another. What it shares with the local Mac — how an
+/// action is sent and written down, how the setup is shared, every verb in between — is in
+/// AgentDevice.swift; this file is the part only a machine over ssh has: routes, host keys, the
+/// link, and waking, sleeping and booting something that is not the device the app runs on.
 @MainActor
 @Observable
 final class MachineModel: AgentDevice, @MainActor Identifiable {
@@ -27,7 +26,6 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     private(set) var machine: Machine
     private(set) var link: Link = .unknown
     private(set) var status: AgentStatus?
-    private(set) var remembered: [String: RememberedSystem] = RememberedStore.load()
     private(set) var lastChecked: Date?
     private(set) var isRefreshing = false
     /// The route the last successful call went over, for the diagnosis page.
@@ -37,6 +35,10 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     private(set) var hostKeyPrompt: HostKeyPrompt?
 
     let core = DeviceCore()
+
+    /// The last thing known about each of this machine's systems, in the one store every machine
+    /// shares.
+    let remembered: RememberedSettings
 
     var id: String { machine.id }
     var name: String {
@@ -74,15 +76,17 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     private var sleepExpectation: Date?
     private var lastRefreshFinished: Date?
 
-    init(machine: Machine) {
+    init(machine: Machine, remembered: RememberedSettings) {
         self.machine = machine
         self.agent = RemoteAgent(machine: machine)
+        self.remembered = remembered
     }
 
     /// For the tests: a model whose transport never launches a process.
-    init(machine: Machine, agent: RemoteAgent) {
+    init(machine: Machine, agent: RemoteAgent, remembered: RememberedSettings = .inMemory()) {
         self.machine = machine
         self.agent = agent
+        self.remembered = remembered
     }
 
     /// Follow an edit to this machine's entry in the setup without starting over.
@@ -173,11 +177,11 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
 
     func autoUpdateValue(for system: SystemConfig) -> Bool? {
         if currentSystem?.id == system.id, let live = status?.autoUpdate { return live }
-        return remembered[RememberedStore.key(machine: machine.id, system: system.id)]?.autoUpdate
+        return remembered.system(machine: machine.id, system: system.id)?.autoUpdate
     }
 
     func autoUpdateCheckedAt(for system: SystemConfig) -> Date? {
-        remembered[RememberedStore.key(machine: machine.id, system: system.id)]?.checkedAt
+        remembered.system(machine: machine.id, system: system.id)?.checkedAt
     }
 
     // MARK: - Reaching the agent
@@ -357,12 +361,7 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         link = .online(system)
 
         guard let configured = system.configured else { return }
-        let key = RememberedStore.key(machine: machine.id, system: configured.id)
-        var snapshot = remembered[key] ?? RememberedSystem()
-        snapshot.autoUpdate = newStatus.autoUpdate ?? snapshot.autoUpdate
-        snapshot.checkedAt = Date()
-        remembered[key] = snapshot
-        RememberedStore.save(remembered)
+        remembered.record(machine: machine.id, system: configured.id, autoUpdate: newStatus.autoUpdate)
     }
 
     private func handleStatusFailure(_ failure: AgentFailure) {
@@ -803,14 +802,10 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
 
     func setAutoUpdate(_ enabled: Bool, on system: SystemConfig, service: ServiceStatus? = nil) {
         guard currentSystem?.id == system.id else { return }
-        let key = RememberedStore.key(machine: machine.id, system: system.id)
-        saveAutoUpdate(enabled, service: service, subject: service?.displayName ?? system.name) { [weak self] value in
-            guard let self, service == nil else { return }
-            var snapshot = self.remembered[key] ?? RememberedSystem()
-            snapshot.autoUpdate = value
-            snapshot.checkedAt = Date()
-            self.remembered[key] = snapshot
-            RememberedStore.save(self.remembered)
+        let machineId = machine.id
+        saveAutoUpdate(enabled, service: service, subject: service?.displayName ?? system.name) { [remembered] value in
+            guard service == nil else { return }
+            remembered.record(machine: machineId, system: system.id, autoUpdate: value)
         }
     }
 

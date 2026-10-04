@@ -5,8 +5,8 @@ import Observation
 ///
 /// This object owns nothing about any particular machine. It holds the shared setup and this
 /// device's private bindings, brings the models in line when either changes, fans the poll out
-/// across them, keeps the one place a question is shown, and owns the operation history the
-/// machines all write into.
+/// across them, keeps the one place a question is shown, and owns the operation history and the
+/// remembered settings the machines all write into.
 ///
 /// It is also where "every device is a peer" is actually true. There is no authority flag and no
 /// follower mode: this device edits the setup when the user edits it, publishes it to any machine
@@ -35,6 +35,10 @@ final class AppModel {
     /// Everything anyone has asked for, kept across launches.
     let operations: OperationStore
 
+    /// The last thing known about every machine's systems. One store for every model, so no
+    /// machine's reading can overwrite another's.
+    let remembered: RememberedSettings
+
     private var pollTask: Task<Void, Never>?
 
     /// Called whenever something the menu bar draws has changed.
@@ -44,12 +48,14 @@ final class AppModel {
         config: ConfigStore = ConfigStore(),
         bindings: BindingsStore = BindingsStore(),
         operations: OperationStore = OperationStore(),
-        appUpdates: AppUpdateModel = AppUpdateModel()
+        appUpdates: AppUpdateModel = AppUpdateModel(),
+        remembered: RememberedSettings = RememberedSettings()
     ) {
         self.config = config
         self.bindings = bindings
         self.operations = operations
         self.appUpdates = appUpdates
+        self.remembered = remembered
         appUpdates.onStateChange = { [weak self] in self?.onStateChange?() }
         config.onChange = { [weak self] in
             guard let self else { return }
@@ -131,7 +137,7 @@ final class AppModel {
     }
 
     private func makeMachineModel(_ machine: Machine) -> MachineModel {
-        let model = MachineModel(machine: machine)
+        let model = MachineModel(machine: machine, remembered: remembered)
         wire(model)
         return model
     }
