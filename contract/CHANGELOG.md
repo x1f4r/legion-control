@@ -141,7 +141,9 @@ not, the agent now answers as they say.
   or `config-invalid` is held until the hash changes or a person asks. A merge
   goes entry by entry: it asks about a deletion against an edit, keeps endpoints
   without an id and unknown keys, inserts what theirs added after its
-  predecessor, and never rewrites a number.
+  predecessor, and never rewrites a number. A device whose applied document
+  breaks `unknown-site` or a `helper-` rule still merges, and only a result
+  section 9.7 accepts is written.
 - **A client older than its agent** keeps using the highest contract it
   implements and says so once (section 1, rule 9). Nothing on the wire changes.
 - **Sites and wake are normative** (sections 10.1 and 10.2), with one
