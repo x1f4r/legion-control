@@ -13,6 +13,10 @@ struct AgentRequest: Sendable, Equatable {
     /// The bytes to send on stdin, for the two commands that hand over a document.
     var input: Data?
 
+    /// Whether this reads the status. Its reply is the one that says whether the key on the far
+    /// side is restricted.
+    var isStatusRead: Bool { arguments.first == "status" }
+
     /// A refusal built here rather than sent. An id that does not match the contract's grammar is a
     /// sign of a mangled config, and it is caught before it can reach a shell.
     struct Invalid: Error, Sendable, Equatable {

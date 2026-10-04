@@ -108,12 +108,27 @@ enum AgentBootstrap {
     process.exit(installed.status===null?1:installed.status);
     """
 
-    static func sshArguments(target: SSHTarget, system: SystemConfig, argv: [String]) -> [String] {
+    /// A script as it goes over ssh: on one line. Section 15.2 of the contract refuses a line feed
+    /// in any argument, because no two shells quote one the same way, and every statement in both
+    /// scripts already ends in a semicolon, so joining the lines changes nothing node reads. The
+    /// scripts themselves stay as written, byte for byte the copies the other clients send.
+    static func oneLine(_ script: String) -> String {
+        script.replacingOccurrences(of: "\n", with: " ")
+    }
+
+    /// The ssh arguments for one of the two script runs, written in the system's own grammar.
+    static func sshArguments(target: SSHTarget, system: SystemConfig, argv: [String]) throws -> [String] {
+        if let problem = Addresses.problem(with: target) { throw Failure(message: problem) }
         var commandSystem = system
         commandSystem.agent = argv
-        return RemoteCommand.sshArguments(target: target, connectTimeout: 8,
-                                           command: RemoteCommand(system: commandSystem, arguments: []),
-                                           knownHostsFile: AppPaths.overridesKnownHosts ? AppPaths.knownHostsFile.path : nil)
+        let line: String
+        do throws(CommandLineRefusal) {
+            line = try RemoteCommand(system: commandSystem, arguments: []).commandLine()
+        } catch {
+            throw Failure(message: "The bootstrap cannot be sent to \(system.name) in its shell's grammar. \(error.message)")
+        }
+        return RemoteCommand.sshArguments(target: target, connectTimeout: 8, command: line,
+                                          knownHostsFile: AppPaths.overridesKnownHosts ? AppPaths.knownHostsFile.path : nil)
     }
     static func sftpArguments(target: SSHTarget) -> [String] {
         var arguments = ["-b", "-", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no", "-o", "ConnectTimeout=8"]
@@ -134,15 +149,15 @@ enum AgentBootstrap {
         let archive = try await stagedArchive(payload, operation: operation)
         defer { try? FileManager.default.removeItem(at: archive) }
         let remoteArchive = layout.path("incoming/legion-bootstrap-\(operation).tgz").replacingOccurrences(of: "\\", with: "/")
-        let prepare = await Shell.run(executable: "/usr/bin/ssh", arguments: sshArguments(target: target, system: system,
-                                      argv: layout.prefix + ["-e", prepareScript, "--", layout.base]), timeout: 30)
+        let prepare = await Shell.run(executable: "/usr/bin/ssh", arguments: try sshArguments(target: target, system: system,
+                                      argv: layout.prefix + ["-e", oneLine(prepareScript), "--", layout.base]), timeout: 30)
         guard prepare.succeeded else { throw Failure(message: "Bootstrap preflight failed: \(prepare.failureText)") }
         let batch = "put \(try sftpQuoted(archive.path)) \(try sftpQuoted(remoteArchive))\n"
         let upload = await Shell.run(executable: "/usr/bin/sftp", arguments: sftpArguments(target: target), timeout: 120, input: Data(batch.utf8))
         guard upload.succeeded else { throw Failure(message: "The signed archive could not be uploaded: \(upload.failureText)") }
-        let command = layout.prefix + ["-e", installScript, "--", layout.base, remoteArchive,
+        let command = layout.prefix + ["-e", oneLine(installScript), "--", layout.base, remoteArchive,
                                        ReleaseTrust.sha256(of: payload), String(payload.count), operation]
-        let result = await Shell.run(executable: "/usr/bin/ssh", arguments: sshArguments(target: target, system: system, argv: command), timeout: 300)
+        let result = await Shell.run(executable: "/usr/bin/ssh", arguments: try sshArguments(target: target, system: system, argv: command), timeout: 300)
         return try decode(result)
     }
 

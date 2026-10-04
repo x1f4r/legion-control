@@ -228,6 +228,14 @@ private struct MachineEditor: View {
         }
     }
 
+    /// The grammar a system's lines are written in, or that it is not driven at all.
+    private static func grammarLabel(_ system: SystemConfig) -> String {
+        switch system.grammar {
+        case .success(let grammar): grammar.rawValue
+        case .failure(let refusal): refusal.code == "unknown-shell" ? "unknown shell, not driven" : "not driven"
+        }
+    }
+
     private var systemsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             SectionHeading(title: "Systems")
@@ -240,7 +248,7 @@ private struct MachineEditor: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Text(system.name).font(.headline)
-                        Text("\(system.platform.rawValue) · \(system.remoteShell.rawValue)\(system.isRestricted ? " · restricted key" : "")")
+                        Text("\(system.platform.rawValue) · \(Self.grammarLabel(system))\(system.isRestricted ? " · restricted key" : "")")
                             .font(.caption).foregroundStyle(.secondary)
                         Spacer(minLength: 8)
                         if machine.systems.count > 1 {
@@ -350,6 +358,7 @@ private struct NewMachineEditor: View {
     @State private var user = ""
     @State private var agentPath = CommandArguments.text(CommandArguments.installedAgent(platform: .linux, user: ""))
     @State private var platform = Platform.linux
+    @State private var windowsShell = "cmd"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -373,10 +382,21 @@ private struct NewMachineEditor: View {
                 .fixedSize()
             }
 
+            if platform == .windows {
+                HStack(alignment: .firstTextBaseline, spacing: 18) {
+                    Text("Shell").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
+                    Picker("", selection: $windowsShell) {
+                        Text("cmd").tag("cmd")
+                        Text("powershell").tag("powershell")
+                    }
+                    .labelsHidden().pickerStyle(.segmented).fixedSize()
+                }
+            }
+
             LabelledField("Agent arguments", text: $agentPath, placeholder: "[\"/absolute/base/bin/legionctl\"]")
 
             QuietNote(text: platform == .windows
-                      ? "Windows systems are quoted for PowerShell by default. A machine still on the stock OpenSSH shell needs \"shell\": \"cmd\" adding by hand."
+                      ? "cmd is what a stock Windows OpenSSH runs. Choose powershell only if this account's OpenSSH DefaultShell points at it."
                       : "Enter a JSON array of arguments. Spaces inside each quoted path are preserved.")
 
             Button("Add the machine") { add() }
@@ -405,6 +425,18 @@ private struct NewMachineEditor: View {
         CommandArguments.parse(agentPath) ?? []
     }
 
+    /// A Windows system always says which shell it has, so no client is left to guess.
+    private var systemEntry: [String: Any] {
+        var system: [String: Any] = [
+            "id": platform.rawValue,
+            "name": platform.defaultName,
+            "platform": platform.rawValue,
+            "agent": agentArgv
+        ]
+        if platform == .windows { system["shell"] = windowsShell }
+        return system
+    }
+
     private func add() {
         let machineId = id.trimmingCharacters(in: .whitespaces)
         var entry: [String: Any] = [
@@ -415,12 +447,7 @@ private struct NewMachineEditor: View {
                 "kind": "remote",
                 "host": host.trimmingCharacters(in: .whitespaces)
             ] as [String: Any]],
-            "systems": [[
-                "id": platform.rawValue,
-                "name": platform.defaultName,
-                "platform": platform.rawValue,
-                "agent": agentArgv
-            ] as [String: Any]]
+            "systems": [systemEntry]
         ]
         if !user.trimmingCharacters(in: .whitespaces).isEmpty,
            var endpoints = entry["endpoints"] as? [[String: Any]] {
@@ -521,8 +548,9 @@ private struct SystemForm: View {
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Shell").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
                 Picker("", selection: $shell) {
-                    Text("What the platform implies").tag("")
-                    ForEach(RemoteShell.allCases, id: \.self) { value in Text(value.rawValue).tag(value.rawValue) }
+                    // A Windows system always names its shell: no client guesses one for it.
+                    if platform != .windows { Text("What the platform implies").tag("") }
+                    ForEach(["posix", "cmd", "powershell"], id: \.self) { value in Text(value).tag(value) }
                 }
                 .labelsHidden().pickerStyle(.menu).fixedSize()
             }
@@ -535,7 +563,7 @@ private struct SystemForm: View {
             LabelledField("Agent arguments", text: $argv, placeholder: "JSON array: one string per argument")
 
             if restricted {
-                QuietNote(text: "A forced command never reaches a shell, so the argv is sent as POSIX words whatever the platform is.")
+                QuietNote(text: "A forced command never reaches a shell, so the command is written in the dispatcher's own grammar whatever the platform is. The arguments have to be exactly the interpreter and the agent's entry.")
             }
 
             Button("Add the system") {
@@ -546,12 +574,24 @@ private struct SystemForm: View {
                     "platform": platform.rawValue,
                     "agent": words
                 ]
-                if !shell.isEmpty { entry["shell"] = shell }
+                let chosen = platform == .windows && shell.isEmpty ? "cmd" : shell
+                if !chosen.isEmpty { entry["shell"] = chosen }
                 if restricted { entry["restricted"] = true }
-                if save(entry) { id = ""; name = ""; shell = ""; argv = ""; restricted = false }
+                if save(entry) { id = ""; name = ""; shell = platform == .windows ? "cmd" : ""; argv = ""; restricted = false }
             }
-            .disabled(!AgentToken.isValid(id.trimmingCharacters(in: .whitespaces)) || CommandArguments.parse(argv) == nil)
+            .disabled(!AgentToken.isValid(id.trimmingCharacters(in: .whitespaces)) || !argumentsFit)
         }
+        .onChange(of: platform) { _, newPlatform in
+            // cmd is what a stock Windows OpenSSH runs, so it is what a new Windows system starts with.
+            if newPlatform == .windows, shell.isEmpty { shell = "cmd" }
+        }
+    }
+
+    /// A restricted system the dispatcher could not take would be saved only to be refused on every
+    /// command.
+    private var argumentsFit: Bool {
+        guard let words = CommandArguments.parse(argv) else { return false }
+        return !restricted || words.count == 2
     }
 }
 

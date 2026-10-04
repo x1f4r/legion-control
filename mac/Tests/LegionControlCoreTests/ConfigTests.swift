@@ -148,6 +148,16 @@ struct ConfigTests {
         #expect(!MaintenanceWindow(from: "24:00", to: "04:00").looksValid)
     }
 
+    @Test("a system no grammar can be written for is a warning that says why")
+    func refusedGrammarIsAWarning() throws {
+        let json = """
+        { "version": 1, "machines": [ { "id": "tower", "endpoints": [{"id":"e","host":"192.0.2.10"}],
+          "systems": [{"id":"l","platform":"linux","restricted":true,"agent":["/bin/sh","-c","legionctl"]}] } ] }
+        """
+        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
+        #expect(config.warnings().contains { $0.contains("is never sent anything") && $0.contains("the interpreter and the agent's entry") })
+    }
+
     @Test("an address outside the dial grammar is a warning that names it")
     func undialableAddressIsAWarning() throws {
         let json = """
@@ -274,6 +284,26 @@ struct ConfigTests {
         #expect(throws: ControllerEditor.EditFailure.self) {
             try ControllerEditor.upsertMachine(["id": "has space"], in: &root)
         }
+    }
+
+    @Test("a Windows system the editor writes always names its shell, and keeps one it had")
+    func editorWritesWindowsShell() throws {
+        var root: [String: Any] = ["version": 1, "machines": [[
+            "id": "tower",
+            "systems": [["id": "windows", "platform": "windows", "agent": ["node", "C:\\lc\\agent\\src\\index.mjs"]],
+                        ["id": "linux", "platform": "linux", "agent": ["node", "/a"]],
+                        ["id": "pwsh", "platform": "windows", "shell": "powershell", "agent": ["node", "C:\\a.mjs"]]]
+        ] as [String: Any]]]
+        // The launcher migration changes only the agent, and the system it touches gains the shell it
+        // already ran as.
+        try ControllerEditor.upsertSystem(["id": "windows", "agent": ["node", "C:\\lc\\bin\\launcher.mjs"]],
+                                          onMachine: "tower", in: &root)
+        try ControllerEditor.upsertSystem(["id": "linux", "agent": ["node", "/b"]], onMachine: "tower", in: &root)
+        try ControllerEditor.upsertSystem(["id": "pwsh", "agent": ["node", "C:\\b.mjs"]], onMachine: "tower", in: &root)
+        let systems = try #require(((root["machines"] as? [[String: Any]])?.first)?["systems"] as? [[String: Any]])
+        #expect(systems[0]["shell"] as? String == "cmd")
+        #expect(systems[1]["shell"] == nil)
+        #expect(systems[2]["shell"] as? String == "powershell")
     }
 
     @Test("a document with no identity gets one only when it is adopted, not on every load")

@@ -447,7 +447,7 @@ enum AppUpdates {
         exitTimeout: Int = 10,
         launchTimeout: Int = 45
     ) -> String {
-        func quoted(_ url: URL) -> String { RemoteShell.posixQuoted(url.path(percentEncoded: false)) }
+        func quoted(_ url: URL) -> String { CommandGrammar.posixQuoted(url.path(percentEncoded: false)) }
         return """
         #!/bin/sh
         set -u

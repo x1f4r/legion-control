@@ -410,18 +410,22 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
     var agent: [String]
     /// Overrides the platform's icon with any SF Symbol name.
     var symbol: String?
-    /// Which shell the far side hands an ssh command to, when it is not the one the platform
-    /// implies. Stock Windows OpenSSH runs cmd.exe; a machine set up for remote administration
-    /// usually has `DefaultShell` pointed at PowerShell, which is what this defaults to for Windows.
-    /// A machine that still has the stock setting says `"shell": "cmd"`.
-    var shell: RemoteShell?
+    /// Which shell the far side hands an ssh command to, as the document spells it. Stock Windows
+    /// OpenSSH runs cmd.exe, and that is what a Windows system without one gets; an account whose
+    /// `DefaultShell` points at PowerShell says `"shell": "powershell"`. Kept as written, because a
+    /// spelling this app does not know is a system it refuses to drive, not one to guess at.
+    var shell: String?
     /// True when this system's key is restricted to a forced command through the dispatcher.
     ///
     /// A forced command bypasses the login shell entirely: sshd hands the request to the dispatcher
     /// as `SSH_ORIGINAL_COMMAND` and nothing interprets it as PowerShell or as cmd. So the argv is
-    /// serialised as POSIX words, which is the grammar the dispatcher parses, whatever platform the
-    /// machine is.
+    /// written in the dispatcher's own grammar whatever platform the machine is.
     var restricted: Bool?
+    /// The grammar this system's command lines are written in (section 15.1 of the contract), or
+    /// why it has none, worked out from `platform`, `shell` and `restricted` as the document has
+    /// them. A route whose last status reported a restricted session can still move it to the
+    /// dispatcher's grammar at run time; nothing moves it anywhere else.
+    var grammar: Result<CommandGrammar, CommandLineRefusal>
 
     private enum CodingKeys: String, CodingKey {
         case id, name, platform, agent, symbol, shell, restricted
@@ -434,13 +438,15 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
         name = try container.decodeIfPresent(String.self, forKey: .name) ?? platform.defaultName
         agent = try container.decodeIfPresent([String].self, forKey: .agent) ?? []
         symbol = try container.decodeIfPresent(String.self, forKey: .symbol)
-        shell = try container.decodeIfPresent(RemoteShell.self, forKey: .shell)
+        shell = try container.decodeIfPresent(String.self, forKey: .shell)
         restricted = try container.decodeIfPresent(Bool.self, forKey: .restricted)
+        grammar = CommandGrammar.resolve(platform: platform, shell: shell, restricted: restricted,
+                                         restrictedSession: false, agentLength: agent.count)
     }
 
     /// Used by the tests and by the guided setup, which build systems rather than decode them.
     init(id: String, name: String? = nil, platform: Platform = .linux, agent: [String] = [],
-         symbol: String? = nil, shell: RemoteShell? = nil, restricted: Bool? = nil) {
+         symbol: String? = nil, shell: String? = nil, restricted: Bool? = nil) {
         self.id = id
         self.platform = platform
         self.name = name ?? platform.defaultName
@@ -448,21 +454,17 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
         self.symbol = symbol
         self.shell = shell
         self.restricted = restricted
+        self.grammar = CommandGrammar.resolve(platform: platform, shell: shell, restricted: restricted,
+                                              restrictedSession: false, agentLength: agent.count)
     }
 
     var symbolName: String { symbol ?? platform.symbolName }
 
-    /// The shell to quote for.
-    ///
-    /// A restricted system is serialised as POSIX words whatever it runs on, because a forced
-    /// command never reaches a shell: the dispatcher on the far side parses the request itself, and
-    /// its grammar is POSIX. Otherwise it is what the config names, or what the platform implies.
-    var remoteShell: RemoteShell {
-        if restricted == true { return .posix }
-        return shell ?? RemoteShell.default(for: platform)
-    }
-
     var isRestricted: Bool { restricted == true }
+
+    /// Whether the document chose a shell for this system. A Windows system that did not is written
+    /// for cmd, and a PowerShell login refusing that line is worth naming as the likely cause.
+    var hasDefaultedShell: Bool { shell == nil && restricted != true }
 }
 
 enum Platform: String, Decodable, Sendable, Equatable, CaseIterable {
@@ -578,6 +580,12 @@ extension ControllerConfig {
                 guard !system.agent.isEmpty else {
                     throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" has no \"agent\" command. It has to be the argv to run over ssh.")
                 }
+                // The shared schema allows exactly these three. Any other spelling used to stop the
+                // document decoding at all, and it is still refused, now with a sentence that says
+                // which system and why.
+                if let shell = system.shell, !["posix", "cmd", "powershell"].contains(shell) {
+                    throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" names the shell \"\(shell)\". Use posix, cmd or powershell.")
+                }
             }
 
             if let site = machine.site, !site.isEmpty, !seenSites.contains(site) {
@@ -670,6 +678,11 @@ extension ControllerConfig {
             for route in machine.routes {
                 if let part = Addresses.undialablePart(of: route.target) {
                     out.append("\(machine.name) lists \(route.target.display), which this app never dials, scans or pins: \(part) is not one it accepts.")
+                }
+            }
+            for system in machine.systems {
+                if case .failure(let refusal) = system.grammar {
+                    out.append("\(system.name) on \(machine.name) is never sent anything. \(refusal.message)")
                 }
             }
             guard let wake = machine.wake else { continue }

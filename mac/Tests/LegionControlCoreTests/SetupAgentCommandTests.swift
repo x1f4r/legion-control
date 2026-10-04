@@ -19,7 +19,7 @@ struct SetupAgentCommandTests {
         try "#!/bin/sh\nprintf '%s' \"$*\"\n".write(to: launcher, atomically: false, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: launcher.path)
         let argv = CommandArguments.installedAgent(platform: .linux, user: "different account")
-        let command = RemoteShell.posix.serialize(argv + ["config"])
+        let command = try CommandGrammar.posix.serialize(argv + ["config"])
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", command]

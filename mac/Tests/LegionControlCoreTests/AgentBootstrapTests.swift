@@ -61,6 +61,38 @@ struct AgentBootstrapTests {
         #expect(try String(contentsOf: old.appending(path: "index.mjs"), encoding: .utf8) == "// legacy fixture")
     }
 
+    @Test("the bootstrap scripts go over ssh on one line and still run")
+    func scriptsSurviveTheCommandLine() async throws {
+        // A command line may not carry a line feed in any grammar, so the scripts are joined onto one
+        // line on the way out. This runs that line through sh with a real node, as a POSIX login
+        // would, and checks node still reads both scripts.
+        let base = FileManager.default.temporaryDirectory.appending(path: "bootstrap-line-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let entry = base.appending(path: "agent/src")
+        try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true)
+        try Data("// legacy fixture".utf8).write(to: entry.appending(path: "index.mjs"))
+        let node = try #require(["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"].first { FileManager.default.isExecutableFile(atPath: $0) })
+        let layout = try AgentBootstrap.layout(argv: [node, entry.appending(path: "index.mjs").path])
+
+        func line(_ argv: [String]) throws -> String {
+            try RemoteCommand(system: SystemConfig(id: "linux", agent: argv), arguments: []).commandLine()
+        }
+        let prepare = try line(layout.prefix + ["-e", AgentBootstrap.oneLine(AgentBootstrap.prepareScript), "--", layout.base])
+        #expect(!prepare.contains("\n"))
+        let prepared = await Shell.run(executable: "/bin/sh", arguments: ["-c", prepare], timeout: 30)
+        #expect(prepared.standardOutput == "{\"ok\":true}\n", "\(prepared.standardError)")
+
+        // The install script refuses an archive that is not there, which it can only do once node
+        // has parsed all of it.
+        let install = try line(layout.prefix + ["-e", AgentBootstrap.oneLine(AgentBootstrap.installScript), "--", layout.base,
+                                                base.appending(path: "missing.tgz").path, String(repeating: "0", count: 64), "1",
+                                                AgentToken.newOperationId()])
+        let installed = await Shell.run(executable: "/bin/sh", arguments: ["-c", install], timeout: 30)
+        #expect(installed.exitCode != 0)
+        #expect(installed.standardError.contains("ENOENT"))
+        #expect(!installed.standardError.contains("SyntaxError"))
+    }
+
     @Test("bootstrap refuses archive symlinks before running any staged code")
     func unsafeArchive() async throws {
         let (dir, source, _) = try await fixture()

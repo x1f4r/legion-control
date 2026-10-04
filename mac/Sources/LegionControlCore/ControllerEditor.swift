@@ -132,9 +132,19 @@ enum ControllerEditor {
     }
 
     /// Add or replace one system on one machine.
+    ///
+    /// A Windows system this writes always says which shell it has, as section 15.1 of the contract
+    /// asks of every editor. One that had none is given cmd, which is what it already ran as, so
+    /// nothing that runs changes and no client is left to guess.
     static func upsertSystem(_ system: [String: Any], onMachine machineId: String, in root: inout [String: Any]) throws {
         try mutateMachine(machineId, in: &root) { machine in
             try upsertKeyed(system, in: &machine, list: "systems", what: "system")
+            guard var systems = machine["systems"] as? [[String: Any]],
+                  let index = systems.firstIndex(where: { $0["id"] as? String == system["id"] as? String }),
+                  systems[index]["platform"] as? String == "windows",
+                  systems[index]["shell"] == nil || systems[index]["shell"] is NSNull else { return }
+            systems[index]["shell"] = "cmd"
+            machine["systems"] = systems
         }
     }
 

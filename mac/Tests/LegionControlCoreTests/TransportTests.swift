@@ -166,6 +166,92 @@ struct TransportTests {
         #expect(await calls.value == 2)
     }
 
+    /// A transport whose ssh is `answer`.
+    static func agent(_ machine: Machine,
+                      answer: @escaping @Sendable (_ arguments: [String]) async -> CommandResult) -> RemoteAgent {
+        var agent = RemoteAgent(machine: machine)
+        agent.runner = { _, arguments, _, _ in await answer(arguments) }
+        return agent
+    }
+
+    static func restart() throws -> AgentRequest {
+        try AgentRequest.restart(service: "demo", intent: .init(operationId: AgentToken.newOperationId()), dialect: .v3)
+    }
+
+    static let statusJSON = #"{"ok":true,"contract":3,"agentVersion":"3.1.0","system":{"id":"linux","name":"Linux"},"services":[]}"#
+
+    @Test("an address outside the dial grammar is never dialled, and the next one is")
+    func undialableAddressIsSkipped() async throws {
+        // T5. The host is passed after `--`, but a known_hosts pattern or an option-shaped host is
+        // still nothing this app should ever hand to ssh.
+        let machine = Self.machine(endpoints: [("remote", "victim.example,*", nil), ("remote", "192.0.2.10", nil)],
+                                   systems: [("linux", .linux)])
+        let destinations = Recorder()
+        let agent = Self.agent(machine) { arguments in
+            await destinations.append(FakeSSH.destination(arguments) ?? "")
+            return Self.result(out: TransportTests.statusJSON)
+        }
+        _ = try await agent.send(.status(dialect: .v3), decoding: AgentStatus.self, preferring: nil)
+        #expect(await destinations.values == ["me@192.0.2.10"])
+
+        let only = Self.machine(endpoints: [("lan", "-oProxyCommand=x", nil)], systems: [("linux", .linux)])
+        let refusing = Self.agent(only) { arguments in
+            await destinations.append(FakeSSH.destination(arguments) ?? "")
+            return Self.result(out: TransportTests.statusJSON)
+        }
+        await #expect(throws: AgentFailure(.badRequest, system: only.systems[0], route: only.routes[0].label,
+                                           detail: Addresses.problem(with: only.routes[0].target)!, dispatch: .never)) {
+            _ = try await refusing.send(try Self.restart(), decoding: AgentActionResult.self, preferring: nil)
+        }
+        #expect(await destinations.count == 1)
+    }
+
+    @Test("a line a system's grammar refuses is not sent, and a mutation may go on to the next system")
+    func refusedLineIsBadRequest() async throws {
+        // The walk vectors pin this: nothing left this Mac, so the next system is as safe as the first.
+        let machine = Machine(
+            id: "tower",
+            endpoints: [Endpoint(id: "lan", kind: "lan", host: "192.0.2.10", user: "me")],
+            systems: [SystemConfig(id: "windows", platform: .windows, agent: ["node", "C:\\100%\\a.mjs"], shell: "cmd"),
+                      SystemConfig(id: "linux", platform: .linux, agent: ["node", "/a.mjs"])]
+        )
+        let lines = Recorder()
+        let agent = Self.agent(machine) { arguments in
+            await lines.append(FakeSSH.line(arguments))
+            return Self.result(out: #"{"ok":true,"contract":3,"action":"restarted"}"#)
+        }
+        let reply = try await agent.send(try Self.restart(), decoding: AgentActionResult.self, preferring: nil)
+        #expect(reply.system.id == "linux")
+        #expect(await lines.count == 1)
+    }
+
+    @Test("a route that reported a restricted session gets the dispatcher's grammar from then on")
+    func restrictedSessionIsRemembered() async throws {
+        let machine = Machine(
+            id: "tower",
+            endpoints: [Endpoint(id: "lan", kind: "lan", host: "192.0.2.10", user: "me")],
+            systems: [SystemConfig(id: "windows", platform: .windows,
+                                   agent: ["C:\\node.exe", "C:\\Users\\me\\launcher.mjs"], shell: "cmd")]
+        )
+        let lines = Recorder()
+        let agent = Self.agent(machine) { arguments in
+            await lines.append(FakeSSH.line(arguments))
+            return Self.result(out: #"{"ok":true,"contract":3,"agent":{"restrictedSession":true},"services":[]}"#)
+        }
+        _ = try await agent.send(.status(dialect: .legacy), decoding: AgentStatus.self, preferring: nil)
+        _ = try await agent.send(.status(dialect: .legacy), decoding: AgentStatus.self, preferring: nil)
+        #expect(await lines.values == ["@\"C:\\node.exe\" \"C:\\Users\\me\\launcher.mjs\" \"status\"",
+                                       "'C:\\node.exe' 'C:\\Users\\me\\launcher.mjs' status"])
+    }
+
+    @Test("a system with no agent command is not driven")
+    func emptyAgentIsNotTried() {
+        let machine = Machine(id: "tower", endpoints: [Endpoint(host: "192.0.2.10")],
+                              systems: [SystemConfig(id: "linux", agent: []), SystemConfig(id: "other", agent: ["node", "/a.mjs"])])
+        let attempts = RemoteAgent.attempts(machine: machine, preferredSystem: nil, preferredRoute: nil)
+        #expect(attempts.map(\.system.id) == ["other"])
+    }
+
     @Test("the whole command shares one budget across every attempt")
     func attemptsShareTheBudget() {
         let machine = Self.machine(endpoints: [("remote", "a", nil), ("remote", "b", nil), ("remote", "c", nil)])
@@ -309,6 +395,13 @@ actor Counter {
     private(set) var value = 0
     func increment() { value += 1 }
     func reset() { value = 0 }
+}
+
+/// What a fake transport was given, in order.
+actor Recorder {
+    private(set) var values: [String] = []
+    var count: Int { values.count }
+    func append(_ value: String) { values.append(value) }
 }
 
 struct RouteBackoffTests {

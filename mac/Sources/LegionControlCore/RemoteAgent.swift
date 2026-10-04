@@ -27,8 +27,8 @@ struct AgentReply<Value: Sendable>: Sendable {
 }
 
 /// Talks to the agent on one machine over ssh. No daemon, no ports, no credentials: every call is
-/// one `ssh <destination> <quoted agent command>` round trip, with both halves taken from the
-/// controller config.
+/// one `ssh <destination> <command line>` round trip, with both halves taken from the controller
+/// config.
 struct RemoteAgent: Sendable {
     static let sshPath = "/usr/bin/ssh"
 
@@ -45,6 +45,9 @@ struct RemoteAgent: Sendable {
 
     var connectTimeout: Int = 8
     var backoff = RouteBackoff()
+    /// What the last status over each route said about the key's session. Shared by copies, like
+    /// the backoff, because both are about the far side rather than about this value.
+    var sessions = RouteSessions()
 
     /// Swapped out in tests. Everything above this line is pure decision making; this is the only
     /// thing that touches a process.
@@ -84,7 +87,8 @@ struct RemoteAgent: Sendable {
     /// The order to try things in.
     ///
     /// Routes outer, systems inner. A system hint orders both routes and command shapes, while the
-    /// authenticated response establishes what is actually running.
+    /// authenticated response establishes what is actually running. A system with no agent command
+    /// is never driven, so it is not tried at all.
     static func attempts(
         machine: Machine,
         preferredSystem: SystemConfig?,
@@ -93,7 +97,8 @@ struct RemoteAgent: Sendable {
         preferLAN: Bool = false
     ) -> [Attempt] {
         let allRoutes = machine.routes(bindings: bindings)
-        guard !allRoutes.isEmpty, !machine.systems.isEmpty else { return [] }
+        let drivable = machine.systems.filter { !$0.agent.isEmpty }
+        guard !allRoutes.isEmpty, !drivable.isEmpty else { return [] }
 
         var routes = allRoutes
 
@@ -127,7 +132,7 @@ struct RemoteAgent: Sendable {
 
         routes = privateAliases + routes
 
-        var systems = machine.systems
+        var systems = drivable
         if let preferredSystem, let index = systems.firstIndex(where: { $0.id == preferredSystem.id }) {
             systems.insert(systems.remove(at: index), at: 0)
         }
@@ -158,7 +163,10 @@ struct RemoteAgent: Sendable {
                                      preferredRoute: preferredRoute, bindings: bindings,
                                      preferLAN: preferLAN)
         guard !attempts.isEmpty else {
-            throw AgentFailure(.noRoute, detail: "\(machine.name) has no ssh host and no endpoints.", dispatch: .never)
+            if machine.routes(bindings: bindings).isEmpty {
+                throw AgentFailure(.noRoute, detail: "\(machine.name) has no ssh host and no endpoints.", dispatch: .never)
+            }
+            throw AgentFailure(.badRequest, detail: CommandLineRefusal("no-command").message, dispatch: .never)
         }
 
         // Every attempt shares the budget the caller gave the whole command. Without this a machine
@@ -183,13 +191,32 @@ struct RemoteAgent: Sendable {
             // spending it produces a timeout that says nothing.
             if tried > 0, remaining < 4 { break }
 
+            // Neither of these is sent anywhere, so neither can have run. An address this app does
+            // not dial is the same refusal for every system behind it.
+            if let problem = Addresses.problem(with: attempt.route.target) {
+                best = Self.preferred(best, AgentFailure(.badRequest, system: attempt.system, route: attempt.route.label,
+                                                         detail: problem, dispatch: .never))
+                while index < attempts.count, attempts[index].route.id == attempt.route.id { index += 1 }
+                continue
+            }
+            let command = RemoteCommand(system: attempt.system, arguments: arguments,
+                                        restrictedSession: sessions.isRestricted(attempt.route.target))
+            let line: String
+            do throws(CommandLineRefusal) {
+                line = try command.commandLine()
+            } catch {
+                best = Self.preferred(best, AgentFailure(.badRequest, system: attempt.system, route: attempt.route.label,
+                                                         detail: error.message, dispatch: .never))
+                continue
+            }
+
             tried += 1
             let result = await runner(
                 Self.sshPath,
                 RemoteCommand.sshArguments(
                     target: attempt.route.target,
                     connectTimeout: min(connectTimeout, max(2, Int(remaining))),
-                    command: RemoteCommand(system: attempt.system, arguments: arguments),
+                    command: line,
                     knownHostsFile: AppPaths.overridesKnownHosts
                         ? AppPaths.knownHostsFile.path(percentEncoded: false)
                         : nil
@@ -204,6 +231,7 @@ struct RemoteAgent: Sendable {
                 do {
                     let value = try JSONDecoder().decode(Value.self, from: json)
                     backoff.clear(attempt.route.target)
+                    if request.isStatusRead { sessions.record(json, target: attempt.route.target) }
                     return AgentReply(value: value, system: attempt.system, route: attempt.route, attempts: tried)
                 } catch {
                     throw AgentFailure(
@@ -332,5 +360,34 @@ struct RemoteAgent: Sendable {
             return nil
         }
         return String(text[start...end]).data(using: .utf8)
+    }
+}
+
+/// What the last status over each route said about the key's session.
+///
+/// A key bound to the restricted dispatcher answers status with `agent.restrictedSession: true`, and
+/// from then on every line over that route is written in the dispatcher's grammar, whatever the
+/// document says about the system (section 15.1 of the contract). Keyed by the account, address and
+/// key, because restriction is a property of one key on one account.
+final class RouteSessions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var restricted: [String: Bool] = [:]
+
+    private func key(_ target: SSHTarget) -> String {
+        "\(target.destination):\(target.port ?? 22):\(target.identityFile ?? "")"
+    }
+
+    func isRestricted(_ target: SSHTarget) -> Bool {
+        lock.withLock { restricted[key(target)] ?? false }
+    }
+
+    /// Takes what a decoded status reply says. A reply that does not say it is not restricted.
+    func record(_ json: Data, target: SSHTarget) {
+        struct Report: Decodable {
+            struct Agent: Decodable { var restrictedSession: Bool? }
+            var agent: Agent?
+        }
+        let report = try? JSONDecoder().decode(Report.self, from: json)
+        lock.withLock { restricted[key(target)] = report?.agent?.restrictedSession == true }
     }
 }
