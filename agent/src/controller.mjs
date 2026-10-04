@@ -214,15 +214,25 @@ function metadataFrom(value, { required = false } = {}) {
 }
 
 function unavailableSnapshot(error, raw = null, hash = null) {
-  return { document: null, raw, hash, meta: legacyMeta(), consistent: false, error };
+  return { document: null, raw, text: null, hash, meta: legacyMeta(), consistent: false, error };
 }
 
-/** Parse one already-selected document, checking every metadata claim it binds. */
+/**
+ * Parse one already-selected document, checking every metadata claim it binds.
+ *
+ * A snapshot carries the document twice over. `raw` is the file as it lies on
+ * disk, which is what the metadata checks compare against. `text` is the
+ * canonical text, the exact bytes `hash` covers, and it is what `config` serves:
+ * a client hashes and adopts those bytes as they are, and re-serialising the
+ * parsed document instead gave every platform a different hash of the same
+ * setup. The document is parsed from the canonical text too, so a file a
+ * person saved with a byte order mark reads the same as one without.
+ */
 function documentSnapshot(bytes, meta, { requireMatch = false } = {}) {
   if (!bytes) {
     return requireMatch
       ? unavailableSnapshot('controller metadata names a document that is missing')
-      : { document: null, raw: null, hash: null, meta, consistent: true };
+      : { document: null, raw: null, text: null, hash: null, meta, consistent: true };
   }
   let body;
   let hash;
@@ -232,16 +242,22 @@ function documentSnapshot(bytes, meta, { requireMatch = false } = {}) {
   } catch (error) {
     return { ...unavailableSnapshot(`controller.json ${error.message}`), consistent: !requireMatch };
   }
+  // The agent never stores more than this, so a larger file was put there by
+  // hand, and serving it would promise clients a document they refuse to take.
+  if (body.length > MAX_CONTROLLER_BYTES) {
+    return { ...unavailableSnapshot(`controller.json is larger than ${MAX_CONTROLLER_BYTES} bytes`), consistent: !requireMatch };
+  }
   const raw = bytes.toString('utf8');
   if (requireMatch && (hash !== meta.hash || (meta.bytes > 0 && meta.bytes !== body.length))) {
     return unavailableSnapshot('controller document and metadata do not describe the same canonical bytes', raw, hash);
   }
+  const text = body.toString('utf8');
   let document;
   try {
-    document = JSON.parse(raw);
+    document = JSON.parse(text);
     if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('not a JSON object');
   } catch (error) {
-    return { document: null, raw, hash, meta: requireMatch ? legacyMeta() : meta, consistent: !requireMatch,
+    return { document: null, raw, text: null, hash, meta: requireMatch ? legacyMeta() : meta, consistent: !requireMatch,
       error: error.message === 'not a JSON object' ? 'controller.json is not a JSON object' : `controller.json does not parse: ${error.message}` };
   }
   if (requireMatch) {
@@ -252,7 +268,7 @@ function documentSnapshot(bytes, meta, { requireMatch = false } = {}) {
       return unavailableSnapshot('controller document and metadata disagree about setup identity, revision, or lineage', raw, hash);
     }
   }
-  return { document, raw, hash, meta, consistent: true };
+  return { document, raw, text, hash, meta, consistent: true };
 }
 
 /** Select the journal's committed version without changing either live file. */

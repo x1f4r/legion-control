@@ -130,6 +130,63 @@ test('storing writes the canonical bytes and the metadata as one transaction', a
   });
 });
 
+test('a snapshot carries the canonical text that its hash covers, however the bytes were written', async () => {
+  await withHome(async (home) => {
+    // Pushed with Windows line endings and trailing blank lines: what is served
+    // back is the canonical text, byte for byte the bytes the hash covers.
+    const pushed = `${document('setup-a', 1, 'alpha').replace(/\n/g, '\r\n')}\r\n\r\n`;
+    assert.equal(storeController(pushed, { id: 'setup-a', revision: 1 }).ok, true);
+    const stored = readController();
+    assert.equal(stored.text, canonicalBytes(pushed).toString('utf8'));
+    assert.equal(canonicalHash(stored.text), stored.hash);
+    assert.deepEqual(JSON.parse(stored.text), stored.document);
+
+    // Put there by hand, with a byte order mark and no metadata: the document
+    // is parsed from its canonical text, so the mark does not stop it.
+    fs.rmSync(path.join(home, 'controller.meta.json'));
+    fs.writeFileSync(path.join(home, 'controller.json'), `\ufeff  {"version": 1, "machines": []}  \r\n`);
+    const placed = readController();
+    assert.deepEqual(placed.document, { version: 1, machines: [] });
+    assert.equal(placed.text, '{"version": 1, "machines": []}\n');
+    assert.equal(placed.hash, canonicalHash(placed.text));
+  });
+});
+
+test('a snapshot with no document carries no text', async () => {
+  await withHome(async (home) => {
+    const file = path.join(home, 'controller.json');
+    assert.equal(readController().text, null, 'nothing stored');
+
+    fs.writeFileSync(file, '');
+    const empty = readController();
+    assert.equal(empty.document, null);
+    assert.equal(empty.text, null);
+
+    fs.writeFileSync(file, '{"version": 1, "machines": [');
+    assert.equal(readController().text, null, 'text that does not parse is never served as a document');
+
+    fs.rmSync(file);
+    fs.mkdirSync(file);
+    const unreadable = readController();
+    assert.equal(unreadable.document, null);
+    assert.equal(unreadable.text, null);
+    assert.ok(unreadable.error);
+  });
+});
+
+test('a setup file larger than the agent ever stores is not served', async () => {
+  await withHome(async (home) => {
+    const padding = ' '.repeat(1024 * 1024);
+    fs.writeFileSync(path.join(home, 'controller.json'), `{"version": 1, "machines": [], "notes": "${padding}"}`);
+    const oversized = readController();
+    assert.equal(oversized.document, null);
+    assert.equal(oversized.text, null);
+    assert.match(oversized.error, /larger than 1048576 bytes/);
+    // Nothing anybody depends on is held, so a push may still replace it.
+    assert.equal(storeController(document('setup-a', 1, 'alpha'), { id: 'setup-a', revision: 1 }).ok, true);
+  });
+});
+
 test('the flags and the document have to say the same thing', async () => {
   await withHome(async () => {
     const refused = storeController(document('setup-a', 1, 'alpha'), { id: 'setup-b', revision: 1 });

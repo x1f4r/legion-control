@@ -990,10 +990,16 @@ async function commandConfig(positional, flags, options) {
 
   if (sub === undefined) {
     const stored = readController();
+    // `raw` is the stored canonical text, the exact bytes `hash` covers, and it
+    // is what a client hashes and adopts. `controller` is the same document
+    // parsed, kept for older clients; re-serialising it can never be relied on
+    // to give the same bytes back.
+    const raw = stored.document ? stored.text : null;
     const payload = {
       controller: stored.document,
+      raw,
       hash: stored.hash,
-      bytes: stored.raw ? Buffer.byteLength(stored.raw, 'utf8') : 0,
+      bytes: raw ? Buffer.byteLength(raw, 'utf8') : 0,
       meta: stored.meta,
     };
     // A file that is there but unreadable is worth saying out loud: the hash is
