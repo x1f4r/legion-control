@@ -192,7 +192,11 @@ export async function checkVersions(root = repository) {
   return { agent: { version, floor: agent?.legionControl?.agentFloor }, app: { version: appVersion?.value, build: appBuild?.value }, problems };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Compared through realpath, as contract/validate.mjs does. Node resolves the symlinks in
+// import.meta.url but not in argv[1], so through a symlinked checkout a plain comparison never
+// runs the check and the gate passes having looked at nothing.
+const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
+if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
   const result = await checkVersions(path.resolve(process.argv[2] ?? repository));
   for (const { message } of result.problems) console.error(message);
   if (result.problems.length) process.exitCode = 1;

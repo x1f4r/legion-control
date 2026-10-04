@@ -63,7 +63,10 @@ export async function packageAgent({ source = path.join(repository, 'agent'), de
     return { archive: path.join(destination, name), manifest: path.join(destination, path.basename(releaseManifest)), artifact };
   } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Compared through realpath: Node resolves the symlinks in import.meta.url but not in argv[1], so
+// run through a symlinked checkout a plain comparison would package nothing and still exit 0.
+const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
+if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
   try { console.log(JSON.stringify(await packageAgent(), null, 2)); }
   catch (error) { console.error(error.message); process.exitCode = 1; }
 }
