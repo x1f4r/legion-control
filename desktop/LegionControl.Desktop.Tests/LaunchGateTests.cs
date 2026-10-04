@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using LegionControl.Desktop.Cli;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Model;
 using LegionControl.Desktop.Transport;
@@ -748,6 +749,88 @@ public class LaunchGateTests
         Assert.Equal("""{ "schema": 2 }""", File.ReadAllText(aside));
         Assert.Equal(new[] { LaunchValues.SystemPath("pi", "linux") },
             LaunchValues.Review(approvals.Current, LaunchProjection.Of(d0)).Select(waiting => waiting.Path));
+    }
+
+    // MARK: the command line
+
+    [Fact]
+    public async Task TheCommandLineListsApprovesAndRevertsWhatWaits()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(Unreachable(LaunchDocuments.Root()));
+        File.WriteAllText(Path.Combine(home.Path, "approved-launch.json"),
+            LaunchRecord.Seeded(LaunchProjection.Of(d0), d0.Hash).ToJson().ToJsonString());
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+        {
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "id");
+            LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/srv/pi/bin/launcher.mjs");
+        });
+        File.WriteAllBytes(home.ConfigPath, d1.Bytes);
+        Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, home.ConfigPath);
+        try
+        {
+            var listed = new StringWriter();
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "setup" }, listed));
+            Assert.Contains("machines[tower].systems[linux]  changed", listed.ToString());
+            Assert.Contains("[\"sh\", \"-c\", \"id\"] as posix", listed.ToString());
+            Assert.Contains("machines[pi].systems[linux]", listed.ToString());
+
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--reconcile-once" }, new StringWriter()));
+
+            var approved = new StringWriter();
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(
+                new[] { "--command", "setup", "--approve-launch", "machines[pi].systems[linux]" }, approved));
+            Assert.Contains("approved  machines[pi].systems[linux]", approved.ToString());
+
+            var reverted = new StringWriter();
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(
+                new[] { "--command", "setup", "--revert-launch", "machines[tower].systems[linux]" }, reverted));
+            Assert.Contains($"revision {d1.Identity.RevisionNumber + 1}", reverted.ToString());
+
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(
+                new[] { "--command", "setup", "--approve-launch", "machines[tower].systems[linux]" }, new StringWriter()));
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--reconcile-once" }, new StringWriter()));
+            var current = ControllerDocument.FromRaw(File.ReadAllBytes(home.ConfigPath));
+            Assert.Equal(LaunchDocuments.Tower, LaunchProjection.Of(current).TupleAt("tower", "linux")!.Agent);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, null);
+        }
+    }
+
+    [Fact]
+    public async Task TheCommandLineEditRefusesToCarryAWaitingCommand()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(Unreachable(LaunchDocuments.Root()));
+        File.WriteAllText(Path.Combine(home.Path, "approved-launch.json"),
+            LaunchRecord.Seeded(LaunchProjection.Of(d0), d0.Hash).ToJson().ToJsonString());
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "id"));
+        File.WriteAllBytes(home.ConfigPath, d1.Bytes);
+        var edited = JsonNode.Parse(d1.Text)!.AsObject();
+        LaunchDocuments.System(edited, "tower", "linux")["shell"] = "powershell";
+        var input = home.Write("edited.json", edited.ToJsonString());
+        Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, home.ConfigPath);
+        try
+        {
+            var output = new StringWriter();
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "edit", "--in", input }, output));
+            Assert.Contains("waiting for approval", output.ToString());
+            Assert.Equal(d1.Bytes, File.ReadAllBytes(home.ConfigPath));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, null);
+        }
+    }
+
+    /// The same setup with no address anywhere, so a command-line run never reaches for ssh.
+    private static JsonObject Unreachable(JsonObject root)
+    {
+        foreach (var machine in root["machines"]!.AsArray().OfType<JsonObject>()) machine.Remove("endpoints");
+        return root;
     }
 
     /// Everything the document offers is what runs: the gate changed nothing.

@@ -32,6 +32,7 @@ public static class Runner
         "timeout", "out", "site", "pause", "windows", "automatic", "patience", "screenshot",
         "quit-after", "update-marker", "budget", "in", "self", "system", "local-agent",
         "identity", "device", "alias", "template", "command", "route", "trust-systems", "legacy-system", "base", "local-agent-json",
+        "approve-launch", "revert-launch",
     };
 
     public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output)
@@ -135,6 +136,11 @@ public static class Runner
             output.WriteLine($"Setup           {identity.Id ?? "no id"} revision {identity.RevisionNumber}, hash {document.Hash[..12]}, lineage {identity.Lineage.Count}");
         }
         foreach (var warning in app.Config.Warnings) output.WriteLine($"Setup warning    {warning}");
+        if (app.Approvals.Problem is { } launchProblem) output.WriteLine($"Approvals        {launchProblem}");
+        if (app.LaunchReview.Count is var waiting and > 0)
+        {
+            output.WriteLine($"Approvals        {waiting} launch {(waiting == 1 ? "value waits" : "values wait")} for approval on this device; see --command setup");
+        }
         output.WriteLine($"This device      {app.Bindings.Device}"
                          + (app.Bindings.Self is { } self ? $", bound to machine \"{self.Machine}\"" : ", not bound to a machine")
                          + (app.Bindings.LocalAgent.Count > 0 ? ", local agent configured" : ""));
@@ -265,6 +271,15 @@ public static class Runner
             output.WriteLine();
             output.WriteLine($"This device holds revision {document.Identity.RevisionNumber}, hash {document.Hash}");
         }
+        // Like a divergence, a command waiting for approval is something only a person settles, and
+        // until then the machine it belongs to is not driven the way the setup says.
+        if (app.LaunchReview.Count > 0)
+        {
+            output.WriteLine();
+            output.WriteLine($"Waiting for approval on this device: {string.Join(", ", app.LaunchReview.Select(entry => entry.Path))}");
+            output.WriteLine("Review them with --command setup.");
+            worst = Math.Max(worst, Failed);
+        }
         if (json)
         {
             output.WriteLine(JsonSerializer.Serialize(
@@ -278,6 +293,9 @@ public static class Runner
     private static async Task<int> SetupAsync(
         AppModel app, CommandLine line, TextWriter output, bool json, CancellationToken token)
     {
+        if (line.Value("approve-launch") is { } approve) return ApproveLaunch(app, approve, output);
+        if (line.Value("revert-launch") is { } revert) return RevertLaunch(app, revert, output);
+
         var machine = line.Value("machine") is null ? null : Pick(app, line, output);
 
         if (line.Has("take-theirs") || line.Has("keep-mine") || line.Has("merge") || line.Has("replace-theirs"))
@@ -315,6 +333,8 @@ public static class Runner
         output.WriteLine($"Hash      {document.Hash}");
         output.WriteLine($"Lineage   {(document.Identity.Lineage.Count == 0 ? "none" : string.Join(", ", document.Identity.Lineage.Select(hash => hash[..12])))}");
         output.WriteLine($"Kept      {app.Config.Ledger.Hashes().Count} earlier documents");
+        if (app.Approvals.Problem is { } launchProblem) output.WriteLine($"Approvals {launchProblem}");
+        WriteLaunchReview(app, output);
 
         foreach (var each in app.Machines.Where(each => machine is null || each.Id == machine.Id))
         {
@@ -332,7 +352,82 @@ public static class Runner
             revision = document.Identity.RevisionNumber,
             hash = document.Hash,
             lineage = document.Identity.Lineage,
+            launchReview = app.LaunchReview.Select(entry => new
+            {
+                path = entry.Path,
+                scope = entry.Scope.Wire(),
+                kind = entry.Kind,
+                approvable = entry.Approvable,
+            }),
         }, Indented));
+        return Ok;
+    }
+
+    /// Each launch value this device has not approved, beside the one it did approve at that place.
+    private static void WriteLaunchReview(AppModel app, TextWriter output)
+    {
+        if (app.LaunchReview.Count == 0) return;
+        var identity = app.Config.Document?.Identity;
+        output.WriteLine();
+        output.WriteLine($"Waiting for approval on this device. Revision {identity?.RevisionNumber} says it was written by {identity?.Device ?? "an unnamed device"} ({identity?.Source ?? "no source"}); that is not verified.");
+        foreach (var entry in app.LaunchReview)
+        {
+            output.WriteLine($"  {entry.Path}  {entry.Kind}{(entry.Approvable ? "" : ", cannot be approved: it can only be reverted or left")}");
+            output.WriteLine($"    approved  {(entry.Recorded ? LaunchGate.Describe(entry.Scope, entry.Approved) : "nothing")}");
+            output.WriteLine($"    offered   {LaunchGate.Describe(entry.Scope, entry.Offered)}");
+        }
+        output.WriteLine("Approving lets this device run the command over ssh with its own key: --approve-launch PATH, or all.");
+        output.WriteLine("--revert-launch PATH puts the approved value back into the shared setup as an edit.");
+    }
+
+    /// Approves what waits at one path, or everything that can be approved, and says exactly what
+    /// was recorded. The values are the ones this run read and printed, never a later document's.
+    private static int ApproveLaunch(AppModel app, string which, TextWriter output)
+    {
+        var chosen = which == "all"
+            ? app.LaunchReview
+            : app.LaunchReview.Where(entry => entry.Path == which).ToList();
+        if (chosen.Count == 0)
+        {
+            output.WriteLine(app.LaunchReview.Count == 0
+                ? "Nothing waits for approval on this device."
+                : $"Nothing waits for approval at {which}. Waiting: {string.Join(", ", app.LaunchReview.Select(entry => entry.Path))}");
+            return Failed;
+        }
+        var approvable = chosen.Where(entry => entry.Approvable).ToList();
+        if (approvable.Count > 0 && app.ApproveLaunch(approvable) is { } problem)
+        {
+            output.WriteLine(problem);
+            return Failed;
+        }
+        foreach (var entry in approvable) output.WriteLine($"approved  {entry.Path}  {LaunchGate.Describe(entry.Scope, entry.Offered)}");
+        foreach (var entry in chosen.Where(entry => !entry.Approvable))
+        {
+            output.WriteLine($"refused   {entry.Path} cannot be approved: it holds a character a person could not see, a shape this app cannot quote, or a repository that is not owner/name. Revert it with --revert-launch {entry.Path}, or leave it.");
+        }
+        return approvable.Count == chosen.Count ? Ok : Failed;
+    }
+
+    /// Puts the value this device approved back at one path, as an ordinary edit that replicates.
+    private static int RevertLaunch(AppModel app, string path, TextWriter output)
+    {
+        if (app.LaunchReview.FirstOrDefault(entry => entry.Path == path) is not { } entry)
+        {
+            output.WriteLine($"Nothing waits for approval at {path}.");
+            return Failed;
+        }
+        if (!entry.CanRevert)
+        {
+            output.WriteLine($"This device approved nothing at {path} that it could put back. Approve the offered value, or leave it.");
+            return Failed;
+        }
+        if (app.RevertLaunch(entry) is { } problem)
+        {
+            output.WriteLine(problem);
+            return Failed;
+        }
+        output.WriteLine($"reverted  {path}  {LaunchGate.Describe(entry.Scope, entry.Approved)}");
+        output.WriteLine($"This device now holds revision {app.Config.Document?.Identity.RevisionNumber}, hash {app.Config.Document?.Hash}.");
         return Ok;
     }
 
@@ -700,6 +795,14 @@ public static class Runner
                 output.WriteLine($"Could not read {input}: {error.Message}");
                 return Failed;
             }
+            // The same refusals as the window's editor: an edit approves the commands it changes, so
+            // it may not change one that is waiting for approval.
+            if (app.LaunchEditProblems(text) is { Count: > 0 } refused)
+            {
+                foreach (var refusal in refused) output.WriteLine(refusal.Sentence);
+                output.WriteLine("Nothing was applied. Approve or revert a waiting value with --command setup --approve-launch PATH or --revert-launch PATH.");
+                return Failed;
+            }
             var (document, problem) = app.Config.ApplyEdit(text, $"applied from {Path.GetFileName(input)}");
             if (document is null)
             {
@@ -1049,6 +1152,13 @@ public static class Runner
           --reconcile-once                    one pass: publish where behind, adopt where ahead
                                               (also spelled --command reconcile-once)
           --command setup --machine ID --merge | --keep-mine | --take-theirs | --replace-theirs
+
+        Commands from the shared setup run only once this device approved them:
+          --command setup                     lists what waits, beside what this device approved
+          --command setup --approve-launch PATH | --approve-launch all
+                                              approves what waits there, and prints what it recorded
+          --command setup --revert-launch PATH
+                                              puts the approved value back, as an edit that replicates
 
         Where things live:
           LEGION_CONTROL_CONFIG  the setup document to read

@@ -47,6 +47,7 @@ sending it again.
 | --- | --- | --- |
 | the setup document | `~/.config/legion-control/config.json` | `%APPDATA%\legion-control\config.json` |
 | this device's own settings | `bindings.json` beside it | the same |
+| the commands this device approved | `approved-launch.json` beside it | the same |
 | earlier setups, by hash | `revisions/` beside it | the same |
 | operations this app started | `operations.json` beside it | the same |
 | desktop preferences | `desktop-settings.json` beside it | the same |
@@ -84,6 +85,31 @@ about.
 
 `--replace` is the one command that overwrites a different setup, and it is only ever sent after a
 person has answered that question in front of a preview of what changes.
+
+## Commands from the shared setup
+
+Ancestry says that a document claims to descend from another, not who wrote it, and any key that may
+publish the setup, a restricted one included, can write a descendant. So the values that decide what
+this device runs with its own key are never taken from replication alone: each system's agent argv
+with the grammar its line is written in, a machine's `ssh.identityFile`, `appUpdates.githubRepo` and
+`local`. The document still applies as it arrives. A system whose command changed keeps running the
+one this device approved there, and a system with no approved command is not driven at all, until a
+person approves the new one here.
+
+`approved-launch.json` holds what this device approved. It is never published. The first start of
+this build approves everything in the setup it already applies; deleting the file does that again.
+An edit made here, in the editor, with `--command edit --in` or by hand in the file, approves what
+it changed. Importing a setup into a device that has none approves everything in it, after showing
+all of it. Nothing that arrives from another peer approves anything, and neither do merges.
+
+```
+legion-control --command setup                                   # what waits, beside what was approved
+legion-control --command setup --approve-launch 'machines[tower].systems[linux]'
+legion-control --command setup --approve-launch all
+legion-control --command setup --revert-launch 'machines[tower].systems[linux]'
+```
+
+`--reconcile-once` exits 1 while anything waits, as it does while two copies need a decision.
 
 ## Private settings
 
