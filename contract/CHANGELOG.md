@@ -31,6 +31,17 @@ comparing versions (v3.md section 1, "Additions in agent 3.1.0").
   already sent and the schema did not allow.
 - The guard grammars in `common.schema.json`: `sshHostGuard`, `sshUser`,
   `agentArgItem`, `githubRepo` and `launchPath`.
+- **`restricted` and `launchChanges` on `config set`.** A restricted session's
+  push that would introduce a launch value the machine does not hold, or replace
+  a held copy the machine cannot read, is refused with `restricted` and
+  `current`, plus `launchChanges`, the paths of the refused values and never the
+  values, when the held copy could be read (section 9.4).
+- **The approval record**: the launch values a device approved, kept beside its
+  applied setup in `approved-launch.json` (Android: the `approved-launch`
+  preference), private like the bindings and never published or merged (section
+  11).
+- The `launch` vectors: what waits for review, what a device runs meanwhile, and
+  what a restricted push gets, case by case (`contract/vectors/launch.json`).
 
 ### Changed
 
@@ -48,6 +59,12 @@ comparing versions (v3.md section 1, "Additions in agent 3.1.0").
 - `controller-document.schema.json` holds hosts, users, argv items and the
   update repository to the guard grammars, types the deprecated `machine.ssh`,
   and allows an empty `agent`, which means the system is not driven.
+- **The agent reads launch values in restricted sessions.** It compares a pushed
+  document's launch values with the ones the held document carries, by the rules
+  of section 9.9; unrestricted sessions are never refused for them.
+- Rule 5 of section 1 now points at section 15: an argv is serialised for its
+  system's grammar exactly as that section specifies, and a system restricted on
+  the route uses the dispatcher grammar on every platform.
 
 ### Fixed (agent replies)
 
@@ -88,6 +105,28 @@ not, the agent now answers as they say.
   key order and adopt only on a matching hash, otherwise decline.
 - Never send `--allow-downgrade` to an agent whose status carries no `floor`,
   and only after a person decided to go back.
+- **Launch values need local approval** (section 9.9). A system's
+  `{agent, grammar}`, `machine.ssh.identityFile`, `appUpdates.githubRepo` and
+  `local` are applied with the document and run only once this device approved
+  them; until then the value last approved at that place runs, or nothing.
+  Approve, a local edit, enrolment after a summary of every launch value, and
+  the first start of a 1.4 client approve; replication never does. The launcher
+  migration under the same base and grammar is accepted without asking.
+- **Command lines and retry safety** (section 15). The grammar is `dispatch`
+  when the system is restricted on the route, else its `shell`, else `posix`, or
+  `cmd` on Windows; it is never inferred and a line is never retried in another
+  grammar. Each grammar has one exact serialisation and refuses what it cannot
+  carry. ssh's own log, never remote stderr, shows that a command was never
+  sent; an unexplained exit 255 is `linkLost`, `unknown`. A mutation moves to
+  another route or system only after a failure that is `never`. `status` sends
+  `--budget-ms` of `min(20000, remaining − 5000)`, at least 1000. Hosts, users
+  and ports are held to the dial grammar before they are dialled, scanned or
+  pinned, and ssh and ssh-keyscan get `--` before the host.
+- **Document acceptance is normative** (section 9.7). Every client accepts
+  exactly the documents `contract/tools/document-rules.mjs` accepts, under peer,
+  local or applied intake. What a client cannot use is a warning with a code,
+  never a refusal, and the document this device already applies is never refused
+  while section 12 accepts its bytes.
 
 ### Conformance
 
@@ -108,6 +147,10 @@ not, the agent now answers as they say.
   order mark or surrounding whitespace no longer makes a document unparseable.
   The hash vector `double-bom` pins that exactly one leading byte order mark
   is stripped.
+- `contract/test/transport-shells.test.mjs` runs serialised lines through sh,
+  dash, bash, zsh, ksh and fish, and on Windows through cmd.exe, Windows
+  PowerShell and pwsh, and checks that node receives exactly the argv. A shell
+  that is not installed is skipped with the reason.
 
 ---
 
