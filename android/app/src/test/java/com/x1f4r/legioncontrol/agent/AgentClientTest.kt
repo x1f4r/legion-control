@@ -312,6 +312,27 @@ class AgentClientTest {
     }
 
     @Test
+    fun `a skipped address beside one that did not answer still reads as a machine that is off`() = runBlocking {
+        // A trailing dot or a zone passes the document's guard and fails the dial grammar, so the
+        // setup is valid. Reported ahead of the address that was dialled, the skipped entry made
+        // every sleep a setup fault, polled at the blocked rate; and once the good address was in
+        // backoff, the next poll dialled nothing at all.
+        val endpoints = listOf(
+            endpoint("dotted", host = "tower.example."),
+            endpoint("zoned", host = "fe80::1%en0"),
+            endpoint("lan"),
+        )
+        val transport = FakeTransport {
+            throw AgentFailure.Unreachable("Tower", "no answer", null, DispatchStage.NOT_STARTED, FailureKind.HOST_UNREACHABLE)
+        }
+        val (agent, _) = client(machine(endpoints = endpoints, systems = listOf(linux)), transport)
+        failsWith<AgentFailure.Unreachable> { agent.status() }
+        failsWith<AgentFailure.Unreachable> { agent.status() }
+        failsWith<AgentFailure.Unreachable> { agent.restart("t3") }
+        assertEquals(listOf("lan", "lan", "lan"), transport.sent.map { it.endpoint })
+    }
+
+    @Test
     fun `a command that cannot be written is refused, and another system's line still goes`() = runBlocking {
         val transport = FakeTransport { accepted }
         val awkward = linux.copy(agent = listOf("/usr/bin/node", "/home/me/odd\\\\name/index.mjs"))

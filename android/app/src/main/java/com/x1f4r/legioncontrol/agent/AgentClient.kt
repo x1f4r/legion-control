@@ -737,7 +737,7 @@ class AgentClient(
                 // Nothing to dial, so nothing to send on any of its systems. Recorded once, and the
                 // transport would refuse it in the same words if it were asked.
                 routes.note(endpoint, "is not an address this app dials")
-                failures.record(undialable(endpoint))
+                failures.skipped(undialable(endpoint))
                 continue
             }
             for (system in attemptOrder(endpoint)) {
@@ -928,6 +928,13 @@ class AgentClient(
      * A host key that does not match its pin comes first of all, and a refused key next, because
      * they are questions rather than reports and the only ones with an action attached. A request
      * that could not be made is a fault in the document, which is the next most useful thing to say.
+     *
+     * An address skipped because it is outside the dial grammar comes last of all, after a machine
+     * that did not answer. The document holding it is valid and Apply has already named the entry,
+     * so it is worth saying only when nothing else happened: reported first, beside a good address
+     * that was asleep, it turned every sleep or reboot into a setup that cannot work, polled at the
+     * blocked rate. The route selector leaves such an address out whenever there is a good one, and
+     * this keeps the same order should one ever be handed over anyway.
      */
     private class Failures {
         var hostKeyChanged: AgentFailure? = null
@@ -938,6 +945,12 @@ class AgentClient(
         var unreadable: AgentFailure? = null
         var unreachable: AgentFailure? = null
         var ambiguous: AgentFailure? = null
+        var undialable: AgentFailure? = null
+
+        /** An address this app does not dial, kept apart from a command line it would not write. */
+        fun skipped(failure: AgentFailure) {
+            undialable = undialable ?: failure
+        }
 
         fun record(failure: AgentFailure) {
             when (failure) {
@@ -963,7 +976,7 @@ class AgentClient(
 
         fun worthReporting(): AgentFailure? =
             hostKeyChanged ?: notAuthorised ?: badRequest ?: scriptMissing ?: unreadable ?: ambiguous ?:
-                wrongShape ?: unreachable
+                wrongShape ?: unreachable ?: undialable
     }
 
     /**

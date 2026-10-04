@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.net
 
+import com.x1f4r.legioncontrol.agent.Addresses
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.data.MachineHints
 import java.util.concurrent.ConcurrentHashMap
@@ -55,13 +56,21 @@ class RouteSelector(
      * The remembered route leads, the configuration's own order follows, and addresses in backoff
      * are left out. If that empties the list, the address whose backoff expires soonest is returned
      * on its own: a machine that is off should cost one connection per poll, not none and not four.
+     *
+     * An address outside the dial grammar (contract section 15.6) is never dialled, so it is never
+     * penalised either, and counted as ready it would stand in for every good address in backoff:
+     * the poll after a machine went to sleep dialled nothing and reported a setup fault. Such an
+     * address is left out whenever the machine has one this app does dial. When it has none, they
+     * are all returned, so the caller can say why nothing was dialled.
      */
     fun candidates(): List<Endpoint> {
         val ordered = orderEndpoints(machine.endpoints, remembered()?.id, expectedSystem, preferLan)
+        val dialable = ordered.filter { Addresses.isDialable(it.host, it.user, it.port) }
+        if (dialable.isEmpty()) return ordered
         val moment = now()
-        val ready = ordered.filter { (backoff[it.id]?.until ?: 0L) <= moment }
+        val ready = dialable.filter { (backoff[it.id]?.until ?: 0L) <= moment }
         if (ready.isNotEmpty()) return ready
-        return listOfNotNull(ordered.minByOrNull { backoff[it.id]?.until ?: 0L })
+        return listOfNotNull(dialable.minByOrNull { backoff[it.id]?.until ?: 0L })
     }
 
     /** Every address the configuration names, whatever their backoff. For diagnostics only. */
