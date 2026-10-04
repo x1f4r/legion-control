@@ -37,8 +37,10 @@ public sealed record AttemptEvidence(
 public static class AttemptClassifier
 {
     // What JavaScript's `.` matches: anything but a line terminator. .NET's would also take a
-    // carriage return, and the patterns below have to match exactly the lines the reference does.
-    private const string Any = @"[^\n\r  ]";
+    // carriage return, U+2028 and U+2029, and the patterns below have to match exactly the lines the
+    // reference does. The two separators are written as regex escapes, not as the characters, so
+    // that no editor can quietly strip them as unusual line endings.
+    private const string Any = @"[^\n\r\u2028\u2029]";
 
     private static Regex Line(string pattern) => new(pattern.Replace(".+", Any + "+"), RegexOptions.CultureInvariant);
 

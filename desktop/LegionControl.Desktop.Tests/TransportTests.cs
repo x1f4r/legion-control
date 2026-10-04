@@ -590,6 +590,26 @@ public class ClassificationTests
         Assert.Contains("No route to host", asleep.Detail);
     }
 
+    [Theory]
+    [InlineData("\u2028")]
+    [InlineData("\u2029")]
+    [InlineData("\r")]
+    public void ALogLineIsReadAsJavaScriptReadsIt(string separator)
+    {
+        // JavaScript's `.` stops at a carriage return and at both Unicode separators, so the
+        // reference never reads this as a refused connection. Neither may this client: matching
+        // across the break would claim that nothing ran on a line ssh never wrote whole.
+        var failure = RemoteAgent.Classify(
+            FakeRunner.SshFailure($"ssh: connect to host a{separator}b port 22: Connection refused\n"), OneAttempt, 30)!;
+        Assert.Equal(FailureKind.LinkLost, failure.Kind);
+        Assert.Equal(Dispatch.Unknown, failure.Dispatch);
+
+        var whole = RemoteAgent.Classify(
+            FakeRunner.SshFailure("ssh: connect to host a b port 22: Connection refused\n"), OneAttempt, 30)!;
+        Assert.Equal(FailureKind.ConnectionRefused, whole.Kind);
+        Assert.Equal(Dispatch.Never, whole.Dispatch);
+    }
+
     [Fact]
     public void ALinkThatDroppedMidSessionIsAmbiguousAndSaysSo()
     {
