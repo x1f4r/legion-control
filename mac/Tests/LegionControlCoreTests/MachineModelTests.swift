@@ -15,17 +15,24 @@ struct MachineModelTests {
     /// A transport that answers from a script keyed by the first word of the command.
     final class FakeRunner: @unchecked Sendable {
         private let lock = NSLock()
-        private var replies: [String: [CommandResult]] = [:]
+        private var replies: [String: [(result: CommandResult, sshLog: String)]] = [:]
         private(set) var commands: [[String]] = []
 
         func answer(_ verb: String, with results: [CommandResult]) {
             lock.lock(); defer { lock.unlock() }
-            replies[verb] = results
+            replies[verb] = results.map { ($0, "") }
         }
 
         func answer(_ verb: String, json: String, exit: Int32 = 0) {
             answer(verb, with: [CommandResult(exitCode: exit, standardOutput: json, standardError: "",
                                               timedOut: false, launchFailure: nil)])
+        }
+
+        /// ssh itself failing, in its own words: exit 255, nothing on stdout, the reason in its log.
+        func answer(_ verb: String, sshLog: String) {
+            lock.lock(); defer { lock.unlock() }
+            replies[verb] = [(CommandResult(exitCode: 255, standardOutput: "", standardError: "",
+                                            timedOut: false, launchFailure: nil), sshLog)]
         }
 
         func run(_ arguments: [String]) -> CommandResult {
@@ -35,12 +42,16 @@ struct MachineModelTests {
             // quoted command, which is the last argument.
             let verb = arguments.last?.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
             guard var queued = replies[verb], !queued.isEmpty else {
+                // Unscripted reads as a machine that is not there, which is what a test that never
+                // expected the call wants: nothing ran, and nothing is owed.
+                FakeSSH.writeLog("ssh: connect to host 10.0.0.5 port 22: Operation timed out\n", for: arguments)
                 return CommandResult(exitCode: 255, standardOutput: "", standardError: "no scripted reply for \(verb)",
                                      timedOut: false, launchFailure: nil)
             }
             let next = queued.removeFirst()
             if !queued.isEmpty { replies[verb] = queued }
-            return next
+            FakeSSH.writeLog(next.sshLog, for: arguments)
+            return next.result
         }
 
         var sentCommands: [String] {
@@ -66,13 +77,15 @@ struct MachineModelTests {
     }
 
     static func model(_ runner: FakeRunner) -> (MachineModel, OperationStore, URL) {
-        var agent = RemoteAgent(machine: machine())
-        agent.runner = { _, arguments, _, _ in runner.run(arguments) }
-        let model = MachineModel(machine: machine(), agent: agent)
-
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appending(path: "legion-model-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var agent = RemoteAgent(machine: machine())
+        agent.logDirectory = directory.appending(path: "ssh-logs")
+        agent.runner = { _, arguments, _, _ in runner.run(arguments) }
+        let model = MachineModel(machine: machine(), agent: agent)
+
         let store = OperationStore(url: directory.appending(path: "operations.json"))
         model.operations = store
         return (model, store, directory)
@@ -205,9 +218,7 @@ struct MachineModelTests {
     @Test("a rejected key is not drawn as a sleeping machine")
     func authFailureIsNotSleep() async throws {
         let runner = FakeRunner()
-        runner.answer("status", with: [CommandResult(exitCode: 255, standardOutput: "",
-                                                     standardError: "me@pi: Permission denied (publickey).",
-                                                     timedOut: false, launchFailure: nil)])
+        runner.answer("status", sshLog: "me@pi: Permission denied (publickey).\n")
         let (model, _, directory) = Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -220,10 +231,7 @@ struct MachineModelTests {
     @Test("an unknown host key raises a question with a fingerprint, and writes nothing")
     func unknownHostKeyAsks() async throws {
         let runner = FakeRunner()
-        runner.answer("status", with: [CommandResult(
-            exitCode: 255, standardOutput: "",
-            standardError: "No ED25519 host key is known for pi and you have requested strict checking.",
-            timedOut: false, launchFailure: nil)])
+        runner.answer("status", sshLog: "No ED25519 host key is known for pi and you have requested strict checking.\n")
         let (model, _, directory) = Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -237,10 +245,7 @@ struct MachineModelTests {
     @Test("a changed host key offers explicit inspection and never advises deleting pins")
     func changedHostKeyExplains() async throws {
         let runner = FakeRunner()
-        runner.answer("status", with: [CommandResult(
-            exitCode: 255, standardOutput: "",
-            standardError: "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@",
-            timedOut: false, launchFailure: nil)])
+        runner.answer("status", sshLog: "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n")
         let (model, _, directory) = Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -283,9 +288,7 @@ struct MachineModelTests {
         // looks like. Only the agent's own acknowledgement counts.
         let runner = FakeRunner()
         runner.answer("status", json: Self.onlineStatus)
-        runner.answer("boot", with: [CommandResult(exitCode: 255, standardOutput: "",
-                                                   standardError: "client_loop: send disconnect: Broken pipe",
-                                                   timedOut: false, launchFailure: nil)])
+        runner.answer("boot", sshLog: "client_loop: send disconnect: Broken pipe\n")
         let (model, store, directory) = Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -612,14 +615,15 @@ struct MachineModelTests {
 
     /// A model whose transport waits at the gate, with somewhere to write its operations.
     static func gatedModel(_ runner: FakeRunner, gate: Gate) throws -> (MachineModel, OperationStore, URL) {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var agent = RemoteAgent(machine: machine())
+        agent.logDirectory = directory.appending(path: "ssh-logs")
         agent.runner = { _, arguments, _, _ in
             await gate.pass(arguments)
             return runner.run(arguments)
         }
         let model = MachineModel(machine: machine(), agent: agent)
-        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let store = OperationStore(url: directory.appending(path: "operations.json"))
         model.operations = store
         return (model, store, directory)
@@ -746,17 +750,14 @@ struct MachineModelTests {
         #expect(model.lastRoute == nil)
     }
 
-    static let unknownHostKey = CommandResult(
-        exitCode: 255, standardOutput: "",
-        standardError: "No ED25519 host key is known for pi and you have requested strict checking.",
-        timedOut: false, launchFailure: nil)
+    static let unknownHostKey = "No ED25519 host key is known for pi and you have requested strict checking.\n"
 
     @Test("a host key question goes with the address it was about")
     func hostKeyQuestionFollowsTheEntry() async throws {
         // The question used to outlive an edit that dropped its address, so a key could still be
         // pinned for a host this device no longer dials.
         let runner = FakeRunner()
-        runner.answer("status", with: [Self.unknownHostKey])
+        runner.answer("status", sshLog: Self.unknownHostKey)
         let (model, _, directory) = Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -784,7 +785,7 @@ struct MachineModelTests {
     @Test("a read that meets an unknown key at an address the entry has since dropped asks nothing")
     func hostKeyFailureDuringEditAsksNothing() async throws {
         let runner = FakeRunner()
-        runner.answer("status", with: [Self.unknownHostKey])
+        runner.answer("status", sshLog: Self.unknownHostKey)
         let gate = Gate(holding: "status")
         let (model, _, directory) = try Self.gatedModel(runner, gate: gate)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -810,7 +811,10 @@ struct MachineModelTests {
 
         let piRunner = FakeRunner()
         piRunner.answer("status", json: Self.onlineStatus)
+        let logs = FakeSSH.logDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
         var piAgent = RemoteAgent(machine: Self.machine())
+        piAgent.logDirectory = logs
         piAgent.runner = { _, arguments, _, _ in piRunner.run(arguments) }
         let pi = MachineModel(machine: Self.machine(), agent: piAgent, remembered: remembered)
 
@@ -821,6 +825,7 @@ struct MachineModelTests {
         towerRunner.answer("status", json: Self.onlineStatus.replacingOccurrences(of: #""hostname": "pi""#,
                                                                                   with: #""autoUpdate": true, "hostname": "tower""#))
         var towerAgent = RemoteAgent(machine: towerMachine)
+        towerAgent.logDirectory = logs
         towerAgent.runner = { _, arguments, _, _ in towerRunner.run(arguments) }
         let tower = MachineModel(machine: towerMachine, agent: towerAgent, remembered: remembered)
 

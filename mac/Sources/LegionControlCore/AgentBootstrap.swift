@@ -116,8 +116,13 @@ enum AgentBootstrap {
         script.replacingOccurrences(of: "\n", with: " ")
     }
 
-    /// The ssh arguments for one of the two script runs, written in the system's own grammar.
-    static func sshArguments(target: SSHTarget, system: SystemConfig, argv: [String]) throws -> [String] {
+    /// One of the two script runs over ssh, written in the system's own grammar and read the way
+    /// every other attempt is: ssh's own log is the only evidence of whether it left this Mac.
+    static func runOverSSH(target: SSHTarget, system: SystemConfig, argv: [String], timeout: TimeInterval,
+                           logDirectory: URL = SSHLog.directory,
+                           runner: @Sendable (String, [String], TimeInterval, Data?) async -> CommandResult = {
+                               await Shell.run(executable: $0, arguments: $1, timeout: $2, input: $3)
+                           }) async throws -> (result: CommandResult, verdict: AttemptClassifier.Verdict) {
         if let problem = Addresses.problem(with: target) { throw Failure(message: problem) }
         var commandSystem = system
         commandSystem.agent = argv
@@ -127,8 +132,14 @@ enum AgentBootstrap {
         } catch {
             throw Failure(message: "The bootstrap cannot be sent to \(system.name) in its shell's grammar. \(error.message)")
         }
-        return RemoteCommand.sshArguments(target: target, connectTimeout: 8, command: line,
-                                          knownHostsFile: AppPaths.overridesKnownHosts ? AppPaths.knownHostsFile.path : nil)
+        let log = SSHLog.create(in: logDirectory)
+        let result = await runner(RemoteAgent.sshPath,
+                                  RemoteCommand.sshArguments(target: target, connectTimeout: 8, command: line,
+                                                             knownHostsFile: AppPaths.overridesKnownHosts ? AppPaths.knownHostsFile.path : nil,
+                                                             logFile: log?.path(percentEncoded: false)),
+                                  timeout, nil)
+        let sshLog = log.map(SSHLog.consume) ?? ""
+        return (result, AttemptClassifier.classify(AttemptEvidence(result, sshLog: sshLog), timeout: Int(timeout)))
     }
     static func sftpArguments(target: SSHTarget) -> [String] {
         var arguments = ["-b", "-", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no", "-o", "ConnectTimeout=8"]
@@ -149,16 +160,16 @@ enum AgentBootstrap {
         let archive = try await stagedArchive(payload, operation: operation)
         defer { try? FileManager.default.removeItem(at: archive) }
         let remoteArchive = layout.path("incoming/legion-bootstrap-\(operation).tgz").replacingOccurrences(of: "\\", with: "/")
-        let prepare = await Shell.run(executable: "/usr/bin/ssh", arguments: try sshArguments(target: target, system: system,
-                                      argv: layout.prefix + ["-e", oneLine(prepareScript), "--", layout.base]), timeout: 30)
-        guard prepare.succeeded else { throw Failure(message: "Bootstrap preflight failed: \(prepare.failureText)") }
+        let prepare = try await runOverSSH(target: target, system: system,
+                                           argv: layout.prefix + ["-e", oneLine(prepareScript), "--", layout.base], timeout: 30)
+        guard prepare.result.succeeded else { throw Failure(message: "Bootstrap preflight failed: \(prepare.result.failureText)") }
         let batch = "put \(try sftpQuoted(archive.path)) \(try sftpQuoted(remoteArchive))\n"
         let upload = await Shell.run(executable: "/usr/bin/sftp", arguments: sftpArguments(target: target), timeout: 120, input: Data(batch.utf8))
         guard upload.succeeded else { throw Failure(message: "The signed archive could not be uploaded: \(upload.failureText)") }
         let command = layout.prefix + ["-e", oneLine(installScript), "--", layout.base, remoteArchive,
                                        ReleaseTrust.sha256(of: payload), String(payload.count), operation]
-        let result = await Shell.run(executable: "/usr/bin/ssh", arguments: try sshArguments(target: target, system: system, argv: command), timeout: 300)
-        return try decode(result)
+        let install = try await runOverSSH(target: target, system: system, argv: command, timeout: 300)
+        return try decode(install.result, verdict: install.verdict)
     }
 
     static func installLocal(payload: Data, operation: String, layout: Layout) async throws -> AgentActionResult {
@@ -168,12 +179,16 @@ enum AgentBootstrap {
         guard prepare.succeeded else { throw Failure(message: "Bootstrap preflight failed: \(prepare.failureText)") }
         let args = Array(layout.prefix.dropFirst()) + ["-e", installScript, "--", layout.base, archive.path,
                                                     ReleaseTrust.sha256(of: payload), String(payload.count), operation]
-        return try decode(await Shell.run(executable: layout.prefix[0], arguments: args, timeout: 300))
+        let result = await Shell.run(executable: layout.prefix[0], arguments: args, timeout: 300)
+        return try decode(result, verdict: AttemptClassifier.classify(AttemptEvidence(result, sshLog: "")))
     }
 
-    static func decode(_ result: CommandResult) throws -> AgentActionResult {
-        if let json = RemoteAgent.extractJSONObject(from: result.standardOutput),
+    /// The install's own reply, or a failure that says whether it can have run. Only evidence that
+    /// nothing was started makes it certain; anything else is left for the next status to settle.
+    static func decode(_ result: CommandResult, verdict: AttemptClassifier.Verdict) throws -> AgentActionResult {
+        if verdict.isReply, let json = AttemptClassifier.jsonObjectSlice(result.standardOutput),
            let reply = try? JSONDecoder().decode(AgentActionResult.self, from: json) { return reply }
-        throw Failure(message: "The bootstrap returned no acknowledged result: \(result.failureText)", uncertain: true)
+        throw Failure(message: "The bootstrap returned no acknowledged result: \(result.failureText)",
+                      uncertain: verdict.dispatch != .never)
     }
 }

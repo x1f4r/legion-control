@@ -48,6 +48,13 @@ struct RemoteAgent: Sendable {
     /// What the last status over each route said about the key's session. Shared by copies, like
     /// the backoff, because both are about the far side rather than about this value.
     var sessions = RouteSessions()
+    /// Where ssh writes its own log for each attempt. Moved in tests, so they never write into the
+    /// real application support folder.
+    var logDirectory: URL = SSHLog.directory
+
+    /// The clock the one deadline is read from. Moved in tests, so a walk over dead routes can be
+    /// run without waiting for them.
+    var now: @Sendable () -> Date = { Date() }
 
     /// Swapped out in tests. Everything above this line is pure decision making; this is the only
     /// thing that touches a process.
@@ -149,16 +156,20 @@ struct RemoteAgent: Sendable {
         return attempts
     }
 
+    /// The walk of section 15.5 of the contract.
+    ///
+    /// One deadline covers the whole command, so a machine with three addresses and two systems
+    /// cannot spend six times the timeout finding out it is asleep. A read goes on after any failure;
+    /// a mutation goes on only after a failure that proves nothing ran, and AttemptWalk is where that
+    /// rule is written. Each attempt gets a fresh ssh log, because ssh's own words are the only
+    /// evidence of where a command stopped.
     private func call<Value: Decodable & Sendable>(
         _ request: AgentRequest,
         decoding: Value.Type,
         preferring preferred: SystemConfig?,
         route preferredRoute: MachineRoute?
     ) async throws -> AgentReply<Value> {
-        let arguments = request.arguments
         let timeout = request.timeout
-        let safety = request.safety
-        let input = request.input
         let attempts = Self.attempts(machine: machine, preferredSystem: preferred,
                                      preferredRoute: preferredRoute, bindings: bindings,
                                      preferLAN: preferLAN)
@@ -169,34 +180,31 @@ struct RemoteAgent: Sendable {
             throw AgentFailure(.badRequest, detail: CommandLineRefusal("no-command").message, dispatch: .never)
         }
 
-        // Every attempt shares the budget the caller gave the whole command. Without this a machine
-        // with three addresses and two systems could spend six times the status timeout finding out
-        // it is asleep, which is exactly the "reachable machine looks unavailable" failure.
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = now().addingTimeInterval(timeout)
         var best: AgentFailure?
-        var tried = 0
+        var made = 0
+        var dead = Set<String>()
 
-        var index = 0
-        while index < attempts.count {
-            let attempt = attempts[index]
-            index += 1
+        for attempt in attempts where !dead.contains(attempt.route.id) {
             if var failure = backoff.failure(for: attempt.route.target) {
                 failure.dispatch = .never
                 best = Self.preferred(best, failure)
-                while index < attempts.count, attempts[index].route.id == attempt.route.id { index += 1 }
+                dead.insert(attempt.route.id)
                 continue
             }
-            let remaining = deadline.timeIntervalSinceNow
+            let remaining = deadline.timeIntervalSince(now())
             // Below this there is not enough time left for a connection, let alone a command, and
             // spending it produces a timeout that says nothing.
-            if tried > 0, remaining < 4 { break }
+            if made > 0, remaining < 4 { break }
+            guard let arguments = request.arguments(remainingMilliseconds: Int((remaining * 1000).rounded(.down)),
+                                                    attemptsMade: made) else { break }
 
             // Neither of these is sent anywhere, so neither can have run. An address this app does
             // not dial is the same refusal for every system behind it.
             if let problem = Addresses.problem(with: attempt.route.target) {
                 best = Self.preferred(best, AgentFailure(.badRequest, system: attempt.system, route: attempt.route.label,
                                                          detail: problem, dispatch: .never))
-                while index < attempts.count, attempts[index].route.id == attempt.route.id { index += 1 }
+                dead.insert(attempt.route.id)
                 continue
             }
             let command = RemoteCommand(system: attempt.system, arguments: arguments,
@@ -210,7 +218,8 @@ struct RemoteAgent: Sendable {
                 continue
             }
 
-            tried += 1
+            made += 1
+            let log = SSHLog.create(in: logDirectory)
             let result = await runner(
                 Self.sshPath,
                 RemoteCommand.sshArguments(
@@ -219,20 +228,25 @@ struct RemoteAgent: Sendable {
                     command: line,
                     knownHostsFile: AppPaths.overridesKnownHosts
                         ? AppPaths.knownHostsFile.path(percentEncoded: false)
-                        : nil
+                        : nil,
+                    logFile: log?.path(percentEncoded: false)
                 ),
-                max(4, remaining),
-                input
+                remaining,
+                request.input
             )
+            let sshLog = log.map(SSHLog.consume) ?? ""
+            let verdict = AttemptClassifier.classify(AttemptEvidence(result, sshLog: sshLog), timeout: Int(timeout))
 
-            // Decode before classifying failures: `boot` prints its JSON and then pulls the machine
-            // out from under ssh, so a non-zero exit with a good reply still means the agent spoke.
-            if let json = Self.extractJSONObject(from: result.standardOutput) {
+            let step = AttemptWalk.step(after: verdict, safety: request.safety)
+            if step == .reply {
+                // `boot` prints its JSON and then pulls the machine out from under ssh, so a non-zero
+                // exit with a good reply still means the agent spoke.
+                let json = AttemptClassifier.jsonObjectSlice(result.standardOutput) ?? Data()
                 do {
                     let value = try JSONDecoder().decode(Value.self, from: json)
                     backoff.clear(attempt.route.target)
                     if request.isStatusRead { sessions.record(json, target: attempt.route.target) }
-                    return AgentReply(value: value, system: attempt.system, route: attempt.route, attempts: tried)
+                    return AgentReply(value: value, system: attempt.system, route: attempt.route, attempts: made)
                 } catch {
                     throw AgentFailure(
                         .unreadableOutput,
@@ -246,24 +260,19 @@ struct RemoteAgent: Sendable {
                 }
             }
 
-            var failure = Self.classify(result, attempt: attempt, timeout: Int(timeout))
+            var failure = Self.failure(verdict, attempt: attempt, command: command, result: result, sshLog: sshLog)
             failure.target = attempt.route.target
-            if Self.isRouteLevel(failure.kind) { backoff.record(failure, target: attempt.route.target) }
+            if verdict.routeLevel { backoff.record(failure, target: attempt.route.target) }
 
-            // The rule the whole file exists for. A mutation whose fate is not known is never sent
+            // The rule the whole walk exists for. A mutation whose fate is not known is never sent
             // anywhere else, on any route, under any system: it is reported as it is.
-            if safety == .mutation, !failure.dispatch.isSafeToRetryMutation {
-                throw failure
-            }
+            if step == .stop { throw failure }
 
             best = Self.preferred(best, failure)
-
             // A failure at the connection level says nothing about the command shape, so trying the
-            // other systems on this same address would be three more attempts at a machine that is
-            // not answering. Skip to the next route instead.
-            if Self.isRouteLevel(failure.kind) {
-                while index < attempts.count, attempts[index].route.id == attempt.route.id { index += 1 }
-            }
+            // other systems on this same address would be more attempts at a machine that is not
+            // answering.
+            if step == .next(routeIsDead: true) { dead.insert(attempt.route.id) }
         }
 
         throw best ?? AgentFailure(.unreadableOutput, detail: "No output.", dispatch: .unknown)
@@ -271,58 +280,27 @@ struct RemoteAgent: Sendable {
 
     // MARK: - Reading what came back
 
-    static func classify(_ result: CommandResult, attempt: Attempt, timeout: Int) -> AgentFailure {
-        if let launchFailure = result.launchFailure {
-            return AgentFailure(.launchFailed, system: attempt.system, route: attempt.route.label,
-                                detail: launchFailure, dispatch: .never)
+    /// The failure a verdict stands for, in words a person can act on.
+    static func failure(_ verdict: AttemptClassifier.Verdict, attempt: Attempt, command: RemoteCommand,
+                        result: CommandResult, sshLog: String) -> AgentFailure {
+        var failure = AgentFailure(verdict.kind ?? .unreadableOutput, system: attempt.system, route: attempt.route.label,
+                                   detail: detail(result, sshLog: sshLog), dispatch: verdict.dispatch)
+        // A cmd line handed to a PowerShell login fails loudly, as a here-string PowerShell cannot
+        // parse. On a Windows system that left its shell to the default that is almost certainly
+        // what happened, and the fix is one word in the setup.
+        if attempt.system.platform == .windows, attempt.system.hasDefaultedShell, !command.restrictedSession,
+           ["parsererror", "here-string"].contains(where: { result.standardError.lowercased().contains($0) }) {
+            failure.hint = "This account logs in to PowerShell; set shell to powershell."
         }
-        if result.timedOut {
-            // Our own watchdog. The far side may be halfway through an install, so this is the one
-            // outcome that is genuinely unknown and must never be read as either success or failure.
-            return AgentFailure(.timedOut(seconds: timeout), system: attempt.system,
-                                route: attempt.route.label,
-                                detail: condense(result.failureText), dispatch: .unknown)
-        }
-
-        let text = result.standardError + "\n" + result.standardOutput
-
-        // ssh reserves exit status 255 for its own failures. Anything else came from the far side,
-        // which means a session was established and the command ran.
-        if result.exitCode == 255 {
-            let diagnosis = SSHDiagnosis.classify(text)
-                ?? (.hostUnreachable, Dispatch.never)
-            return AgentFailure(diagnosis.0, system: attempt.system, route: attempt.route.label,
-                                detail: condense(result.failureText), dispatch: diagnosis.1)
-        }
-
-        // Which failure we report matters, because every attempt but one is aimed at a system that
-        // is not running and is guaranteed to fail. An interpreter that was not found means we used
-        // the wrong shape; an interpreter that ran and could not find the script means we used the
-        // right shape and the agent really is not installed.
-        if SSHDiagnosis.agentIsMissing(text) {
-            return AgentFailure(.agentMissing, system: attempt.system, route: attempt.route.label,
-                                detail: condense(result.failureText), dispatch: .never)
-        }
-        if SSHDiagnosis.interpreterIsMissing(text) {
-            return AgentFailure(.interpreterMissing, system: attempt.system, route: attempt.route.label,
-                                detail: condense(result.failureText), dispatch: .never)
-        }
-
-        // Something ran on the far side and said something we do not understand. It got as far as a
-        // shell, so we cannot claim it did nothing.
-        return AgentFailure(.unreadableOutput, system: attempt.system, route: attempt.route.label,
-                            detail: condense(result.failureText), dispatch: .unknown)
+        return failure
     }
 
-    /// Whether the failure is about the address rather than about the command.
-    static func isRouteLevel(_ kind: AgentFailure.Kind) -> Bool {
-        switch kind {
-        case .hostUnreachable, .connectionRefused, .authenticationFailed,
-             .hostKeyChanged, .hostKeyUnknown, .launchFailed, .noRoute, .timedOut, .linkLost:
-            true
-        case .interpreterMissing, .agentMissing, .unreadableOutput, .agentFailed, .badRequest:
-            false
-        }
+    /// What to show under the sentence: ssh's own words first, because with `-E` they are no longer
+    /// in stderr, then whatever the far side said.
+    static func detail(_ result: CommandResult, sshLog: String) -> String {
+        let logged = CommandResult.informativeLines(sshLog)
+        let text = result.failureText
+        return condense(logged.isEmpty ? text : logged + "\n" + text)
     }
 
     /// Which of two failures is the one worth telling the user about.
@@ -351,15 +329,6 @@ struct RemoteAgent: Sendable {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.count <= 400 { return trimmed }
         return String(trimmed.prefix(400)) + "..."
-    }
-
-    /// PowerShell prepends a CLIXML banner and can interleave progress records, so take the slice
-    /// from the first brace to the last brace instead of trusting the whole stream to be JSON.
-    static func extractJSONObject(from text: String) -> Data? {
-        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), start < end else {
-            return nil
-        }
-        return String(text[start...end]).data(using: .utf8)
     }
 }
 

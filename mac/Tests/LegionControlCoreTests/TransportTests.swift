@@ -27,94 +27,141 @@ struct TransportTests {
         )
     }
 
-    static func result(exit: Int32 = 0, out: String = "", err: String = "",
+    static func result(exit: Int32? = 0, out: String = "", err: String = "",
                        timedOut: Bool = false, launchFailure: String? = nil) -> CommandResult {
-        CommandResult(exitCode: exit, standardOutput: out, standardError: err,
-                      timedOut: timedOut, launchFailure: launchFailure)
+        FakeSSH.result(exit: exit, out: out, err: err, timedOut: timedOut, launchFailure: launchFailure)
     }
 
     static func attempt(_ machine: Machine) -> RemoteAgent.Attempt {
         RemoteAgent.Attempt(route: machine.routes[0], system: machine.systems[0])
     }
 
+    /// A transport whose ssh is `answer`, writing its logs somewhere of their own.
+    static func agent(_ machine: Machine,
+                      answer: @escaping @Sendable (_ arguments: [String]) async -> CommandResult) -> (RemoteAgent, URL) {
+        let logs = FakeSSH.logDirectory()
+        var agent = RemoteAgent(machine: machine)
+        agent.logDirectory = logs
+        agent.runner = { _, arguments, _, _ in await answer(arguments) }
+        return (agent, logs)
+    }
+
+    /// What one attempt's evidence comes to, the way the transport turns it into a failure.
+    static func failure(_ result: CommandResult, log: String = "") -> AgentFailure {
+        let machine = Self.machine()
+        let verdict = AttemptClassifier.classify(AttemptEvidence(result, sshLog: log), timeout: 25)
+        return RemoteAgent.failure(verdict, attempt: Self.attempt(machine),
+                                   command: RemoteCommand(system: machine.systems[0], arguments: ["status"]),
+                                   result: result, sshLog: log)
+    }
+
+    static func restart() throws -> AgentRequest {
+        try AgentRequest.restart(service: "demo", intent: .init(operationId: AgentToken.newOperationId()), dialect: .v3)
+    }
+
     // MARK: - Classification
 
     @Test("a timeout is never a failure and never a success")
     func timeoutIsUnknown() {
-        let failure = RemoteAgent.classify(Self.result(timedOut: true), attempt: Self.attempt(Self.machine()), timeout: 60)
-        #expect(failure.kind == .timedOut(seconds: 60))
+        let failure = Self.failure(Self.result(exit: nil, timedOut: true))
+        #expect(failure.kind == .timedOut(seconds: 25))
         // The rule the review's finding 14 is about: the old transport mapped this to "unreachable",
         // and the boot handler then drew a reboot that had never happened.
         #expect(failure.dispatch == .unknown)
         #expect(!failure.meansAsleepOrOff)
     }
 
-    @Test("ssh diagnoses are told apart rather than folded into unreachable")
+    @Test("ssh's own log is told apart rather than folded into unreachable")
     func sshDiagnoses() {
         let cases: [(String, AgentFailure.Kind, Dispatch)] = [
             ("ssh: connect to host x port 22: Connection refused", .connectionRefused, .never),
             ("ssh: connect to host x port 22: No route to host", .hostUnreachable, .never),
             ("me@x: Permission denied (publickey).", .authenticationFailed, .never),
-            ("@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@", .hostKeyChanged, .never),
+            ("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @", .hostKeyChanged, .never),
             ("No ED25519 host key is known for x and you have requested strict checking.", .hostKeyUnknown, .never),
             ("client_loop: send disconnect: Broken pipe", .linkLost, .unknown)
         ]
         for (text, kind, dispatch) in cases {
-            let failure = RemoteAgent.classify(Self.result(exit: 255, err: text),
-                                               attempt: Self.attempt(Self.machine()), timeout: 25)
+            let failure = Self.failure(Self.result(exit: 255), log: text + "\n")
             #expect(failure.kind == kind, "\(text)")
             #expect(failure.dispatch == dispatch, "\(text)")
+            #expect(failure.detail.contains(text), "ssh's words are still shown: \(text)")
+        }
+    }
+
+    @Test("an ssh-looking line on remote stderr proves nothing")
+    func remoteStderrIsNotEvidence() {
+        // The agent writes raw text to stderr and the launcher passes it through, so a program on the
+        // far side can print any of these after doing its work. Only ssh's own log may say "never".
+        for text in ["ssh: connect to host x port 22: Connection refused", "me@x: Permission denied (publickey)."] {
+            let failure = Self.failure(Self.result(exit: 255, err: text))
+            #expect(failure.kind == .linkLost, "\(text)")
+            #expect(failure.dispatch == .unknown, "\(text)")
         }
     }
 
     @Test("a rejected key does not read as a sleeping machine")
     func authIsNotSleep() {
-        let failure = RemoteAgent.classify(Self.result(exit: 255, err: "Permission denied (publickey)."),
-                                           attempt: Self.attempt(Self.machine()), timeout: 25)
+        let failure = Self.failure(Self.result(exit: 255), log: "me@x: Permission denied (publickey).\n")
         #expect(!failure.meansAsleepOrOff)
         #expect(failure.message(machine: "Tower").contains("rejected the key"))
     }
 
-    @Test("a missing interpreter proves nothing ran; unreadable output does not")
+    @Test("a shell that could not start the interpreter proves nothing ran; the rest does not")
     func remoteFailureDispatch() {
-        let missing = RemoteAgent.classify(Self.result(exit: 127, err: "bash: node: command not found"),
-                                           attempt: Self.attempt(Self.machine()), timeout: 25)
+        let missing = Self.failure(Self.result(exit: 127, err: "bash: node: command not found"))
         #expect(missing.kind == .interpreterMissing)
         #expect(missing.dispatch == .never)
 
-        let noAgent = RemoteAgent.classify(Self.result(exit: 1, err: "Error: Cannot find module '/agent.mjs'"),
-                                           attempt: Self.attempt(Self.machine()), timeout: 25)
+        // Node ran and printed this, possibly after doing half of its work.
+        let noAgent = Self.failure(Self.result(exit: 1, err: "Error: Cannot find module '/agent.mjs'"))
         #expect(noAgent.kind == .agentMissing)
-        #expect(noAgent.dispatch == .never)
+        #expect(noAgent.dispatch == .unknown)
 
-        let garbage = RemoteAgent.classify(Self.result(exit: 3, out: "something happened"),
-                                           attempt: Self.attempt(Self.machine()), timeout: 25)
+        let garbage = Self.failure(Self.result(exit: 3, out: "something happened"))
         #expect(garbage.kind == .unreadableOutput)
         // It got as far as a shell on the far side, so we cannot claim it did nothing.
         #expect(garbage.dispatch == .unknown)
+    }
+
+    @Test("a PowerShell login refusing a cmd line is named, with the one-word fix")
+    func powerShellLoginHint() {
+        let windows = SystemConfig(id: "windows", platform: .windows, agent: ["node", "C:\\a.mjs"])
+        let machine = Self.machine(systems: [("windows", .windows)])
+        let attempt = RemoteAgent.Attempt(route: machine.routes[0], system: windows)
+        let result = Self.result(exit: 1, err: "No characters are allowed after a here-string header but before the end of the line.\n    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException")
+        let verdict = AttemptClassifier.classify(AttemptEvidence(result, sshLog: ""))
+        let failure = RemoteAgent.failure(verdict, attempt: attempt, command: RemoteCommand(system: windows, arguments: ["status"]),
+                                          result: result, sshLog: "")
+        #expect(failure.message(machine: "Tower") == "This account logs in to PowerShell; set shell to powershell.")
+
+        // A system that chose cmd on purpose gets the plain reading: its document already says cmd.
+        var chosen = windows
+        chosen.shell = "cmd"
+        let plain = RemoteAgent.failure(verdict, attempt: .init(route: machine.routes[0], system: chosen),
+                                        command: RemoteCommand(system: chosen, arguments: ["status"]), result: result, sshLog: "")
+        #expect(plain.hint == nil)
     }
 
     // MARK: - Retrying elsewhere
 
     @Test("a read is tried on every route; a mutation stops at the first uncertain failure")
     func mutationIsNotReplayed() async throws {
-        let machine = Self.machine()
         let calls = Counter()
-
-        var agent = RemoteAgent(machine: machine)
-        agent.runner = { _, _, _, _ in
+        // A timeout: the far side may have done the work.
+        let (agent, logs) = Self.agent(Self.machine()) { _ in
             await calls.increment()
-            // A timeout: the far side may have done the work.
-            return Self.result(timedOut: true)
+            return Self.result(exit: nil, timedOut: true)
         }
+        defer { try? FileManager.default.removeItem(at: logs) }
 
         // A read may be retried freely: nothing on the far side changed.
         _ = try? await agent.send(.status(dialect: .v3), decoding: AgentStatus.self, preferring: nil)
-        let readAttempts = await calls.value
-        #expect(readAttempts >= 1)
+        #expect(await calls.value >= 1)
 
         await calls.reset()
-        agent.backoff = RouteBackoff()
+        agent.backoff.clear(Self.machine().routes[0].target)
+        agent.backoff.clear(Self.machine().routes[1].target)
         var failure: AgentFailure?
         do {
             _ = try await agent.send(
@@ -125,60 +172,132 @@ struct TransportTests {
         } catch let error as AgentFailure {
             failure = error
         }
-        let mutationAttempts = await calls.value
         // Exactly one. A reboot whose outcome is unknown must never be sent to a second address.
-        #expect(mutationAttempts == 1)
+        #expect(await calls.value == 1)
         #expect(failure?.dispatch == .unknown)
     }
 
-    @Test("a mutation is retried elsewhere only when nothing can have run")
-    func mutationRetriesAfterProvableNonDispatch() async throws {
-        let machine = Self.machine()
+    @Test("an unexplained exit 255 stops a mutation after one attempt, whatever the agent speaks",
+          arguments: [AgentDialect.legacy, AgentDialect.v3])
+    func unexplainedExit255IsNotRetried(dialect: AgentDialect) async throws {
+        // M15. The Mac read a bare 255 as "never sent" and walked on to the next route, so a restart
+        // whose link dropped after it had started could run a second time. Two routes and two systems
+        // are four places it could have gone; it goes to one.
+        for log in ["", "Connection to 10.0.0.40 closed by remote host.\n", "something nobody has seen before\n"] {
+            let calls = Counter()
+            let (agent, logs) = Self.agent(Self.machine()) { arguments in
+                await calls.increment()
+                FakeSSH.writeLog(log, for: arguments)
+                return Self.result(exit: 255)
+            }
+            defer { try? FileManager.default.removeItem(at: logs) }
+            var failure: AgentFailure?
+            do {
+                _ = try await agent.send(
+                    try AgentRequest.restart(service: "demo", intent: .init(operationId: AgentToken.newOperationId()), dialect: dialect),
+                    decoding: AgentActionResult.self, preferring: nil)
+            } catch let error as AgentFailure {
+                failure = error
+            }
+            #expect(await calls.value == 1, "log: \(log)")
+            #expect(failure?.kind == .linkLost)
+            #expect(failure?.dispatch == .unknown)
+        }
+    }
+
+    @Test("a reply that cannot be read is an acknowledgement, and is not sent again")
+    func unreadableReplyIsNotRetried() async throws {
         let calls = Counter()
-        var agent = RemoteAgent(machine: machine)
-        agent.runner = { _, _, _, _ in
+        let (agent, logs) = Self.agent(Self.machine()) { _ in
+            await calls.increment()
+            return Self.result(exit: 0, out: #"{"ok":"yes"}"#)
+        }
+        defer { try? FileManager.default.removeItem(at: logs) }
+        await #expect(throws: AgentFailure.self) {
+            _ = try await agent.send(try Self.restart(), decoding: AgentActionResult.self, preferring: nil)
+        }
+        #expect(await calls.value == 1)
+    }
+
+    @Test("a mutation is retried elsewhere only when ssh's own log proves nothing ran")
+    func mutationRetriesAfterProvableNonDispatch() async throws {
+        let calls = Counter()
+        let (agent, logs) = Self.agent(Self.machine()) { arguments in
             await calls.increment()
             // Connection refused: nothing was ever handed to the far side.
-            return Self.result(exit: 255, err: "ssh: connect to host x port 22: Connection refused")
+            FakeSSH.writeLog("ssh: connect to host x port 22: Connection refused\n", for: arguments)
+            return Self.result(exit: 255)
         }
-        _ = try? await agent.send(
-            try AgentRequest.restart(service: "demo", intent: .init(operationId: AgentToken.newOperationId()), dialect: .v3),
-            decoding: AgentActionResult.self,
-            preferring: nil
-        )
+        defer { try? FileManager.default.removeItem(at: logs) }
+        _ = try? await agent.send(try Self.restart(), decoding: AgentActionResult.self, preferring: nil)
         // Both routes, because neither could have run anything. Systems are not retried per route
         // for a connection-level failure.
         #expect(await calls.value == 2)
+        // And every log was read back and deleted.
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: logs.path)) ?? []).isEmpty)
+    }
+
+    @Test("a read goes on to the next route after an unexplained exit 255")
+    func readsFailOver() async throws {
+        let destinations = Recorder()
+        let (agent, logs) = Self.agent(Self.machine()) { arguments in
+            await destinations.append(FakeSSH.destination(arguments) ?? "")
+            if await destinations.count == 1 { return Self.result(exit: 255) }
+            return Self.result(out: TransportTests.statusJSON)
+        }
+        defer { try? FileManager.default.removeItem(at: logs) }
+        let reply = try await agent.send(.status(dialect: .v3), decoding: AgentStatus.self, preferring: nil)
+        #expect(reply.value.ok == true)
+        // The second attempt is on the other route: linkLost says nothing good about the first one.
+        #expect(await destinations.values == ["me@100.64.0.10", "me@10.0.0.40"])
     }
 
     @Test("a route-level failure skips the other systems on that address")
     func routeLevelFailureSkipsSystems() async throws {
         // Two routes and two systems is four combinations; a machine that is simply asleep should
         // cost two attempts, not four, or a status call takes four connect timeouts to fail.
-        let machine = Self.machine()
         let calls = Counter()
-        var agent = RemoteAgent(machine: machine)
-        agent.runner = { _, _, _, _ in
+        let (agent, logs) = Self.agent(Self.machine()) { arguments in
             await calls.increment()
-            return Self.result(exit: 255, err: "ssh: connect to host x port 22: No route to host")
+            FakeSSH.writeLog("ssh: connect to host x port 22: No route to host\n", for: arguments)
+            return Self.result(exit: 255)
         }
+        defer { try? FileManager.default.removeItem(at: logs) }
         _ = try? await agent.send(.status(dialect: .v3), decoding: AgentStatus.self, preferring: nil)
         #expect(await calls.value == 2)
     }
 
-    /// A transport whose ssh is `answer`.
-    static func agent(_ machine: Machine,
-                      answer: @escaping @Sendable (_ arguments: [String]) async -> CommandResult) -> RemoteAgent {
-        var agent = RemoteAgent(machine: machine)
-        agent.runner = { _, arguments, _, _ in await answer(arguments) }
-        return agent
-    }
+    @Test("a status after two dead routes asks for only the time that is left")
+    func statusBudgetShrinks() async throws {
+        // C9. Every attempt used to send 20000 whatever was left of the 30 s, so after two dead
+        // routes the working one was cut off by this app's own deadline. Each dead route here costs
+        // the eight seconds a connect timeout would.
+        let machine = Self.machine(endpoints: [("remote", "192.0.2.10", nil), ("remote", "192.0.2.11", nil),
+                                               ("remote", "192.0.2.12", nil)],
+                                   systems: [("linux", .linux)])
+        let clock = TestClock()
+        let lines = Recorder()
+        let (base, logs) = Self.agent(machine) { arguments in
+            await lines.append(FakeSSH.line(arguments))
+            if await lines.count < 3 {
+                clock.advance(8)
+                FakeSSH.writeLog("ssh: connect to host x port 22: Operation timed out\n", for: arguments)
+                return Self.result(exit: 255)
+            }
+            return Self.result(out: TransportTests.statusJSON)
+        }
+        defer { try? FileManager.default.removeItem(at: logs) }
+        var agent = base
+        agent.now = { clock.now() }
+        _ = try await agent.send(.status(dialect: .v3), decoding: AgentStatus.self, preferring: nil)
+        #expect(await lines.values == ["node /agent.mjs status --budget-ms 20000",
+                                       "node /agent.mjs status --budget-ms 17000",
+                                       "node /agent.mjs status --budget-ms 9000"])
 
-    static func restart() throws -> AgentRequest {
-        try AgentRequest.restart(service: "demo", intent: .init(operationId: AgentToken.newOperationId()), dialect: .v3)
+        // An agent not known to speak contract 3 gets no budget at all.
+        let legacy = AgentRequest.status(dialect: .legacy)
+        #expect(legacy.arguments(remainingMilliseconds: 14_000, attemptsMade: 2) == ["status"])
     }
-
-    static let statusJSON = #"{"ok":true,"contract":3,"agentVersion":"3.1.0","system":{"id":"linux","name":"Linux"},"services":[]}"#
 
     @Test("an address outside the dial grammar is never dialled, and the next one is")
     func undialableAddressIsSkipped() async throws {
@@ -187,18 +306,20 @@ struct TransportTests {
         let machine = Self.machine(endpoints: [("remote", "victim.example,*", nil), ("remote", "192.0.2.10", nil)],
                                    systems: [("linux", .linux)])
         let destinations = Recorder()
-        let agent = Self.agent(machine) { arguments in
+        let (agent, logs) = Self.agent(machine) { arguments in
             await destinations.append(FakeSSH.destination(arguments) ?? "")
             return Self.result(out: TransportTests.statusJSON)
         }
+        defer { try? FileManager.default.removeItem(at: logs) }
         _ = try await agent.send(.status(dialect: .v3), decoding: AgentStatus.self, preferring: nil)
         #expect(await destinations.values == ["me@192.0.2.10"])
 
         let only = Self.machine(endpoints: [("lan", "-oProxyCommand=x", nil)], systems: [("linux", .linux)])
-        let refusing = Self.agent(only) { arguments in
+        let (refusing, refusingLogs) = Self.agent(only) { arguments in
             await destinations.append(FakeSSH.destination(arguments) ?? "")
             return Self.result(out: TransportTests.statusJSON)
         }
+        defer { try? FileManager.default.removeItem(at: refusingLogs) }
         await #expect(throws: AgentFailure(.badRequest, system: only.systems[0], route: only.routes[0].label,
                                            detail: Addresses.problem(with: only.routes[0].target)!, dispatch: .never)) {
             _ = try await refusing.send(try Self.restart(), decoding: AgentActionResult.self, preferring: nil)
@@ -216,10 +337,11 @@ struct TransportTests {
                       SystemConfig(id: "linux", platform: .linux, agent: ["node", "/a.mjs"])]
         )
         let lines = Recorder()
-        let agent = Self.agent(machine) { arguments in
+        let (agent, logs) = Self.agent(machine) { arguments in
             await lines.append(FakeSSH.line(arguments))
             return Self.result(out: #"{"ok":true,"contract":3,"action":"restarted"}"#)
         }
+        defer { try? FileManager.default.removeItem(at: logs) }
         let reply = try await agent.send(try Self.restart(), decoding: AgentActionResult.self, preferring: nil)
         #expect(reply.system.id == "linux")
         #expect(await lines.count == 1)
@@ -234,14 +356,36 @@ struct TransportTests {
                                    agent: ["C:\\node.exe", "C:\\Users\\me\\launcher.mjs"], shell: "cmd")]
         )
         let lines = Recorder()
-        let agent = Self.agent(machine) { arguments in
+        let (agent, logs) = Self.agent(machine) { arguments in
             await lines.append(FakeSSH.line(arguments))
             return Self.result(out: #"{"ok":true,"contract":3,"agent":{"restrictedSession":true},"services":[]}"#)
         }
+        defer { try? FileManager.default.removeItem(at: logs) }
         _ = try await agent.send(.status(dialect: .legacy), decoding: AgentStatus.self, preferring: nil)
         _ = try await agent.send(.status(dialect: .legacy), decoding: AgentStatus.self, preferring: nil)
         #expect(await lines.values == ["@\"C:\\node.exe\" \"C:\\Users\\me\\launcher.mjs\" \"status\"",
                                        "'C:\\node.exe' 'C:\\Users\\me\\launcher.mjs' status"])
+    }
+
+    @Test("output cut off at the cap is never read as a reply")
+    func truncatedOutputIsNoReply() async throws {
+        let calls = Counter()
+        let (agent, logs) = Self.agent(Self.machine(systems: [("linux", .linux)])) { _ in
+            await calls.increment()
+            var result = Self.result(out: #"{"ok":true,"contract":3,"action":"restarted"}"#)
+            result.standardOutputTruncated = true
+            return result
+        }
+        defer { try? FileManager.default.removeItem(at: logs) }
+        var failure: AgentFailure?
+        do {
+            _ = try await agent.send(try Self.restart(), decoding: AgentActionResult.self, preferring: nil)
+        } catch let error as AgentFailure {
+            failure = error
+        }
+        #expect(failure?.kind == .unreadableOutput)
+        #expect(failure?.dispatch == .unknown)
+        #expect(await calls.value == 1)
     }
 
     @Test("a system with no agent command is not driven")
@@ -251,6 +395,8 @@ struct TransportTests {
         let attempts = RemoteAgent.attempts(machine: machine, preferredSystem: nil, preferredRoute: nil)
         #expect(attempts.map(\.system.id) == ["other"])
     }
+
+    static let statusJSON = #"{"ok":true,"contract":3,"agentVersion":"3.1.0","system":{"id":"linux","name":"Linux"},"services":[]}"#
 
     @Test("the whole command shares one budget across every attempt")
     func attemptsShareTheBudget() {
@@ -402,6 +548,14 @@ actor Recorder {
     private(set) var values: [String] = []
     var count: Int { values.count }
     func append(_ value: String) { values.append(value) }
+}
+
+/// A clock a test moves by hand.
+final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var date = Date(timeIntervalSince1970: 1_000)
+    func now() -> Date { lock.withLock { date } }
+    func advance(_ seconds: TimeInterval) { lock.withLock { date.addTimeInterval(seconds) } }
 }
 
 struct RouteBackoffTests {

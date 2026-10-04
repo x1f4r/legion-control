@@ -104,20 +104,13 @@ actor MacAgent {
 
         let result = await runner(executable, leading + arguments, timeout, input)
 
-        if let launchFailure = result.launchFailure {
-            throw AgentFailure(.launchFailed, detail: launchFailure, dispatch: .never)
-        }
-        if result.timedOut {
-            // The same honesty the remote side keeps: the agent may be halfway through an install,
-            // so this is unknown rather than failed.
-            throw AgentFailure(.timedOut(seconds: Int(timeout)),
-                               detail: "The local agent did not finish within \(Int(timeout)) seconds.",
-                               dispatch: .unknown)
-        }
-
-        // Decode first: the agent reports its own refusals as a clean JSON object with a non-zero
-        // exit code, and those refusals are the interesting answers, not failures.
-        if let json = RemoteAgent.extractJSONObject(from: result.standardOutput) {
+        // The same reading of an attempt the machines get, with no ssh log: a local spawn has no
+        // connection to fail before the command starts. A reply comes first even on a non-zero exit,
+        // because the agent reports its own refusals as a clean JSON object and those refusals are
+        // the interesting answers, not failures.
+        let verdict = AttemptClassifier.classify(AttemptEvidence(result, sshLog: ""), timeout: Int(timeout))
+        if verdict.isReply {
+            let json = AttemptClassifier.jsonObjectSlice(result.standardOutput) ?? Data()
             do {
                 return try JSONDecoder().decode(Value.self, from: json)
             } catch {
@@ -126,12 +119,15 @@ actor MacAgent {
                                    dispatch: .acknowledged)
             }
         }
-
-        let text = result.standardError + "\n" + result.standardOutput
-        if SSHDiagnosis.agentIsMissing(text) {
-            throw AgentFailure(.agentMissing, detail: RemoteAgent.condense(result.failureText), dispatch: .never)
+        if case .timedOut = verdict.kind {
+            // The same honesty the remote side keeps: the agent may be halfway through an install,
+            // so this is unknown rather than failed.
+            throw AgentFailure(.timedOut(seconds: Int(timeout)),
+                               detail: "The local agent did not finish within \(Int(timeout)) seconds.",
+                               dispatch: .unknown)
         }
-        throw AgentFailure(.unreadableOutput, detail: RemoteAgent.condense(result.failureText), dispatch: .unknown)
+        throw AgentFailure(verdict.kind ?? .unreadableOutput, detail: RemoteAgent.condense(result.failureText),
+                           dispatch: verdict.dispatch)
     }
 
     // MARK: - Finding node
@@ -211,6 +207,8 @@ extension AgentFailure {
             "The local agent did not finish within \(seconds) seconds, so what it did is not known."
         case .unreadableOutput:
             "The local agent replied with something unreadable."
+        case .linkLost:
+            "The local agent ended without an exit status, so what it did is not known."
         case .agentFailed:
             "The local agent reported a problem. \(detail)"
         default:

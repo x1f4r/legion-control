@@ -93,6 +93,50 @@ struct AgentBootstrapTests {
         #expect(!installed.standardError.contains("SyntaxError"))
     }
 
+    @Test("the bootstrap reads ssh's own log, and is certain only when nothing can have run")
+    func bootstrapUsesTheClassifier() async throws {
+        let logs = FakeSSH.logDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
+        let target = SSHTarget(host: "192.0.2.10", user: "me", port: nil, identityFile: nil)
+        let system = SystemConfig(id: "linux", agent: ["/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs"])
+        let argv = ["/usr/bin/node", "-e", AgentBootstrap.oneLine(AgentBootstrap.prepareScript), "--", "/home/me/.legion-control"]
+
+        let refused = try await AgentBootstrap.runOverSSH(target: target, system: system, argv: argv, timeout: 5,
+                                                          logDirectory: logs) { _, arguments, _, _ in
+            #expect(Array(arguments.suffix(3).prefix(2)) == ["--", "me@192.0.2.10"])
+            FakeSSH.writeLog("ssh: connect to host 192.0.2.10 port 22: Connection refused\n", for: arguments)
+            return FakeSSH.result(exit: 255)
+        }
+        #expect(refused.verdict.dispatch == .never)
+        do {
+            _ = try AgentBootstrap.decode(refused.result, verdict: refused.verdict)
+            Issue.record("a refused connection decoded as a reply")
+        } catch let failure as AgentBootstrap.Failure {
+            #expect(!failure.uncertain)
+        }
+
+        // The same exit with nothing in ssh's log may have run, so the outcome is left open.
+        let dropped = try await AgentBootstrap.runOverSSH(target: target, system: system, argv: argv, timeout: 5,
+                                                          logDirectory: logs) { _, _, _, _ in FakeSSH.result(exit: 255) }
+        #expect(dropped.verdict.dispatch == .unknown)
+        do {
+            _ = try AgentBootstrap.decode(dropped.result, verdict: dropped.verdict)
+            Issue.record("a dropped link decoded as a reply")
+        } catch let failure as AgentBootstrap.Failure {
+            #expect(failure.uncertain)
+        }
+
+        // A system whose shell cannot carry the script is refused before anything is dialled.
+        let cmd = SystemConfig(id: "windows", platform: .windows, agent: ["node.exe", "C:\\lc\\agent\\src\\index.mjs"])
+        await #expect(throws: AgentBootstrap.Failure.self) {
+            _ = try await AgentBootstrap.runOverSSH(target: target, system: cmd, argv: ["node.exe", "-e", AgentBootstrap.oneLine(AgentBootstrap.prepareScript)],
+                                                    timeout: 5, logDirectory: logs) { _, _, _, _ in
+                Issue.record("ssh was run for a line cmd cannot carry")
+                return FakeSSH.result()
+            }
+        }
+    }
+
     @Test("bootstrap refuses archive symlinks before running any staged code")
     func unsafeArchive() async throws {
         let (dir, source, _) = try await fixture()

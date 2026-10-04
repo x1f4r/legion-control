@@ -103,6 +103,9 @@ struct AgentFailure: Error, Sendable, Equatable {
     /// Raw text worth showing under the sentence: ssh's own words, exit codes, stack frames.
     var detail: String
     var dispatch: Dispatch
+    /// What to change, when the evidence points at one likely cause, said instead of the kind's own
+    /// sentence.
+    var hint: String?
 
     init(_ kind: Kind, system: SystemConfig? = nil, route: String? = nil, detail: String = "", dispatch: Dispatch) {
         self.kind = kind
@@ -114,6 +117,7 @@ struct AgentFailure: Error, Sendable, Equatable {
 
     /// One sentence naming what went wrong, in terms of the thing that has to change.
     func message(machine: String) -> String {
+        if let hint { return hint }
         switch kind {
         case .noRoute:
             return "There is no ssh host configured for \(machine)."
@@ -175,87 +179,5 @@ struct AgentFailure: Error, Sendable, Equatable {
         case .agentFailed: "agent reported a failure"
         case .badRequest: "not sent"
         }
-    }
-}
-
-/// Reads ssh's own diagnostics.
-///
-/// ssh reserves exit status 255 for its own failures and puts the reason in one line of stderr. That
-/// line is the only evidence there is for whether anything ran on the far side, so it is worth
-/// reading properly rather than folding into a single "unreachable".
-enum SSHDiagnosis {
-    /// What the text says, or nil when it says nothing recognisable.
-    static func classify(_ text: String) -> (kind: AgentFailure.Kind, dispatch: Dispatch)? {
-        let lower = text.lowercased()
-
-        // Host key first: it is the one failure that looks alarming and has a mundane cause on a
-        // dual boot machine, and its text also contains "permission denied" in some versions.
-        if lower.contains("remote host identification has changed")
-            || lower.contains("host key verification failed")
-            || lower.contains("key_verify failed") {
-            return (.hostKeyChanged, .never)
-        }
-        if lower.contains("no matching host key type")
-            || lower.contains("host key for") && lower.contains("has changed") {
-            return (.hostKeyChanged, .never)
-        }
-        if lower.contains("no rsa host key is known")
-            || lower.contains("host key is not known")
-            || lower.contains("no ed25519 host key is known") {
-            return (.hostKeyUnknown, .never)
-        }
-
-        if lower.contains("permission denied")
-            || lower.contains("too many authentication failures")
-            || lower.contains("no supported authentication methods")
-            || lower.contains("authentication failed") {
-            return (.authenticationFailed, .never)
-        }
-
-        if lower.contains("connection refused") {
-            return (.connectionRefused, .never)
-        }
-        if lower.contains("no route to host")
-            || lower.contains("network is unreachable")
-            || lower.contains("could not resolve hostname")
-            || lower.contains("name or service not known")
-            || lower.contains("nodename nor servname provided")
-            || lower.contains("operation timed out")
-            || lower.contains("connection timed out")
-            || lower.contains("host is down") {
-            return (.hostUnreachable, .never)
-        }
-
-        // A session that was up and went away. This one is genuinely ambiguous: it is what a reboot
-        // looks like from here, and it is also what a flaky link looks like.
-        if lower.contains("connection closed by remote host")
-            || lower.contains("connection reset by peer")
-            || lower.contains("client_loop: send disconnect")
-            || lower.contains("broken pipe")
-            || lower.contains("connection to") && lower.contains("closed by remote host") {
-            return (.linkLost, .unknown)
-        }
-
-        return nil
-    }
-
-    /// The markers that prove the interpreter itself was never found, which is the one remote
-    /// failure that is safe to treat as "nothing ran".
-    static func interpreterIsMissing(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        let markers = [
-            "command not found", "unknown command", "not recognized as the name",
-            "is not recognized as an internal", "commandnotfoundexception",
-            "no such file or directory", "cannot find path"
-        ]
-        return markers.contains { lower.contains($0) }
-    }
-
-    /// The markers that prove the interpreter ran and the agent script was not where the config
-    /// said it would be.
-    static func agentIsMissing(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        let markers = ["cannot find module", "module_not_found", "err_module_not_found"]
-        return markers.contains { lower.contains($0) }
     }
 }
