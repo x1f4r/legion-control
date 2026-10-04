@@ -141,6 +141,25 @@ test('two builds of one agent tree are the same bytes, whenever its files were w
   } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
 });
 
+test('the signed agent manifest lists its files in byte order, which no locale has a say in', async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-package-order-'));
+  try {
+    const source = path.join(scratch, 'source');
+    for (const directory of ['src', 'install']) fs.mkdirSync(path.join(source, directory), { recursive: true });
+    fs.writeFileSync(path.join(source, 'package.json'), '{"version":"3.1.0","legionControl":{"agentFloor":"3.1.0"}}\n');
+    // A collation puts alpha before Zeta; their bytes put Zeta first.
+    for (const name of ['alpha.mjs', 'Zeta.mjs']) fs.writeFileSync(path.join(source, 'src', name), 'export {};\n');
+    fs.writeFileSync(path.join(source, 'install/install.sh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const privateKey = path.join(scratch, 'private.pem');
+    const publicKey = path.join(scratch, 'public.pem');
+    createSigningKey(privateKey, publicKey);
+    const result = await packageAgent({ source, clientVersion: '1.4.0', destination: path.join(scratch, 'dist'), privateKey, publicKey });
+    const { files } = readTar(zlib.gunzipSync(fs.readFileSync(result.archive)));
+    const manifest = JSON.parse(files.get('agent/MANIFEST.json').toString('utf8'));
+    assert.deepEqual(manifest.files.map(file => file.path), ['install/install.sh', 'package.json', 'src/Zeta.mjs', 'src/alpha.mjs']);
+  } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+});
+
 test('a path longer than a ustar name is split at a slash, and one that cannot be is refused', () => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-package-long-'));
   try {

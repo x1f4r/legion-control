@@ -129,7 +129,9 @@ export async function packageAgent({ source = path.join(repository, 'agent'), de
       } else throw new Error(`Unsupported agent package entry: ${relative}`);
     }
     for (const relative of ['src', 'install', 'package.json']) await copy(relative);
-    files.sort((a, b) => a.path.localeCompare(b.path, 'en'));
+    // Byte order, as in the tarball. A collation would make the signed manifest, and with it the
+    // tarball, depend on the ICU data of the Node that happened to build it.
+    files.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
     const manifest = path.join(stage, 'MANIFEST.json');
     fs.writeFileSync(manifest, JSON.stringify({ schema: 1, version, contract: 3, files }, null, 2) + '\n');
     signManifest(manifest, privateKey, manifest + '.sig');
