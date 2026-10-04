@@ -1791,6 +1791,199 @@ function checkLaunchCase(where, entry, reference) {
   else pass();
 }
 
+// ---------------------------------------------------------------------------
+// Setup reconciliation (section 9.5).
+//
+// The rules are a table, and the one independent statement of a table is the
+// table typed again by a person: every case's hand-written want, which
+// generation refuses to disagree with. What is checked here holds of any
+// answer whatever the rule: the shape each decision has, that an automatic
+// write only ever follows strict descent, that no guardrail lets a second
+// request or a held push out, and that only a refusal saying what the machine
+// holds is filed.
+// ---------------------------------------------------------------------------
+
+const SENDING_DECISIONS = ['push', 'readMeta', 'fetch'];
+const DECISION_REASONS = {
+  push: ['machine-empty', 'machine-unidentified', 'machine-behind'],
+  unknown: ['no-local', 'local-unidentified'],
+};
+
+function checkReconcileCase(where, group, entry) {
+  const input = entry.input ?? {};
+  const expect = entry.expect ?? {};
+  const problems = [];
+  if (group === 'decide') {
+    const remote = input.status?.controller?.hash ?? null;
+    if (!(DECISION_REASONS[expect.decision] ?? [null]).includes(expect.reason)) problems.push(`${expect.decision} never comes with the reason ${expect.reason}`);
+    if ((expect.expect !== null) !== (expect.decision === 'fetch')) problems.push('expect is set for a fetch and for nothing else');
+    if (expect.decision === 'fetch') {
+      const filed = Object.hasOwn(input.metaByHash ?? {}, remote) ? input.metaByHash[remote] : null;
+      if (expect.expect !== remote) problems.push('a fetch expects the hash the status reported');
+      if (!(filed?.lineage ?? []).includes(input.local?.hash)) problems.push('a fetch whose filed lineage does not hold the applied hash is not strict descent');
+    }
+    if (expect.reason === 'machine-behind' && !(input.local?.lineage ?? []).includes(remote)) problems.push('a push to a machine whose hash is not an ancestor is not strict descent');
+    if (expect.decision !== 'unsupported' && !(input.status?.contract >= 3 && input.status?.controller)) problems.push('only a contract 3 machine that reports its copy takes part');
+  } else if (group === 'admit') {
+    const { expected = {}, fetched = {} } = input;
+    if ((expect.admission === 'headMoved') !== (input.currentLocalHash !== expected.localHash)) problems.push('headMoved is exactly an applied hash that changed during the read');
+    if (expect.admission === 'adopt' && !(fetched.hash === expected.remoteHash && input.accepted === true
+      && fetched.id === expected.localId && (fetched.lineage ?? []).includes(expected.localHash))) {
+      problems.push('adopted bytes are not the expected, accepted descendant of the applied document');
+    }
+  } else if (group === 'gate') {
+    const state = input.state ?? {};
+    const failed = Object.hasOwn(state.failedAt ?? {}, input.localHash) ? state.failedAt[input.localHash] : null;
+    if ((expect.action === 'none') !== !SENDING_DECISIONS.includes(input.decision)) problems.push('only push, readMeta and fetch send anything');
+    if ((expect.reason === null) !== (expect.action !== 'hold')) problems.push('a hold, and only a hold, has a reason');
+    if (expect.action === 'act') {
+      if (state.inFlight) problems.push('a second request while one is in flight');
+      if (failed !== null && input.now - failed < 60000) problems.push('a request inside the 60 s back-off');
+      if (input.decision === 'push' && (state.localInvalid || state.localMutation || state.runningOperations > 0
+        || Object.hasOwn(state.held ?? {}, input.localHash))) {
+        problems.push('a push let out past a guardrail');
+      }
+    }
+  } else if (group === 'pushReply') {
+    const { reply, localHash } = input;
+    if ((expect.metaHash !== null) !== (expect.effect === 'fileMeta')) problems.push('metaHash is set for fileMeta and for nothing else');
+    if (expect.effect === 'fileMeta' && (!['stale-revision', 'controller-conflict'].includes(reply?.reasonCode) || expect.metaHash !== reply?.current?.hash)) {
+      problems.push('only the current of a stale-revision or controller-conflict refusal is filed, under its own hash');
+    }
+    if (expect.effect === 'clear' && !(reply?.ok === true && reply.hash === localHash)) problems.push('only a reply that holds the applied hash clears a failure');
+    if (reply === null && expect.effect !== 'fail') problems.push('a push whose reply was never read is a failure');
+  }
+  if (problems.length > 0) fail(where, problems.join('; '));
+  else pass();
+}
+
+// ---------------------------------------------------------------------------
+// Merging (section 9.8).
+// ---------------------------------------------------------------------------
+
+/** Whether string a comes before b in code-point order, compared here apart from the reference. */
+function beforeByCodePoint(a, b) {
+  const x = Array.from(a, (character) => character.codePointAt(0));
+  const y = Array.from(b, (character) => character.codePointAt(0));
+  for (let index = 0; index < Math.min(x.length, y.length); index += 1) {
+    if (x[index] !== y[index]) return x[index] < y[index];
+  }
+  return x.length < y.length;
+}
+
+const hashAgain = (text) => crypto.createHash('sha256').update(canonicalBytesAgain(Buffer.from(text, 'utf8'))).digest('hex');
+
+function checkMergeCase(where, entry) {
+  const { baseText, mineText, theirsText, mineHash, theirsHash, writer = {} } = entry.input ?? {};
+  const { differences = [], resultText, error } = entry.expect ?? {};
+  const problems = [];
+  if (hashAgain(mineText) !== mineHash) problems.push('mineHash is not the canonical hash of mineText');
+  if (hashAgain(theirsText) !== theirsHash) problems.push('theirsHash is not the canonical hash of theirsText');
+  for (const [label, text] of [['baseText', baseText], ['mineText', mineText], ['theirsText', theirsText]]) {
+    if (text !== null && !checkDocument(text, { intake: 'peer' }).valid) problems.push(`${label} is refused by section 9.7, and only documents peer intake accepts are merged`);
+  }
+  const keys = differences.map((difference) => difference.entry);
+  if (!keys.every((key, index) => index === 0 || beforeByCodePoint(keys[index - 1], key))) problems.push('differences are not listed once each in code-point order of their keys');
+  if (differences.some((difference) => (difference.kind === 'noBase') !== (baseText === null))) problems.push('noBase is the kind of every difference of a merge without a base, and of no other');
+  if ((resultText === null) !== (error !== null)) problems.push('a merge either writes a document or names the rule it breaks');
+  if (resultText !== null) {
+    const verdict = checkDocument(resultText, { intake: 'peer' });
+    if (!verdict.valid) problems.push(`the merged document is refused by section 9.7: ${verdict.errors.map((problem) => problem.code).join(', ')}`);
+    const result = JSON.parse(resultText).controller ?? {};
+    const mine = JSON.parse(mineText).controller ?? {};
+    const theirs = JSON.parse(theirsText).controller ?? {};
+    const lineage = Array.isArray(result.lineage) ? result.lineage : [];
+    if (result.id !== mine.id) problems.push('the merged document does not keep mine\'s setup id');
+    if (result.revision !== Math.max(mine.revision ?? 0, theirs.revision ?? 0) + 1) problems.push('the merged revision is not one more than the higher of the two');
+    if (result.updatedAt !== writer.now || result.source !== writer.source || result.device !== writer.device) problems.push('updatedAt, source and device are not the writer\'s');
+    if (lineage[0] !== mineHash || lineage[1] !== theirsHash || lineage.length > 32 || new Set(lineage).size !== lineage.length) {
+      problems.push('the merged lineage does not start with both heads, or holds a hash twice, or is longer than 32');
+    }
+  }
+  if (problems.length > 0) fail(where, problems.join('; '));
+  else pass();
+}
+
+/** A JSON number lexeme as an exact BigInt mantissa and power of ten, read here apart from the reference. */
+function decimalAgain(lexeme) {
+  const match = /^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$/.exec(lexeme);
+  const fraction = match[3] ?? '';
+  return { mantissa: BigInt(`${match[1]}${match[2]}${fraction}`), exponent: Number(match[4] ?? 0) - fraction.length };
+}
+
+function sameDecimal(a, b) {
+  const x = decimalAgain(a);
+  const y = decimalAgain(b);
+  if (x.mantissa === 0n || y.mantissa === 0n) return x.mantissa === y.mantissa;
+  const low = Math.min(x.exponent, y.exponent);
+  return x.mantissa * 10n ** BigInt(x.exponent - low) === y.mantissa * 10n ** BigInt(y.exponent - low);
+}
+
+// ---------------------------------------------------------------------------
+// Wake (sections 10.1 and 10.2).
+// ---------------------------------------------------------------------------
+
+const OCTET_AGAIN = '(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])';
+const IPV4_AGAIN = new RegExp(`^${OCTET_AGAIN}(?:\\.${OCTET_AGAIN}){3}$`);
+const DOTTED_PREFIX_AGAIN = new RegExp(`^${OCTET_AGAIN}(?:\\.${OCTET_AGAIN}){0,2}\\.?$`);
+const CIDR_PREFIX_AGAIN = new RegExp(`^(${OCTET_AGAIN}(?:\\.${OCTET_AGAIN}){3})/(8|9|[12][0-9]|3[0-2])$`);
+
+/** An IPv4 address as a number, by arithmetic rather than the reference's bit operations. */
+const ipv4Again = (text) => text.split('.').reduce((value, part) => value * 256 + Number(part), 0);
+
+/** Whether a section 10.1 prefix holds a dotted-quad address; null when the text is no prefix. */
+function prefixHoldsAgain(prefix, address) {
+  if (DOTTED_PREFIX_AGAIN.test(prefix)) {
+    const octets = prefix.replace(/\.$/, '').split('.');
+    return IPV4_AGAIN.test(address) && octets.every((octet, index) => address.split('.')[index] === octet);
+  }
+  const cidr = CIDR_PREFIX_AGAIN.exec(prefix);
+  if (cidr === null) return null;
+  const block = 2 ** (32 - Number(cidr[2]));
+  const network = ipv4Again(cidr[1]);
+  if (network % block !== 0) return null;
+  return IPV4_AGAIN.test(address) && Math.floor(ipv4Again(address) / block) === network / block;
+}
+
+function checkWakePlan(where, entry, fixture) {
+  const problems = [];
+  const { documentText, target } = entry.input ?? {};
+  const expect = entry.expect ?? {};
+  // Every plan runs against the one setup clients can also load as a fixture.
+  if (!jsonEqual(JSON.parse(documentText), fixture)) problems.push('documentText is not fixtures/controller-document.wake-defaults.json');
+  if (!checkDocument(documentText, { intake: 'peer' }).valid) problems.push('documentText is refused by section 9.7');
+  const document = JSON.parse(documentText);
+  const siteIds = (document.sites ?? []).map((site) => site.id);
+  const machine = (document.machines ?? []).find((candidate) => candidate.id === target);
+  if (!expect.matching.every((id, index) => siteIds.includes(id) && (index === 0 || siteIds.indexOf(expect.matching[index - 1]) < siteIds.indexOf(id)))) {
+    problems.push('matching is not a list of sites in document order');
+  }
+  if (expect.effective !== null && !siteIds.includes(expect.effective)) problems.push('the effective site is not in the setup');
+  const directSteps = expect.steps.filter((step) => step.kind === 'direct');
+  const directSkips = expect.skipped.filter((skip) => skip.kind === 'direct');
+  if (directSteps.length + directSkips.length !== 1) problems.push('the direct step is either planned or skipped, exactly once');
+  for (const step of directSteps) {
+    if (!step.broadcast.every((address) => IPV4_AGAIN.test(address)) || !step.ports.every((port) => port >= 1 && port <= 65535) || step.repeats !== 3) {
+      problems.push('a direct step sends three packets to dotted IPv4 addresses on ports from 1 to 65535');
+    }
+  }
+  if (directSteps.length > 0 && typeof machine?.wake?.mac !== 'string') problems.push('a direct step for a machine with no MAC address');
+  const list = machine?.wake?.helpers?.length > 0 ? machine.wake.helpers : machine?.wake?.helper === undefined ? [] : [machine.wake.helper];
+  const nothing = expect.skipped.some((skip) => skip.kind === 'helpers');
+  if (nothing !== (list.length === 0 && directSteps.length === 0)) problems.push('"helpers: none" is said exactly when there is no direct step and no helper at all');
+  if (expect.steps.filter((step) => step.kind === 'helper').length + expect.skipped.filter((skip) => skip.kind === 'helper').length !== list.length) {
+    problems.push('every helper entry is either a step or skipped, exactly once');
+  }
+  for (const id of expect.offerWakeFirst) {
+    const helper = (document.machines ?? []).find((candidate) => candidate.id === id);
+    if (!expect.skipped.some((skip) => skip.machine === id && skip.reason === 'asleep') || helper?.wake === null || typeof helper?.wake !== 'object') {
+      problems.push(`${id} is offered to be woken first, and only an asleep helper with a wake block of its own is`);
+    }
+  }
+  if (problems.length > 0) fail(where, problems.join('; '));
+  else pass();
+}
+
 /**
  * The checks each family gets from code that is not its reference. A family
  * the index lists and this table does not is a failure: a vector checked only
@@ -1846,6 +2039,56 @@ const INDEPENDENT = {
 
   launch: (where, data, groups, reference) => {
     for (const entry of groups.get('review') ?? []) checkLaunchCase(`${where}/review/${entry.name}`, entry, reference);
+  },
+
+  'setup-reconcile': (where, data, groups) => {
+    for (const [group, cases] of groups) {
+      for (const entry of cases) checkReconcileCase(`${where}/${group}/${entry.name}`, group, entry);
+    }
+  },
+
+  'setup-merge': (where, data, groups) => {
+    for (const entry of groups.get('merges') ?? []) checkMergeCase(`${where}/merges/${entry.name}`, entry);
+    for (const entry of groups.get('bases') ?? []) {
+      const { mineLineage = [], theirsLineage = [], kept = {} } = entry.input ?? {};
+      const usable = (hash) => theirsLineage.includes(hash) && typeof kept[hash] === 'string' && hashAgain(kept[hash]) === hash;
+      const base = mineLineage.find(usable) ?? null;
+      if (base !== entry.expect?.base) fail(`${where}/bases/${entry.name}`, `the newest hash of mine's lineage in theirs' with kept bytes that hash to it is ${base}, and the case says ${entry.expect?.base}`);
+      else pass();
+    }
+    for (const entry of groups.get('numbers') ?? []) {
+      const equal = sameDecimal(entry.input?.a, entry.input?.b);
+      if (equal !== entry.expect?.equal) fail(`${where}/numbers/${entry.name}`, `${entry.input?.a} and ${entry.input?.b} are ${equal ? 'one number' : 'two numbers'}, and the case says otherwise`);
+      else pass();
+    }
+  },
+
+  wake: (where, data, groups) => {
+    for (const entry of groups.get('prefixes') ?? []) {
+      const { prefix, addresses = [] } = entry.input ?? {};
+      const valid = prefixHoldsAgain(prefix, '0.0.0.0') !== null;
+      const contains = addresses.map((address) => valid && prefixHoldsAgain(prefix, address) === true);
+      if (valid !== entry.expect?.valid || !jsonEqual(contains, entry.expect?.contains)) {
+        fail(`${where}/prefixes/${entry.name}`, `read here, ${JSON.stringify(prefix)} is ${valid ? '' : 'not '}a prefix holding ${JSON.stringify(contains)}, and the case says ${JSON.stringify(entry.expect)}`);
+      } else {
+        pass();
+      }
+    }
+    for (const entry of groups.get('broadcasts') ?? []) {
+      if (IPV4_AGAIN.test(entry.input?.text) !== entry.expect?.valid) fail(`${where}/broadcasts/${entry.name}`, 'whether the entry is a dotted IPv4 address disagrees with the case');
+      else pass();
+    }
+    const fixture = readJson(path.join(FIXTURE_DIR, 'controller-document.wake-defaults.json'));
+    for (const entry of groups.get('plans') ?? []) checkWakePlan(`${where}/plans/${entry.name}`, entry, fixture);
+    for (const entry of groups.get('readiness') ?? []) {
+      const starts = entry.expect?.pollStartsMs ?? [];
+      const gaps = starts.map((start, index) => start - (index === 0 ? 0 : starts[index - 1]));
+      const shaped = entry.input?.sentAnything
+        ? starts[0] === 5000 && gaps.every((gap, index) => index === 0 || (gap >= gaps[index - 1] && gap <= 20000)) && starts.at(-1) <= 120000 && starts.at(-1) + 20000 > 120000
+        : starts.length === 0;
+      if (!shaped) fail(`${where}/readiness/${entry.name}`, 'polls start 5 s after a send, at growing intervals of at most 20 s, until 120 s; after no send there are none');
+      else pass();
+    }
   },
 };
 

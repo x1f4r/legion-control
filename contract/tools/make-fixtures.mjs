@@ -36,6 +36,7 @@ import {
   H_CURRENT,
   CONTROLLER_DOC_SIZE,
   TOWER_DOC,
+  WAKE_DEFAULTS,
 } from './documents.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -2507,6 +2508,13 @@ addDocument('controller-document.unknown-keys.json', {
     },
   ],
 });
+
+addDocument('controller-document.wake-defaults.json', {
+  variant: 'wake-defaults',
+  schema: 'controller-document.schema.json',
+  description: 'The setup every wake vector plans against (contract/vectors/wake.json carries it as documentText). Five sites: one with a broadcast, one written in CIDR, two that share a subnet, one with no prefixes. Eight machines, each one wake rule: helpers in order, a helper that can be woken itself, a lanPrefix without its trailing dot, a broadcast list that holds a name, a helper list that repeats an entry. Valid, with the warnings those choices earn.',
+  tags: ['controller', 'sites', 'wake'],
+}, WAKE_DEFAULTS);
 
 addDocument('controller-document.invalid-helper-cycle.json', {
   variant: 'invalid-helper-cycle',

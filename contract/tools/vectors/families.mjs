@@ -10,7 +10,10 @@ import identifiers from './identifiers.cases.mjs';
 import launch from './launch.cases.mjs';
 import outcome from './outcome.cases.mjs';
 import setupAcceptance from './setup-acceptance.cases.mjs';
+import setupMerge from './setup-merge.cases.mjs';
+import setupReconcile from './setup-reconcile.cases.mjs';
 import transport from './transport.cases.mjs';
+import wake from './wake.cases.mjs';
 
 /**
  * The hash family keeps the file and the flat layout it had before there was a
@@ -31,4 +34,4 @@ export const HASH_FAMILY = Object.freeze({
 });
 
 /** The case modules of the families in the `groups` layout, each written to vectors/<family>.json. */
-export const CASE_MODULES = Object.freeze([identifiers, outcome, transport, setupAcceptance, launch]);
+export const CASE_MODULES = Object.freeze([identifiers, outcome, transport, setupAcceptance, launch, setupReconcile, setupMerge, wake]);

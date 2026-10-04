@@ -1221,6 +1221,26 @@
       ]
     },
     {
+      "file": "controller-document.wake-defaults.json",
+      "kind": "document",
+      "expect": "valid",
+      "command": null,
+      "variant": "wake-defaults",
+      "schema": "controller-document.schema.json",
+      "ok": null,
+      "exitCode": null,
+      "contract": null,
+      "action": null,
+      "reasonCode": null,
+      "outcome": null,
+      "description": "The setup every wake vector plans against (contract/vectors/wake.json carries it as documentText). Five sites: one with a broadcast, one written in CIDR, two that share a subnet, one with no prefixes. Eight machines, each one wake rule: helpers in order, a helper that can be woken itself, a lanPrefix without its trailing dot, a broadcast list that holds a name, a helper list that repeats an entry. Valid, with the warnings those choices earn.",
+      "tags": [
+        "controller",
+        "sites",
+        "wake"
+      ]
+    },
+    {
       "file": "controller-document.invalid-helper-cycle.json",
       "kind": "document",
       "expect": "invalid",

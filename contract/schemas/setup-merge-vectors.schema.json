@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "setup-merge-vectors.schema.json",
+  "title": "contract/vectors/setup-merge.json",
+  "description": "Merging, v3.md section 9.8, as cases. merges gives a base, mine, theirs and a person's choices, and expects the differences shown and the document written; bases pins which kept revision is the base; numbers pins when two number lexemes are the same value.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "family": { "const": "setup-merge" },
+    "contract": { "const": 3 },
+    "section": { "const": "9.8" },
+    "reference": { "const": "tools/setup-sync.mjs" },
+    "notes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/text" } },
+    "groups": {
+      "type": "object",
+      "properties": {
+        "merges": { "type": "array", "minItems": 16, "items": { "$ref": "#/$defs/mergesCase" } },
+        "bases": { "type": "array", "minItems": 4, "items": { "$ref": "#/$defs/basesCase" } },
+        "numbers": { "type": "array", "minItems": 6, "items": { "$ref": "#/$defs/numbersCase" } }
+      },
+      "required": ["merges", "bases", "numbers"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["family", "contract", "section", "reference", "notes", "groups"],
+  "additionalProperties": false,
+  "$defs": {
+    "hash": { "$ref": "common.schema.json#/$defs/sha256" },
+    "side": { "enum": ["mine", "theirs"] },
+    "mergesCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "baseText": { "type": ["string", "null"] },
+            "mineText": { "type": "string" },
+            "theirsText": { "type": "string" },
+            "mineHash": { "$ref": "#/$defs/hash" },
+            "theirsHash": { "$ref": "#/$defs/hash" },
+            "writer": {
+              "description": "The device writing the merge, whose time, source and device name the result carries.",
+              "type": "object",
+              "properties": {
+                "source": { "$ref": "common.schema.json#/$defs/controllerSource" },
+                "device": { "$ref": "common.schema.json#/$defs/text" },
+                "now": { "$ref": "common.schema.json#/$defs/iso" }
+              },
+              "required": ["source", "device", "now"],
+              "additionalProperties": false
+            },
+            "choices": {
+              "description": "The person's answers, by entry key. An entry not named takes mine for a mine difference and theirs for every other.",
+              "type": "object",
+              "propertyNames": { "minLength": 1 },
+              "additionalProperties": { "$ref": "#/$defs/side" }
+            }
+          },
+          "required": ["baseText", "mineText", "theirsText", "mineHash", "theirsHash", "writer", "choices"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "differences": {
+              "description": "Every entry where mine and theirs differ, in code-point order of the key.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "entry": { "type": "string", "minLength": 1 },
+                  "kind": { "enum": ["mine", "theirs", "both", "noBase"] }
+                },
+                "required": ["entry", "kind"],
+                "additionalProperties": false
+              }
+            },
+            "resultText": {
+              "description": "The merged document, or null when section 9.7 refuses it. Compared as a parsed document: object key order ignored, number lexemes exact.",
+              "type": ["string", "null"]
+            },
+            "error": {
+              "description": "When resultText is null, the first of the result's section 9.7 error codes in code-point order.",
+              "enum": ["duplicate-member", "schema", "duplicate-machine", "duplicate-site", "duplicate-system", "duplicate-endpoint", "unknown-site", "helper-self", "helper-unknown", "helper-alias", "helper-cycle", null]
+            }
+          },
+          "required": ["differences", "resultText", "error"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "basesCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "mineHash": { "$ref": "#/$defs/hash" },
+            "theirsHash": { "$ref": "#/$defs/hash" },
+            "mineLineage": { "$ref": "common.schema.json#/$defs/lineage" },
+            "theirsLineage": { "$ref": "common.schema.json#/$defs/lineage" },
+            "kept": {
+              "description": "The texts this device kept, by the hash it kept them under.",
+              "type": "object",
+              "propertyNames": { "pattern": "^[0-9a-f]{64}$" },
+              "additionalProperties": { "type": "string" }
+            }
+          },
+          "required": ["mineHash", "theirsHash", "mineLineage", "theirsLineage", "kept"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "base": { "$ref": "common.schema.json#/$defs/sha256OrNull" }
+          },
+          "required": ["base"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "numbersCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "a": { "$ref": "#/$defs/lexeme" },
+            "b": { "$ref": "#/$defs/lexeme" }
+          },
+          "required": ["a", "b"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": { "equal": { "type": "boolean" } },
+          "required": ["equal"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "lexeme": {
+      "description": "A JSON number exactly as written.",
+      "type": "string",
+      "pattern": "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$"
+    }
+  }
+}

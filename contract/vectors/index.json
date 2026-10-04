@@ -276,6 +276,138 @@
           }
         }
       ]
+    },
+    {
+      "family": "setup-reconcile",
+      "file": "vectors/setup-reconcile.json",
+      "schema": "setup-reconcile-vectors.schema.json",
+      "layout": "groups",
+      "section": "9.5",
+      "reference": "tools/setup-sync.mjs",
+      "generator": "tools/vectors/setup-reconcile.cases.mjs",
+      "groups": [
+        {
+          "group": "decide",
+          "cases": 16,
+          "consumers": {
+            "mac": 16,
+            "desktop": 16,
+            "android": 16
+          }
+        },
+        {
+          "group": "admit",
+          "cases": 7,
+          "consumers": {
+            "mac": 7,
+            "desktop": 7,
+            "android": 7
+          }
+        },
+        {
+          "group": "gate",
+          "cases": 20,
+          "consumers": {
+            "mac": 20,
+            "desktop": 20,
+            "android": 20
+          }
+        },
+        {
+          "group": "pushReply",
+          "cases": 13,
+          "consumers": {
+            "mac": 13,
+            "desktop": 13,
+            "android": 13
+          }
+        }
+      ]
+    },
+    {
+      "family": "setup-merge",
+      "file": "vectors/setup-merge.json",
+      "schema": "setup-merge-vectors.schema.json",
+      "layout": "groups",
+      "section": "9.8",
+      "reference": "tools/setup-sync.mjs",
+      "generator": "tools/vectors/setup-merge.cases.mjs",
+      "groups": [
+        {
+          "group": "merges",
+          "cases": 24,
+          "consumers": {
+            "mac": 24,
+            "desktop": 24,
+            "android": 24
+          }
+        },
+        {
+          "group": "bases",
+          "cases": 5,
+          "consumers": {
+            "mac": 5,
+            "desktop": 5,
+            "android": 5
+          }
+        },
+        {
+          "group": "numbers",
+          "cases": 10,
+          "consumers": {
+            "mac": 10,
+            "desktop": 10,
+            "android": 10
+          }
+        }
+      ]
+    },
+    {
+      "family": "wake",
+      "file": "vectors/wake.json",
+      "schema": "wake-vectors.schema.json",
+      "layout": "groups",
+      "section": "10",
+      "reference": "tools/wake-plan.mjs",
+      "generator": "tools/vectors/wake.cases.mjs",
+      "groups": [
+        {
+          "group": "prefixes",
+          "cases": 19,
+          "consumers": {
+            "mac": 19,
+            "desktop": 19,
+            "android": 19
+          }
+        },
+        {
+          "group": "broadcasts",
+          "cases": 8,
+          "consumers": {
+            "mac": 8,
+            "desktop": 8,
+            "android": 8
+          }
+        },
+        {
+          "group": "plans",
+          "cases": 22,
+          "consumers": {
+            "mac": 22,
+            "desktop": 22,
+            "android": 22
+          }
+        },
+        {
+          "group": "readiness",
+          "cases": 2,
+          "consumers": {
+            "mac": 2,
+            "desktop": 2,
+            "android": 2
+          }
+        }
+      ]
     }
   ]
 }

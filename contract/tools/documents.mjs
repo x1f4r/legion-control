@@ -189,6 +189,70 @@ export const TOWER_DOC = frozen({
   ],
 });
 
+// ---------------------------------------------------------------------------
+// The setup every wake vector plans against.
+//
+// Each machine is one of the situations section 10.2 has a rule for: a target
+// at a site with a broadcast and two helpers (tower), the always-on helper with
+// no wake block of its own (pi), a helper that can be woken itself (nas), a
+// machine at a CIDR site with no broadcast and one port (laptop), a machine
+// placed by the deprecated lanPrefix alone, without its trailing dot (old-box),
+// one at a site that shares its subnet with another and whose broadcast list
+// holds a name (studio), one at a site with no prefixes at all (shed), and one
+// whose helper list repeats an entry (tv). Written to
+// fixtures/controller-document.wake-defaults.json and carried as documentText
+// by every plan case, so a client can load either and get the same setup.
+// ---------------------------------------------------------------------------
+
+/** A machine of the wake setup: one endpoint and one Linux system, so nothing but its wake rules is unusual. */
+function wakeMachine(id, { place = {}, wake } = {}) {
+  return {
+    id,
+    ...place,
+    endpoints: [{ id: 'remote', host: `${id}.example.net`, user: 'me' }],
+    systems: [{ id: 'linux', platform: 'linux', agent: ['node', '/home/me/.legion-control/bin/launcher.mjs'] }],
+    ...(wake === undefined ? {} : { wake }),
+  };
+}
+
+export const WAKE_DEFAULTS = frozen({
+  version: 1,
+  sites: [
+    { id: 'home', name: 'Home', lanPrefixes: ['192.168.1.'], broadcast: ['192.168.1.255'] },
+    { id: 'office', name: 'Office', lanPrefixes: ['192.168.10.0/24'] },
+    { id: 'flat', name: 'Flat', lanPrefixes: ['192.168.50.'] },
+    { id: 'attic', name: 'Attic', lanPrefixes: ['192.168.50.'], broadcast: ['192.168.50.255'] },
+    { id: 'cabin', name: 'Cabin' },
+  ],
+  machines: [
+    wakeMachine('tower', {
+      place: { site: 'home' },
+      wake: {
+        mac: '02:00:00:00:00:01',
+        helper: { machine: 'pi', action: 'wake-tower' },
+        helpers: [{ machine: 'pi', action: 'wake-tower' }, { machine: 'nas', action: 'wake-tower' }],
+      },
+    }),
+    wakeMachine('pi', { place: { site: 'home', alwaysOn: true } }),
+    wakeMachine('nas', { place: { site: 'home' }, wake: { mac: '02:00:00:00:00:02', broadcast: ['192.168.1.255'] } }),
+    wakeMachine('laptop', { place: { site: 'office' }, wake: { mac: '02:00:00:00:00:03', ports: [9] } }),
+    wakeMachine('old-box', { wake: { mac: '02:00:00:00:00:04', lanPrefix: '10.0.0' } }),
+    wakeMachine('studio', { place: { site: 'flat' }, wake: { mac: '02:00:00:00:00:05', broadcast: ['192.168.50.255', 'studio.local'] } }),
+    wakeMachine('shed', { place: { site: 'cabin' }, wake: { mac: '02:00:00:00:00:06' } }),
+    wakeMachine('tv', {
+      place: { site: 'home' },
+      wake: {
+        mac: '02:00:00:00:00:07',
+        helper: { machine: 'pi', action: 'wake-tv' },
+        helpers: [{ machine: 'pi', action: 'wake-tv' }, { machine: 'pi', action: 'wake-tv' }, { machine: 'nas', action: 'wake-tv' }],
+      },
+    }),
+  ],
+});
+
+/** Exactly the bytes of fixtures/controller-document.wake-defaults.json. */
+export const WAKE_DEFAULTS_TEXT = documentText(WAKE_DEFAULTS);
+
 /** A mutable deep copy of a shared document, for a generator that needs to change one thing in it. */
 export function copyOf(document) {
   return structuredClone(document);

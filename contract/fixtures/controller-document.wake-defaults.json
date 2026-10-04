@@ -1,0 +1,277 @@
+{
+  "version": 1,
+  "sites": [
+    {
+      "id": "home",
+      "name": "Home",
+      "lanPrefixes": [
+        "192.168.1."
+      ],
+      "broadcast": [
+        "192.168.1.255"
+      ]
+    },
+    {
+      "id": "office",
+      "name": "Office",
+      "lanPrefixes": [
+        "192.168.10.0/24"
+      ]
+    },
+    {
+      "id": "flat",
+      "name": "Flat",
+      "lanPrefixes": [
+        "192.168.50."
+      ]
+    },
+    {
+      "id": "attic",
+      "name": "Attic",
+      "lanPrefixes": [
+        "192.168.50."
+      ],
+      "broadcast": [
+        "192.168.50.255"
+      ]
+    },
+    {
+      "id": "cabin",
+      "name": "Cabin"
+    }
+  ],
+  "machines": [
+    {
+      "id": "tower",
+      "site": "home",
+      "endpoints": [
+        {
+          "id": "remote",
+          "host": "tower.example.net",
+          "user": "me"
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "platform": "linux",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs"
+          ]
+        }
+      ],
+      "wake": {
+        "mac": "02:00:00:00:00:01",
+        "helper": {
+          "machine": "pi",
+          "action": "wake-tower"
+        },
+        "helpers": [
+          {
+            "machine": "pi",
+            "action": "wake-tower"
+          },
+          {
+            "machine": "nas",
+            "action": "wake-tower"
+          }
+        ]
+      }
+    },
+    {
+      "id": "pi",
+      "site": "home",
+      "alwaysOn": true,
+      "endpoints": [
+        {
+          "id": "remote",
+          "host": "pi.example.net",
+          "user": "me"
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "platform": "linux",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nas",
+      "site": "home",
+      "endpoints": [
+        {
+          "id": "remote",
+          "host": "nas.example.net",
+          "user": "me"
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "platform": "linux",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs"
+          ]
+        }
+      ],
+      "wake": {
+        "mac": "02:00:00:00:00:02",
+        "broadcast": [
+          "192.168.1.255"
+        ]
+      }
+    },
+    {
+      "id": "laptop",
+      "site": "office",
+      "endpoints": [
+        {
+          "id": "remote",
+          "host": "laptop.example.net",
+          "user": "me"
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "platform": "linux",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs"
+          ]
+        }
+      ],
+      "wake": {
+        "mac": "02:00:00:00:00:03",
+        "ports": [
+          9
+        ]
+      }
+    },
+    {
+      "id": "old-box",
+      "endpoints": [
+        {
+          "id": "remote",
+          "host": "old-box.example.net",
+          "user": "me"
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "platform": "linux",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs"
+          ]
+        }
+      ],
+      "wake": {
+        "mac": "02:00:00:00:00:04",
+        "lanPrefix": "10.0.0"
+      }
+    },
+    {
+      "id": "studio",
+      "site": "flat",
+      "endpoints": [
+        {
+          "id": "remote",
+          "host": "studio.example.net",
+          "user": "me"
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "platform": "linux",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs"
+          ]
+        }
+      ],
+      "wake": {
+        "mac": "02:00:00:00:00:05",
+        "broadcast": [
+          "192.168.50.255",
+          "studio.local"
+        ]
+      }
+    },
+    {
+      "id": "shed",
+      "site": "cabin",
+      "endpoints": [
+        {
+          "id": "remote",
+          "host": "shed.example.net",
+          "user": "me"
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "platform": "linux",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs"
+          ]
+        }
+      ],
+      "wake": {
+        "mac": "02:00:00:00:00:06"
+      }
+    },
+    {
+      "id": "tv",
+      "site": "home",
+      "endpoints": [
+        {
+          "id": "remote",
+          "host": "tv.example.net",
+          "user": "me"
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "platform": "linux",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs"
+          ]
+        }
+      ],
+      "wake": {
+        "mac": "02:00:00:00:00:07",
+        "helper": {
+          "machine": "pi",
+          "action": "wake-tv"
+        },
+        "helpers": [
+          {
+            "machine": "pi",
+            "action": "wake-tv"
+          },
+          {
+            "machine": "pi",
+            "action": "wake-tv"
+          },
+          {
+            "machine": "nas",
+            "action": "wake-tv"
+          }
+        ]
+      }
+    }
+  ]
+}

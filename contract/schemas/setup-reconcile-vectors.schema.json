@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "setup-reconcile-vectors.schema.json",
+  "title": "contract/vectors/setup-reconcile.json",
+  "description": "Setup reconciliation, v3.md section 9.5, as cases. decide applies the eleven ordered rules to one status; admit says whether fetched bytes may replace the applied document; gate applies the guardrails to a decision; pushReply says what a config set reply means for the next decision.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "family": { "const": "setup-reconcile" },
+    "contract": { "const": 3 },
+    "section": { "const": "9.5" },
+    "reference": { "const": "tools/setup-sync.mjs" },
+    "notes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/text" } },
+    "groups": {
+      "type": "object",
+      "properties": {
+        "decide": { "type": "array", "minItems": 16, "items": { "$ref": "#/$defs/decideCase" } },
+        "admit": { "type": "array", "minItems": 7, "items": { "$ref": "#/$defs/admitCase" } },
+        "gate": { "type": "array", "minItems": 17, "items": { "$ref": "#/$defs/gateCase" } },
+        "pushReply": { "type": "array", "minItems": 10, "items": { "$ref": "#/$defs/pushReplyCase" } }
+      },
+      "required": ["decide", "admit", "gate", "pushReply"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["family", "contract", "section", "reference", "notes", "groups"],
+  "additionalProperties": false,
+  "$defs": {
+    "hash": { "$ref": "common.schema.json#/$defs/sha256" },
+    "decision": { "enum": ["unsupported", "unknown", "push", "inSync", "differentSetup", "readMeta", "fetch", "diverged"] },
+    "milliseconds": {
+      "description": "A time in integer milliseconds on the device's own clock. Only ever compared with another time from the same clock.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "meta": {
+      "description": "What a device filed about a hash: a config meta answer, or the current of a push refusal. A hash fixes the document, so an entry never goes stale. decide reads id and lineage.",
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "common.schema.json#/$defs/setupIdOrNull" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "updatedAt": { "$ref": "common.schema.json#/$defs/isoOrNull" },
+        "source": { "anyOf": [{ "$ref": "common.schema.json#/$defs/controllerSource" }, { "type": "null" }] },
+        "lineage": { "$ref": "common.schema.json#/$defs/lineage" },
+        "device": { "$ref": "common.schema.json#/$defs/textOrNull" },
+        "hash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+        "bytes": { "$ref": "common.schema.json#/$defs/count" }
+      },
+      "required": ["id", "lineage"],
+      "additionalProperties": false
+    },
+    "decideCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "local": {
+              "description": "This device's applied document, or null when it has none.",
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "hash": { "$ref": "#/$defs/hash" },
+                    "id": { "$ref": "common.schema.json#/$defs/setupIdOrNull" },
+                    "lineage": { "$ref": "common.schema.json#/$defs/lineage" }
+                  },
+                  "required": ["hash", "id", "lineage"],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
+            },
+            "status": {
+              "description": "The machine's status reply, reduced to what the rules read. A null contract is a 2.x agent, which sends none.",
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "contract": { "type": ["integer", "null"] },
+                    "controller": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "hash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+                            "id": { "$ref": "common.schema.json#/$defs/setupIdOrNull" }
+                          },
+                          "required": ["hash", "id"],
+                          "additionalProperties": false
+                        },
+                        { "type": "null" }
+                      ]
+                    }
+                  },
+                  "required": ["contract", "controller"],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
+            },
+            "metaByHash": {
+              "type": "object",
+              "propertyNames": { "pattern": "^[0-9a-f]{64}$" },
+              "additionalProperties": { "$ref": "#/$defs/meta" }
+            }
+          },
+          "required": ["local", "status", "metaByHash"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "decision": { "$ref": "#/$defs/decision" },
+            "reason": { "enum": ["no-local", "local-unidentified", "machine-empty", "machine-unidentified", "machine-behind", null] },
+            "expect": {
+              "description": "The hash fetched bytes must have; set only for fetch.",
+              "$ref": "common.schema.json#/$defs/sha256OrNull"
+            }
+          },
+          "required": ["decision", "reason", "expect"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "admitCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "expected": {
+              "description": "What the decision was made from.",
+              "type": "object",
+              "properties": {
+                "localHash": { "$ref": "#/$defs/hash" },
+                "localId": { "$ref": "common.schema.json#/$defs/setupId" },
+                "remoteHash": { "$ref": "#/$defs/hash" }
+              },
+              "required": ["localHash", "localId", "remoteHash"],
+              "additionalProperties": false
+            },
+            "currentLocalHash": {
+              "description": "The applied hash, read again from storage after the read.",
+              "$ref": "#/$defs/hash"
+            },
+            "fetched": {
+              "description": "The canonical hash of the fetched bytes, the hash the reply carried, and the id and lineage of the bytes' own controller block.",
+              "type": "object",
+              "properties": {
+                "hash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+                "replyHash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+                "id": { "$ref": "common.schema.json#/$defs/setupIdOrNull" },
+                "lineage": { "$ref": "common.schema.json#/$defs/lineage" }
+              },
+              "required": ["hash", "replyHash", "id", "lineage"],
+              "additionalProperties": false
+            },
+            "accepted": {
+              "description": "Whether section 9.7 accepts the bytes under peer intake.",
+              "type": "boolean"
+            }
+          },
+          "required": ["expected", "currentLocalHash", "fetched", "accepted"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "admission": { "enum": ["adopt", "headMoved", "moved", "unverifiable", "invalid", "inconsistent"] }
+          },
+          "required": ["admission"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "gateCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "decision": { "$ref": "#/$defs/decision" },
+            "localHash": { "$ref": "#/$defs/hash" },
+            "remoteHash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
+            "agentVersion": { "type": "string", "minLength": 1 },
+            "now": { "$ref": "#/$defs/milliseconds" },
+            "state": {
+              "description": "The per-machine state, in memory only.",
+              "type": "object",
+              "properties": {
+                "inFlight": { "type": "boolean" },
+                "failedAt": {
+                  "description": "When a request for an applied hash last failed.",
+                  "type": "object",
+                  "propertyNames": { "pattern": "^[0-9a-f]{64}$" },
+                  "additionalProperties": { "$ref": "#/$defs/milliseconds" }
+                },
+                "held": {
+                  "description": "The refusal code that holds pushes of an applied hash.",
+                  "type": "object",
+                  "propertyNames": { "pattern": "^[0-9a-f]{64}$" },
+                  "additionalProperties": { "enum": ["restricted", "config-invalid"] }
+                },
+                "localInvalid": { "type": "boolean" },
+                "localMutation": { "type": "boolean" },
+                "runningOperations": { "type": "integer", "minimum": 0 },
+                "lockedAt": { "anyOf": [{ "$ref": "#/$defs/milliseconds" }, { "type": "null" }] },
+                "statusAt": { "anyOf": [{ "$ref": "#/$defs/milliseconds" }, { "type": "null" }] },
+                "settled": {
+                  "description": "\"<applied hash> <remote hash> <agentVersion>\" for each remembered admission refusal.",
+                  "type": "array",
+                  "items": { "type": "string", "pattern": "^[0-9a-f]{64} [0-9a-f]{64} [^ ]+$" }
+                }
+              },
+              "required": ["inFlight", "failedAt", "held", "localInvalid", "localMutation", "runningOperations", "lockedAt", "statusAt", "settled"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["decision", "localHash", "remoteHash", "agentVersion", "now", "state"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "action": { "enum": ["act", "hold", "none"] },
+            "reason": { "enum": ["in-flight", "backoff", "local-invalid", "held", "operation-running", "settled", null] }
+          },
+          "required": ["action", "reason"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "pushReplyCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "reply": {
+              "description": "A config set reply, or null when no reply was read.",
+              "anyOf": [{ "$ref": "config-set.schema.json" }, { "type": "null" }]
+            },
+            "localHash": { "$ref": "#/$defs/hash" },
+            "now": { "$ref": "#/$defs/milliseconds" }
+          },
+          "required": ["reply", "localHash", "now"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "effect": { "enum": ["clear", "fail", "fileMeta", "locked", "hold"] },
+            "metaHash": {
+              "description": "The hash current is filed under; set only for fileMeta.",
+              "$ref": "common.schema.json#/$defs/sha256OrNull"
+            }
+          },
+          "required": ["effect", "metaHash"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    }
+  }
+}
