@@ -157,6 +157,7 @@ function failure(message, reasonCode = REASON.internal, extra = {}) {
  * 13). Asked once before an operation record exists, so a refusal leaves
  * nothing behind, and again under the lock, after an interrupted swap may have
  * been recovered and the live version can differ from the one first judged.
+ * A retry of a recorded request is not asked first: see retriesRecorded.
  */
 function judgeTransition(mode, verified, base, allowDowngrade) {
   const floor = effectiveFloor(base);
@@ -209,6 +210,21 @@ export async function checkBundle(source) {
     message: `the bundle carries agent ${verified.manifest.version} (contract ${verified.manifest.contract}) and its signature matches release key ${trustFingerprint().slice(0, 8)}`,
     manifest: manifestShape(verified),
   };
+}
+
+/**
+ * Whether --op names a self-update already recorded for this same bundle. That
+ * is a retry, and withOperation answers it with the first request's record
+ * without running anything. Judged first, it would be judged against whatever
+ * is live now: a client whose reply was lost, retrying after another client
+ * had moved the agent on, would hear a refusal for an install that succeeded.
+ * Any other request under that id is judged as usual, so reusing an id never
+ * gets a bundle past the floor.
+ */
+function retriesRecorded(opId, target) {
+  if (!opId) return false;
+  const existing = readOperation(opId);
+  return existing?.kind === 'self-update' && existing.target === target;
 }
 
 function replayTarget(opId, variant) {
@@ -331,8 +347,10 @@ export async function runSelfUpdate(config, options = {}) {
       current: liveState(), staged: null, previous: previousState(), manifest: null, selfTest: null,
     });
   }
-  const verdict = judgeTransition('install', verified, basePath(), options.allowDowngrade);
-  if (!verdict.ok) return transitionRefused(verdict, verified, basePath());
+  if (!retriesRecorded(options.opId, target)) {
+    const verdict = judgeTransition('install', verified, basePath(), options.allowDowngrade);
+    if (!verdict.ok) return transitionRefused(verdict, verified, basePath());
+  }
   return installVerified(config, verified, { target, ...options });
 }
 
@@ -359,8 +377,10 @@ export async function runBootstrapInstall(config, options = {}) {
     current: liveState(layout.base), staged: null, previous: previousState(layout.base), manifest: null, selfTest: null,
   });
   const target = `install:${digest(verified.files.get('MANIFEST.json'))}`;
-  const verdict = judgeTransition('install', verified, layout.base, options.allowDowngrade);
-  if (!verdict.ok) return transitionRefused(verdict, verified, layout.base);
+  if (!retriesRecorded(options.opId, target)) {
+    const verdict = judgeTransition('install', verified, layout.base, options.allowDowngrade);
+    if (!verdict.ok) return transitionRefused(verdict, verified, layout.base);
+  }
   return installVerified(config, verified, { target, base: layout.base, ...options });
 }
 

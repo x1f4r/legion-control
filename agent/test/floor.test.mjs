@@ -256,6 +256,33 @@ test('the judge under the lock sees the agent that an interrupted swap puts back
   }, { live: '3.3.0', liveFloor: '3.1.0' });
 });
 
+test('a retried install answers with its first result, whatever has been installed since', async () => {
+  await withAgent(async ({ module, base, candidate }) => {
+    process.env.LEGIONCTL_RESTRICTED = '1';
+    const first = candidate('first', '3.2.0', { floor: '3.2.0' });
+    const installed = await install(module, first, { opId: 'retried-install-0001' });
+    assert.equal(installed.action, 'installed', installed.message);
+    const later = await install(module, candidate('later', '3.3.0', { floor: '3.3.0' }), { opId: 'later-install-0001' });
+    assert.equal(later.action, 'installed', later.message);
+
+    // The reply to the first install was lost, and its client sends the same
+    // request again. Judged against 3.3.0 it would be refused, and the client
+    // would report a failure for an install that succeeded.
+    const retried = await install(module, first, { opId: 'retried-install-0001' });
+    assert.equal(retried.replayed, true);
+    assert.equal(retried.action, 'installed', retried.message);
+    assert.equal(retried.to, '3.2.0');
+    assert.equal(versionOf(path.join(base, 'agent')), '3.3.0', 'nothing was installed a second time');
+    assert.equal(readFloor(base).version, '3.3.0');
+
+    // The same id with another bundle is not a retry, and is judged like any
+    // other request.
+    const reused = await install(module, candidate('older', '3.0.0'), { opId: 'retried-install-0001' });
+    assert.equal(reused.reasonCode, 'restricted');
+    assert.equal(versionOf(path.join(base, 'agent')), '3.3.0');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Rolling back
 // ---------------------------------------------------------------------------
