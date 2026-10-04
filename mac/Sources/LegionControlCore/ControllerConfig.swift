@@ -667,6 +667,11 @@ extension ControllerConfig {
             if machine.routes.isEmpty {
                 out.append("\(machine.name) has no address and no ssh alias, so there is no way to reach it.")
             }
+            for route in machine.routes {
+                if let part = Addresses.undialablePart(of: route.target) {
+                    out.append("\(machine.name) lists \(route.target.display), which this app never dials, scans or pins: \(part) is not one it accepts.")
+                }
+            }
             guard let wake = machine.wake else { continue }
             let helpers = wake.orderedHelpers
             let placed = machine.site != nil || wake.lanPrefix != nil

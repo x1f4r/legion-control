@@ -483,8 +483,7 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         Task { @MainActor in
             do {
                 let context = try await HostIdentityContext.resolve(target)
-                let scan = await Shell.run(executable: "/usr/bin/ssh-keyscan",
-                                           arguments: ["-T", "8", "-p", String(context.port), context.scanHost], timeout: 20)
+                let scan = await Shell.run(executable: "/usr/bin/ssh-keyscan", arguments: context.keyscanArguments, timeout: 20)
                 guard scan.succeeded else { throw HostIdentityFailure("The offered keys could not be read. \(scan.failureText)") }
                 let offered = try HostPublicKey.parse(scan.standardOutput, uniqueAlgorithms: true)
                 guard !offered.isEmpty else { throw HostIdentityFailure("The server offered no inspectable keys.") }

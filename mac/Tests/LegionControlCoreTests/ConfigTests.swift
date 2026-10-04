@@ -148,6 +148,18 @@ struct ConfigTests {
         #expect(!MaintenanceWindow(from: "24:00", to: "04:00").looksValid)
     }
 
+    @Test("an address outside the dial grammar is a warning that names it")
+    func undialableAddressIsAWarning() throws {
+        let json = """
+        { "version": 1, "machines": [ { "id": "tower", "name": "Tower",
+          "endpoints": [{"id":"lan","host":"desk-tower.local"}, {"id":"odd","host":"tower.example.","user":"me"}],
+          "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
+        """
+        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
+        let warnings = config.warnings().filter { $0.contains("never dials") }
+        #expect(warnings == ["Tower lists me@tower.example., which this app never dials, scans or pins: the host \"tower.example.\" is not one it accepts."])
+    }
+
     @Test("a wake path that cannot work is a warning, not a refusal")
     func warnings() throws {
         let json = """
