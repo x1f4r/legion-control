@@ -976,14 +976,17 @@ extension AgentDevice {
     }
 
     /// Start one action: write it down, run it, and write down what it ended in.
+    ///
+    /// Returns false, having started nothing, while another action holds the device.
+    @discardableResult
     func perform(
         _ label: String,
         kind: OperationKind,
         subject: String,
         targetVersion: String? = nil,
         _ work: @escaping @MainActor (_ operationId: String) async -> ActionResolution
-    ) {
-        guard core.activity == nil else { return }
+    ) -> Bool {
+        guard core.activity == nil else { return false }
         core.activity = label
         core.lastActionOutcome = nil
         setStatus(label + ".")
@@ -1035,5 +1038,6 @@ extension AgentDevice {
             }
             self.onStateChange?()
         }
+        return true
     }
 }

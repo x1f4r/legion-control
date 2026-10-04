@@ -728,6 +728,63 @@ struct MachineModelTests {
         #expect(!last.contains { $0.contains("10.0.0.5") })
     }
 
+    @Test("a machine renamed while it is being woken still reads as waking")
+    func renameDuringWakeStillWaking() async throws {
+        // Waking used to be read off the activity line, compared with the machine's name as it is
+        // now. An edit lands on the busy model since the setup stopped replacing it, so a rename
+        // mid-wake turned the button back to "Wake" while the wake was still running.
+        let setup = try JSONDecoder().decode(ControllerConfig.self, from: Data("""
+        { "version": 1, "machines": [
+          { "id": "pi", "name": "Pi",
+            "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.5", "user": "me" } ],
+            "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ],
+            "wake": { "mac": "02:00:00:00:00:01", "helpers": [ { "machine": "hub", "action": "wake-pi" } ] } },
+          { "id": "hub", "name": "Hub",
+            "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.7", "user": "me" } ],
+            "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] } ] }
+        """.utf8)).validated()
+        let pi = try #require(setup.machine(id: "pi"))
+        let hubEntry = try #require(setup.machine(id: "hub"))
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // The only step is the helper, which is read first, and that read is held while the edit
+        // lands. Nothing is ever broadcast: this device is not on the machine's network.
+        let gate = Gate(holding: "status")
+        let hubRunner = FakeRunner()
+        var hubAgent = RemoteAgent(machine: hubEntry)
+        hubAgent.logDirectory = directory.appending(path: "hub-logs")
+        hubAgent.runner = { _, arguments, _, _ in
+            await gate.pass(arguments)
+            return hubRunner.run(arguments)
+        }
+        let hub = MachineModel(machine: hubEntry, agent: hubAgent)
+
+        let piRunner = FakeRunner()
+        var piAgent = RemoteAgent(machine: pi)
+        piAgent.logDirectory = directory.appending(path: "pi-logs")
+        piAgent.runner = { _, arguments, _, _ in piRunner.run(arguments) }
+        let model = MachineModel(machine: pi, agent: piAgent)
+        model.setup = { setup }
+        model.peer = { $0 == "hub" ? hub : nil }
+
+        model.wake()
+        #expect(model.isWaking)
+        #expect(await gate.waitUntilHolding() != nil)
+
+        var renamed = pi
+        renamed.name = "Pi in the hall"
+        model.update(machine: renamed)
+        #expect(model.isWaking)
+
+        // The hub does not answer, so there is nothing to send the packet with and the wake ends.
+        gate.release()
+        await Self.settle(model)
+        #expect(!model.isWorking)
+        #expect(!model.isWaking)
+    }
+
     @Test("a system removed from the entry is no longer commanded with its old launcher")
     func editDropsARemovedSystem() async throws {
         let runner = FakeRunner()

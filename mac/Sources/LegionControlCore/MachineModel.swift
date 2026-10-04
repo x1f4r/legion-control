@@ -148,9 +148,11 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     private static let sleepGrace: TimeInterval = 600
 
     /// True only while the wake packet is in flight.
-    var isWaking: Bool { activity == wakeLabel }
-
-    private var wakeLabel: String { "Waking \(machine.name)" }
+    ///
+    /// A flag of its own rather than a reading of the activity line. The line names the machine as
+    /// it was called when the wake began, and an edit to the entry, a new name included, lands on
+    /// this model while the wake is still running.
+    private(set) var isWaking = false
 
     /// The system we can actually command. Everything that talks to the agent keys off this.
     var currentSystem: SystemDescriptor? {
@@ -588,7 +590,8 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
             return
         }
 
-        perform(wakeLabel, kind: .wake, subject: machine.name) { operation in
+        let started = perform("Waking \(machine.name)", kind: .wake, subject: machine.name) { operation in
+            defer { self.isWaking = false }
             var attempts: [String] = []
 
             for step in plan.steps {
@@ -668,6 +671,9 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
                 detail: (attempts + unavailable).joined(separator: "\n")
             )
         }
+        // The work itself starts on a later turn of the main actor, so the flag goes up here, and
+        // only when this wake took the device rather than finding another action on it.
+        if started { isWaking = true }
     }
 
     /// Wake this machine and then boot it into a particular system.
