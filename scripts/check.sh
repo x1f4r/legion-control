@@ -12,6 +12,8 @@ if [[ "$component" == all || "$component" == agent ]]; then
   npm --prefix agent test
   node --test tests/*.test.mjs
   node contract/validate.mjs
+  node contract/tools/generate.mjs --check
+  node --test contract/test/*.test.mjs
 fi
 if [[ "$component" == all || "$component" == mac ]]; then
   swift test --package-path mac
