@@ -95,7 +95,13 @@ enum Shell {
         let control = RunControl(killGrace: killGrace)
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                DispatchQueue.global(qos: .userInitiated).async {
+                // A thread of its own, not a block on a global queue. This thread spends the whole
+                // command blocked in waitid and in the wait for the readers, and the readers are
+                // DispatchIO handlers that need a free global-queue thread to deliver anything. GCD
+                // keeps that pool near one thread per core, so on a three-core machine three commands
+                // in flight left no thread to read their output, and a command that printed was
+                // reported as having printed nothing once the drain deadline passed.
+                Thread.detachNewThread {
                     continuation.resume(returning: runBlocking(
                         executable: executable,
                         arguments: arguments,
@@ -482,7 +488,9 @@ final class LoginShellPath: @unchecked Sendable {
             return true
         }
         guard first else { return }
-        DispatchQueue.global(qos: .userInitiated).async {
+        // Its own thread for the same reason as every command: the lookup blocks while its output
+        // is read on the global queues.
+        Thread.detachNewThread {
             let path = Self.resolve(shell: shell)
             self.lock.withLock { self.resolved = path }
             self.lookup.leave()
