@@ -24,6 +24,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import {
+  AGENT_TREE,
   AGENT_VERSION,
   basePath,
   compilePattern,
@@ -36,8 +37,10 @@ import {
 } from './config.mjs';
 import { CONTRACT_VERSION } from './contract.mjs';
 import { listActions } from './actions.mjs';
+import { carriesSignedManifest } from './archive.mjs';
 import { bootTargets } from './boot.mjs';
 import { readController } from './controller.mjs';
+import { reportedFloor } from './floor.mjs';
 import { checkHealth, healthPort } from './probes/health.mjs';
 import { probeProcessAsync } from './probes/process.mjs';
 import { collectTelemetry } from './probes/telemetry.mjs';
@@ -249,6 +252,11 @@ export async function buildStatus(loaded, { budgetMs = DEFAULT_STATUS_BUDGET_MS 
     node: process.versions.node,
     restrictedSession: process.env.LEGIONCTL_RESTRICTED === '1',
     capabilities: ['setup-lineage', 'wol-action', 'configured-telemetry', 'service-config-admin'],
+    // The oldest agent this machine may be replaced by, and whether the tree
+    // answering is a signed release at all (contract section 13). A client
+    // offers to go back only to an agent that reports a floor.
+    floor: reportedFloor(),
+    signed: carriesSignedManifest(AGENT_TREE),
   };
 
   const configBlock = {

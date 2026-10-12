@@ -66,7 +66,7 @@ struct ControllerConfig: Decodable, Sendable, Equatable {
 ///
 /// A site exists so the app can tell "I am on that network, I can send a magic packet myself" from
 /// "I am somewhere else and need a helper over there". Its address prefixes are a hint and never a
-/// proof: two households behind stock routers are both on 192.168.178, so a prefix that matches says
+/// proof: two households behind stock routers are both on 192.168.50, so a prefix that matches says
 /// this *could* be the site and nothing stronger. What proves which machine answered is the pinned
 /// host key, and that is checked on every connection whatever this says.
 struct Site: Decodable, Sendable, Equatable, Identifiable {
@@ -410,18 +410,22 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
     var agent: [String]
     /// Overrides the platform's icon with any SF Symbol name.
     var symbol: String?
-    /// Which shell the far side hands an ssh command to, when it is not the one the platform
-    /// implies. Stock Windows OpenSSH runs cmd.exe; a machine set up for remote administration
-    /// usually has `DefaultShell` pointed at PowerShell, which is what this defaults to for Windows.
-    /// A machine that still has the stock setting says `"shell": "cmd"`.
-    var shell: RemoteShell?
+    /// Which shell the far side hands an ssh command to, as the document spells it. Stock Windows
+    /// OpenSSH runs cmd.exe, and that is what a Windows system without one gets; an account whose
+    /// `DefaultShell` points at PowerShell says `"shell": "powershell"`. Kept as written, because a
+    /// spelling this app does not know is a system it refuses to drive, not one to guess at.
+    var shell: String?
     /// True when this system's key is restricted to a forced command through the dispatcher.
     ///
     /// A forced command bypasses the login shell entirely: sshd hands the request to the dispatcher
     /// as `SSH_ORIGINAL_COMMAND` and nothing interprets it as PowerShell or as cmd. So the argv is
-    /// serialised as POSIX words, which is the grammar the dispatcher parses, whatever platform the
-    /// machine is.
+    /// written in the dispatcher's own grammar whatever platform the machine is.
     var restricted: Bool?
+    /// The grammar this system's command lines are written in (section 15.1 of the contract), or
+    /// why it has none, worked out from `platform`, `shell` and `restricted` as the document has
+    /// them. A route whose last status reported a restricted session can still move it to the
+    /// dispatcher's grammar at run time; nothing moves it anywhere else.
+    var grammar: Result<CommandGrammar, CommandLineRefusal>
 
     private enum CodingKeys: String, CodingKey {
         case id, name, platform, agent, symbol, shell, restricted
@@ -434,13 +438,15 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
         name = try container.decodeIfPresent(String.self, forKey: .name) ?? platform.defaultName
         agent = try container.decodeIfPresent([String].self, forKey: .agent) ?? []
         symbol = try container.decodeIfPresent(String.self, forKey: .symbol)
-        shell = try container.decodeIfPresent(RemoteShell.self, forKey: .shell)
+        shell = try container.decodeIfPresent(String.self, forKey: .shell)
         restricted = try container.decodeIfPresent(Bool.self, forKey: .restricted)
+        grammar = CommandGrammar.resolve(platform: platform, shell: shell, restricted: restricted,
+                                         restrictedSession: false, agentLength: agent.count)
     }
 
     /// Used by the tests and by the guided setup, which build systems rather than decode them.
     init(id: String, name: String? = nil, platform: Platform = .linux, agent: [String] = [],
-         symbol: String? = nil, shell: RemoteShell? = nil, restricted: Bool? = nil) {
+         symbol: String? = nil, shell: String? = nil, restricted: Bool? = nil) {
         self.id = id
         self.platform = platform
         self.name = name ?? platform.defaultName
@@ -448,19 +454,11 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
         self.symbol = symbol
         self.shell = shell
         self.restricted = restricted
+        self.grammar = CommandGrammar.resolve(platform: platform, shell: shell, restricted: restricted,
+                                              restrictedSession: false, agentLength: agent.count)
     }
 
     var symbolName: String { symbol ?? platform.symbolName }
-
-    /// The shell to quote for.
-    ///
-    /// A restricted system is serialised as POSIX words whatever it runs on, because a forced
-    /// command never reaches a shell: the dispatcher on the far side parses the request itself, and
-    /// its grammar is POSIX. Otherwise it is what the config names, or what the platform implies.
-    var remoteShell: RemoteShell {
-        if restricted == true { return .posix }
-        return shell ?? RemoteShell.default(for: platform)
-    }
 
     var isRestricted: Bool { restricted == true }
 }
@@ -562,6 +560,19 @@ extension ControllerConfig {
             guard seenMachines.insert(machine.id).inserted else {
                 throw ConfigProblem("Two machines share the id \"\(machine.id)\". Ids have to be unique.")
             }
+            // Addresses and login names arrive from peers and reach ssh, ssh-keyscan and known_hosts,
+            // which read commas, stars, leading hyphens and shell syntax as instructions. The shared
+            // schema's guard grammar is what every client and the agent hold a document to.
+            for (host, user) in machine.endpoints.map({ ($0.host, $0.user) })
+                + (machine.ssh.map { [($0.host, $0.user)] } ?? []) {
+                guard SetupGuard.isHost(host) else {
+                    throw ConfigProblem("Machine \"\(machine.id)\" has the address \(SetupGuard.describe(host)), which is not a host name or IP address.")
+                }
+                if let user, !SetupGuard.isUser(user) {
+                    throw ConfigProblem("Machine \"\(machine.id)\" has the login name \(SetupGuard.describe(user)), which is not one ssh can be given safely.")
+                }
+            }
+
             // A machine with no systems, or with no address, is not a broken document: the shared
             // schema allows both, and refusing one would mean this device could not carry a setup
             // another peer considers perfectly valid. Such a machine is drawn as one nothing can be
@@ -577,6 +588,17 @@ extension ControllerConfig {
                 }
                 guard !system.agent.isEmpty else {
                     throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" has no \"agent\" command. It has to be the argv to run over ssh.")
+                }
+                // The argv is run over ssh word by word, so an empty word or a control character in
+                // one is never something a person meant. The agent refuses the same items.
+                for item in system.agent where !SetupGuard.isAgentArg(item) {
+                    throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" has an \"agent\" word that is empty, too long or holds a control character (\(SetupGuard.describe(item))).")
+                }
+                // The shared schema allows exactly these three. Any other spelling used to stop the
+                // document decoding at all, and it is still refused, now with a sentence that says
+                // which system and why.
+                if let shell = system.shell, !["posix", "cmd", "powershell"].contains(shell) {
+                    throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" names the shell \"\(shell)\". Use posix, cmd or powershell.")
                 }
             }
 
@@ -616,6 +638,11 @@ extension ControllerConfig {
         // path that cannot start anywhere.
         if let cycle = wakeHelperCycle() {
             throw ConfigProblem("The wake helpers form a loop: \(cycle.joined(separator: " → ")). One of them has to be a machine that is already awake.")
+        }
+        // The release repository decides where this app downloads itself from, so it is held to
+        // the way GitHub spells owner/name rather than pasted into a URL as it came.
+        if let repo = appUpdates?.githubRepo, !repo.isEmpty, !SetupGuard.isRepository(repo) {
+            throw ConfigProblem("The update repository \(SetupGuard.describe(repo)) is not a GitHub owner/name.")
         }
         return self
     }
@@ -666,6 +693,16 @@ extension ControllerConfig {
             }
             if machine.routes.isEmpty {
                 out.append("\(machine.name) has no address and no ssh alias, so there is no way to reach it.")
+            }
+            for route in machine.routes {
+                if let part = Addresses.undialablePart(of: route.target) {
+                    out.append("\(machine.name) lists \(route.target.display), which this app never dials, scans or pins: \(part) is not one it accepts.")
+                }
+            }
+            for system in machine.systems {
+                if case .failure(let refusal) = system.grammar {
+                    out.append("\(system.name) on \(machine.name) is never sent anything. \(refusal.message)")
+                }
             }
             guard let wake = machine.wake else { continue }
             let helpers = wake.orderedHelpers
@@ -746,9 +783,7 @@ struct ControllerIdentity: Codable, Sendable, Equatable {
         guard let lineage else { return true }
         guard lineage.count <= Self.lineageLimit else { return false }
         guard Set(lineage).count == lineage.count else { return false }
-        return lineage.allSatisfy { hash in
-            hash.count == 64 && hash.allSatisfy { $0.isHexDigit && !$0.isUppercase }
-        }
+        return lineage.allSatisfy(AgentToken.isValidHash)
     }
 
     /// The identity for a document derived from this one.

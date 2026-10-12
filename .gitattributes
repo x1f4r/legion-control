@@ -1,4 +1,17 @@
+# Generated contract files are compared byte for byte by node contract/tools/generate.mjs --check,
+# so a checkout must give them the LF line endings the generators write, on every platform.
+contract/fixtures/*.json text eol=lf
+contract/vectors/*.json text eol=lf
+contract/hash-vectors.json text eol=lf
+# The legacy bootstrap scripts are compared byte for byte with the copies the Mac
+# and Android clients send with node -e, so a checkout must not change them either.
+contract/bootstrap/*.cjs text eol=lf
 # Signed fixture bytes must not be rewritten by checkout line-ending conversion.
 tests/fixtures/trust/manifest.json -text
 # The read-reply fixture reports the exact byte count of this setup document.
 contract/fixtures/controller-document.sites-helpers.json -text
+# Contract tests prove their checks work by planting known defects, matched as exact multi-line
+# snippets of the reference implementations, and several agent tests match source text the same
+# way. A Windows checkout with CRLF endings would make those snippets match nothing.
+*.mjs text eol=lf
+*.cjs text eol=lf

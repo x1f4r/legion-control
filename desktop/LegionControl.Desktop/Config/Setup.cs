@@ -32,8 +32,12 @@ public sealed record ControllerIdentity
     /// The kind this client is, on the wire. Fixed by the contract: never a platform name.
     public const string ThisSource = "desktop";
 
-    private static readonly Regex HashGrammar = new("^[0-9a-f]{64}$", RegexOptions.Compiled);
-    private static readonly Regex IdGrammar = new(@"^[A-Za-z0-9][A-Za-z0-9._:@/\\~=+-]*$", RegexOptions.Compiled);
+    private static readonly Regex HashGrammar = new(@"\A[0-9a-f]{64}\z", RegexOptions.Compiled);
+    private static readonly Regex IdGrammar = new(@"\A[A-Za-z0-9][A-Za-z0-9._:@/\\~=+-]*\z", RegexOptions.Compiled);
+
+    /// Whether a value is a sha256 the way the contract writes one: 64 lower-case hex digits and
+    /// nothing else, not even a final newline.
+    public static bool IsHash(string? value) => CommandSurface.Matches(HashGrammar, value);
 
     public static ControllerIdentity From(Value json)
     {
@@ -59,7 +63,7 @@ public sealed record ControllerIdentity
     public IReadOnlyList<string> Problems()
     {
         var problems = new List<string>();
-        if (Id is not null && !IdGrammar.IsMatch(Id))
+        if (Id is not null && !CommandSurface.Matches(IdGrammar, Id))
         {
             problems.Add($"The setup id \"{Id}\" is not a plain token. Use letters, digits and . _ : @ / ~ = + -");
         }
@@ -70,7 +74,7 @@ public sealed record ControllerIdentity
         }
         foreach (var hash in Lineage)
         {
-            if (!HashGrammar.IsMatch(hash)) problems.Add($"\"{hash}\" in the setup lineage is not a sha256 hash.");
+            if (!IsHash(hash)) problems.Add($"\"{hash}\" in the setup lineage is not a sha256 hash.");
         }
         if (Lineage.Distinct(StringComparer.Ordinal).Count() != Lineage.Count)
         {

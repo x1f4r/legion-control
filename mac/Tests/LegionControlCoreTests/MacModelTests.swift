@@ -240,6 +240,346 @@ struct MacModelTests {
         #expect(model.noteIsError)
     }
 
+    // MARK: - One core with the machines
+
+    @Test("a failed action here is kept as the last outcome, exactly as one over ssh is")
+    func localFailureIsTheLastOutcome() async throws {
+        // The local side had no last outcome at all, so the panel's error notice, which reads it,
+        // never showed a failure on the device the app runs on.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("update", json: """
+        { "ok": false, "contract": 3, "action": "failed", "message": "The updater refused this release." }
+        """, exit: 1)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        let service = try #require(model.services.first)
+        model.update(service, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        let outcome = try #require(model.lastActionOutcome)
+        #expect(outcome.isError)
+        #expect(outcome.text.contains("refused this release"))
+        #expect(outcome.operationId == store.newestFirst.first { $0.kind == .update }?.id)
+    }
+
+    @Test("a setup the local agent cannot hand over is said, not swallowed")
+    func unreadableLocalSetupIsSaid() async throws {
+        // Reading the local agent's copy used to return nothing on any error without a word, so a
+        // setup this Mac could not read looked exactly like one that was never asked for.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answerTimeout("config")
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        model.adoptRemoteSetup()
+        let deadline = Date().addingTimeInterval(2)
+        while model.note == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+
+        #expect(model.note?.contains("could not be read") == true)
+        #expect(model.note?.contains("did not finish within") == true)
+        #expect(model.noteIsError)
+    }
+
+    @Test("the local maintenance cycle keeps what happened to each service")
+    func localCycleKeepsDetails() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("cycle", json: """
+        { "ok": true, "contract": 3, "action": "cycled",
+          "children": [ { "service": "t3", "action": "updated" },
+                        { "service": "edge", "action": "deferred", "reasonCode": "busy" } ] }
+        """)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        model.runCycle()
+        await Self.settle(model)
+
+        let record = try #require(store.newestFirst.first { $0.kind == .updateAll })
+        #expect(record.state == .succeeded)
+        #expect(record.summary == "Maintenance cycle on This Mac: 1 updated, 1 held back.")
+        // The counts used to be all there was. Which service was held back, and why, is the part
+        // anyone acting on the result needs.
+        #expect(record.detail == "t3: updated\nedge: deferred (busy)")
+        #expect(model.noteDetail == record.detail)
+    }
+
+    @Test("a local action that never reached the agent is followed by a fresh read straight away")
+    func localNeverDispatchedRereads() async throws {
+        // A failure that proves nothing ran asks for no read over ssh. Here the read costs one local
+        // process, and without it this Mac went on showing an agent that had gone, until the next
+        // poll, which never comes while nothing is on screen.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        #expect(model.isReachable)
+        let service = try #require(model.services.first)
+        try FileManager.default.removeItem(at: directory.appending(path: "index.mjs"))
+        model.restart(service, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        #expect(store.newestFirst.first { $0.kind == .restart }?.state == .failed)
+        #expect(model.failure?.kind == .agentMissing)
+        #expect(!model.isReachable)
+        // The read does not take the action's own sentence away.
+        #expect(model.note?.contains("did not happen") == true)
+    }
+
+    @Test("what a configured action printed here stays with this Mac's own line")
+    func localActionOutputStaysWithTheLine() async throws {
+        // It used to be folded into the line itself. It is the line's detail now, which the local
+        // section offers behind Details rather than leaving it to the window's status bar.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("run", json: """
+        { "ok": true, "contract": 3, "action": "ran", "output": "reindexed 412 documents" }
+        """)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        let action = try #require(model.actions.first)
+        model.run(action, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        #expect(model.note == "Reindex ran.")
+        #expect(model.noteDetail == "reindexed 412 documents")
+        #expect(store.newestFirst.first { $0.kind == .action }?.output == "reindexed 412 documents")
+    }
+
+    @Test("replacing the copy the local agent holds names the local agent, not this Mac")
+    func localSetupReplacementWording() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced" }"#)
+        runner.answer("status", json: Self.status)
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        model.controllerConfig = { document }
+        var asked: PendingDialog?
+        model.ask = { asked = $0 }
+
+        await model.refresh()
+        model.core.setup.decision = .diverged
+        model.requestSetupReplacement()
+        let question = try #require(asked)
+        #expect(question.title == "Replace the setup the local agent is holding?")
+
+        question.perform()
+        await Self.settle(model)
+        #expect(model.note == "Replaced the setup the local agent was holding with this device's.")
+        #expect(runner.sent.contains { $0.contains("config") && $0.contains("--replace") })
+    }
+
+    // MARK: - A different agent
+
+    /// A status from an agent that can hold the setup and holds none yet, so the first read pushes.
+    static let statusHoldingNoSetup = """
+    { "ok": true, "contract": 3, "agentVersion": "3.0.0", "system": { "id": "mac", "name": "macOS" },
+      "agent": { "version": "3.0.0", "contract": 3 },
+      "services": [ { "id": "t3", "name": "T3 Code", "installed": "1", "latest": "1", "upToDate": true } ],
+      "controller": {} }
+    """
+
+    /// The argv a binding gives, run through a fake. `/bin/echo` only has to exist.
+    static func boundAgent(_ runner: FakeRunner) -> (argv: [String], agent: MacAgent) {
+        let argv = ["/bin/echo", "/opt/agent/index.mjs"]
+        return (argv, MacAgent(argv: argv) { _, arguments, _, _ in runner.run(arguments) })
+    }
+
+    /// Holds every command with one verb until the test lets it go, and says when one has arrived.
+    final class Gate: @unchecked Sendable {
+        private let lock = NSLock()
+        private let verb: String
+        private var open = false
+        private var arrived = false
+
+        init(holding verb: String) { self.verb = verb }
+
+        func release() { lock.withLock { open = true } }
+
+        private var isOpen: Bool { lock.withLock { open } }
+
+        private var hasArrived: Bool { lock.withLock { arrived } }
+
+        private func arrive() { lock.withLock { arrived = true } }
+
+        /// Called by the runner with every command, and returns once the command may go on.
+        func pass(_ arguments: [String]) async {
+            guard arguments.count > 1, arguments[1] == verb else { return }
+            arrive()
+            while !isOpen { try? await Task.sleep(for: .milliseconds(5)) }
+        }
+
+        func waitUntilHolding(timeout: TimeInterval = 5) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeout)
+            while !hasArrived, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+            return hasArrived
+        }
+    }
+
+    /// A model whose agent waits at the gate.
+    static func gatedModel(_ runner: FakeRunner, gate: Gate) throws -> (MacModel, URL) {
+        let (script, directory) = try scriptFile()
+        let path = script.path(percentEncoded: false)
+        let agent = MacAgent(scriptPath: path, interpreter: "/bin/echo") { _, arguments, _, _ in
+            await gate.pass(arguments)
+            return runner.run(arguments)
+        }
+        return (MacModel(config: LocalConfig(enabled: true, name: "This Mac", agent: path), agent: agent), directory)
+    }
+
+    @Test("a new agent command starts from what the new agent says, and gets the push the old one refused")
+    func newAgentCommandStartsAfresh() async throws {
+        // The model is kept across the change now, and it used to keep everything the old agent had
+        // said with it: its services until the next read, its doctor run, and a refusal of the
+        // current document that held the push to the new agent back for a minute.
+        let old = FakeRunner()
+        old.answer("status", json: Self.statusHoldingNoSetup)
+        old.answer("config", json: #"{ "ok": false, "contract": 3, "error": "this agent keeps the copy it has" }"#, exit: 1)
+        old.answer("doctor", json: #"{ "ok": true, "contract": 3, "checks": [] }"#)
+        old.answer("status", json: Self.statusHoldingNoSetup)
+        let (model, _, directory) = try Self.model(old)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        model.controllerConfig = { document }
+
+        await model.refresh()
+        let deadline = Date().addingTimeInterval(2)
+        while model.core.setup.lastShare == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+        guard case .failed = model.setupSharing else {
+            Issue.record("the old agent's refusal was not shown: \(model.setupSharing)")
+            return
+        }
+        model.runDoctor()
+        await Self.settle(model)
+        #expect(model.doctor != nil)
+        let outcome = try #require(model.lastActionOutcome)
+
+        let fresh = FakeRunner()
+        fresh.answer("status", json: Self.statusHoldingNoSetup)
+        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored" }"#)
+        let bound = Self.boundAgent(fresh)
+        model.update(config: LocalConfig(enabled: true, name: "This Mac", agent: bound.argv.last ?? ""),
+                     agent: bound.agent, boundMachineId: nil, boundAgentArgv: bound.argv)
+
+        // Nothing the old agent said is shown as the new one's, and what the user did stays.
+        #expect(model.status == nil)
+        #expect(model.failure == nil)
+        #expect(model.sidebarSummary == "checking")
+        #expect(model.doctor == nil)
+        #expect(model.setupSharing == .unknown)
+        #expect(model.lastActionOutcome == outcome)
+
+        await model.refresh()
+        let pushed = Date().addingTimeInterval(2)
+        while model.core.setup.lastShare == nil, Date() < pushed { try? await Task.sleep(for: .milliseconds(10)) }
+        #expect(fresh.sent.contains { $0.contains("config") && $0.contains("set") })
+        #expect(model.core.setup.lastShare?.failure == nil)
+    }
+
+    @Test("a read that was out when the agent command changed is not taken as the new agent's")
+    func readAcrossAnAgentChangeIsDropped() async throws {
+        let old = FakeRunner()
+        old.answer("status", json: Self.status)
+        let gate = Gate(holding: "status")
+        let (model, directory) = try Self.gatedModel(old, gate: gate)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let read = Task { await model.refresh() }
+        #expect(await gate.waitUntilHolding())
+        let fresh = FakeRunner()
+        fresh.answer("status", json: Self.statusHoldingNoSetup)
+        let bound = Self.boundAgent(fresh)
+        model.update(config: LocalConfig(enabled: true, name: "This Mac", agent: bound.argv.last ?? ""),
+                     agent: bound.agent, boundMachineId: nil, boundAgentArgv: bound.argv)
+        gate.release()
+        await read.value
+
+        // The old agent answered, and its answer went nowhere.
+        #expect(old.sent.count == 1)
+        #expect(model.status == nil)
+        #expect(model.lastChecked == nil)
+
+        // Nor does it count as a read: the next chance to read asks the new agent at once.
+        await model.refreshIfNeeded()
+        #expect(fresh.sent.count == 1)
+        #expect(model.services.first?.upToDate == true)
+    }
+
+    @Test("a push that was out when the agent command changed is not held against the new agent")
+    func pushAcrossAnAgentChangeIsDropped() async throws {
+        let old = FakeRunner()
+        old.answer("status", json: Self.statusHoldingNoSetup)
+        old.answer("config", json: #"{ "ok": false, "contract": 3, "error": "this agent keeps the copy it has" }"#, exit: 1)
+        let gate = Gate(holding: "config")
+        let (model, directory) = try Self.gatedModel(old, gate: gate)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        model.controllerConfig = { document }
+
+        await model.refresh()
+        #expect(await gate.waitUntilHolding())
+        let fresh = FakeRunner()
+        fresh.answer("status", json: Self.statusHoldingNoSetup)
+        fresh.answer("status", json: Self.statusHoldingNoSetup)
+        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored" }"#)
+        let bound = Self.boundAgent(fresh)
+        model.update(config: LocalConfig(enabled: true, name: "This Mac", agent: bound.argv.last ?? ""),
+                     agent: bound.agent, boundMachineId: nil, boundAgentArgv: bound.argv)
+
+        // The old push is still out, so the new agent's first read starts no second one beside it.
+        await model.refresh()
+        #expect(model.isReachable)
+        #expect(!fresh.sent.contains { $0.contains("config") })
+
+        gate.release()
+        let deadline = Date().addingTimeInterval(2)
+        while model.core.setup.isSharing, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+        // The old agent's refusal is about the old agent.
+        #expect(model.core.setup.lastShare == nil)
+        #expect(model.setupSharing == .unknown)
+        #expect(!model.noteIsError)
+
+        await model.refresh()
+        let pushed = Date().addingTimeInterval(2)
+        while model.core.setup.lastShare == nil, Date() < pushed { try? await Task.sleep(for: .milliseconds(10)) }
+        #expect(fresh.sent.contains { $0.contains("config") && $0.contains("set") })
+        #expect(model.core.setup.lastShare?.failure == nil)
+    }
+
+    @Test("a new name for this device keeps what its agent said")
+    func renameKeepsTheReading() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        #expect(model.isReachable)
+        let path = model.config.agentPath
+        model.update(config: LocalConfig(enabled: true, name: "Desk", agent: path),
+                     agent: MacAgent(scriptPath: path, interpreter: "/bin/echo") { _, arguments, _, _ in runner.run(arguments) },
+                     boundMachineId: nil, boundAgentArgv: nil)
+
+        #expect(model.name == "Desk")
+        #expect(model.isReachable)
+        #expect(model.lastChecked != nil)
+    }
+
     @Test("the local agent is run through the bound argv when the device is a machine in the setup")
     func boundLocalAgent() async throws {
         // The `self` binding: this device is one of the machines in the shared document, and it is

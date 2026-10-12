@@ -294,8 +294,8 @@ private fun SystemsEditor(app: AppModel, machine: MachineConfig) {
     val editor = app.editor
     SectionHeading("Systems", note = "${machine.systems.size}", showsRule = false)
     ExplanationText(
-        "The command that runs the control agent, written as you would type it. A path with a space " +
-            "in it is fine as long as the system says which shell it logs in to.",
+        "The command that runs the control agent. Every part is passed as it is written, so use " +
+            "absolute paths: a ~ is not expanded.",
     )
     machine.systems.forEach { system ->
         DetailRow(system.name ?: system.id, alignment = Alignment.Top) {
@@ -303,7 +303,7 @@ private fun SystemsEditor(app: AppModel, machine: MachineConfig) {
                 PlainField(
                     value = system.agent.joinToString(" "),
                     onValueChange = { editor.setSystemAgent(machine.id, system.id, it) },
-                    placeholder = "/usr/bin/node ~/.legion-control/agent/src/index.mjs",
+                    placeholder = "/usr/bin/node /home/me/.legion-control/bin/launcher.mjs",
                 )
                 Actions {
                     listOf("posix", "powershell", "cmd").forEach { shell ->
@@ -313,20 +313,28 @@ private fun SystemsEditor(app: AppModel, machine: MachineConfig) {
                             emphasis = system.shell == shell,
                         ) { editor.setSystemShell(machine.id, system.id, shell) }
                     }
-                    PlainAction(
-                        label = "unset",
-                        enabled = system.shell != null,
-                    ) { editor.setSystemShell(machine.id, system.id, null) }
+                    // A Windows system is always saved with a shell (contract section 15.1), so
+                    // unsetting one would only write cmd, which has its own action.
+                    if (system.platform != "windows") {
+                        PlainAction(
+                            label = "unset",
+                            enabled = system.shell != null,
+                        ) { editor.setSystemShell(machine.id, system.id, null) }
+                    }
                 }
                 QuietText(
                     when (RemoteShell.fromWire(system.shell)) {
-                        RemoteShell.AUTO ->
-                            "Not set. Fine while nothing in the command needs quoting; a path with a " +
-                                "space in it needs an answer here."
-
                         RemoteShell.POSIX -> "sh, bash, zsh or fish."
                         RemoteShell.CMD -> "cmd.exe, which is what Windows OpenSSH starts with by default."
                         RemoteShell.POWERSHELL -> "PowerShell, set as this account's DefaultShell."
+                        // The default is the platform's stock OpenSSH shell, never a guess at
+                        // PowerShell, so an account that logs in to PowerShell has to say so.
+                        else -> if (system.platform == "windows") {
+                            "Not set, so cmd.exe, which is what Windows OpenSSH starts with by " +
+                                "default. Choose powershell if this account logs in to PowerShell."
+                        } else {
+                            "Not set, so sh, bash, zsh or fish."
+                        }
                     },
                 )
                 Actions {

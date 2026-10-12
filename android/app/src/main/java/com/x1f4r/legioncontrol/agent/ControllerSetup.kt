@@ -1,8 +1,8 @@
 package com.x1f4r.legioncontrol.agent
 
 import com.x1f4r.legioncontrol.net.CommandOutcome
+import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
-import com.x1f4r.legioncontrol.net.SshTransport
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -49,41 +49,24 @@ sealed interface ControllerFetch {
  * reached with the argv the configuration names; this list exists for the one machine that is not
  * in any configuration yet, because it is the machine the configuration is about to come from.
  *
- * Built through the quoting rules rather than by pasting a user name into a string. A user name with
- * a space in it is unusual and it is not impossible, and it is the one value here that comes from
- * outside.
+ * Nothing here comes from outside: no user name is pasted into a path, and the home directory is
+ * the far side's own `$HOME`, expanded by a shell that is asked for explicitly. A bare `~` used to
+ * do that job, and argv elements are literal now (contract section 15.2), so a tilde would be a
+ * directory called `~`. Both Windows shapes run the same encoded script, once for an account that
+ * logs in to cmd.exe and once for one that logs in to PowerShell, because which of the two it is
+ * cannot be known before anything has answered.
  */
-fun setupCommands(user: String): List<SetupCommand> = listOf(
+fun setupCommands(): List<SetupCommand> = listOf(
     // Installed wrappers retain the runtime selected by the installer, even without Node on PATH.
-    SetupCommand(RemoteShell.POSIX, listOf("~/.legion-control/bin/legionctl", "config")),
-    SetupCommand(
-        RemoteShell.CMD,
-        listOf(
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-            "-EncodedCommand", Base64.getEncoder().encodeToString(
-                WINDOWS_SETUP_SCRIPT.toByteArray(Charsets.UTF_16LE),
-            ),
-        ),
-    ),
     SetupCommand(
         RemoteShell.POSIX,
-        listOf("/usr/bin/node", "/home/$user/.legion-control/agent/src/index.mjs", "config"),
+        listOf("/bin/sh", "-c", "exec \"\$HOME/.legion-control/bin/legionctl\" \"\$@\"", "legionctl", "config"),
     ),
+    SetupCommand(RemoteShell.CMD, WINDOWS_SETUP_ARGV),
+    SetupCommand(RemoteShell.POWERSHELL, WINDOWS_SETUP_ARGV),
     SetupCommand(
         RemoteShell.POSIX,
-        listOf("node", "~/.legion-control/agent/src/index.mjs", "config"),
-    ),
-    SetupCommand(
-        RemoteShell.POSIX,
-        listOf("/opt/homebrew/bin/node", "~/.legion-control/agent/src/index.mjs", "config"),
-    ),
-    SetupCommand(
-        RemoteShell.CMD,
-        listOf("node", "C:\\Users\\$user\\.legion-control\\agent\\src\\index.mjs", "config"),
-    ),
-    SetupCommand(
-        RemoteShell.POWERSHELL,
-        listOf("node", "C:\\Users\\$user\\.legion-control\\agent\\src\\index.mjs", "config"),
+        listOf("/bin/sh", "-c", "exec node \"\$HOME/.legion-control/agent/src/index.mjs\" \"\$@\"", "legionctl", "config"),
     ),
 )
 
@@ -94,12 +77,17 @@ internal const val WINDOWS_SETUP_SCRIPT =
         "& (Join-Path \$HOME '.legion-control/bin/legionctl.ps1') config; exit \$LASTEXITCODE " +
         "} catch { [Console]::Error.WriteLine(\$_.Exception.Message); exit 1 }"
 
-/** One layout to try: which shell to write it for, and the argv to write. */
-data class SetupCommand(val shell: RemoteShell, val arguments: List<String>) {
-    /** Null when the user name cannot be written for that shell, which is a reason to skip it. */
+private val WINDOWS_SETUP_ARGV: List<String> = listOf(
+    "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+    "-EncodedCommand", Base64.getEncoder().encodeToString(WINDOWS_SETUP_SCRIPT.toByteArray(Charsets.UTF_16LE)),
+)
+
+/** One layout to try: which grammar to write it in, and the argv to write. */
+data class SetupCommand(val grammar: RemoteShell, val arguments: List<String>) {
+    /** Null when the argv cannot be written in that grammar, which is a reason to skip it. */
     fun line(): String? = try {
-        buildRemoteCommand(shell, arguments)
-    } catch (_: UnquotableArgument) {
+        buildRemoteCommand(grammar, arguments)
+    } catch (_: CommandLineRefusal) {
         null
     }
 }
@@ -109,33 +97,39 @@ data class SetupCommand(val shell: RemoteShell, val arguments: List<String>) {
  *
  * Every [AgentFailure] the transport raises is left to travel: a refused key does not get better on
  * the next command shape, and a host key that does not match its pin is a question rather than a
- * fault. Only a shape that produced no reply moves on to the next one, and a shape that produced one
- * ends the search whatever the reply says.
+ * fault. A shape that produced a reply ends the search whatever the reply says, and so does a
+ * failure that rules out the whole address (section 15.5, step 7): with one address there is
+ * nowhere else to go. Anything else moves on to the next shape, which is safe because `config` is a
+ * read.
  */
-suspend fun fetchController(transport: SshTransport, endpoint: Endpoint): ControllerFetch =
-    fetchController(endpoint.user) { line -> transport.run(endpoint, line, FETCH_TIMEOUT_MILLIS) }
+suspend fun fetchController(transport: CommandTransport, endpoint: Endpoint): ControllerFetch =
+    fetchController { line -> transport.run(endpoint, line, FETCH_TIMEOUT_MILLIS) }
 
-internal suspend fun fetchController(
-    user: String,
-    run: suspend (String) -> CommandOutcome,
-): ControllerFetch {
+internal suspend fun fetchController(run: suspend (String) -> CommandOutcome): ControllerFetch {
     var detail: String? = null
-    // Two shapes can produce the same line: when nothing in a command needs quoting, the cmd.exe and
-    // the PowerShell forms are byte for byte the same, and running it twice would only cost a round
-    // trip against a machine that has already said no once.
-    val tried = mutableSetOf<String>()
-    for (command in setupCommands(user)) {
+    for (command in setupCommands()) {
         val line = command.line() ?: continue
-        if (!tried.add(line)) continue
         val outcome = run(line)
-        val reply = readControllerReply(outcome.stdout)
-        if (reply != ControllerFetch.Unreadable) return reply
-        if (detail == null) {
-            val text = listOf(outcome.stderr, outcome.stdout)
-                .firstOrNull { it.isNotBlank() }
-                ?.trim()
-                ?: "exit status ${outcome.exitStatus}"
-            detail = if (text.length <= 400) text else text.take(400) + "..."
+        val reading = AttemptClassifier.classify(outcome)
+        if (reading.isReply) {
+            val reply = readControllerReply(outcome.stdout)
+            if (reply != ControllerFetch.Unreadable) return reply
+        }
+        val text = listOf(outcome.stderr, outcome.stdout)
+            .firstOrNull { it.isNotBlank() }
+            ?.trim()
+            ?: "exit status ${outcome.exitStatus}"
+        val condensed = if (text.length <= 400) text else text.take(400) + "..."
+        when (reading.kind) {
+            FailureKind.TIMED_OUT -> throw AgentFailure.TimedOut((FETCH_TIMEOUT_MILLIS / 1000L).toInt(), condensed)
+            FailureKind.LINK_LOST -> throw AgentFailure.Unreachable(
+                null,
+                "The link closed before the setup arrived: $condensed",
+                stage = reading.dispatch,
+                reason = FailureKind.LINK_LOST,
+            )
+
+            else -> if (detail == null) detail = condensed
         }
     }
     // Exhausting known layouts cannot distinguish an absent agent from one that cannot start.

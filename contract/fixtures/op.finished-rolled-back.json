@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -16,8 +16,8 @@
     "mode": "manual",
     "initiator": {
       "client": "mac",
-      "device": "roberts-macbook-pro",
-      "user": "x1f4r"
+      "device": "office-macbook-pro",
+      "user": "me"
     },
     "state": "finished",
     "phase": "done",
@@ -37,7 +37,8 @@
       "from": "1.4.2",
       "to": "1.4.2",
       "exitCode": 1,
-      "output": null
+      "output": null,
+      "outcome": "failed"
     },
     "log": [
       {
@@ -53,9 +54,10 @@
         "line": "rolled back to 1.4.2, health 200"
       }
     ],
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.1.0",
     "systemId": "linux",
     "from": "1.4.2",
-    "to": "1.4.2"
+    "to": "1.4.2",
+    "outcome": "failed"
   }
 }

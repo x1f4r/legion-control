@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Builds the desktop client for Linux and Windows, from any of the three.
 #
+#   ./desktop/build.sh [all|linux|windows|test] [--require-agent]
+#
+# --require-agent stops the build unless dist/ holds the signed agent bundle. A release passes it;
+# any other build without the bundle goes ahead and says so.
+#
 # Self-contained on purpose: the machines this runs on are a Windows box with only the .NET runtime
 # and a Linux box that may have no dotnet at all, so the binary carries its own. The two archives
 # are named exactly as the signed release manifest names them, because the client picks its own
@@ -12,6 +17,15 @@ root="$(cd "$here/.." && pwd)"
 project="$here/LegionControl.Desktop"
 tests="$here/LegionControl.Desktop.Tests"
 out="$root/dist"
+
+target=all
+require_agent=0
+for argument in "$@"; do
+  case "$argument" in
+    --require-agent) require_agent=1 ;;
+    *) target="$argument" ;;
+  esac
+done
 
 # The pinned toolchain first, then whatever dotnet is on the path. Never a global install: the
 # version this is built with is a decision, not an accident of the machine it ran on.
@@ -37,14 +51,23 @@ fi
 echo "Legion Control desktop $version, built with $("$dotnet" --version)"
 
 # The signed agent bundle, when the release tooling has produced one. A normal build carries none
-# and says so in the app rather than offering an action that cannot work.
+# and says so in the app rather than offering an action that cannot work. A build that requires it
+# stops first, so its log never says it went ahead without one.
+if [ "$require_agent" -eq 1 ]; then
+  for artifact in "legionctl-agent-$agent_version.tgz" Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig; do
+    if [ ! -s "$out/$artifact" ]; then
+      echo "Missing signed agent artifact: $artifact. Run scripts/package-agent.mjs first." >&2
+      exit 1
+    fi
+  done
+fi
 if [ -f "$out/legionctl-agent-$agent_version.tgz" ]; then
   echo "Bundling the signed agent from $out"
 else
   echo "No signed agent bundle in $out: the agent install action will be unavailable in this build."
 fi
 
-case "${1:-all}" in
+case "$target" in
   test)
     targets=""
     ;;
@@ -58,7 +81,7 @@ case "${1:-all}" in
     targets="linux-x64 linux-arm64 win-x64"
     ;;
   *)
-    echo "usage: build.sh [all|linux|windows|test]" >&2
+    echo "usage: build.sh [all|linux|windows|test] [--require-agent]" >&2
     exit 1
     ;;
 esac

@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "systemctl suspend was accepted; whether the machine actually suspended is not something this process can see",
+  "outcome": "pending",
   "action": "sleeping",
   "op": {
     "id": "5e2a9c76-8d34-4b1e-97f0-6a3d5b8c214f",
@@ -17,8 +18,8 @@
     "mode": "force",
     "initiator": {
       "client": "mac",
-      "device": "roberts-macbook-pro",
-      "user": "x1f4r"
+      "device": "office-macbook-pro",
+      "user": "me"
     },
     "state": "running",
     "phase": "suspending",
@@ -45,7 +46,8 @@
         "line": "systemctl suspend accepted"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.1.0",
+    "systemId": "linux",
+    "outcome": "pending"
   }
 }

@@ -12,6 +12,13 @@ struct AgentRequest: Sendable, Equatable {
     var safety: CommandSafety
     /// The bytes to send on stdin, for the two commands that hand over a document.
     var input: Data?
+    /// True for a status read against an agent known to speak contract 3, whose `--budget-ms` is
+    /// worked out again for every attempt from what is left of the deadline.
+    private var budgetsStatus = false
+
+    /// Whether this reads the status. Its reply is the one that says whether the key on the far
+    /// side is restricted.
+    var isStatusRead: Bool { arguments.first == "status" }
 
     /// A refusal built here rather than sent. An id that does not match the contract's grammar is a
     /// sign of a mangled config, and it is caught before it can reach a shell.
@@ -44,11 +51,27 @@ struct AgentRequest: Sendable, Equatable {
 
     /// The status snapshot. The budget is the agent's own, and it is deliberately smaller than the
     /// client timeout: the agent answering late with everything is worse than answering on time with
-    /// what it had and saying the rest is not known.
-    static func status(dialect: AgentDialect, budgetMs: Int = 20_000) -> AgentRequest {
-        var arguments = ["status"]
-        if dialect.supportsBudget { arguments += ["--budget-ms", String(budgetMs)] }
-        return AgentRequest(arguments, timeout: 30, safety: .readOnly)
+    /// what it had and saying the rest is not known. `arguments` carries the budget of a first
+    /// attempt with the whole timeout ahead of it; later attempts get less (see below).
+    static func status(dialect: AgentDialect) -> AgentRequest {
+        guard dialect.supportsBudget else { return AgentRequest(["status"], timeout: 30, safety: .readOnly) }
+        var request = AgentRequest(["status", "--budget-ms", String(StatusBudget.next(remainingMs: 30_000, attemptsMade: 0)!)],
+                                   timeout: 30, safety: .readOnly)
+        request.budgetsStatus = true
+        return request
+    }
+
+    /// The arguments for one attempt at this request, or nil when there is no time left to make it.
+    ///
+    /// Only a status read against a contract 3 agent changes from attempt to attempt: its budget is
+    /// what is left of the one deadline the whole command shares, less the time ssh and the reply
+    /// need. Every other request is the same on every attempt.
+    func arguments(remainingMilliseconds: Int, attemptsMade: Int) -> [String]? {
+        guard budgetsStatus else { return arguments }
+        guard let budget = StatusBudget.next(remainingMs: remainingMilliseconds, attemptsMade: attemptsMade) else {
+            return nil
+        }
+        return ["status", "--budget-ms", String(budget)]
     }
 
     static func doctor(deep: Bool) -> AgentRequest {

@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { canonicalBytes, canonicalHash, isValidUtf8, TRIM_CODE_POINTS } from '../tools/canonical.mjs';
+import { canonicalBytes, canonicalHash, isValidUtf8, rejection, TRIM_CODE_POINTS } from '../tools/canonical.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const vectors = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'hash-vectors.json'), 'utf8'));
@@ -52,9 +52,12 @@ test('every line ending collapses to one LF and the result carries exactly one',
 
 test('canonicalising is idempotent, so a stored document rehashes to itself', () => {
   // The agent stores the canonical bytes. If a second pass changed them, the
-  // hash the machine reports would drift away from the hash it stored.
+  // hash the machine reports would drift away from the hash it stored. Only a
+  // document that is accepted is ever stored, and double-bom shows why that
+  // matters: its canonical form still starts with U+FEFF, which a second pass
+  // would strip. It is refused, so it never has to rehash to itself.
   for (const vector of vectors.vectors) {
-    if (vector.sha256 === null) continue;
+    if (vector.sha256 === null || !vector.accepted) continue;
     const once = canonicalBytes(Buffer.from(vector.inputBase64, 'base64'));
     const twice = canonicalBytes(once);
     assert.equal(twice.toString('base64'), once.toString('base64'), vector.name);
@@ -114,4 +117,15 @@ test('internal whitespace is content: reformatting a document is a real edit', (
   const compact = '{"version":1,"machines":[]}';
   const pretty = '{\n  "version": 1,\n  "machines": []\n}';
   assert.notEqual(canonicalHash(compact), canonicalHash(pretty));
+});
+
+test('a document is refused for the first rule it breaks, judged on its canonical bytes', () => {
+  const doc = '{"version":1,"machines":[]}';
+  assert.equal(rejection(Buffer.alloc(1048577, 0x20)), 'too-large', 'size is judged on the bytes as given, before anything else');
+  assert.equal(rejection(Buffer.from([0xff, 0x0a])), 'invalid-utf8');
+  assert.equal(rejection(' \r\n\t'), 'empty');
+  assert.equal(rejection('[]'), 'not-a-json-object');
+  assert.equal(rejection('{"version":"1","machines":[]}'), 'not-a-json-object');
+  assert.equal(rejection(`${BOM}\r\n${doc}\r\n`), null, 'a byte order mark and blank lines around the document never make it unparseable');
+  assert.equal(rejection(`${BOM}${BOM}${doc}`), 'not-a-json-object', 'only one byte order mark is stripped');
 });

@@ -21,11 +21,14 @@ import com.x1f4r.legioncontrol.agent.MachineControl
 import com.x1f4r.legioncontrol.agent.OpRecord
 import com.x1f4r.legioncontrol.agent.PolicyPatch
 import com.x1f4r.legioncontrol.agent.SetupProvenance
+import com.x1f4r.legioncontrol.agent.SignedTarball
 import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.agent.readControllerReply
+import com.x1f4r.legioncontrol.agent.resolveSystem
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -37,7 +40,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import java.io.File
 
 /**
  * The one seam between the screen and the transport.
@@ -53,6 +55,14 @@ private class WiredServices(private val control: LegionControl) : ControlService
     override suspend fun publicKey(): String = control.identity.identity().authorizedKeysLine
 
     override suspend fun keyFingerprint(): String = control.identity.identity().fingerprint
+
+    override suspend fun keyChange(): KeyChange? = control.identity.change()
+
+    override suspend fun acknowledgeKeyChange() = control.identity.acknowledgeChange()
+
+    override suspend fun replaceUnreadableKey() {
+        control.identity.replaceUnreadable()
+    }
 
     override val config: StateFlow<ControllerConfig?> get() = control.config.config
 
@@ -217,7 +227,7 @@ private class WiredMachineClient(
 
     override val route: Route? get() = lastRoute
 
-    override suspend fun status(): Result<AgentStatus> = attempt { wiring.agent.status(STATUS_BUDGET_MS) }
+    override suspend fun status(): Result<AgentStatus> = attempt { wiring.agent.status() }
 
     override suspend fun update(
         request: UpdateRequest,
@@ -329,7 +339,7 @@ private class WiredMachineClient(
     override suspend fun waitForWake(): Boolean = withTimeoutOrNull(WAKE_WAIT_MILLIS) {
         while (true) {
             delay(WAKE_POLL_MILLIS)
-            val status = runCatching { wiring.agent.status(STATUS_BUDGET_MS) }.getOrNull()?.value
+            val status = runCatching { wiring.agent.status() }.getOrNull()?.value
             if (status?.ok != false && status?.systemId != null) return@withTimeoutOrNull true
         }
         @Suppress("UNREACHABLE_CODE")
@@ -353,28 +363,27 @@ private class WiredMachineClient(
     /**
      * Puts the signed bundle on the machine, by whichever route that machine can take.
      *
-     * A machine already on contract 3 takes it on standard input in one command. One on 2.x has no
-     * `self-update` at all, so the file goes over SFTP and the staged tree installs itself, which is
-     * the bootstrap the contract describes. The 2.x path is deliberately two steps and both of them
-     * are visible in the operation log, because it is the one path that runs code the far side has
-     * only just received.
+     * Decided here again rather than taken from the screen, from the agent client's own last
+     * authenticated status: a button that was enabled a minute ago is not permission. A machine on
+     * contract 3 takes the bundle on standard input in one command. One on 2.x has no `self-update`
+     * at all, so it gets the legacy bootstrap, the one path that runs code the far side has only just
+     * received. Anything else is refused before a byte is sent.
      */
     override suspend fun installAgent(
-        tarball: File,
+        tarball: SignedTarball,
         operationId: String?,
-    ): Result<AgentActionResult> = when (AgentDeploymentPath.forAgent(wiring.agent.abilities)) {
-        AgentDeploymentPath.STDIN ->
-            attempt { wiring.agent.selfUpdateFromStdin(tarball, operationId) }
+    ): Result<AgentActionResult> {
+        val status = wiring.agent.lastStatus
+        val system = status?.let { machine.resolveSystem(it.systemId, it.systemName, it.osName) }
+        return when (val path = AgentDeploymentPath.decide(wiring.agent.abilities, status, system)) {
+            AgentDeploymentPath.Stdin ->
+                attempt { wiring.agent.selfUpdateFromStdin(tarball.file, operationId) }
 
-        AgentDeploymentPath.UPLOAD_AND_INSTALL -> try {
-            val remote = "$INCOMING_DIR/${tarball.name}"
-            wiring.agent.upload(tarball, remote)
-            // A 2.x agent has no self-update at all, so the tree that has just been uploaded is what
-            // installs itself. It verifies its own signed manifest first; this app verified the same
-            // bundle before it left the phone.
-            attempt { wiring.agent.bootstrapAgent(remote, INCOMING_DIR, operationId) }
-        } catch (failure: AgentFailure) {
-            Result.failure(failure)
+            is AgentDeploymentPath.UploadAndInstall ->
+                attempt { wiring.agent.bootstrapLegacy(path.system, path.layout, tarball, operationId) }
+
+            is AgentDeploymentPath.Unavailable ->
+                Result.failure(AgentFailure.BadRequest("The control agent cannot be installed from here.", path.reason))
         }
     }
 
@@ -399,22 +408,8 @@ private class WiredMachineClient(
     }
 
     private companion object {
-        /**
-         * The agent's own budget for a snapshot, well inside the client's thirty second command
-         * budget so that a bounded partial answer always beats a client timeout.
-         */
-        const val STATUS_BUDGET_MS = 20_000L
         const val WAKE_POLL_MILLIS = 3_000L
         const val WAKE_WAIT_MILLIS = 45_000L
-
-        /**
-         * Where a bundle is put on a machine that cannot take it on standard input.
-         *
-         * A relative path under the login directory rather than an absolute one, because the agent's
-         * base directory is not something this app is told and `~` is the one thing every shell in
-         * the contract agrees about.
-         */
-        const val INCOMING_DIR = ".legion-control/incoming"
     }
 }
 

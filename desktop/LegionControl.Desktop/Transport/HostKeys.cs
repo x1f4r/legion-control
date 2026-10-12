@@ -31,8 +31,20 @@ public sealed class HostKeys(IProcessRunner runner)
     public string KeygenPath { get; init; } = AppPaths.IsWindows ? "ssh-keygen.exe" : "ssh-keygen";
     public HostIdentityStore Identities { get; init; } = new();
 
-    private string Needle(string host, int port) => LookupIdentity ?? (port == 22 ? host : $"[{host}]:{port}");
+    /// The known_hosts pattern for an address, built only from values that passed the dial
+    /// grammar. Pinning a key under an unchecked name is how `victim.example,*` would pin it for
+    /// every host there is.
+    private string Needle(string host, int port)
+    {
+        if (!Addresses.IsHost(LookupIdentity ?? host) || !Addresses.IsPort(port))
+            throw new IOException(Unscannable(LookupIdentity ?? host));
+        return LookupIdentity ?? (port == 22 ? host : $"[{host}]:{port}");
+    }
+
     private string Address(string host, int port) => $"{LookupIdentity ?? host.ToLowerInvariant()}:{port}";
+
+    private static string Unscannable(string host) =>
+        $"\"{host}\" is not a host name or an IP address this app will scan or pin. Manual SSH enrollment needed.";
 
     /// Resolve the same lookup identity and writable pin file used by the real SSH invocation.
     /// Proxy/certificate or multi-file configurations remain native-verifiable but cannot enroll
@@ -40,6 +52,7 @@ public sealed class HostKeys(IProcessRunner runner)
     public static async Task<(HostKeys? Keys, string Host, int Port, string? Problem)> ForRouteAsync(
         IProcessRunner runner, MachineRoute route, string? knownHosts, CancellationToken token = default)
     {
+        if (Addresses.Refusal(route.Target) is { } undialable) return (null, route.Target.Host, route.Target.Port ?? 22, undialable);
         var arguments = new List<string> { "-G", "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no" };
         if (knownHosts is not null) arguments.AddRange(new[] { "-o", $"UserKnownHostsFile={knownHosts}" });
         arguments.AddRange(route.Target.SshOptions);
@@ -50,7 +63,14 @@ public sealed class HostKeys(IProcessRunner runner)
         var options = result.StandardOutput.Split('\n').Select(l => l.Trim().Split(' ', 2))
             .Where(p => p.Length == 2).GroupBy(p => p[0]).ToDictionary(g => g.Key, g => g.First()[1]);
         var host = options.GetValueOrDefault("hostname") ?? route.Target.Host;
-        var port = int.TryParse(options.GetValueOrDefault("port"), out var parsed) ? parsed : route.Target.Port ?? 22;
+        var port = int.TryParse(options.GetValueOrDefault("port"), System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : route.Target.Port ?? 22;
+        var alias = options.GetValueOrDefault("hostkeyalias");
+        // What ssh will actually look up is what gets scanned and pinned, so it has to pass the
+        // same dial grammar as the document's own host: ssh_config can turn a plain name into
+        // anything at all.
+        if (!Addresses.IsHost(host) || !Addresses.IsPort(port)) return (null, host, port, Unscannable(host));
+        if (alias is not (null or "none") && !Addresses.IsHost(alias)) return (null, host, port, Unscannable(alias));
         var path = knownHosts ?? options.GetValueOrDefault("userknownhostsfile");
         if (options.GetValueOrDefault("proxycommand") is { } proxy && proxy != "none"
             || options.GetValueOrDefault("proxyjump") is { } jump && jump != "none")
@@ -64,7 +84,6 @@ public sealed class HostKeys(IProcessRunner runner)
         else if (knownHosts is null && path.Contains(' '))
             return (null, host, port, "SSH uses multiple known_hosts paths. Existing verification is retained; select one explicit path in private bindings before enrolling keys here.");
         path = path.StartsWith("~/") ? System.IO.Path.Combine(AppPaths.UserHome, path[2..]) : path;
-        var alias = options.GetValueOrDefault("hostkeyalias");
         var lookup = alias is null or "none" ? (port == 22 ? host : $"[{host}]:{port}") : alias;
         var auxiliary = (options.GetValueOrDefault("globalknownhostsfile") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
         if (knownHosts is null) auxiliary.Add(System.IO.Path.Combine(AppPaths.UserHome, ".ssh", "known_hosts2"));
@@ -85,8 +104,11 @@ public sealed class HostKeys(IProcessRunner runner)
     {
         try
         {
+            if (!Addresses.IsHost(host) || !Addresses.IsPort(port)) return new TrustOutcome.Failed(Unscannable(host));
             var pinned = await PinnedAsync(host, port, cancellationToken);
-            var scan = await _runner.RunAsync(KeyscanPath, new[] { "-T", "5", "-p", port.ToString(), host },
+            // `--` before the host, so no name is ever read as an option.
+            var scan = await _runner.RunAsync(KeyscanPath,
+                new[] { "-T", "5", "-p", port.ToString(System.Globalization.CultureInfo.InvariantCulture), "--", host },
                 TimeSpan.FromSeconds(20), null, cancellationToken);
             var lines = scan.StandardOutput.Split('\n').Select(l => l.Trim())
                 .Where(l => l.Length > 0 && !l.StartsWith('#')).Distinct().ToList();
@@ -123,6 +145,8 @@ public sealed class HostKeys(IProcessRunner runner)
         IReadOnlyDictionary<HostPublicKey, string>? legacyAssignments = null,
         CancellationToken cancellationToken = default)
     {
+        // An offer can come back from a file the CLI wrote, so its address is checked again here.
+        if (!Addresses.IsHost(offer.Host) || !Addresses.IsPort(offer.Port)) return new TrustOutcome.Failed(Unscannable(offer.Host));
         try
         {
             return await Identities.LockedAsync<TrustOutcome>(async state =>

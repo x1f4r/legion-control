@@ -39,7 +39,7 @@ class UpdateCheckScheduleTest {
 
     private fun available() = AppUpdates.Check.Available(AppUpdates.Release(
         version = "2.0.0", notes = "", assetUrl = "https://example.invalid/app.apk",
-        assetName = ReleaseAssets.ANDROID_APK, sizeBytes = 1,
+        assetName = ReleaseAssets.ANDROID_APK,
         manifest = VerifiedManifest(ReleaseManifest(version = "2.0.0"), byteArrayOf()),
     ))
 

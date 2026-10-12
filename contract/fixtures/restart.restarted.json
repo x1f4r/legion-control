@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "t3 restarted and answered on 8081",
+  "outcome": "succeeded",
   "action": "restarted",
   "service": "t3",
   "detached": false,
@@ -19,8 +20,8 @@
     "mode": "manual",
     "initiator": {
       "client": "mac",
-      "device": "roberts-macbook-pro",
-      "user": "x1f4r"
+      "device": "office-macbook-pro",
+      "user": "me"
     },
     "state": "finished",
     "phase": "done",
@@ -38,7 +39,8 @@
       "reasonCode": null,
       "message": "t3 restarted and answered on 8081",
       "exitCode": 0,
-      "output": null
+      "output": null,
+      "outcome": "succeeded"
     },
     "log": [
       {
@@ -54,7 +56,8 @@
         "line": "started t3-code.service, health 200"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.1.0",
+    "systemId": "linux",
+    "outcome": "succeeded"
   }
 }

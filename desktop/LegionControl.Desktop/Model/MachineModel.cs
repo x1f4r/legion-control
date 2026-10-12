@@ -62,7 +62,7 @@ public sealed class MachineModel
     public string Id => Machine.Id;
 
     /// What to call it. A machine that is this device is called by this device's own name, because
-    /// "Robert's tower" beats "tower" when it is the thing you are sitting at.
+    /// "Desk tower" beats "tower" when it is the thing you are sitting at.
     public string Name => IsSelf && Bindings.DeviceName is { Length: > 0 } device ? device : Machine.Name;
 
     /// Whether this machine is the device the app is running on.
@@ -90,8 +90,7 @@ public sealed class MachineModel
     {
         try
         {
-            var reply = await NewAgent().StatusAsync(Capabilities, PreferredSystem(), null,
-                cancellationToken: cancellationToken);
+            var reply = await NewAgent().StatusAsync(Capabilities, PreferredSystem(), null, cancellationToken);
             var previousSystem = Routes.RememberedSystemId;
             Status = reply.Value;
             Failure = null;
@@ -104,7 +103,7 @@ public sealed class MachineModel
             {
                 Routes.ForgetRoute($"the machine answered as {reported} rather than {previousSystem}");
             }
-            Routes.Remember(reply.Route, reply.System);
+            Routes.Remember(reply.Route, reply.System, reply.Value.Agent?.RestrictedSession == true);
 
             ObserveTransition(reply.Value);
             if (Settings.KeepMetricsHistory && reply.Value.Metrics is { } metrics)
@@ -842,7 +841,11 @@ public sealed class MachineModel
         }
         var routes = Routes.Order(Bindings.RoutesFor(Machine), ExpectedSystemId(), Presence.IsOnNetworkOf(Machine))
             .Where(route => !Routes.IsBackedOff(route.Id)).ToList();
-        return new RemoteAgent(Machine, _runner, routes) { KnownHostsFile = Bindings.KnownHosts };
+        return new RemoteAgent(Machine, _runner, routes)
+        {
+            KnownHostsFile = Bindings.KnownHosts,
+            RestrictedSessions = Routes.RestrictedSessions,
+        };
     }
 
     /// Which system to build the command for first.

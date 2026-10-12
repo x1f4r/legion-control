@@ -4,7 +4,7 @@
     "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
     "revision": 13,
     "lineage": [
-      "668a9a05d7eabf59835baea274c89cd5a1275e1e4978929faeffe68dcc487c1c"
+      "81a6d710365ad9a0289cff90310898e22c04795134d6de67f58b207b3938e7a4"
     ]
   },
   "futureTopLevelKey": {
@@ -14,7 +14,7 @@
   "machines": [
     {
       "id": "pi",
-      "name": "Atlas",
+      "name": "Beacon",
       "futureMachineKey": [
         "anything",
         "at",
@@ -23,8 +23,8 @@
       "endpoints": [
         {
           "id": "lan",
-          "host": "192.168.178.40",
-          "user": "x1f4r",
+          "host": "192.168.50.40",
+          "user": "me",
           "futureEndpointKey": 42
         }
       ]

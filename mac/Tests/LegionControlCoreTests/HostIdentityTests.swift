@@ -22,7 +22,7 @@ struct HostIdentityTests {
     }
     func context(_ dir: URL, existing: [HostPublicKey] = []) -> HostIdentityContext {
         let known = dir.appending(path: "known_hosts")
-        return .init(address: "[tower-alias]:2222:2222", lookup: "tower-alias", scanHost: "192.168.178.20", port: 2222,
+        return .init(address: "[tower-alias]:2222:2222", lookup: "tower-alias", scanHost: "192.168.50.20", port: 2222,
                      knownHosts: known, pinFiles: [known: (try? Data(contentsOf: known)) ?? Data()], existing: existing)
     }
 
@@ -131,23 +131,59 @@ struct HostIdentityTests {
             if executable == "/usr/bin/ssh" {
                 #expect(arguments.first == "-G")
                 #expect(arguments.last == "private-alias")
-                return TransportTests.result(out: "hostname 192.168.178.20\nport 2222\nhostkeyalias shared-tower\nuserknownhostsfile \(known.path)\nglobalknownhostsfile /dev/null\n")
+                return TransportTests.result(out: "hostname 192.168.50.20\nport 2222\nhostkeyalias shared-tower\nuserknownhostsfile \(known.path)\nglobalknownhostsfile /dev/null\n")
             }
             #expect(arguments == ["-F", "shared-tower", "-f", known.path])
             return TransportTests.result(out: "# Host shared-tower found\n|1|hashed|entry \(key.id)\n")
         }
         #expect(result.lookup == "shared-tower")
-        #expect(result.scanHost == "192.168.178.20")
+        #expect(result.scanHost == "192.168.50.20")
         #expect(result.port == 2222)
         #expect(result.knownHosts == known)
         #expect(result.existing == [key])
+    }
+
+    @Test("a pin is built only from values that pass the dial grammar")
+    func pinsAreChecked() async throws {
+        // T5. A known_hosts line is a pattern list: `victim.example,*` written there pins the scanned
+        // key for every host there is, on the OpenSSH versions that still read it that way.
+        let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
+        let known = dir.appending(path: "known_hosts")
+        func resolve(_ host: String, reported: String) async throws -> HostIdentityContext {
+            try await HostIdentityContext.resolve(.init(host: host, user: "me", port: nil, identityFile: nil)) { executable, _, _ in
+                #expect(executable == "/usr/bin/ssh")
+                return TransportTests.result(out: reported + "userknownhostsfile \(known.path)\nglobalknownhostsfile /dev/null\n")
+            }
+        }
+        // What ssh -G reports is held to the same grammar as the document.
+        await #expect(throws: HostIdentityFailure.self) {
+            _ = try await resolve("tower", reported: "hostname victim.example,*\nport 22\n")
+        }
+        await #expect(throws: HostIdentityFailure.self) {
+            _ = try await resolve("tower", reported: "hostname 192.0.2.10\nport 22\nhostkeyalias *.example\n")
+        }
+        await #expect(throws: HostIdentityFailure.self) {
+            _ = try await resolve("tower", reported: "hostname 192.0.2.10\nport 70000\n")
+        }
+        // And a configured host that fails it is never handed to ssh at all.
+        await #expect(throws: HostIdentityFailure.self) {
+            _ = try await HostIdentityContext.resolve(.init(host: "-oProxyCommand=x", user: nil, port: nil, identityFile: nil)) { _, _, _ in
+                Issue.record("ssh was run for a host outside the dial grammar")
+                return TransportTests.result()
+            }
+        }
+
+        let context = try await resolve("tower", reported: "hostname 2001:db8::10\nport 2222\n")
+        #expect(context.lookup == "[2001:db8::10]:2222")
+        // The port, then `--`, then the host: neither can ever be read as an option.
+        #expect(context.keyscanArguments == ["-T", "8", "-p", "2222", "--", "2001:db8::10"])
     }
 
     @Test("complex SSH key providers retain native verification and disable app enrollment")
     func externalProvider() async {
         await #expect(throws: HostIdentityFailure.self) {
             try await HostIdentityContext.resolve(.init(host: "alias", user: nil, port: nil, identityFile: nil)) { _, _, _ in
-                TransportTests.result(out: "hostname 192.168.178.20\nport 22\nproxycommand helper --connect\n")
+                TransportTests.result(out: "hostname 192.168.50.20\nport 22\nproxycommand helper --connect\n")
             }
         }
     }

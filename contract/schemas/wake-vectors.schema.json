@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wake-vectors.schema.json",
+  "title": "contract/vectors/wake.json",
+  "description": "Sites and wake, v3.md sections 10.1 and 10.2, as cases. prefixes and broadcasts pin the address grammar; plans gives the shared wake setup, this device's addresses, the helpers' last status reads and the wake holds, and expects the placement and the ordered plan; readiness pins when the polls after a send start.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "family": { "const": "wake" },
+    "contract": { "const": 3 },
+    "section": { "const": "10" },
+    "reference": { "const": "tools/wake-plan.mjs" },
+    "notes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/text" } },
+    "groups": {
+      "type": "object",
+      "properties": {
+        "prefixes": { "type": "array", "minItems": 18, "items": { "$ref": "#/$defs/prefixesCase" } },
+        "broadcasts": { "type": "array", "minItems": 8, "items": { "$ref": "#/$defs/broadcastsCase" } },
+        "plans": { "type": "array", "minItems": 21, "items": { "$ref": "#/$defs/plansCase" } },
+        "readiness": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/readinessCase" } }
+      },
+      "required": ["prefixes", "broadcasts", "plans", "readiness"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["family", "contract", "section", "reference", "notes", "groups"],
+  "additionalProperties": false,
+  "$defs": {
+    "id": { "type": "string", "minLength": 1 },
+    "prefixesCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "prefix": { "type": "string" },
+            "addresses": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          },
+          "required": ["prefix", "addresses"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "valid": { "type": "boolean" },
+            "contains": { "type": "array", "items": { "type": "boolean" } }
+          },
+          "required": ["valid", "contains"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "broadcastsCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": { "text": { "type": "string" } },
+          "required": ["text"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": { "valid": { "type": "boolean" } },
+          "required": ["valid"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "helperState": {
+      "description": "A helper's last status read this session. actions maps an action id to its declared kind and is given only for a ready helper whose status listed them.",
+      "type": "object",
+      "properties": {
+        "state": { "enum": ["ready", "asleep", "unusable", "unknown", "not-driven"] },
+        "actions": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "required": ["state"],
+      "additionalProperties": false
+    },
+    "step": {
+      "description": "One step of a plan. Every key is present; those that do not apply to its kind are null.",
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["direct", "helper"] },
+        "machine": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "action": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "readFirst": { "type": ["boolean", "null"] },
+        "broadcast": { "anyOf": [{ "type": "array", "minItems": 1, "items": { "type": "string" } }, { "type": "null" }] },
+        "ports": { "anyOf": [{ "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 1, "maximum": 65535 } }, { "type": "null" }] },
+        "repeats": { "type": ["integer", "null"] }
+      },
+      "required": ["kind", "machine", "action", "readFirst", "broadcast", "ports", "repeats"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "direct" } } },
+          "then": { "properties": { "machine": { "type": "null" }, "action": { "type": "null" }, "readFirst": { "type": "null" }, "broadcast": { "type": "array" }, "ports": { "type": "array" }, "repeats": { "const": 3 } } },
+          "else": { "properties": { "machine": { "type": "string" }, "action": { "type": "string" }, "readFirst": { "type": "boolean" }, "broadcast": { "type": "null" }, "ports": { "type": "null" }, "repeats": { "type": "null" } } }
+        }
+      ]
+    },
+    "skip": {
+      "description": "Why the direct step or a helper entry is not a step, or, for kind helpers, that there was nothing to try at all.",
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["direct", "helper", "helpers"] },
+        "machine": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "action": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "reason": { "enum": ["no-mac", "ambiguous", "unplaced", "elsewhere", "missing", "self", "duplicate", "asleep", "unusable", "no-action", "held", "none"] }
+      },
+      "required": ["kind", "machine", "action", "reason"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "helper" } } },
+          "then": { "properties": { "machine": { "type": "string" }, "action": { "type": "string" }, "reason": { "enum": ["missing", "self", "duplicate", "asleep", "unusable", "no-action", "held"] } } },
+          "else": { "properties": { "machine": { "type": "null" }, "action": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "direct" } } },
+          "then": { "properties": { "reason": { "enum": ["no-mac", "ambiguous", "unplaced", "elsewhere"] } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "helpers" } } },
+          "then": { "properties": { "reason": { "const": "none" } } }
+        }
+      ]
+    },
+    "plansCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": {
+            "documentText": {
+              "description": "fixtures/controller-document.wake-defaults.json.",
+              "type": "string"
+            },
+            "target": { "$ref": "#/$defs/id" },
+            "here": {
+              "description": "This device's addresses, a.b.c.d/length or a.b.c.d, and the site the person said it is on.",
+              "type": "object",
+              "properties": {
+                "addresses": { "type": "array", "items": { "type": "string" } },
+                "currentSite": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+              },
+              "required": ["addresses", "currentSite"],
+              "additionalProperties": false
+            },
+            "helpers": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/helperState" }
+            },
+            "holds": {
+              "description": "The wake holds this device recorded for the target.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "helper": { "$ref": "#/$defs/id" },
+                  "action": { "$ref": "#/$defs/id" }
+                },
+                "required": ["helper", "action"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["documentText", "target", "here", "helpers", "holds"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "matching": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+            "effective": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+            "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } },
+            "skipped": { "type": "array", "items": { "$ref": "#/$defs/skip" } },
+            "offerWakeFirst": { "type": "array", "items": { "$ref": "#/$defs/id" } }
+          },
+          "required": ["matching", "effective", "steps", "skipped", "offerWakeFirst"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    },
+    "readinessCase": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "vector-index.schema.json#/$defs/caseName" },
+        "purpose": { "$ref": "vector-index.schema.json#/$defs/purpose" },
+        "consumers": { "$ref": "vector-index.schema.json#/$defs/consumers" },
+        "tags": { "$ref": "vector-index.schema.json#/$defs/tags" },
+        "input": {
+          "type": "object",
+          "properties": { "sentAnything": { "type": "boolean" } },
+          "required": ["sentAnything"],
+          "additionalProperties": false
+        },
+        "expect": {
+          "type": "object",
+          "properties": {
+            "pollStartsMs": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+          },
+          "required": ["pollStartsMs"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "purpose", "consumers", "tags", "input", "expect"],
+      "additionalProperties": false
+    }
+  }
+}

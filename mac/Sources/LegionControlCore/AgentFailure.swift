@@ -7,9 +7,9 @@ import Foundation
 /// that may have reached it can never be retried, because "reboot" and "update" are not questions
 /// you get to ask twice, and a second one landing on a machine that already took the first is how a
 /// user loses work.
-enum Dispatch: Sendable, Equatable {
+enum Dispatch: String, Sendable, Equatable {
     /// The agent provably never ran: no route, refused, authentication rejected, host key refused,
-    /// or the interpreter itself was missing.
+    /// the interpreter itself was missing, or this app refused to write the command line at all.
     case never
     /// It may or may not have run. A timeout and a link that dropped mid-session both land here.
     case unknown
@@ -57,6 +57,41 @@ struct AgentFailure: Error, Sendable, Equatable {
         case unreadableOutput
         /// The agent replied cleanly and what it said was that it had failed.
         case agentFailed
+        /// This app refused to send the command: a line its grammar cannot carry, or an address
+        /// it does not dial. Nothing left this Mac.
+        case badRequest
+
+        /// Whether the failure is about the address rather than about the command, so the other
+        /// systems on that address are not worth trying (section 15.5).
+        var isRouteLevel: Bool {
+            switch self {
+            case .hostUnreachable, .connectionRefused, .authenticationFailed,
+                 .hostKeyChanged, .hostKeyUnknown, .launchFailed, .noRoute, .timedOut, .linkLost:
+                true
+            case .interpreterMissing, .agentMissing, .unreadableOutput, .agentFailed, .badRequest:
+                false
+            }
+        }
+
+        /// The kind's name in the contract and the shared vectors.
+        var contractName: String {
+            switch self {
+            case .noRoute: "noRoute"
+            case .launchFailed: "launchFailed"
+            case .hostUnreachable: "hostUnreachable"
+            case .connectionRefused: "connectionRefused"
+            case .authenticationFailed: "authenticationFailed"
+            case .hostKeyChanged: "hostKeyChanged"
+            case .hostKeyUnknown: "hostKeyUnknown"
+            case .timedOut: "timedOut"
+            case .linkLost: "linkLost"
+            case .interpreterMissing: "interpreterMissing"
+            case .agentMissing: "agentMissing"
+            case .unreadableOutput: "unreadableOutput"
+            case .agentFailed: "agentFailed"
+            case .badRequest: "badRequest"
+            }
+        }
     }
 
     var kind: Kind
@@ -68,6 +103,9 @@ struct AgentFailure: Error, Sendable, Equatable {
     /// Raw text worth showing under the sentence: ssh's own words, exit codes, stack frames.
     var detail: String
     var dispatch: Dispatch
+    /// What to change, when the evidence points at one likely cause, said instead of the kind's own
+    /// sentence.
+    var hint: String?
 
     init(_ kind: Kind, system: SystemConfig? = nil, route: String? = nil, detail: String = "", dispatch: Dispatch) {
         self.kind = kind
@@ -79,6 +117,7 @@ struct AgentFailure: Error, Sendable, Equatable {
 
     /// One sentence naming what went wrong, in terms of the thing that has to change.
     func message(machine: String) -> String {
+        if let hint { return hint }
         switch kind {
         case .noRoute:
             return "There is no ssh host configured for \(machine)."
@@ -106,6 +145,8 @@ struct AgentFailure: Error, Sendable, Equatable {
             return "The agent replied with something unreadable."
         case .agentFailed:
             return "The control agent reported a problem. \(detail)"
+        case .badRequest:
+            return "Nothing was sent to \(machine): this app will not write that command line or dial that address."
         }
     }
 
@@ -136,88 +177,7 @@ struct AgentFailure: Error, Sendable, Equatable {
         case .agentMissing: "agent not installed"
         case .unreadableOutput: "unreadable reply"
         case .agentFailed: "agent reported a failure"
+        case .badRequest: "not sent"
         }
-    }
-}
-
-/// Reads ssh's own diagnostics.
-///
-/// ssh reserves exit status 255 for its own failures and puts the reason in one line of stderr. That
-/// line is the only evidence there is for whether anything ran on the far side, so it is worth
-/// reading properly rather than folding into a single "unreachable".
-enum SSHDiagnosis {
-    /// What the text says, or nil when it says nothing recognisable.
-    static func classify(_ text: String) -> (kind: AgentFailure.Kind, dispatch: Dispatch)? {
-        let lower = text.lowercased()
-
-        // Host key first: it is the one failure that looks alarming and has a mundane cause on a
-        // dual boot machine, and its text also contains "permission denied" in some versions.
-        if lower.contains("remote host identification has changed")
-            || lower.contains("host key verification failed")
-            || lower.contains("key_verify failed") {
-            return (.hostKeyChanged, .never)
-        }
-        if lower.contains("no matching host key type")
-            || lower.contains("host key for") && lower.contains("has changed") {
-            return (.hostKeyChanged, .never)
-        }
-        if lower.contains("no rsa host key is known")
-            || lower.contains("host key is not known")
-            || lower.contains("no ed25519 host key is known") {
-            return (.hostKeyUnknown, .never)
-        }
-
-        if lower.contains("permission denied")
-            || lower.contains("too many authentication failures")
-            || lower.contains("no supported authentication methods")
-            || lower.contains("authentication failed") {
-            return (.authenticationFailed, .never)
-        }
-
-        if lower.contains("connection refused") {
-            return (.connectionRefused, .never)
-        }
-        if lower.contains("no route to host")
-            || lower.contains("network is unreachable")
-            || lower.contains("could not resolve hostname")
-            || lower.contains("name or service not known")
-            || lower.contains("nodename nor servname provided")
-            || lower.contains("operation timed out")
-            || lower.contains("connection timed out")
-            || lower.contains("host is down") {
-            return (.hostUnreachable, .never)
-        }
-
-        // A session that was up and went away. This one is genuinely ambiguous: it is what a reboot
-        // looks like from here, and it is also what a flaky link looks like.
-        if lower.contains("connection closed by remote host")
-            || lower.contains("connection reset by peer")
-            || lower.contains("client_loop: send disconnect")
-            || lower.contains("broken pipe")
-            || lower.contains("connection to") && lower.contains("closed by remote host") {
-            return (.linkLost, .unknown)
-        }
-
-        return nil
-    }
-
-    /// The markers that prove the interpreter itself was never found, which is the one remote
-    /// failure that is safe to treat as "nothing ran".
-    static func interpreterIsMissing(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        let markers = [
-            "command not found", "unknown command", "not recognized as the name",
-            "is not recognized as an internal", "commandnotfoundexception",
-            "no such file or directory", "cannot find path"
-        ]
-        return markers.contains { lower.contains($0) }
-    }
-
-    /// The markers that prove the interpreter ran and the agent script was not where the config
-    /// said it would be.
-    static func agentIsMissing(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        let markers = ["cannot find module", "module_not_found", "err_module_not_found"]
-        return markers.contains { lower.contains($0) }
     }
 }

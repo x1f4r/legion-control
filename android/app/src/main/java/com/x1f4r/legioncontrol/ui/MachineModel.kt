@@ -6,6 +6,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentAction
+import com.x1f4r.legioncontrol.agent.AgentDeploymentPath
 import com.x1f4r.legioncontrol.agent.AgentStatus
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.DoctorReport
@@ -348,7 +349,7 @@ class MachineModel(
     /** What this machine's last handover of the setup did, while that is still news. */
     val setupNote: String? get() = setup.noteFor(machine.id, now)
 
-    val actions: List<AgentAction> get() = status?.actions.orEmpty().filter { !it.id.isNullOrBlank() }
+    val actions: List<AgentAction> get() = runnableActions(status?.actions)
 
     /** Every change this app has asked this machine for, newest first. */
     val history: List<OperationRecord> get() = operations.forMachine(machine.id)
@@ -670,7 +671,7 @@ class MachineModel(
             }
 
             val failure = outcome.exceptionOrNull()
-            if (failure?.dispatchStage == com.x1f4r.legioncontrol.agent.DispatchStage.AMBIGUOUS ||
+            if (failure?.dispatchStage?.mayHaveRun == true ||
                 (result != null && (result.op?.state in listOf("queued", "running") || result.effectiveAction == null))) {
                 val settled = if (helperClient.abilities.speaksV3) {
                     helperClient.operation(operationId, waitSeconds = 20).getOrNull()
@@ -1197,7 +1198,17 @@ class MachineModel(
         }
     }
 
+    /**
+     * How a signed agent would be put on this machine, or why it would not.
+     *
+     * From the reading on screen, so the install action is offered only when it can work and says
+     * why when it cannot. The wiring decides again from its own last status before anything is sent.
+     */
+    val agentDeployment: AgentDeploymentPath
+        get() = agentDeploymentFor(machine, abilities, status, link)
+
     fun requestAgentInstall(version: String) {
+        if (refuseAgentInstall()) return
         dialog = Dialog.ConfirmAgentInstall(machine.name, version, abilities.agentVersion)
     }
 
@@ -1209,6 +1220,7 @@ class MachineModel(
             statusDetail = fleet.agentBundleProblem
             return
         }
+        if (refuseAgentInstall()) return
         change(
             task = Task.AGENT,
             label = "Installing the control agent",
@@ -1217,6 +1229,15 @@ class MachineModel(
         ) { id ->
             client.installAgent(bundle, id)
         }
+    }
+
+    /** Says why the agent cannot be installed from here, when it cannot. True when it said so. */
+    private fun refuseAgentInstall(): Boolean {
+        val unavailable = agentDeployment as? AgentDeploymentPath.Unavailable ?: return false
+        statusLine = "The control agent cannot be installed from here."
+        statusIsError = true
+        statusDetail = unavailable.reason
+        return true
     }
 
     // MARK: - Plumbing
@@ -1390,7 +1411,7 @@ interface FleetContext {
     val deviceName: String
 
     /** The signed agent bundle this build carries, or null with a reason. */
-    val agentBundle: java.io.File?
+    val agentBundle: com.x1f4r.legioncontrol.agent.SignedTarball?
     val agentBundleProblem: String?
 
     fun client(machineId: String): MachineClient?
@@ -1451,3 +1472,35 @@ fun freshness(checkedAt: Long?, now: Long): String {
         }
     }
 }
+
+/**
+ * How a signed agent would be put on [machine], from the reading on screen.
+ *
+ * The system is read off [status] itself, as the wiring reads it before it sends anything, rather
+ * than off the link, which names none unless it is online. The link only says whether [status] is
+ * still the machine's word. A status that names one of this machine's systems is what puts the
+ * link online, so one that does while the link is anything else is from before a failure: the
+ * machine is not answering now, and that is the reason given, not that its agent never said which
+ * system it is. A status that names no system is current, and that is what it says.
+ */
+internal fun agentDeploymentFor(
+    machine: Machine,
+    abilities: AgentAbilities,
+    status: AgentStatus?,
+    link: LinkState,
+): AgentDeploymentPath {
+    val system = status?.let { machine.resolveSystem(it.systemId, it.systemName, it.osName) }
+    if (system != null && link !is LinkState.Online) {
+        return AgentDeploymentPath.Unavailable(AgentDeploymentPath.READ_STATUS_FIRST)
+    }
+    return AgentDeploymentPath.decide(abilities, status, system)
+}
+
+/**
+ * The actions an agent offered, as far as this app can send them back.
+ *
+ * An id goes straight onto a command line when it is run, so one that is not a token is left out
+ * here rather than offered as a button that can only fail.
+ */
+internal fun runnableActions(offered: List<AgentAction>?): List<AgentAction> =
+    offered.orEmpty().filter { Contract.isToken(it.id) }

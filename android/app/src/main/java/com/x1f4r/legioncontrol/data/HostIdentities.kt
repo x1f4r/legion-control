@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.data
 
+import com.x1f4r.legioncontrol.agent.Addresses
 import kotlinx.serialization.Serializable
 import java.nio.ByteBuffer
 import java.util.Base64
@@ -44,8 +45,15 @@ data class HostTrustApproval(
 fun HostIdentities.snapshot(address: String, legacy: List<String>) =
     HostTrustSnapshot(revision, endpoints.firstOrNull { it.address == address }?.systems.orEmpty(), legacy)
 
-/** Pure enrollment transaction. Shared topology never participates in this decision. */
+/**
+ * Pure enrollment transaction. Shared topology never participates in this decision.
+ *
+ * Only an address made of a checked host and port is ever keyed (contract section 15.6). A host
+ * string that never passed the dial grammar, `victim.example,*` being the classic, is never one a
+ * key is written down for, whatever the dialog that asked was shown.
+ */
 fun HostIdentities.approve(address: String, offeredBlob: String, legacy: List<String>, approval: HostTrustApproval): HostIdentities {
+    require(Addresses.isPinnable(address)) { "$address is not a host and port this app pins a key for." }
     val before = snapshot(address, legacy)
     val offered = HostIdentityKey.fromBlob(offeredBlob)
     if (before.systems.any { it.id == approval.selectedSystemId && offered in it.keys }) return this
@@ -75,6 +83,7 @@ fun HostIdentities.approve(address: String, offeredBlob: String, legacy: List<St
 
 /** A separate local settings action reserves OS identities without approving any offered key. */
 fun HostIdentities.configureSystems(address: String, systems: List<HostIdentitySystem>, expectedRevision: Long): HostIdentities {
+    require(Addresses.isPinnable(address)) { "$address is not a host and port this app pins a key for." }
     require(revision == expectedRevision) { "Host trust changed. Reopen local trust settings." }
     require(systems.isNotEmpty() && systems.map { it.id }.distinct().size == systems.size)
     require(systems.all { it.keys.isEmpty() && it.id.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,63}")) })

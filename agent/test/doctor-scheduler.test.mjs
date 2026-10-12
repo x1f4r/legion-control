@@ -7,9 +7,9 @@ import { linuxSchedulerCommand, runDoctor } from '../src/doctor.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { withHome, writeConfig } from './helpers.mjs';
 
-const base = '/home/x1f4r/.legion-control';
-const node = '/home/x1f4r/.local/opt/node-v24.20.0-linux-arm64/bin/node';
-const home = '/home/x1f4r';
+const base = '/home/me/.legion-control';
+const node = '/home/me/.local/opt/node-v24.20.0-linux-arm64/bin/node';
+const home = '/home/me';
 const inspect = (command) => linuxSchedulerCommand(`[Service]\nExecStart=${command}\n`, { base, node, home });
 
 test('doctor accepts the installed same-base stable launcher cycle', () => {

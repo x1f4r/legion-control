@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "interrupted",
   "message": "the worker holding this operation is gone and the installed version is 0.0.31-nightly.20260901, so the install did not complete; t3 was started again and left on the version it had",
+  "outcome": "unknown",
   "action": "interrupted",
   "service": "t3",
   "from": "0.0.31-nightly.20260901",
@@ -21,8 +22,8 @@
     "mode": "manual",
     "initiator": {
       "client": "desktop",
-      "device": "legion-cachy",
-      "user": "x1f4r"
+      "device": "legion-linux",
+      "user": "me"
     },
     "state": "finished",
     "phase": "done",
@@ -42,7 +43,8 @@
       "from": "0.0.31-nightly.20260901",
       "to": "0.0.31-nightly.20260901",
       "exitCode": null,
-      "output": null
+      "output": null,
+      "outcome": "unknown"
     },
     "log": [
       {
@@ -62,9 +64,10 @@
         "line": "recovery: ensured t3-code.service is up"
       }
     ],
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.1.0",
     "systemId": "linux",
     "from": "0.0.31-nightly.20260901",
-    "to": "0.0.32-nightly.20260902"
+    "to": "0.0.32-nightly.20260902",
+    "outcome": "unknown"
   }
 }

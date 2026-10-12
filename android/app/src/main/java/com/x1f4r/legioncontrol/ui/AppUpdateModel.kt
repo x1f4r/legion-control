@@ -8,6 +8,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.data.SecretStore
 import com.x1f4r.legioncontrol.net.AppUpdates
+import com.x1f4r.legioncontrol.net.UpdateSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -39,13 +40,15 @@ class AppUpdateModel(
      * Where to look. Read on every check rather than once, because the configuration that names it
      * can be applied while the app is open, and the next check has to go to the new address.
      */
-    private val repo: () -> String,
+    private val source: () -> UpdateSource,
 ) {
     private val app = context.applicationContext
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler("AppUpdateModel"))
 
     private val schedule = UpdateCheckSchedule()
     private var foregroundJob: Job? = null
+    private var downloadJob: Job? = null
     private var checkedRepo: String? = null
     private val repositoryEpoch = UpdateRepositoryEpoch(repo())
     private var downloadOrigin: UpdateRepositoryEpoch.Ticket? = null
@@ -67,20 +70,29 @@ class AppUpdateModel(
     var note: String? by mutableStateOf(null)
         private set
 
+    /** Why the setup's repository is not the one being checked, when it is not. */
+    var repositoryNote: String? by mutableStateOf(source().note)
+        private set
+
     val newerAppAvailable: Boolean
         get() = check is AppUpdates.Check.Available
 
     /** Setup changes invalidate offers immediately, including while the activity is paused. */
-    fun observeRepositories(changes: Flow<String>) {
+    fun observeRepositories(changes: Flow<UpdateSource>) {
         scope.launch {
             changes.distinctUntilChanged().collect {
-                if (syncRepository(it) && foregroundJob != null) recheck()
+                repositoryNote = it.note
+                if (syncRepository(it.repository) && foregroundJob != null) recheck()
             }
         }
     }
 
+    private fun repo(): String = source().repository
+
     private fun syncRepository(repository: String = repo()): Boolean {
         if (!repositoryEpoch.change(repository)) return false
+        // A download from the old source would only be thrown away when it finished.
+        downloadJob?.cancel()
         checkedRepo = null
         check = null
         discardDownload()
@@ -127,7 +139,7 @@ class AppUpdateModel(
         downloading = true
         progress = 0
         failure = null
-        scope.launch {
+        downloadJob = scope.launch {
             try {
                 val result = AppUpdates.download(app, release) { if (isCurrent(origin)) progress = it }
                 if (!isCurrent(origin)) {
@@ -176,6 +188,7 @@ class AppUpdateModel(
 
     fun close() {
         stop()
+        downloadJob?.cancel()
         scope.cancel()
     }
 

@@ -1,6 +1,6 @@
 {
   "name": "legionctl",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "description": "Legion Control agent: service lifecycle, busy detection, durable operations, boot switching and sleep for one system",
@@ -10,6 +10,9 @@
   },
   "engines": {
     "node": ">=24.0.0"
+  },
+  "legionControl": {
+    "agentFloor": "3.1.0"
   },
   "scripts": {
     "check": "node scripts/check-syntax.mjs",

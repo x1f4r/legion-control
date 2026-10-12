@@ -29,7 +29,7 @@ class ControllerDocumentTest {
           "machines": [
             {
               "id": "pi",
-              "name": "Atlas",
+              "name": "Beacon",
               "aFieldFromTheFuture": true,
               "endpoints": [
                 { "id": "lan", "kind": "lan", "host": "10.0.0.5", "port": 22, "user": "me", "extra": 1 }
@@ -45,7 +45,7 @@ class ControllerDocumentTest {
     @Test
     fun `an edit keeps every key it does not understand`() {
         val document = ControllerDocument.parse(withUnknownKeys).getOrThrow()
-        val edited = document.editMachine("pi") { it.withText("name", "Atlas the Pi") }
+        val edited = document.editMachine("pi") { it.withText("name", "Beacon the Pi") }
 
         val root = edited.root
         assertNotNull("a top-level key nobody knows has to survive", root["somethingNewerClientsUnderstand"])
@@ -55,7 +55,7 @@ class ControllerDocumentTest {
         )
 
         val machine = root["machines"]!!.jsonArray[0].jsonObject
-        assertEquals("Atlas the Pi", machine["name"]!!.jsonPrimitive.content)
+        assertEquals("Beacon the Pi", machine["name"]!!.jsonPrimitive.content)
         assertEquals(true, machine["aFieldFromTheFuture"]!!.jsonPrimitive.content.toBoolean())
         assertEquals(
             1,
@@ -71,7 +71,7 @@ class ControllerDocumentTest {
     fun `an edit descends from what it was made from`() {
         val base = ControllerDocument.parse(withUnknownKeys).getOrThrow()
         val edited = base
-            .editMachine("pi") { it.withText("name", "Atlas the Pi") }
+            .editMachine("pi") { it.withText("name", "Beacon the Pi") }
             .asEditOf(base, deviceName = "Pixel", now = "2026-09-05T10:00:00Z")
 
         val identity = edited.identity!!
@@ -93,7 +93,7 @@ class ControllerDocumentTest {
     fun `the ancestry never grows past its cap`() {
         var document = ControllerDocument.parse(withUnknownKeys).getOrThrow()
         repeat(40) { index ->
-            val next = document.editMachine("pi") { it.withText("name", "Atlas $index") }
+            val next = document.editMachine("pi") { it.withText("name", "Beacon $index") }
             document = next.asEditOf(document, "Pixel", "2026-09-05T10:00:00Z")
         }
         assertEquals(MAX_LINEAGE, document.identity!!.lineage.size)

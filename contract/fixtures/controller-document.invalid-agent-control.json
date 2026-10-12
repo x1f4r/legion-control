@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "controller": {
+    "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+    "revision": 3,
+    "lineage": []
+  },
+  "machines": [
+    {
+      "id": "tower",
+      "name": "Tower",
+      "endpoints": [
+        {
+          "id": "lan",
+          "kind": "lan",
+          "host": "desk-tower.local",
+          "user": "me",
+          "port": 22
+        }
+      ],
+      "systems": [
+        {
+          "id": "linux",
+          "name": "Linux",
+          "platform": "linux",
+          "shell": "posix",
+          "agent": [
+            "node",
+            "/home/me/.legion-control/bin/launcher.mjs\u0007"
+          ]
+        }
+      ]
+    }
+  ]
+}

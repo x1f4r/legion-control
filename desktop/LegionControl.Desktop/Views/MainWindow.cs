@@ -733,7 +733,7 @@ public sealed class MainWindow : Window
             if (installationBase is null) return;
         }
         var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, installationBase: installationBase);
-        Sheets.Text(this, "Agent", outcome.Sentence_);
+        Sheets.Text(this, "Agent", outcome.Report);
         await machine.RefreshAsync();
         if (outcome is not AgentInstallOutcome.Installed || system is null || installationBase is null || _app.Config.Document is not { } document) return;
         var argv = system.Agent.ToArray();

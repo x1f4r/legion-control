@@ -42,6 +42,12 @@ struct MacSection: View {
             if let note = mac.note, !note.isEmpty {
                 Text(note).font(.callout).foregroundStyle(mac.noteIsError ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
                     .lineLimit(2).textSelection(.enabled)
+                // What an action printed, and the agent's own words about a failure, sit behind the
+                // line rather than in it. The window's status bar offers them only while this device
+                // spoke last, so the section that ran the action keeps its own way to them.
+                if mac.noteDetail?.isEmpty == false {
+                    Button("Details") { panel = "Result" }.buttonStyle(.link).font(.callout)
+                }
             }
         }
         .onChange(of: model.dialog?.id) { _, id in
@@ -55,6 +61,9 @@ struct MacSection: View {
                 switch panel {
                 case "Settings": deviceSection; appSettings
                 case "Schedule": schedule
+                case "Result":
+                    if let note = mac.note { Text(note).textSelection(.enabled) }
+                    if let detail = mac.noteDetail { Text(detail).font(.callout.monospaced()).textSelection(.enabled) }
                 case "Activity":
                     Text(model.operations.exportText()).font(.callout.monospaced()).textSelection(.enabled)
                     Button("Export operation history") { exportHistory() }

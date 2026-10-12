@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "not-installed",
   "message": "demo is not installed on this machine, so there was nothing to update",
+  "outcome": "failed",
   "action": "failed",
   "service": "demo",
   "from": null,

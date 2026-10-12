@@ -23,6 +23,7 @@ import { spawnDetached } from './detached.mjs';
 import { fileURLToPath } from 'node:url';
 import { checkWorkerModules } from './selftest-modules.mjs';
 import {
+  AGENT_METADATA_PROBLEM,
   AGENT_VERSION,
   basePath,
   configPath,
@@ -38,13 +39,17 @@ import {
   envelope,
   isValidOperationId,
   isValidToken,
+  OK_REPLY_ACTIONS,
+  outcomeOf,
   parseDuration,
+  producedOutcome,
   REASON,
   resolveDeadline,
 } from './contract.mjs';
 import { runAction } from './actions.mjs';
 import { MAX_CONTROLLER_BYTES, readController, readControllerMeta, storeController } from './controller.mjs';
 import { buildBundle, runDoctor } from './doctor.mjs';
+import { reportedFloor } from './floor.mjs';
 import { acquireOperationLock } from './lock.mjs';
 import { log, readLogLines } from './log.mjs';
 import {
@@ -53,6 +58,7 @@ import {
   currentInitiator,
   deriveState,
   listOperations,
+  missingOperation,
   newOperationId,
   queueOperation,
   readOperation,
@@ -70,7 +76,7 @@ import { buildStatus, DEFAULT_STATUS_BUDGET_MS } from './status.mjs';
 import { serviceState } from './state.mjs';
 import { checkBundle, resolveBootstrapLayout, runBootstrapInstall, runRollback, runSelfUpdate } from './selfupdate.mjs';
 import { runRestart, runUpdate } from './update.mjs';
-import { authorize } from './dispatch.mjs';
+import { authorize, parseCommandLine } from './dispatch.mjs';
 
 /**
  * The command table. `flags` stand alone, `options` take a value, `positional`
@@ -122,7 +128,7 @@ const COMMANDS = {
     summary: 'the stored setup document; "config set" replaces it from stdin, "config meta" reads its identity',
   },
   'self-update': {
-    flags: ['stdin', 'install', 'rollback', 'check'],
+    flags: ['stdin', 'install', 'rollback', 'check', 'allow-downgrade'],
     options: ['from', 'op'],
     mutates: true,
     summary: 'replace this agent from a signed bundle',
@@ -201,13 +207,9 @@ function ok(payload) {
   return { payload: wrap({ ok: true, ...payload }), exitCode: 0 };
 }
 
-/**
- * A refusal. `exitCode` is 0 for the answers that are not errors — deferred,
- * queued, noop, conflict — because a client scripting against exit codes should
- * not have to treat "the machine is busy" as a failure.
- */
-function refuse(reasonCode, message, extra = {}, { exitCode = 1 } = {}) {
-  return { payload: wrap({ ok: false, reasonCode, message, ...extra }), exitCode };
+/** A refusal: the command did not do what was asked, and says which closed reason stopped it. */
+function refuse(reasonCode, message, extra = {}) {
+  return { payload: wrap({ ok: false, reasonCode, message, ...extra }), exitCode: 1 };
 }
 
 function badArgument(message, { command = null, argument = null, accepts = null } = {}) {
@@ -219,21 +221,41 @@ function badArgument(message, { command = null, argument = null, accepts = null 
   });
 }
 
-/** Every mutating reply carries its action; these actions are answers, not errors. */
-const NON_ERROR_ACTIONS = new Set(['deferred', 'queued', 'noop', 'conflict', 'accepted', 'armed', 'skipped', 'checked', 'already-running']);
-
-function mutationReply(result, extra = {}) {
+/**
+ * The reply to a mutation, in the shape every mutating verb shares.
+ *
+ * Rule 7 decides `ok` and the exit code together: deferring, queueing, doing
+ * nothing for a stated reason, being refused by a lock that somebody else
+ * holds and being told the work is already under way are answers, not errors,
+ * so they are `ok: true` and exit 0 whatever the work itself returned. A
+ * client scripting against exit codes should not have to treat "the machine is
+ * busy" as a failure.
+ *
+ * The outcome (contract section 5.6) is the reducer's for the reply itself,
+ * lowered to unknown only where the work said it failed in a way that may
+ * have changed the machine. A reply that changes nothing, a bundle check,
+ * states none. And an --op id already bound to another request is not a
+ * mutation reply at all: nothing was attempted, so it is refused about that
+ * argument.
+ */
+function mutationReply(result, extra = {}, { changes = true } = {}) {
+  if (result.refusal) return badArgument(result.message, result.refusal);
+  const ok = result.ok === true || OK_REPLY_ACTIONS.has(result.action);
+  const reasonCode = result.reasonCode ?? null;
   const payload = wrap({
-    ok: result.ok === true,
-    reasonCode: result.reasonCode ?? null,
+    ok,
+    reasonCode,
     message: result.message ?? '',
+    ...(changes ? { outcome: producedOutcome({ ok, action: result.action, reasonCode, outcome: result.outcome }) } : {}),
     action: result.action,
     ...(result.replayed === true ? { replayed: true } : {}),
     ...(Array.isArray(result.notes) && result.notes.length > 0 ? { notes: result.notes } : {}),
     ...extra,
+    // Work that is already running is followed exactly like work just
+    // accepted, and the record says whether a detached worker owns it.
+    ...(result.action === 'already-running' ? { detached: result.detached === true } : {}),
   });
-  const exitCode = result.ok === true || NON_ERROR_ACTIONS.has(result.action) ? 0 : 1;
-  return { payload, exitCode };
+  return { payload, exitCode: ok ? 0 : 1 };
 }
 
 // ---------------------------------------------------------------------------
@@ -355,19 +377,25 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
     expiresAt: ttl.expiresAt,
   });
 
-  if (queued.conflict) {
-    return refuse(queued.reasonCode ?? REASON.badArgument, queued.error, { action: 'conflict', op: wireRecord(queued.record) }, { exitCode: 0 });
-  }
+  // An id already bound to another request is a bad --op, never a replay and
+  // never a conflict to wait out (contract section 5.5).
+  if (queued.conflict) return badArgument(queued.error, { command: kind, argument: '--op' });
   if (!queued.ok) {
-    return refuse(REASON.internal, `the request could not be recorded: ${queued.error}`, { action: 'failed' });
+    return refuse(REASON.internal, `the request could not be recorded: ${queued.error}`, { command: kind, argument: null, error: queued.error });
   }
   if (queued.replay) {
     const record = queued.record;
     return mutationReply({
-      ...(record.state === 'finished' ? record.result : {
+      ...(record.state === 'finished' ? record.result : record.state === 'queued' ? {
         ok: true,
-        action: record.state === 'queued' ? 'queued' : 'accepted',
-        message: `this request is already ${record.state} as ${record.id}`,
+        action: 'queued',
+        message: `this request is already queued as ${record.id}`,
+      } : {
+        ok: true,
+        action: 'already-running',
+        reasonCode: REASON.alreadyRunning,
+        detached: record.detached === true,
+        message: `this request is already running as ${record.id}; it was not started a second time`,
       }),
       replayed: true,
     }, {
@@ -426,7 +454,8 @@ async function commandBusy(config, options) {
   // than repeated under a second key.
   // A machine with NO services answers in the same shape rather than with an
   // empty list, because "there is nothing here to be busy with" is an answer
-  // about the machine, not about a service.
+  // about the machine, not about a service. Like a declared "none" it is
+  // monitored: nothing is waiting for somebody to describe a probe.
   if (entries.length <= 1) {
     const only =
       entries.length === 1
@@ -434,7 +463,7 @@ async function commandBusy(config, options) {
         : {
             busy: false,
             unknown: false,
-            monitored: false,
+            monitored: true,
             reason: 'no services are configured',
             evidence: 'none',
             checkedAt: new Date().toISOString(),
@@ -599,9 +628,11 @@ async function commandCycle(config, flags, options) {
     opId: options.get('op') ?? null,
   });
 
+  // A dry run changes nothing and opens no record, so it is `skipped`: a
+  // client must never read a preview as a cycle that ran.
   if (flags.has('dry-run')) {
     return ok({
-      action: 'cycled',
+      action: 'skipped',
       dryRun: true,
       message: `${result.children.filter((child) => child.wouldRun).length} of ${result.children.length} services would be updated now`,
       op: null,
@@ -726,7 +757,13 @@ async function commandPolicy(config, positional, options) {
     return refuse(
       REASON.badArgument,
       `the policy patch is not usable: ${validated.errors.map((entry) => `${entry.path}: ${entry.message}`).join('; ')}`,
-      { command: 'policy', problems: validated.errors, error: 'invalid policy patch' },
+      {
+        command: 'policy',
+        // In the one problem shape every refusal uses, so a client lists them
+        // the same way whichever command was refused.
+        problems: validated.errors.map((entry) => ({ level: 'error', path: entry.path, message: entry.message, fix: null })),
+        error: 'invalid policy patch',
+      },
     );
   }
 
@@ -860,14 +897,10 @@ async function commandOp(config, positional, options) {
 
   for (;;) {
     const record = readOperation(id);
-    if (!record) {
-      return refuse(REASON.badArgument, `there is no operation ${id} on this machine`, {
-        id,
-        op: null,
-        command: 'op',
-        error: `unknown operation ${id}`,
-      });
-    }
+    // Not an error about the machine or the argument: the request never
+    // arrived, or it was pruned. `op: null` is what a client keys on, and a
+    // client that retries an id it was never told about would retry forever.
+    if (!record) return refuse(REASON.notConfigured, missingOperation(id), { id, op: null });
     // Derived, not written: status and op both promise to change nothing, and a
     // record whose process is plainly gone must not be reported as still running.
     const derived = deriveState(record, { systemId: config.system.id });
@@ -890,6 +923,9 @@ function commandCancel(positional) {
   if (!isValidOperationId(id)) return badArgument(`${JSON.stringify(id)} is not an operation id`, { command: 'cancel', argument: id });
 
   const result = cancelOperation(id);
+  if (result.missing) {
+    return refuse(REASON.notConfigured, result.message, { command: 'cancel', argument: id, error: `no operation ${id} on this machine` });
+  }
   return mutationReply(result, { id, op: result.op ? wireRecord(readOperation(id)) : null });
 }
 
@@ -916,9 +952,10 @@ function commandLogs(options) {
     if (!isValidOperationId(opId)) return badArgument(`${JSON.stringify(opId)} is not an operation id`, { command: 'logs', argument: '--op' });
     const record = readOperation(opId);
     if (!record) {
-      return refuse(REASON.badArgument, `there is no operation ${opId} on this machine`, {
+      return refuse(REASON.notConfigured, missingOperation(opId), {
         command: 'logs',
-        error: `unknown operation ${opId}`,
+        argument: '--op',
+        error: `no operation ${opId} on this machine`,
       });
     }
     const lines = (record.log ?? []).slice(-requested);
@@ -990,10 +1027,16 @@ async function commandConfig(positional, flags, options) {
 
   if (sub === undefined) {
     const stored = readController();
+    // `raw` is the stored canonical text, the exact bytes `hash` covers, and it
+    // is what a client hashes and adopts. `controller` is the same document
+    // parsed, kept for older clients; re-serialising it can never be relied on
+    // to give the same bytes back.
+    const raw = stored.document ? stored.text : null;
     const payload = {
       controller: stored.document,
+      raw,
       hash: stored.hash,
-      bytes: stored.raw ? Buffer.byteLength(stored.raw, 'utf8') : 0,
+      bytes: raw ? Buffer.byteLength(raw, 'utf8') : 0,
       meta: stored.meta,
     };
     // A file that is there but unreadable is worth saying out loud: the hash is
@@ -1030,6 +1073,8 @@ async function commandConfig(positional, flags, options) {
   // against every other mutation. Without this a `config set` landing in the
   // middle of an install could be read half-written by the update that is
   // running, and two concurrent pushes could interleave their revisions.
+  // Refused by the lock, the document was not stored: that is exit 1, with the
+  // outcome `deferred` telling the client it can push again later.
   const lock = acquireOperationLock({ kind: 'config', target: 'config set' });
   if (!lock.ok) {
     return refuse(lock.reasonCode ?? REASON.operationInProgress, lock.message, {
@@ -1039,7 +1084,7 @@ async function commandConfig(positional, flags, options) {
       revision,
       error: lock.message,
       ...(lock.conflictDetail ? { conflict: lock.conflictDetail } : {}),
-    }, { exitCode: 0 });
+    });
   }
 
   try {
@@ -1051,7 +1096,9 @@ async function commandConfig(positional, flags, options) {
         bytes: stored.bytes ?? 0,
         id,
         revision,
-        ...(stored.divergent ? { divergent: true } : {}),
+        // A controller-conflict is either two setups or two branches of one,
+        // and only the second is a merge, so it always says which.
+        ...(stored.reasonCode === REASON.controllerConflict ? { divergent: stored.divergent === true } : {}),
         ...(stored.current ? { current: stored.current } : {}),
         error: stored.error,
       });
@@ -1118,24 +1165,34 @@ async function commandSelfUpdate(config, flags, options) {
   if ((flags.has('stdin') && options.has('from')) || (flags.has('rollback') && (flags.has('stdin') || options.has('from')))) {
     return badArgument('self-update accepts one bundle source; --rollback does not take a bundle', { command: 'self-update' });
   }
+  // Going below the installed agent or the version floor is a decision only an
+  // unrestricted session makes (contract section 13). The dispatcher already
+  // refuses the flag; this holds however else a restricted session got here.
+  if (flags.has('allow-downgrade') && process.env.LEGIONCTL_RESTRICTED === '1') {
+    const message = 'self-update --allow-downgrade takes the agent below the installed one or the version floor, which a restricted key may not do';
+    return refuse(REASON.restricted, message, { command: 'self-update', argument: '--allow-downgrade', error: message });
+  }
+  const allowDowngrade = flags.has('allow-downgrade');
 
   if (flags.has('check')) {
     const result = await checkBundle({ from: options.get('from') ?? null, stdin: flags.has('stdin') });
     return mutationReply(result, {
       current: { version: AGENT_VERSION, contract: CONTRACT_VERSION },
+      floor: reportedFloor(),
       staged: null,
       previous: null,
       manifest: result.manifest,
       selfTest: null,
       op: null,
       available: result.ok,
-    });
+    }, { changes: false });
   }
 
   if (flags.has('rollback')) {
-    const result = await runRollback(config, operationOptions(flags, options));
+    const result = await runRollback(config, { ...operationOptions(flags, options), allowDowngrade });
     return mutationReply(result, {
       current: result.current,
+      floor: reportedFloor(),
       staged: result.staged ?? null,
       previous: result.previous ?? null,
       manifest: result.manifest ?? null,
@@ -1145,9 +1202,10 @@ async function commandSelfUpdate(config, flags, options) {
   }
 
   if (flags.has('install')) {
-    const result = await runBootstrapInstall(config, operationOptions(flags, options));
+    const result = await runBootstrapInstall(config, { ...operationOptions(flags, options), allowDowngrade });
     return mutationReply(result, {
       current: result.current,
+      floor: reportedFloor(),
       staged: result.staged ?? null,
       previous: result.previous ?? null,
       manifest: result.manifest ?? null,
@@ -1161,9 +1219,10 @@ async function commandSelfUpdate(config, flags, options) {
     return badArgument('self-update needs --from PATH, --stdin, --check or --rollback', { command: 'self-update' });
   }
 
-  const result = await runSelfUpdate(config, { from, stdin: flags.has('stdin'), ...operationOptions(flags, options) });
+  const result = await runSelfUpdate(config, { from, stdin: flags.has('stdin'), ...operationOptions(flags, options), allowDowngrade });
   return mutationReply(result, {
     current: result.current,
+    floor: reportedFloor(),
     staged: result.staged ?? null,
     previous: result.previous ?? null,
     manifest: result.manifest ?? null,
@@ -1176,44 +1235,58 @@ async function commandSelfUpdate(config, flags, options) {
 // Detached work
 // ---------------------------------------------------------------------------
 
-/** Open the record, hand it to a detached worker, and answer `accepted`. */
+/**
+ * Open the record, hand it to a detached worker, and answer `accepted`.
+ *
+ * Every answer keeps the command's own shape (`queuedShape`), whatever it is,
+ * so a client decodes one thing per verb: `--detach` is a way of asking, not a
+ * different reply.
+ */
 async function detachedRun(config, { kind, service = null, target = null, actionId = null, opId, force, mode }) {
   const id = opId ?? newOperationId();
+  const shape = queuedShape(kind, { service, target, actionId });
   const opened = beginOperation({ id, kind, service, target, actionId, force, mode,
     systemId: config.system.id, detached: true, queueRequested: false });
+  // An id already bound to another request is a bad --op (contract section 5.5).
+  if (opened.conflict) return badArgument(opened.error, { command: kind, argument: '--op' });
   if (!opened.ok) {
-    return refuse(opened.reasonCode ?? REASON.internal, opened.error, {
-      action: opened.conflict ? 'conflict' : 'failed', service, op: wireRecord(opened.record),
+    return refuse(REASON.internal, `the operation record could not be written (${opened.error}), so nothing was started`, {
+      command: kind, argument: null, error: opened.error,
     });
   }
   if (opened.replay) {
     const existing = opened.record;
     if (existing.state === 'finished') {
       return mutationReply({ ...existing.result, action: existing.result?.action ?? 'failed' }, {
-        service, op: wireRecord(existing), replayed: true,
+        ...shape,
+        ...(kind === 'update' ? { from: existing.result?.from ?? null, to: existing.result?.to ?? null } : {}),
+        ...(kind === 'run' ? { exitCode: existing.result?.exitCode ?? null, output: existing.result?.output ?? '' } : {}),
+        op: wireRecord(existing), replayed: true,
       });
     }
-    return ok({ action: 'accepted', reasonCode: REASON.alreadyRunning,
-      message: `operation ${id} is already ${existing.state}`, service,
-      detached: existing.detached === true, op: wireRecord(existing), replayed: true });
+    // Still running: the client follows it exactly as it would `accepted`, and
+    // `accepted` would claim this request started it.
+    return mutationReply({ ok: true, action: 'already-running', reasonCode: REASON.alreadyRunning, detached: existing.detached === true,
+      message: `operation ${id} is already ${existing.state}; it was not started a second time` }, {
+      ...shape, op: wireRecord(existing), replayed: true });
   }
 
   updateOperation(id, { launchPendingUntil: new Date(Date.now() + 30000).toISOString() });
   const started = await detachOperation(opened.record);
   if (!started.ok) {
     if (started.uncertain) {
-      return ok({ action: 'accepted', reasonCode: REASON.timedOut,
-        message: `the worker launch could not be confirmed: ${started.error}; query operation ${id} before retrying`,
-        service, detached: true, op: wireRecord(readOperation(id)) });
+      return mutationReply({ ok: true, action: 'accepted', reasonCode: REASON.timedOut,
+        message: `the worker launch could not be confirmed: ${started.error}; query operation ${id} before retrying` }, {
+        ...shape, detached: true, op: wireRecord(readOperation(id)) });
     }
     log(`could not detach ${kind}: ${started.error}; running it in this session instead`, kind);
     updateOperation(id, { detached: false });
     return { synchronous: { id, kind, service, target, actionId, force, mode } };
   }
   updateOperation(id, (record) => record.state === 'running' && record.pid === process.pid ? { pid: started.pid } : {});
-  return ok({ action: 'accepted',
-    message: `${kind} accepted as operation ${id}; ask "op ${id} --wait 20" for the result`,
-    service, detached: true, op: wireRecord(readOperation(id)) });
+  return mutationReply({ ok: true, action: 'accepted',
+    message: `${kind} accepted as operation ${id}; ask "op ${id} --wait 20" for the result` }, {
+    ...shape, detached: true, op: wireRecord(readOperation(id)) });
 }
 
 /** The detached worker. Never called by a client. */
@@ -1282,7 +1355,7 @@ async function commandVersion(flags, loaded) {
     // before swapping anything.
     const modules = [
       'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'boot.mjs', 'config.mjs', 'contract.mjs', 'controller.mjs',
-      'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'http.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
+      'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
       'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
       'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs',
       'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'scheduler.mjs',
@@ -1301,6 +1374,9 @@ async function commandVersion(flags, loaded) {
     const workers = checkWorkerModules(fileURLToPath(new URL('.', import.meta.url)));
     if (!workers.ok) failed.push(`worker modules: ${workers.error}`);
     else loadedCount += 2;
+    // The version every reply carries comes from package.json. A tree that
+    // cannot say which version it is must not replace one that can.
+    if (AGENT_METADATA_PROBLEM) failed.push(`package.json: ${AGENT_METADATA_PROBLEM}`);
     // The configuration is read but never written: a self-test that changed the
     // machine it is testing would be worse than no self-test.
     if (!loaded.ok && loaded.config === null) failed.push(`config.json: ${loaded.error}`);
@@ -1370,6 +1446,24 @@ async function dispatch(command, positional, flags, options, loaded) {
 }
 
 /**
+ * Whether an invocation asks for a change (contract section 5.6). Its reply
+ * carries `outcome` whatever happened, a refusal included, and nothing else's
+ * does: a dry run, a bundle check and every read change nothing, so there is
+ * no outcome to state.
+ */
+function mutatingInvocation(command, positional, flags) {
+  if (flags.has('help')) return false;
+  if (['update', 'restart', 'boot', 'sleep', 'run', 'cancel', 'auto-update'].includes(command)) return true;
+  if (command === 'cycle') return !flags.has('dry-run');
+  if (command === 'self-update') return !flags.has('check');
+  if (['config', 'policy', 'service-config'].includes(command)) return positional[0] === 'set';
+  return false;
+}
+
+/** Whether the reply being built answers a mutating invocation, for the last-resort handler in main(). */
+let answeringMutation = false;
+
+/**
  * Run one command, having already decided what it is.
  *
  * Split out from main() because `dispatch` re-enters it with the argv it parsed
@@ -1378,7 +1472,17 @@ async function dispatch(command, positional, flags, options, loaded) {
 async function execute(argv) {
   const { flags, options, positional } = parseArgs(argv);
   const command = positional.shift();
+  const mutating = mutatingInvocation(command, positional, flags);
+  if (mutating) answeringMutation = true;
+  const reply = await answer(command, positional, flags, options);
+  // A refusal answers a mutating invocation too, and a client decides on the
+  // outcome of every one, so the replies built without one get it here.
+  if (mutating) reply.payload.outcome ??= outcomeOf(reply.payload);
+  return reply;
+}
 
+/** The reply to one parsed invocation, before execute() adds what every reply to a mutation carries. */
+async function answer(command, positional, flags, options) {
   if (!command || flags.has('help')) {
     return { payload: wrap(helpPayload(command ? null : 'no command given')), exitCode: command ? 0 : 1 };
   }
@@ -1449,14 +1553,16 @@ async function execute(argv) {
     // The file is there and unusable. `config-missing` is reserved for a machine
     // that has no config at all, and that machine is inert rather than broken —
     // its mutations are refused by having nothing to act on, not by this gate.
+    // Nothing was attempted, so this is a refusal in the refusal shape rather
+    // than an action of the command.
     return refuse(
       REASON.configInvalid,
       `${command} was refused because config.json cannot be used: ${problems.map((problem) => `${problem.path}: ${problem.message}`).join('; ') || loaded.error}`,
       {
         command,
+        argument: null,
         problems,
         error: loaded.error,
-        action: 'failed',
       },
     );
   }
@@ -1464,7 +1570,8 @@ async function execute(argv) {
   const result = await dispatch(command, positional, flags, options, loaded);
 
   // A detach that could not spawn falls back to doing the work here, so the
-  // caller gets a real answer rather than a promise nobody will keep.
+  // caller gets a real answer rather than a promise nobody will keep. It keeps
+  // the command's own shape, like every other answer to it.
   if (result.synchronous) {
     const fallback = result.synchronous;
     const shared = { existingOpId: fallback.id, force: fallback.force, mode: fallback.mode };
@@ -1476,7 +1583,9 @@ async function execute(argv) {
       ran = await runAction(loaded.config, fallback.actionId, shared);
     }
     return mutationReply(ran, {
-      service: fallback.service ?? null,
+      ...queuedShape(fallback.kind, fallback),
+      ...(fallback.kind === 'update' ? { from: ran.from ?? null, to: ran.to ?? null } : {}),
+      ...(fallback.kind === 'run' ? { exitCode: ran.exitCode ?? null, output: ran.output ?? '' } : {}),
       detached: false,
       op: wireRecord(readOperation(fallback.id)),
     });
@@ -1497,12 +1606,20 @@ async function commandDispatch() {
   const authorized = authorize(line);
   if (!authorized.ok) {
     log(`restricted session refused: ${authorized.message}`, 'dispatch');
-    return refuse(authorized.reasonCode, authorized.message, {
+    const refused = refuse(authorized.reasonCode, authorized.message, {
       command: null,
       argument: authorized.argument ?? null,
       accepts: authorized.accepts,
       error: authorized.message,
     });
+    // A mutation this key may not send is still a mutation that was asked for,
+    // and its client decides on the outcome like any other.
+    const tokens = parseCommandLine(line).tokens;
+    if (tokens && tokens.length > 2) {
+      const { flags, positional } = parseArgs(tokens.slice(3));
+      if (mutatingInvocation(tokens[2], positional, flags)) refused.payload.outcome = outcomeOf(refused.payload);
+    }
+    return refused;
   }
   process.env.LEGIONCTL_RESTRICTED = '1';
   return execute(authorized.argv);
@@ -1525,6 +1642,8 @@ main().catch((error) => {
       system: systemIdentity ?? { id: platformName(), name: platformName() },
       reasonCode: REASON.internal,
       message,
+      // Whatever a mutation had done before this, nobody observed it.
+      ...(answeringMutation ? { outcome: 'unknown' } : {}),
       command: null,
       error: message,
     },

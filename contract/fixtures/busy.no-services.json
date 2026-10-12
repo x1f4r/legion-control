@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.1.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "busy": false,
+  "unknown": false,
+  "monitored": true,
+  "reason": "no services are configured",
+  "evidence": "none",
+  "checkedAt": "2026-09-05T14:00:00.000Z",
+  "elapsedMs": 0,
+  "error": null,
+  "monitoredServices": 0,
+  "unmonitoredServices": 0
+}

@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentBundle
+import com.x1f4r.legioncontrol.agent.SignedTarball
 import com.x1f4r.legioncontrol.agent.AgentAction
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.Contract
@@ -20,6 +21,7 @@ import com.x1f4r.legioncontrol.agent.provenanceOf
 import com.x1f4r.legioncontrol.agent.shouldAskForMeta
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.EXAMPLE_CONTROLLER_CONFIG
+import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.agent.SetupChangePreview
 import com.x1f4r.legioncontrol.data.SetupMerge
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -32,6 +34,7 @@ import com.x1f4r.legioncontrol.data.advisories
 import com.x1f4r.legioncontrol.data.SiteConfig
 import com.x1f4r.legioncontrol.net.SiteMatch
 import com.x1f4r.legioncontrol.net.matchSite
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -40,7 +43,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -70,9 +72,11 @@ class AppModel(
      * The scope changes run on.
      *
      * Deliberately not tied to the screen. Polling stops when the app is put away; an update that
-     * was asked for does not, because locking the phone is not withdrawing the request.
+     * was asked for does not, because locking the phone is not withdrawing the request. A failure
+     * nothing caught is logged rather than allowed to end the process.
      */
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler("AppModel"))
     private var clockJob: Job? = null
     private var polling = false
 
@@ -91,6 +95,14 @@ class AppModel(
     var keyFingerprint: String by mutableStateOf("")
         private set
 
+    /** Why this phone's key could not be read the last time it was asked for. Nothing was replaced. */
+    var keyProblem: String? by mutableStateOf(null)
+        private set
+
+    /** This phone's key was replaced because the old one could no longer be opened, until seen. */
+    var keyChange: KeyChange? by mutableStateOf(null)
+        private set
+
     var now: Long by mutableStateOf(System.currentTimeMillis())
         private set
 
@@ -100,7 +112,7 @@ class AppModel(
     private var addresses: List<String> = emptyList()
 
     /** The signed agent bundle this build carries, once it has been checked. */
-    var agentBundle: File? by mutableStateOf(null)
+    var agentBundle: SignedTarball? by mutableStateOf(null)
         private set
     var agentBundleVersion: String? by mutableStateOf(null)
         private set
@@ -184,7 +196,7 @@ class AppModel(
         override val siteMatch: SiteMatch get() = this@AppModel.siteMatch
         override val localAddresses: List<String> get() = addresses
         override val deviceName: String get() = services.deviceName()
-        override val agentBundle: File? get() = this@AppModel.agentBundle
+        override val agentBundle: SignedTarball? get() = this@AppModel.agentBundle
         override val agentBundleProblem: String? get() = this@AppModel.agentBundleProblem
 
         override fun client(machineId: String): MachineClient? =
@@ -259,12 +271,7 @@ class AppModel(
 
     fun startPolling() {
         polling = true
-        if (publicKey.isEmpty()) {
-            scope.launch {
-                publicKey = runCatching { services.publicKey() }.getOrDefault("")
-                keyFingerprint = runCatching { services.keyFingerprint() }.getOrDefault("")
-            }
-        }
+        if (publicKey.isEmpty()) loadKey()
         machines.forEach { it.startPolling() }
         // Anything that was in flight when the app was last closed is picked up rather than assumed.
         operations.resume(clients)
@@ -277,6 +284,61 @@ class AppModel(
                 }
             }
         }
+    }
+
+    /**
+     * Reads this phone's key, and whether it was replaced.
+     *
+     * A key that could not be read is said so, rather than drawn as one that has not been generated
+     * yet: it is there, nothing replaced it, and this is asked again on the next return to the app
+     * or a press of Try again.
+     */
+    fun loadKey() {
+        scope.launch {
+            try {
+                publicKey = services.publicKey()
+                keyFingerprint = services.keyFingerprint()
+                keyProblem = null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                keyProblem = failure.message ?: "This phone's key could not be read just now."
+            }
+            keyChange = try {
+                services.keyChange()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                keyChange
+            }
+        }
+    }
+
+    /**
+     * Replaces a key that keeps failing to read, once the user has confirmed it.
+     *
+     * Never done on the app's own say: every machine that trusted the old key stops accepting this
+     * phone. What follows is the same as after any replacement, the new key and a note saying it
+     * changed; a key that read by the time this ran is kept, and nothing is said.
+     */
+    fun replaceUnreadableKey() {
+        scope.launch {
+            try {
+                services.replaceUnreadableKey()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                keyProblem = failure.message ?: "A new key for this phone could not be made just now."
+                return@launch
+            }
+            loadKey()
+        }
+    }
+
+    /** The user has seen that the key changed and has the new one. */
+    fun acknowledgeKeyChange() {
+        keyChange = null
+        scope.launch { runCatching { services.acknowledgeKeyChange() } }
     }
 
     fun stopPolling() {
@@ -402,7 +464,7 @@ class AppModel(
                     // A push whose reply was lost is byte-identical when it is tried again and the
                     // agent answers `noop`, so there is nothing to recover here: the next poll does
                     // it. Nothing is reported for an ordinary unreachable machine.
-                    if (failure.dispatchStage == com.x1f4r.legioncontrol.agent.DispatchStage.AMBIGUOUS) {
+                    if (failure.dispatchStage.mayHaveRun) {
                         "The setup may or may not have reached ${client.machine.name}. " +
                             "The next check settles it."
                     } else {

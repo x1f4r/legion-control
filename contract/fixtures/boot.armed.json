@@ -1,12 +1,13 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "message": "BootNext set to 0002 (Windows 11) and read back; the machine was not rebooted",
+  "outcome": "succeeded",
   "action": "armed",
   "target": "windows",
   "armed": true,
@@ -19,8 +20,8 @@
     "mode": "manual",
     "initiator": {
       "client": "desktop",
-      "device": "legion-cachy",
-      "user": "x1f4r"
+      "device": "legion-linux",
+      "user": "me"
     },
     "state": "finished",
     "phase": "done",
@@ -39,7 +40,8 @@
       "message": "BootNext set to 0002 and read back",
       "exitCode": 0,
       "output": null,
-      "verified": true
+      "verified": true,
+      "outcome": "succeeded"
     },
     "log": [
       {
@@ -47,7 +49,8 @@
         "line": "BootNext set to 0002 and read back"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.1.0",
+    "systemId": "linux",
+    "outcome": "succeeded"
   }
 }

@@ -33,7 +33,30 @@ import { fileURLToPath } from 'node:url';
 import { CONTRACT_VERSION } from './contract.mjs';
 import { acquireFileLock, stateLockPath, writeJsonAtomic } from './state.mjs';
 
-export const AGENT_VERSION = '3.0.1';
+/** The running agent's own tree: the directory above src/, holding package.json and, in a release, the signed manifest. */
+export const AGENT_TREE = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
+
+// agent/package.json is the one place the agent's version is written. The
+// release tooling, the signed manifest and every contract fixture read it from
+// there, and so does the agent, rather than keep a copy that a release can
+// forget to bump. Reading it must not throw here, so a tree whose package.json
+// cannot be read reports 0.0.0: no signed manifest names that version, and
+// `version --check` fails on the problem, so such a tree cannot pass the
+// self-test that every staged agent has to pass before it replaces one.
+function readAgentMetadata() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(AGENT_TREE, 'package.json'), 'utf8'));
+    if (typeof parsed?.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+$/.test(parsed.version)) return { version: parsed.version, problem: null };
+    return { version: null, problem: `${path.join(AGENT_TREE, 'package.json')} has no x.y.z version` };
+  } catch (error) {
+    return { version: null, problem: `${path.join(AGENT_TREE, 'package.json')} cannot be read: ${error.message}` };
+  }
+}
+
+const AGENT_METADATA = readAgentMetadata();
+export const AGENT_VERSION = AGENT_METADATA.version ?? '0.0.0';
+/** Why the running tree's package.json gave no version, or null. `version --check` fails on it. */
+export const AGENT_METADATA_PROBLEM = AGENT_METADATA.problem;
 
 /** The config schema this agent understands. Bumped only for a breaking change. */
 export const CONFIG_VERSION = 3;

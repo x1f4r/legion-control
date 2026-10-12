@@ -45,7 +45,7 @@
       "minLength": 1
     },
     "currentSite": {
-      "description": "The site this device says it is on, chosen by a person. It exists because two sites may have identical private subnets: matching 192.168.178. proves nothing when both homes use the router's default range. This is a routing HINT that resolves that ambiguity; it never authenticates a machine, and it must never be used to reject a known remote address whose site merely looks like another one. Unset, or matching more than one site, means the location is unconfirmed and the client says so.",
+      "description": "The site this device says it is on, chosen by a person. It exists because two sites may have identical private subnets: matching 192.168.50. proves nothing when both homes use the router's default range. This is a routing HINT that resolves that ambiguity; it never authenticates a machine, and it must never be used to reject a known remote address whose site merely looks like another one. When the named site has prefixes, the choice counts only while one of them matches an address of this device; a site with no prefixes is taken on the person's word. Unset, naming no site, or several matching sites without this answer means the location is unconfirmed.",
       "$ref": "#/$defs/token"
     },
     "machines": {

@@ -6,7 +6,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import com.x1f4r.legioncontrol.data.BindingsStore
-import com.x1f4r.legioncontrol.data.DEFAULT_GITHUB_REPO
+import com.x1f4r.legioncontrol.net.UpdateSource
 import com.x1f4r.legioncontrol.ui.theme.LegionTheme
 
 /**
@@ -43,12 +43,13 @@ class MainActivity : ComponentActivity() {
         // Held here for the same reason the model is, plus one of its own: the page that draws it
         // is a page of a pager and is disposed the moment it is swiped away from. State kept inside
         // it would ask GitHub for the release list again on every swipe back.
+        // The repository the setup names, held to GitHub's grammar first: UpdateSource falls back to
+        // the built-in one, and says so, rather than put a peer's arbitrary text into a URL.
         updates = AppUpdateModel(applicationContext) {
-            services.config.value?.appUpdates?.githubRepo?.takeIf { it.isNotBlank() }
-                ?: DEFAULT_GITHUB_REPO
+            UpdateSource.of(services.config.value?.appUpdates?.githubRepo)
         }
         updates.observeRepositories(services.config.map { config ->
-            config?.appUpdates?.githubRepo?.takeIf { it.isNotBlank() } ?: DEFAULT_GITHUB_REPO
+            UpdateSource.of(config?.appUpdates?.githubRepo)
         })
         setContent {
             LegionTheme {

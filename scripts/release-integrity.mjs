@@ -48,7 +48,10 @@ export async function verifyArtifact(file, expected) {
   if (actual.size !== expected.size || actual.sha256 !== expected.sha256) throw new Error('Artifact bytes do not match the signed manifest.');
   return true;
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Compared through realpath: Node resolves the symlinks in import.meta.url but not in argv[1], so
+// run through a symlinked checkout a plain comparison would skip verify and still exit 0.
+const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
+if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
   try {
     const [verb, ...args] = process.argv.slice(2);
     if (verb === 'keygen' && args.length === 2) createSigningKey(...args);

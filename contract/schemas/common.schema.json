@@ -146,7 +146,7 @@
       ]
     },
     "reasonCode": {
-      "description": "The closed enum from v3.md section 2.2. Codes may be added in a later 3.x; a client that meets one it does not know renders the message and treats the reply as failed.",
+      "description": "The closed enum from v3.md section 3. Codes may be added in a later 3.x; a client that meets one it does not know renders the message and treats the reply as failed.",
       "enum": [
         "busy",
         "busy-unknown",
@@ -193,6 +193,25 @@
         {
           "type": "null"
         }
+      ]
+    },
+    "outcome": {
+      "description": "What a client decides on (v3.md section 5.6). succeeded: finished, the requested state holds. failed: finished, not in effect, and the state is known. deferred: finished without acting, by design. pending: the agent still owns the work; poll op ID --wait 20. unknown: no evidence either way; never resent automatically. When it is absent, or a value this list does not have, a client reduces it with the function in section 5.6.",
+      "enum": [
+        "succeeded",
+        "failed",
+        "deferred",
+        "pending",
+        "unknown"
+      ]
+    },
+    "terminalOutcome": {
+      "description": "The outcome of something that has finished: every outcome except pending.",
+      "enum": [
+        "succeeded",
+        "failed",
+        "deferred",
+        "unknown"
       ]
     },
     "systemIdentity": {
@@ -243,6 +262,10 @@
         },
         "notes": {
           "$ref": "#/$defs/notes"
+        },
+        "outcome": {
+          "description": "On every reply to a mutating invocation from agent 3.1.0 on (section 5.6). Absent from older agents and from replies that change nothing.",
+          "$ref": "#/$defs/outcome"
         }
       },
       "required": [
@@ -519,7 +542,7 @@
       ]
     },
     "opPhase": {
-      "description": "The union of the per-kind phase lists in v3.md section 2.3. Which phases a kind may report is fixed there; the union is what a decoder has to accept.",
+      "description": "The union of the per-kind phase lists in v3.md section 5.2. Which phases a kind may report is fixed there; the union is what a decoder has to accept.",
       "enum": [
         "resolving",
         "recovering",
@@ -679,6 +702,10 @@
             },
             "verified": {
               "type": "boolean"
+            },
+            "outcome": {
+              "description": "Stored with the result when the operation finishes, from agent 3.1.0 on. Agrees with the record's own outcome.",
+              "$ref": "#/$defs/terminalOutcome"
             }
           },
           "required": [
@@ -715,7 +742,8 @@
       "type": "object",
       "properties": {
         "opId": {
-          "$ref": "#/$defs/opId"
+          "description": "The record of the update the cycle ran for this service. Null when no update was started: a service the policy deferred before anything ran.",
+          "$ref": "#/$defs/opIdOrNull"
         },
         "service": {
           "$ref": "#/$defs/configuredId"
@@ -733,7 +761,29 @@
         "action",
         "reasonCode"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "Only a deferral may have no record: anything the cycle actually did to a service is an operation with an id.",
+          "if": {
+            "properties": {
+              "opId": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "opId"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "const": "deferred"
+              }
+            }
+          }
+        }
+      ]
     },
     "opRecord": {
       "description": "One operation, exactly as it is stored at <base>/ops/<id>.json and exactly as `op` returns it.",
@@ -829,6 +879,10 @@
         },
         "systemId": {
           "$ref": "#/$defs/token"
+        },
+        "outcome": {
+          "description": "From agent 3.1.0 on: pending while the record is queued or running, and the terminal outcome of its result once it is finished (section 5.6).",
+          "$ref": "#/$defs/outcome"
         }
       },
       "required": [
@@ -857,7 +911,7 @@
       "additionalProperties": false,
       "allOf": [
         {
-          "description": "A finished operation has an end and a result; a running or queued one has neither.",
+          "description": "A finished operation has an end, a result and a terminal outcome; a running or queued one has neither end nor result, and its outcome is pending.",
           "if": {
             "properties": {
               "state": {
@@ -884,7 +938,8 @@
                   "to": {},
                   "exitCode": {},
                   "output": {},
-                  "verified": {}
+                  "verified": {},
+                  "outcome": {}
                 }
               },
               "phase": {
@@ -892,6 +947,9 @@
               },
               "pid": {
                 "type": "null"
+              },
+              "outcome": {
+                "$ref": "#/$defs/terminalOutcome"
               }
             }
           },
@@ -902,6 +960,9 @@
               },
               "result": {
                 "type": "null"
+              },
+              "outcome": {
+                "const": "pending"
               }
             }
           }
@@ -1089,6 +1150,10 @@
         },
         "expiresAt": {
           "$ref": "#/$defs/isoOrNull"
+        },
+        "outcome": {
+          "description": "From agent 3.1.0 on, the record's own outcome (section 5.6).",
+          "$ref": "#/$defs/outcome"
         }
       },
       "required": [
@@ -1106,7 +1171,36 @@
         "updatedAt",
         "expiresAt"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "Pending exactly while the operation is queued or running, as on the record.",
+          "if": {
+            "properties": {
+              "state": {
+                "const": "finished"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "$ref": "#/$defs/terminalOutcome"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "outcome": {
+                "const": "pending"
+              }
+            }
+          }
+        }
+      ]
     },
     "opConflict": {
       "description": "Who holds the operation lock. Sent with every `conflict` answer so the app can name what is in the way instead of saying \"busy\".",
@@ -1240,7 +1334,7 @@
       ]
     },
     "controllerDocument": {
-      "description": "The setup document, which the agent stores and never interprets. The two keys below are the only ones it checks before accepting the bytes; everything else belongs to the clients and is not part of this contract.",
+      "description": "The setup document as a config reply carries it, parsed. The two keys below are the least any stored document has; from agent 3.1.0 on, config set also checks its structure (v3.md section 9.4) and controller-document.schema.json is its full shape.",
       "anyOf": [
         {
           "type": "object",
@@ -1657,8 +1751,9 @@
       "type": "object",
       "properties": {
         "id": {
+          "description": "The closed list of check ids, so a client can render each one. agent.floor, agent.signed, files.private and ssh.shell are reported by agent 3.1.0 on.",
           "type": "string",
-          "pattern": "^(?:config\\.(?:parse|validate)|base\\.writable|node\\.(?:version|sqlite)|npm\\.(?:available|prefix)|service\\.[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:process|health|busy|relay|latest|endpoint)|scheduler\\.(?:present|command|lastRun)|privileges\\.(?:sudo|boot)|sleep\\.tool|locks|ops\\.dir|controller\\.copy|session\\.restricted|clock)$"
+          "pattern": "^(?:config\\.(?:parse|validate)|base\\.writable|node\\.(?:version|sqlite)|npm\\.(?:available|prefix)|service\\.[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:process|health|busy|relay|latest|endpoint)|scheduler\\.(?:present|command|lastRun)|privileges\\.(?:sudo|boot)|sleep\\.tool|locks|ops\\.dir|controller\\.copy|session\\.restricted|clock|agent\\.(?:floor|signed)|files\\.private|ssh\\.shell)$"
         },
         "level": {
           "enum": [
@@ -1985,6 +2080,35 @@
           "type": "null"
         }
       ]
+    },
+    "sshHostGuard": {
+      "description": "The guard on a host in the setup document: a name of dot-separated labels or an IP address, and nothing ssh, ssh-keyscan or known_hosts read as syntax (no comma, star, space, leading hyphen, brackets, scheme or user). The agent's HOST_GUARD_PATTERN is this string. Clients apply the stricter dial grammar of v3.md section 15.6 before they dial, scan or pin.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^(?:[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?(?:\\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*\\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*(?:%[A-Za-z0-9._-]{1,32})?)$"
+    },
+    "sshUser": {
+      "description": "The guard on a login name: 1 to 64 characters from letters, digits, . _ - @ \\ and single spaces, starting with a letter, digit or _ and ending with a letter, digit, ., _ or -. Covers local and domain accounts and nothing a shell or ssh reads as syntax. The agent's USER_PATTERN is this string.",
+      "type": "string",
+      "pattern": "^(?=[^\\n]{1,64}$)(?!.* [ -])[A-Za-z0-9_](?:[A-Za-z0-9._@\\\\ -]*[A-Za-z0-9._-])?$"
+    },
+    "agentArgItem": {
+      "description": "One item of an agent argv: not empty, no control character. At most 4096 UTF-8 bytes, which is checked in code because a schema counts characters. The agent's AGENT_ARG_PATTERN is this pattern.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "githubRepo": {
+      "description": "owner/name as GitHub spells them; . and .. are not names. The agent's REPO_PATTERN is this string.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/(?!\\.\\.?$)[A-Za-z0-9._-]{1,100}$"
+    },
+    "launchPath": {
+      "description": "Where a launch value sits in the setup document (v3.md section 9.9): a system's {agent, grammar} tuple, a machine's deprecated identityFile, the update repository, or the deprecated top-level local. Ids are written as they are, inside the brackets.",
+      "type": "string",
+      "pattern": "^(?:machines\\[[^\\[\\]]+\\]\\.(?:systems\\[[^\\[\\]]+\\]|ssh\\.identityFile)|appUpdates\\.githubRepo|local)$"
     }
   }
 }

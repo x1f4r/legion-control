@@ -2,13 +2,30 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "config-read.schema.json",
   "title": "legionctl config",
-  "description": "The controller document this machine is holding, its hash, and who wrote it. The agent stores bytes and never interprets them, so `controller` is returned as it was given.",
+  "description": "The controller document this machine is holding, its hash, and who wrote it. `raw` is the stored text, exactly the canonical bytes `hash` covers, and is what a client hashes and adopts; `controller` is the same document parsed, kept for older clients. Agents before 3.1.0 send no `raw`.",
   "type": "object",
-  "allOf": [{ "$ref": "common.schema.json#/$defs/envelope" }],
+  "allOf": [
+    { "$ref": "common.schema.json#/$defs/envelope" },
+    {
+      "description": "There is stored text exactly when there is a stored document.",
+      "if": { "properties": { "controller": { "type": "null" } }, "required": ["controller"] },
+      "then": { "properties": { "raw": { "type": "null" } } }
+    }
+  ],
   "properties": {
     "controller": { "$ref": "common.schema.json#/$defs/controllerDocument" },
+    "raw": {
+      "description": "The stored document as text: the canonical bytes of v3.md section 12, at most 1 MiB of UTF-8, null exactly when `controller` is null. Hash and adopt this; never re-serialise `controller`.",
+      "anyOf": [
+        { "type": "string", "minLength": 1, "maxLength": 1048576 },
+        { "type": "null" }
+      ]
+    },
     "hash": { "$ref": "common.schema.json#/$defs/sha256OrNull" },
-    "bytes": { "$ref": "common.schema.json#/$defs/count" },
+    "bytes": {
+      "description": "The UTF-8 length of `raw`, 0 when it is null.",
+      "$ref": "common.schema.json#/$defs/count"
+    },
     "meta": { "$ref": "common.schema.json#/$defs/controllerMeta" },
     "error": {
       "description": "Set when a file is there and could not be read. The hash is still reported, so the authority pushes over it instead of leaving it to sit there.",

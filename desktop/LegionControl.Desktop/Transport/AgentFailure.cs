@@ -72,6 +72,10 @@ public sealed class AgentFailure : Exception
     public string Detail { get; }
     public Dispatch Dispatch { get; }
     public int TimeoutSeconds { get; }
+    /// This app ended the command because it was asked to, not because time ran out. Only ever
+    /// with [FailureKind.TimedOut]: a cancelled command is exactly as unknown as one that ran out
+    /// of time, so the kind and the dispatch stay those of a timeout and only the words change.
+    public bool Cancelled { get; init; }
 
     public AgentFailure(
         FailureKind kind,
@@ -107,6 +111,7 @@ public sealed class AgentFailure : Exception
             $"The host key for {machine} is not one already approved for this address, so ssh refused to connect and nothing was run. On a dual boot machine this may be the other configured system answering.",
         FailureKind.HostKeyUnknown =>
             $"{machine} is not in known_hosts. Check the fingerprint and trust it before this app will talk to it.",
+        FailureKind.TimedOut when Cancelled => $"The command to {machine} was cancelled before it answered. Whether it ran is not known.",
         FailureKind.TimedOut => $"{machine} did not answer within {TimeoutSeconds} seconds. Whether the command ran is not known.",
         FailureKind.LinkLost => $"The connection to {machine} dropped. Whether the command ran is not known.",
         FailureKind.InterpreterMissing => $"The interpreter the document names for {System?.Name ?? machine} is not on that system.",
@@ -135,6 +140,7 @@ public sealed class AgentFailure : Exception
         FailureKind.AuthenticationFailed => "key rejected",
         FailureKind.HostKeyChanged => "host key changed",
         FailureKind.HostKeyUnknown => "host key not known",
+        FailureKind.TimedOut when Cancelled => "cancelled before it answered",
         FailureKind.TimedOut => $"timed out after {TimeoutSeconds}s",
         FailureKind.LinkLost => "connection dropped",
         FailureKind.InterpreterMissing => "interpreter missing",
@@ -158,96 +164,4 @@ public sealed class AgentFailure : Exception
         FailureKind.AgentMissing => "Install the control agent on that system.",
         _ => null,
     };
-}
-
-/// Reads ssh's own diagnostics.
-///
-/// ssh reserves exit status 255 for its own failures and puts the reason in one line of stderr.
-/// That line is the only evidence there is for whether anything ran on the far side, so it is worth
-/// reading properly rather than folding into a single "unreachable".
-public static class SshDiagnosis
-{
-    public static (FailureKind Kind, Dispatch Dispatch)? Classify(string text)
-    {
-        var lower = text.ToLowerInvariant();
-
-        // Host key first: it is the one failure that looks alarming and has a mundane cause on a
-        // dual boot machine, and its text contains "permission denied" in some versions.
-        if (lower.Contains("remote host identification has changed")
-            || lower.Contains("host key verification failed")
-            || lower.Contains("key_verify failed"))
-        {
-            return (FailureKind.HostKeyChanged, Dispatch.Never);
-        }
-        if (lower.Contains("no matching host key type")
-            || (lower.Contains("host key for") && lower.Contains("has changed")))
-        {
-            return (FailureKind.HostKeyChanged, Dispatch.Never);
-        }
-        if (lower.Contains("no rsa host key is known")
-            || lower.Contains("host key is not known")
-            || lower.Contains("no ed25519 host key is known")
-            || lower.Contains("not known by any other names"))
-        {
-            return (FailureKind.HostKeyUnknown, Dispatch.Never);
-        }
-
-        if (lower.Contains("permission denied")
-            || lower.Contains("too many authentication failures")
-            || lower.Contains("no supported authentication methods")
-            || lower.Contains("authentication failed"))
-        {
-            return (FailureKind.AuthenticationFailed, Dispatch.Never);
-        }
-
-        if (lower.Contains("connection refused")) return (FailureKind.ConnectionRefused, Dispatch.Never);
-
-        if (lower.Contains("no route to host")
-            || lower.Contains("network is unreachable")
-            || lower.Contains("could not resolve hostname")
-            || lower.Contains("name or service not known")
-            || lower.Contains("nodename nor servname provided")
-            || lower.Contains("operation timed out")
-            || lower.Contains("connection timed out")
-            || lower.Contains("host is down"))
-        {
-            return (FailureKind.HostUnreachable, Dispatch.Never);
-        }
-
-        // A session that was up and went away. Genuinely ambiguous: it is what a reboot looks like
-        // from here, and it is also what a flaky link looks like.
-        if (lower.Contains("connection closed by remote host")
-            || lower.Contains("connection reset by peer")
-            || lower.Contains("client_loop: send disconnect")
-            || lower.Contains("broken pipe")
-            || (lower.Contains("connection to") && lower.Contains("closed by remote host")))
-        {
-            return (FailureKind.LinkLost, Dispatch.Unknown);
-        }
-
-        return null;
-    }
-
-    /// The markers that prove the interpreter itself was never found, which is the one remote
-    /// failure that is safe to treat as "nothing ran".
-    public static bool InterpreterIsMissing(string text)
-    {
-        var lower = text.ToLowerInvariant();
-        string[] markers =
-        {
-            "command not found", "unknown command", "not recognized as the name",
-            "is not recognized as an internal", "commandnotfoundexception",
-            "no such file or directory", "cannot find path",
-        };
-        return markers.Any(lower.Contains);
-    }
-
-    /// The markers that prove the interpreter ran and the agent script was not where the document
-    /// said it would be.
-    public static bool AgentIsMissing(string text)
-    {
-        var lower = text.ToLowerInvariant();
-        string[] markers = { "cannot find module", "module_not_found", "err_module_not_found" };
-        return markers.Any(lower.Contains);
-    }
 }

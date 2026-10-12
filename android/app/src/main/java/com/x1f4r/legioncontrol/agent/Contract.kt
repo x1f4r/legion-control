@@ -21,10 +21,10 @@ object Contract {
      * Kept beside the required contract because the two move together: an app that needs contract 3
      * has to be able to put a contract 3 agent on a machine that has an older one.
      */
-    const val BUNDLED_AGENT_VERSION = "3.0.1"
+    const val BUNDLED_AGENT_VERSION = "3.1.0"
 
     /**
-     * The argv grammar from rule 4.
+     * The argv grammar from rule 5, `common.schema.json#/$defs/token`.
      *
      * Every token this app sends and every value it accepts back matches it: no spaces, no quotes,
      * no dollar, no semicolon. Every argv item is also quoted for the shell on the far side, and the
@@ -33,6 +33,12 @@ object Contract {
      * quoting does.
      */
     private val TOKEN = Regex("^[A-Za-z0-9][A-Za-z0-9._:@/\\\\~=+-]*$")
+
+    /** A service, action or boot target id as a configuration names it: no `:`, `/` or `@`. */
+    private val CONFIGURED_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+    /** A setup id: what the agent's `--controller-id` takes, at most 64 characters. */
+    private val SETUP_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 
     /** A lowercase UUIDv4, or any lowercase id of 8 to 64 characters from [a-z0-9-]. */
     private val OP_ID = Regex("^[a-z0-9-]{8,64}$")
@@ -43,13 +49,30 @@ object Contract {
     /** `02:00`, in the machine's local time. */
     private val CLOCK = Regex("^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 
-    fun isToken(value: String?): Boolean = value != null && TOKEN.matches(value)
+    /** A canonical setup hash: 64 lowercase hex digits. */
+    private val SHA256_HEX = Regex("^[0-9a-f]{64}$")
 
-    fun isOpId(value: String?): Boolean = value != null && OP_ID.matches(value)
+    fun isToken(value: String?): Boolean = matchesWhole(TOKEN, value)
 
-    fun isDuration(value: String?): Boolean = value != null && DURATION.matches(value)
+    fun isConfiguredId(value: String?): Boolean = matchesWhole(CONFIGURED_ID, value)
 
-    fun isClockTime(value: String?): Boolean = value != null && CLOCK.matches(value)
+    fun isSetupId(value: String?): Boolean = matchesWhole(SETUP_ID, value)
+
+    fun isOpId(value: String?): Boolean = matchesWhole(OP_ID, value)
+
+    fun isDuration(value: String?): Boolean = matchesWhole(DURATION, value)
+
+    fun isClockTime(value: String?): Boolean = matchesWhole(CLOCK, value)
+
+    fun isSha256Hex(value: String?): Boolean = matchesWhole(SHA256_HEX, value)
+
+    /**
+     * The matching rule every implementation of these grammars shares: the whole value has to
+     * match, and a line feed or carriage return is refused before any pattern is applied, so that a
+     * pattern engine whose `$` also matches before a final newline can never let one through.
+     */
+    private fun matchesWhole(pattern: Regex, value: String?): Boolean =
+        value != null && '\n' !in value && '\r' !in value && pattern.matches(value)
 
     /** A fresh operation id. Lowercase, because the grammar says so and a UUID is not by default. */
     fun newOpId(): String = UUID.randomUUID().toString().lowercase(Locale.ROOT)
@@ -60,11 +83,18 @@ object Contract {
      * Called on every id that came out of a document or off a machine, before it goes anywhere near
      * a command line. The quoting layer would make a hostile id harmless anyway; this is the second
      * lock on the same door, and it is the one that also catches an id that is merely wrong.
+     *
+     * A refusal is an [AgentFailure.BadRequest], never sent and safe to report, because every caller
+     * already turns an [AgentFailure] into a sentence. It used to be an IllegalArgumentException,
+     * which nothing between here and the screen caught.
      */
     fun requireToken(value: String, what: String): String {
-        require(TOKEN.matches(value)) {
-            "$what \"$value\" is not a valid identifier. Letters, digits and . _ : @ / \\ ~ = + - " +
-                "only, starting with a letter or a digit."
+        if (!isToken(value)) {
+            throw AgentFailure.BadRequest(
+                "This app will not send that request.",
+                "$what \"$value\" is not a valid identifier. Letters, digits and . _ : @ / \\ ~ = + - " +
+                    "only, starting with a letter or a digit.",
+            )
         }
         return value
     }

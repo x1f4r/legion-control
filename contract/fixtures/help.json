@@ -1,12 +1,12 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
-  "usage": "node /home/x1f4r/.legion-control/agent/src/index.mjs <command> [args] [--flags]",
+  "usage": "node /home/me/.legion-control/agent/src/index.mjs <command> [args] [--flags]",
   "commands": [
     {
       "name": "status",
@@ -175,7 +175,8 @@
         "--install",
         "--rollback",
         "--check",
-        "--stdin"
+        "--stdin",
+        "--allow-downgrade"
       ],
       "mutates": true,
       "summary": "signed agent replacement, keeping the previous tree"

@@ -6,13 +6,20 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import androidx.core.content.FileProvider
 import com.x1f4r.legioncontrol.BuildConfig
+import com.x1f4r.legioncontrol.data.DEFAULT_GITHUB_REPO
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -33,13 +40,15 @@ import java.security.MessageDigest
  *    read out of the manifest before this succeeds.
  * 3. Take the artefact whose name is exactly `Legion-Control-android-arm64.apk`, never the first
  *    thing ending in `.apk`.
- * 4. Download it, and check its size and sha256 against the signed manifest.
- * 5. Look inside the archive: the package name, the version name and the signing certificate all
- *    have to match the app that is running.
+ * 4. Download it, stopping at the size the signed manifest gives, and check its sha256.
+ * 5. Look inside the archive: the package name, the version name and the signing certificate have
+ *    to match the app that is running, and the build number has to be newer.
  * 6. Only then offer it to the system installer.
  *
  * Deliberately built on HttpURLConnection rather than pulling in an http client: three requests, no
- * streaming API worth the dependency, and the rest of this project has stayed free of them.
+ * streaming API worth the dependency, and the rest of this project has stayed free of them. Nothing
+ * is read whole on the strength of having been asked for: every file has a cap ([ReleaseLimits]),
+ * and the repository is a name GitHub could have before it goes into a URL ([UpdateSource]).
  */
 object AppUpdates {
 
@@ -52,8 +61,7 @@ object AppUpdates {
         val notes: String,
         val assetUrl: String,
         val assetName: String,
-        val sizeBytes: Long,
-        /** The signed manifest this release was verified against. */
+        /** The signed manifest this release was verified against, and the only source of a size. */
         val manifest: VerifiedManifest,
     ) {
         /** What the release says the agent version is, for the agent install action. */
@@ -100,11 +108,18 @@ object AppUpdates {
                     "different package name, so a published release cannot replace it.",
             )
         }
+        // The caller resolves the setup's repository through UpdateSource. Checked again here so
+        // that no path at all puts an unchecked name into a URL.
+        if (!UpdateSource.isRepository(repo)) {
+            return@withContext Check.Failed("\"$repo\" is not an owner/name GitHub accepts, so it was not asked.")
+        }
         try {
             val connection = open(releasesUrl(repo), "application/vnd.github+json")
             outcomeOf(connection.responseCode)?.let { return@withContext it }
 
-            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            val body = connection.inputStream.use {
+                readCapped(it, ReleaseLimits.RELEASE_JSON_BYTES, connection.contentLengthLong, "The release list")
+            }.toString(Charsets.UTF_8)
             val root = json.parseToJsonElement(body).jsonObject
             val tag = root["tag_name"]?.jsonPrimitive?.content.orEmpty()
             val notes = root["body"]?.jsonPrimitive?.content.orEmpty()
@@ -114,16 +129,18 @@ object AppUpdates {
                 .firstOrNull { it["name"]?.jsonPrimitive?.content == name }
                 ?.get("url")?.jsonPrimitive?.content
 
-            fun assetSize(name: String): Long = assets
-                .firstOrNull { it["name"]?.jsonPrimitive?.content == name }
-                ?.get("size")?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
-
             val latest = tag.removePrefix("v")
             if (!isNewer(latest, BuildConfig.VERSION_NAME)) return@withContext Check.UpToDate()
 
-            val manifestBytes = assetUrl(ReleaseAssets.MANIFEST)?.let { fetch(it) }
+            val manifestBytes = assetUrl(ReleaseAssets.MANIFEST)?.let {
+                try {
+                    fetch(it, ReleaseLimits.MANIFEST_BYTES, "That release's manifest")
+                } catch (_: ResponseTooLarge) {
+                    return@withContext Check.Failed(ManifestProblem.TooLarge(ReleaseLimits.MANIFEST_BYTES).sentence)
+                }
+            }
             val signature = assetUrl(ReleaseAssets.MANIFEST_SIGNATURE)
-                ?.let { fetch(it) }
+                ?.let { fetch(it, ReleaseLimits.SIGNATURE_BYTES, "That release's signature") }
                 ?.toString(Charsets.UTF_8)
 
             val verified = ReleaseVerification.verify(manifestBytes, signature, latest)
@@ -135,10 +152,8 @@ object AppUpdates {
                     )
                 }
 
-            if (verified.artifact(ReleaseAssets.ANDROID_APK) == null) {
-                return@withContext Check.Failed(
-                    ManifestProblem.MissingArtifact(ReleaseAssets.ANDROID_APK).sentence,
-                )
+            ReleaseVerification.artifactToFetch(verified, ReleaseAssets.ANDROID_APK).onFailure {
+                return@withContext Check.Failed((it as ManifestVerificationFailed).problem.sentence)
             }
             val url = assetUrl(ReleaseAssets.ANDROID_APK) ?: return@withContext Check.Failed(
                 ManifestProblem.ArtifactMissingFromRelease(ReleaseAssets.ANDROID_APK).sentence,
@@ -150,10 +165,11 @@ object AppUpdates {
                     notes = notes.lineSequence().take(6).joinToString("\n").trim(),
                     assetUrl = url,
                     assetName = ReleaseAssets.ANDROID_APK,
-                    sizeBytes = assetSize(ReleaseAssets.ANDROID_APK),
                     manifest = verified,
                 ),
             )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Check.Failed(e.message ?: e.javaClass.simpleName)
         }
@@ -184,23 +200,30 @@ object AppUpdates {
 
     /**
      * Download into app private storage, then check it against the signed manifest and against this
-     * app's own identity. onProgress gets 0..100, or -1 when the size is unknown.
+     * app's own identity. onProgress gets 0..100.
+     *
+     * The artefact is resolved in the signed manifest before anything is fetched, and its signed
+     * size is the most that is ever read: a server that sends more is not sending the signed file,
+     * and is not given the disk to prove it on. The previous version took whatever size it could
+     * find, the release's own or the server's, and read to the end of whatever arrived.
      *
      * The file is written to a staging name and only renamed into place once every check has
      * passed, so there is never a moment where a half-checked APK sits at the path the install
-     * action reads. A refused download leaves nothing behind at all.
+     * action reads. A refused or cancelled download leaves nothing behind at all.
      */
     suspend fun download(
         context: Context,
         release: Release,
         onProgress: (Int) -> Unit,
     ): Download = withContext(Dispatchers.IO) {
+        val artifact = ReleaseVerification.artifactToFetch(release.manifest, release.assetName)
+            .getOrElse { return@withContext Download.Refused((it as ManifestVerificationFailed).problem) }
+        val dir = File(context.cacheDir, "updates").apply { mkdirs() }
+        val staging = File(dir, "${release.assetName}.part")
+        val target = File(dir, release.assetName)
         try {
-            val dir = File(context.cacheDir, "updates").apply { mkdirs() }
             // One file, reused. A cache full of old apks is not worth keeping around.
             dir.listFiles()?.forEach { it.delete() }
-            val staging = File(dir, "${release.assetName}.part")
-            val target = File(dir, release.assetName)
 
             val connection = open(release.assetUrl, "application/octet-stream").apply {
                 instanceFollowRedirects = true
@@ -210,51 +233,13 @@ object AppUpdates {
                 return@withContext Download.Failed("download failed: HTTP ${connection.responseCode}")
             }
 
-            val expected = release.manifest.artifact(release.assetName)?.size
-                ?.takeIf { it > 0 }
-                ?: release.sizeBytes.takeIf { it > 0 }
-                ?: connection.contentLengthLong
+            val refused = connection.inputStream.use { input ->
+                receive(input, connection.contentLengthLong, staging, release.assetName, artifact, onProgress)
+            }
+            if (refused != null) return@withContext Download.Refused(refused)
 
-            // Hashed while it is written rather than by reading the file again afterwards. It is one
-            // pass over the same bytes and it means the hash is of what was received, not of what is
-            // on disk a moment later.
-            val digest = MessageDigest.getInstance("SHA-256")
-            var written = 0L
-            connection.inputStream.use { input ->
-                staging.outputStream().use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        output.write(buffer, 0, read)
-                        digest.update(buffer, 0, read)
-                        written += read
-                        onProgress(if (expected > 0) ((written * 100) / expected).toInt() else -1)
-                    }
-                }
-            }
-
-            val artifact = release.manifest.artifact(release.assetName)
-            if (artifact == null) {
-                staging.delete()
-                return@withContext Download.Refused(
-                    ManifestProblem.MissingArtifact(release.assetName),
-                )
-            }
-            if (artifact.size > 0 && written != artifact.size) {
-                staging.delete()
-                return@withContext Download.Refused(
-                    ManifestProblem.WrongSize(release.assetName, artifact.size, written),
-                )
-            }
-            val actual = digest.digest().joinToString("") { "%02x".format(it) }
-            if (!actual.equals(artifact.sha256, ignoreCase = true)) {
-                staging.delete()
-                return@withContext Download.Refused(ManifestProblem.WrongHash(release.assetName))
-            }
-
-            // The archive itself, before it is ever named as something to install. Package, version
-            // and signing certificate, all against the app that is running.
+            // The archive itself, before it is ever named as something to install. Package, version,
+            // build number and signing certificate, all against the app that is running.
             ApkInspection.check(context, staging, expectedVersion = release.version)?.let { problem ->
                 staging.delete()
                 return@withContext Download.Failed(problem)
@@ -265,9 +250,72 @@ object AppUpdates {
                 staging.delete()
             }
             Download.Ready(target)
+        } catch (cancelled: CancellationException) {
+            staging.delete()
+            throw cancelled
         } catch (e: Exception) {
+            staging.delete()
             Download.Failed(e.message ?: e.javaClass.simpleName)
         }
+    }
+
+    /**
+     * Streams [input] into [staging], and says whether what arrived is the signed artefact.
+     *
+     * Null when it is. Otherwise the reason, with [staging] already deleted. [announced] is the
+     * server's Content-Length, or -1: one larger than the signed size is refused before a byte is
+     * read, and one that is smaller proves nothing, because the bytes are counted anyway. Reading
+     * stops the moment it would pass the signed size, and cancellation is honoured between chunks,
+     * which is where a blocking read on a phone can be interrupted at all.
+     */
+    internal suspend fun receive(
+        input: InputStream,
+        announced: Long,
+        staging: File,
+        name: String,
+        artifact: ReleaseArtifact,
+        onProgress: (Int) -> Unit,
+    ): ManifestProblem? {
+        val size = artifact.size
+        if (announced > size) return ManifestProblem.Oversized(name, size)
+
+        // Hashed while it is written rather than by reading the file again afterwards. It is one
+        // pass over the same bytes and it means the hash is of what was received, not of what is
+        // on disk a moment later.
+        val digest = MessageDigest.getInstance("SHA-256")
+        var written = 0L
+        try {
+            staging.outputStream().use { output ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    if (written + read > size) {
+                        staging.delete()
+                        return ManifestProblem.Oversized(name, size)
+                    }
+                    output.write(buffer, 0, read)
+                    digest.update(buffer, 0, read)
+                    written += read
+                    onProgress(((written * 100) / size).toInt())
+                }
+            }
+        } catch (failure: Throwable) {
+            staging.delete()
+            throw failure
+        }
+
+        if (written != size) {
+            staging.delete()
+            return ManifestProblem.WrongSize(name, size, written)
+        }
+        val actual = digest.digest().joinToString("") { "%02x".format(it) }
+        if (!actual.equals(artifact.sha256, ignoreCase = true)) {
+            staging.delete()
+            return ManifestProblem.WrongHash(name)
+        }
+        return null
     }
 
     /** True when Android will let us hand it an apk at all. */
@@ -302,13 +350,80 @@ object AppUpdates {
             readTimeout = 15_000
         }
 
-    /** A small asset, whole. Used for the manifest and its signature, which are both tiny. */
-    private fun fetch(url: String): ByteArray? {
+    /** A small asset, whole, up to [cap] bytes. Used for the manifest and its signature. */
+    private fun fetch(url: String, cap: Int, what: String): ByteArray? {
         val connection = open(url, "application/octet-stream").apply {
             instanceFollowRedirects = true
         }
         if (connection.responseCode != 200) return null
-        return connection.inputStream.use { it.readBytes() }
+        return connection.inputStream.use { readCapped(it, cap, connection.contentLengthLong, what) }
+    }
+
+    /**
+     * All of [input], or [ResponseTooLarge] once it is more than [cap] bytes.
+     *
+     * Refused before reading when the server announces more ([announced], or -1 for nothing
+     * announced), and otherwise counted as it arrives, because an announcement is the server's word.
+     */
+    internal fun readCapped(input: InputStream, cap: Int, announced: Long, what: String): ByteArray {
+        if (announced > cap) throw ResponseTooLarge(what, cap)
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(8 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            if (out.size() + read > cap) throw ResponseTooLarge(what, cap)
+            out.write(buffer, 0, read)
+        }
+        return out.toByteArray()
+    }
+}
+
+/** A release file larger than anything of its kind needs to be. It was not read to the end. */
+class ResponseTooLarge(what: String, limit: Int) :
+    IOException("$what is over $limit bytes, far more than it needs, so it was not read.")
+
+/**
+ * Where the app looks for its own releases.
+ *
+ * The setup names it, and every peer can edit the setup, so the name is held to the grammar GitHub
+ * gives repository names before it goes anywhere near a URL. One that fails is not used: the app
+ * checks the built-in repository instead and says which name it passed over, rather than sending a
+ * path, a query or another host to api.github.com on a peer's say-so.
+ */
+data class UpdateSource(
+    /** owner/name, and always one GitHub could have. */
+    val repository: String,
+    /** What the setup named instead, when that was not a repository name and so was not used. */
+    val refused: String? = null,
+) {
+    /** One sentence for the update block, or null when the setup's repository is the one in use. */
+    val note: String?
+        get() = refused?.let {
+            "The setup names \"$it\" as the update source, which is not a GitHub owner/name, so " +
+                "$repository is checked instead."
+        }
+
+    companion object {
+        /**
+         * `common.schema.json#/$defs/githubRepo`, string for string: an owner of up to 39 letters,
+         * digits and inner hyphens, a slash, and a name of up to 100 of letters, digits, `.`, `_`
+         * and `-` that is not `.` or `..`.
+         */
+        const val REPO_PATTERN = "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/(?!\\.\\.?$)[A-Za-z0-9._-]{1,100}$"
+
+        private val repo = Regex(REPO_PATTERN)
+
+        /** Whether [value] is an owner/name GitHub could have. A line break is refused before the pattern. */
+        fun isRepository(value: String): Boolean =
+            '\n' !in value && '\r' !in value && repo.matches(value)
+
+        /** The source for what the setup says: the built-in repository when it says nothing usable. */
+        fun of(configured: String?): UpdateSource = when {
+            configured.isNullOrBlank() -> UpdateSource(DEFAULT_GITHUB_REPO)
+            isRepository(configured) -> UpdateSource(configured)
+            else -> UpdateSource(DEFAULT_GITHUB_REPO, refused = configured)
+        }
     }
 }
 
@@ -329,14 +444,14 @@ object ApkInspection {
         val archive = context.packageManager.getPackageArchiveInfo(apk.absolutePath, flags)
             ?: return "That file is not an Android package this phone can read."
 
-        if (archive.packageName != context.packageName) {
-            return "That package is ${archive.packageName} and this app is ${context.packageName}."
-        }
-
-        val version = archive.versionName
-        if (version != null && version != expectedVersion) {
-            return "That package says it is version $version and the release says $expectedVersion."
-        }
+        judge(
+            installedPackage = context.packageName,
+            installedBuild = BuildConfig.VERSION_CODE.toLong(),
+            offeredPackage = archive.packageName,
+            offeredVersion = archive.versionName,
+            offeredBuild = archive.longVersionCode,
+            expectedVersion = expectedVersion,
+        )?.let { return it }
 
         val installed = signingDigests(context, context.packageName)
         val offered = signingDigests(archive)
@@ -346,6 +461,35 @@ object ApkInspection {
         if (installed.intersect(offered).isEmpty()) {
             return "That package is signed by a different key than the app that is running. " +
                 "Nothing was installed."
+        }
+        return null
+    }
+
+    /**
+     * The checks that need only names and numbers.
+     *
+     * The build number as well as the version name, because the name is the release's word and the
+     * number is what Android compares: an archive that is not a higher build is refused by the
+     * installer as a downgrade, or reinstalls what is already here, after the user has been told it
+     * was an update.
+     */
+    internal fun judge(
+        installedPackage: String,
+        installedBuild: Long,
+        offeredPackage: String?,
+        offeredVersion: String?,
+        offeredBuild: Long,
+        expectedVersion: String,
+    ): String? {
+        if (offeredPackage != installedPackage) {
+            return "That package is $offeredPackage and this app is $installedPackage."
+        }
+        if (offeredVersion != null && offeredVersion != expectedVersion) {
+            return "That package says it is version $offeredVersion and the release says $expectedVersion."
+        }
+        if (offeredBuild <= installedBuild) {
+            return "That package is build $offeredBuild and this app is build $installedBuild. An update " +
+                "has to be a newer build, so it was not offered."
         }
         return null
     }

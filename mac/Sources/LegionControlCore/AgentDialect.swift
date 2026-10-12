@@ -80,6 +80,33 @@ enum AgentToken {
     /// A fresh operation id in the form the contract asks for.
     static func newOperationId() -> String { UUID().uuidString.lowercased() }
 
+    /// `^[0-9]+(m|h|d)$`: a queued request's lifetime, as `--expires` takes it.
+    static func isValidDuration(_ value: String) -> Bool {
+        let scalars = Array(value.unicodeScalars)
+        guard let unit = scalars.last, ["m", "h", "d"].contains(unit), scalars.count >= 2 else { return false }
+        return scalars.dropLast().allSatisfy(isDigit)
+    }
+
+    /// `^(?:[01][0-9]|2[0-3]):[0-5][0-9]$`: one end of a maintenance window.
+    static func isValidClockTime(_ value: String) -> Bool {
+        let scalars = Array(value.unicodeScalars)
+        guard scalars.count == 5, scalars[2] == ":", [0, 1, 3, 4].allSatisfy({ isDigit(scalars[$0]) }) else {
+            return false
+        }
+        let hour = (scalars[0].value - 48) * 10 + (scalars[1].value - 48)
+        return hour <= 23 && scalars[3].value - 48 <= 5
+    }
+
+    /// `^[0-9a-f]{64}$`: a sha256 in lower case hex, the only form a setup's hash and lineage take.
+    /// Swift's own idea of a hex digit also takes the fullwidth forms, and those are exactly what an
+    /// ASCII grammar is there to refuse.
+    static func isValidHash(_ value: String) -> Bool {
+        value.unicodeScalars.count == 64 && value.unicodeScalars.allSatisfy { isDigit($0) || ("a"..."f").contains($0) }
+    }
+
+    /// ASCII only. `Character.isNumber` and friends also take Arabic-Indic and fullwidth digits.
+    private static func isDigit(_ scalar: Unicode.Scalar) -> Bool { ("0"..."9").contains(scalar) }
+
     /// `^\d+(m|h|d)$`, the duration form the agent accepts.
     static func duration(seconds: TimeInterval) -> String {
         let total = max(60, Int(seconds.rounded()))

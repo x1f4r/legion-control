@@ -109,6 +109,8 @@ enum ControllerEditor {
         guard AgentToken.isValid(id) else {
             throw EditFailure("\"\(id)\" is not a usable machine id. Use letters, digits and . _ - : @ / \\ ~ = +.")
         }
+        if let ssh = machine["ssh"] as? [String: Any] { try requireDialable(ssh) }
+        for endpoint in (machine["endpoints"] as? [[String: Any]]) ?? [] { try requireDialable(endpoint) }
         var machines = (root["machines"] as? [[String: Any]]) ?? []
         if let index = machines.firstIndex(where: { $0["id"] as? String == id }) {
             var merged = machines[index]
@@ -132,9 +134,21 @@ enum ControllerEditor {
     }
 
     /// Add or replace one system on one machine.
+    ///
+    /// A Windows system this writes always says which shell it has, as section 15.1 of the contract
+    /// asks of every editor, so no client is left to guess. One that had none is given cmd, the
+    /// contract's default and what every 1.4 client already writes its lines in, so nothing a 1.4
+    /// client runs changes. It is not what a 1.3 Mac ran: that wrote Windows lines for PowerShell,
+    /// and on a PowerShell login the transport names the one-word fix.
     static func upsertSystem(_ system: [String: Any], onMachine machineId: String, in root: inout [String: Any]) throws {
         try mutateMachine(machineId, in: &root) { machine in
             try upsertKeyed(system, in: &machine, list: "systems", what: "system")
+            guard var systems = machine["systems"] as? [[String: Any]],
+                  let index = systems.firstIndex(where: { $0["id"] as? String == system["id"] as? String }),
+                  systems[index]["platform"] as? String == "windows",
+                  systems[index]["shell"] == nil || systems[index]["shell"] is NSNull else { return }
+            systems[index]["shell"] = "cmd"
+            machine["systems"] = systems
         }
     }
 
@@ -153,6 +167,9 @@ enum ControllerEditor {
     static func upsertEndpoint(_ endpoint: [String: Any], onMachine machineId: String, in root: inout [String: Any]) throws {
         try mutateMachine(machineId, in: &root) { machine in
             try upsertKeyed(endpoint, in: &machine, list: "endpoints", what: "endpoint")
+            // Checked as it ends up, after the merge: a new port on an old host is still one address.
+            let saved = (machine["endpoints"] as? [[String: Any]])?.first { $0["id"] as? String == endpoint["id"] as? String }
+            try requireDialable(saved ?? endpoint)
         }
     }
 
@@ -267,6 +284,19 @@ enum ControllerEditor {
     }
 
     // MARK: - Small helpers
+
+    /// Refuses an address this app would never dial, scan or pin (section 15.6 of the contract).
+    ///
+    /// The schema lets such a value through, and a peer's copy may carry one: this app keeps it and
+    /// warns. An editor is where a person is typing it, so it is refused there, naming the part
+    /// that fails, rather than saved only to be skipped on every call.
+    private static func requireDialable(_ entry: [String: Any]) throws {
+        guard let host = entry["host"] as? String else { return }
+        let target = SSHTarget(host: host, user: entry["user"] as? String, port: entry["port"] as? Int, identityFile: nil)
+        if let part = Addresses.undialablePart(of: target) {
+            throw EditFailure("\(target.display) cannot be saved: \(part) is not one this app dials, scans or pins.")
+        }
+    }
 
     private static func mutateMachine(
         _ id: String,

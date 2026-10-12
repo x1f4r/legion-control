@@ -32,20 +32,49 @@ data class MachineSystem(
     val platform: Platform,
     val agent: List<String>,
     /**
-     * Which shell this system's account logs in to, for writing the command line.
+     * The grammar this system's command line is written in, as contract section 15.1 gives it from
+     * the document's `platform`, `shell` and `restricted`, or null when it has none.
      *
-     * [RemoteShell.AUTO] until the configuration says, and that is not a gap: while every argument
-     * means the same thing in all three shells the command is written exactly as it always was.
-     * Only a path or an id that actually needs quoting makes the answer matter, and then it is asked
-     * for rather than guessed at.
+     * Computed once, here, and never derived anywhere else. A route whose last status reported a
+     * restricted session can only ever move it to [RemoteShell.DISPATCH] at run time.
      */
-    val shell: RemoteShell = RemoteShell.AUTO,
+    val grammar: RemoteShell? = RemoteShell.POSIX,
+    /** Why [grammar] is null: `unknown-shell` or `restricted-agent-shape`. */
+    val grammarRefusal: String? = null,
+    /**
+     * Whether this device approved the command it runs here (contract section 9.9).
+     *
+     * Set by the launch gate, which is what decides [agent] and [grammar]. A system the gate leaves
+     * [LaunchState.NOT_DRIVEN] is never sent anything, and nothing new is put on it either: the
+     * legacy bootstrap runs code with this argv's interpreter, so it is refused there in so many
+     * words rather than by the empty argv alone.
+     */
+    val launchState: LaunchState = LaunchState.APPROVED,
 ) {
     /**
      * A system the agent named that the configuration does not have. It can still be reported and
      * still be booted away from; it just has no interpreter path, so nothing can be run on it.
      */
     val isConfigured: Boolean get() = agent.isNotEmpty()
+
+    /**
+     * Whether commands are sent to this system at all: it names an agent, and its document gives
+     * that agent a grammar. A system whose `shell` is not one the contract knows is kept and shown,
+     * and never driven.
+     */
+    val isDriven: Boolean get() = isConfigured && grammar != null
+}
+
+/** Where a system's command stands with this device's approvals (contract section 9.9). */
+enum class LaunchState {
+    /** The command in force is the one this device approved. */
+    APPROVED,
+
+    /** The approved command is in force, and a changed one is waiting for approval. */
+    APPROVED_WITH_CHANGE_WAITING,
+
+    /** No approved command: nothing is sent to this system from this device. */
+    NOT_DRIVEN,
 }
 
 /** Everything a magic packet needs, and how to tell when the machine is back. */
@@ -109,12 +138,22 @@ fun ControllerConfig.toMachines(): List<Machine> = machines.map { it.toMachine()
 
 private fun MachineConfig.toMachine(): Machine {
     val systems = systems.map { system ->
+        // The document's own strings, compared exactly. Platform.fromWire forgives a capital letter
+        // for the sake of a glyph; the grammar does not, or two clients would quote differently.
+        val choice = grammarFor(
+            platform = system.platform,
+            shell = system.shell,
+            restricted = system.restricted,
+            restrictedSession = false,
+            agentLength = system.agent.size,
+        )
         MachineSystem(
             id = system.id,
             name = system.name?.takeIf { it.isNotBlank() } ?: system.id,
             platform = Platform.fromWire(system.platform),
             agent = system.agent,
-            shell = RemoteShell.fromWire(system.shell),
+            grammar = choice.grammar,
+            grammarRefusal = choice.refusal,
         )
     }
     val endpoints = endpoints.map { endpoint ->

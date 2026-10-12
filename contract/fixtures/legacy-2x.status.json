@@ -5,7 +5,7 @@
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
-  "hostname": "atlas",
+  "hostname": "beacon",
   "agentVersion": "2.1.0",
   "services": [
     {

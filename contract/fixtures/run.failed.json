@@ -1,13 +1,14 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "not-running",
   "message": "flush-cache exited 3",
+  "outcome": "failed",
   "action": "failed",
   "id": "flush-cache",
   "exitCode": 3,
@@ -21,8 +22,8 @@
     "mode": "manual",
     "initiator": {
       "client": "desktop",
-      "device": "legion-cachy",
-      "user": "x1f4r"
+      "device": "legion-linux",
+      "user": "me"
     },
     "state": "finished",
     "phase": "done",
@@ -40,7 +41,8 @@
       "reasonCode": "not-running",
       "message": "flush-cache exited 3",
       "exitCode": 3,
-      "output": "error: the build daemon is not running, so there is no cache to flush\n"
+      "output": "error: the build daemon is not running, so there is no cache to flush\n",
+      "outcome": "failed"
     },
     "log": [
       {
@@ -48,7 +50,8 @@
         "line": "run flush-cache"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.1.0",
+    "systemId": "linux",
+    "outcome": "failed"
   }
 }

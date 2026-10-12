@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import {
+  AGENT_TREE,
   AGENT_VERSION,
   basePath,
   configPath,
@@ -24,9 +25,11 @@ import {
   userHome,
 } from './config.mjs';
 import { CONTRACT_VERSION } from './contract.mjs';
+import { carriesSignedManifest } from './archive.mjs';
 import { selectSleepCommand } from './boot.mjs';
 import { readController } from './controller.mjs';
 import { checkEndpoint } from './endpoint.mjs';
+import { effectiveFloor, floorPath, isOlder } from './floor.mjs';
 import { currentHolder } from './lock.mjs';
 import { checkServiceBusy } from './probes/busy.mjs';
 import { checkHealth } from './probes/health.mjs';
@@ -80,7 +83,7 @@ function configChecks(loaded) {
           : 'fix the JSON; every mutating command is refused until it parses',
       ),
     );
-    checks.push(check('config.validate', 'fail', 'not reached', 'the file has to parse first', null));
+    checks.push(check('config.validate', 'fail', 'not reached', 'the file has to parse first', 'fix config.json so it parses; this check runs once it does'));
     return checks;
   }
 
@@ -118,7 +121,7 @@ function configChecks(loaded) {
           config.actions.length === 1 ? '' : 's'
         }`,
         notes.length > 0 ? notes.map((note) => `${note.path}: ${note.message}`).join(' | ') : null,
-        notes.map((note) => note.fix).filter(Boolean).join(' | ') || null,
+        notes.length > 0 ? notes.map((note) => note.fix).filter(Boolean).join(' | ') || 'review the paths listed above' : null,
       ),
     );
   }
@@ -265,10 +268,74 @@ function environmentChecks() {
       Number.isFinite(drift) ? 'ok' : 'warn',
       `the machine clock reads ${new Date().toISOString()}`,
       `local offset ${-new Date().getTimezoneOffset() / 60} h; maintenance windows are local time`,
-      null,
+      Number.isFinite(drift) ? null : 'set the clock, or turn on network time; every timestamp, expiry and maintenance window depends on it',
     ),
   );
 
+  return checks;
+}
+
+/**
+ * The agent itself: the version floor it is held to, and whether the tree
+ * answering is a signed release (contract section 13).
+ */
+function agentChecks() {
+  const checks = [];
+  const floor = effectiveFloor();
+  const file = floorPath();
+  if (floor.unreadable) {
+    checks.push(
+      check(
+        'agent.floor',
+        'warn',
+        'the version floor cannot be read',
+        `${floor.error}. Until it can, a restricted key cannot roll the agent back${floor.version ? `, and only the floor ${floor.version} the live agent declares is enforced` : ''}`,
+        `write the floor this machine should keep into ${file} as {"schema":1,"version":"x.y.z"}, at most the installed ${floor.live}; an unrestricted self-update with --allow-downgrade also rewrites it`,
+      ),
+    );
+  } else if (floor.version === null) {
+    checks.push(
+      check(
+        'agent.floor',
+        'warn',
+        'no version floor is in effect',
+        `the live agent ${floor.live} declares none and ${file} does not exist, so any signed agent may replace it, an older one included`,
+        'install a signed agent 3.1.0 or later; it declares a floor and records it when it installs',
+      ),
+    );
+  } else if (isOlder(floor.live, floor.version)) {
+    checks.push(
+      check(
+        'agent.floor',
+        'fail',
+        `agent ${floor.live} is below the version floor ${floor.version}`,
+        `the stable launcher refuses to run a signed agent below the floor recorded in ${file}`,
+        `install a signed agent at or above ${floor.version}, or go back deliberately from an unrestricted session with self-update --allow-downgrade, which lowers the floor`,
+      ),
+    );
+  } else {
+    checks.push(
+      check(
+        'agent.floor',
+        'ok',
+        `version floor ${floor.version}`,
+        `agent ${floor.live} can be replaced only by a signed agent at or above it, unless an unrestricted session goes back deliberately`,
+        null,
+      ),
+    );
+  }
+
+  checks.push(
+    carriesSignedManifest(AGENT_TREE)
+      ? check('agent.signed', 'ok', 'the running agent carries its signed manifest', `${AGENT_TREE} has MANIFEST.json and MANIFEST.json.sig; the stable launcher verifies them before it runs the agent`, null)
+      : check(
+          'agent.signed',
+          'warn',
+          'the running agent carries no signed manifest',
+          `${AGENT_TREE} has no MANIFEST.json and MANIFEST.json.sig, so nothing shows it came from a release, and nothing checks its files or the version floor before it runs`,
+          'install a signed release with self-update or the installer from a release download; a source checkout is unsigned by design',
+        ),
+  );
   return checks;
 }
 
@@ -550,7 +617,9 @@ async function serviceChecks(config, service, { deep }) {
           probe.running ? 'fail' : 'warn',
           `${service.name} does not answer`,
           health.error,
-          probe.running ? 'check the service log; the process is up but not serving' : null,
+          probe.running
+            ? 'check the service log; the process is up but not serving'
+            : `it cannot answer while it is stopped; start it with "legionctl restart --service ${id}"`,
         ),
   );
 
@@ -630,7 +699,7 @@ export async function runDoctor(loaded, { service = null, deep = false } = {}) {
   const startedAt = Date.now();
   const raw = readJsonDocument(loaded.path ?? configPath());
   const sanitize = diagnosticRedactor(loaded.config, raw.state === 'ok' ? raw.value : null);
-  const checks = [...configChecks(loaded), ...environmentChecks()];
+  const checks = [...configChecks(loaded), ...environmentChecks(), ...agentChecks()];
 
   const config = loaded.config;
   if (config) {
@@ -639,13 +708,16 @@ export async function runDoctor(loaded, { service = null, deep = false } = {}) {
 
     const selected = service ? config.services.filter((entry) => entry.id === service) : config.services;
     if (service && selected.length === 0) {
+      const ids = config.services.map((entry) => entry.id);
       checks.push(
         check(
           `service.${service}.process`,
           'fail',
           `this machine has no service called ${service}`,
-          `it has: ${config.services.map((entry) => entry.id).join(', ') || 'none'}`,
-          null,
+          `it has: ${ids.join(', ') || 'none'}`,
+          ids.length > 0
+            ? `use one of ${ids.join(', ')}, or leave out --service to check them all`
+            : 'leave out --service; this machine looks after no services',
         ),
       );
     }
@@ -693,7 +765,7 @@ export async function runDoctor(loaded, { service = null, deep = false } = {}) {
     const stored = readController();
     checks.push(
       !stored.hash
-        ? check('controller.copy', 'warn', 'this machine carries no setup document', 'a client will push one the first time it connects', null)
+        ? check('controller.copy', 'warn', 'this machine carries no setup document', 'a client will push one the first time it connects', 'connect once from a client that holds the setup; it publishes the document here')
         : stored.error
           ? check('controller.copy', 'fail', 'the stored setup document cannot be read', stored.error, 'a client will push over it; until then this machine cannot answer setup questions')
           : check(
@@ -774,6 +846,32 @@ function diagnosticRedactor(...configs) {
   return walk;
 }
 
+/**
+ * Keys whose values a client decodes rather than reads: identifiers, enum
+ * words, versions, timestamps, hashes and the names a reply is about. A
+ * configured argument that happens to be a word like "restart" or "busy" is
+ * still redacted wherever it appears in prose, but rewriting it inside these
+ * turned an operation's kind into "re<redacted>" and a reason code into
+ * something no schema allows, and the bundle into a reply no client decodes.
+ */
+const VERBATIM_KEYS = new Set([
+  'agentVersion', 'system', 'reasonCode', 'deferredReason', 'action', 'outcome', 'state', 'phase', 'kind', 'mode', 'evidence', 'level', 'disposition',
+  'id', 'opId', 'service', 'target', 'actionId', 'systemId', 'hash', 'keyFingerprint', 'lineage', 'source', 'version', 'from', 'to',
+  'installed', 'latest', 'nightly', 'staged', 'channel', 'pendingVersion', 'replaced', 'floor', 'signed',
+  'requestedAt', 'startedAt', 'updatedAt', 'finishedAt', 'expiresAt', 'checkedAt', 'at', 'nextWindow', 'pauseUntil', 'generatedAt', 'days',
+  'controller', 'raw', 'meta', 'current', 'command', 'argument', 'accepts', 'name', 'os', 'node', 'unit', 'capabilities', 'launchChanges', 'path',
+]);
+
+/** Redact the free text of a reply with `redact`, leaving every value under VERBATIM_KEYS as it is. */
+export function redactReply(value, redact, key = null) {
+  if (key !== null && VERBATIM_KEYS.has(key)) return value;
+  if (Array.isArray(value)) return value.map((item) => redactReply(item, redact));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([name, inner]) => [name, redactReply(inner, redact, name)]));
+  }
+  return redact(value);
+}
+
 /** Keep executable names for diagnosis; every subsequent argument is private. */
 export function redactConfig(config) {
   if (!config) return null;
@@ -800,7 +898,7 @@ export async function buildBundle({ doctor, status, history, logs, config, rawCo
   void CONTRACT_VERSION;
   void os;
   const sanitize = diagnosticRedactor(config, rawConfig);
-  const evidence = sanitize({ doctor, status, history, logs });
+  const evidence = redactReply({ doctor, status, history, logs }, sanitize);
   return {
     generatedAt: new Date().toISOString(),
     ...evidence,

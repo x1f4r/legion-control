@@ -1,4 +1,4 @@
-// Writes contract/hash-vectors.json.
+// Builds contract/hash-vectors.json, the vectors of the `hash` family.
 //
 // Every vector is a pair of byte strings and the hash they must produce. The
 // inputs are the shapes a real controller document arrives in: a file the Mac
@@ -8,15 +8,16 @@
 // `purpose`, because a vector nobody understands gets deleted the first time it
 // fails.
 //
-// Run: node contract/tools/make-hash-vectors.mjs
+// Whether a vector is accepted, and why not, is stated by hand below and also
+// computed by contract/tools/canonical.mjs. The two have to agree or nothing is
+// written: a table that only repeats what the code says checks nothing.
+//
+// Run: node contract/tools/generate.mjs
 
 import fs from 'node:fs';
-import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonicalBytes, canonicalHash, isValidUtf8 } from './canonical.mjs';
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const OUT = path.join(HERE, '..', 'hash-vectors.json');
+import { canonicalBytes, canonicalHash, isValidUtf8, run } from './canonical.mjs';
+import { documentText } from './documents.mjs';
 
 // One realistic document, in the compact form the Mac writes, used by most of
 // the vectors so that the hash they share is visibly the same number.
@@ -25,9 +26,9 @@ const DOC = [
   '  "version": 1,',
   '  "machines": [',
   '    {',
-  '      "id": "atlas",',
-  '      "name": "Atlas",',
-  '      "endpoints": [{ "host": "100.113.65.2", "user": "x1f4r", "port": 22 }]',
+  '      "id": "beacon",',
+  '      "name": "Beacon",',
+  '      "endpoints": [{ "host": "100.113.65.2", "user": "me", "port": 22 }]',
   '    }',
   '  ]',
   '}',
@@ -50,11 +51,16 @@ const NBSP = '\u00a0';
  *
  * `input` is given as bytes so a case can carry a byte sequence that is not
  * valid text at all, which is exactly the case an implementation is most likely
- * to hash instead of refusing.
+ * to hash instead of refusing. `accepted` and `reject` are what a person says
+ * the store does with it; the reference has to say the same.
  */
-function vector(name, purpose, inputBytes, { accepted = true, reject = null } = {}) {
+function vector(name, purpose, inputBytes, { accepted = true, reject = null, tags } = {}) {
   const buffer = Buffer.isBuffer(inputBytes) ? inputBytes : Buffer.from(inputBytes, 'utf8');
   const valid = isValidUtf8(buffer);
+  const computed = run('vectors', { inputBase64: buffer.toString('base64') });
+  if (computed.accepted !== accepted || computed.reject !== reject) {
+    throw new Error(`hash/vectors/${name}: want disagrees with tools/canonical.mjs: stated accepted ${accepted} and reject ${JSON.stringify(reject)}, the reference gives accepted ${computed.accepted} and reject ${JSON.stringify(computed.reject)}`);
+  }
   const entry = {
     name,
     purpose,
@@ -66,10 +72,11 @@ function vector(name, purpose, inputBytes, { accepted = true, reject = null } = 
     accepted,
     reject,
   };
+  if (tags !== undefined) entry.tags = tags;
   return entry;
 }
 
-const vectors = [
+const table = () => [
   vector(
     'plain-no-trailing-newline',
     'The baseline. Every other vector that ends in the same document must produce this same hash.',
@@ -180,35 +187,59 @@ const vectors = [
     Buffer.from([0x7b, 0x22, 0x76, 0x80, 0x22, 0x7d]),
     { accepted: false, reject: 'invalid-utf8' },
   ),
+  vector(
+    'double-bom',
+    'Two byte order marks in front of the baseline document. The rule strips exactly one, so the canonical bytes still begin with U+FEFF and the text is not a JSON object: refused. A decoder that drops a BOM on its own before the rule strips another (Foundation\'s String(data:encoding:) does) lands on the plain hash and stores a document every other side refuses.',
+    `${BOM}${BOM}${DOC}`,
+    { accepted: false, reject: 'not-a-json-object', tags: ['finding:c13'] },
+  ),
 ];
 
-const names = new Set();
-for (const entry of vectors) {
-  if (names.has(entry.name)) throw new Error(`duplicate vector name: ${entry.name}`);
-  names.add(entry.name);
+/** The vectors, built once. Building throws when a stated verdict disagrees with the reference. */
+let built = null;
+export function hashVectors() {
+  if (built !== null) return built;
+  const vectors = table();
+  const names = new Set();
+  for (const entry of vectors) {
+    if (names.has(entry.name)) throw new Error(`hash/vectors: the name ${entry.name} is used twice`);
+    names.add(entry.name);
+  }
+  built = vectors;
+  return vectors;
 }
 
-const document = {
-  $schema: './schemas/hash-vectors.schema.json',
-  contract: 3,
-  algorithm: 'sha256',
-  encoding: 'lowercase hex of the sha256 of the canonical UTF-8 bytes',
-  steps: [
-    'Decode the bytes as UTF-8. Refuse anything that is not valid UTF-8; it has no hash.',
-    'Strip one leading U+FEFF, if and only if it is the very first code point.',
-    'Replace every CRLF with LF, then every remaining lone CR with LF.',
-    'Remove code points U+0009, U+000A, U+000B, U+000C, U+000D and U+0020 from both ends, and nothing else. Do not use the language runtime’s own trim.',
-    'Append exactly one LF.',
-    'Encode as UTF-8. The hash is the lowercase hex sha256 of those bytes, and those bytes are what is stored on disk.',
-  ],
-  trimCodePoints: ['U+0009', 'U+000A', 'U+000B', 'U+000C', 'U+000D', 'U+0020'],
-  notes: [
-    'inputBase64 is base64 of the raw input bytes; canonicalBase64 is base64 of the bytes after the steps above. Both are base64 because a JSON string cannot carry a lone CR or an invalid byte.',
-    'accepted is whether the agent stores the document at all. A vector with accepted false still has a hash when its bytes are valid UTF-8, because canonicalisation happens before the document is inspected; the store then refuses it and the hash is never published.',
-    'A client that implements this rule correctly reproduces canonicalBase64 and sha256 for every vector, and refuses every vector whose sha256 is null.',
-  ],
-  vectors,
-};
+/** contract/hash-vectors.json, as the one entry of a Map from contract-relative path to text. */
+export function buildHashVectors() {
+  const document = {
+    $schema: './schemas/hash-vectors.schema.json',
+    contract: 3,
+    algorithm: 'sha256',
+    encoding: 'lowercase hex of the sha256 of the canonical UTF-8 bytes',
+    steps: [
+      'Decode the bytes as UTF-8. Refuse anything that is not valid UTF-8; it has no hash.',
+      'Strip one leading U+FEFF, if and only if it is the very first code point.',
+      'Replace every CRLF with LF, then every remaining lone CR with LF.',
+      'Remove code points U+0009, U+000A, U+000B, U+000C, U+000D and U+0020 from both ends, and nothing else. Do not use the language runtime’s own trim.',
+      'Append exactly one LF.',
+      'Encode as UTF-8. The hash is the lowercase hex sha256 of those bytes, and those bytes are what is stored on disk.',
+    ],
+    trimCodePoints: ['U+0009', 'U+000A', 'U+000B', 'U+000C', 'U+000D', 'U+0020'],
+    notes: [
+      'inputBase64 is base64 of the raw input bytes; canonicalBase64 is base64 of the bytes after the steps above. Both are base64 because a JSON string cannot carry a lone CR or an invalid byte.',
+      'accepted is whether the agent stores the document at all. A vector with accepted false still has a hash when its bytes are valid UTF-8, because canonicalisation happens before the document is inspected; the store then refuses it and the hash is never published.',
+      'reject is the first of these that applies, in this order: too-large (more than 1048576 bytes as given), invalid-utf8, empty (the canonical bytes are a single LF), not-a-json-object (the canonical text does not parse as a JSON object with a numeric version and an array machines). It is null exactly when accepted is true.',
+      'A client that implements this rule correctly reproduces canonicalBase64 and sha256 for every vector, and refuses every vector whose sha256 is null.',
+    ],
+    vectors: hashVectors(),
+  };
+  return new Map([['hash-vectors.json', documentText(document)]]);
+}
 
-fs.writeFileSync(OUT, `${JSON.stringify(document, null, 2)}\n`, 'utf8');
-process.stdout.write(`wrote ${path.relative(process.cwd(), OUT)} with ${vectors.length} vectors\n`);
+// The vectors are written by generate.mjs, together with everything else that
+// is generated, so a run of this file on its own says where to go instead of
+// silently doing nothing.
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
+  process.stderr.write('make-hash-vectors.mjs builds hash-vectors.json for generate.mjs; run node contract/tools/generate.mjs to write or check it\n');
+  process.exitCode = 1;
+}

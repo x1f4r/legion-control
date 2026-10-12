@@ -25,17 +25,17 @@ class SetupMergeTest {
         ).getOrThrow().root
 
     private val base = document(
-        """{"id":"pi","name":"Atlas","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"}],"systems":[]},
+        """{"id":"pi","name":"Beacon","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"}],"systems":[]},
            {"id":"tower","name":"Tower","endpoints":[],"systems":[]}""",
     )
 
     private val mine = document(
-        """{"id":"pi","name":"Atlas","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"},{"id":"tailnet","host":"100.1.1.1","user":"me"}],"systems":[]},
+        """{"id":"pi","name":"Beacon","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"},{"id":"tailnet","host":"100.1.1.1","user":"me"}],"systems":[]},
            {"id":"tower","name":"Tower","endpoints":[],"systems":[]}""",
     )
 
     private val theirs = document(
-        """{"id":"pi","name":"Atlas","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"}],"systems":[]},
+        """{"id":"pi","name":"Beacon","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"}],"systems":[]},
            {"id":"tower","name":"The big tower","endpoints":[],"systems":[]}""",
     )
 
@@ -60,11 +60,11 @@ class SetupMergeTest {
     @Test
     fun `an entry both sides changed is listed for a decision and defaults to theirs`() {
         val bothChanged = document(
-            """{"id":"pi","name":"Atlas the Pi","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"}],"systems":[]},
+            """{"id":"pi","name":"Beacon the Pi","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"}],"systems":[]},
                {"id":"tower","name":"Tower","endpoints":[],"systems":[]}""",
         )
         val theirRename = document(
-            """{"id":"pi","name":"Atlas the Raspberry","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"}],"systems":[]},
+            """{"id":"pi","name":"Beacon the Raspberry","endpoints":[{"id":"lan","host":"10.0.0.5","user":"me"}],"systems":[]},
                {"id":"tower","name":"Tower","endpoints":[],"systems":[]}""",
         )
 
@@ -81,7 +81,7 @@ class SetupMergeTest {
         )
         val pi = merged["machines"]!!.jsonArray.map { it.jsonObject }
             .first { it["id"]!!.jsonPrimitive.content == "pi" }
-        assertEquals("Atlas the Pi", pi["name"]!!.jsonPrimitive.content)
+        assertEquals("Beacon the Pi", pi["name"]!!.jsonPrimitive.content)
     }
 
     @Test
@@ -117,7 +117,7 @@ class SetupMergeTest {
     @Test
     fun `a merge keeps keys neither side's model understands`() {
         val a = ControllerDocument.parse(
-            """{"version":1,"futureTopLevel":{"a":1},"machines":[{"id":"pi","futureMachineKey":"x","name":"Atlas","endpoints":[],"systems":[]}]}""",
+            """{"version":1,"futureTopLevel":{"a":1},"machines":[{"id":"pi","futureMachineKey":"x","name":"Beacon","endpoints":[],"systems":[]}]}""",
         ).getOrThrow().root
         val b = ControllerDocument.parse(
             """{"version":1,"futureTopLevel":{"a":1},"machines":[{"id":"pi","futureMachineKey":"x","name":"Pi","endpoints":[],"systems":[]}]}""",
@@ -149,7 +149,7 @@ class SetupMergeTest {
     @Test
     fun `a change preview counts what a person would notice`() {
         assertEquals(listOf("pi", "tower"), base.machineIds())
-        assertEquals("Atlas", base.machineLabel("pi"))
+        assertEquals("Beacon", base.machineLabel("pi"))
         assertEquals(1, base.endpointCount())
         assertEquals(2, mine.endpointCount())
         assertTrue(sameMachine(base, mine, "tower"))

@@ -12,20 +12,20 @@ struct WakeTests {
     {
       "version": 1,
       "sites": [
-        { "id": "attic", "name": "Attic house", "lanPrefixes": ["192.168.178."], "broadcast": ["192.168.178.255"] },
-        { "id": "flat", "name": "New flat", "lanPrefixes": ["192.168.178."], "broadcast": ["192.168.178.255"] }
+        { "id": "attic", "name": "Attic house", "lanPrefixes": ["192.168.50."], "broadcast": ["192.168.50.255"] },
+        { "id": "flat", "name": "New flat", "lanPrefixes": ["192.168.50."], "broadcast": ["192.168.50.255"] }
       ],
       "machines": [
         { "id": "pi", "name": "Pi", "site": "attic", "alwaysOn": true,
-          "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.168.178.5" } ],
+          "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.168.50.5" } ],
           "wake": { "mac": "AA:BB:CC:DD:EE:01" },
           "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] },
         { "id": "legion", "name": "Legion", "site": "attic",
-          "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.168.178.9" } ],
+          "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.168.50.9" } ],
           "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] },
         { "id": "tower", "name": "Tower", "site": "flat",
-          "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.168.178.20" } ],
-          "wake": { "mac": "AA:BB:CC:DD:EE:FF", "broadcast": ["192.168.178.255"],
+          "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.168.50.20" } ],
+          "wake": { "mac": "AA:BB:CC:DD:EE:FF", "broadcast": ["192.168.50.255"],
                     "helpers": [ { "machine": "pi", "action": "wake-tower" },
                                  { "machine": "legion", "action": "wake-tower" } ] },
           "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] }
@@ -50,7 +50,7 @@ struct WakeTests {
         // were somewhere else entirely — which works either way.
         let config = try! Self.config()
         let placement = SiteAwareness.placement(sites: config.allSites,
-                                                addresses: ["192.168.178.42"], confirmed: nil)
+                                                addresses: ["192.168.50.42"], confirmed: nil)
         #expect(placement.matching.sorted() == ["attic", "flat"])
         #expect(placement.isAmbiguous)
         #expect(placement.effective == nil)
@@ -61,7 +61,7 @@ struct WakeTests {
     func confirmedSite() {
         let config = try! Self.config()
         let placement = SiteAwareness.placement(sites: config.allSites,
-                                                addresses: ["192.168.178.42"], confirmed: "flat")
+                                                addresses: ["192.168.50.42"], confirmed: "flat")
         #expect(placement.effective == "flat")
         #expect(!placement.isAmbiguous)
         #expect(placement.description(sites: config.allSites).contains("confirmed"))
@@ -93,14 +93,14 @@ struct WakeTests {
         let plan = WakePlan.plan(
             for: tower, in: config,
             placement: SiteAwareness.Placement(matching: ["flat"], confirmed: "flat"),
-            addresses: ["192.168.178.42"],
+            addresses: ["192.168.50.42"],
             helperStates: ["pi": Self.awake, "legion": Self.awake]
         )
         guard case .direct(let broadcasts, _)? = plan.steps.first else {
             Issue.record("expected a direct send first")
             return
         }
-        #expect(broadcasts == ["192.168.178.255"])
+        #expect(broadcasts == ["192.168.50.255"])
     }
 
     @Test("off-site the helpers are walked in the order the setup lists them")
@@ -177,7 +177,7 @@ struct WakeTests {
         let plan = WakePlan.plan(
             for: tower, in: config,
             placement: SiteAwareness.Placement(matching: ["attic", "flat"], confirmed: nil),
-            addresses: ["192.168.178.42"],
+            addresses: ["192.168.50.42"],
             helperStates: ["pi": Self.awake, "legion": Self.awake]
         )
         #expect(!plan.steps.contains { if case .direct = $0 { return true } else { return false } })

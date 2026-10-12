@@ -1,0 +1,162 @@
+{
+  "ok": true,
+  "contract": 3,
+  "agentVersion": "3.1.0",
+  "system": {
+    "id": "windows",
+    "name": "Windows 11"
+  },
+  "os": "windows",
+  "hostname": "tower",
+  "timing": {
+    "budgetMs": 20000,
+    "elapsedMs": 1210,
+    "partial": false
+  },
+  "agent": {
+    "version": "3.1.0",
+    "contract": 3,
+    "base": "C:\\Users\\me\\.legion-control",
+    "node": "24.9.0",
+    "restrictedSession": false,
+    "capabilities": [
+      "setup-lineage",
+      "wol-action",
+      "configured-telemetry",
+      "service-config-admin"
+    ],
+    "floor": "3.1.0",
+    "signed": true
+  },
+  "config": {
+    "ok": true,
+    "source": "file",
+    "problems": []
+  },
+  "services": [
+    {
+      "id": "demo",
+      "name": "Demo",
+      "kind": "command",
+      "installed": "1.4.2",
+      "latest": "1.4.2",
+      "channel": null,
+      "upToDate": true,
+      "running": false,
+      "healthy": true,
+      "port": 8765,
+      "staged": null,
+      "appPath": null,
+      "busy": {
+        "busy": false,
+        "unknown": false,
+        "monitored": true,
+        "reason": "idle",
+        "evidence": "command",
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "elapsedMs": 41,
+        "error": null
+      },
+      "relay": {
+        "configured": false,
+        "running": false
+      },
+      "pendingRestart": false,
+      "lastUpdate": null,
+      "canUpdate": true,
+      "canRestart": true,
+      "process": {
+        "running": false,
+        "state": "unknown",
+        "startedAt": null,
+        "error": "the process probe failed: Get-CimInstance: Access denied"
+      },
+      "health": {
+        "ok": true,
+        "status": 200,
+        "checkedAt": "2026-09-05T14:00:00.000Z",
+        "elapsedMs": 4,
+        "error": null
+      },
+      "endpoint": {
+        "configured": false,
+        "reachable": null
+      },
+      "updates": {
+        "automatic": false,
+        "inherited": false,
+        "pauseUntil": null,
+        "eligibleNow": false,
+        "deferredReason": "policy-off"
+      },
+      "pendingVersion": null,
+      "drain": false,
+      "lastOperation": null
+    }
+  ],
+  "busy": {
+    "busy": false,
+    "unknown": false,
+    "reason": "idle",
+    "monitoredServices": 1,
+    "unmonitoredServices": 0
+  },
+  "bootTargets": [],
+  "actions": [],
+  "autoUpdate": true,
+  "updates": {
+    "automatic": true,
+    "pauseUntil": null,
+    "maintenanceWindows": [
+      {
+        "days": [
+          "mon",
+          "tue",
+          "wed",
+          "thu",
+          "fri",
+          "sat",
+          "sun"
+        ],
+        "from": "02:00",
+        "to": "06:00"
+      }
+    ],
+    "inWindowNow": false,
+    "nextWindow": "2026-09-06T02:00:00.000Z",
+    "lastCycle": {
+      "opId": "7c5b3d92-4e18-4a6f-b273-9d0e1f8a5c46",
+      "at": "2026-09-05T02:02:00.000Z",
+      "action": "cycled"
+    }
+  },
+  "operations": {
+    "running": [],
+    "queued": [],
+    "recent": []
+  },
+  "controller": {
+    "hash": "81a6d710365ad9a0289cff90310898e22c04795134d6de67f58b207b3938e7a4",
+    "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
+    "revision": 12,
+    "updatedAt": "2026-09-02T16:00:00.000Z",
+    "source": "mac"
+  },
+  "t3": {
+    "installed": "1.4.2",
+    "nightly": "1.4.2",
+    "upToDate": true,
+    "serverRunning": false,
+    "healthy": true,
+    "port": 8765
+  },
+  "pendingRestart": false,
+  "lastUpdate": null,
+  "connect": {
+    "configured": false,
+    "running": false
+  },
+  "notes": [
+    "demo: the process probe failed, so whether demo is running is not known."
+  ]
+}

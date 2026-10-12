@@ -44,7 +44,17 @@ test('a service nobody described blocks, and says exactly what to write', async 
 test('a service declared never busy permits action and is not called unmonitored', async () => {
   const answer = await checkServiceBusy({ id: 'x', name: 'X', busy: { type: 'none' } });
   assert.equal(answer.busy, false);
+  assert.equal(answer.unknown, false);
   assert.equal(answer.evidence, 'none');
+  // A declaration is an answer, so it is monitored, and the aggregate counts
+  // only the services that block for want of a probe as unmonitored.
+  assert.equal(answer.monitored, true);
+  const aggregate = aggregateBusy([
+    { service: { id: 'x', name: 'X' }, busy: answer },
+    { service: { id: 'y', name: 'Y' }, busy: await checkServiceBusy({ id: 'y', name: 'Y', busy: { type: 'unmonitored' } }) },
+  ]);
+  assert.equal(aggregate.monitoredServices, 1);
+  assert.equal(aggregate.unmonitoredServices, 1);
 });
 
 test('the aggregate blocks when any service does, and names which', () => {

@@ -31,21 +31,45 @@ public sealed record CommandOptions
 /// out-of-date machine would lose the ability to update it at all.
 public static class CommandSurface
 {
+    // The identifier grammars of common.schema.json, matched the way every implementation matches
+    // them (contract/vectors/identifiers.json): the whole input, ASCII classes only, and a line
+    // feed or carriage return refused before any pattern sees the value. `$` would also match
+    // before a final newline here, and `\d` would take an Arabic-Indic digit.
+
     /// The grammar every token the agent accepts has to match. Checked here as well as there,
     /// because a token this client cannot see the far side reject comes back as a puzzling failure
     /// rather than as a refusal to send something malformed.
-    private static readonly Regex TokenGrammar = new(@"^[A-Za-z0-9][A-Za-z0-9._:@/\\~=+-]*$", RegexOptions.Compiled);
+    private static readonly Regex TokenGrammar = new(@"\A[A-Za-z0-9][A-Za-z0-9._:@/\\~=+-]*\z", RegexOptions.Compiled);
+
+    /// The ids the agent's own configuration gives services, actions and boot targets: a token
+    /// without the separators a path or an address would need.
+    private static readonly Regex ConfiguredIdGrammar = new(@"\A[A-Za-z0-9][A-Za-z0-9._-]*\z", RegexOptions.Compiled);
+
+    /// A shared setup's id, as the agent stores it: at most 64 characters and no separators of a
+    /// path or an address.
+    private static readonly Regex SetupIdGrammar = new(@"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\z", RegexOptions.Compiled);
 
     /// Operation ids are narrower still: lower case, and long enough not to collide.
-    private static readonly Regex OperationIdGrammar = new("^[a-z0-9-]{8,64}$", RegexOptions.Compiled);
+    private static readonly Regex OperationIdGrammar = new(@"\A[a-z0-9-]{8,64}\z", RegexOptions.Compiled);
 
-    private static readonly Regex DurationGrammar = new(@"^\d+(m|h|d)$", RegexOptions.Compiled);
+    private static readonly Regex DurationGrammar = new(@"\A[0-9]+(m|h|d)\z", RegexOptions.Compiled);
 
-    public static bool IsValidToken(string? value) => value is not null && TokenGrammar.IsMatch(value);
+    private static readonly Regex ClockTimeGrammar = new(@"\A(?:[01][0-9]|2[0-3]):[0-5][0-9]\z", RegexOptions.Compiled);
 
-    public static bool IsValidOperationId(string? value) => value is not null && OperationIdGrammar.IsMatch(value);
+    public static bool IsValidToken(string? value) => Matches(TokenGrammar, value);
 
-    public static bool IsValidDuration(string? value) => value is not null && DurationGrammar.IsMatch(value);
+    public static bool IsValidConfiguredId(string? value) => Matches(ConfiguredIdGrammar, value);
+
+    public static bool IsValidSetupId(string? value) => Matches(SetupIdGrammar, value);
+
+    public static bool IsValidOperationId(string? value) => Matches(OperationIdGrammar, value);
+
+    public static bool IsValidDuration(string? value) => Matches(DurationGrammar, value);
+
+    public static bool IsValidClockTime(string? value) => Matches(ClockTimeGrammar, value);
+
+    internal static bool Matches(Regex grammar, string? value) =>
+        value is not null && !value.Contains('\n') && !value.Contains('\r') && grammar.IsMatch(value);
 
     /// A fresh operation id in the shape the agent accepts.
     public static string NewOperationId() => Guid.NewGuid().ToString("d").ToLowerInvariant();

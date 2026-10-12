@@ -1,5 +1,9 @@
 package com.x1f4r.legioncontrol.data
 
+import com.x1f4r.legioncontrol.contract.VectorJson
+import com.x1f4r.legioncontrol.contract.VectorJson.boolean
+import com.x1f4r.legioncontrol.contract.VectorJson.string
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -20,7 +24,7 @@ class PeerConfigValidationTest {
     private val base = """
         "machines": [
           {
-            "id": "pi", "name": "Atlas", "site": "home",
+            "id": "pi", "name": "Beacon", "site": "home",
             "endpoints": [{ "id": "lan", "kind": "lan", "host": "10.0.0.5", "port": 22, "user": "me" }],
             "systems": [{ "id": "linux", "platform": "linux", "agent": ["node", "a.mjs"] }]
           }
@@ -63,6 +67,19 @@ class PeerConfigValidationTest {
             read("""{"version":1,"controller":{"id":"setup-a","lineage":[$tooMany]},$base,"sites":[{"id":"home"}]}""")
                 .exceptionOrNull()!!.message!!.contains("at most"),
         )
+    }
+
+    @Test
+    fun `an ancestry entry is a hash exactly when the contract's sha256 vectors say so`() {
+        // Apply checks the ancestry with Contract.isSha256Hex, so the identifier vectors pin the code
+        // that runs here rather than a copy of the pattern kept beside it.
+        val cases = VectorJson.cases("identifiers", "sha256")
+        assertTrue(cases.isNotEmpty())
+        cases.forEach { case ->
+            val entry = JsonPrimitive(case.input.string("value")!!)
+            val text = """{"version":1,"controller":{"id":"setup-a","lineage":[$entry]},$base,"sites":[{"id":"home"}]}"""
+            assertEquals(case.name, case.expect.boolean("valid"), read(text).isSuccess)
+        }
     }
 
     @Test
@@ -142,29 +159,52 @@ class PeerConfigValidationTest {
     }
 
     @Test
-    fun `a system whose command needs quoting has to say which shell it logs in to`() {
-        // Found at Apply rather than during a restart, which is the whole reason it is checked here.
+    fun `a command that needs quoting is a valid document, written for the platform's own shell`() {
+        // A path with a space used to need a declared shell before the document was accepted at all.
+        // Every grammar now has exactly one way to write it, and a system without a shell gets the
+        // platform's stock OpenSSH shell, so the document is valid as it stands.
         val text = """
             {"version":1,"machines":[
               {"id":"a","endpoints":[{"id":"e","kind":"lan","host":"10.0.0.5","port":22,"user":"me"}],
                "systems":[{"id":"s","agent":["/opt/my node/bin/node","a.mjs"]}]}
             ]}
         """.trimIndent()
-        assertTrue(read(text).exceptionOrNull()!!.message!!.contains("cannot be run"))
+        assertTrue(read(text).isSuccess)
 
-        val fixed = text.replace("\"id\":\"s\"", "\"id\":\"s\",\"shell\":\"posix\"")
-        assertTrue(read(fixed).isSuccess)
+        // A command its grammar cannot write is still a valid document, and is said at Apply.
+        val percent = text.replace("\"/opt/my node/bin/node\"", "\"C:\\\\Users\\\\%USERNAME%\\\\node.exe\"")
+            .replace("\"id\":\"s\"", "\"id\":\"s\",\"platform\":\"windows\"")
+        val advisories = read(percent).getOrThrow().advisories()
+        assertTrue(advisories.toString(), advisories.any { it.contains("cannot be sent") && it.contains("%") })
+    }
+
+    @Test
+    fun `a tilde in a command and an address that is never dialled are said, and not refused`() {
+        val text = """
+            {"version":1,"machines":[
+              {"id":"a","endpoints":[
+                 {"id":"e","kind":"lan","host":"10.0.0.5","port":22,"user":"me"},
+                 {"id":"odd","kind":"remote","host":"1234","port":22,"user":"me"}],
+               "systems":[{"id":"s","agent":["node","~/.legion-control/agent/src/index.mjs"]}]}
+            ]}
+        """.trimIndent()
+        val advisories = read(text).getOrThrow().advisories()
+        assertTrue(advisories.toString(), advisories.any { it.contains("~/.legion-control") && it.contains("not expanded") })
+        assertTrue(advisories.toString(), advisories.any { it.contains("\"odd\"") && it.contains("skipped") })
+        assertTrue(advisories.toString(), advisories.none { it.contains("\"e\"") })
     }
 
     @Test
     fun `an unknown shell name is refused rather than treated as unset`() {
-        val text = """
-            {"version":1,"machines":[
-              {"id":"a","endpoints":[{"id":"e","kind":"lan","host":"10.0.0.5","port":22,"user":"me"}],
-               "systems":[{"id":"s","shell":"fish","agent":["node","a.mjs"]}]}
-            ]}
-        """.trimIndent()
-        assertTrue(read(text).exceptionOrNull()!!.message!!.contains("posix"))
+        listOf("fish", "auto", "POSIX").forEach { shell ->
+            val text = """
+                {"version":1,"machines":[
+                  {"id":"a","endpoints":[{"id":"e","kind":"lan","host":"10.0.0.5","port":22,"user":"me"}],
+                   "systems":[{"id":"s","shell":"$shell","agent":["node","a.mjs"]}]}
+                ]}
+            """.trimIndent()
+            assertTrue(shell, read(text).exceptionOrNull()!!.message!!.contains("posix"))
+        }
     }
 
     @Test

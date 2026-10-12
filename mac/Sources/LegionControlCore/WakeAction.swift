@@ -7,7 +7,7 @@ enum WakeAction {
     static func run(action: String, target: String, machineId: String, machineName: String,
                     declaredPacket: Bool, dialect: AgentDialect, operations: OperationStore?,
                     send: @escaping @MainActor (AgentRequest) async throws -> AgentActionResult,
-                    read: @escaping @MainActor (AgentRequest) async throws -> AgentOperationResult) async -> MachineModel.WakeActionOutcome {
+                    read: @escaping @MainActor (AgentRequest) async throws -> AgentOperationResult) async -> WakeActionOutcome {
         if !declaredPacket, let previous = operations?.unresolved.first(where: { $0.machineId == machineId && $0.subject == action && $0.kind == .action }) {
             if let reply = try? await read(try AgentRequest.operation(id: previous.id, wait: nil)) {
                 if let operation = reply.operation, operation.isFinished {
@@ -33,7 +33,7 @@ enum WakeAction {
                                           kind: .action, subject: action,
                                           summary: "Asking \(machineName) to wake \(target).",
                                           agentTracked: dialect.supportsOperations))
-        func result(_ result: AgentActionResult, running: Bool = false) -> MachineModel.WakeActionOutcome {
+        func result(_ result: AgentActionResult, running: Bool = false) -> WakeActionOutcome {
             let state = OperationOutcome.state(for: result, stillRunning: running)
             let summary = result.output?.trimmingCharacters(in: .whitespacesAndNewlines)
                 .nilIfEmpty ?? result.message ?? "\(action): \(state.title)"

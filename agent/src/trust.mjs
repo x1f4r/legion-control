@@ -9,10 +9,14 @@
 // key is therefore part of the installed program, separate from shared topology
 // and local machine configuration, with no runtime override.
 //
-// The value is the exact contents of contract/release-public-key.pem. Rotating
-// it means shipping a release signed by the OLD key that carries the new one; a
-// key that is lost without a backup cannot be rotated at all, and every install
-// then has to be replaced by hand.
+// The value is the exact contents of contract/release-public-key.pem. There is
+// no key-rotation protocol (docs/security.md, "Losing the signing key"), and
+// changing this value alone does not rotate anything: the clients, this agent
+// and the stable launcher, which keeps its own copy in install/launcher.mjs,
+// all have to agree, through recovery as much as after the next launch. A
+// release signed by the old key that carries a new one is not assumed to get
+// there, so a replaced key means verifying every step or reinstalling out of
+// band, and a lost key means every install has to be replaced by hand.
 
 import crypto from 'node:crypto';
 
@@ -61,8 +65,17 @@ export function verifyDetachedSignature(bytes, signature) {
     : { ok: false, error: 'the signature does not match the release key compiled into this agent' };
 }
 
+/**
+ * The SHA-256 of the trusted key's SPKI, in hex. A self-update reply's
+ * `manifest.keyFingerprint` is this whole value, as the contract's sha256
+ * pattern requires; people read the short form below.
+ */
+export function trustKeyHash() {
+  const der = publicKey().export({ type: 'spki', format: 'der' });
+  return crypto.createHash('sha256').update(der).digest('hex');
+}
+
 /** A short, stable fingerprint of the trusted key, for doctor and diagnostics. */
 export function trustFingerprint() {
-  const der = publicKey().export({ type: 'spki', format: 'der' });
-  return crypto.createHash('sha256').update(der).digest('hex').slice(0, 16);
+  return trustKeyHash().slice(0, 16);
 }

@@ -87,10 +87,14 @@
             }
           },
           {
+            "description": "The machine lock, under either of its two codes: the reply names the operation in the way, not the held copy.",
             "if": {
               "properties": {
                 "reasonCode": {
-                  "const": "operation-in-progress"
+                  "enum": [
+                    "operation-in-progress",
+                    "lock-held"
+                  ]
                 }
               },
               "required": [
@@ -106,6 +110,48 @@
                 "divergent": false
               }
             }
+          },
+          {
+            "description": "A restricted session that may not publish this document says what the machine still holds. launchChanges names the refused launch values, and only this refusal carries it.",
+            "if": {
+              "properties": {
+                "reasonCode": {
+                  "const": "restricted"
+                }
+              },
+              "required": [
+                "reasonCode"
+              ]
+            },
+            "then": {
+              "required": [
+                "current"
+              ]
+            },
+            "else": {
+              "properties": {
+                "launchChanges": false
+              }
+            }
+          },
+          {
+            "description": "problems explains a config-invalid refusal and nothing else.",
+            "if": {
+              "properties": {
+                "reasonCode": {
+                  "const": "config-invalid"
+                }
+              },
+              "required": [
+                "reasonCode"
+              ]
+            },
+            "then": {},
+            "else": {
+              "properties": {
+                "problems": false
+              }
+            }
           }
         ],
         "properties": {
@@ -115,7 +161,10 @@
               "controller-conflict",
               "bad-argument",
               "config-invalid",
-              "operation-in-progress"
+              "operation-in-progress",
+              "lock-held",
+              "restricted",
+              "internal"
             ]
           }
         }
@@ -124,7 +173,9 @@
         "properties": {
           "divergent": false,
           "conflict": false,
-          "current": false
+          "current": false,
+          "launchChanges": false,
+          "problems": false
         }
       }
     },
@@ -232,6 +283,37 @@
     "conflict": {
       "description": "Set when the refusal is the machine-wide operation lock rather than anything about the document: a setup change during a running update could be read half-written by that update.",
       "$ref": "common.schema.json#/$defs/opConflict"
+    },
+    "launchChanges": {
+      "description": "restricted only, from agent 3.1.0 on: the paths of the launch values (v3.md section 9.9) this machine does not hold and a restricted session may not introduce, in document order. Paths, never the values.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "$ref": "common.schema.json#/$defs/launchPath"
+      }
+    },
+    "problems": {
+      "description": "config-invalid only, from agent 3.1.0 on: why the document was refused, one entry per problem, at most 50 (v3.md section 9.4).",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "$ref": "common.schema.json#/$defs/text"
+          },
+          "message": {
+            "$ref": "common.schema.json#/$defs/text"
+          }
+        },
+        "required": [
+          "path",
+          "message"
+        ],
+        "additionalProperties": false
+      }
     }
   },
   "required": [

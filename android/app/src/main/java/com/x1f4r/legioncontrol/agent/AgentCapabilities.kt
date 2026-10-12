@@ -16,14 +16,21 @@ import kotlinx.serialization.Serializable
  * contract 3 proper. Nothing else consults it.
  */
 data class AgentAbilities(
-    /** The `contract` number from the last reply. Zero until something has answered. */
-    val contract: Int = 0,
+    /**
+     * The `contract` number from the last reply, or null when no reply has carried one.
+     *
+     * Null rather than zero, because "nothing said" is not a number to compare against. A zero that
+     * stood for "not read yet" was below 3, and that was enough for the app to pick the legacy
+     * bootstrap for a machine nobody had heard from. Only an authenticated status says what an agent
+     * is; see [AgentDeploymentPath.decide].
+     */
+    val contract: Int? = null,
     val agentVersion: String? = null,
     /** Verb names from `help`, when it has been read. Empty otherwise, which means "do not assume". */
     val verbs: Set<String> = emptySet(),
 ) {
     /** Whether every v3 command and flag in this app is safe to send. */
-    val speaksV3: Boolean get() = contract >= Contract.REQUIRED
+    val speaksV3: Boolean get() = (contract ?: 0) >= Contract.REQUIRED
 
     /**
      * Whether the far side is newer than this build understands.
@@ -31,14 +38,14 @@ data class AgentAbilities(
      * Worth saying rather than hiding: the app keeps working against the part of the contract it
      * knows, and the user is told that the machine has moved on.
      */
-    val isNewerThanThisApp: Boolean get() = contract > Contract.REQUIRED
+    val isNewerThanThisApp: Boolean get() = (contract ?: 0) > Contract.REQUIRED
 
     /** The optional wake proxy, only ever used when `help` actually listed it. */
     val hasWakeProxy: Boolean get() = speaksV3 && "wake" in verbs
 
     /** One line for the machine page. */
     fun summary(): String = when {
-        contract <= 0 -> "not read yet"
+        contract == null || contract <= 0 -> "not read yet"
         !speaksV3 -> "contract $contract, older than this app needs"
         isNewerThanThisApp -> "contract $contract, newer than this app knows"
         else -> "contract $contract"
@@ -48,12 +55,12 @@ data class AgentAbilities(
         val unknown = AgentAbilities()
 
         fun of(status: AgentStatus): AgentAbilities = AgentAbilities(
-            contract = status.contract ?: status.agent?.contract ?: 0,
+            contract = status.contract ?: status.agent?.contract,
             agentVersion = status.version,
         )
 
         fun of(version: AgentVersion): AgentAbilities = AgentAbilities(
-            contract = version.contract ?: 0,
+            contract = version.contract,
             agentVersion = version.agentVersion,
         )
     }

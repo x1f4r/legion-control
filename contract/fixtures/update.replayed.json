@@ -1,13 +1,14 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "already-running",
   "message": "operation 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3 is already running; nothing was started twice",
+  "outcome": "pending",
   "action": "already-running",
   "service": "t3",
   "from": "0.0.36-nightly.20260904",
@@ -23,8 +24,8 @@
     "mode": "force",
     "initiator": {
       "client": "mac",
-      "device": "roberts-macbook-pro",
-      "user": "x1f4r"
+      "device": "office-macbook-pro",
+      "user": "me"
     },
     "state": "running",
     "phase": "installing",
@@ -59,9 +60,10 @@
         "line": "npm install -g t3@0.0.37-nightly.20260905"
       }
     ],
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.1.0",
     "systemId": "linux",
     "from": "0.0.36-nightly.20260904",
-    "to": "0.0.37-nightly.20260905"
+    "to": "0.0.37-nightly.20260905",
+    "outcome": "pending"
   }
 }

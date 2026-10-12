@@ -80,3 +80,11 @@ test('successful agent rollback requires publisher verification and discarded st
   assert.equal(fixture('self-update.self-test-failed.json').staged, null);
   assert.equal(fixture('self-update.legacy-rollback-refused.json').ok, false);
 });
+
+test('doctor check ids are a closed list that names the checks agent 3.1.0 adds', () => {
+  const check = (id) => ({ id, level: 'ok', summary: 'fine', detail: null, fix: null });
+  for (const id of ['agent.floor', 'agent.signed', 'files.private', 'ssh.shell', 'session.restricted']) {
+    assert.deepEqual(errors('common.schema.json#/$defs/doctorCheck', check(id)), [], id);
+  }
+  for (const id of ['agent.version', 'files', 'ssh.shell.extra']) assert.ok(errors('common.schema.json#/$defs/doctorCheck', check(id)).length, id);
+});

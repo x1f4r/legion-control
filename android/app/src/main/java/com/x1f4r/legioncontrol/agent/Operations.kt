@@ -209,8 +209,8 @@ sealed interface OperationEvent {
     /**
      * The transport gave up. [stage] decides whether this can be sent again.
      *
-     * [DispatchStage.NOT_STARTED] finishes it as failed and retryable; [DispatchStage.AMBIGUOUS]
-     * moves it to [TrackedState.OUTCOME_UNKNOWN] and never to a verdict.
+     * [DispatchStage.NOT_STARTED] finishes it as failed and retryable; [DispatchStage.AMBIGUOUS] and
+     * [DispatchStage.ACKNOWLEDGED] move it to [TrackedState.OUTCOME_UNKNOWN] and never to a verdict.
      */
     data class TransportFailed(
         val summary: String,
@@ -283,7 +283,9 @@ fun OperationRecord.reduce(event: OperationEvent): OperationRecord {
                 retryable = true,
             ).logged(event.at, event.summary, isError = true)
 
-            DispatchStage.AMBIGUOUS -> copy(
+            // The agent had it, even when what it said could not be read, so an acknowledged
+            // failure is reconciled exactly like an ambiguous one.
+            DispatchStage.AMBIGUOUS, DispatchStage.ACKNOWLEDGED -> copy(
                 state = TrackedState.OUTCOME_UNKNOWN,
                 summary = unknownSentence(),
                 detail = event.detail,

@@ -36,8 +36,9 @@ test('detached action survives the launching process, preserves isolation and re
     const accepted = cli(['run', 'first', '--detach', '--op', id], { home, env: { LEGIONCTL_CLIENT: 'phone', LEGIONCTL_DEVICE: 'test controller' } });
     assert.equal(accepted.payload?.action, 'accepted', accepted.stdout + accepted.stderr);
     assert.equal(accepted.payload.detached, true);
-    const conflict = cli(['run', 'second', '--detach', '--op', id], { home });
-    assert.equal(conflict.payload.action, 'conflict', conflict.stdout);
+    const reused = cli(['run', 'second', '--detach', '--op', id], { home });
+    assert.equal(reused.payload.reasonCode, 'bad-argument', reused.stdout);
+    assert.equal(reused.payload.argument, '--op');
     const completed = await finish(home, id);
     assert.equal(completed.result.action, 'ran', JSON.stringify(completed));
     assert.equal(completed.initiator.client, 'phone');

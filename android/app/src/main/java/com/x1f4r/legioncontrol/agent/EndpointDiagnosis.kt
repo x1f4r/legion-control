@@ -29,6 +29,12 @@ enum class DiagnosisStatus(val label: String) {
     /** Nothing on the other end inside the budget, with the link still up. */
     TIMED_OUT("did not answer in time"),
 
+    /**
+     * Not dialled, or nothing could be sent: the address or the command is not one this app makes as
+     * written. A fix in the setup, not a fact about the machine.
+     */
+    NOT_DIALLED("is not usable as written"),
+
     /** Nothing at all: asleep, off, or a route that does not carry. */
     UNREACHABLE("did not answer"),
     ;

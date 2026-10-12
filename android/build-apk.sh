@@ -2,9 +2,16 @@
 #
 # Legion Control for Android: build a signed release APK.
 #
-#   ./android/build-apk.sh              build, sign, print where the APK landed
-#   ./android/build-apk.sh --install    same, then install it on the connected phone
-#   ./android/build-apk.sh --clean      throw the previous build output away first
+#   ./android/build-apk.sh                  build, sign, print where the APK landed
+#   ./android/build-apk.sh --install        same, then install it on the connected phone
+#   ./android/build-apk.sh --clean          throw the previous build output away first
+#   ./android/build-apk.sh --require-agent  fail unless the signed agent bundle is there (releases)
+#
+# The signed agent bundle (dist/legionctl-agent-<version>.tgz, its signed manifest and the detached
+# signature, made by scripts/package-agent.mjs with the release key) goes into the APK when dist/
+# has it. Without it the APK still builds, and its "install the agent" action says this build
+# carries nothing to install. A release build passes --require-agent, so a release never ships
+# without the agent it names.
 #
 # The signing key lives outside this repository, at ~/.legion-control/android-release.jks, with its
 # password in ~/.legion-control/android-release.pw. Both are created on the first run, both are mode
@@ -35,6 +42,7 @@ KEY_VALIDITY_DAYS=9862 # about 27 years, so this never expires in practice
 
 DO_INSTALL=0
 DO_CLEAN=0
+REQUIRE_AGENT=0
 
 die() { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
 say() { printf '%s\n' "$1"; }
@@ -43,6 +51,7 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--install) DO_INSTALL=1 ;;
 		--clean) DO_CLEAN=1 ;;
+		--require-agent) REQUIRE_AGENT=1 ;;
 		-h|--help) awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
 		*) die "unknown option: $1" ;;
 	esac
@@ -86,16 +95,50 @@ ZIPALIGN="$SDK_DIR/build-tools/$BUILD_TOOLS_DIR/zipalign"
 [ -x "$ZIPALIGN" ] || die "no zipalign in $SDK_DIR/build-tools/$BUILD_TOOLS_DIR."
 
 # ---------------------------------------------------------------------------
-# Signing key
+# The agent bundle
 # ---------------------------------------------------------------------------
 
-# Signing a distributable build requires the complete signed agent bundle.
-for artifact in legionctl-agent-3.0.1.tgz Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig; do
-    if [ ! -s "$HERE/../dist/$artifact" ]; then
-        printf 'ERROR: missing signed agent artifact: %s. Run scripts/package-agent.mjs first.\n' "$artifact" >&2
-        exit 1
-    fi
+# The agent the APK carries is the one agent/package.json describes, the file the agent itself
+# reads its version from, so a new agent needs no edit here.
+AGENT_PACKAGE="$HERE/../agent/package.json"
+[ -r "$AGENT_PACKAGE" ] || die "cannot read $AGENT_PACKAGE, which names the agent the APK carries."
+# Under set -e a failed read inside the assignment would end the script without a word, so a
+# failure here falls through to the check below and its message instead.
+AGENT_VERSION="$(sed -n 's|^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$AGENT_PACKAGE" 2>/dev/null | head -1 || true)"
+printf '%s' "$AGENT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+	|| die "could not read an x.y.z agent version from $AGENT_PACKAGE."
+
+AGENT_ARTIFACTS=("legionctl-agent-$AGENT_VERSION.tgz" Legion-Control-agent-manifest.json Legion-Control-agent-manifest.json.sig)
+BUNDLE_PARTS=0
+for artifact in "${AGENT_ARTIFACTS[@]}"; do
+	if [ -e "$HERE/../dist/$artifact" ]; then BUNDLE_PARTS=$((BUNDLE_PARTS + 1)); fi
 done
+
+if [ "$BUNDLE_PARTS" -eq 0 ] && [ "$REQUIRE_AGENT" -eq 0 ]; then
+	# Only the release key makes a bundle, so this is what every build outside a release finds.
+	# Gradle copies nothing out of dist/ when there is nothing there to copy.
+	say "No signed agent bundle in dist/, so this APK carries no agent and its install action says so."
+	say "A release build passes --require-agent and stops here instead."
+else
+	# Part of a bundle, or another agent's, is never right: the APK would carry a manifest that
+	# names a tarball it does not have. So it stops whether or not --require-agent was given.
+	for artifact in "${AGENT_ARTIFACTS[@]}"; do
+		if [ ! -s "$HERE/../dist/$artifact" ]; then
+			printf 'ERROR: missing signed agent artifact: %s. Run scripts/package-agent.mjs first.\n' "$artifact" >&2
+			exit 1
+		fi
+	done
+	# The app finds the tarball by the name its signed manifest gives, so a manifest left over from
+	# another agent would point it at a file the APK does not carry.
+	MANIFEST_AGENT="$(sed -n 's|.*"agentVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' "$HERE/../dist/Legion-Control-agent-manifest.json" | head -1 || true)"
+	[ "$MANIFEST_AGENT" = "$AGENT_VERSION" ] \
+		|| die "dist/Legion-Control-agent-manifest.json is for agent ${MANIFEST_AGENT:-unknown}, not $AGENT_VERSION. Run scripts/package-agent.mjs again."
+	say "Bundling the signed agent $AGENT_VERSION from dist/"
+fi
+
+# ---------------------------------------------------------------------------
+# Signing key
+# ---------------------------------------------------------------------------
 
 # The directory is shared with the agent tree the Mac installer deploys, so its mode is left alone
 # and the two files are locked down individually instead.
@@ -138,7 +181,9 @@ if [ "$DO_CLEAN" -eq 1 ]; then
 fi
 
 say "Building the release APK with the wrapper (Gradle $( sed -n 's/.*gradle-\([0-9.]*\)-bin\.zip/\1/p' "$HERE/gradle/wrapper/gradle-wrapper.properties" 2>/dev/null | head -1 ), JDK 21)"
-( cd "$HERE" && ./gradlew --no-daemon assembleRelease )
+# legion.agentVersion tells app/build.gradle.kts which bundle to copy out of dist/, so it does not
+# fall back on a version of its own.
+( cd "$HERE" && ./gradlew --no-daemon assembleRelease "-Plegion.agentVersion=$AGENT_VERSION" )
 
 # What AGP leaves behind depends on whether app/build.gradle.kts declares a signingConfig for the
 # release build type. Without one it writes app-release-unsigned.apk and this script signs it. With

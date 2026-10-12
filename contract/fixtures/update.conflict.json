@@ -1,13 +1,14 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
   },
   "reasonCode": "operation-in-progress",
   "message": "an update of t3 has held the lock since 2026-09-05T14:00:01.000Z; this request was not started",
+  "outcome": "deferred",
   "action": "conflict",
   "service": "demo",
   "from": null,

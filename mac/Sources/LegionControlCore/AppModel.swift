@@ -4,9 +4,9 @@ import Observation
 /// Everything the app knows: one model per machine in the setup, plus the device this runs on.
 ///
 /// This object owns nothing about any particular machine. It holds the shared setup and this
-/// device's private bindings, rebuilds the models when either changes, fans the poll out across
-/// them, keeps the one place a question is shown, and owns the operation history the machines all
-/// write into.
+/// device's private bindings, brings the models in line when either changes, fans the poll out
+/// across them, keeps the one place a question is shown, and owns the operation history and the
+/// remembered settings the machines all write into.
 ///
 /// It is also where "every device is a peer" is actually true. There is no authority flag and no
 /// follower mode: this device edits the setup when the user edits it, publishes it to any machine
@@ -23,7 +23,7 @@ final class AppModel {
     /// The question waiting for an answer, whoever raised it.
     var dialog: PendingDialog?
     /// The setup disagreement waiting to be settled, when there is one.
-    var divergence: MachineModel.SetupDivergence?
+    var divergence: SetupDivergence?
 
     let config: ConfigStore
     /// This device's own settings, which are never published to anyone.
@@ -35,6 +35,10 @@ final class AppModel {
     /// Everything anyone has asked for, kept across launches.
     let operations: OperationStore
 
+    /// The last thing known about every machine's systems. One store for every model, so no
+    /// machine's reading can overwrite another's.
+    let remembered: RememberedSettings
+
     private var pollTask: Task<Void, Never>?
 
     /// Called whenever something the menu bar draws has changed.
@@ -44,12 +48,14 @@ final class AppModel {
         config: ConfigStore = ConfigStore(),
         bindings: BindingsStore = BindingsStore(),
         operations: OperationStore = OperationStore(),
-        appUpdates: AppUpdateModel = AppUpdateModel()
+        appUpdates: AppUpdateModel = AppUpdateModel(),
+        remembered: RememberedSettings = RememberedSettings()
     ) {
         self.config = config
         self.bindings = bindings
         self.operations = operations
         self.appUpdates = appUpdates
+        self.remembered = remembered
         appUpdates.onStateChange = { [weak self] in self?.onStateChange?() }
         config.onChange = { [weak self] in
             guard let self else { return }
@@ -90,11 +96,18 @@ final class AppModel {
 
     // MARK: - Following the setup
 
-    /// Builds the models the setup asks for, keeping the ones whose machine has not changed.
+    /// Builds the models the setup asks for, keeping every one whose machine is still there.
     ///
-    /// Keeping them matters more than it looks: a rebuild throws away the link state, the last
+    /// Keeping them matters more than it looks: a new model starts without the link state, the last
     /// reading and anything in flight, and the config file is written by hand while the app is open.
-    /// An edit to one machine must not reset the others.
+    /// An edit to one machine must not reset the others, and an edit to a machine that is busy must
+    /// not reset that one either: its model takes the new entry in place.
+    ///
+    /// One change still drops a model, busy or not: a binding that makes a machine this device, or
+    /// stops it being this device, swaps its machine model for the local one or back, because the
+    /// two reach the agent in different ways. An action running in the dropped model finishes
+    /// there, and its record still lands and is announced as usual, but no section shows it any
+    /// more, and the agent's own mutation lock is then all that stands in the way of a second one.
     private func rebuild() {
         appUpdates.repositoryDidChange()
         let binding = bindings.bindings
@@ -108,8 +121,9 @@ final class AppModel {
             // inventing a loopback endpoint would be inventing a route nobody asked for.
             .filter { $0.id != selfMachineId }
             .map { machine in
-                if let model = existing[machine.id], model.machine == machine { return model }
-                return makeMachineModel(machine)
+                guard let model = existing[machine.id] else { return makeMachineModel(machine) }
+                model.update(machine: machine)
+                return model
             }
 
         rebuildLocalModel(selfMachineId: selfMachineId)
@@ -129,17 +143,30 @@ final class AppModel {
     }
 
     private func makeMachineModel(_ machine: Machine) -> MachineModel {
-        let model = MachineModel(machine: machine)
+        let model = MachineModel(machine: machine, remembered: remembered)
         wire(model)
         return model
     }
 
+    /// What every device is told the same way: where questions go, where history is written, and
+    /// the setup it shares.
+    private func wireDevice(_ device: some AgentDevice) {
+        device.onStateChange = { [weak self] in self?.onStateChange?() }
+        device.ask = { [weak self] dialog in self?.dialog = dialog }
+        device.controllerConfig = { [weak self] in self?.config.document }
+        device.operations = operations
+        device.onOperationFinished = { [weak self] record in self?.announce(record) }
+        device.adoptSetup = { [weak self] bytes, description in
+            self?.config.adopt(bytes, describedAs: description)
+        }
+        device.setupBase = { [weak self] mine, theirs in
+            self?.config.commonAncestor(mine: mine, theirs: theirs)
+        }
+        device.onSetupDiverged = { [weak self] divergence in self?.divergence = divergence }
+    }
+
     private func wire(_ model: MachineModel) {
-        model.onStateChange = { [weak self] in self?.onStateChange?() }
-        model.ask = { [weak self] dialog in self?.dialog = dialog }
-        model.controllerConfig = { [weak self] in self?.config.document }
-        model.operations = operations
-        model.onOperationFinished = { [weak self] record in self?.announce(record) }
+        wireDevice(model)
         model.bindings = { [weak self] in self?.bindings.bindings ?? .empty }
         model.setup = { [weak self] in self?.config.config }
         model.peer = { [weak self] id in self?.machine(id: id) }
@@ -154,22 +181,23 @@ final class AppModel {
             }
         }
         model.placement = { [weak self] in self?.placement ?? SiteAwareness.Placement(matching: [], confirmed: nil) }
-        model.adoptSetup = { [weak self] bytes, description in
-            self?.config.adopt(bytes, describedAs: description)
-        }
-        model.setupBase = { [weak self] mine, theirs in
-            self?.config.commonAncestor(mine: mine, theirs: theirs)
-        }
-        model.onSetupDiverged = { [weak self] divergence in self?.divergence = divergence }
     }
 
     /// The local model: either this device's own agent as configured by `local`, or the machine this
     /// device is bound to when the bindings say so.
+    ///
+    /// Like the machines, the model is kept once there is one. A new name, a new agent command or a
+    /// new binding is taken in place, so an action running here is never left behind in a model
+    /// the app no longer shows.
     private func rebuildLocalModel(selfMachineId: String?) {
         if let selfMachineId, let machine = config.config?.machine(id: selfMachineId),
            let argv = bindings.bindings.localAgent?.argv, !argv.isEmpty {
             let local = LocalConfig(enabled: true, name: bindings.bindings.effectiveDeviceName, agent: argv.last ?? "")
-            if mac?.config.name != local.name || mac?.boundMachineId != selfMachineId || mac?.boundAgentArgv != argv {
+            if let mac {
+                if mac.config.name != local.name || mac.boundMachineId != selfMachineId || mac.boundAgentArgv != argv {
+                    mac.update(config: local, agent: MacAgent(argv: argv), boundMachineId: selfMachineId, boundAgentArgv: argv)
+                }
+            } else {
                 let model = MacModel(config: local, agent: MacAgent(argv: argv))
                 model.boundMachineId = selfMachineId
                 model.boundAgentArgv = argv
@@ -181,7 +209,13 @@ final class AppModel {
         }
 
         if !bindings.isPresent, let local = config.local {
-            if mac?.config != local || mac?.boundMachineId != nil {
+            if let mac {
+                if mac.config != local || mac.boundMachineId != nil {
+                    mac.update(config: local, agent: MacAgent(scriptPath: local.agentPath),
+                               boundMachineId: nil, boundAgentArgv: nil)
+                    mac.boundMachine = nil
+                }
+            } else {
                 let model = MacModel(config: local)
                 wireLocal(model)
                 mac = model
@@ -192,25 +226,14 @@ final class AppModel {
     }
 
     private func wireLocal(_ model: MacModel) {
+        wireDevice(model)
         model.migrateAgentCommand = { [weak self, weak model] argv in
             guard let self, model?.boundMachineId != nil else { return }
             _ = self.bindings.update { $0.localAgent = .init(argv: argv) }
         }
-        model.onStateChange = { [weak self] in self?.onStateChange?() }
-        model.ask = { [weak self] dialog in self?.dialog = dialog }
-        model.controllerConfig = { [weak self] in self?.config.document }
-        model.operations = operations
-        model.onOperationFinished = { [weak self] record in self?.announce(record) }
-        model.adoptSetup = { [weak self] bytes, description in
-            self?.config.adopt(bytes, describedAs: description)
-        }
-        model.setupBase = { [weak self] mine, theirs in
-            self?.config.commonAncestor(mine: mine, theirs: theirs)
-        }
-        model.onSetupDiverged = { [weak self] divergence in self?.divergence = divergence }
     }
 
-    func replaceSetupOnPeer(_ divergence: MachineModel.SetupDivergence) {
+    func replaceSetupOnPeer(_ divergence: SetupDivergence) {
         self.divergence = nil
         if let machine = machine(id: divergence.machineId) {
             machine.replaceSetup()
@@ -260,7 +283,7 @@ final class AppModel {
 
     /// Settle a divergence by merging the two branches.
     @discardableResult
-    func resolveDivergence(_ divergence: MachineModel.SetupDivergence,
+    func resolveDivergence(_ divergence: SetupDivergence,
                            choices: [String: SetupMerge.Choice]) -> String? {
         do {
             let identity = divergence.mine.identity.merged(
@@ -300,14 +323,14 @@ final class AppModel {
     /// Not a replace: the new revision lists the machine's document as one of its parents, so the
     /// machine accepts it as an ordinary fast-forward and no `--replace` is ever sent.
     @discardableResult
-    func keepMine(_ divergence: MachineModel.SetupDivergence) -> String? {
+    func keepMine(_ divergence: SetupDivergence) -> String? {
         let choices = Dictionary(uniqueKeysWithValues: divergence.differences.map { ($0.id, SetupMerge.Choice.mine) })
         return resolveDivergence(divergence, choices: choices)
     }
 
     /// Settle a divergence by taking the machine's branch.
     @discardableResult
-    func takeTheirs(_ divergence: MachineModel.SetupDivergence) -> String? {
+    func takeTheirs(_ divergence: SetupDivergence) -> String? {
         config.keepRevision(divergence.mine.bytes)
         let problem = config.adopt(divergence.theirsBytes, describedAs: "took the setup from \(divergence.machineName)")
         if problem == nil { self.divergence = nil }
@@ -340,17 +363,19 @@ final class AppModel {
     }
 
     var statusDetail: String? {
-        guard let recent = mostRecent else { return nil }
-        if let mac, mac.noteStamp > recent.statusStamp, mac.note != nil { return nil }
+        guard let recent = mostRecent else { return mac?.noteDetail }
+        if let mac, mac.noteStamp > recent.statusStamp, mac.note != nil { return mac.noteDetail }
         return recent.statusDetail
     }
 
-    /// What the last action the user started ended in.
-    var lastActionOutcome: MachineModel.ActionOutcome? {
-        machines
-            .filter { $0.lastActionOutcome != nil }
-            .max { $0.statusStamp < $1.statusStamp }?
-            .lastActionOutcome
+    /// What the last action the user started ended in, on whichever device spoke last. This Mac is
+    /// one of them: a failure here has to reach the panel's notice as surely as one over ssh.
+    var lastActionOutcome: ActionOutcome? {
+        var spoken: [(at: Date, outcome: ActionOutcome)] = machines.compactMap { machine in
+            machine.lastActionOutcome.map { (machine.statusStamp, $0) }
+        }
+        if let mac, let outcome = mac.lastActionOutcome { spoken.append((mac.noteStamp, outcome)) }
+        return spoken.max { $0.at < $1.at }?.outcome
     }
 
     /// Operations this app started and never learned the outcome of. The one thing that asks for

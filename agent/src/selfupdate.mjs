@@ -1,4 +1,5 @@
-// Signed, bounded and crash-recoverable agent replacement.
+// Signed, bounded and crash-recoverable agent replacement, held to the version
+// floor in floor.mjs.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -8,10 +9,11 @@ import { AGENT_VERSION, basePath, incomingDir, runCommand } from './config.mjs';
 import { CONTRACT_VERSION, REASON } from './contract.mjs';
 import { stageFiles, verifyAgentArchive, verifyAgentTree, MAX_ARCHIVE_BYTES } from './archive.mjs';
 import { commitInstallSwap, commitRollbackSwap, recoverAgentSwap, swapPaths } from './agent-swap.mjs';
+import { effectiveFloor, judgeAgentTransition, lowerFloor, raiseFloor, restoreFloor, treeDeclaration } from './floor.mjs';
 import { log, note } from './log.mjs';
 import { withOperation } from './operate.mjs';
 import { readOperation, recordPhase } from './operations.mjs';
-import { trustFingerprint } from './trust.mjs';
+import { trustFingerprint, trustKeyHash } from './trust.mjs';
 
 export const STDIN_IDLE_TIMEOUT_MS = 15_000;
 export const STDIN_TOTAL_TIMEOUT_MS = 120_000;
@@ -39,7 +41,7 @@ function manifestShape(verified) {
     contract: verified.manifest.contract ?? null,
     files: verified.entryCount,
     signatureVerified: true,
-    keyFingerprint: trustFingerprint(),
+    keyFingerprint: trustKeyHash(),
   };
 }
 
@@ -150,6 +152,52 @@ function failure(message, reasonCode = REASON.internal, extra = {}) {
   return { ok: false, action: 'failed', reasonCode, message, ...extra };
 }
 
+/**
+ * Whether this session may move the agent to a verified tree (contract section
+ * 13). Asked once before an operation record exists, so a refusal leaves
+ * nothing behind, and again under the lock, after an interrupted swap may have
+ * been recovered and the live version can differ from the one first judged.
+ * A retry of a recorded request is not asked first: see retriesRecorded.
+ */
+function judgeTransition(mode, verified, base, allowDowngrade) {
+  const floor = effectiveFloor(base);
+  return judgeAgentTransition({
+    mode,
+    target: verified.manifest.version,
+    live: floor.live,
+    floor: floor.version,
+    floorUnreadable: floor.unreadable,
+    restricted: process.env.LEGIONCTL_RESTRICTED === '1',
+    allowDowngrade: allowDowngrade === true,
+  });
+}
+
+function transitionRefused(verdict, verified, base) {
+  log(`self-update refused: ${verdict.message}`, 'self-update');
+  return failure(verdict.message, verdict.reasonCode, {
+    current: liveState(base), staged: null, previous: previousState(base), manifest: manifestShape(verified), selfTest: null,
+  });
+}
+
+/**
+ * Before the swap of a deliberate downgrade, the floor goes down to the target,
+ * so the launcher will run what was asked for. Returns null when the verdict
+ * does not lower it, or `{ ok, error, previous }` from lowerFloor.
+ */
+function lowerFloorFor(verdict, verified, base) {
+  if (!verdict.lowerFloor) return null;
+  const lowered = lowerFloor(base, verified.manifest.version);
+  if (lowered.ok) note(`the version floor is set to ${verified.manifest.version} for a deliberate downgrade`, 'self-update');
+  return lowered;
+}
+
+/** A swap that did not commit leaves the floor as it found it. */
+function restoreLoweredFloor(lowered, base, notes) {
+  if (!lowered) return notes;
+  const restored = restoreFloor(base, lowered.previous);
+  return restored.ok ? notes : [...notes, `the version floor could not be put back after the failed swap: ${restored.error}`];
+}
+
 export async function checkBundle(source) {
   const read = await readBundle(source);
   if (!read.ok) return failure(read.error, read.reasonCode, { manifest: null });
@@ -162,6 +210,21 @@ export async function checkBundle(source) {
     message: `the bundle carries agent ${verified.manifest.version} (contract ${verified.manifest.contract}) and its signature matches release key ${trustFingerprint().slice(0, 8)}`,
     manifest: manifestShape(verified),
   };
+}
+
+/**
+ * Whether --op names a self-update already recorded for this same bundle. That
+ * is a retry, and withOperation answers it with the first request's record
+ * without running anything. Judged first, it would be judged against whatever
+ * is live now: a client whose reply was lost, retrying after another client
+ * had moved the agent on, would hear a refusal for an install that succeeded.
+ * Any other request under that id is judged as usual, so reusing an id never
+ * gets a bundle past the floor.
+ */
+function retriesRecorded(opId, target) {
+  if (!opId) return false;
+  const existing = readOperation(opId);
+  return existing?.kind === 'self-update' && existing.target === target;
 }
 
 function replayTarget(opId, variant) {
@@ -201,7 +264,7 @@ function publishStableLauncher(files, base) {
   }
 }
 
-async function installVerified(config, verified, { target, base = basePath(), ...operation } = {}) {
+async function installVerified(config, verified, { target, base = basePath(), allowDowngrade = false, ...operation } = {}) {
   const manifest = manifestShape(verified);
   return withOperation(
     { kind: 'self-update', target, systemId: config?.system?.id ?? null, ...operation },
@@ -210,6 +273,8 @@ async function installVerified(config, verified, { target, base = basePath(), ..
       // null only on that path.
       const recovered = recoverAgentSwap(base);
       if (!recovered.ok) return failure(recovered.error, REASON.internal, { current: liveState(base), previous: previousState(base), manifest, selfTest: null });
+      const verdict = judgeTransition('install', verified, base, allowDowngrade);
+      if (!verdict.ok) return transitionRefused(verdict, verified, base);
       lock.phase('staging');
       recordPhase(opId, 'staging', { step: 2, of: 4, note: `agent ${manifest.version}` });
       removeTree(stagingDir(base));
@@ -228,24 +293,43 @@ async function installVerified(config, verified, { target, base = basePath(), ..
 
       lock.phase('swapping');
       recordPhase(opId, 'swapping', { step: 4, of: 4, note: 'renaming the trees' });
+      const lowered = lowerFloorFor(verdict, verified, base);
+      if (lowered && !lowered.ok) {
+        removeTree(stagingDir(base));
+        return failure(`the version floor could not be lowered to ${manifest.version}, so the live agent is untouched: ${lowered.error}`, REASON.internal, {
+          current: liveState(base), staged: null, previous: previousState(base), manifest, selfTest: test,
+        });
+      }
       try { publishStableLauncher(verified.files, base); }
       catch (error) {
         removeTree(stagingDir(base));
         return failure(`the recovery launcher could not be installed, so the live agent is untouched: ${error.message}`, REASON.internal, {
           current: liveState(base), staged: null, previous: previousState(base), manifest, selfTest: test,
+          ...(lowered ? { notes: restoreLoweredFloor(lowered, base, []) } : {}),
         });
       }
       const before = liveState(base);
+      // The floor the outgoing tree declared still binds after an upgrade, but
+      // not after a deliberate downgrade, which has just gone below it.
+      const outgoingFloor = lowered ? null : treeDeclaration(agentDir(base)).floor;
       note(`installing agent ${manifest.version} over ${before.version ?? 'an earlier agent'}`, 'self-update');
       const swapped = commitInstallSwap(base);
-      if (!swapped.ok) return failure(swapped.error, REASON.internal, { current: liveState(base), previous: previousState(base), manifest, selfTest: test, notes: swapped.notes });
+      if (!swapped.ok) {
+        return failure(swapped.error, REASON.internal, {
+          current: liveState(base), previous: previousState(base), manifest, selfTest: test, notes: restoreLoweredFloor(lowered, base, swapped.notes ?? []),
+        });
+      }
+      // Only a committed install raises the floor, to the highest of what was
+      // recorded and what either tree declares.
+      const raised = raiseFloor(base, [verified.agentFloor, outgoingFloor]);
+      const notes = raised.ok ? swapped.notes : [...swapped.notes, raised.error];
       const message = `agent ${manifest.version} is installed${before.version ? ` and ${before.version} is kept at ${previousDir(base)}` : ''}`;
       log(message, 'self-update');
       return {
         ok: true, action: 'installed', reasonCode: null, message, from: before.version, to: manifest.version,
         current: { version: manifest.version, contract: manifest.contract ?? CONTRACT_VERSION }, staged: null,
         previous: before.version ? { version: before.version, path: previousDir(base) } : null,
-        manifest, selfTest: test, ...(swapped.notes.length ? { notes: swapped.notes } : {}),
+        manifest, selfTest: test, ...(notes.length ? { notes } : {}),
       };
     },
   );
@@ -262,6 +346,10 @@ export async function runSelfUpdate(config, options = {}) {
     return failure(`${verified.error}; nothing was extracted and the running agent is untouched`, REASON.signatureInvalid, {
       current: liveState(), staged: null, previous: previousState(), manifest: null, selfTest: null,
     });
+  }
+  if (!retriesRecorded(options.opId, target)) {
+    const verdict = judgeTransition('install', verified, basePath(), options.allowDowngrade);
+    if (!verdict.ok) return transitionRefused(verdict, verified, basePath());
   }
   return installVerified(config, verified, { target, ...options });
 }
@@ -289,6 +377,10 @@ export async function runBootstrapInstall(config, options = {}) {
     current: liveState(layout.base), staged: null, previous: previousState(layout.base), manifest: null, selfTest: null,
   });
   const target = `install:${digest(verified.files.get('MANIFEST.json'))}`;
+  if (!retriesRecorded(options.opId, target)) {
+    const verdict = judgeTransition('install', verified, layout.base, options.allowDowngrade);
+    if (!verdict.ok) return transitionRefused(verdict, verified, layout.base);
+  }
   return installVerified(config, verified, { target, base: layout.base, ...options });
 }
 
@@ -320,11 +412,16 @@ export async function runRollback(config, options = {}) {
   }
   const target = `rollback:${digest(verified.files.get('MANIFEST.json'))}`;
   const manifest = manifestShape(verified);
+  const { allowDowngrade = false, ...operation } = options;
+  const verdict = judgeTransition('rollback', verified, base, allowDowngrade);
+  if (!verdict.ok) return transitionRefused(verdict, verified, base);
   return withOperation(
-    { kind: 'self-update', target, systemId: config?.system?.id ?? null, ...options },
+    { kind: 'self-update', target, systemId: config?.system?.id ?? null, ...operation },
     async ({ opId, lock }) => {
       const recovered = recoverAgentSwap(base);
       if (!recovered.ok) return failure(recovered.error, REASON.internal, { current: liveState(base), previous: previousState(base), manifest: null, selfTest: null });
+      const judged = judgeTransition('rollback', verified, base, allowDowngrade);
+      if (!judged.ok) return transitionRefused(judged, verified, base);
       const rollbackStage = swapPaths(base).rollbackStaging;
       removeTree(rollbackStage);
       const staged = stageFiles(verified.files, rollbackStage);
@@ -340,9 +437,22 @@ export async function runRollback(config, options = {}) {
       }
       lock.phase('swapping');
       recordPhase(opId, 'swapping');
+      // A rollback never raises the floor; one below it goes ahead only as a
+      // deliberate downgrade, which lowers it first.
+      const lowered = lowerFloorFor(judged, verified, base);
+      if (lowered && !lowered.ok) {
+        removeTree(rollbackStage);
+        return failure(`the version floor could not be lowered to ${manifest.version}, so the live agent is untouched: ${lowered.error}`, REASON.internal, {
+          current: liveState(base), staged: null, previous: previousState(base), manifest, selfTest: test,
+        });
+      }
       const before = liveState(base);
       const swapped = commitRollbackSwap(base);
-      if (!swapped.ok) return failure(swapped.error, REASON.internal, { current: liveState(base), previous: previousState(base), manifest, selfTest: test, notes: swapped.notes });
+      if (!swapped.ok) {
+        return failure(swapped.error, REASON.internal, {
+          current: liveState(base), previous: previousState(base), manifest, selfTest: test, notes: restoreLoweredFloor(lowered, base, swapped.notes ?? []),
+        });
+      }
       const retainedPath = fs.existsSync(swapPaths(base).rollbackParked) ? swapPaths(base).rollbackParked : previousDir(base);
       const message = `rolled back to agent ${manifest.version}; ${before.version ?? 'the outgoing agent'} is kept at ${retainedPath}`;
       log(message, 'self-update');

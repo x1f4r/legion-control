@@ -46,8 +46,17 @@
         "cycled",
         "skipped",
         "failed",
-        "conflict"
+        "conflict",
+        "already-running"
       ]
+    },
+    "replayed": {
+      "description": "Set on a reply that returns an existing record for the same --op id instead of starting a cycle.",
+      "type": "boolean"
+    },
+    "detached": {
+      "description": "On a replay of a running record (already-running): the record's own detached, copied.",
+      "type": "boolean"
     },
     "dryRun": {
       "type": "boolean"
@@ -96,7 +105,7 @@
       "type": "array",
       "maxItems": 50,
       "items": {
-        "$ref": "common.schema.json#/$defs/opChild"
+        "$ref": "#/$defs/operationEntry"
       }
     },
     "recovered": {
@@ -104,7 +113,7 @@
       "type": "array",
       "maxItems": 50,
       "items": {
-        "$ref": "common.schema.json#/$defs/opChild"
+        "$ref": "#/$defs/operationEntry"
       }
     },
     "conflict": {
@@ -120,5 +129,32 @@
     "dryRun",
     "op"
   ],
-  "unevaluatedProperties": false
+  "unevaluatedProperties": false,
+  "$defs": {
+    "operationEntry": {
+      "description": "One queued or recovered operation the cycle answered for. Unlike a child it is any kind of operation, and a boot, a sleep, a run or a cycle names no service, so `service` is null for those. It always has a record.",
+      "type": "object",
+      "properties": {
+        "opId": {
+          "$ref": "common.schema.json#/$defs/opId"
+        },
+        "service": {
+          "$ref": "common.schema.json#/$defs/configuredIdOrNull"
+        },
+        "action": {
+          "$ref": "common.schema.json#/$defs/opAction"
+        },
+        "reasonCode": {
+          "$ref": "common.schema.json#/$defs/reasonCodeOrNull"
+        }
+      },
+      "required": [
+        "opId",
+        "service",
+        "action",
+        "reasonCode"
+      ],
+      "additionalProperties": false
+    }
+  }
 }

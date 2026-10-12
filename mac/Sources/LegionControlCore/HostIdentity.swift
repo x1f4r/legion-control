@@ -67,10 +67,18 @@ struct HostIdentityContext: Sendable {
     var pinFiles: [URL: Data]
     var existing: [HostPublicKey]
 
+    /// What OpenSSH would look the target up as, read with `ssh -G`.
+    ///
+    /// Every value a pin is built from is held to the dial grammar of section 15.6 of the contract
+    /// first: the configured host before ssh is asked anything, and the `hostname`, `hostkeyalias`
+    /// and port it reports before any of them is used. A known_hosts line is a pattern list, so a
+    /// host such as `victim.example,*` written there would pin the scanned key for every host there
+    /// is; refusing it here is what keeps a shared document from choosing what this Mac trusts.
     static func resolve(_ target: SSHTarget,
                         runner: @Sendable (String, [String], TimeInterval) async -> CommandResult = {
                             await Shell.run(executable: $0, arguments: $1, timeout: $2)
                         }) async throws -> Self {
+        if let problem = Addresses.problem(with: target) { throw HostIdentityFailure(problem) }
         let isolated = AppPaths.overridesKnownHosts
         let options = isolated ? ["-F", "/dev/null", "-o", "UserKnownHostsFile=\(AppPaths.knownHostsFile.path)", "-o", "GlobalKnownHostsFile=/dev/null"] : []
         let config = await runner("/usr/bin/ssh", ["-G"] + options + target.sshOptions + ["--", target.destination], 10)
@@ -87,6 +95,10 @@ struct HostIdentityContext: Sendable {
         let host = values["hostname"] ?? target.host
         let port = Int(values["port"] ?? "") ?? target.port ?? 22
         let alias = values["hostkeyalias"].flatMap { $0 == "none" ? nil : $0 }
+        guard Addresses.hostForm(host) != nil, alias.map({ Addresses.hostForm($0) != nil }) ?? true,
+              Addresses.isPort(port) else {
+            throw HostIdentityFailure("OpenSSH resolves this route to a host name or alias this app does not pin. Manual SSH enrollment is needed.")
+        }
         let lookup = alias ?? (port == 22 ? host : "[\(host)]:\(port)")
         func paths(_ key: String) throws -> [URL] {
             let raw = values[key] ?? ""
@@ -118,6 +130,10 @@ struct HostIdentityContext: Sendable {
         return Self(address: "\(lookup.lowercased()):\(port)", lookup: lookup, scanHost: host, port: port,
                     knownHosts: destination, pinFiles: snapshots, existing: existing)
     }
+
+    /// What ssh-keyscan is run with: the checked port, then `--`, then the checked host, so neither
+    /// can ever be read as an option.
+    var keyscanArguments: [String] { ["-T", "8", "-p", String(port), "--", scanHost] }
 }
 
 struct HostIdentityStore {

@@ -5,7 +5,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { canonicalBytes, canonicalHash, judgeIncoming, readControllerBlock, readController, readControllerMeta, storeController } from '../src/controller.mjs';
+import {
+  MAX_CONTROLLER_BYTES, canonicalBytes, canonicalHash, judgeIncoming, readControllerBlock, readController, readControllerMeta, storeController,
+} from '../src/controller.mjs';
 import { REPO, fresh, withHome } from './helpers.mjs';
 
 const vectors = JSON.parse(fs.readFileSync(path.join(REPO, 'contract', 'hash-vectors.json'), 'utf8'));
@@ -127,6 +129,94 @@ test('storing writes the canonical bytes and the metadata as one transaction', a
     assert.equal(meta.id, 'setup-a');
     assert.equal(meta.revision, 1);
     assert.equal(readController().hash, stored.hash, 'the document and its metadata always agree');
+  });
+});
+
+test('a snapshot carries the canonical text that its hash covers, however the bytes were written', async () => {
+  await withHome(async (home) => {
+    // Pushed with Windows line endings and trailing blank lines: what is served
+    // back is the canonical text, byte for byte the bytes the hash covers.
+    const pushed = `${document('setup-a', 1, 'alpha').replace(/\n/g, '\r\n')}\r\n\r\n`;
+    assert.equal(storeController(pushed, { id: 'setup-a', revision: 1 }).ok, true);
+    const stored = readController();
+    assert.equal(stored.text, canonicalBytes(pushed).toString('utf8'));
+    assert.equal(canonicalHash(stored.text), stored.hash);
+    assert.deepEqual(JSON.parse(stored.text), stored.document);
+
+    // Put there by hand, with a byte order mark and no metadata: the document
+    // is parsed from its canonical text, so the mark does not stop it.
+    fs.rmSync(path.join(home, 'controller.meta.json'));
+    fs.writeFileSync(path.join(home, 'controller.json'), `\ufeff  {"version": 1, "machines": []}  \r\n`);
+    const placed = readController();
+    assert.deepEqual(placed.document, { version: 1, machines: [] });
+    assert.equal(placed.text, '{"version": 1, "machines": []}\n');
+    assert.equal(placed.hash, canonicalHash(placed.text));
+  });
+});
+
+test('a snapshot with no document carries no text', async () => {
+  await withHome(async (home) => {
+    const file = path.join(home, 'controller.json');
+    assert.equal(readController().text, null, 'nothing stored');
+
+    fs.writeFileSync(file, '');
+    const empty = readController();
+    assert.equal(empty.document, null);
+    assert.equal(empty.text, null);
+
+    fs.writeFileSync(file, '{"version": 1, "machines": [');
+    assert.equal(readController().text, null, 'text that does not parse is never served as a document');
+
+    fs.rmSync(file);
+    fs.mkdirSync(file);
+    const unreadable = readController();
+    assert.equal(unreadable.document, null);
+    assert.equal(unreadable.text, null);
+    assert.ok(unreadable.error);
+  });
+});
+
+test('a setup file larger than the agent ever stores is not served', async () => {
+  await withHome(async (home) => {
+    const padding = ' '.repeat(1024 * 1024);
+    fs.writeFileSync(path.join(home, 'controller.json'), `{"version": 1, "machines": [], "notes": "${padding}"}`);
+    const oversized = readController();
+    assert.equal(oversized.document, null);
+    assert.equal(oversized.text, null);
+    assert.match(oversized.error, /larger than 1048576 bytes/);
+    // Nothing anybody depends on is held, so a push may still replace it.
+    assert.equal(storeController(document('setup-a', 1, 'alpha'), { id: 'setup-a', revision: 1 }).ok, true);
+  });
+});
+
+test('the size limit is on the canonical bytes, so a document it would push over is refused before anything is staged', async () => {
+  await withHome(async (home) => {
+    // Exactly 1 MiB as sent, with no final newline: canonical form adds one,
+    // and the bytes this machine would hold are one over the limit. Storing
+    // them left a commit journal no reader accepts, and every later `config`
+    // and `config set` answered internal until somebody deleted it by hand.
+    const sized = (length) => {
+      const opening = '{"version": 1, "machines": [], "notes": "';
+      return `${opening}${'x'.repeat(length - opening.length - 2)}"}`;
+    };
+    const atLimit = sized(MAX_CONTROLLER_BYTES);
+    assert.equal(Buffer.byteLength(atLimit), MAX_CONTROLLER_BYTES);
+
+    const refused = storeController(atLimit);
+    assert.equal(refused.ok, false);
+    assert.equal(refused.reasonCode, 'bad-argument');
+    assert.match(refused.error, /larger than 1048576 bytes/);
+    for (const name of ['controller.json', 'controller.json.staged', 'controller.commit.json', 'controller.meta.json']) {
+      assert.equal(fs.existsSync(path.join(home, name)), false, `${name} was written for a refused document`);
+    }
+    assert.equal(readController().consistent, true);
+
+    // One byte shorter, it fits with its newline, and is stored and served.
+    const fits = sized(MAX_CONTROLLER_BYTES - 1);
+    const stored = storeController(fits);
+    assert.equal(stored.ok, true, stored.error);
+    assert.equal(stored.bytes, MAX_CONTROLLER_BYTES);
+    assert.equal(readController().text, `${fits}\n`);
   });
 });
 

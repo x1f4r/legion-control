@@ -12,7 +12,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validate, loadSchemas, registry, resolveRef } from '../validate.mjs';
+import fs from 'node:fs';
+import { validate, loadSchemas, registry, resolveRef, jsonEqual, schemaForCommand, checkReply } from '../validate.mjs';
 
 loadSchemas();
 
@@ -193,4 +194,50 @@ test('every schema file is registered under its own name', () => {
   ]) {
     assert.ok(registry.has(required), `${required} is missing`);
   }
+});
+
+test('a type may be a list of types', () => {
+  // The shared document writes its deprecated keys as "type": ["object", "null"].
+  // Read as one string, that refused every document that carried them.
+  accepts({ type: ['object', 'null'] }, null);
+  accepts({ type: ['object', 'null'] }, { local: true });
+  rejects({ type: ['object', 'null'] }, 'local');
+  accepts({ $ref: 'controller-document.schema.json' }, { version: 1, machines: [], local: { enabled: false }, ssh: null });
+});
+
+test('JSON equality ignores key order and nothing else', () => {
+  assert.equal(jsonEqual({ a: 1, b: [1, { c: null }] }, { b: [1, { c: null }], a: 1 }), true);
+  assert.equal(jsonEqual([1, 2], [2, 1]), false);
+  assert.equal(jsonEqual({ a: 1 }, { a: 1, b: undefined }), false);
+  assert.equal(jsonEqual({ a: null }, { a: false }), false);
+  assert.equal(jsonEqual('1', 1), false);
+});
+
+test('a reply is read with the schema its command and its shape call for', () => {
+  const v3 = { ok: true, contract: 3 };
+  assert.equal(schemaForCommand('status', { ok: true }), 'legacy-2x-status.schema.json');
+  assert.equal(schemaForCommand('config', { ok: true }), 'legacy-2x-config.schema.json');
+  assert.equal(schemaForCommand('update', { ok: true }), 'legacy-2x-mutation.schema.json');
+  assert.equal(schemaForCommand('cancel', { ok: false, contract: 3, command: 'cancel' }), 'error.schema.json');
+  assert.equal(schemaForCommand('self-update', { ok: false, contract: 3, command: 'self-update', action: 'failed' }), 'self-update.schema.json');
+  assert.equal(schemaForCommand('config', v3), 'config-read.schema.json');
+  assert.equal(schemaForCommand('config meta', v3), 'config-meta.schema.json');
+  assert.equal(schemaForCommand('config set', v3), 'config-set.schema.json');
+  assert.equal(schemaForCommand('policy set', v3), 'policy.schema.json');
+  assert.equal(schemaForCommand('auto-update', v3), 'policy.schema.json');
+  assert.equal(schemaForCommand('service-config set', v3), 'service-config.schema.json');
+  assert.equal(schemaForCommand('op', v3), 'op.schema.json');
+});
+
+test('checkReply returns the problems of one reply, and none for a reply that holds', () => {
+  const read = (name) => JSON.parse(fs.readFileSync(new URL(`../fixtures/${name}`, import.meta.url), 'utf8'));
+  assert.deepEqual(checkReply('config-read.schema.json', read('config.read.json')), []);
+  assert.deepEqual(checkReply('update.schema.json', read('update.conflict.json'), { where: 'conflict' }), []);
+
+  const optimistic = { ...read('run.timed-out.json'), outcome: 'failed' };
+  assert.match(checkReply('run.schema.json', optimistic, { where: 'run' }).join(' '), /^run: outcome is "failed", and the reducer of section 5\.6 gives "unknown"/);
+
+  const unknownKey = { ...read('busy.idle.json'), surprise: true };
+  assert.match(checkReply('busy.schema.json', unknownKey).join(' '), /unexpected key "surprise"/);
+  assert.match(checkReply('nothing.schema.json', {}).join(' '), /no schema named nothing\.schema\.json/);
 });

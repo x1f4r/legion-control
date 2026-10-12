@@ -261,7 +261,7 @@ struct AppUpdateTests {
         defer { if oldApp.isRunning { oldApp.terminate() } }
         let launched = root.appending(path: "unexpected-launch")
         // A shell function captures every attempted launch without opening any real application.
-        let intercept = "open() { printf launched > " + RemoteShell.posixQuoted(launched.path) + "; }\n"
+        let intercept = "open() { printf launched > " + CommandGrammar.posixQuoted(launched.path) + "; }\n"
         let script = intercept + AppUpdates.swapScript(
             current: current, staged: staged, previous: previous, marker: marker,
             pid: oldApp.processIdentifier, exitTimeout: 1, launchTimeout: 1

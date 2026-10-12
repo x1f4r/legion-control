@@ -14,6 +14,7 @@ namespace LegionControl.Desktop.Transport;
 public sealed class RouteBook
 {
     private readonly Dictionary<string, DateTimeOffset> _failedAt = new(StringComparer.Ordinal);
+    private readonly HashSet<(string Route, string System)> _restricted = new();
     private readonly object _gate = new();
 
     /// How long an address that failed is left alone. The rule is per address, not per machine: a
@@ -25,14 +26,33 @@ public sealed class RouteBook
     /// The system that answered last, which is the shape the next command is built for.
     public string? RememberedSystemId { get; private set; }
 
-    public void Remember(MachineRoute route, SystemConfig system)
+    /// The route and system that just answered. When the answer was an authenticated status,
+    /// [restrictedSession] is what it said about this key on that route under that system; an
+    /// answer to anything else passes null and leaves what is known about the route alone.
+    public void Remember(MachineRoute route, SystemConfig system, bool? restrictedSession = null)
     {
         lock (_gate)
         {
             RememberedRouteId = route.Id;
             RememberedSystemId = system.Id;
             _failedAt.Remove(route.Id);
+            if (restrictedSession == true) _restricted.Add((route.Id, system.Id));
+            else if (restrictedSession == false) _restricted.Remove((route.Id, system.Id));
         }
+    }
+
+    /// Each route with the system whose last authenticated status over it reported
+    /// `agent.restrictedSession: true`. That system is restricted on that route whatever the
+    /// document says, and its command lines are written for the dispatcher (contract section 15.1).
+    ///
+    /// Kept per system as well as per route, because the restriction belongs to the key one
+    /// system's sshd forces, not to the address. The two systems of a dual boot machine often
+    /// answer on the same address with different keys. Marked per route alone, a restricted Linux
+    /// left that address marked for Windows after a reboot, every Windows line went out in a
+    /// grammar cmd cannot run, and no status could ever get through to clear the mark.
+    public IReadOnlySet<(string Route, string System)> RestrictedSessions
+    {
+        get { lock (_gate) return new HashSet<(string Route, string System)>(_restricted); }
     }
 
     public void NoteFailure(string routeId, DateTimeOffset? at = null)

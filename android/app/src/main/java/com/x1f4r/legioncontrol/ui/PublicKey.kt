@@ -35,11 +35,14 @@ fun AuthorisationScreen(
     publicKey: String,
     systems: List<MachineSystem>,
     detail: String?,
+    /** This phone's key was replaced, which is the likeliest reason a machine stopped accepting it. */
+    keyChanged: Boolean = false,
     onRetry: () -> Unit,
 ) {
     var instructions by remember { mutableStateOf(false) }
     var connectionDetails by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth()) {
+        if (keyChanged) QuietText("This phone's key changed, so a machine that accepted the old one refuses this one.")
         QuietText("Add this device's public key to the target's authorized keys.")
         PublicKeyBlock(publicKey)
         PlainAction("Try again", enabled = true, onClick = onRetry)

@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -10,7 +10,7 @@
   "doctor": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.1.0",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
@@ -34,7 +34,7 @@
       {
         "id": "base.writable",
         "level": "ok",
-        "summary": "/home/x1f4r/.legion-control is writable",
+        "summary": "/home/me/.legion-control is writable",
         "detail": null,
         "fix": null
       },
@@ -62,7 +62,7 @@
       {
         "id": "npm.prefix",
         "level": "ok",
-        "summary": "global prefix /home/x1f4r/.local",
+        "summary": "global prefix /home/me/.local",
         "detail": null,
         "fix": null
       },
@@ -182,22 +182,22 @@
   "status": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.1.0",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
     },
     "os": "linux",
-    "hostname": "atlas",
+    "hostname": "beacon",
     "timing": {
       "budgetMs": 20000,
       "elapsedMs": 2310,
       "partial": false
     },
     "agent": {
-      "version": "3.0.0",
+      "version": "3.1.0",
       "contract": 3,
-      "base": "/home/x1f4r/.legion-control",
+      "base": "/home/me/.legion-control",
       "node": "24.9.0",
       "restrictedSession": false,
       "capabilities": [
@@ -205,7 +205,9 @@
         "wol-action",
         "configured-telemetry",
         "service-config-admin"
-      ]
+      ],
+      "floor": "3.1.0",
+      "signed": true
     },
     "config": {
       "ok": true,
@@ -513,7 +515,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-05T14:00:00.000Z",
           "updatedAt": "2026-09-05T14:00:47.000Z",
-          "expiresAt": null
+          "expiresAt": null,
+          "outcome": "pending"
         }
       ],
       "queued": [
@@ -530,7 +533,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-05T13:57:00.000Z",
           "updatedAt": "2026-09-05T13:57:00.000Z",
-          "expiresAt": "2026-09-05T17:57:00.000Z"
+          "expiresAt": "2026-09-05T17:57:00.000Z",
+          "outcome": "pending"
         }
       ],
       "recent": [
@@ -547,7 +551,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-05T13:30:00.000Z",
           "updatedAt": "2026-09-05T13:30:02.000Z",
-          "expiresAt": null
+          "expiresAt": null,
+          "outcome": "succeeded"
         },
         {
           "id": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
@@ -562,7 +567,8 @@
           "reasonCode": null,
           "requestedAt": "2026-09-04T13:59:00.000Z",
           "updatedAt": "2026-09-04T14:00:00.000Z",
-          "expiresAt": null
+          "expiresAt": null,
+          "outcome": "succeeded"
         },
         {
           "id": "7c5b3d92-4e18-4a6f-b273-9d0e1f8a5c46",
@@ -577,12 +583,13 @@
           "reasonCode": null,
           "requestedAt": "2026-09-05T02:00:00.000Z",
           "updatedAt": "2026-09-05T02:02:00.000Z",
-          "expiresAt": null
+          "expiresAt": null,
+          "outcome": "succeeded"
         }
       ]
     },
     "controller": {
-      "hash": "668a9a05d7eabf59835baea274c89cd5a1275e1e4978929faeffe68dcc487c1c",
+      "hash": "81a6d710365ad9a0289cff90310898e22c04795134d6de67f58b207b3938e7a4",
       "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846",
       "revision": 12,
       "updatedAt": "2026-09-02T16:00:00.000Z",
@@ -612,7 +619,7 @@
   "history": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.1.0",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
@@ -631,7 +638,8 @@
         "reasonCode": null,
         "requestedAt": "2026-09-05T14:00:00.000Z",
         "updatedAt": "2026-09-05T14:00:47.000Z",
-        "expiresAt": null
+        "expiresAt": null,
+        "outcome": "pending"
       },
       {
         "id": "a1f8c3d7-2b46-4e58-90ca-7d1b4f62e830",
@@ -646,7 +654,8 @@
         "reasonCode": null,
         "requestedAt": "2026-09-05T13:30:00.000Z",
         "updatedAt": "2026-09-05T13:30:02.000Z",
-        "expiresAt": null
+        "expiresAt": null,
+        "outcome": "succeeded"
       },
       {
         "id": "b2e9d5c1-77a4-4f0b-8d36-1e5a9c02f4d8",
@@ -661,7 +670,8 @@
         "reasonCode": null,
         "requestedAt": "2026-09-04T13:59:00.000Z",
         "updatedAt": "2026-09-04T14:00:00.000Z",
-        "expiresAt": null
+        "expiresAt": null,
+        "outcome": "succeeded"
       }
     ],
     "limit": 200,
@@ -675,14 +685,14 @@
   "logs": {
     "ok": true,
     "contract": 3,
-    "agentVersion": "3.0.0",
+    "agentVersion": "3.1.0",
     "system": {
       "id": "linux",
       "name": "Raspberry Pi OS"
     },
     "source": "agent",
     "opId": null,
-    "path": "/home/x1f4r/.legion-control/legionctl.log",
+    "path": "/home/me/.legion-control/legionctl.log",
     "requested": 200,
     "returned": 2,
     "truncated": true,
@@ -737,7 +747,7 @@
         },
         "busy": {
           "type": "t3-sqlite",
-          "home": "/home/x1f4r/.t3",
+          "home": "/home/me/.t3",
           "staleHours": 12
         },
         "health": {
@@ -747,7 +757,7 @@
         },
         "deploy": {
           "identityFile": "<redacted>",
-          "host": "atlas"
+          "host": "beacon"
         }
       }
     ]

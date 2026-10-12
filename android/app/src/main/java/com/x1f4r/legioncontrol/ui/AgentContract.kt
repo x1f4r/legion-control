@@ -18,10 +18,12 @@ import com.x1f4r.legioncontrol.agent.MachineSystem
 import com.x1f4r.legioncontrol.agent.OpRecord
 import com.x1f4r.legioncontrol.agent.PolicyPatch
 import com.x1f4r.legioncontrol.agent.SetupProvenance
+import com.x1f4r.legioncontrol.agent.SignedTarball
 import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -29,7 +31,6 @@ import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.net.RouteKind
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
-import java.io.File
 
 /**
  * The shape the screen expects from the transport.
@@ -97,6 +98,15 @@ sealed interface LinkState {
 
     /** The command could not be written for the shell the far side uses. A configuration fault. */
     data class Misconfigured(val reason: String) : LinkState
+
+    /**
+     * This phone's own key could not be read, so nothing was sent.
+     *
+     * Not offline, and not a fault in the setup: the machine may well have answered, and what failed
+     * is on this side. Drawn as offline it read as a machine that was asleep, offered to wake it, and
+     * during a reboot went on waiting for a machine that may have been back for minutes.
+     */
+    data class PhoneKeyUnavailable(val reason: String) : LinkState
 }
 
 /** Whether a wake packet can reach a machine right now, and in one sentence why not. */
@@ -236,7 +246,7 @@ interface MachineClient {
     suspend fun hasWakeProxy(): Boolean
 
     /** Puts a signed agent bundle on the machine and installs it. */
-    suspend fun installAgent(tarball: File, operationId: String?): Result<AgentActionResult>
+    suspend fun installAgent(tarball: SignedTarball, operationId: String?): Result<AgentActionResult>
 
     /** Adds an offered host key to the ones trusted for an address. The keys already there stay. */
     fun configureHostSystems(address: String, systems: List<com.x1f4r.legioncontrol.data.HostIdentitySystem>, revision: Long)
@@ -257,6 +267,18 @@ interface ControlServices {
 
     /** This phone's key fingerprint, for comparing by eye. */
     suspend fun keyFingerprint(): String
+
+    /** When this phone's key was replaced because the old one could no longer be opened, until seen. */
+    suspend fun keyChange(): KeyChange?
+
+    /** The user has seen [keyChange]. */
+    suspend fun acknowledgeKeyChange()
+
+    /**
+     * Makes this phone a new key because the old one keeps failing to read, and only because the
+     * user confirmed it. A key that reads by now is kept.
+     */
+    suspend fun replaceUnreadableKey()
 
     /** The configuration in force, or null when there is none. */
     val config: StateFlow<ControllerConfig?>
@@ -398,7 +420,8 @@ fun Throwable.toLinkState(): LinkState = when (this) {
         canApprove = canApprove,
     )
 
-    is AgentFailure.Unquotable -> LinkState.Misconfigured(detail ?: summary)
+    is AgentFailure.BadRequest -> LinkState.Misconfigured(detail ?: summary)
+    is AgentFailure.KeyUnavailable -> LinkState.PhoneKeyUnavailable(summary)
     // A command that ran too long says nothing about the link, because the link is what carried it
     // right up to the moment we gave up. Drawing that as offline would claim the machine is asleep on
     // the strength of it having answered, and a boot handler that reads an offline link as "the
@@ -410,7 +433,7 @@ fun Throwable.toLinkState(): LinkState = when (this) {
         // A link that dropped while a command was on it is not the same as one that was never there.
         // The first is unsettled and the second is offline, and only the second is a reason to say
         // the machine is asleep.
-        if (dispatch == DispatchStage.AMBIGUOUS) LinkState.Unsettled(summary) else LinkState.Offline(sentence)
+        if (dispatch.mayHaveRun) LinkState.Unsettled(summary) else LinkState.Offline(sentence)
 
     else -> LinkState.Offline(sentence)
 }

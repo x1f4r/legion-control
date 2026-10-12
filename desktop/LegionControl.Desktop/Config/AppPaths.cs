@@ -64,6 +64,10 @@ public static class AppPaths
 
     public static string LogFile => Path.Combine(Home, "legion-control-desktop.log");
 
+    /// Where ssh writes its own log for each attempt. Each file is read and deleted as soon as the
+    /// attempt is over, so this stays empty between commands.
+    public static string SshLogDirectory => Path.Combine(Home, "ssh-logs");
+
     /// Where a downloaded release is unpacked and where the previous one is kept.
     public static string UpdatesDirectory => Path.Combine(Home, "updates");
 

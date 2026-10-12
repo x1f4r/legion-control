@@ -131,6 +131,43 @@ struct ConfigTests {
         """
         let decoded = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8))
         #expect(throws: ConfigProblem.self) { _ = try decoded.validated() }
+
+        // Swift's own idea of a hex digit takes the fullwidth letters too; the contract's does not.
+        let fullwidth = String(repeating: "a", count: 63) + "\u{FF41}"
+        let wide = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.replacingOccurrences(of: "short", with: fullwidth).utf8))
+        #expect(throws: ConfigProblem.self) { _ = try wide.validated() }
+        let plain = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.replacingOccurrences(of: "short", with: String(repeating: "a", count: 64)).utf8))
+        #expect(throws: Never.self) { _ = try plain.validated() }
+    }
+
+    @Test("a maintenance window end is HH:MM in ASCII digits, nothing that only parses like one")
+    func clockTimes() {
+        #expect(MaintenanceWindow(from: "02:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "+1:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "\u{0660}\u{0662}:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "24:00", to: "04:00").looksValid)
+    }
+
+    @Test("a system no grammar can be written for is a warning that says why")
+    func refusedGrammarIsAWarning() throws {
+        let json = """
+        { "version": 1, "machines": [ { "id": "tower", "endpoints": [{"id":"e","host":"192.0.2.10"}],
+          "systems": [{"id":"l","platform":"linux","restricted":true,"agent":["/bin/sh","-c","legionctl"]}] } ] }
+        """
+        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
+        #expect(config.warnings().contains { $0.contains("is never sent anything") && $0.contains("the interpreter and the agent's entry") })
+    }
+
+    @Test("an address outside the dial grammar is a warning that names it")
+    func undialableAddressIsAWarning() throws {
+        let json = """
+        { "version": 1, "machines": [ { "id": "tower", "name": "Tower",
+          "endpoints": [{"id":"lan","host":"desk-tower.local"}, {"id":"odd","host":"tower.example.","user":"me"}],
+          "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
+        """
+        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
+        let warnings = config.warnings().filter { $0.contains("never dials") }
+        #expect(warnings == ["Tower lists me@tower.example., which this app never dials, scans or pins: the host \"tower.example.\" is not one it accepts."])
     }
 
     @Test("a wake path that cannot work is a warning, not a refusal")
@@ -247,6 +284,65 @@ struct ConfigTests {
         #expect(throws: ControllerEditor.EditFailure.self) {
             try ControllerEditor.upsertMachine(["id": "has space"], in: &root)
         }
+    }
+
+    @Test("an address the app would never dial is refused by the editor, naming the part that fails")
+    func editorRefusesUndialableAddresses() throws {
+        // C-2: the schema lets these through and the app only warns about one a peer wrote, but an
+        // editor is where a person types it. Saved, it would be skipped on every call.
+        var root: [String: Any] = ["version": 1, "machines": [[
+            "id": "tower", "endpoints": [["id": "lan", "host": "192.0.2.10", "user": "me"]],
+            "systems": [["id": "linux", "platform": "linux", "agent": ["node", "/a"]]]
+        ] as [String: Any]]]
+        let refusals: [([String: Any], String)] = [
+            (["id": "bad", "host": "victim.example,*"], "the host \"victim.example,*\""),
+            (["id": "bad", "host": "-oProxyCommand=x"], "the host \"-oProxyCommand=x\""),
+            (["id": "bad", "host": "192.0.2.11", "user": "me$(id)"], "the user \"me$(id)\""),
+            (["id": "bad", "host": "192.0.2.11", "port": 70000], "the port 70000"),
+            // A merge that leaves an old host with a new, bad port is one bad address too.
+            (["id": "lan", "port": 0], "the port 0")
+        ]
+        for (endpoint, part) in refusals {
+            do {
+                try ControllerEditor.upsertEndpoint(endpoint, onMachine: "tower", in: &root)
+                Issue.record("saved \(endpoint)")
+            } catch let failure as ControllerEditor.EditFailure {
+                #expect(failure.message.contains(part), "\(failure.message)")
+            }
+        }
+        #expect(throws: ControllerEditor.EditFailure.self) {
+            try ControllerEditor.upsertMachine(["id": "nas", "ssh": ["host": "nas.example,*"]], in: &root)
+        }
+        #expect(throws: ControllerEditor.EditFailure.self) {
+            try ControllerEditor.upsertMachine(["id": "nas", "endpoints": [["id": "e", "host": "nas.example", "port": 0]]], in: &root)
+        }
+        // Nothing refused was written, and a good address still is.
+        let tower = try #require((root["machines"] as? [[String: Any]])?.first)
+        #expect((tower["endpoints"] as? [[String: Any]])?.count == 1)
+        #expect((tower["endpoints"] as? [[String: Any]])?.first?["port"] == nil)
+        #expect((root["machines"] as? [[String: Any]])?.count == 1)
+        try ControllerEditor.upsertEndpoint(["id": "remote", "host": "desk-tower.local", "port": 2222], onMachine: "tower", in: &root)
+        try ControllerEditor.upsertMachine(["id": "nas", "endpoints": [["id": "e", "host": "2001:db8::5", "user": "me"]]], in: &root)
+    }
+
+    @Test("a Windows system the editor writes always names its shell, and keeps one it had")
+    func editorWritesWindowsShell() throws {
+        var root: [String: Any] = ["version": 1, "machines": [[
+            "id": "tower",
+            "systems": [["id": "windows", "platform": "windows", "agent": ["node", "C:\\lc\\agent\\src\\index.mjs"]],
+                        ["id": "linux", "platform": "linux", "agent": ["node", "/a"]],
+                        ["id": "pwsh", "platform": "windows", "shell": "powershell", "agent": ["node", "C:\\a.mjs"]]]
+        ] as [String: Any]]]
+        // The launcher migration changes only the agent, and the system it touches gains cmd, the
+        // shell every 1.4 client already writes its lines in.
+        try ControllerEditor.upsertSystem(["id": "windows", "agent": ["node", "C:\\lc\\bin\\launcher.mjs"]],
+                                          onMachine: "tower", in: &root)
+        try ControllerEditor.upsertSystem(["id": "linux", "agent": ["node", "/b"]], onMachine: "tower", in: &root)
+        try ControllerEditor.upsertSystem(["id": "pwsh", "agent": ["node", "C:\\b.mjs"]], onMachine: "tower", in: &root)
+        let systems = try #require(((root["machines"] as? [[String: Any]])?.first)?["systems"] as? [[String: Any]])
+        #expect(systems[0]["shell"] as? String == "cmd")
+        #expect(systems[1]["shell"] == nil)
+        #expect(systems[2]["shell"] as? String == "powershell")
     }
 
     @Test("a document with no identity gets one only when it is adopted, not on every load")
@@ -462,7 +558,7 @@ struct ConfigTests {
         #expect(FilePreferences(url: url).bool(forKey: "bool") == false)
     }
 
-    @Test("changing the bound local argv replaces the transport and uses this device's name")
+    @Test("changing the bound local argv replaces the transport in place and uses this device's name")
     func boundTransportTracksEdits() throws {
         let home = try Self.temporaryHome()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -482,7 +578,9 @@ struct ConfigTests {
         #expect(before.name == "My local name")
         #expect(app.machines.isEmpty)
         bindings.update { $0.localAgent = .init(argv: ["/bin/echo", "second"]) }
-        #expect(app.mac !== before)
+        // The same model, so nothing in flight on this device is left behind in one the app no
+        // longer shows; only the command it spawns its agent with has changed.
+        #expect(app.mac === before)
         #expect(app.mac?.boundAgentArgv == ["/bin/echo", "second"])
     }
 }

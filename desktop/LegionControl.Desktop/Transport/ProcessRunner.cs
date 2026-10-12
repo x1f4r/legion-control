@@ -9,10 +9,21 @@ public sealed record CommandResult
     public int ExitCode { get; init; }
     public string StandardOutput { get; init; } = "";
     public string StandardError { get; init; } = "";
-    /// Our own watchdog fired. The far side may well still be working, so this is never read as
-    /// either success or failure anywhere above this line.
+    /// This app ended the process: our own watchdog fired, or the caller cancelled. The far side
+    /// may well still be working, so this is never read as either success or failure anywhere
+    /// above this line.
     public bool TimedOut { get; init; }
+    /// The caller cancelled, rather than the watchdog firing. Always together with [TimedOut]: a
+    /// cancelled command is exactly as unknown as one that ran out of time, and is only told
+    /// differently to the person reading about it.
+    public bool Cancelled { get; init; }
     public string? LaunchFailure { get; init; }
+    /// More came out than is kept, and the rest was discarded. Output that was cut off can never be
+    /// read as a reply, however much of one it seems to hold.
+    public bool StandardOutputTruncated { get; init; }
+    /// What ssh wrote to its own log (`-E`), read back after the run. Only ssh writes there, never
+    /// the far side, which is why this and not stderr is the evidence of where a command stopped.
+    public string SshLog { get; init; } = "";
 
     public bool Succeeded => ExitCode == 0 && !TimedOut && LaunchFailure is null;
 
@@ -24,7 +35,10 @@ public sealed record CommandResult
         get
         {
             if (LaunchFailure is not null) return LaunchFailure;
+            if (Cancelled) return "The command was cancelled before it finished.";
             if (TimedOut) return "The command did not finish in time.";
+            var fromLog = InformativeLines(SshLog);
+            if (fromLog.Length > 0) return fromLog;
             var fromError = InformativeLines(StandardError);
             if (fromError.Length > 0) return fromError;
             var fromOutput = InformativeLines(StandardOutput);
@@ -114,6 +128,11 @@ public sealed class ProcessRunner : IAgentProcessRunner
         // packet.
         startInfo.Environment["LEGION_NO_WAKE"] = "1";
 
+        // A command that was cancelled before it started never ran, and saying so is the one
+        // honest answer there is. Once it has started, a cancellation is reported below as this
+        // app ending a command whose outcome is not known.
+        cancellationToken.ThrowIfCancellationRequested();
+
         using var process = new Process { StartInfo = startInfo };
         try
         {
@@ -149,6 +168,7 @@ public sealed class ProcessRunner : IAgentProcessRunner
         else writing = WriteInputAsync(process, input, linked.Token);
 
         var timedOut = false;
+        var cancelled = false;
         try
         {
             var exited = process.WaitForExitAsync(linked.Token);
@@ -165,8 +185,13 @@ public sealed class ProcessRunner : IAgentProcessRunner
         }
         catch (OperationCanceledException)
         {
-            timedOut = watchdog.IsCancellationRequested;
-            Trace($"wait cancelled watchdog={timedOut}");
+            // The watchdog and the caller end the process the same way, and either way the far
+            // side may already have acted on what it was sent. A cancelled run is therefore never
+            // handed back as an ordinary result with whatever exit status the kill produced: it is
+            // a run this app ended, exactly as unknown as one that ran out of time.
+            timedOut = true;
+            cancelled = cancellationToken.IsCancellationRequested;
+            Trace($"wait cancelled watchdog={watchdog.IsCancellationRequested} caller={cancelled}");
             TryKill(process);
             // Give the process a moment to go, then take whatever the readers already have. The
             // pipe stays open as long as anything holds the far end, and ssh hands its own stderr
@@ -184,13 +209,23 @@ public sealed class ProcessRunner : IAgentProcessRunner
         await Task.WhenAny(Task.WhenAll(output.Completion, errors.Completion, writing), Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None));
 
         drains.Cancel();
-        Trace($"return stdoutChars={output.Text.Length} stderrChars={errors.Text.Length}");
+        // The process only closes the streams it was never asked for. These two were, so they are
+        // closed here: a grandchild that inherited the far end (a ProxyCommand, a helper ssh
+        // started) would otherwise keep both pipes, and a drain blocked on one, alive after the
+        // command is long finished.
+        output.Close();
+        errors.Close();
+        var standardOutput = output.Text;
+        var standardError = errors.Text;
+        Trace($"return stdoutChars={standardOutput.Length} stderrChars={standardError.Length} truncated={output.Truncated}");
         return new CommandResult
         {
             ExitCode = process.HasExited ? process.ExitCode : -1,
-            StandardOutput = output.Text,
-            StandardError = errors.Text,
+            StandardOutput = standardOutput,
+            StandardError = standardError,
+            StandardOutputTruncated = output.Truncated,
             TimedOut = timedOut,
+            Cancelled = cancelled,
         };
     }
 
@@ -208,28 +243,88 @@ public sealed class ProcessRunner : IAgentProcessRunner
         }
     }
 
+    /// One output stream, kept up to [Limit] bytes.
+    ///
+    /// Counted in the bytes the pipe delivered, the way every other client counts them, so a reply
+    /// one of them would cut off is cut off here too; a count of decoded characters let through
+    /// up to three times as many bytes of non-ASCII text. The rest is read and thrown away rather
+    /// than left in the pipe: a child that cannot write blocks, and a blocked child is a timeout
+    /// that says nothing. Sixteen MiB is far more than any agent reply, so a stream that reaches
+    /// it is not one this app could have read anyway.
+    ///
+    /// The kept bytes are decoded once at the end, by the same rules the process's own reader
+    /// would have used: its encoding, and a byte order mark that picks another.
     private sealed class OutputCapture
     {
-        private readonly StringBuilder _text = new();
+        public const int Limit = 16 * 1024 * 1024;
+        private readonly MemoryStream _kept = new();
         private readonly object _gate = new();
+        private readonly StreamReader _reader;
+        private readonly Encoding _encoding;
+        private bool _truncated;
         public Task Completion { get; }
-        public string Text { get { lock (_gate) return _text.ToString(); } }
-        public OutputCapture(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing = null) => Completion = DrainAsync(reader, token, trace, framing);
-        private async Task DrainAsync(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing)
+        public bool Truncated { get { lock (_gate) return _truncated; } }
+        public OutputCapture(StreamReader reader, CancellationToken token, Action<string> trace, AgentReplyFraming? framing = null)
         {
-            var buffer = new char[4096];
+            _reader = reader;
+            // Nothing has been read through the reader, so this is still the encoding it was made
+            // with rather than one a byte order mark chose.
+            _encoding = reader.CurrentEncoding;
+            Completion = DrainAsync(reader.BaseStream, token, trace, framing);
+        }
+
+        /// The kept bytes as text.
+        public string Text
+        {
+            get
+            {
+                byte[] bytes;
+                lock (_gate) bytes = _kept.ToArray();
+                using var decoder = new StreamReader(new MemoryStream(bytes), _encoding, detectEncodingFromByteOrderMarks: true);
+                return decoder.ReadToEnd();
+            }
+        }
+
+        public void Close()
+        {
+            try { _reader.Dispose(); }
+            catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException) { }
+        }
+
+        private async Task DrainAsync(Stream stream, CancellationToken token, Action<string> trace, AgentReplyFraming? framing)
+        {
+            var buffer = new byte[4096];
+            // Decodes for the framing as the bytes arrive. Stateful, so a character split across
+            // two reads is still one character.
+            var decoder = _encoding.GetDecoder();
+            var characters = new char[_encoding.GetMaxCharCount(buffer.Length)];
+            var first = true;
             try
             {
                 while (true)
                 {
-                    var read = await reader.ReadAsync(buffer, token).ConfigureAwait(false);
+                    var read = await stream.ReadAsync(buffer, token).ConfigureAwait(false);
                     if (read == 0) { trace("EOF"); return; }
-                    lock (_gate) _text.Append(buffer, 0, read);
-                    trace($"read chars={read}");
-                    framing?.Append(buffer.AsSpan(0, read));
+                    int kept;
+                    lock (_gate)
+                    {
+                        kept = (int)Math.Min(read, Limit - _kept.Length);
+                        _kept.Write(buffer, 0, kept);
+                        if (kept < read) _truncated = true;
+                    }
+                    trace($"read bytes={read}");
+                    if (framing is null || kept == 0) continue;
+                    var decoded = decoder.GetChars(buffer, 0, kept, characters, 0, flush: false);
+                    var text = characters.AsSpan(0, decoded);
+                    // The reader would have taken a byte order mark as one, never as text.
+                    if (first && text.Length > 0 && text[0] == '\uFEFF') text = text[1..];
+                    if (decoded > 0) first = false;
+                    framing.Append(text);
                 }
             }
-            catch (Exception error) when (error is IOException or ObjectDisposedException or OperationCanceledException) { }
+            // Closing the reader under a pending read ends the read with one of these too.
+            catch (Exception error) when (error is IOException or ObjectDisposedException or OperationCanceledException
+                                              or InvalidOperationException) { }
         }
     }
 

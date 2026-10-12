@@ -118,7 +118,17 @@ android {
  */
 val copyAgentBundle by tasks.registering(Sync::class) {
     val dist = rootProject.layout.projectDirectory.dir("../dist")
-    val version = providers.gradleProperty("legion.agentVersion").getOrElse("3.0.1")
+    // agent/package.json is the one place the agent's version is written, and it is what names the
+    // tarball scripts/package-agent.mjs puts in dist. A second copy here went stale with every
+    // agent release and left the APK without the bundle it was built to carry.
+    val version = providers.gradleProperty("legion.agentVersion")
+        .orElse(
+            providers.fileContents(rootProject.layout.projectDirectory.file("../agent/package.json")).asText.map { text ->
+                (groovy.json.JsonSlurper().parseText(text) as Map<*, *>)["version"] as? String
+                    ?: throw GradleException("agent/package.json does not say which version the agent is.")
+            },
+        )
+        .get()
     from(dist) {
         include("legionctl-agent-$version.tgz")
         include("Legion-Control-agent-manifest.json")
@@ -155,16 +165,28 @@ dependencies {
     testImplementation(libs.junit)
 
     implementation(libs.sshj)
+    // The ssh identity's ed25519 key: sshj 0.39 signs with this library's key classes and no other.
+    // Release signatures are checked with Bouncy Castle below, not with this.
     implementation(libs.eddsa)
+    implementation(libs.bcprov)
     // sshj logs through slf4j. Without a binding, slf4j 2 falls back to a no-op and prints a warning
     // on first use; this sends the same lines to logcat instead, which is where they are useful.
     runtimeOnly(libs.slf4j.android)
 }
 
+// The logcat binding reaches for android.util.Log, which a JVM unit test does not have, and sshj
+// then cannot initialise at all. Unit tests run sshj without it: slf4j falls back to a no-op.
+configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configureEach {
+    exclude(group = "uk.uuid.slf4j", module = "slf4j-android")
+}
+
 // Shared contract and signature fixtures are test inputs even though they live outside Android.
+// The corpus is found through legion.contract rather than by guessing at working directories, so a
+// test that cannot find it fails instead of skipping.
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
-    inputs.files(rootProject.fileTree("../contract/fixtures") { include("*.json") })
-    inputs.files(rootProject.file("../contract/hash-vectors.json"))
-    inputs.files(rootProject.file("../contract/release-public-key.pem"))
+    systemProperty("legion.contract", rootProject.file("../contract").absolutePath)
+    inputs.files(rootProject.fileTree("../contract") {
+        include("fixtures/*.json", "vectors/*.json", "hash-vectors.json", "release-public-key.pem", "bootstrap/*.cjs")
+    })
     inputs.files(rootProject.fileTree("../tests/fixtures/trust") { include("*") })
 }

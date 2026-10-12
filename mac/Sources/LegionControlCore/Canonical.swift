@@ -30,13 +30,15 @@ enum Canonical {
     /// hand back a stable hash for a document nobody can read, and the two sides would then agree
     /// forever about rubbish.
     static func bytes(_ raw: Data) throws -> Data {
-        guard var text = String(data: raw, encoding: .utf8) else { throw NotUTF8() }
+        // Foundation's decoder is only asked whether the bytes are UTF-8: it also drops a leading
+        // byte order mark without saying so, and the rule below must remove exactly one.
+        guard String(data: raw, encoding: .utf8) != nil else { throw NotUTF8() }
 
-        // 1. One leading byte order mark, and only a leading one. A BOM further in is a zero width
-        //    no-break space inside the document and stays where it is.
-        if text.unicodeScalars.first == "\u{FEFF}" {
-            text = String(String.UnicodeScalarView(text.unicodeScalars.dropFirst()))
-        }
+        // 1. One leading byte order mark, and only a leading one. A second one, or one further in,
+        //    is a zero width no-break space inside the document and stays where it is.
+        let bom: [UInt8] = [0xEF, 0xBB, 0xBF]
+        let body = raw.starts(with: bom) ? raw.dropFirst(bom.count) : raw[...]
+        var text = String(decoding: body, as: UTF8.self)
 
         // 2. Line endings. CRLF first, then any remaining lone CR, so a CRLF file does not turn into
         //    a blank line between every pair of lines.

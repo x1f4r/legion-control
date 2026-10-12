@@ -1,88 +1,21 @@
 import assert from 'node:assert/strict';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { spawn, spawnSync } from 'node:child_process';
-import zlib from 'node:zlib';
 import test from 'node:test';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import { readBundle, resolveBootstrapLayout, selfTest } from '../src/selfupdate.mjs';
 import { acquireOperationLock } from '../src/lock.mjs';
+import { AGENT, bundleTree, isolatedModule, patchTrust, signingPair, signTree } from './signing.mjs';
 
-const AGENT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CURRENT_VERSION = JSON.parse(fs.readFileSync(path.join(AGENT, 'package.json'), 'utf8')).version;
 
-function signingPair() { return crypto.generateKeyPairSync('ed25519'); }
-const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
-
-function signTree(dir, privateKey) {
-  const files = [];
-  const walk = (relative) => {
-    const absolute = path.join(dir, relative);
-    for (const name of fs.readdirSync(absolute).sort()) {
-      const child = path.posix.join(relative, name);
-      const stat = fs.lstatSync(path.join(dir, child));
-      if (stat.isDirectory()) walk(child);
-      else if (child !== 'MANIFEST.json' && child !== 'MANIFEST.json.sig') {
-        const bytes = fs.readFileSync(path.join(dir, child));
-        files.push({ path: child, sha256: sha(bytes), size: bytes.length });
-      }
-    }
-  };
-  for (const relative of ['src', 'install']) if (fs.existsSync(path.join(dir, relative))) walk(relative);
-  for (const relative of ['package.json']) {
-    if (!fs.existsSync(path.join(dir, relative))) continue;
-    const bytes = fs.readFileSync(path.join(dir, relative));
-    files.push({ path: relative, sha256: sha(bytes), size: bytes.length });
-  }
-  files.sort((a, b) => a.path.localeCompare(b.path));
-  const version = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
-  const manifest = Buffer.from(`${JSON.stringify({ schema: 1, version, contract: 3, files }, null, 2)}\n`);
-  fs.writeFileSync(path.join(dir, 'MANIFEST.json'), manifest);
-  fs.writeFileSync(path.join(dir, 'MANIFEST.json.sig'), `${crypto.sign(null, manifest, privateKey).toString('base64')}\n`);
-}
-
-function patchTrust(src, publicKey) {
-  const file = path.join(src, 'trust.mjs');
-  const pemBody = publicKey.export({ type: 'spki', format: 'pem' }).toString().split('\n')[1];
-  const original = fs.readFileSync(file, 'utf8');
-  fs.writeFileSync(file, original.replace(/  'MCowBQYDK2VwAyEA[^']+',/, `  '${pemBody}',`));
-}
-
-function bundleTree(directory) {
-  const parts = [];
-  const walk = (relative = '') => {
-    for (const name of fs.readdirSync(path.join(directory, relative))) {
-      const child = relative ? `${relative}/${name}` : name;
-      if (fs.statSync(path.join(directory, child)).isDirectory()) { walk(child); continue; }
-      const bytes = fs.readFileSync(path.join(directory, child));
-      const header = Buffer.alloc(512);
-      header.write(`agent/${child}`, 0, 100);
-      header.write('0000644\0', 100);
-      header.write(`${bytes.length.toString(8).padStart(11, '0')}\0`, 124);
-      header.write('        ', 148);
-      header.write('0', 156);
-      header.write('ustar\0', 257);
-      header.write('00', 263);
-      const checksum = header.reduce((sum, byte) => sum + byte, 0);
-      header.write(`${checksum.toString(8).padStart(6, '0')}\0 `, 148);
-      parts.push(header, bytes, Buffer.alloc((512 - bytes.length % 512) % 512));
-    }
-  };
-  walk();
-  return zlib.gzipSync(Buffer.concat([...parts, Buffer.alloc(1024)]));
-}
-
-async function isolatedModule() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-selfupdate-module-'));
-  const src = path.join(root, 'src');
-  fs.cpSync(path.join(AGENT, 'src'), src, { recursive: true });
-  const pair = signingPair();
-  patchTrust(src, pair.publicKey);
-  const module = await import(`${pathToFileURL(path.join(src, 'selfupdate.mjs')).href}?${Date.now()}-${Math.random()}`);
-  return { root, src, pair, module };
+/** A copy of the agent source as a tree, package.json included, in `root`. */
+function copyAgentSource(root) {
+  fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
+  fs.copyFileSync(path.join(AGENT, 'package.json'), path.join(root, 'package.json'));
 }
 
 test('stdin has an idle deadline and closes the readable', async () => {
@@ -205,7 +138,7 @@ test('self-test must report the version and contract from the signed manifest', 
 test('version --check fails when an imported module is missing', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-module-check-'));
   try {
-    fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
+    copyAgentSource(root);
     const entry = path.join(root, 'src', 'index.mjs');
     fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace("'http.mjs', 'lock.mjs'", "'missing-check-module.mjs', 'lock.mjs'"));
     const result = spawnSync(process.execPath, [path.join(root, 'src', 'index.mjs'), 'version', '--check'], {
@@ -219,6 +152,30 @@ test('version --check fails when an imported module is missing', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('the agent states the version its package.json gives, and a tree without one fails its self-test', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-package-version-'));
+  try {
+    copyAgentSource(root);
+    const metadata = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ ...metadata, version: '9.8.7' }));
+    const run = (args) => spawnSync(process.execPath, [path.join(root, 'src', 'index.mjs'), ...args], {
+      encoding: 'utf8', env: { ...process.env, LEGIONCTL_HOME: path.join(root, 'data') }, timeout: 10_000,
+    });
+    // One place says which version this is, so no copy elsewhere can disagree.
+    assert.equal(JSON.parse(run(['version']).stdout).agentVersion, '9.8.7');
+    const checked = run(['version', '--check']);
+    assert.equal(checked.status, 0, checked.stdout);
+    assert.equal(JSON.parse(checked.stdout).agentVersion, '9.8.7');
+
+    fs.unlinkSync(path.join(root, 'package.json'));
+    const unknown = run(['version', '--check']);
+    assert.equal(unknown.status, 1);
+    const reply = JSON.parse(unknown.stdout);
+    assert.equal(reply.agentVersion, '0.0.0', 'a version no signed manifest names');
+    assert.match(reply.selfTest.failed.join(' '), /package\.json/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 for (const worker of ['status-probe-worker.mjs', 'service-profile-probe.mjs']) {
   for (const damage of ['missing', 'syntax', 'nested-import']) {
     test(`staged self-test rejects ${worker} with ${damage} damage`, () => {
@@ -226,7 +183,7 @@ for (const worker of ['status-probe-worker.mjs', 'service-profile-probe.mjs']) {
       const oldHome = process.env.LEGIONCTL_HOME;
       try {
         process.env.LEGIONCTL_HOME = path.join(root, 'data');
-        fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
+        copyAgentSource(root);
         const entry = path.join(root, 'src', worker);
         if (damage === 'missing') fs.unlinkSync(entry);
         else if (damage === 'syntax') fs.writeFileSync(entry, 'this is deliberately invalid syntax !!!');
@@ -252,7 +209,7 @@ test('staged self-test parses worker entry points and dependencies without execu
   const oldHome = process.env.LEGIONCTL_HOME;
   try {
     process.env.LEGIONCTL_HOME = path.join(root, 'data');
-    fs.cpSync(path.join(AGENT, 'src'), path.join(root, 'src'), { recursive: true });
+    copyAgentSource(root);
     const marker = path.join(root, 'worker-executed');
     const sentinel = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'executed'); throw new Error('worker must not execute');\n`;
     for (const worker of ['status-probe-worker.mjs', 'service-profile-probe.mjs']) {
@@ -311,7 +268,7 @@ test('installed manifest is reported verified only while the signed tree is comp
   } finally { fs.rmSync(isolated.root, { recursive: true, force: true }); }
 });
 
-test('staged signed bootstrap installs the intended base, replays, and conflicts with rollback', async () => {
+test('staged signed bootstrap installs the intended base, replays, and refuses its id for other bytes or a rollback', async () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-bootstrap-'));
   try {
     const pair = signingPair();
@@ -352,13 +309,18 @@ test('staged signed bootstrap installs the intended base, replays, and conflicts
     const changed = spawnSync(process.execPath, [entry, 'self-update', '--install', '--op', 'bootstrap-install-0001'], {
       encoding: 'utf8', cwd: os.tmpdir(), env, timeout: 120_000,
     });
-    assert.equal(JSON.parse(changed.stdout).action, 'conflict');
+    // The id names the install of other bytes, so it is a bad --op: never a
+    // replay and never a conflict to wait out.
+    const reused = JSON.parse(changed.stdout);
+    assert.equal(reused.reasonCode, 'bad-argument');
+    assert.equal(reused.argument, '--op');
 
     const rollback = spawnSync(process.execPath, [path.join(base, 'agent', 'src', 'index.mjs'), 'self-update', '--rollback', '--op', 'bootstrap-install-0001'], {
       encoding: 'utf8', env: { ...env, LEGIONCTL_HOME: base }, timeout: 120_000,
     });
-    const conflict = JSON.parse(rollback.stdout);
-    assert.equal(conflict.action, 'conflict');
+    const refused = JSON.parse(rollback.stdout);
+    assert.equal(refused.reasonCode, 'bad-argument');
+    assert.equal(refused.argument, '--op');
     assert.equal(fs.existsSync(path.join(base, 'agent')), true);
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
@@ -384,7 +346,7 @@ test('rollback refuses a tampered signed previous tree and leaves it retained', 
   }
 });
 
-test('bundle installs bind exact bytes and conflict with a rollback operation in either direction', async () => {
+test('bundle installs bind exact bytes and refuse a rollback id in either direction', async () => {
   const isolated = await isolatedModule();
   const oldHome = process.env.LEGIONCTL_HOME;
   try {
@@ -405,14 +367,16 @@ test('bundle installs bind exact bytes and conflict with a rollback operation in
     });
     const first = await install('bundle-install-0001');
     assert.equal(first.action, 'installed', first.message);
+    assert.match(first.manifest.keyFingerprint, /^[0-9a-f]{64}$/, 'the whole key hash, as the contract\'s sha256 pattern requires');
     assert.equal((await install('bundle-install-0001')).replayed, true);
     fs.appendFileSync(path.join(candidate, 'src', 'index.mjs'), '// another payload\n');
     signTree(candidate, isolated.pair.privateKey);
-    assert.equal((await install('bundle-install-0001', bundleTree(candidate))).action, 'conflict');
-    assert.equal((await isolated.module.runRollback({ system: { id: 'test' } }, { opId: 'bundle-install-0001' })).action, 'conflict');
+    const reusedOp = { command: 'self-update', argument: '--op' };
+    assert.deepEqual((await install('bundle-install-0001', bundleTree(candidate))).refusal, reusedOp);
+    assert.deepEqual((await isolated.module.runRollback({ system: { id: 'test' } }, { opId: 'bundle-install-0001' })).refusal, reusedOp);
     const rollback = await isolated.module.runRollback({ system: { id: 'test' } }, { opId: 'bundle-rollback-0001' });
     assert.equal(rollback.action, 'rolled-back', rollback.message);
-    assert.equal((await install('bundle-rollback-0001')).action, 'conflict');
+    assert.deepEqual((await install('bundle-rollback-0001')).refusal, reusedOp);
     assert.equal(fs.readFileSync(path.join(live, 'src', 'index.mjs'), 'utf8'), `${script}// agent\n`);
   } finally {
     if (oldHome === undefined) delete process.env.LEGIONCTL_HOME; else process.env.LEGIONCTL_HOME = oldHome;

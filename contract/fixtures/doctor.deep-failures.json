@@ -1,7 +1,7 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -26,7 +26,7 @@
     {
       "id": "base.writable",
       "level": "ok",
-      "summary": "/home/x1f4r/.legion-control is writable",
+      "summary": "/home/me/.legion-control is writable",
       "detail": null,
       "fix": null
     },
@@ -54,7 +54,7 @@
     {
       "id": "npm.prefix",
       "level": "ok",
-      "summary": "global prefix /home/x1f4r/.local",
+      "summary": "global prefix /home/me/.local",
       "detail": null,
       "fix": null
     },

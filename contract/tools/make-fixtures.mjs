@@ -1,4 +1,4 @@
-// Writes contract/fixtures/*.json and contract/fixtures/index.json.
+// Builds contract/fixtures/*.json and contract/fixtures/index.json.
 //
 // The fixtures are generated rather than hand written so that the facts shared
 // between them stay shared: an operation id means the same operation in the
@@ -8,33 +8,69 @@
 // here is written as one machine on one afternoon, because a fixture set with
 // four unrelated clocks in it reads as noise.
 //
-// The machine is a Raspberry Pi called atlas with three services on it: a T3
+// The machine is a Raspberry Pi called beacon with three services on it: a T3
 // server watched through its state database, a demo service watched through a
 // command, and a service nobody has described a busy probe for. That last one
 // is not padding: "nobody said" is a state the gate has to get right, and it is
 // the state a real machine spends most of its life in.
 //
-// Run: node contract/tools/make-fixtures.mjs
+// Nothing is written here: buildFixtures() returns the files as text, and
+// generate.mjs writes or checks them.
+//
+// Run: node contract/tools/generate.mjs
 
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonicalHash } from './canonical.mjs';
+import {
+  at as T,
+  documentText,
+  copyOf,
+  SETUP_ID,
+  OTHER_SETUP_ID,
+  H_OTHER_BRANCH,
+  LINEAGE,
+  CONTROLLER_DOC,
+  CONTROLLER_DOC_TEXT,
+  H_CURRENT,
+  CONTROLLER_DOC_SIZE,
+  TOWER_DOC,
+  WAKE_DEFAULTS,
+} from './documents.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const OUT = path.join(HERE, '..', 'fixtures');
 
-const AGENT = '3.0.0';
+// The agent version every 3.x reply and record carries. agent/package.json is
+// the only place a version is written, so it is read from there: a release that
+// bumps the agent regenerates the fixtures, and `generate.mjs --check` fails
+// until it has.
+const AGENT_PACKAGE = JSON.parse(fs.readFileSync(path.join(HERE, '..', '..', 'agent', 'package.json'), 'utf8'));
+const AGENT = AGENT_PACKAGE.version;
+if (typeof AGENT !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(AGENT)) {
+  throw new Error(`agent/package.json has no x.y.z version (found ${JSON.stringify(AGENT)})`);
+}
+
+// The version floor a 3.1.0 agent reports (contract section 13): the
+// agentFloor its signed package.json declares. It is read from there like the
+// version, and it is never above AGENT: a declared floor is at most the
+// agent's own version, and the launcher refuses a signed tree below its floor,
+// so a fixture with a live agent under its floor would show a reply no agent
+// can send.
+const AGENT_FLOOR = AGENT_PACKAGE.legionControl?.agentFloor;
+const versionKey = (version) => version.split('.').map(Number);
+const floorAboveAgent = () => {
+  const [floor, agent] = [versionKey(AGENT_FLOOR), versionKey(AGENT)];
+  const index = floor.findIndex((part, at) => part !== agent[at]);
+  return index >= 0 && floor[index] > agent[index];
+};
+if (typeof AGENT_FLOOR !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(AGENT_FLOOR) || floorAboveAgent()) {
+  throw new Error(`agent/package.json declares no legionControl.agentFloor at most its version ${AGENT} (found ${JSON.stringify(AGENT_FLOOR)})`);
+}
+
 const LINUX = { id: 'linux', name: 'Raspberry Pi OS' };
 const MAC = { id: 'mac', name: 'macOS' };
 const WINDOWS = { id: 'windows', name: 'Windows 11' };
-
-// One afternoon, in order.
-const T = (minutes, seconds = 0, millis = 0) => {
-  const base = Date.UTC(2026, 8, 5, 14, 0, 0, 0);
-  return new Date(base + minutes * 60000 + seconds * 1000 + millis).toISOString();
-};
 
 const OPS = {
   updateRunning: '6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3',
@@ -55,143 +91,35 @@ const OPS = {
   latestUnknown: '1e9f4b73-8d02-4c65-a397-6b5e0d8c2ف14'.replace(/[^a-z0-9-]/g, '') + 'a7',
 };
 
-// One setup, and the chain of documents it has been through. The hashes are the
-// canonical hashes of real documents from contract/hash-vectors.json, so a
-// client test can canonicalise the document fixture below and land on H_CURRENT
-// rather than on a number somebody typed.
-const SETUP_ID = 'setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846';
-const H_PARENT = '1c680fab2ecc79f4b1c2a06e4e3ed2f8a1d54c6f0b93e7a25c8d0f416b2e93a7';
-const H_GRANDPARENT = '1a5ee25ee34b2f9c07d61a8b45e0c3f27d9b8140a6532e7fc019d84b6a3e5027';
-const H_OTHER_BRANCH = '4a88b8efec1592c0d3b7615ae820f4c96d1e037b58a2c94f6013e7d58b2a06cf';
-const LINEAGE = [H_PARENT, H_GRANDPARENT];
-
-// The shared setup document, defined before anything that reports a hash for it.
-//
-// H_CURRENT is COMPUTED from these exact bytes with the reference
-// implementation in contract/tools/canonical.mjs, so the number the config
-// fixtures report really is the hash of controller-document.sites-helpers.json.
-// A client can canonicalise that file with its own implementation and land on
-// the same value; a hand-typed constant here would have proved nothing.
-//
-// Two of the sites carry the SAME private subnet on purpose. That is what two
-// homes behind stock routers look like, and it is the case a prefix match
-// cannot decide.
-
-const CONTROLLER_DOC = {
-  version: 1,
-  controller: {
-    id: SETUP_ID,
-    name: 'Home setup',
-    revision: 12,
-    updatedAt: T(-4200),
-    source: 'mac',
-    device: "Robert's MacBook Pro",
-    lineage: LINEAGE,
-  },
-  sites: [
-    { id: 'attic', name: 'Attic house', lanPrefixes: ['192.168.178.'], broadcast: ['192.168.178.255'] },
-    { id: 'flat', name: 'New flat', lanPrefixes: ['192.168.178.'], broadcast: ['192.168.178.255'] },
-  ],
-  machines: [
-    {
-      id: 'pi',
-      name: 'Atlas',
-      site: 'attic',
-      alwaysOn: true,
-      endpoints: [
-        { id: 'lan', kind: 'lan', host: '192.168.178.40', user: 'x1f4r', port: 22 },
-        { id: 'remote', kind: 'remote', host: 'atlas.example-tailnet.ts.net', user: 'x1f4r', port: 22 },
-      ],
-      systems: [
-        { id: 'linux', name: 'Raspberry Pi OS', platform: 'linux', shell: 'posix', restricted: true, agent: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
-      ],
-    },
-    {
-      id: 'legion',
-      name: 'Legion 7',
-      site: 'attic',
-      alwaysOn: false,
-      endpoints: [
-        { id: 'lan-linux', kind: 'lan', host: '192.168.178.41', user: 'x1f4r', port: 22, system: 'linux' },
-        { id: 'remote-linux', kind: 'remote', host: 'legion-cachy.example-tailnet.ts.net', user: 'x1f4r', port: 22, system: 'linux' },
-        { id: 'remote-windows', kind: 'remote', host: 'legion-win.example-tailnet.ts.net', user: 'x1f4r', port: 22, system: 'windows' },
-      ],
-      wake: {
-        mac: 'AA:BB:CC:DD:EE:FF',
-        broadcast: ['192.168.178.255'],
-        ports: [9, 7],
-        lanPrefix: '192.168.178.',
-        // helpers is the ordered list; helper repeats the first entry so a 1.2
-        // client still finds the one helper it knows how to read. A 1.2 client
-        // does not do failover, and nothing here pretends it does.
-        helper: { machine: 'pi', action: 'wake-legion' },
-        helpers: [
-          { machine: 'pi', action: 'wake-legion' },
-          { machine: 'nas', action: 'wake-legion' },
-        ],
-      },
-      systems: [
-        { id: 'linux', name: 'CachyOS', platform: 'linux', shell: 'posix', agent: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
-        { id: 'windows', name: 'Windows 11', platform: 'windows', shell: 'powershell', agent: ['node', 'C:/Users/x1f4r/.legion-control/agent/src/index.mjs'] },
-      ],
-    },
-    {
-      id: 'nas',
-      name: 'Attic NAS',
-      site: 'attic',
-      alwaysOn: true,
-      endpoints: [{ id: 'lan', kind: 'lan', host: '192.168.178.10', user: 'x1f4r', port: 22 }],
-      systems: [
-        { id: 'linux', name: 'Debian', platform: 'linux', shell: 'posix', agent: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
-      ],
-    },
-    {
-      id: 'tower',
-      name: 'Tower',
-      site: 'flat',
-      alwaysOn: false,
-      endpoints: [
-        { id: 'lan', kind: 'lan', host: '192.168.178.20', user: 'x1f4r', port: 22 },
-        { id: 'remote', kind: 'remote', host: 'tower.example-tailnet.ts.net', user: 'x1f4r', port: 22 },
-      ],
-      wake: {
-        mac: '11:22:33:44:55:66',
-        broadcast: ['192.168.178.255'],
-      },
-      systems: [
-        { id: 'linux', name: 'CachyOS', platform: 'linux', shell: 'posix', agent: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
-        { id: 'windows', name: 'Windows 11', platform: 'windows', shell: 'cmd', agent: ['node', 'C:/Users/x1f4r/.legion-control/agent/src/index.mjs'] },
-      ],
-    },
-  ],
-  appUpdates: { githubRepo: 'x1f4r/legion-control' },
-};
-
-/** Exactly the bytes add() writes, so the hash describes the file on disk. */
-function fixtureBytes(value) {
-  return `${JSON.stringify(value, null, 2)}\n`;
-}
-
-const CONTROLLER_DOC_BYTES = fixtureBytes(CONTROLLER_DOC);
-const H_CURRENT = canonicalHash(CONTROLLER_DOC_BYTES);
-const CONTROLLER_DOC_SIZE = Buffer.byteLength(CONTROLLER_DOC_BYTES, 'utf8');
+// The shared setup document, its identity and its hash come from
+// contract/tools/documents.mjs, which the vector families read as well. The
+// hash the config fixtures report is computed there from the exact bytes of
+// controller-document.sites-helpers.json, and `raw` in config.read.json is
+// those bytes as text.
 
 const INITIATOR = {
-  mac: { client: 'mac', device: 'roberts-macbook-pro', user: 'x1f4r' },
-  phone: { client: 'phone', device: 'pixel-8', user: 'x1f4r' },
-  desktop: { client: 'desktop', device: 'legion-cachy', user: 'x1f4r' },
-  scheduler: { client: 'cli', device: null, user: 'x1f4r' },
+  mac: { client: 'mac', device: 'office-macbook-pro', user: 'me' },
+  phone: { client: 'phone', device: 'pixel-8', user: 'me' },
+  desktop: { client: 'desktop', device: 'legion-linux', user: 'me' },
+  scheduler: { client: 'cli', device: null, user: 'me' },
 };
 
 // ---------------------------------------------------------------------------
 // Building blocks
 // ---------------------------------------------------------------------------
 
-function envelope({ ok = true, system = LINUX, reasonCode, message, notes } = {}) {
-  const reply = { ok, contract: 3, agentVersion: AGENT, system };
+/**
+ * The envelope every 3.x reply starts with. `outcome` is written by hand on
+ * every reply to a mutating command (contract section 5.6) rather than derived
+ * here, so that validate.mjs comparing it with the reducer compares two
+ * statements and not one function with itself.
+ */
+function envelope({ ok = true, system = LINUX, reasonCode, message, notes, outcome, agentVersion = AGENT } = {}) {
+  const reply = { ok, contract: 3, agentVersion, system };
   if (reasonCode !== undefined) reply.reasonCode = reasonCode;
   if (message !== undefined) reply.message = message;
   if (notes !== undefined) reply.notes = notes;
+  if (outcome !== undefined) reply.outcome = outcome;
   return reply;
 }
 
@@ -427,8 +355,57 @@ function legacyBlock(first) {
 // Operation records
 // ---------------------------------------------------------------------------
 
+/**
+ * What a finished result means, stated by hand for the actions these fixtures
+ * use (contract section 5.6). Deliberately not an import of tools/outcome.mjs:
+ * validate.mjs checks every record against the reducer, and a fixture that took
+ * its outcome from the reducer would agree with it whatever the reducer said.
+ * An action missing from this table is an error, so a new fixture has to say
+ * what its outcome is rather than inherit a guess.
+ */
+const RESULT_OUTCOMES = {
+  updated: 'succeeded',
+  restarted: 'succeeded',
+  ran: 'succeeded',
+  rebooted: 'succeeded',
+  armed: 'succeeded',
+  installed: 'succeeded',
+  cycled: 'succeeded',
+  // The old version is running again: a success only when it was the request.
+  'rolled-back': (result) => (result.reasonCode === null ? 'succeeded' : 'failed'),
+  // The cancelled request was deferred by a person; a cancel that worked succeeded.
+  cancelled: (result) => (result.reasonCode === 'cancelled' ? 'deferred' : 'succeeded'),
+  // A worker that died, or a command killed at its timeout, may have done anything.
+  interrupted: 'unknown',
+  failed: (result) => (['timed-out', 'interrupted'].includes(result.reasonCode) ? 'unknown' : 'failed'),
+};
+
+/** The outcome of a record or summary in `state`, whose result is `result`: pending until it is finished. */
+function fixtureOutcome(state, result) {
+  if (state !== 'finished') return 'pending';
+  const rule = RESULT_OUTCOMES[result.action];
+  if (rule === undefined) throw new Error(`no outcome is stated for a finished ${result.action}; add it to RESULT_OUTCOMES`);
+  return typeof rule === 'function' ? rule(result) : rule;
+}
+
+/**
+ * A record with its outcome on the record and, once finished, on its result,
+ * as agent 3.1.0 stores them. Recomputed from scratch every time, so a record
+ * built by spreading another one and changing its state or result can never
+ * carry the outcome of the record it was copied from.
+ */
+function withOutcome(op) {
+  const { outcome: _discarded, ...rest } = op;
+  let result = rest.result;
+  if (result !== null) {
+    const { outcome: _stale, ...fields } = result;
+    result = { ...fields, outcome: fixtureOutcome('finished', fields) };
+  }
+  return { ...rest, result, outcome: fixtureOutcome(rest.state, result) };
+}
+
 function record(overrides) {
-  return {
+  return withOutcome({
     id: 'unset',
     kind: 'update',
     service: null,
@@ -451,7 +428,7 @@ function record(overrides) {
     agentVersion: AGENT,
     systemId: 'linux',
     ...overrides,
-  };
+  });
 }
 
 function summarise(op, { action = null, reasonCode = null } = {}) {
@@ -469,6 +446,7 @@ function summarise(op, { action = null, reasonCode = null } = {}) {
     requestedAt: op.requestedAt,
     updatedAt: op.updatedAt,
     expiresAt: op.expiresAt,
+    outcome: fixtureOutcome(op.state, op.result),
   };
 }
 
@@ -600,7 +578,10 @@ const OP_CYCLE = record({
   },
   children: [
     { opId: OPS.updateDone, service: 't3', action: 'updated', reasonCode: null },
-    { opId: OPS.applyFailed, service: 'demo', action: 'deferred', reasonCode: 'policy-off' },
+    // Deferred by policy before an update was ever started, so there is no
+    // record to name: opId is null, and only a deferral may say so. The
+    // busy-deferred child below did start an update, which deferred itself.
+    { opId: null, service: 'demo', action: 'deferred', reasonCode: 'policy-off' },
     { opId: OPS.latestUnknown, service: 'edge', action: 'deferred', reasonCode: 'busy-unknown' },
   ],
   log: [
@@ -741,7 +722,7 @@ const OP_SELF_UPDATE = record({
     ok: true,
     action: 'installed',
     reasonCode: null,
-    message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/x1f4r/.legion-control/agent.prev',
+    message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/me/.legion-control/agent.prev',
     from: '2.1.0',
     to: '3.0.0',
     exitCode: 0,
@@ -826,16 +807,18 @@ const OP_POSTCONDITION = record({
 
 function status({
   system = LINUX,
-  hostname = 'atlas',
+  hostname = 'beacon',
   services = [SERVICE_T3, SERVICE_DEMO, SERVICE_EDGE],
   timing = { budgetMs: 20000, elapsedMs: 2310, partial: false },
   agent = {
     version: AGENT,
     contract: 3,
-    base: '/home/x1f4r/.legion-control',
+    base: '/home/me/.legion-control',
     node: '24.9.0',
     restrictedSession: false,
     capabilities: ['setup-lineage', 'wol-action', 'configured-telemetry', 'service-config-admin'],
+    floor: AGENT_FLOOR,
+    signed: true,
   },
   config = { ok: true, source: 'file', problems: [] },
   automatic = true,
@@ -900,8 +883,19 @@ function status({
 }
 
 const fixtures = [];
+const FILES = new Map();
+
+/**
+ * The exit code rule 7 gives a reply (contract section 1): 0 when it is ok, or
+ * when its action is one that answers ok whatever happened next. Written here
+ * and separately in validate.mjs, so the index and the check are two statements.
+ */
+function exitCodeOf(reply) {
+  return reply.ok === true || ['accepted', 'already-running', 'queued', 'deferred', 'noop', 'conflict'].includes(reply.action) ? 0 : 1;
+}
 
 function add(file, entry, data) {
+  if (FILES.has(`fixtures/${file}`)) throw new Error(`fixtures/${file} is written twice`);
   const isReply = entry.kind !== 'document';
   fixtures.push({
     file,
@@ -911,14 +905,15 @@ function add(file, entry, data) {
     variant: entry.variant,
     schema: entry.schema,
     ok: isReply ? data.ok : null,
-    exitCode: isReply ? (data.ok ? 0 : 1) : null,
+    exitCode: isReply ? exitCodeOf(data) : null,
     contract: isReply ? (data.contract ?? null) : null,
     action: isReply ? (data.action ?? null) : null,
     reasonCode: isReply ? (data.reasonCode ?? null) : null,
+    outcome: isReply ? (data.outcome ?? null) : null,
     description: entry.description,
     tags: entry.tags ?? [],
   });
-  fs.writeFileSync(path.join(OUT, file), `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  FILES.set(`fixtures/${file}`, documentText(data));
 }
 
 /**
@@ -981,9 +976,11 @@ add('status.partial.json', {
   agent: {
     version: AGENT,
     contract: 3,
-    base: '/home/x1f4r/.legion-control',
+    base: '/home/me/.legion-control',
     node: '24.9.0',
     restrictedSession: true,
+    floor: AGENT_FLOOR,
+    signed: true,
   },
   services: [
     { ...SERVICE_T3, busy: BUSY_TIMED_OUT, updates: serviceUpdates({ eligibleNow: false, deferredReason: 'busy-unknown' }) },
@@ -1051,8 +1048,49 @@ add('status.no-services.json', {
   timing: { budgetMs: 20000, elapsedMs: 42, partial: false },
   notes: [
     'No configuration file was found, so this agent is running on inert defaults: no services, and automatic updates off.',
-    'Write /home/x1f4r/.legion-control/config.json to describe what this machine runs.',
+    'Write /home/me/.legion-control/config.json to describe what this machine runs.',
   ],
+}));
+
+add('status.process-unknown.json', {
+  command: 'status',
+  variant: 'process-unknown',
+  schema: 'status.schema.json',
+  description: 'The process probe failed. `process.error` says so, and `process.running` false is then not evidence that anything stopped: a client shows the process as unknown, no running turn is abandoned on its account, and the stop guard holds. The health check still answered, which is exactly the case a reading of `running` alone gets wrong.',
+  tags: ['process', 'finding:g13'],
+}, status({
+  system: WINDOWS,
+  hostname: 'tower',
+  agent: {
+    version: AGENT,
+    contract: 3,
+    base: 'C:\\Users\\me\\.legion-control',
+    node: '24.9.0',
+    restrictedSession: false,
+    capabilities: ['setup-lineage', 'wol-action', 'configured-telemetry', 'service-config-admin'],
+    floor: AGENT_FLOOR,
+    signed: true,
+  },
+  services: [
+    service({
+      id: 'demo',
+      name: 'Demo',
+      installed: '1.4.2',
+      latest: '1.4.2',
+      upToDate: true,
+      running: false,
+      healthy: true,
+      port: 8765,
+      process: { running: false, state: 'unknown', startedAt: null, error: 'the process probe failed: Get-CimInstance: Access denied' },
+      health: { ok: true, status: 200, checkedAt: T(0), elapsedMs: 4, error: null },
+      updates: serviceUpdates({ automatic: false, inherited: false, eligibleNow: false, deferredReason: 'policy-off' }),
+    }),
+  ],
+  bootTargets: [],
+  actions: [],
+  operations: { running: [], queued: [], recent: [] },
+  timing: { budgetMs: 20000, elapsedMs: 1210, partial: false },
+  notes: ['demo: the process probe failed, so whether demo is running is not known.'],
 }));
 
 // -- busy -------------------------------------------------------------------
@@ -1128,6 +1166,26 @@ add('busy.idle.json', {
   ],
 });
 
+add('busy.no-services.json', {
+  command: 'busy',
+  variant: 'no-services',
+  schema: 'busy.schema.json',
+  description: 'A machine with no services at all answers in the one-service shape: nothing to protect, so monitored true, busy and unknown false, evidence "none", and both counts 0. Agent 3.0.1 sent monitored false here, which is the shape of a service nobody described, and made every client warn about a machine with nothing to warn about.',
+  tags: ['busy-gate', 'empty', 'finding:c2'],
+}, {
+  ...envelope(),
+  busy: false,
+  unknown: false,
+  monitored: true,
+  reason: 'no services are configured',
+  evidence: 'none',
+  checkedAt: T(0),
+  elapsedMs: 0,
+  error: null,
+  monitoredServices: 0,
+  unmonitoredServices: 0,
+});
+
 // -- update -----------------------------------------------------------------
 
 add('update.accepted.json', {
@@ -1137,7 +1195,7 @@ add('update.accepted.json', {
   description: 'The immediate answer to --detach. The work is running under the id the client supplied; the client now polls op ID --wait 20. This is not a claim that anything finished.',
   tags: ['detach', 'operations'],
 }, {
-  ...envelope({ message: 'update of t3 accepted; poll operation 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3' }),
+  ...envelope({ message: 'update of t3 accepted; poll operation 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3', outcome: 'pending' }),
   action: 'accepted',
   service: 't3',
   from: '0.0.36-nightly.20260904',
@@ -1153,7 +1211,7 @@ add('update.updated.json', {
   description: 'A synchronous update that finished. `from` and `to` are the versions read on the machine after the install, never the version that was aimed at.',
   tags: ['happy-path'],
 }, {
-  ...envelope({ message: 'updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904' }),
+  ...envelope({ message: 'updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904', outcome: 'succeeded' }),
   action: 'updated',
   service: 't3',
   from: '0.0.35-nightly.20260903',
@@ -1169,7 +1227,7 @@ add('update.noop.json', {
   description: 'Nothing to install. The one benign "nothing happened", and the reason it needs a code: the other nine look identical without one.',
   tags: ['reason-codes'],
 }, {
-  ...envelope({ reasonCode: 'no-update', message: 'demo is already on 1.4.2' }),
+  ...envelope({ reasonCode: 'no-update', message: 'demo is already on 1.4.2', outcome: 'succeeded' }),
   action: 'noop',
   service: 'demo',
   from: '1.4.2',
@@ -1184,7 +1242,7 @@ add('update.deferred-busy.json', {
   description: 'The busy gate held. Deferring costs a delay and the next cycle tries again; going ahead costs somebody their work, which is why this is the default and --force is a decision a person makes.',
   tags: ['busy-gate'],
 }, {
-  ...envelope({ reasonCode: 'busy', message: 't3 is busy (1 turn running); pass --force to update anyway' }),
+  ...envelope({ reasonCode: 'busy', message: 't3 is busy (1 turn running); pass --force to update anyway', outcome: 'deferred' }),
   action: 'deferred',
   service: 't3',
   from: '0.0.36-nightly.20260904',
@@ -1199,7 +1257,7 @@ add('update.queued.json', {
   description: '--when-idle. The request is held with an expiry and runs on the next cycle that finds the machine idle. A second when-idle request for the same service replaces this one, and the reply names the id it displaced.',
   tags: ['queue'],
 }, {
-  ...envelope({ message: 't3 will be updated on the next idle cycle, or dropped at 2026-09-05T18:00:00.000Z' }),
+  ...envelope({ message: 't3 will be updated on the next idle cycle, or dropped at 2026-09-05T18:00:00.000Z', outcome: 'pending' }),
   action: 'queued',
   service: 't3',
   from: '0.0.36-nightly.20260904',
@@ -1236,6 +1294,7 @@ add('update.conflict.json', {
   ...envelope({
     reasonCode: 'operation-in-progress',
     message: 'an update of t3 has held the lock since 2026-09-05T14:00:01.000Z; this request was not started',
+    outcome: 'deferred',
   }),
   action: 'conflict',
   service: 'demo',
@@ -1261,6 +1320,7 @@ add('update.replayed.json', {
   ...envelope({
     reasonCode: 'already-running',
     message: 'operation 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3 is already running; nothing was started twice',
+    outcome: 'pending',
   }),
   action: 'already-running',
   service: 't3',
@@ -1278,7 +1338,7 @@ add('update.replayed-finished.json', {
   description: 'The same id again, after the work finished. The finished result comes back with replayed true, so a client that retried gets the answer it lost rather than a second install.',
   tags: ['idempotency'],
 }, {
-  ...envelope({ message: 'updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904' }),
+  ...envelope({ message: 'updated t3 from 0.0.35-nightly.20260903 to 0.0.36-nightly.20260904', outcome: 'succeeded' }),
   action: 'updated',
   service: 't3',
   from: '0.0.35-nightly.20260903',
@@ -1298,6 +1358,7 @@ add('update.rolled-back.json', {
     ok: false,
     reasonCode: 'rolled-back',
     message: 'demo 1.5.0 would not answer its health check, so 1.4.2 was put back and is running',
+    outcome: 'failed',
   }),
   action: 'rolled-back',
   service: 'demo',
@@ -1317,6 +1378,7 @@ add('update.postcondition-failed.json', {
     ok: false,
     reasonCode: 'postcondition-failed',
     message: 'the update command exited 0 and demo is still on 1.4.2, not the 1.5.1 that was expected',
+    outcome: 'failed',
   }),
   action: 'failed',
   service: 'demo',
@@ -1337,6 +1399,7 @@ add('update.interrupted.json', {
     ok: false,
     reasonCode: 'interrupted',
     message: 'the worker holding this operation is gone and the installed version is 0.0.31-nightly.20260901, so the install did not complete; t3 was started again and left on the version it had',
+    outcome: 'unknown',
   }),
   action: 'interrupted',
   service: 't3',
@@ -1356,6 +1419,7 @@ add('update.latest-unknown.json', {
     ok: false,
     reasonCode: 'latest-unknown',
     message: 'the newest version of t3 could not be looked up (npm registry timed out after 10000 ms), so there is nothing to compare 0.0.36-nightly.20260904 against',
+    outcome: 'failed',
   }),
   action: 'failed',
   service: 't3',
@@ -1375,6 +1439,7 @@ add('update.not-installed.json', {
     ok: false,
     reasonCode: 'not-installed',
     message: 'demo is not installed on this machine, so there was nothing to update',
+    outcome: 'failed',
   }),
   action: 'failed',
   service: 'demo',
@@ -1392,6 +1457,7 @@ add('update.forced-unverified.json', {
 }, {
   ...envelope({
     message: 'the update command for demo exited 0; there is no version to read back and no verify command, so nothing was checked',
+    outcome: 'succeeded',
   }),
   action: 'updated',
   service: 'demo',
@@ -1440,6 +1506,7 @@ add('update.app-closed.json', {
     system: MAC,
     reasonCode: 'app-closed',
     message: 'T3 Desktop 1.9.4 is downloaded and applies when the app quits; it is still running, so nothing was replaced',
+    outcome: 'deferred',
   }),
   action: 'deferred',
   service: 't3-desktop',
@@ -1460,6 +1527,7 @@ add('update.apply-failed.json', {
     ok: false,
     reasonCode: 'apply-failed',
     message: 'the staged T3 Desktop 1.9.4 could not be applied (the pending bundle is not signed by the expected team); 1.9.3 is still installed and running',
+    outcome: 'failed',
   }),
   action: 'failed',
   service: 't3-desktop',
@@ -1496,6 +1564,20 @@ add('update.apply-failed.json', {
   }),
 });
 
+error('update.id-reused.json', 'id-reused',
+  'An --op id that already names a different request: here an update of t3, reused for an update of demo. An id binds its intent, so this is refused with bad-argument naming --op. It is never replayed, because the record belongs to another request, and never reported as a lock conflict, because nothing is in the way of a new id.',
+  ['idempotency', 'grammar', 'finding:c2'], {
+    ...envelope({
+      ok: false,
+      reasonCode: 'bad-argument',
+      message: `--op ${OPS.updateRunning} already names an update of t3; send a new id for an update of demo`,
+      outcome: 'failed',
+    }),
+    command: 'update',
+    argument: '--op',
+    error: `--op ${OPS.updateRunning} already names a different request`,
+  });
+
 // -- restart ----------------------------------------------------------------
 
 add('restart.restarted.json', {
@@ -1505,7 +1587,7 @@ add('restart.restarted.json', {
   description: 'A restart that came back healthy. The health check after the start is what turns "the command exited 0" into "the service is answering".',
   tags: ['happy-path'],
 }, {
-  ...envelope({ message: 't3 restarted and answered on 8081' }),
+  ...envelope({ message: 't3 restarted and answered on 8081', outcome: 'succeeded' }),
   action: 'restarted',
   service: 't3',
   detached: false,
@@ -1549,6 +1631,7 @@ add('restart.deferred-busy-unknown.json', {
   ...envelope({
     reasonCode: 'busy-unknown',
     message: 'whether edge is busy could not be determined (no busy probe is configured), so the restart was not run; pass --force to restart anyway',
+    outcome: 'deferred',
   }),
   action: 'deferred',
   service: 'edge',
@@ -1562,7 +1645,7 @@ add('restart.queued.json', {
   description: 'A restart held until the machine is idle, with the expiry that stops the queue from filling up with requests nobody remembers making.',
   tags: ['queue'],
 }, {
-  ...envelope({ message: 't3 will be restarted on the next idle cycle, or dropped at 2026-09-05T17:57:00.000Z' }),
+  ...envelope({ message: 't3 will be restarted on the next idle cycle, or dropped at 2026-09-05T17:57:00.000Z', outcome: 'pending' }),
   action: 'queued',
   service: 't3',
   replaced: null,
@@ -1578,7 +1661,7 @@ add('boot.rebooting.json', {
   description: 'Armed, read back from the firmware, and rebooting. The read-back is the whole point: a reboot on an unarmed machine comes back on the same system, and reporting that as success sends the controller off waiting for a machine that never appears.',
   tags: ['boot', 'read-back'],
 }, {
-  ...envelope({ message: 'BootNext set to 0002 (Windows 11) and read back; reboot scheduled in 3 seconds' }),
+  ...envelope({ message: 'BootNext set to 0002 (Windows 11) and read back; reboot scheduled in 3 seconds', outcome: 'pending' }),
   action: 'rebooting',
   target: 'windows',
   armed: true,
@@ -1609,7 +1692,7 @@ add('boot.armed.json', {
   description: '--no-reboot: the next boot is pointed at Windows and the machine keeps running. Useful on its own, and the half of boot that can be verified without losing the session.',
   tags: ['boot'],
 }, {
-  ...envelope({ message: 'BootNext set to 0002 (Windows 11) and read back; the machine was not rebooted' }),
+  ...envelope({ message: 'BootNext set to 0002 (Windows 11) and read back; the machine was not rebooted', outcome: 'succeeded' }),
   action: 'armed',
   target: 'windows',
   armed: true,
@@ -1651,6 +1734,7 @@ add('boot.already-on-target.json', {
     system: WINDOWS,
     reasonCode: 'already-on-target',
     message: 'this machine is already running Windows 11',
+    outcome: 'succeeded',
   }),
   action: 'noop',
   target: 'windows',
@@ -1664,11 +1748,11 @@ add('boot.queued.json', {
   description: 'Boot into Windows once the machine is idle. The cycle arms and reboots it exactly as a manual request would; nothing about being queued makes the transition softer.',
   tags: ['queue', 'boot'],
 }, {
-  ...envelope({ message: 'the machine will boot into Windows 11 on the next idle cycle, or the request is dropped at 2026-09-05T14:40:00.000Z' }),
+  ...envelope({ message: 'the machine will boot into Windows 11 on the next idle cycle, or the request is dropped at 2026-09-05T14:40:00.000Z', outcome: 'pending' }),
   action: 'queued',
   target: 'windows',
   replaced: null,
-  op: {
+  op: withOutcome({
     ...OP_CANCELLED,
     state: 'queued',
     phase: 'queued',
@@ -1676,7 +1760,7 @@ add('boot.queued.json', {
     finishedAt: null,
     result: null,
     log: [{ at: T(-200), line: 'queued until idle, expires in 4h' }],
-  },
+  }),
 });
 
 // -- sleep ------------------------------------------------------------------
@@ -1688,7 +1772,7 @@ add('sleep.sleeping.json', {
   description: 'The suspend was accepted. That is all a process about to be frozen can honestly report: `slept` is only ever written later, by the recovery pass, once the machine has come back.',
   tags: ['honesty'],
 }, {
-  ...envelope({ message: 'systemctl suspend was accepted; whether the machine actually suspended is not something this process can see' }),
+  ...envelope({ message: 'systemctl suspend was accepted; whether the machine actually suspended is not something this process can see', outcome: 'pending' }),
   action: 'sleeping',
   op: OP_SLEEP,
 });
@@ -1700,7 +1784,7 @@ add('sleep.queued.json', {
   description: 'Sleep when idle. The expiry matters more here than anywhere: a queued sleep that fires two days late suspends a machine somebody is sitting at.',
   tags: ['queue'],
 }, {
-  ...envelope({ message: 'the machine will suspend on the next idle cycle, or the request is dropped at 2026-09-05T16:00:00.000Z' }),
+  ...envelope({ message: 'the machine will suspend on the next idle cycle, or the request is dropped at 2026-09-05T16:00:00.000Z', outcome: 'pending' }),
   action: 'queued',
   replaced: null,
   op: record({
@@ -1729,7 +1813,7 @@ add('run.ran.json', {
   description: 'A configured action that ran. `output` is what the command printed; the agent has always returned it and the apps now show it, which is the difference between "the action ran" and knowing what it did.',
   tags: ['happy-path'],
 }, {
-  ...envelope({ message: 'sunshine-restart finished with exit code 0' }),
+  ...envelope({ message: 'sunshine-restart finished with exit code 0', outcome: 'succeeded' }),
   action: 'ran',
   id: 'sunshine-restart',
   exitCode: 0,
@@ -1745,7 +1829,7 @@ add('run.failed.json', {
   description: 'The action ran and exited non-zero. The output is the diagnosis, so it is returned rather than summarised away.',
   tags: ['failure'],
 }, {
-  ...envelope({ ok: false, reasonCode: 'not-running', message: 'flush-cache exited 3' }),
+  ...envelope({ ok: false, reasonCode: 'not-running', message: 'flush-cache exited 3', outcome: 'failed' }),
   action: 'failed',
   id: 'flush-cache',
   exitCode: 3,
@@ -1783,11 +1867,11 @@ add('run.wol-ran.json', {
   description: 'A wake action on a helper. The agent sends the magic packets itself, so a Pi on the target LAN is a wake helper without a wakeonlan binary anywhere. Note what the output does NOT claim: packets were sent, not that anything woke up. Readiness is the authenticated poll that follows, because a UDP datagram is never evidence of a machine coming back.',
   tags: ['wake', 'helper', 'honesty'],
 }, {
-  ...envelope({ message: 'sent 6 packets to 192.168.178.255:9, 192.168.178.255:7' }),
+  ...envelope({ message: 'sent 6 packets to 192.168.50.255:9, 192.168.50.255:7', outcome: 'succeeded' }),
   action: 'ran',
   id: 'wake-legion',
   exitCode: 0,
-  output: 'sent 6 packets to 192.168.178.255:9, 192.168.178.255:7',
+  output: 'sent 6 packets to 192.168.50.255:9, 192.168.50.255:7',
   detached: false,
   op: record({
     id: 'f28a4c60-7b13-4e95-8d02-6a1c39f7b504',
@@ -1807,9 +1891,9 @@ add('run.wol-ran.json', {
       ok: true,
       action: 'ran',
       reasonCode: null,
-      message: 'sent 6 packets to 192.168.178.255:9, 192.168.178.255:7',
+      message: 'sent 6 packets to 192.168.50.255:9, 192.168.50.255:7',
       exitCode: 0,
-      output: 'sent 6 packets to 192.168.178.255:9, 192.168.178.255:7',
+      output: 'sent 6 packets to 192.168.50.255:9, 192.168.50.255:7',
     },
     log: [{ at: T(-4), line: 'wol wake-legion: 3 repeats to 2 addresses for AA:BB:CC:DD:EE:FF' }],
   }),
@@ -1825,7 +1909,8 @@ add('run.wol-failed.json', {
   ...envelope({
     ok: false,
     reasonCode: 'internal',
-    message: 'no packets could be sent: 192.168.178.255:9 and 192.168.178.255:7 both failed with EACCES (the broadcast socket was refused)',
+    message: 'no packets could be sent: 192.168.50.255:9 and 192.168.50.255:7 both failed with EACCES (the broadcast socket was refused)',
+    outcome: 'failed',
   }),
   action: 'failed',
   id: 'wake-legion',
@@ -1849,11 +1934,11 @@ add('run.wol-failed.json', {
       ok: false,
       action: 'failed',
       reasonCode: 'internal',
-      message: 'no packets could be sent: 192.168.178.255:9 and 192.168.178.255:7 both failed with EACCES',
+      message: 'no packets could be sent: 192.168.50.255:9 and 192.168.50.255:7 both failed with EACCES',
       exitCode: 1,
       output: null,
     },
-    log: [{ at: T(-5), line: 'wol wake-legion: EACCES on 192.168.178.255:9' }],
+    log: [{ at: T(-5), line: 'wol wake-legion: EACCES on 192.168.50.255:9' }],
   }),
 });
 
@@ -1868,6 +1953,7 @@ add('run.timed-out.json', {
     ok: false,
     reasonCode: 'timed-out',
     message: 'flush-cache did not finish within 120 s and was killed; whether it changed anything before that is not known',
+    outcome: 'unknown',
   }),
   action: 'failed',
   id: 'flush-cache',
@@ -1908,7 +1994,7 @@ add('cycle.cycled.json', {
   description: 'The scheduled pass. One service updated and two were skipped for different reasons; one deferral never stops the rest, which is the whole point of walking them under one parent record.',
   tags: ['scheduler'],
 }, {
-  ...envelope({ message: '3 services walked: 1 updated, 2 deferred' }),
+  ...envelope({ message: '3 services walked: 1 updated, 2 deferred', outcome: 'succeeded' }),
   action: 'cycled',
   dryRun: false,
   op: OP_CYCLE,
@@ -1947,6 +2033,7 @@ add('cycle.conflict.json', {
   ...envelope({
     reasonCode: 'lock-held',
     message: 'an update of t3 has held the lock since 2026-09-05T14:00:01.000Z; this cycle did nothing',
+    outcome: 'deferred',
   }),
   action: 'conflict',
   dryRun: false,
@@ -2060,7 +2147,7 @@ add('cancel.cancelled.json', {
   description: 'A queued operation dropped before it ran.',
   tags: ['queue'],
 }, {
-  ...envelope({ message: 'the queued boot into windows was cancelled before it ran' }),
+  ...envelope({ message: 'the queued boot into windows was cancelled before it ran', outcome: 'succeeded' }),
   id: OPS.cancelled,
   action: 'cancelled',
   op: OP_CANCELLED,
@@ -2076,11 +2163,31 @@ add('cancel.conflict-running.json', {
   ...envelope({
     reasonCode: 'already-running',
     message: 'operation 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3 is already running and cannot be cancelled; wait for it to finish',
+    outcome: 'deferred',
   }),
   id: OPS.updateRunning,
   action: 'conflict',
   op: OP_UPDATE_RUNNING,
 });
+
+// An id this machine has no record of. cancel answers it the way op does, before
+// it looks at anything else: 3.0.1 answered action "failed", which reads as
+// "the operation was found and could not be cancelled".
+const UNKNOWN_OP = '11111111-2222-4333-8444-555555555555';
+
+error('cancel.not-found.json', 'not-found',
+  'cancel with an id this machine has no record of. The refusal shape, with not-configured and the id as the argument, exactly as op answers an unknown id: the request never arrived or was pruned, and there is nothing to cancel.',
+  ['operations', 'idempotency', 'finding:c2'], {
+    ...envelope({
+      ok: false,
+      reasonCode: 'not-configured',
+      message: `no operation ${UNKNOWN_OP} on this machine; it either never arrived or has been pruned`,
+      outcome: 'failed',
+    }),
+    command: 'cancel',
+    argument: UNKNOWN_OP,
+    error: `no operation ${UNKNOWN_OP} on this machine`,
+  });
 
 // -- history / logs ---------------------------------------------------------
 
@@ -2113,6 +2220,7 @@ addHistory({
       requestedAt: T(-300),
       updatedAt: T(-60),
       expiresAt: T(-60),
+      outcome: 'deferred',
     },
     {
       id: OPS.latestUnknown,
@@ -2128,6 +2236,7 @@ addHistory({
       requestedAt: T(-600),
       updatedAt: T(-598),
       expiresAt: null,
+      outcome: 'failed',
     },
     summarise(OP_CANCELLED),
     summarise(OP_UPDATE_DONE),
@@ -2152,7 +2261,7 @@ add('logs.agent.json', {
   ...envelope(),
   source: 'agent',
   opId: null,
-  path: '/home/x1f4r/.legion-control/legionctl.log',
+  path: '/home/me/.legion-control/legionctl.log',
   requested: 100,
   returned: 6,
   truncated: true,
@@ -2183,6 +2292,19 @@ add('logs.operation.json', {
   lines: OP_ROLLED_BACK.log.map((entry) => ({ at: entry.at, line: entry.line, command: 'update' })),
 });
 
+error('logs.not-found.json', 'not-found',
+  'logs --op with an id this machine has no record of: not-configured, naming the option, in the refusal shape. 3.0.1 answered bad-argument, which says the request was malformed when it was only about an operation that is gone.',
+  ['diagnostics', 'operations', 'finding:c2'], {
+    ...envelope({
+      ok: false,
+      reasonCode: 'not-configured',
+      message: `no operation ${UNKNOWN_OP} on this machine; it either never arrived or has been pruned`,
+    }),
+    command: 'logs',
+    argument: '--op',
+    error: `no operation ${UNKNOWN_OP} on this machine`,
+  });
+
 // -- doctor / bundle --------------------------------------------------------
 
 const DOCTOR_OK = {
@@ -2191,11 +2313,11 @@ const DOCTOR_OK = {
   checks: [
     { id: 'config.parse', level: 'ok', summary: 'config.json parses', detail: '4.1 kB, read at 2026-09-05T14:00:00.000Z', fix: null },
     { id: 'config.validate', level: 'ok', summary: '3 services, 1 boot target, 2 actions', detail: null, fix: null },
-    { id: 'base.writable', level: 'ok', summary: '/home/x1f4r/.legion-control is writable', detail: null, fix: null },
+    { id: 'base.writable', level: 'ok', summary: '/home/me/.legion-control is writable', detail: null, fix: null },
     { id: 'node.version', level: 'ok', summary: 'node 24.9.0', detail: 'the agent needs 22 or newer', fix: null },
     { id: 'node.sqlite', level: 'ok', summary: 'node:sqlite is available', detail: 'needed by the t3-sqlite busy probe', fix: null },
     { id: 'npm.available', level: 'ok', summary: 'npm 11.6.0', detail: null, fix: null },
-    { id: 'npm.prefix', level: 'ok', summary: 'global prefix /home/x1f4r/.local', detail: null, fix: null },
+    { id: 'npm.prefix', level: 'ok', summary: 'global prefix /home/me/.local', detail: null, fix: null },
     { id: 'service.t3.process', level: 'ok', summary: 't3-code.service is active since 2026-09-03T14:10:00.000Z', detail: null, fix: null },
     { id: 'service.t3.health', level: 'ok', summary: 't3 answered 200 on 8081 in 8 ms', detail: null, fix: null },
     { id: 'service.t3.busy', level: 'ok', summary: 'the t3-sqlite probe read the state database', detail: '1 turn running', fix: null },
@@ -2242,7 +2364,7 @@ add('doctor.deep-failures.json', {
       detail: 'a service with no busy key counts as unmonitored, which blocks every disruptive action on this machine',
       fix: 'add a busy probe for edge, or set its busy.type to "none" if it is never busy',
     },
-    { id: 'base.writable', level: 'ok', summary: '/home/x1f4r/.legion-control is writable', detail: null, fix: null },
+    { id: 'base.writable', level: 'ok', summary: '/home/me/.legion-control is writable', detail: null, fix: null },
     { id: 'node.version', level: 'ok', summary: 'node 24.9.0', detail: null, fix: null },
     {
       id: 'node.sqlite',
@@ -2252,7 +2374,7 @@ add('doctor.deep-failures.json', {
       fix: 'install node 22.5 or newer from NodeSource, or change the t3 busy probe to a command probe',
     },
     { id: 'npm.available', level: 'ok', summary: 'npm 11.6.0', detail: null, fix: null },
-    { id: 'npm.prefix', level: 'ok', summary: 'global prefix /home/x1f4r/.local', detail: null, fix: null },
+    { id: 'npm.prefix', level: 'ok', summary: 'global prefix /home/me/.local', detail: null, fix: null },
     { id: 'service.t3.process', level: 'ok', summary: 't3-code.service is active', detail: null, fix: null },
     {
       id: 'service.t3.health',
@@ -2334,7 +2456,7 @@ add('bundle.json', {
     ...envelope(),
     source: 'agent',
     opId: null,
-    path: '/home/x1f4r/.legion-control/legionctl.log',
+    path: '/home/me/.legion-control/legionctl.log',
     requested: 200,
     returned: 2,
     truncated: true,
@@ -2355,9 +2477,9 @@ add('bundle.json', {
         package: 't3',
         channel: 'nightly',
         process: { type: 'systemd-user', unit: 't3-code.service' },
-        busy: { type: 't3-sqlite', home: '/home/x1f4r/.t3', staleHours: 12 },
+        busy: { type: 't3-sqlite', home: '/home/me/.t3', staleHours: 12 },
         health: { type: 'http', port: 8081, path: '/health' },
-        deploy: { identityFile: '<redacted>', host: 'atlas' },
+        deploy: { identityFile: '<redacted>', host: 'beacon' },
       },
     ],
   },
@@ -2377,7 +2499,7 @@ addDocument('controller-document.minimal.json', {
   tags: ['controller', 'compatibility'],
 }, {
   version: 1,
-  machines: [{ id: 'pi', name: 'Atlas', endpoints: [{ host: '192.168.178.40', user: 'x1f4r' }] }],
+  machines: [{ id: 'pi', name: 'Beacon', endpoints: [{ host: '192.168.50.40', user: 'me' }] }],
 });
 
 addDocument('controller-document.unknown-keys.json', {
@@ -2392,19 +2514,26 @@ addDocument('controller-document.unknown-keys.json', {
   machines: [
     {
       id: 'pi',
-      name: 'Atlas',
+      name: 'Beacon',
       futureMachineKey: ['anything', 'at', 'all'],
-      endpoints: [{ id: 'lan', host: '192.168.178.40', user: 'x1f4r', futureEndpointKey: 42 }],
+      endpoints: [{ id: 'lan', host: '192.168.50.40', user: 'me', futureEndpointKey: 42 }],
     },
   ],
 });
+
+addDocument('controller-document.wake-defaults.json', {
+  variant: 'wake-defaults',
+  schema: 'controller-document.schema.json',
+  description: 'The setup every wake vector plans against (contract/vectors/wake.json carries it as documentText). Five sites: one with a broadcast, one written in CIDR, two that share a subnet, one with no prefixes. Eight machines, each one wake rule: helpers in order, a helper that can be woken itself, a lanPrefix without its trailing dot, a broadcast list that holds a name, a helper list that repeats an entry. Valid, with the warnings those choices earn.',
+  tags: ['controller', 'sites', 'wake'],
+}, WAKE_DEFAULTS);
 
 addDocument('controller-document.invalid-helper-cycle.json', {
   variant: 'invalid-helper-cycle',
   schema: 'controller-document.schema.json',
   expect: 'invalid',
   description: 'INVALID. Two machines name each other as their wake helper, so waking either one requires the other to be awake already. The schema alone cannot see this; contract/validate.mjs walks the helper graph, and every client editor must refuse to save it for the same reason.',
-  tags: ['controller', 'wake', 'invalid'],
+  tags: ['controller', 'wake', 'invalid', 'agent-enforced'],
 }, {
   version: 1,
   controller: { id: SETUP_ID, revision: 1, lineage: [] },
@@ -2427,11 +2556,11 @@ addDocument('controller-document.invalid-unknown-site.json', {
   schema: 'controller-document.schema.json',
   expect: 'invalid',
   description: 'INVALID. A machine names a site that sites[] does not define, which would silently drop it out of every on-site wake decision.',
-  tags: ['controller', 'sites', 'invalid'],
+  tags: ['controller', 'sites', 'invalid', 'agent-enforced'],
 }, {
   version: 1,
   controller: { id: SETUP_ID, revision: 1, lineage: [] },
-  sites: [{ id: 'attic', name: 'Attic house', lanPrefixes: ['192.168.178.'] }],
+  sites: [{ id: 'attic', name: 'Attic house', lanPrefixes: ['192.168.50.'] }],
   machines: [{ id: 'tower', name: 'Tower', site: 'flat' }],
 });
 
@@ -2440,7 +2569,7 @@ addDocument('controller-document.invalid-self-helper.json', {
   schema: 'controller-document.schema.json',
   expect: 'invalid',
   description: 'INVALID. A machine is its own wake helper, which asks a sleeping machine to wake itself.',
-  tags: ['controller', 'wake', 'invalid'],
+  tags: ['controller', 'wake', 'invalid', 'agent-enforced'],
 }, {
   version: 1,
   machines: [
@@ -2453,11 +2582,11 @@ addDocument('controller-document.invalid-helper-mismatch.json', {
   schema: 'controller-document.schema.json',
   expect: 'invalid',
   description: 'INVALID. `helper` and `helpers[0]` name different helpers, so a 1.2 client and a 1.3 client would try different machines from the same document. An editor that writes helpers must write helper = helpers[0].',
-  tags: ['controller', 'wake', 'compatibility', 'invalid'],
+  tags: ['controller', 'wake', 'compatibility', 'invalid', 'agent-enforced'],
 }, {
   version: 1,
   machines: [
-    { id: 'pi', name: 'Atlas' },
+    { id: 'pi', name: 'Beacon' },
     { id: 'legion', name: 'Legion 7' },
     {
       id: 'tower',
@@ -2471,6 +2600,61 @@ addDocument('controller-document.invalid-helper-mismatch.json', {
   ],
 });
 
+/**
+ * The guard grammars of common.schema.json, one refused value each. Each
+ * document is TOWER_DOC with exactly one value replaced, so that value is the
+ * only thing that can be refusing it. The agent refuses all six on `config set`
+ * from 3.1.0, and every client refuses them before it dials, pins, runs or
+ * publishes anything.
+ */
+function guardDocument(file, description, tags, change) {
+  const document = copyOf(TOWER_DOC);
+  change(document);
+  addDocument(file, {
+    variant: file.replace(/^controller-document\.|\.json$/g, ''),
+    schema: 'controller-document.schema.json',
+    expect: 'invalid',
+    description,
+    tags: ['controller', 'grammar', 'agent-enforced', 'invalid', ...tags],
+  }, document);
+}
+
+guardDocument('controller-document.invalid-host.json',
+  'INVALID. An endpoint host with a comma and a star in it. It never reaches ssh, ssh-keyscan or known_hosts, where `victim.example,*` would be a pattern that pins one key for every host there is. The host guard of common.schema.json allows names and addresses and nothing a known_hosts line reads as syntax.',
+  ['finding:t5'], (document) => {
+    document.machines[0].endpoints[0].host = 'victim.example,*';
+  });
+
+guardDocument('controller-document.invalid-host-option.json',
+  'INVALID. A host that starts with a hyphen is an ssh option, and -oProxyCommand runs a command on this device before any connection exists. The host guard refuses it in the document, and clients also put -- in front of the host.',
+  ['finding:t5'], (document) => {
+    document.machines[0].endpoints[0].host = '-oProxyCommand=x';
+  });
+
+guardDocument('controller-document.invalid-user.json',
+  'INVALID. A user name with a command substitution in it. The user guard allows letters, digits, `. _ - @ \\` and single spaces, which covers local and domain account names and nothing a shell or ssh reads as syntax.',
+  ['finding:t5'], (document) => {
+    document.machines[0].endpoints[0].user = 'me$(id)';
+  });
+
+guardDocument('controller-document.invalid-repo.json',
+  'INVALID. A repository named `..` turns the update URL of every client that reads this setup into a path that climbs out of the owner. The repository guard is `owner/name` as GitHub spells them, and `.` and `..` are not names.',
+  ['finding:t6'], (document) => {
+    document.appUpdates = { githubRepo: 'owner/..' };
+  });
+
+guardDocument('controller-document.invalid-agent-argv.json',
+  'INVALID. An empty argv item. Depending on the shell it vanishes or becomes an empty argument, so the command that runs is not the one the document says; the argv-item guard refuses it in the document itself.',
+  ['finding:t5'], (document) => {
+    document.machines[0].systems[0].agent = ['node', ''];
+  });
+
+guardDocument('controller-document.invalid-agent-control.json',
+  'INVALID. An argv item with a control character in it, U+0007 here. Control characters change what a terminal shows a person and what some shells do with a line, so no argv item may hold one.',
+  ['finding:t5'], (document) => {
+    document.machines[0].systems[0].agent = ['node', '/home/me/.legion-control/bin/launcher.mjs\u0007'];
+  });
+
 // -- private bindings --------------------------------------------------------
 
 addDocument('bindings.desktop-self.json', {
@@ -2479,15 +2663,15 @@ addDocument('bindings.desktop-self.json', {
   description: 'What one device knows about itself: which machine it is, how to run its own agent without ssh, where its keys live, and which site the user says it is on. None of it is publishable, and none of it is a key — only where the keys are.',
   tags: ['bindings', 'peer', 'self-control'],
 }, {
-  deviceName: "Robert's tower",
+  deviceName: "Desk tower",
   self: { machine: 'tower', system: 'linux' },
-  localAgent: { argv: ['node', '/home/x1f4r/.legion-control/agent/src/index.mjs'] },
+  localAgent: { argv: ['node', '/home/me/.legion-control/agent/src/index.mjs'] },
   identityFile: '~/.ssh/legion-control_ed25519',
   knownHostsFile: '~/.config/legion-control/known_hosts',
   currentSite: 'flat',
   machines: {
-    legion: { identityFile: '~/.ssh/id_legion', sshAlias: 'legion-win-lan' },
-    pi: { sshAlias: 'atlas' },
+    legion: { identityFile: '~/.ssh/id_legion', sshAlias: 'legion-windows-lan' },
+    pi: { sshAlias: 'beacon' },
   },
 });
 
@@ -2508,9 +2692,9 @@ addDocument('bindings.invalid-local-agent-shell.json', {
   description: 'INVALID. There is no localAgent.shell. Local execution spawns the argv directly, so wrapping it in cmd or powershell would add a quoting layer between the client and the agent with no ssh anywhere on the path to need one.',
   tags: ['bindings', 'invalid'],
 }, {
-  deviceName: "Robert's tower",
+  deviceName: "Desk tower",
   self: { machine: 'tower' },
-  localAgent: { argv: ['node', 'C:/Users/x1f4r/.legion-control/agent/src/index.mjs'], shell: 'cmd' },
+  localAgent: { argv: ['node', 'C:/Users/me/.legion-control/agent/src/index.mjs'], shell: 'cmd' },
 });
 
 // -- config read and set -----------------------------------------------------
@@ -2521,7 +2705,7 @@ const CONTROLLER_META = {
   updatedAt: T(-4200),
   source: 'mac',
   lineage: LINEAGE,
-  device: "Robert's MacBook Pro",
+  device: "Office MacBook Pro",
   hash: H_CURRENT,
   bytes: CONTROLLER_DOC_SIZE,
 };
@@ -2530,10 +2714,25 @@ add('config.read.json', {
   command: 'config',
   variant: 'read',
   schema: 'config-read.schema.json',
-  description: 'The setup a machine carries, with the lineage that decides whether a client is behind it. The agent stores bytes and reads only the controller block; the document comes back as it was given.',
-  tags: ['controller', 'peer'],
+  description: 'The setup a machine carries, with the lineage that decides whether a client is behind it. `raw` is the stored document as text, exactly the canonical bytes `hash` covers: a client hashes and adopts those, never a re-serialisation of `controller`, which is the same document parsed and kept for older clients.',
+  tags: ['controller', 'peer', 'finding:c1'],
 }, {
   ...envelope(),
+  controller: CONTROLLER_DOC,
+  raw: CONTROLLER_DOC_TEXT,
+  hash: H_CURRENT,
+  bytes: CONTROLLER_DOC_SIZE,
+  meta: CONTROLLER_META,
+});
+
+add('config.read-without-raw.json', {
+  command: 'config',
+  variant: 'read-without-raw',
+  schema: 'config-read.schema.json',
+  description: 'The same read from agent 3.0.1, which sends no `raw`. The parsed `controller` cannot be adopted as it stands: a client rebuilds JSON.stringify(controller, null, 2) in received key order and adopts only when the canonical hash of that text is the reported hash, and otherwise declines and says the agent has to be updated first.',
+  tags: ['controller', 'peer', 'agent-3.0', 'fallback', 'finding:c1'],
+}, {
+  ...envelope({ agentVersion: '3.0.1' }),
   controller: CONTROLLER_DOC,
   hash: H_CURRENT,
   bytes: CONTROLLER_DOC_SIZE,
@@ -2544,18 +2743,19 @@ add('config.read-empty.json', {
   command: 'config',
   variant: 'read-empty',
   schema: 'config-read.schema.json',
-  description: 'A machine that holds no setup yet. A hash of nothing means "ready for one and has none", which is a different thing from a hash that disagrees, and the first push to it is accepted without a question.',
+  description: 'A machine that holds no setup yet. A hash of nothing means "ready for one and has none", which is a different thing from a hash that disagrees, and the first push to it is accepted without a question. `raw` is null exactly when `controller` is.',
   tags: ['controller'],
 }, {
   ...envelope(),
   controller: null,
+  raw: null,
   hash: null,
   bytes: 0,
   meta: null,
 });
 
 add('config.meta-empty.json', {
-  command: 'config',
+  command: 'config meta',
   variant: 'meta-empty',
   schema: 'config-meta.schema.json',
   description: 'config meta on a machine that carries nothing. Every field is honestly null and the lineage is empty, which is a different answer from "the file is unreadable" and lets the first push through without a question.',
@@ -2577,6 +2777,7 @@ add('config.set.bad-argument.json', {
     ok: false,
     reasonCode: 'bad-argument',
     message: '--revision 13 does not match controller.revision 12 in the document on stdin; nothing was written',
+    outcome: 'failed',
   }),
   hash: null,
   bytes: 0,
@@ -2593,7 +2794,7 @@ add('config.set.stored.json', {
   description: 'The first setup a machine has ever held. Nothing to descend from, so it is simply stored.',
   tags: ['controller', 'peer'],
 }, {
-  ...envelope({ message: `stored revision 12 of setup-3f9c2a71, ${CONTROLLER_DOC_SIZE} bytes` }),
+  ...envelope({ message: `stored revision 12 of setup-3f9c2a71, ${CONTROLLER_DOC_SIZE} bytes`, outcome: 'succeeded' }),
   action: 'stored',
   hash: H_CURRENT,
   bytes: CONTROLLER_DOC_SIZE,
@@ -2601,7 +2802,7 @@ add('config.set.stored.json', {
   revision: 12,
   source: 'mac',
   lineage: LINEAGE,
-  device: "Robert's MacBook Pro",
+  device: "Office MacBook Pro",
 });
 
 add('config.set.fast-forward.json', {
@@ -2611,7 +2812,7 @@ add('config.set.fast-forward.json', {
   description: 'The machine held H_PARENT and the pushed document lists it as an ancestor, so the machine is behind and the push descends from what it has. This is the only kind of automatic write there is: strictly along descent, which is acyclic, so two peers can never take turns overwriting each other.',
   tags: ['controller', 'peer', 'lineage'],
 }, {
-  ...envelope({ message: `fast-forwarded from 1c680fab to ${H_CURRENT.slice(0, 8)}, revision 12, ${CONTROLLER_DOC_SIZE} bytes` }),
+  ...envelope({ message: `fast-forwarded from 1c680fab to ${H_CURRENT.slice(0, 8)}, revision 12, ${CONTROLLER_DOC_SIZE} bytes`, outcome: 'succeeded' }),
   action: 'stored',
   hash: H_CURRENT,
   bytes: CONTROLLER_DOC_SIZE,
@@ -2629,7 +2830,7 @@ add('config.set.noop.json', {
   description: 'The same bytes the machine already holds. Nothing is written and the answer is success, which is what makes a push safe to retry after a link drops mid-reply: the retry is byte-identical and lands here.',
   tags: ['controller', 'idempotency'],
 }, {
-  ...envelope({ message: 'this machine already holds 3d7251f8; nothing was written' }),
+  ...envelope({ message: 'this machine already holds 3d7251f8; nothing was written', outcome: 'succeeded' }),
   action: 'noop',
   hash: H_CURRENT,
   bytes: CONTROLLER_DOC_SIZE,
@@ -2650,6 +2851,7 @@ add('config.set.stale-revision.json', {
     ok: false,
     reasonCode: 'stale-revision',
     message: 'this machine holds 3d7251f8 (revision 12), which descends from the 1c680fab you pushed; fetch it rather than pushing over it',
+    outcome: 'failed',
   }),
   hash: null,
   bytes: 0,
@@ -2670,6 +2872,7 @@ add('config.set.conflict-divergent.json', {
     ok: false,
     reasonCode: 'controller-conflict',
     message: 'this machine holds 3d7251f8 revision 12 from mac; the document offered is revision 12 and neither descends from the other, so both edits are still here and somebody has to merge them',
+    outcome: 'failed',
   }),
   hash: null,
   bytes: 0,
@@ -2690,10 +2893,11 @@ add('config.set.conflict-other-id.json', {
     ok: false,
     reasonCode: 'controller-conflict',
     message: 'this machine holds setup setup-3f9c2a71 and the document offered is setup setup-8b04d193; --replace is needed, and somebody has to decide',
+    outcome: 'failed',
   }),
   hash: null,
   bytes: 0,
-  id: 'setup-8b04d193-6c27-4a51-83ef-90b7d2c46e15',
+  id: OTHER_SETUP_ID,
   revision: 4,
   divergent: true,
   current: CONTROLLER_META,
@@ -2706,11 +2910,11 @@ add('config.set.replaced.json', {
   description: 'The same push again with --replace, after a person answered the question. --replace is authority replacement, never a retry flag, and no client ever sends it on its own.',
   tags: ['controller', 'peer'],
 }, {
-  ...envelope({ message: 'setup setup-3f9c2a71 replaced by setup-8b04d193 revision 4, 198 bytes' }),
+  ...envelope({ message: 'setup setup-3f9c2a71 replaced by setup-8b04d193 revision 4, 198 bytes', outcome: 'succeeded' }),
   action: 'replaced',
   hash: H_OTHER_BRANCH,
   bytes: 198,
-  id: 'setup-8b04d193-6c27-4a51-83ef-90b7d2c46e15',
+  id: OTHER_SETUP_ID,
   revision: 4,
   source: 'phone',
   lineage: [],
@@ -2722,13 +2926,14 @@ add('config.set.locked.json', {
   command: 'config set',
   variant: 'operation-in-progress',
   schema: 'config-set.schema.json',
-  description: 'A setup push that arrived while an update held the machine lock. Refused, because a document rewritten under a running update could be read half-written by that update. Nothing about the document is wrong, so the reply names the operation rather than the held copy, and the client retries when the operation finishes.',
-  tags: ['controller', 'operation-lock', 'peer'],
+  description: 'A setup push that arrived while an update held the machine lock. Refused, because a document rewritten under a running update could be read half-written by that update. Nothing about the document is wrong, so the reply names the operation rather than the held copy, and the client retries when the operation finishes. It exits 1 with ok false, and its outcome is deferred: nothing failed.',
+  tags: ['controller', 'operation-lock', 'peer', 'finding:c2'],
 }, {
   ...envelope({
     ok: false,
     reasonCode: 'operation-in-progress',
     message: 'an update of t3 has held the lock since 2026-09-05T14:00:01.000Z; the setup was not changed, and this push can be retried when it finishes',
+    outcome: 'deferred',
   }),
   hash: null,
   bytes: 0,
@@ -2743,8 +2948,51 @@ add('config.set.locked.json', {
   },
 });
 
+add('config.set.invalid-document.json', {
+  command: 'config set',
+  variant: 'invalid-document',
+  schema: 'config-set.schema.json',
+  description: 'A document that parses and breaks the setup rules: here an endpoint host that is not a host at all. Agent 3.1.0 checks the structure before it writes anything and answers config-invalid with every problem as a path and a message. Agents before 3.1.0 stored whatever parsed, so a client checks before it publishes as well.',
+  tags: ['controller', 'peer', 'agent-enforced'],
+}, {
+  ...envelope({
+    ok: false,
+    reasonCode: 'config-invalid',
+    message: 'the document breaks 1 rule of the setup document, so nothing was written; the first is machines[0].endpoints[0].host',
+    outcome: 'failed',
+  }),
+  hash: null,
+  bytes: 0,
+  id: SETUP_ID,
+  revision: 4,
+  problems: [
+    { path: 'machines[0].endpoints[0].host', message: 'is not a host name or an address, so no client may hand it to ssh' },
+  ],
+});
+
+add('config.set.restricted-launch.json', {
+  command: 'config set',
+  variant: 'restricted-launch',
+  schema: 'config-set.schema.json',
+  description: 'A restricted key pushed a descendant that changes the command a machine is driven with. A restricted session may rename, reroute and reuse launch values the machine already holds, never introduce one, so the push is refused. The refusal names the paths of the refused values and never the values, and carries what the machine still holds.',
+  tags: ['controller', 'restricted-session', 'setup-lineage', 'finding:t1'],
+}, {
+  ...envelope({
+    ok: false,
+    reasonCode: 'restricted',
+    message: 'this key is restricted, and the document carries a launch value this machine does not hold (machines[tower].systems[linux]); publish it from a device whose key is not restricted',
+    outcome: 'failed',
+  }),
+  hash: null,
+  bytes: 0,
+  id: SETUP_ID,
+  revision: 13,
+  current: CONTROLLER_META,
+  launchChanges: ['machines[tower].systems[linux]'],
+});
+
 add('config.meta.json', {
-  command: 'config',
+  command: 'config meta',
   variant: 'meta-with-lineage',
   schema: 'config-meta.schema.json',
   description: 'Identity, revision and lineage without the document: one line instead of a megabyte. This is the extra round trip a client makes only when the hashes differ and status alone cannot decide which side is ahead.',
@@ -2835,13 +3083,13 @@ add('policy.service.json', {
 });
 
 add('policy.set-paused.json', {
-  command: 'policy',
+  command: 'policy set',
   variant: 'set-paused',
   schema: 'policy.schema.json',
   description: 'A pause applied to one service. Only the key that was touched is rewritten, and the reply is the effective policy afterwards, so the screen redraws from the answer rather than from what it hoped it did.',
   tags: ['policy'],
 }, {
-  ...envelope({ message: 'updates for t3 are paused until 2026-09-08T02:00:00.000Z' }),
+  ...envelope({ message: 'updates for t3 are paused until 2026-09-08T02:00:00.000Z', outcome: 'succeeded' }),
   service: 't3',
   updates: {
     automatic: true,
@@ -2865,7 +3113,7 @@ add('auto-update.off.json', {
   description: 'The 2.x switch, answering in the v3 shape. `autoUpdate` is still the plain boolean a 2.x client reads; turning the scheduler off never stops a manual update.',
   tags: ['policy', '2x-compatibility'],
 }, {
-  ...envelope({ message: 'automatic updates are off for this machine; a manual update still runs' }),
+  ...envelope({ message: 'automatic updates are off for this machine; a manual update still runs', outcome: 'succeeded' }),
   service: null,
   updates: {
     automatic: false,
@@ -2915,6 +3163,12 @@ add('auto-update.off.json', {
 
 const KEY_FINGERPRINT = '8f2b6d41c0973ea5b8de10f47c26935ab0d84e7f1c53920684bfae7d3506c19b';
 
+// Every self-update reply from agent 3.1.0 on states `floor` (contract section
+// 13). The trees the fixtures up to the downgrade ones show are 2.1.0 and
+// 3.0.0, which declare no floor, and nothing has recorded one, so no floor is
+// in effect and the reply says null. The downgrade fixtures show a 3.1.0 tree
+// and the floor it declares.
+
 add('self-update.check.json', {
   command: 'self-update',
   variant: 'check',
@@ -2925,6 +3179,7 @@ add('self-update.check.json', {
   ...envelope({ message: 'agent 2.1.0 is installed, contract 2; the bundled agent is 3.0.0' }),
   action: 'checked',
   current: { version: '2.1.0', contract: 2 },
+  floor: null,
   staged: null,
   previous: null,
   manifest: null,
@@ -2940,11 +3195,12 @@ add('self-update.installed.json', {
   description: 'A swap that happened. The signature was checked against the key this running agent was built with, every file hash matched, the staged tree passed its own self-test, and only then was anything renamed. The previous tree is kept.',
   tags: ['self-update', 'trust'],
 }, {
-  ...envelope({ message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/x1f4r/.legion-control/agent.prev' }),
+  ...envelope({ message: 'agent 3.0.0 is installed and 2.1.0 is kept at /home/me/.legion-control/agent.prev', outcome: 'succeeded' }),
   action: 'installed',
   current: { version: '3.0.0', contract: 3 },
+  floor: null,
   staged: null,
-  previous: { version: '2.1.0', path: '/home/x1f4r/.legion-control/agent.prev' },
+  previous: { version: '2.1.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: {
     schema: 1,
     version: '3.0.0',
@@ -2968,9 +3224,11 @@ add('self-update.signature-invalid.json', {
     ok: false,
     reasonCode: 'signature-invalid',
     message: 'MANIFEST.json.sig is not a valid signature over MANIFEST.json for the release key 8f2b6d41; nothing was extracted and the running agent is untouched',
+    outcome: 'failed',
   }),
   action: 'failed',
   current: { version: '2.1.0', contract: 2 },
+  floor: null,
   staged: null,
   previous: null,
   manifest: null,
@@ -2989,9 +3247,11 @@ add('self-update.self-test-failed.json', {
     ok: false,
     reasonCode: 'internal',
     message: 'the staged agent 3.0.0 failed its self-test (node:sqlite is not available in node 20.11.1), so nothing was swapped and 2.1.0 is still running',
+    outcome: 'failed',
   }),
   action: 'failed',
   current: { version: '2.1.0', contract: 2 },
+  floor: null,
   staged: null,
   previous: null,
   manifest: {
@@ -3015,13 +3275,13 @@ add('self-update.rolled-back.json', {
   description: 'A complete signed previous agent passed signature, file hashes and its own version/contract self-test before being restored; the outgoing signed build remains retained.',
   tags: ['self-update', 'recovery'],
 }, {
-  ...envelope({ message: 'rolled back to the previous signed agent 3.0.0; the outgoing build is kept at /home/x1f4r/.legion-control/agent.prev' }),
-  action: 'rolled-back', current: { version: '3.0.0', contract: 3 }, staged: null,
-  previous: { version: '3.0.0', path: '/home/x1f4r/.legion-control/agent.prev' },
+  ...envelope({ message: 'rolled back to the previous signed agent 3.0.0; the outgoing build is kept at /home/me/.legion-control/agent.prev', outcome: 'succeeded' }),
+  action: 'rolled-back', current: { version: '3.0.0', contract: 3 }, floor: null, staged: null,
+  previous: { version: '3.0.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: { schema: 1, version: '3.0.0', contract: 3, files: 31, signatureVerified: true, keyFingerprint: KEY_FINGERPRINT },
   selfTest: { ok: true, exitCode: 0, output: '{"ok":true,"contract":3,"agentVersion":"3.0.0","selfTest":{"ok":true}}' },
-  op: { ...OP_SELF_UPDATE, id: OPS.selfRollback, target: `rollback:${'2'.repeat(64)}`, from: '3.0.0', to: '3.0.0',
-    result: { ...OP_SELF_UPDATE.result, action: 'rolled-back', from: '3.0.0', to: '3.0.0', message: 'The previous signed build is restored.' } },
+  op: withOutcome({ ...OP_SELF_UPDATE, id: OPS.selfRollback, target: `rollback:${'2'.repeat(64)}`, from: '3.0.0', to: '3.0.0',
+    result: { ...OP_SELF_UPDATE.result, action: 'rolled-back', from: '3.0.0', to: '3.0.0', message: 'The previous signed build is restored.' } }),
 });
 
 add('self-update.legacy-rollback-refused.json', {
@@ -3029,10 +3289,61 @@ add('self-update.legacy-rollback-refused.json', {
   description: 'The retained 2.x tree is unsigned. It remains on disk for independently verified manual recovery but cannot be executed by the ordinary rollback command.',
   tags: ['self-update', 'trust', 'legacy'],
 }, {
-  ...envelope({ ok: false, reasonCode: 'signature-invalid', message: 'The previous agent is retained, but it is not a complete tree signed by the release key; restore it manually after independent verification.' }),
-  action: 'failed', current: { version: '3.0.0', contract: 3 }, staged: null,
-  previous: { version: '2.1.0', path: '/home/x1f4r/.legion-control/agent.prev' },
+  ...envelope({ ok: false, reasonCode: 'signature-invalid', message: 'The previous agent is retained, but it is not a complete tree signed by the release key; restore it manually after independent verification.', outcome: 'failed' }),
+  action: 'failed', current: { version: '3.0.0', contract: 3 }, floor: null, staged: null,
+  previous: { version: '2.1.0', path: '/home/me/.legion-control/agent.prev' },
   manifest: null, selfTest: null, op: null,
+});
+
+// A signed bundle older than the version floor. Its signature is checked first,
+// so the refusals below can name exactly what they refused; they happen before
+// an operation record exists, which is why op is null.
+const OLDER_MANIFEST = { schema: 1, version: '3.0.0', contract: 3, files: 31, signatureVerified: true, keyFingerprint: KEY_FINGERPRINT };
+
+add('self-update.downgrade-restricted.json', {
+  command: 'self-update',
+  variant: 'downgrade-restricted',
+  schema: 'self-update.schema.json',
+  description: 'A restricted key offered a properly signed agent older than the version floor. A signature stops a forged build, not an old one with a known hole in it, so a restricted session may only move the agent forward. Refused before an operation record exists; nothing was staged, and `floor` says what the line is.',
+  tags: ['self-update', 'trust', 'restricted-session', 'floor', 'finding:t2'],
+}, {
+  ...envelope({
+    ok: false,
+    reasonCode: 'restricted',
+    message: `agent 3.0.0 is below the version floor ${AGENT_FLOOR}; a restricted key can only move the agent forward or roll back to a signed agent at or above ${AGENT_FLOOR}`,
+    outcome: 'failed',
+  }),
+  action: 'failed',
+  current: { version: AGENT, contract: 3 },
+  floor: AGENT_FLOOR,
+  staged: null,
+  previous: null,
+  manifest: OLDER_MANIFEST,
+  selfTest: null,
+  op: null,
+});
+
+add('self-update.downgrade-needs-flag.json', {
+  command: 'self-update',
+  variant: 'downgrade-needs-flag',
+  schema: 'self-update.schema.json',
+  description: 'The same older bundle from an unrestricted session that did not ask to go back. bad-argument, nothing staged: going below the floor takes --allow-downgrade, which a client sends only after a person decided to, and only to an agent whose status reports a floor.',
+  tags: ['self-update', 'trust', 'floor', 'finding:t2'],
+}, {
+  ...envelope({
+    ok: false,
+    reasonCode: 'bad-argument',
+    message: `agent 3.0.0 is older than the floor ${AGENT_FLOOR}; nothing was staged. Repeat with --allow-downgrade from an unrestricted session to go back deliberately`,
+    outcome: 'failed',
+  }),
+  action: 'failed',
+  current: { version: AGENT, contract: 3 },
+  floor: AGENT_FLOOR,
+  staged: null,
+  previous: null,
+  manifest: OLDER_MANIFEST,
+  selfTest: null,
+  op: null,
 });
 
 // -- version / help ---------------------------------------------------------
@@ -3046,7 +3357,7 @@ add('version.json', {
 }, {
   ...envelope(),
   node: '24.9.0',
-  base: '/home/x1f4r/.legion-control',
+  base: '/home/me/.legion-control',
   os: 'linux',
 });
 
@@ -3059,7 +3370,7 @@ add('version.check.json', {
 }, {
   ...envelope(),
   node: '24.9.0',
-  base: '/home/x1f4r/.legion-control',
+  base: '/home/me/.legion-control',
   os: 'linux',
   selfTest: { ok: true, modules: 18, failed: [] },
 });
@@ -3072,7 +3383,7 @@ add('help.json', {
   tags: ['handshake'],
 }, {
   ...envelope(),
-  usage: 'node /home/x1f4r/.legion-control/agent/src/index.mjs <command> [args] [--flags]',
+  usage: 'node /home/me/.legion-control/agent/src/index.mjs <command> [args] [--flags]',
   commands: [
     { name: 'status', flags: ['--budget-ms <ms>'], mutates: false, summary: 'bounded snapshot with timing and partial flags' },
     { name: 'busy', flags: ['--budget-ms <ms>'], mutates: false, summary: 'aggregate busy plus per-service evidence' },
@@ -3091,7 +3402,7 @@ add('help.json', {
     { name: 'doctor', flags: ['--service <id>', '--deep'], mutates: false, summary: 'preflight and diagnosis checks' },
     { name: 'bundle', flags: [], mutates: false, summary: 'doctor, status, history, logs and a redacted config in one reply' },
     { name: 'config', flags: ['--controller-id <id>', '--revision <n>', '--replace'], mutates: true, summary: 'the stored controller document; "config set" reads one from stdin, "config meta" reads its identity' },
-    { name: 'self-update', flags: ['--from <path>', '--install', '--rollback', '--check', '--stdin'], mutates: true, summary: 'signed agent replacement, keeping the previous tree' },
+    { name: 'self-update', flags: ['--from <path>', '--install', '--rollback', '--check', '--stdin', '--allow-downgrade'], mutates: true, summary: 'signed agent replacement, keeping the previous tree' },
     { name: 'version', flags: ['--check'], mutates: false, summary: 'the agent version, and with --check the self-test' },
     { name: 'help', flags: [], mutates: false, summary: 'this list' },
   ],
@@ -3110,6 +3421,7 @@ error('error.bad-argument.json', 'bad-argument',
       ok: false,
       reasonCode: 'bad-argument',
       message: '--service "t3; rm -rf ~" is not a valid value: it must match ^[A-Za-z0-9][A-Za-z0-9._:@/\\~=+-]*$',
+      outcome: 'failed',
     }),
     command: 'update',
     argument: '--service',
@@ -3124,6 +3436,7 @@ error('error.unknown-service.json', 'unknown-service',
       ok: false,
       reasonCode: 'unknown-service',
       message: 'this machine has no service called "t3-desktop"; it has t3, demo and edge',
+      outcome: 'failed',
     }),
     command: 'update',
     argument: '--service',
@@ -3138,6 +3451,7 @@ error('error.unknown-target.json', 'unknown-target',
       ok: false,
       reasonCode: 'unknown-target',
       message: 'this machine has no boot target called "macos"; it can boot into windows',
+      outcome: 'failed',
     }),
     command: 'boot',
     argument: 'macos',
@@ -3152,6 +3466,7 @@ error('error.unknown-action.json', 'unknown-action',
       ok: false,
       reasonCode: 'unknown-action',
       message: 'this machine has no action called "reindex"; it has sunshine-restart and flush-cache',
+      outcome: 'failed',
     }),
     command: 'run',
     argument: 'reindex',
@@ -3166,6 +3481,7 @@ error('error.config-invalid.json', 'config-invalid',
       ok: false,
       reasonCode: 'config-invalid',
       message: 'config.json does not parse, so nothing on this machine will be changed until it does; status still works and reads from config.last-good.json',
+      outcome: 'failed',
     }),
     command: 'update',
     argument: null,
@@ -3186,7 +3502,8 @@ error('error.config-missing.json', 'config-missing',
     ...envelope({
       ok: false,
       reasonCode: 'config-missing',
-      message: 'there is no /home/x1f4r/.legion-control/config.json, so this machine has no services to update',
+      message: 'there is no /home/me/.legion-control/config.json, so this machine has no services to update',
+      outcome: 'failed',
     }),
     command: 'update',
     argument: null,
@@ -3228,6 +3545,7 @@ error('error.internal.json', 'internal',
       ok: false,
       reasonCode: 'internal',
       message: 'the agent failed while writing the operation record: ENOSPC: no space left on device, write',
+      outcome: 'unknown',
     }),
     command: 'update',
     argument: null,
@@ -3282,7 +3600,7 @@ add('legacy-2x.status.json', {
   ok: true,
   os: 'linux',
   system: LINUX,
-  hostname: 'atlas',
+  hostname: 'beacon',
   agentVersion: '2.1.0',
   services: [LEGACY_SERVICE],
   busy: LEGACY_BUSY,
@@ -3369,9 +3687,9 @@ for (const [variant, command, payload, description] of [
     'An unrestricted administrator reads the full machine-local document, its opaque structural hash, incomplete service templates and the input byte limit.'],
   ['validate', 'service-config validate', serviceValidation,
     'The proposed document validates against the current hash. The reply previews service changes without echoing commands or saving anything.'],
-  ['set', 'service-config set', { ...serviceValidation, hash: proposedServiceHash, saved: true, message: 'Agent configuration saved. No setup or service command was executed.' },
+  ['set', 'service-config set', { ...serviceValidation, hash: proposedServiceHash, saved: true, message: 'Agent configuration saved. No setup or service command was executed.', outcome: 'succeeded' },
     'Saving the exact validated proposal succeeds under compare-and-swap and reports its resulting hash; no service command or package installation runs.'],
-  ['conflict', 'service-config set', { ok: false, reasonCode: 'stale-revision', message: 'Agent configuration changed; reload and review your edits before saving.', valid: false, conflict: true, hash: proposedServiceHash },
+  ['conflict', 'service-config set', { ok: false, reasonCode: 'stale-revision', message: 'Agent configuration changed; reload and review your edits before saving.', valid: false, conflict: true, hash: proposedServiceHash, outcome: 'failed' },
     'Another administrator changed machine-local configuration after the edit began. The old expectedHash is refused and no proposal is saved.'],
   ['invalid', 'service-config validate', { ok: false, reasonCode: 'config-invalid', message: 'The configuration is incomplete or invalid; nothing was saved.', valid: false,
     errors: [{ path: 'services[0].busy', message: 'Choose a busy probe, or explicitly set type none to allow work without busy protection.' }] },
@@ -3408,28 +3726,45 @@ add('service-config.profiles.json', {
 });
 
 const index = {
-  $comment: 'Generated by node contract/tools/make-fixtures.mjs. Edit that file, not these.',
+  $comment: 'Generated by node contract/tools/generate.mjs. Edit contract/tools, not these files.',
   contract: 3,
   agentVersion: AGENT,
   naming: '<command>.<variant>.json, lowercase and dot-separated. Replies from an agent 2.x are prefixed legacy-2x. and validate against a legacy-2x-*.schema.json.',
-  loading: 'Load index.json first and walk `fixtures`; do not glob the directory, because index.json is itself a .json file in it. Every entry names the schema its payload validates against, relative to contract/schemas.',
-  hashVectors: '../hash-vectors.json, validated by contract/validate.mjs against schemas/hash-vectors.schema.json. It is not a reply fixture and is deliberately not in this directory.',
+  loading: 'Load index.json first and walk fixtures in order; do not glob the directory. Handle every entry by kind and schema: an entry your test has no handler for is a failure, never a skip.',
+  vectors: '../vectors/index.json lists every vector family, the hash vectors included. Vectors are not reply fixtures and are deliberately not in this directory.',
   fields: {
     file: 'the fixture, in this directory',
-    command: 'the legionctl command whose reply this is',
+    kind: 'reply, or document for a setup document or a bindings file',
+    expect: 'valid, or invalid for a fixture that exists to be refused',
+    command: 'the legionctl command whose reply this is; config meta and config set are commands of their own',
     variant: 'which answer to that command',
     schema: 'the schema in contract/schemas that this payload validates against',
     ok: 'the reply’s own ok',
-    exitCode: 'the process exit code that goes with it: 0 when the command did what was asked, 1 otherwise',
+    exitCode: 'the exit code rule 7 gives: 0 when ok is true or action is accepted, already-running, queued, deferred, noop or conflict; 1 otherwise',
     contract: '3, or null for a reply from an agent 2.x that carries no contract key',
     action: 'the reply’s action, when it has one',
     reasonCode: 'the reply’s reasonCode, when it has one',
+    outcome: 'the reply’s outcome (section 5.6), or null when it carries none',
     tags: 'what this fixture is for, so a client test can pick a subset',
   },
   fixtures,
   coverageExemptions: { reasonCodes: {} },
 };
+FILES.set('fixtures/index.json', documentText(index));
 
-fs.mkdirSync(OUT, { recursive: true });
-fs.writeFileSync(path.join(OUT, 'index.json'), `${JSON.stringify(index, null, 2)}\n`, 'utf8');
-process.stdout.write(`wrote ${fixtures.length} fixtures and index.json\n`);
+/**
+ * Every fixture and fixtures/index.json, as a Map from the path relative to
+ * contract/ to the exact text that belongs there. Built once, when this module
+ * is first imported.
+ */
+export function buildFixtures() {
+  return new Map(FILES);
+}
+
+// The fixtures are written by generate.mjs, together with everything else that
+// is generated, so a run of this file on its own says where to go instead of
+// silently doing nothing.
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
+  process.stderr.write('make-fixtures.mjs builds the fixtures for generate.mjs; run node contract/tools/generate.mjs to write or check them\n');
+  process.exitCode = 1;
+}

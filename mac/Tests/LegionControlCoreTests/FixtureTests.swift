@@ -82,7 +82,8 @@ struct FixtureTests {
                     #expect(!history.records.isEmpty)
                 case command == "logs":
                     let logs = try JSONDecoder().decode(AgentLogsResult.self, from: data)
-                    #expect(!logs.text.isEmpty)
+                    // A refusal (an operation the machine does not know) carries no lines.
+                    if entry.ok != false { #expect(!logs.text.isEmpty) }
                 case command == "doctor":
                     let doctor = try JSONDecoder().decode(AgentDoctorResult.self, from: data)
                     #expect(!(doctor.checks ?? []).isEmpty)
@@ -156,7 +157,7 @@ struct FixtureTests {
         let status = try JSONDecoder().decode(AgentStatus.self, from: try Self.bytes("status.full.json"))
         #expect(status.contractVersion == 3)
         #expect(status.speaksRequiredContract)
-        #expect(status.version == "3.0.0")
+        #expect(status.version == "3.1.0")
         #expect(!status.resolvedServices.isEmpty)
         #expect(status.controllerHash != nil)
         #expect(status.controller?.identity.id != nil)

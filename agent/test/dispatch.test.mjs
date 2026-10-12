@@ -129,6 +129,17 @@ test('a restricted key may upload a bundle but may not run one from a path', () 
   assert.match(install.message, /tree this session provided/);
 });
 
+test('a restricted key may not ask to go below the installed agent or the version floor', () => {
+  for (const flag of ['--allow-downgrade', '--allow-downgrade=1']) {
+    for (const mode of ['--stdin', '--rollback', '--check']) {
+      const refused = authorize(`${NODE} ${ENTRY} self-update ${mode} ${flag}`);
+      assert.equal(refused.ok, false, `${mode} ${flag}`);
+      assert.equal(refused.reasonCode, 'restricted');
+      assert.match(refused.message, /only an unrestricted session/);
+    }
+  }
+});
+
 test('the allow list is the one published to the clients', () => {
   for (const command of ['status', 'busy', 'update', 'restart', 'boot', 'sleep', 'run', 'cycle', 'op', 'cancel', 'history', 'logs', 'doctor', 'bundle', 'config', 'policy', 'version']) {
     assert.ok(RESTRICTED_COMMANDS.has(command), `${command} should be allowed for a restricted key`);

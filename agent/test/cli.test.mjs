@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { cli, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
+import { AGENT_VERSION, cli, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
 
 /** A home with the fixture service configured and running. */
 async function withService(body, { config = null, initial = {} } = {}) {
@@ -21,7 +21,7 @@ test('status describes the service, its process, health and busy evidence apart'
     const { payload, exitCode } = cli(['status'], { home });
     assert.equal(exitCode, 0);
     assert.equal(payload.contract, 3);
-    assert.equal(payload.agentVersion, '3.0.1');
+    assert.equal(payload.agentVersion, AGENT_VERSION);
 
     const service = payload.services[0];
     assert.equal(service.installed, '1.0.0');
@@ -113,8 +113,12 @@ test('an updater that does nothing is caught, rolled back, and --force does not 
 test('an update whose result cannot be confirmed at all is refused before it touches anything', async () => {
   await withService(
     async ({ home, dir }) => {
-      const { payload } = cli(['update', '--force'], { home });
-      assert.equal(payload.action, 'noop');
+      const { payload, exitCode } = cli(['update', '--force'], { home });
+      // Refused, and failed rather than a no-op: a client must never show an
+      // update nothing could confirm as done.
+      assert.equal(payload.action, 'failed');
+      assert.equal(payload.outcome, 'failed');
+      assert.equal(exitCode, 1);
       assert.equal(payload.reasonCode, 'postcondition-failed');
       assert.match(payload.message, /--force overrides the busy gate, not the evidence/);
       assert.equal(readFixture(dir, 'update-runs', '0'), '0', 'nothing may run when nothing could confirm it');
@@ -130,11 +134,13 @@ test('an update whose result cannot be confirmed at all is refused before it tou
   );
 });
 
-test('a version lookup that fails is a no-op that --force cannot push past', async () => {
+test('a version lookup that fails is a failed update that --force cannot push past', async () => {
   await withService(
     async ({ home, dir }) => {
-      const { payload } = cli(['update', '--force'], { home });
-      assert.equal(payload.action, 'noop');
+      const { payload, exitCode } = cli(['update', '--force'], { home });
+      assert.equal(payload.action, 'failed');
+      assert.equal(payload.outcome, 'failed');
+      assert.equal(exitCode, 1);
       assert.equal(payload.reasonCode, 'latest-unknown');
       assert.equal(readFixture(dir, 'update-runs', '0'), '0', 'installing an unnamed version is a guess, not an update');
     },
@@ -159,12 +165,19 @@ test('the same operation id twice does the work once', async () => {
   );
 });
 
-test('an operation id names one intent; reusing it for another is a conflict', async () => {
+test('an operation id names one intent; reusing it for another is a bad --op, not a conflict', async () => {
   await withService(async ({ home }) => {
     const id = 'bbbbbbbb-2222-4222-8222-222222222222';
     cli(['restart', '--op', id], { home });
     const clash = cli(['update', '--op', id], { home });
-    assert.equal(clash.payload.action, 'conflict');
+    // A conflict tells a client to try the same request later; this one can
+    // never succeed, so it is refused about the argument instead.
+    assert.equal(clash.exitCode, 1);
+    assert.equal(clash.payload.reasonCode, 'bad-argument');
+    assert.equal(clash.payload.action, undefined);
+    assert.equal(clash.payload.command, 'update');
+    assert.equal(clash.payload.argument, '--op');
+    assert.equal(clash.payload.outcome, 'failed');
     assert.match(clash.payload.message, /binds one intent/);
   });
 });
@@ -472,7 +485,7 @@ test('doctor reports the scheduler, the busy source and the lock, with fixes', a
   await withService(async ({ home }) => {
     const { payload } = cli(['doctor'], { home });
     const ids = payload.checks.map((check) => check.id);
-    for (const id of ['config.parse', 'config.validate', 'base.writable', 'node.version', 'locks', 'ops.dir', 'clock', 'session.restricted', 'controller.copy', 'sleep.tool', 'scheduler.present', 'scheduler.command', 'scheduler.lastRun', 'service.demo.process', 'service.demo.health', 'service.demo.busy']) {
+    for (const id of ['config.parse', 'config.validate', 'base.writable', 'node.version', 'locks', 'ops.dir', 'clock', 'session.restricted', 'agent.floor', 'agent.signed', 'controller.copy', 'sleep.tool', 'scheduler.present', 'scheduler.command', 'scheduler.lastRun', 'service.demo.process', 'service.demo.health', 'service.demo.busy']) {
       assert.ok(ids.includes(id), `doctor should check ${id}`);
     }
     for (const check of payload.checks) {
@@ -481,7 +494,7 @@ test('doctor reports the scheduler, the busy source and the lock, with fixes', a
     assert.equal(typeof payload.counts.ok, 'number');
     assert.equal(payload.counts.ok + payload.counts.warn + payload.counts.fail, payload.checks.length);
     // Every check id has to be one the contract names, or a client cannot render it.
-    const allowed = /^(?:config\.(?:parse|validate)|base\.writable|node\.(?:version|sqlite)|npm\.(?:available|prefix)|service\.[A-Za-z0-9][A-Za-z0-9._-]*\.(?:process|health|busy|relay|latest|endpoint)|scheduler\.(?:present|command|lastRun)|privileges\.(?:sudo|boot)|sleep\.tool|locks|ops\.dir|controller\.copy|session\.restricted|clock)$/;
+    const allowed = /^(?:config\.(?:parse|validate)|base\.writable|node\.(?:version|sqlite)|npm\.(?:available|prefix)|service\.[A-Za-z0-9][A-Za-z0-9._-]*\.(?:process|health|busy|relay|latest|endpoint)|scheduler\.(?:present|command|lastRun)|privileges\.(?:sudo|boot)|sleep\.tool|locks|ops\.dir|controller\.copy|session\.restricted|clock|agent\.(?:floor|signed))$/;
     for (const check of payload.checks) assert.match(check.id, allowed, `${check.id} is not a contract check id`);
   });
 });

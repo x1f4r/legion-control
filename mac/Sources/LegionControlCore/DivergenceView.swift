@@ -9,7 +9,7 @@ import SwiftUI
 /// let a person settle those.
 struct DivergenceView: View {
     let model: AppModel
-    let divergence: MachineModel.SetupDivergence
+    let divergence: SetupDivergence
 
     @State private var choices: [String: SetupMerge.Choice] = [:]
     @State private var problem: String?

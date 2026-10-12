@@ -30,6 +30,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { isFloorVersion, isOlder } from './floor.mjs';
 import { verifyDetachedSignature } from './trust.mjs';
 
 /** Compressed bytes we are willing to read. The agent tarball is well under a MB. */
@@ -222,7 +223,8 @@ function sha256(buffer) {
 /**
  * Verify a signed agent bundle, entirely in memory.
  *
- * Returns `{ ok, files, manifest, fingerprint }` or `{ ok: false, error }`.
+ * Returns `{ ok, files, manifest, entryCount, agentFloor }` or `{ ok: false, error }`,
+ * where `agentFloor` is the floor the signed package.json declares, or null.
  * Nothing is written; the caller stages the returned files itself once it has
  * decided it wants them.
  */
@@ -315,17 +317,41 @@ function verifyAgentFiles(archiveFiles, root = 'agent') {
   }
 
   if (!listed.has('package.json') || !listed.has('src/index.mjs')) return reject('the signed inventory must include package.json and src/index.mjs');
+  let agentFloor;
   try {
     const metadata = JSON.parse(parsed.files.get(prefix + 'package.json').toString('utf8'));
     if (metadata.version !== manifest.version) return reject('package.json version differs from the signed manifest');
+    agentFloor = metadata.legionControl?.agentFloor ?? null;
   } catch { return reject('the signed package.json does not parse'); }
+  // The oldest agent this release may be replaced by (contract section 13). It
+  // is at most the release's own version: a higher one would have the launcher
+  // refuse the very tree that declared it. A release from before the floor
+  // declares none, and stays installable from an unrestricted session.
+  if (agentFloor !== null && (!isFloorVersion(agentFloor) || isOlder(manifest.version, agentFloor))) {
+    return reject(`package.json declares agentFloor ${JSON.stringify(agentFloor)}, which is not an x.y.z version at most ${manifest.version}`);
+  }
 
   const files = new Map();
   for (const entry of manifest.files) files.set(entry.path, parsed.files.get(prefix + entry.path));
   files.set('MANIFEST.json', manifestBytes);
   files.set('MANIFEST.json.sig', signatureBytes);
 
-  return { ok: true, error: null, files, manifest, entryCount: manifest.files.length };
+  return { ok: true, error: null, files, manifest, entryCount: manifest.files.length, agentFloor };
+}
+
+/**
+ * Whether a tree carries a signed manifest at all: MANIFEST.json and its
+ * signature, both regular files. It says nothing about whether they verify,
+ * which is verifyAgentTree's job and the launcher's before it runs a tree.
+ * Status reports it as `agent.signed`, so a source checkout or a hand-copied
+ * tree shows as what it is rather than passing for a release.
+ */
+export function carriesSignedManifest(directory) {
+  try {
+    return ['MANIFEST.json', 'MANIFEST.json.sig'].every((name) => fs.lstatSync(path.join(directory, name)).isFile());
+  } catch {
+    return false;
+  }
 }
 
 /** Verify a tree before executing it, including rejection of extra files and links. */

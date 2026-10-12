@@ -9,8 +9,8 @@ import org.junit.Test
 /**
  * Working out which network this device is standing on, and admitting when that cannot be done.
  *
- * Two houses behind the same router model have the same private subnet. 192.168.178.0/24 is one
- * router vendor's default and there are millions of them, so an address starting with 192.168.178. is evidence
+ * Two houses behind the same router model have the same private subnet. 192.168.50.0/24 is one
+ * router vendor's default and there are millions of them, so an address starting with 192.168.50. is evidence
  * about which network this is and no evidence at all about which house it is in. Getting this wrong
  * means sending a wake packet at the wrong building, so the answer here is allowed to be "not sure".
  */
@@ -19,14 +19,14 @@ class SiteDetectionTest {
     private val attic = SiteConfig(
         id = "attic-house",
         name = "Attic house",
-        lanPrefixes = listOf("192.168.178."),
-        broadcast = listOf("192.168.178.255"),
+        lanPrefixes = listOf("192.168.50."),
+        broadcast = listOf("192.168.50.255"),
     )
     private val flat = SiteConfig(
         id = "flat",
         name = "Flat",
-        lanPrefixes = listOf("192.168.178."),
-        broadcast = listOf("192.168.178.255"),
+        lanPrefixes = listOf("192.168.50."),
+        broadcast = listOf("192.168.50.255"),
     )
     private val distinct = SiteConfig(
         id = "office",
@@ -37,7 +37,7 @@ class SiteDetectionTest {
 
     @Test
     fun `one matching site is confirmed`() {
-        val match = matchSite(listOf(attic, distinct), listOf("192.168.178.31"), declaredSiteId = null)
+        val match = matchSite(listOf(attic, distinct), listOf("192.168.50.31"), declaredSiteId = null)
         assertTrue(match is SiteMatch.Confirmed)
         assertEquals("attic-house", match.site?.id)
         assertTrue(match.isOnSite)
@@ -47,7 +47,7 @@ class SiteDetectionTest {
     fun `two sites on the same private subnet are ambiguous, never the first one`() {
         val match = matchSite(
             listOf(attic, flat),
-            listOf("192.168.178.31"),
+            listOf("192.168.50.31"),
             declaredSiteId = null,
         )
         assertTrue("picking one would be a coin toss", match is SiteMatch.Ambiguous)
@@ -60,13 +60,13 @@ class SiteDetectionTest {
     fun `the user saying which site it is settles the ambiguity`() {
         val match = matchSite(
             listOf(attic, flat),
-            listOf("192.168.178.31"),
+            listOf("192.168.50.31"),
             declaredSiteId = "flat",
         )
         assertTrue(match is SiteMatch.Declared)
         assertEquals("flat", match.site?.id)
         assertTrue(match.isOnSite)
-        assertTrue(match.explain().contains("Its address 192.168.178.31 agrees"))
+        assertTrue(match.explain().contains("Its address 192.168.50.31 agrees"))
     }
 
     @Test

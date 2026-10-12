@@ -50,6 +50,7 @@ sending it again.
 | earlier setups, by hash | `revisions/` beside it | the same |
 | operations this app started | `operations.json` beside it | the same |
 | desktop preferences | `desktop-settings.json` beside it | the same |
+| ssh's own log while a command runs, deleted after each attempt | `ssh-logs/` beside it | the same |
 
 Linux uses `$XDG_CONFIG_HOME/legion-control/` instead when `XDG_CONFIG_HOME` is set.
 
@@ -91,19 +92,19 @@ so they live in `bindings.json` and are never published.
 
 ```
 legion-control --command bindings \
-  --device "Robert's tower" \
+  --device "Desk tower" \
   --self tower --system linux \
   --local-agent "node /home/me/.legion-control/agent/src/index.mjs" \
   --identity ~/.ssh/legion-control_ed25519 \
   --site flat
-legion-control --command bindings --machine legion --alias legion-win-lan
+legion-control --command bindings --machine legion --alias legion-windows-lan
 ```
 
 `--self` says this device is one of the machines in the setup. With `--local-agent` it is then
 driven by spawning that command here rather than by an ssh loop back to itself; the argv is run as
 it stands, with no shell and nothing to quote. Without it, it is dialled like any other machine.
 
-`--site` matters where two homes sit behind the same router defaults. A `192.168.178.` address
+`--site` matters where two homes sit behind the same router defaults. A `192.168.50.` address
 cannot tell them apart, so a prefix match is only ever a hint: when two sites match, this app says
 the location is unconfirmed rather than picking one, and a magic packet is only sent from here when
 being on that network is more than a guess. What proves which machine answered is the pinned host

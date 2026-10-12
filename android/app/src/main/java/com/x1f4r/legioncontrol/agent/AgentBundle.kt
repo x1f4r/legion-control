@@ -25,11 +25,11 @@ import java.io.File
  */
 class AgentBundle private constructor(
     /** The tarball, copied out of assets into cache so it has a path and a stream. */
-    val tarball: File,
+    val tarball: SignedTarball,
     val manifest: VerifiedManifest,
     val version: String,
 ) {
-    val fileName: String get() = tarball.name
+    val fileName: String get() = tarball.file.name
 
     /** What to call it on screen. */
     fun describe(): String = "control agent $version, signed"
@@ -37,6 +37,8 @@ class AgentBundle private constructor(
     companion object {
         /** Where the release build puts the three files. */
         private const val ASSET_DIR = "agent"
+
+        private const val STAGING_SUFFIX = ".new"
 
         /**
          * Reads and verifies the bundle, or explains why there is not one.
@@ -105,13 +107,32 @@ class AgentBundle private constructor(
             }
 
             // Written out only after every check has passed. A file on disk is a file something can
-            // send, and one that failed verification should never exist as a path at all.
+            // send, and one that failed verification should never exist as a path at all. Written
+            // beside the name and renamed onto it, because every screen loads the bundle, and one
+            // loading it while another uploads it must never leave a half-written file to read.
             val directory = File(context.cacheDir, "agent-bundle").apply { mkdirs() }
-            directory.listFiles()?.forEach { it.delete() }
             val file = File(directory, tarballName)
-            file.writeBytes(bytes)
+            val staging = File.createTempFile(tarballName, STAGING_SUFFIX, directory)
+            staging.writeBytes(bytes)
+            if (!staging.renameTo(file)) {
+                staging.delete()
+                return@withContext Result.failure(
+                    AgentBundleMissing("The bundled $tarballName could not be written out to be sent."),
+                )
+            }
+            // Another version's file goes. One that another load is still writing does not.
+            directory.listFiles()
+                ?.filter { it.name != tarballName && !it.name.endsWith(STAGING_SUFFIX) }
+                ?.forEach { it.delete() }
 
-            Result.success(AgentBundle(file, verified, agentVersion))
+            // What the signature vouches for, which is what the install is checked against: the
+            // signed size, or when the manifest gives none, that of the bytes the signed hash matched.
+            val signed = SignedTarball(
+                file = file,
+                sha256 = artifact.sha256.lowercase(),
+                size = artifact.size.takeIf { it > 0 } ?: bytes.size.toLong(),
+            )
+            Result.success(AgentBundle(signed, verified, agentVersion))
         }
     }
 }
@@ -120,26 +141,83 @@ class AgentBundle private constructor(
 class AgentBundleMissing(override val message: String) : Exception(message)
 
 /**
- * How to get a signed agent onto one machine.
+ * The agent tarball on this phone, with the size and SHA-256 its signed manifest vouches for.
  *
- * Two paths, chosen by what is already there. A machine that already speaks contract 3 takes the
- * bytes on standard input, which needs no writable temporary path and works through the restricted
- * dispatcher. A machine on 2.x has no `self-update` at all, so the tarball goes over SFTP and the
- * staged tree installs itself, which is the bootstrap the contract describes.
+ * [sha256] and [size] are what was verified, not whatever [file] holds when it is next read. The
+ * bootstrap's install step checks the upload against them on the far side, and that check is worth
+ * something only while it is tied to the signature: hashed again from the file at install time, a
+ * file being rewritten underneath would be sent with its own hash and pass.
+ */
+data class SignedTarball(
+    val file: File,
+    /** Lowercase hex, as the install script compares it. */
+    val sha256: String,
+    val size: Long,
+)
+
+/**
+ * How to get a signed agent onto one machine, or why it cannot be done from here.
+ *
+ * Two paths, chosen by what an authenticated status said is already there. A machine that already
+ * speaks contract 3 takes the bytes on standard input, which needs no writable temporary path and
+ * works through the restricted dispatcher. A machine on 2.x has no `self-update` at all, so the
+ * tarball goes over SFTP and the staged tree installs itself, which is the bootstrap the contract
+ * describes and [AgentBootstrap] carries out.
  *
  * SFTP rather than `cat > path`: a redirect is shell syntax, and this app's whole quoting discipline
  * exists so that it never has to write any.
  */
-enum class AgentDeploymentPath {
+sealed interface AgentDeploymentPath {
     /** `self-update --stdin`, streaming the tarball. Contract 3 and later. */
-    STDIN,
+    data object Stdin : AgentDeploymentPath
 
-    /** SFTP into `<base>/incoming/` then run the staged tree's own `self-update --install`. */
-    UPLOAD_AND_INSTALL,
-    ;
+    /** Prepare [AgentBootstrap.Layout.base], upload into its `incoming/`, and install from there. */
+    data class UploadAndInstall(
+        /** The system that answered the status, which is the one whose interpreter runs the steps. */
+        val system: MachineSystem,
+        val layout: AgentBootstrap.Layout,
+    ) : AgentDeploymentPath
+
+    /** Nothing is sent, and [reason] says why in a sentence for the machine page. */
+    data class Unavailable(val reason: String) : AgentDeploymentPath
 
     companion object {
-        fun forAgent(abilities: AgentAbilities): AgentDeploymentPath =
-            if (abilities.speaksV3) STDIN else UPLOAD_AND_INSTALL
+        /** Why nothing is offered until a machine has answered with an authenticated status. */
+        const val READ_STATUS_FIRST = "Read an authenticated agent status first."
+
+        /**
+         * The path for a machine, from its last authenticated status and the system that gave it.
+         *
+         * The Mac's gate in `AgentBootstrap.swift`, row for row. The order is the rule: nothing is
+         * decided before an authenticated status, a contract 3 agent installs on standard input
+         * whatever key it was reached with, and the legacy bootstrap needs every one of the rows after
+         * that to pass. The previous version took a contract it had not read as zero, so a machine
+         * nobody had heard from yet was sent the legacy upload.
+         */
+        fun decide(
+            abilities: AgentAbilities,
+            lastStatus: AgentStatus?,
+            system: MachineSystem?,
+        ): AgentDeploymentPath {
+            if (lastStatus?.ok != true) return Unavailable(READ_STATUS_FIRST)
+            if ((abilities.contract ?: 0) >= Contract.REQUIRED) return Stdin
+            if (!AgentBootstrap.isAuthenticatedLegacy(lastStatus)) {
+                return Unavailable(
+                    "This agent's status does not say it is a 1.x or 2.x agent, so nothing is " +
+                        "installed over it from the phone.",
+                )
+            }
+            if (system == null) return Unavailable("The agent did not say which of this machine's systems it is.")
+            if (system.launchState == LaunchState.NOT_DRIVEN) return Unavailable("Not approved on this device.")
+            if (system.grammar == RemoteShell.DISPATCH || lastStatus.agent?.restrictedSession == true) {
+                return Unavailable("Needs an administrator connection.")
+            }
+            if (system.grammar != RemoteShell.POSIX) {
+                return Unavailable("Only POSIX systems are bootstrapped from the phone.")
+            }
+            val layout = AgentBootstrap.layout(system.agent)
+                ?: return Unavailable("The installation base cannot be derived from this command.")
+            return UploadAndInstall(system, layout)
+        }
     }
 }

@@ -17,11 +17,15 @@ const BINDINGS_SCHEMA = { $ref: 'bindings.schema.json' };
 
 const schemaErrors = (schema, data) => validate(schema, data, { file: 'common.schema.json' }).errors;
 const helper = (machine, action) => ({ machine, action });
+// checkControllerDocument (tools/document-rules.mjs) reports {code, path, message};
+// the assertions below read the messages, which is what a person is shown.
+const text = (problems) => problems.map((problem) => problem.message).join(' ');
+const codes = (problems) => [...new Set(problems.map((problem) => problem.code))].sort();
 
 const document = (overrides = {}) => ({
   version: 1,
   controller: { id: 'setup-3f9c2a71', revision: 1, lineage: [] },
-  machines: [{ id: 'pi', name: 'Atlas' }],
+  machines: [{ id: 'pi', name: 'Beacon' }],
   ...overrides,
 });
 
@@ -70,14 +74,16 @@ test('a machine cannot be its own wake helper', () => {
   const { errors } = checkControllerDocument(document({
     machines: [{ id: 'tower', wake: { helpers: [helper('tower', 'wake-tower')] } }],
   }));
-  assert.match(errors.join(' '), /its own wake helper/);
+  assert.match(text(errors), /its own wake helper/);
+  assert.deepEqual(codes(errors), ['helper-self']);
 });
 
 test('a helper must be a machine this document describes', () => {
   const { errors } = checkControllerDocument(document({
     machines: [{ id: 'tower', wake: { helpers: [helper('ghost', 'wake-tower')] } }],
   }));
-  assert.match(errors.join(' '), /"ghost" is not a machine/);
+  assert.match(text(errors), /"ghost" is not a machine/);
+  assert.deepEqual(codes(errors), ['helper-unknown']);
 });
 
 test('helpers that wake each other are a cycle, and a cycle is refused', () => {
@@ -87,7 +93,8 @@ test('helpers that wake each other are a cycle, and a cycle is refused', () => {
       { id: 'b', wake: { helpers: [helper('a', 'wake-b')] } },
     ],
   }));
-  assert.match(errors.join(' '), /wake helper cycle/);
+  assert.match(text(errors), /wake helper cycle/);
+  assert.deepEqual(codes(errors), ['helper-cycle']);
 });
 
 test('a longer ring is still a ring', () => {
@@ -98,7 +105,8 @@ test('a longer ring is still a ring', () => {
       { id: 'c', wake: { helpers: [helper('a', 'wake-c')] } },
     ],
   }));
-  assert.match(errors.join(' '), /wake helper cycle/);
+  assert.match(text(errors), /wake helper cycle/);
+  assert.deepEqual(codes(errors), ['helper-cycle']);
 });
 
 test('a chain that is not a ring is fine', () => {
@@ -119,7 +127,8 @@ test('the singular helper must repeat helpers[0]', () => {
       { id: 'tower', wake: { helper: helper('nas', 'wake-tower'), helpers: [helper('pi', 'wake-tower')] } },
     ],
   });
-  assert.match(checkControllerDocument(diverging).errors.join(' '), /compatibility alias/);
+  assert.match(text(checkControllerDocument(diverging).errors), /compatibility alias/);
+  assert.deepEqual(codes(checkControllerDocument(diverging).errors), ['helper-alias']);
 
   const agreeing = document({
     machines: [
@@ -135,17 +144,19 @@ test('a machine cannot name a site nobody defined', () => {
     sites: [{ id: 'attic', lanPrefixes: ['10.0.0.'] }],
     machines: [{ id: 'tower', site: 'flat' }],
   }));
-  assert.match(errors.join(' '), /site "flat" is not in sites/);
+  assert.match(text(errors), /site "flat" is not in sites/);
+  assert.deepEqual(codes(errors), ['unknown-site']);
 });
 
 test('duplicate ids are refused wherever a route or a record would become ambiguous', () => {
-  assert.match(checkControllerDocument(document({ machines: [{ id: 'pi' }, { id: 'pi' }] })).errors.join(' '), /two machines share/);
-  assert.match(checkControllerDocument(document({
+  assert.match(text(checkControllerDocument(document({ machines: [{ id: 'pi' }, { id: 'pi' }] })).errors), /two machines share/);
+  assert.match(text(checkControllerDocument(document({
     machines: [{ id: 'pi', endpoints: [{ id: 'lan', host: 'a' }, { id: 'lan', host: 'b' }] }],
-  })).errors.join(' '), /two endpoints share/);
-  assert.match(checkControllerDocument(document({
+  })).errors), /two endpoints share/);
+  assert.match(text(checkControllerDocument(document({
     machines: [{ id: 'pi', systems: [{ id: 'linux' }, { id: 'linux' }] }],
-  })).errors.join(' '), /two systems share/);
+  })).errors), /two systems share/);
+  assert.match(text(checkControllerDocument(document({ sites: [{ id: 'home' }, { id: 'home' }] })).errors), /two sites share/);
 });
 
 // --- overlapping subnets ----------------------------------------------------
@@ -156,13 +167,13 @@ test('two sites may share a private subnet, and that is a warning, not an error'
   // longer identifies a site.
   const { errors, warnings } = checkControllerDocument(document({
     sites: [
-      { id: 'attic', lanPrefixes: ['192.168.178.'] },
-      { id: 'flat', lanPrefixes: ['192.168.178.'] },
+      { id: 'attic', lanPrefixes: ['192.168.50.'] },
+      { id: 'flat', lanPrefixes: ['192.168.50.'] },
     ],
     machines: [{ id: 'pi', site: 'attic' }, { id: 'tower', site: 'flat' }],
   }));
   assert.deepEqual(errors, []);
-  assert.match(warnings.join(' '), /does not say which site a device is on/);
+  assert.match(text(warnings), /does not say which site a device is on/);
 });
 
 test('a cross-site helper warns, because a router action is a legitimate one', () => {
@@ -174,21 +185,24 @@ test('a cross-site helper warns, because a router action is a legitimate one', (
     ],
   }));
   assert.deepEqual(errors, []);
-  assert.match(warnings.join(' '), /another way, such as a router or a VPN/);
+  assert.match(text(warnings), /another way, such as a router or a VPN/);
 });
 
 test('a helper that is not always on is worth saying out loud', () => {
   const { warnings } = checkControllerDocument(document({
     machines: [{ id: 'legion' }, { id: 'tower', wake: { helpers: [helper('legion', 'wake-tower')] } }],
   }));
-  assert.match(warnings.join(' '), /not marked alwaysOn/);
+  assert.match(text(warnings), /not marked alwaysOn/);
 });
 
 test('a machine that nothing can wake says so', () => {
+  // No site, no lanPrefix and no helper: no client can tell when it shares the
+  // machine's network, so direct wake is never tried and nothing else exists.
   const { warnings } = checkControllerDocument(document({
-    machines: [{ id: 'tower', wake: { mac: 'AA:BB:CC:DD:EE:FF' } }],
+    machines: [{ id: 'tower', wake: { mac: '02:00:00:00:00:01' } }],
   }));
-  assert.match(warnings.join(' '), /only be woken by a controller that happens to be on its LAN/);
+  assert.match(text(warnings), /nothing can wake it/);
+  assert.ok(codes(warnings).includes('wake-unplaced'));
 });
 
 // --- private bindings -------------------------------------------------------
@@ -201,7 +215,7 @@ test('bindings name where a key is, never what it is', () => {
     identityFile: '~/.ssh/legion-control_ed25519',
     knownHostsFile: '~/.config/legion-control/known_hosts',
     currentSite: 'flat',
-    machines: { legion: { identityFile: '~/.ssh/id_legion', sshAlias: 'legion-win-lan' } },
+    machines: { legion: { identityFile: '~/.ssh/id_legion', sshAlias: 'legion-windows-lan' } },
   }), []);
   // Nothing that could hold key material has a home here.
   for (const leak of [{ privateKey: 'x' }, { identity: 'ssh-ed25519 AAAA' }, { password: 'x' }]) {
@@ -219,4 +233,62 @@ test('there is no localAgent.shell', () => {
 
 test('an empty bindings file is valid: a device with none behaves as it did before', () => {
   assert.deepEqual(schemaErrors(BINDINGS_SCHEMA, {}), []);
+});
+
+// --- the guard grammars ----------------------------------------------------
+
+const guard = (name) => ({ $ref: `common.schema.json#/$defs/${name}` });
+
+test('a host is a name or an address, and nothing ssh or known_hosts reads as syntax', () => {
+  for (const host of ['desk-tower', 'desk-tower.local', 'desk-tower.example.net', 'my_alias', '192.0.2.10', '100.64.0.10', '2001:db8::10', '::1', '::ffff:192.0.2.1', 'desk-tower.local.']) {
+    assert.deepEqual(schemaErrors(guard('sshHostGuard'), host), [], host);
+  }
+  for (const host of ['', '-oProxyCommand=x', 'victim.example,*', '*.example', 'host name', 'host;id', '[::1]', 'ssh://h', 'me@h', 'desk-tower\n']) {
+    assert.ok(schemaErrors(guard('sshHostGuard'), host).length > 0, JSON.stringify(host));
+  }
+});
+
+test('a user is an account name, local or domain, and never syntax', () => {
+  for (const user of ['me', 'me.example', '_svc', 'me@example.net', 'AzureAD\\me', 'me 2', 'a']) {
+    assert.deepEqual(schemaErrors(guard('sshUser'), user), [], user);
+  }
+  for (const user of ['', '-o', 'me;id', 'me$(x)', "me'x", 'me  2', 'me -x', ' me', 'me ', 'me\\', 'me@', 'a'.repeat(65), 'mé', 'me\n']) {
+    assert.ok(schemaErrors(guard('sshUser'), user).length > 0, JSON.stringify(user));
+  }
+});
+
+test('an argv item is not empty and holds no control character', () => {
+  for (const item of ['node', '/home/me/.legion-control/bin/launcher.mjs', 'C:\\Program Files\\nodejs\\node.exe', 'naïve']) {
+    assert.deepEqual(schemaErrors(guard('agentArgItem'), item), [], item);
+  }
+  for (const item of ['', 'a\u0007b', 'a\nb', 'tab\there', 'del\u007f']) {
+    assert.ok(schemaErrors(guard('agentArgItem'), item).length > 0, JSON.stringify(item));
+  }
+  const tooManyBytes = { version: 1, machines: [{ id: 'tower', systems: [{ id: 'linux', agent: ['node', 'é'.repeat(2049)] }] }] };
+  assert.match(text(checkControllerDocument(tooManyBytes).errors), /4098 UTF-8 bytes/);
+  assert.deepEqual(codes(checkControllerDocument(tooManyBytes).errors), ['schema']);
+});
+
+test('a repository is owner/name, and . and .. are not names', () => {
+  for (const repo of ['x1f4r/legion-control', 'owner/name.js', 'a/b', 'Owner-1/.hidden']) {
+    assert.deepEqual(schemaErrors(guard('githubRepo'), repo), [], repo);
+  }
+  for (const repo of ['owner/..', 'owner/.', 'owner', '/name', 'owner/name/extra', '-owner/name', 'owner-/name', 'owner/na me']) {
+    assert.ok(schemaErrors(guard('githubRepo'), repo).length > 0, repo);
+  }
+});
+
+test('a launch path names one of the four places a launch value lives', () => {
+  for (const at of ['machines[tower].systems[linux]', 'machines[tower].ssh.identityFile', 'appUpdates.githubRepo', 'local', 'machines[a/b].systems[c:d]']) {
+    assert.deepEqual(schemaErrors(guard('launchPath'), at), [], at);
+  }
+  for (const at of ['machines.tower.systems.linux', 'machines[tower]', 'machines[].systems[linux]', 'local.agent', 'machines[tower].systems[linux].agent']) {
+    assert.ok(schemaErrors(guard('launchPath'), at).length > 0, at);
+  }
+});
+
+test('an empty agent is a system that is not driven, not a broken document', () => {
+  assert.deepEqual(schemaErrors(DOC_SCHEMA, document({ machines: [{ id: 'tower', systems: [{ id: 'linux', agent: [] }] }] })), []);
+  assert.ok(schemaErrors(DOC_SCHEMA, document({ machines: [{ id: 'tower', systems: [{ id: 'linux', agent: ['node', ''] }] }] })).length > 0);
+  assert.ok(schemaErrors(DOC_SCHEMA, document({ machines: [{ id: 'tower', ssh: { host: '-oProxyCommand=x' } }] })).length > 0);
 });

@@ -642,7 +642,8 @@ struct MachineSection: View {
                                send: { try await model.serviceConfig($0) })
             if AgentBundle.shared != nil {
                 Button("Install agent \(AgentBundle.shared?.version ?? "")") { afterSheet { model.installBundledAgent() } }
-                    .disabled(model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true || model.status?.isRestrictedSession == true)
+                    .disabled(model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true
+                              || model.status?.isRestrictedSession == true || model.legacyInstallRefusal != nil)
             } else {
                 Button("Install agent") { }
                     .disabled(true)
@@ -652,6 +653,8 @@ struct MachineSection: View {
 
         if AgentBundle.shared == nil {
             QuietNote(text: AgentBundle.unavailableReason).padding(.top, 12)
+        } else if let refusal = model.legacyInstallRefusal {
+            QuietNote(text: refusal).padding(.top, 12)
         }
 
         if let doctor = model.doctor {

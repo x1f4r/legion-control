@@ -21,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.x1f4r.legioncontrol.agent.AgentDeploymentPath
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.TrackedState
@@ -96,7 +97,7 @@ fun MachineSection(model: MachineModel, app: AppModel) {
     servicePage?.let { page -> DetailSheet(page.name, { servicePage = null }) { ServiceSection(model, page) } }
     sheet?.let { title -> DetailSheet(title, { sheet = null }) {
         when (title) {
-            "Authorize this device" -> AuthorisationScreen(app.publicKey, model.machine.systems, model.statusDetail) { model.refreshNow() }
+            "Authorize this device" -> AuthorisationScreen(app.publicKey, model.machine.systems, model.statusDetail, keyChanged = app.keyChange != null) { model.refreshNow() }
             "Activity" -> OperationsBlock(model)
             "Diagnostics" -> DiagnosticsBlock(model)
             "Telemetry" -> ConfiguredMetricsBlock(model.status?.metrics.orEmpty())
@@ -151,6 +152,7 @@ private fun compactMachineState(model: MachineModel): String = when (val state =
     is LinkState.NeedsKeyAuthorisation -> "SSH key needs authorization"
     is LinkState.Unsettled -> "Outcome unconfirmed"
     is LinkState.Misconfigured -> "Setup needs attention"
+    is LinkState.PhoneKeyUnavailable -> "This phone's key could not be read"
     is LinkState.Offline -> "Not reachable"
     LinkState.Unknown -> "Checking…"
 }
@@ -179,22 +181,28 @@ private fun AgentDetailsDialog(model: MachineModel, app: AppModel, onDismiss: ()
         text = {
             Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
                 DetailRow("Version") { VersionText(model.abilities.agentVersion, "not known") }
-                if (model.abilities.contract > 0) QuietText("Protocol contract ${model.abilities.contract}.")
-                if (!model.speaksV3 && model.abilities.contract > 0) {
+                val contract = model.abilities.contract?.takeIf { it > 0 }
+                if (contract != null) QuietText("Protocol contract $contract.")
+                if (!model.speaksV3 && contract != null) {
                     ExplanationText("Agent ${Contract.REQUIRED} is required for durable changes, policies and shared setup editing.")
                 }
                 if (model.status?.agent?.restrictedSession == true) {
                     ExplanationText("This connection uses a restricted SSH key. Editing service setup requires an administrator SSH key.")
                 }
                 val version = app.agentBundleVersion
+                val unavailable = model.agentDeployment as? AgentDeploymentPath.Unavailable
                 Actions {
                     PlainAction(
                         label = version?.let { "Install agent $it" } ?: "Install agent",
-                        enabled = version != null && !model.isWorking,
-                        emphasis = version != null,
+                        enabled = version != null && unavailable == null && !model.isWorking,
+                        emphasis = version != null && unavailable == null,
                     ) { if (version != null) { onDismiss(); model.requestAgentInstall(version) } }
                 }
-                if (version == null) QuietText(app.agentBundleProblem ?: "This build has no signed agent bundle to install.")
+                if (version == null) {
+                    QuietText(app.agentBundleProblem ?: "This build has no signed agent bundle to install.")
+                } else if (unavailable != null) {
+                    QuietText(unavailable.reason)
+                }
             }
         },
         confirmButton = { androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Close") } },
@@ -494,6 +502,9 @@ private fun RunningNow(model: MachineModel) {
 
                 state is LinkState.Misconfigured ->
                     StatusLine(Mark.Bad, "This machine's setup cannot be used to reach it")
+
+                state is LinkState.PhoneKeyUnavailable ->
+                    StatusLine(Mark.Attention, "This phone's key could not be read, so nothing was sent")
 
                 state is LinkState.Offline -> StatusLine(Mark.Attention, "Asleep or unreachable")
 

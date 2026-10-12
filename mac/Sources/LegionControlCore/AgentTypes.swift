@@ -668,6 +668,10 @@ struct SystemDescriptor: Sendable, Equatable, Identifiable {
             return SystemDescriptor(unknownId: id, platform: status.platform)
         }
         // Nothing was said at all, so the command shape that worked is the only evidence there is.
-        return SystemDescriptor(fallback)
+        // It is read against the entry as it is now: a read that was out while the entry was edited
+        // went with the launcher the entry had then, and a system the entry has dropped since can
+        // still be drawn but not commanded.
+        if let configured = machine.system(id: fallback.id) { return SystemDescriptor(configured) }
+        return SystemDescriptor(unknownId: fallback.id, platform: status.platform)
     }
 }

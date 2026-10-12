@@ -1,0 +1,15 @@
+{
+  "ok": false,
+  "contract": 3,
+  "agentVersion": "3.1.0",
+  "system": {
+    "id": "linux",
+    "name": "Raspberry Pi OS"
+  },
+  "reasonCode": "not-configured",
+  "message": "no operation 11111111-2222-4333-8444-555555555555 on this machine; it either never arrived or has been pruned",
+  "outcome": "failed",
+  "command": "cancel",
+  "argument": "11111111-2222-4333-8444-555555555555",
+  "error": "no operation 11111111-2222-4333-8444-555555555555 on this machine"
+}

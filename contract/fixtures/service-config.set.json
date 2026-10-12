@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -19,5 +19,6 @@
   },
   "warnings": [],
   "saved": true,
-  "message": "Agent configuration saved. No setup or service command was executed."
+  "message": "Agent configuration saved. No setup or service command was executed.",
+  "outcome": "succeeded"
 }

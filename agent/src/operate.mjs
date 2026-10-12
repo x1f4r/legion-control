@@ -12,9 +12,11 @@
 //   ok, action, reasonCode, message, opId, op
 //
 // where `op` is the record summary and `action` is one of the values the
-// contract lists for that kind.
+// contract lists for that kind. The one exception is an --op id that already
+// names a different request: nothing was attempted, so there is no action, and
+// the reply carries `refusal` for the caller to answer in the refusal shape.
 
-import { REASON } from './contract.mjs';
+import { MUTATING_PHASES, REASON } from './contract.mjs';
 import { acquireOperationLock, acquireServiceLock } from './lock.mjs';
 import { log } from './log.mjs';
 import {
@@ -95,14 +97,16 @@ export async function withOperation(options, body) {
       queueRequested: false,
     });
 
+    // An id bound to another intent is a bad --op argument. It is never a
+    // replay, and never a lock conflict either: `conflict` tells a client to
+    // try the same request later, and this request can never succeed.
     if (opened.conflict) {
       return {
         ok: false,
-        action: 'conflict',
-        reasonCode: opened.reasonCode ?? REASON.badArgument,
-        opId: id,
-        op: summarize(opened.record),
+        reasonCode: REASON.badArgument,
+        opId: null,
         message: opened.error,
+        refusal: { command: kind, argument: '--op' },
       };
     }
     if (!opened.ok) {
@@ -131,13 +135,16 @@ export async function withOperation(options, body) {
           replayed: true,
         };
       }
+      // Still running: the client follows it exactly as it follows `accepted`,
+      // but `accepted` would claim this request started something.
       return {
         ok: true,
-        action: 'accepted',
+        action: 'already-running',
         reasonCode: REASON.alreadyRunning,
         opId: record.id,
         op: summarize(record),
         replayed: true,
+        detached: record.detached === true,
         message: `operation ${record.id} is already ${record.state}${record.phase ? ` (${record.phase})` : ''}; it was not started a second time`,
       };
     }
@@ -193,7 +200,11 @@ export async function withOperation(options, body) {
   } catch (err) {
     const message = err?.stack ? String(err.stack).split('\n')[0] : String(err?.message ?? err);
     log(`${kind} threw: ${message}`, kind);
-    const result = { ok: false, action: 'failed', reasonCode: REASON.internal, message };
+    // A body that threw once it was changing the machine left it in a state
+    // nobody observed. Its failure is reported as unknown, so a client checks
+    // again rather than sending the same work a second time.
+    const changing = MUTATING_PHASES.has(readOperation(id)?.phase);
+    const result = { ok: false, action: 'failed', reasonCode: REASON.internal, message, ...(changing ? { outcome: 'unknown' } : {}) };
     const finished = finishOperation(id, result);
     return { ...result, opId: id, op: summarize(finished) };
   } finally {

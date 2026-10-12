@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.0.0",
+  "agentVersion": "3.1.0",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -17,7 +17,7 @@
     "initiator": {
       "client": "phone",
       "device": "pixel-8",
-      "user": "x1f4r"
+      "user": "me"
     },
     "state": "queued",
     "phase": "queued",
@@ -36,7 +36,8 @@
         "line": "queued until idle, expires in 4h"
       }
     ],
-    "agentVersion": "3.0.0",
-    "systemId": "linux"
+    "agentVersion": "3.1.0",
+    "systemId": "linux",
+    "outcome": "pending"
   }
 }

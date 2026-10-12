@@ -17,6 +17,16 @@ const read = (name, fallback = '') => {
 const write = (name, value) => fs.writeFileSync(file(name), String(value));
 const bump = (name) => write(name, Number(read(name, '0')) + 1);
 
+/**
+ * Asleep, not spinning, for as long as the named file is there. A test that
+ * fails before removing it throws its home away, and the file with it; the
+ * deadline is for whatever outlives even that.
+ */
+async function heldWhile(name) {
+  const deadline = Date.now() + 120000;
+  while (fs.existsSync(file(name)) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
 switch (verb) {
   case 'installed':
     if (read('installed-unreadable') === 'on') process.exit(1);
@@ -27,6 +37,10 @@ switch (verb) {
     process.stdout.write(read('latest', '1.0.0'));
     break;
   case 'update':
+    // Held at update-gate, so a test can ask about an update in its running
+    // phase for as long as it needs to, however slowly each launch of the
+    // agent that does the asking starts.
+    await heldWhile('update-gate');
     bump('update-runs');
     if (read('update-noop') === 'on') break;
     if (read('update-fail') === 'on') process.exit(3);

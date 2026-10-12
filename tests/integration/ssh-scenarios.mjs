@@ -166,10 +166,10 @@ try {
     const make = (revision, lineage, name, siteName = 'Test site') => ({
       version: 1,
       controller: { id: setupId, name: 'Integration setup', revision, lineage, source: 'cli', device: 'Integration controller', updatedAt: new Date().toISOString() },
-      sites: [{ id: 'test-site', name: siteName, lanPrefixes: ['192.168.178.'], broadcast: ['192.168.178.255'] }],
+      sites: [{ id: 'test-site', name: siteName, lanPrefixes: ['192.168.50.'], broadcast: ['192.168.50.255'] }],
       machines: [{
         id: 'pi', name, site: 'test-site', alwaysOn: true,
-        endpoints: [{ id: 'pi-ssh', kind: 'remote', host: '192.168.178.56', port: 22, user: 'x1f4r', system: 'pi' }],
+        endpoints: [{ id: 'pi-ssh', kind: 'remote', host: '192.168.50.56', port: 22, user: 'me', system: 'pi' }],
         systems: [{ id: 'pi', name: 'Pi test system', platform: 'linux', agent: [node, agentPath] }]
       }]
     });
