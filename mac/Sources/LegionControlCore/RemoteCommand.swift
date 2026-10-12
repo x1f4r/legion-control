@@ -89,6 +89,9 @@ enum CommandGrammar: String, Sendable, Equatable, CaseIterable {
                 if zip(scalars, scalars.dropFirst()).contains(where: { $0 == " " && $1 == " " }) {
                     throw refusal("double-space")
                 }
+                // PowerShell reads --% as its stop-parsing token even quoted, and passes everything
+                // after it on unquoted.
+                if value == "--%" { throw refusal("stop-parsing") }
                 // PowerShell's tokenizer reads U+2018 to U+201B as single quotes too. Doubling only
                 // U+0027 left a typographic quote free to end the string early.
                 var token = String.UnicodeScalarView()
@@ -202,6 +205,8 @@ struct CommandLineRefusal: Error, Sendable, Equatable {
             return "\(element) ends in a backslash, which PowerShell passes on mangled."
         case "double-space":
             return "\(element) contains two spaces in a row, which PowerShell passes on as one."
+        case "stop-parsing":
+            return "\(element) is --%, which PowerShell reads as an instruction to stop quoting."
         case "too-many-arguments":
             return "The command has more than 64 arguments, more than the restricted dispatcher takes."
         case "argument-too-long":

@@ -1640,7 +1640,7 @@
       },
       {
         "name": "powershell-stop-parsing",
-        "purpose": "The stop-parsing token only works bare; quoted it is an ordinary argument.",
+        "purpose": "PowerShell treats --% as its stop-parsing token even quoted, so every later argument would arrive unquoted; it is refused.",
         "consumers": [
           "mac",
           "desktop",
@@ -1655,9 +1655,9 @@
           ]
         },
         "expect": {
-          "line": "& 'node' '--%'",
-          "refusal": null,
-          "index": null
+          "line": null,
+          "refusal": "stop-parsing",
+          "index": 1
         }
       },
       {

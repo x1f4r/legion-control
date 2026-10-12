@@ -149,6 +149,8 @@ fun buildRemoteCommand(grammar: RemoteShell, argv: List<String>): String {
                 if ('"' in value) refuse("double-quote")
                 if (value.endsWith('\\')) refuse("trailing-backslash")
                 if ("  " in value) refuse("double-space")
+                // PowerShell reads --% as its stop-parsing token even quoted.
+                if (value == "--%") refuse("stop-parsing")
                 "'" + POWERSHELL_QUOTE.replace(value) { it.value + it.value } + "'"
             }
         }
@@ -198,6 +200,7 @@ internal fun describeRefusal(code: String, argument: String?): String {
         "trailing-backslash" ->
             "$what ends in a backslash, which PowerShell passes on wrongly to the program it runs."
         "double-space" -> "$what has two spaces in a row, which PowerShell passes on as one."
+        "stop-parsing" -> "$what is --%, which PowerShell reads as an instruction to stop quoting."
         "too-many-arguments" -> "The command has more arguments than the restricted dispatcher takes."
         "argument-too-long" -> "$what is longer than the restricted dispatcher takes."
         "line-too-long" -> "The command line is longer than the restricted dispatcher takes."

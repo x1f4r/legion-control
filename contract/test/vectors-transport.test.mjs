@@ -109,7 +109,7 @@ test('every refusal a grammar can give is pinned by a command line', () => {
   const pinned = new Set(group('commandLines').map((entry) => entry.expect.refusal).filter(Boolean));
   assert.deepEqual([...pinned].sort(), [
     'argument-too-long', 'control-character', 'double-quote', 'double-space', 'empty-argument', 'exclamation',
-    'line-too-long', 'no-command', 'percent', 'posix-backslash', 'too-many-arguments', 'trailing-backslash',
+    'line-too-long', 'no-command', 'percent', 'posix-backslash', 'stop-parsing', 'too-many-arguments', 'trailing-backslash',
   ]);
   for (const grammarName of ['posix', 'dispatch', 'cmd', 'powershell']) {
     assert.ok(group('commandLines').some((entry) => entry.input.grammar === grammarName && entry.expect.line !== null), grammarName);
@@ -212,7 +212,7 @@ test('a cmd or PowerShell line either refuses an element or quotes every element
       else assert.ok(['double-quote', 'percent', 'exclamation'].includes(cmd.refusal), cmd.refusal);
       const powershell = serialize('powershell', ['node', `${a}${b}`]);
       if (powershell.line !== null) assert.ok(powershell.line.startsWith("& 'node' "), powershell.line);
-      else assert.ok(['double-quote', 'trailing-backslash', 'double-space'].includes(powershell.refusal), powershell.refusal);
+      else assert.ok(['double-quote', 'trailing-backslash', 'double-space', 'stop-parsing'].includes(powershell.refusal), powershell.refusal);
     }
   }
 });

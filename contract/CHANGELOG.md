@@ -262,7 +262,9 @@ not, the agent now answers as they say.
 - `contract/test/transport-shells.test.mjs` runs serialised lines through sh,
   dash, bash, zsh, ksh and fish, and on Windows through cmd.exe, Windows
   PowerShell and pwsh, and checks that node receives exactly the argv. A shell
-  that is not installed is skipped with the reason.
+  that is not installed is skipped with the reason. Run through pwsh, it showed
+  that PowerShell takes `--%` as its stop-parsing token even quoted, so the
+  powershell grammar refuses that element (`stop-parsing`).
 
 ---
 

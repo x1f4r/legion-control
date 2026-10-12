@@ -37,7 +37,7 @@ const SHARED = [
 const PAYLOAD = {
   posix: [...SHARED, '=x', 'double  space', "''", '"double"', '`id`', '&', '!', '%PATH%', 'a\\b', '@scope/pkg', 'x,y:z+w'],
   cmd: [...SHARED, 'double  space', 'a&b|c<d>e^f', 'C:\\stage dir\\', 'trail\\\\', '@(1)'],
-  powershell: [...SHARED, '$env:USERPROFILE', '--%', '@(1)', '$(1+1)', '`n', '&', 'a\\b', '\u201aand\u201b', "''"],
+  powershell: [...SHARED, '$env:USERPROFILE', '@(1)', '$(1+1)', '`n', '&', 'a\\b', '\u201aand\u201b', "''"],
 };
 
 // Every argv the vectors pin for a grammar is sent through it as well.

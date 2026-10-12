@@ -57,6 +57,7 @@ public sealed class CommandLineRefusal(string code, int? index = null) : Excepti
             "exclamation" => $"{element} contains !, which cmd can expand even inside quotes.",
             "trailing-backslash" => $"{element} ends in a backslash, which PowerShell passes on as an escape.",
             "double-space" => $"{element} contains two spaces in a row, which PowerShell does not pass on intact.",
+            "stop-parsing" => $"{element} is --%, which PowerShell reads as an instruction to stop quoting.",
             _ => $"{element} cannot be sent ({code}).",
         } + " Nothing was sent.";
     }
@@ -166,6 +167,8 @@ public static class RemoteShells
                     if (value.Contains('"')) throw new CommandLineRefusal("double-quote", index);
                     if (value.EndsWith('\\')) throw new CommandLineRefusal("trailing-backslash", index);
                     if (value.Contains("  ", StringComparison.Ordinal)) throw new CommandLineRefusal("double-space", index);
+                    // PowerShell reads --% as its stop-parsing token even quoted.
+                    if (value == "--%") throw new CommandLineRefusal("stop-parsing", index);
                     tokens.Add("'" + PowerShellQuote.Replace(value, quote => quote.Value + quote.Value) + "'");
                     break;
                 default:

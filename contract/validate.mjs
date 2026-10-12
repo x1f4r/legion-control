@@ -1601,6 +1601,7 @@ const ELEMENT_REFUSALS = {
   exclamation: (value) => value.includes('!'),
   'trailing-backslash': (value) => value.endsWith('\\'),
   'double-space': (value) => value.includes('  '),
+  'stop-parsing': (value) => value === '--%',
 };
 
 function checkCommandLine(where, entry) {

@@ -102,7 +102,7 @@
           "properties": {
             "line": { "type": ["string", "null"] },
             "refusal": {
-              "enum": [null, "no-command", "empty-argument", "control-character", "posix-backslash", "too-many-arguments", "argument-too-long", "line-too-long", "double-quote", "percent", "exclamation", "trailing-backslash", "double-space"]
+              "enum": [null, "no-command", "empty-argument", "control-character", "posix-backslash", "too-many-arguments", "argument-too-long", "line-too-long", "double-quote", "percent", "exclamation", "trailing-backslash", "stop-parsing", "double-space"]
             },
             "index": { "type": ["integer", "null"], "minimum": 0 }
           },

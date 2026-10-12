@@ -65,7 +65,8 @@ export function resolveGrammar({ platform, shell, restricted, restrictedSession 
  * element and refuses what cmd expands even inside quotes (`%`, `!`) or cannot
  * carry at all (`"`); the `@` prefix makes the line survive whether sshd wrapped
  * it in quotes or not. powershell refuses what its native-argument passing
- * mangles: an embedded `"`, a trailing backslash, two spaces in a row.
+ * mangles: an embedded `"`, a trailing backslash, two spaces in a row, and the
+ * stop-parsing token `--%`.
  */
 export function serialize(grammar, argv) {
   if (!Array.isArray(argv) || argv.length === 0) return { line: null, refusal: 'no-command', index: null };
@@ -91,6 +92,11 @@ export function serialize(grammar, argv) {
       if (value.includes('"')) return refuse('double-quote');
       if (value.endsWith('\\')) return refuse('trailing-backslash');
       if (value.includes('  ')) return refuse('double-space');
+      // PowerShell takes --% as its stop-parsing token even written as the
+      // literal '--%': every argument after it then reaches the program unquoted
+      // and split on its spaces. pwsh on CI showed it; there is no spelling that
+      // passes it through, so it is refused like the other things it mangles.
+      if (value === '--%') return refuse('stop-parsing');
       tokens.push(`'${value.replace(PS_QUOTE, (q) => q + q)}'`);
     } else return { line: null, refusal: 'unknown-shell', index: null };
   }

@@ -159,9 +159,9 @@ class RemoteShellTest {
     fun `powershell doubles every character its tokenizer reads as a single quote`() {
         // T11 and A12: U+2018 to U+201B end a single-quoted string in PowerShell exactly as ' does.
         // Doubling only the ASCII one left a typographic quote free to end the string early.
-        val argv = listOf("node", "it's", "\u2018a\u2019\u201ab\u201b", "\$env:USERPROFILE", "--%")
+        val argv = listOf("node", "it's", "\u2018a\u2019\u201ab\u201b", "\$env:USERPROFILE")
         val line = buildRemoteCommand(RemoteShell.POWERSHELL, argv)
-        assertEquals("& 'node' 'it''s' '\u2018\u2018a\u2019\u2019\u201a\u201ab\u201b\u201b' '\$env:USERPROFILE' '--%'", line)
+        assertEquals("& 'node' 'it''s' '\u2018\u2018a\u2019\u2019\u201a\u201ab\u201b\u201b' '\$env:USERPROFILE'", line)
         assertEquals(argv, readPowerShell(line))
     }
 
@@ -171,6 +171,8 @@ class RemoteShellTest {
         assertRefused("control-character", 1) { buildRemoteCommand(RemoteShell.CMD, listOf("node", "a\nb")) }
         assertRefused("posix-backslash", 1) { buildRemoteCommand(RemoteShell.POSIX, listOf("node", "a\\")) }
         assertRefused("trailing-backslash", 1) { buildRemoteCommand(RemoteShell.POWERSHELL, listOf("node", "C:\\dir\\")) }
+        // PowerShell reads --% as its stop-parsing token even quoted, so it cannot be sent at all.
+        assertRefused("stop-parsing", 1) { buildRemoteCommand(RemoteShell.POWERSHELL, listOf("node", "--%")) }
         assertRefused("no-command", null) { buildRemoteCommand(RemoteShell.POSIX, emptyList()) }
         assertRefused("too-many-arguments", null) {
             buildRemoteCommand(RemoteShell.DISPATCH, List(65) { "a$it" })
