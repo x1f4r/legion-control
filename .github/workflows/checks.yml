@@ -39,6 +39,10 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: android-actions/setup-android@v3
+        with:
+          # The runner's command-line tools no longer offer the legacy "tools" package the
+          # action asks for by default, and sdkmanager then fails the job before Gradle starts.
+          packages: platform-tools
       - run: bash scripts/check.sh android
   desktop:
     name: Desktop (${{ matrix.os }})
