@@ -10,3 +10,8 @@ contract/bootstrap/*.cjs text eol=lf
 tests/fixtures/trust/manifest.json -text
 # The read-reply fixture reports the exact byte count of this setup document.
 contract/fixtures/controller-document.sites-helpers.json -text
+# Contract tests prove their checks work by planting known defects, matched as exact multi-line
+# snippets of the reference implementations, and several agent tests match source text the same
+# way. A Windows checkout with CRLF endings would make those snippets match nothing.
+*.mjs text eol=lf
+*.cjs text eol=lf
