@@ -120,3 +120,56 @@ enum Addresses {
         return halves.count == 2 ? count <= 7 : count == 8
     }
 }
+
+/// The guard grammar a setup document is held to before it is accepted at all
+/// (`contract/schemas/common.schema.json`: sshHostGuard, sshUser, agentArgItem, githubRepo).
+///
+/// This is the layer every client and the agent share: it refuses only what ssh, ssh-keyscan,
+/// known_hosts or a shell would read as syntax, so a document one peer accepts is accepted by all of
+/// them. `Addresses` above is the stricter, client-only question of what this device will dial.
+/// The patterns are the schema's, character for character; a line break is refused before any of
+/// them is applied, because `$` would otherwise also match just before a final newline.
+enum SetupGuard {
+    private static let host = pattern(#"^(?:[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*(?:%[A-Za-z0-9._-]{1,32})?)$"#)
+    private static let user = pattern(#"^(?=[^\n]{1,64}$)(?!.* [ -])[A-Za-z0-9_](?:[A-Za-z0-9._@\\ -]*[A-Za-z0-9._-])?$"#)
+    private static let repository = pattern(#"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/(?!\.\.?$)[A-Za-z0-9._-]{1,100}$"#)
+
+    static func isHost(_ value: String) -> Bool {
+        (1...253).contains(value.utf16.count) && matches(host, value)
+    }
+
+    static func isUser(_ value: String) -> Bool { matches(user, value) }
+
+    static func isRepository(_ value: String) -> Bool { matches(repository, value) }
+
+    /// One word of an agent argv: not empty, at most 4096 UTF-8 bytes, no control character.
+    static func isAgentArg(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 4096 else { return false }
+        return !value.unicodeScalars.contains { $0.value <= 0x1F || $0.value == 0x7F }
+    }
+
+    /// A value as a problem sentence can show it: quoted, control characters spelled out, and cut
+    /// short, so a hostile string cannot rewrite the message it appears in.
+    static func describe(_ value: String) -> String {
+        var shown = ""
+        for scalar in value.unicodeScalars.prefix(80) {
+            if scalar.value <= 0x1F || scalar.value == 0x7F {
+                shown += String(format: "\\u{%02X}", scalar.value)
+            } else {
+                shown.unicodeScalars.append(scalar)
+            }
+        }
+        return "\"\(shown)\(value.unicodeScalars.count > 80 ? "…" : "")\""
+    }
+
+    private static func matches(_ regex: NSRegularExpression, _ value: String) -> Bool {
+        if value.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) { return false }
+        let whole = NSRange(value.startIndex..., in: value)
+        return regex.firstMatch(in: value, options: [], range: whole)?.range == whole
+    }
+
+    private static func pattern(_ text: String) -> NSRegularExpression {
+        // A pattern that does not compile is a programming error caught by the first test run.
+        try! NSRegularExpression(pattern: text)
+    }
+}

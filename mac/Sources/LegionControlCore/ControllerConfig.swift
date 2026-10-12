@@ -560,6 +560,19 @@ extension ControllerConfig {
             guard seenMachines.insert(machine.id).inserted else {
                 throw ConfigProblem("Two machines share the id \"\(machine.id)\". Ids have to be unique.")
             }
+            // Addresses and login names arrive from peers and reach ssh, ssh-keyscan and known_hosts,
+            // which read commas, stars, leading hyphens and shell syntax as instructions. The shared
+            // schema's guard grammar is what every client and the agent hold a document to.
+            for (host, user) in machine.endpoints.map({ ($0.host, $0.user) })
+                + (machine.ssh.map { [($0.host, $0.user)] } ?? []) {
+                guard SetupGuard.isHost(host) else {
+                    throw ConfigProblem("Machine \"\(machine.id)\" has the address \(SetupGuard.describe(host)), which is not a host name or IP address.")
+                }
+                if let user, !SetupGuard.isUser(user) {
+                    throw ConfigProblem("Machine \"\(machine.id)\" has the login name \(SetupGuard.describe(user)), which is not one ssh can be given safely.")
+                }
+            }
+
             // A machine with no systems, or with no address, is not a broken document: the shared
             // schema allows both, and refusing one would mean this device could not carry a setup
             // another peer considers perfectly valid. Such a machine is drawn as one nothing can be
@@ -575,6 +588,11 @@ extension ControllerConfig {
                 }
                 guard !system.agent.isEmpty else {
                     throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" has no \"agent\" command. It has to be the argv to run over ssh.")
+                }
+                // The argv is run over ssh word by word, so an empty word or a control character in
+                // one is never something a person meant. The agent refuses the same items.
+                for item in system.agent where !SetupGuard.isAgentArg(item) {
+                    throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" has an \"agent\" word that is empty, too long or holds a control character (\(SetupGuard.describe(item))).")
                 }
                 // The shared schema allows exactly these three. Any other spelling used to stop the
                 // document decoding at all, and it is still refused, now with a sentence that says
@@ -620,6 +638,11 @@ extension ControllerConfig {
         // path that cannot start anywhere.
         if let cycle = wakeHelperCycle() {
             throw ConfigProblem("The wake helpers form a loop: \(cycle.joined(separator: " → ")). One of them has to be a machine that is already awake.")
+        }
+        // The release repository decides where this app downloads itself from, so it is held to
+        // the way GitHub spells owner/name rather than pasted into a URL as it came.
+        if let repo = appUpdates?.githubRepo, !repo.isEmpty, !SetupGuard.isRepository(repo) {
+            throw ConfigProblem("The update repository \(SetupGuard.describe(repo)) is not a GitHub owner/name.")
         }
         return self
     }
