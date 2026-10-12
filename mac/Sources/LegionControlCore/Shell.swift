@@ -396,41 +396,65 @@ private struct Pipes {
 /// Past the limit the stream is still read and the rest thrown away: a command blocked on a full
 /// pipe would never exit, and the watchdog would end up reporting a timeout for a command that had
 /// simply said too much.
+///
+/// Each stream has a thread of its own that polls the pipe. Reading through DispatchIO left the
+/// output to handlers on the global queues, which GCD runs only when it has a thread free for that
+/// priority; on a small machine busy with other work that could be never within the drain deadline,
+/// and a command that printed was reported as having printed nothing.
 private final class StreamReader: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
     private var truncated = false
+    private var stopping = false
     private let limit: Int
-    private let channel: DispatchIO
 
     init(fileDescriptor: Int32, limit: Int, group: DispatchGroup) {
         self.limit = limit
-        channel = DispatchIO(type: .stream, fileDescriptor: fileDescriptor,
-                             queue: .global(qos: .userInitiated)) { _ in close(fileDescriptor) }
-        channel.setLimit(lowWater: 1)
+        _ = fcntl(fileDescriptor, F_SETFL, fcntl(fileDescriptor, F_GETFL) | O_NONBLOCK)
         group.enter()
-        channel.read(offset: 0, length: Int.max, queue: .global(qos: .userInitiated)) { [self] done, chunk, _ in
-            if let chunk, !chunk.isEmpty { keep(chunk) }
-            if done {
-                channel.close()
+        Thread.detachNewThread { [self] in
+            defer {
+                close(fileDescriptor)
                 group.leave()
             }
-        }
-    }
-
-    private func keep(_ chunk: DispatchData) {
-        lock.withLock {
-            if data.count + chunk.count > limit { truncated = true }
-            chunk.enumerateBytes { bytes, _, stop in
-                let take = min(bytes.count, limit - data.count)
-                if take > 0, let base = bytes.baseAddress { data.append(base, count: take) }
-                if data.count >= limit { stop = true }
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            var poller = pollfd(fd: fileDescriptor, events: Int16(POLLIN), revents: 0)
+            while !lock.withLock({ stopping }) {
+                let ready = poll(&poller, 1, 50)
+                if ready < 0, errno != EINTR { return }
+                if ready <= 0 { continue }
+                if !drain(fileDescriptor, &buffer) { return }
             }
+            // Asked to stop: whatever is already in the pipe is still the command's output, so it is
+            // kept, and only what has not arrived yet is given up on.
+            _ = drain(fileDescriptor, &buffer)
         }
     }
 
-    /// Gives up on the rest: the read ends at once and the descriptor is closed.
-    func stop() { channel.close(flags: .stop) }
+    /// Reads until the pipe has nothing more for now. False once the stream has ended.
+    private func drain(_ fileDescriptor: Int32, _ buffer: inout [UInt8]) -> Bool {
+        while true {
+            let count = buffer.withUnsafeMutableBytes { read(fileDescriptor, $0.baseAddress, $0.count) }
+            if count > 0 {
+                keep(buffer, count: count)
+                continue
+            }
+            if count == 0 { return false }
+            if errno == EINTR { continue }
+            return errno == EAGAIN
+        }
+    }
+
+    private func keep(_ bytes: [UInt8], count: Int) {
+        lock.withLock {
+            let take = min(count, limit - data.count)
+            if take < count { truncated = true }
+            if take > 0 { data.append(contentsOf: bytes[0..<take]) }
+        }
+    }
+
+    /// Gives up on what has not arrived yet; the thread closes the descriptor as it leaves.
+    func stop() { lock.withLock { stopping = true } }
 
     func collected() -> (data: Data, truncated: Bool) {
         lock.withLock { (data, truncated) }
@@ -439,7 +463,8 @@ private final class StreamReader: @unchecked Sendable {
 
 /// Writes a command's standard input and then closes it, so the command sees the end of it.
 private final class StreamWriter: @unchecked Sendable {
-    private let channel: DispatchIO
+    private let lock = NSLock()
+    private var stopping = false
 
     init(fileDescriptor: Int32, data: Data) {
         // A command that exits without reading its input leaves this writing into a broken pipe,
@@ -447,18 +472,33 @@ private final class StreamWriter: @unchecked Sendable {
         // error instead of the signal keeps it that way: the default disposition of SIGPIPE would
         // take the whole app down with it.
         _ = fcntl(fileDescriptor, F_SETNOSIGPIPE, 1)
-        let channel = DispatchIO(type: .stream, fileDescriptor: fileDescriptor,
-                                 queue: .global(qos: .userInitiated)) { _ in close(fileDescriptor) }
-        let payload = data.withUnsafeBytes { DispatchData(bytes: $0) }
-        channel.write(offset: 0, data: payload, queue: .global(qos: .userInitiated)) { done, _, _ in
-            if done { channel.close() }
+        _ = fcntl(fileDescriptor, F_SETFL, fcntl(fileDescriptor, F_GETFL) | O_NONBLOCK)
+        // Its own thread for the same reason as the readers: a document larger than the pipe
+        // buffer is only written while the command reads it, and that must not wait on GCD.
+        Thread.detachNewThread { [self] in
+            defer { close(fileDescriptor) }
+            data.withUnsafeBytes { (payload: UnsafeRawBufferPointer) in
+                guard let base = payload.baseAddress else { return }
+                var offset = 0
+                var poller = pollfd(fd: fileDescriptor, events: Int16(POLLOUT), revents: 0)
+                while offset < payload.count, !lock.withLock({ stopping }) {
+                    let ready = poll(&poller, 1, 50)
+                    if ready < 0, errno != EINTR { return }
+                    if ready <= 0 { continue }
+                    let written = write(fileDescriptor, base + offset, payload.count - offset)
+                    if written > 0 {
+                        offset += written
+                    } else if written < 0, errno != EAGAIN, errno != EINTR {
+                        return
+                    }
+                }
+            }
         }
-        self.channel = channel
     }
 
     /// The command is gone. Whatever it did not read is dropped rather than left waiting for a
     /// reader that will never come.
-    func stop() { channel.close(flags: .stop) }
+    func stop() { lock.withLock { stopping = true } }
 }
 
 /// The PATH the user's login shell sets up, which an app started from Finder or at login does not
