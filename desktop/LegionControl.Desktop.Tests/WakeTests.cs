@@ -580,8 +580,9 @@ public class WakeTests
     }
 
     /// pi's command to wake tower never reports how it ended: its run times out and its record
-    /// still says running. nas's command fails, so no walk waits for tower to answer.
-    private static FakeRunner HeldOnPi() => new(call =>
+    /// still says running. nas's command fails, so no walk waits for tower to answer. pi speaks
+    /// [piContract], and a 2.x pi keeps no records to read.
+    private static FakeRunner HeldOnPi(int piContract = 3) => new(call =>
     {
         if (To(call, "tower")) return Unreachable("tower.example");
         if (To(call, "pi") && call.RemoteCommand.Contains("run wake-tower")) return FakeRunner.TimedOutResult();
@@ -592,7 +593,7 @@ public class WakeTests
         }
         if (call.RemoteCommand.Contains("run wake-tower"))
             return FakeRunner.Ok("""{ "ok": false, "contract": 3, "action": "failed", "reasonCode": "apply-failed", "outcome": "failed" }""");
-        return FakeRunner.Ok(Status("command"));
+        return FakeRunner.Ok(Status("command", To(call, "pi") ? piContract : 3));
     });
 
     /// The fleet with pi as tower's only helper.
@@ -627,7 +628,15 @@ public class WakeTests
         Assert.Equal((1, 0), (Runs(runner, "pi"), Runs(runner, "nas")));
         Assert.Equal(reads + 1, runner.Calls.Count(call => To(call, "pi") && call.RemoteCommand.Contains(" op ")));
 
-        var others = await app.WakeAsync(tower, tryOtherHelpers: true);
+        // With nas there to ask, running pi's command again is not the way past the hold.
+        Assert.Null(app.PlanRunAgain(tower));
+        var refused = await app.WakeAsync(tower, HoldChoice.RunAgain);
+        Assert.False(refused.AnythingTried);
+        Assert.Contains("Another helper could be asked", refused.Sentence);
+        Assert.Equal((1, 0), (Runs(runner, "pi"), Runs(runner, "nas")));
+        Assert.Single(app.Tracker.WakeHoldsFor("tower"));
+
+        var others = await app.WakeAsync(tower, HoldChoice.OtherHelpers);
         Assert.Equal((1, 1), (Runs(runner, "pi"), Runs(runner, "nas")));
         Assert.Contains(others.Attempts, attempt => attempt.Contains("only the other helpers are asked"));
         Assert.Empty(app.Tracker.WakeHoldsFor("tower"));
@@ -655,7 +664,7 @@ public class WakeTests
         Assert.True(app.PlanWake(tower).IsHeld);
         Assert.Null(app.PlanOtherHelpers(tower));
 
-        var others = await app.WakeAsync(tower, tryOtherHelpers: true);
+        var others = await app.WakeAsync(tower, HoldChoice.OtherHelpers);
         Assert.False(others.AnythingTried);
         Assert.Contains("No other helper", others.Sentence);
         Assert.Single(app.Tracker.WakeHoldsFor("tower"));
@@ -665,6 +674,48 @@ public class WakeTests
         await app.WakeAsync(tower);
         Assert.Equal(1, Runs(runner, "pi"));
         Assert.Single(app.Tracker.WakeHoldsFor("tower"));
+    }
+
+    [Fact]
+    public async Task WithTheOnlyHelperHeldAPersonCanStillRunItsCommandAgain()
+    {
+        // A 2.x helper keeps no records, so short of tower answering or pi leaving the setup, a
+        // person is the only release its hold has. With no other helper to ask, that release is
+        // running pi's command again, said for what it is.
+        using var home = new TempHome();
+        var runner = HeldOnPi(piContract: 2);
+        using var app = Device(home, OnlyPi(), runner);
+        var tower = app.Machine("tower")!;
+
+        await app.WakeAsync(tower);
+        Assert.Equal(1, Runs(runner, "pi"));
+        var first = Assert.Single(app.Tracker.WakeHoldsFor("tower"));
+        Assert.Null(app.PlanOtherHelpers(tower));
+        var again = app.PlanRunAgain(tower);
+        Assert.NotNull(again);
+        Assert.Equal(new[] { "Pi" }, again.RunsAgain);
+        Assert.Equal("ask Pi to run wake-tower again", Assert.Single(again.Steps).Describe());
+        Assert.Equal("Run Pi's command again", WakePlanner.RunAgainLabel(again));
+        Assert.Contains("can run it a second time", WakePlanner.RunAgainWarning(again, tower.Name));
+
+        // An ordinary press still holds, and asks pi for no record it does not keep.
+        AMinuteLater(app.Machine("pi")!);
+        await app.WakeAsync(tower);
+        Assert.Equal(1, Runs(runner, "pi"));
+        Assert.DoesNotContain(runner.Calls, call => To(call, "pi") && call.RemoteCommand.Contains(" op "));
+
+        AMinuteLater(app.Machine("pi")!);
+        var report = await app.WakeAsync(tower, HoldChoice.RunAgain);
+        Assert.True(report.AnythingTried);
+        Assert.Equal(2, Runs(runner, "pi"));
+        // The first run is released, not forgotten. The second ended the same way, so it holds in
+        // its place, and the next ordinary press runs nothing.
+        Assert.False(app.Tracker.Find(first.Id)!.IsResolved);
+        var second = Assert.Single(app.Tracker.WakeHoldsFor("tower"));
+        Assert.NotEqual(first.Id, second.Id);
+        AMinuteLater(app.Machine("pi")!);
+        await app.WakeAsync(tower);
+        Assert.Equal(2, Runs(runner, "pi"));
     }
 
     /// One run of `--command wake --machine tower` with [flags] on the device of [home], started
@@ -694,6 +745,7 @@ public class WakeTests
         var (code, text) = await WakeFromTheCommandLine(home, runner);
         Assert.Equal(Runner.Failed, code);
         Assert.Contains("Add --try-other-helpers", text);
+        Assert.DoesNotContain("--run-held-again", text);
         Assert.Equal((1, 0), (Runs(runner, "pi"), Runs(runner, "nas")));
 
         // Asked for without --yes, it prints the walk it would make, which asks nas alone.
@@ -704,6 +756,13 @@ public class WakeTests
         Assert.DoesNotContain("Add --try-other-helpers", text);
         Assert.Single(HoldsOnDisk(home));
 
+        // While nas is there, running pi's command again is not the way past the hold.
+        (code, text) = await WakeFromTheCommandLine(home, runner, "--run-held-again", "--yes");
+        Assert.Equal(Runner.Failed, code);
+        Assert.Contains("Another helper could be asked", text);
+        Assert.Equal((1, 0), (Runs(runner, "pi"), Runs(runner, "nas")));
+        Assert.Single(HoldsOnDisk(home));
+
         (code, _) = await WakeFromTheCommandLine(home, runner, "--try-other-helpers", "--yes");
         Assert.Equal(Runner.NotKnown, code);
         Assert.Equal((1, 1), (Runs(runner, "pi"), Runs(runner, "nas")));
@@ -711,27 +770,49 @@ public class WakeTests
     }
 
     [Fact]
-    public async Task TheCommandLineTriesNoOtherHelperWhenTheHeldOneIsTheOnlyOne()
+    public async Task TheCommandLineRunsTheOnlyHeldCommandAgainOnlyWhenToldTo()
     {
         using var home = new TempHome();
-        var runner = HeldOnPi();
+        var runner = HeldOnPi(piContract: 2);
         Device(home, OnlyPi(), runner).Dispose();
 
         await WakeFromTheCommandLine(home, runner, "--yes");
         Assert.Equal(1, Runs(runner, "pi"));
         var first = Assert.Single(HoldsOnDisk(home));
 
-        // Held, with nobody else to ask: no word of other helpers.
+        // Held, with nobody else to ask: no word of other helpers, and the way past said for what
+        // it is.
         var (code, text) = await WakeFromTheCommandLine(home, runner);
         Assert.Equal(Runner.Failed, code);
         Assert.DoesNotContain("--try-other-helpers", text);
+        Assert.Contains("can run it a second time", text);
+        Assert.Contains("Add --run-held-again", text);
 
-        // Asking for them anyway walks nothing and says there is none.
+        // Asking for the other helpers walks nothing and says there is none.
         (code, text) = await WakeFromTheCommandLine(home, runner, "--try-other-helpers", "--yes");
         Assert.Equal(Runner.Failed, code);
         Assert.Contains("No other helper could be asked to wake Tower", text);
+        Assert.Contains("--run-held-again", text);
         Assert.Equal(1, Runs(runner, "pi"));
         Assert.Equal(first.Id, Assert.Single(HoldsOnDisk(home)).Id);
+
+        // Both at once is no choice at all.
+        (code, _) = await WakeFromTheCommandLine(home, runner, "--try-other-helpers", "--run-held-again", "--yes");
+        Assert.Equal(Runner.Failed, code);
+        Assert.Equal(1, Runs(runner, "pi"));
+
+        // Without --yes it prints the second run it would make, and makes none.
+        (code, text) = await WakeFromTheCommandLine(home, runner, "--run-held-again");
+        Assert.Equal(Runner.Ok, code);
+        Assert.StartsWith("1 way to try: ask Pi to run wake-tower again.", text);
+        Assert.Contains("can run it a second time", text);
+        Assert.Equal(1, Runs(runner, "pi"));
+        Assert.Equal(first.Id, Assert.Single(HoldsOnDisk(home)).Id);
+
+        (code, _) = await WakeFromTheCommandLine(home, runner, "--run-held-again", "--yes");
+        Assert.Equal(Runner.NotKnown, code);
+        Assert.Equal(2, Runs(runner, "pi"));
+        Assert.NotEqual(first.Id, Assert.Single(HoldsOnDisk(home)).Id);
     }
 
     [Fact]
@@ -749,6 +830,8 @@ public class WakeTests
         var unheld = WakePlanner.Plan(config, "tower", presence, ready, Array.Empty<WakeHold>());
         var others = WakePlanner.OtherHelpers(held, unheld, holds, "Tower");
         Assert.Equal(new[] { "nas" }, others!.Steps.Cast<WakeStep.ViaHelper>().Select(step => step.Helper.Machine));
+        // So running pi's command again is not the way past the hold.
+        Assert.Null(WakePlanner.RunAgain(held, unheld, holds, "Tower"));
 
         // A wol on nas runs while the hold stands, so going past the hold would add nobody.
         ready["nas"] = new(HelperReadiness.Ready, new Dictionary<string, string?> { ["wake-tower"] = "wol" });
@@ -756,6 +839,14 @@ public class WakeTests
         unheld = WakePlanner.Plan(config, "tower", presence, ready, Array.Empty<WakeHold>());
         Assert.Null(WakePlanner.OtherHelpers(held, unheld, holds, "Tower"));
         Assert.Null(WakePlanner.OtherHelpers(unheld, unheld, Array.Empty<WakeHold>(), "Tower"));
+
+        // Then the way past is running pi's command again, in its place in the plan, beside the
+        // wol that runs anyway.
+        var again = WakePlanner.RunAgain(held, unheld, holds, "Tower")!;
+        Assert.Equal(new[] { ("pi", true), ("nas", false) },
+            again.Steps.Cast<WakeStep.ViaHelper>().Select(step => (step.Helper.Machine, step.Again)));
+        Assert.Equal(new[] { "Pi" }, again.RunsAgain);
+        Assert.Null(WakePlanner.RunAgain(unheld, unheld, Array.Empty<WakeHold>(), "Tower"));
     }
 
     [Fact]

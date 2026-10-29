@@ -531,11 +531,13 @@ public sealed class MainWindow : Window
             foreach (var helperId in plan.OfferToWakeFirst)
                 if (_app.Machine(helperId) is { } helper)
                     wake.Add(Ui.MenuAction("Wake " + helper.Name + " first", () => Wake(helper)));
-            // Only a person lifts a hold: the command held may still be running on its helper. And
-            // only for another helper to ask: going past the only one would run nothing, and leave
-            // its command free to run again on the next press.
+            // Only a person lifts a hold: the command held may still be running on its helper. With
+            // another helper to ask, the way past is asking it. With none, it is running the held
+            // command again, after a question that says it may then run twice.
             if (plan.IsHeld && _app.PlanOtherHelpers(machine) is not null)
                 wake.Add(Ui.MenuAction("Try the other helpers", () => TryOtherHelpers(machine)));
+            else if (plan.IsHeld && _app.PlanRunAgain(machine) is { } again)
+                wake.Add(Ui.MenuAction(WakePlanner.RunAgainLabel(again), () => RunHeldAgain(machine, again)));
             wake.Add(Ui.MenuAction("Wake details", () => Sheets.Text(this, "Wake", plan.Sentence(machine.Name) + "\n" + string.Join("\n", plan.Obstacles))));
             items.Add(new MenuItem { Header = "Wake options", ItemsSource = wake });
         }
@@ -734,7 +736,19 @@ public sealed class MainWindow : Window
             $"A helper command run earlier to wake {machine.Name} has not reported how it ended, so it may still be running. Trying the other helpers runs their commands, and does not run that one again.",
             "Try them");
         if (!confirmed) return;
-        var report = await _app.WakeAsync(machine, tryOtherHelpers: true);
+        var report = await _app.WakeAsync(machine, HoldChoice.OtherHelpers);
+        Sheets.Text(this, $"Wake — {machine.Name}", string.Join("\n", report.Attempts.Append(report.Sentence)));
+    }
+
+    /// Runs a held helper command again when no other helper could be asked, after a question that
+    /// says the first run may still be going and this can make it two. Without it, a hold on a
+    /// helper that keeps no records would last until the machine answered.
+    private async void RunHeldAgain(MachineModel machine, WakePlan again)
+    {
+        var confirmed = await Sheets.AskAsync(this, $"{WakePlanner.RunAgainLabel(again)} for {machine.Name}?",
+            WakePlanner.RunAgainWarning(again, machine.Name), "Run it again");
+        if (!confirmed) return;
+        var report = await _app.WakeAsync(machine, HoldChoice.RunAgain);
         Sheets.Text(this, $"Wake — {machine.Name}", string.Join("\n", report.Attempts.Append(report.Sentence)));
     }
 

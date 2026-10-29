@@ -669,24 +669,52 @@ public static class Runner
     {
         var machine = Pick(app, line, output);
         if (machine is null) return Failed;
+        var tryOthers = line.Has("try-other-helpers");
+        var runAgain = line.Has("run-held-again");
+        if (tryOthers && runAgain)
+        {
+            output.WriteLine("--try-other-helpers and --run-held-again are two different choices. Give one of them.");
+            return Failed;
+        }
         await app.ReleaseWakeHoldsAsync(machine, token);
         var plan = app.PlanWake(machine, refreshPresence: true);
-        // --try-other-helpers goes past a hold only when another helper is there to ask. Past the
-        // only one, it would run nothing, and leave the held command free to run again later.
+        // There is one way past a hold at a time, and it is the one the window offers: with another
+        // helper to ask, asking it; with none, running the held command again. Asking the others
+        // past the only helper would run nothing, and leave the held command free to run again
+        // later without anyone having chosen that.
         var others = plan.IsHeld ? app.PlanOtherHelpers(machine) : null;
-        var goPast = line.Has("try-other-helpers") && others is not null;
-        var walked = goPast ? others! : plan;
+        var again = plan.IsHeld && others is null ? app.PlanRunAgain(machine) : null;
+        var choice = tryOthers && others is not null ? HoldChoice.OtherHelpers
+            : runAgain && again is not null ? HoldChoice.RunAgain
+            : HoldChoice.Stand;
+        var walked = choice switch
+        {
+            HoldChoice.OtherHelpers => others!,
+            HoldChoice.RunAgain => again!,
+            _ => plan,
+        };
         output.WriteLine(walked.Sentence(machine.Name));
         foreach (var obstacle in walked.Obstacles) output.WriteLine($"  {obstacle}");
         foreach (var offer in walked.OfferToWakeFirst) output.WriteLine($"  \"{offer}\" could be woken first, as a separate step.");
-        if (line.Has("try-other-helpers") && plan.IsHeld && others is null)
+        if (choice == HoldChoice.RunAgain) output.WriteLine($"  {WakePlanner.RunAgainWarning(again!, machine.Name)}");
+        if (choice == HoldChoice.Stand && others is not null)
         {
-            output.WriteLine($"  {WakePlanner.NoOtherHelper(machine.Name)}");
-            return Failed;
-        }
-        if (!goPast && others is not null)
-        {
+            if (runAgain)
+            {
+                output.WriteLine($"  {WakePlanner.OtherHelperFirst(machine.Name)} Add --try-other-helpers for that.");
+                return Failed;
+            }
             output.WriteLine("  A helper command run for it earlier may still be going. Add --try-other-helpers to run the other helpers' commands anyway.");
+        }
+        if (choice == HoldChoice.Stand && again is not null)
+        {
+            if (tryOthers)
+            {
+                output.WriteLine($"  {WakePlanner.NoOtherHelper(machine.Name)}");
+                output.WriteLine("  Add --run-held-again instead to run it again anyway, knowing it can then run twice.");
+                return Failed;
+            }
+            output.WriteLine($"  {WakePlanner.RunAgainWarning(again, machine.Name)} Add --run-held-again to run it again anyway.");
         }
         if (walked.IsEmpty) return Failed;
         if (!line.Has("yes"))
@@ -694,7 +722,7 @@ public static class Runner
             output.WriteLine("Add --yes to actually try it.");
             return Ok;
         }
-        var report = await app.WakeAsync(machine, tryOtherHelpers: goPast, cancellationToken: token);
+        var report = await app.WakeAsync(machine, choice, token);
         foreach (var attempt in report.Attempts) output.WriteLine($"  {attempt}");
         output.WriteLine(report.Sentence);
         return report.Confirmed ? Ok : NotKnown;
@@ -1229,6 +1257,8 @@ public static class Runner
           --command wake    --machine ID      what could wake it, in order; --yes to try
                             [--try-other-helpers]  run the other helpers' commands while one may
                                               still be running
+                            [--run-held-again]  with no other helper to ask, run the held one's
+                                              command again; it can then run twice
           --command trust   --machine ID [--route ID]  show the host keys; --accept to pin them
           --command edit    [--out FILE]      print or save the setup document
           --command bindings                  this device's own settings, which are never shared

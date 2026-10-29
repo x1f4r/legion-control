@@ -368,6 +368,18 @@ public sealed class AppModel : IDisposable
             : WakePlanner.OtherHelpers(Plan(target, holds), Plan(target, Array.Empty<WakeHold>()), holds, target.Name);
     }
 
+    /// What running the held commands for a machine again would walk, or null unless a hold keeps
+    /// a helper back and no other helper could be asked instead. Then running the held command a
+    /// second time is the one way a person has past the hold, which on a helper that keeps no
+    /// records would otherwise last until the machine answers.
+    public WakePlan? PlanRunAgain(MachineModel target)
+    {
+        var holds = WakeHoldsFor(target);
+        return holds.Count == 0
+            ? null
+            : WakePlanner.RunAgain(Plan(target, holds), Plan(target, Array.Empty<WakeHold>()), holds, target.Name);
+    }
+
     private WakePlan Plan(MachineModel target, IReadOnlyList<WakeHold> holds)
     {
         var machines = Machines;
@@ -409,22 +421,30 @@ public sealed class AppModel : IDisposable
     /// Wakes a machine and, when the document asks for a particular system and the machine came up
     /// as another one, offers the ordinary boot request for it.
     ///
-    /// [tryOtherHelpers] is a person's explicit decision to run the other helpers' commands while
-    /// one may still be running: it releases the holds for the machine that are still standing once
-    /// their records were read, and nothing else ever does that on their behalf. The helpers those
-    /// holds were on are not asked in this walk; the others are. When a hold keeps back no other
-    /// helper, nothing is walked and the hold stands: releasing it would ask nobody new, and leave
-    /// the held command free to run a second time on the next press.
+    /// [choice] is a person's explicit decision about the holds for the machine that are still
+    /// standing once their records were read, and nothing else ever makes one on their behalf.
+    /// Either way past releases those holds. [HoldChoice.OtherHelpers] runs the other helpers'
+    /// commands while one may still be running, and does not ask the helpers the holds were on in
+    /// this walk. When a hold keeps back no other helper, that walks nothing and the hold stands:
+    /// releasing it would ask nobody new, and leave the held command free to run a second time on
+    /// the next press without anyone having chosen that. [HoldChoice.RunAgain] is choosing exactly
+    /// that, and is taken only when no other helper could be asked instead.
     public async Task<WakeReport> WakeAsync(
-        MachineModel target, bool tryOtherHelpers = false, CancellationToken cancellationToken = default)
+        MachineModel target, HoldChoice choice = HoldChoice.Stand, CancellationToken cancellationToken = default)
     {
         await ReleaseWakeHoldsAsync(target, cancellationToken);
         var plan = PlanWake(target, refreshPresence: true);
-        if (tryOtherHelpers && plan.IsHeld)
+        if (choice != HoldChoice.Stand && plan.IsHeld)
         {
-            if (PlanOtherHelpers(target) is not { } others) return WakeReport.NothingToTry(WakePlanner.NoOtherHelper(target.Name));
+            var past = choice == HoldChoice.RunAgain ? PlanRunAgain(target) : PlanOtherHelpers(target);
+            if (past is null)
+            {
+                return WakeReport.NothingToTry(choice == HoldChoice.RunAgain
+                    ? WakePlanner.OtherHelperFirst(target.Name)
+                    : WakePlanner.NoOtherHelper(target.Name));
+            }
             Tracker.ReleaseWakeHolds(target.Id, DateTimeOffset.MaxValue);
-            plan = others;
+            plan = past;
         }
         var report = await new WakeRunner(Tracker).RunAsync(
             target, plan,

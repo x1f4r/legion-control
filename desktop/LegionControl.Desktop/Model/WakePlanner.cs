@@ -11,12 +11,17 @@ public abstract record WakeStep
     /// Send the packets from here. Only when this device is on the machine's network (section 10.1).
     public sealed record Direct(IReadOnlyList<string> Broadcast, IReadOnlyList<int> Ports, int Repeats) : WakeStep;
     /// Ask a machine that is on the target's network to send it. [ReadFirst] when this session has
-    /// no status of the helper to go by: it is read once just before its step.
-    public sealed record ViaHelper(WakeHelper Helper, string HelperName, bool ReadFirst) : WakeStep;
+    /// no status of the helper to go by: it is read once just before its step. [Again] when a hold
+    /// is on this very command and a person chose to run it a second time anyway.
+    public sealed record ViaHelper(WakeHelper Helper, string HelperName, bool ReadFirst) : WakeStep
+    {
+        public bool Again { get; init; }
+    }
 
     public string Describe() => this switch
     {
         Direct direct => $"send the packet from here to {string.Join(", ", direct.Broadcast)}",
+        ViaHelper { Again: true } helper => $"ask {helper.HelperName} to run {helper.Helper.Action} again",
         ViaHelper helper => $"ask {helper.HelperName} to run {helper.Helper.Action}",
         _ => "",
     };
@@ -100,6 +105,21 @@ public sealed record HelperState(HelperReadiness Readiness, IReadOnlyDictionary<
 /// still be going.
 public sealed record WakeHold(string Helper, string Action);
 
+/// What a person chose to do about the wake holds on a machine. Only a person ever chooses
+/// anything but [Stand]: a hold is the one thing that keeps a command from running twice, and
+/// every other release is evidence (contract section 10.2).
+public enum HoldChoice
+{
+    /// The holds stand, and the wake walks around them.
+    Stand,
+    /// Ask the helpers a hold keeps back other than the held ones. The held commands are not run
+    /// again in that walk, but their holds are released.
+    OtherHelpers,
+    /// With no other helper to ask, run the held commands again, knowing the first run may still
+    /// be going. A helper that keeps no records would otherwise hold until the machine answers.
+    RunAgain,
+}
+
 /// What could be tried, in order, and what could not (contract section 10.2).
 public sealed record WakePlan(
     IReadOnlyList<string> Matching,
@@ -115,6 +135,11 @@ public sealed record WakePlan(
 
     /// Whether a wake hold is what keeps a helper from running.
     public bool IsHeld => Skipped.Any(skip => skip.Reason == WakeSkip.Held);
+
+    /// The helpers whose command this plan runs a second time while the first run may still be
+    /// going, in plan order.
+    public IReadOnlyList<string> RunsAgain => Steps.OfType<WakeStep.ViaHelper>()
+        .Where(step => step.Again).Select(step => step.HelperName).Distinct().ToList();
 
     /// What to say when there is nothing to try. Never silence, and never a button that does
     /// nothing: a machine nobody can reach is a fact about the setup, and the setup is where it
@@ -246,8 +271,7 @@ public static class WakePlanner
     public static WakePlan Without(WakePlan plan, IReadOnlyList<WakeHold> passed, string targetName)
     {
         if (passed.Count == 0) return plan;
-        bool Passed(WakeStep step) => step is WakeStep.ViaHelper helper
-            && passed.Any(hold => hold.Helper == helper.Helper.Machine && hold.Action == helper.Helper.Action);
+        bool Passed(WakeStep step) => step is WakeStep.ViaHelper helper && IsHeldBy(helper, passed);
         var skipped = plan.Skipped.Concat(plan.Steps.Where(Passed).Cast<WakeStep.ViaHelper>().Select(step =>
             new WakeSkip("helper", step.Helper.Machine, step.Helper.Action, WakeSkip.Held,
                 $"{step.HelperName}'s {step.Helper.Action} was run for {targetName} earlier and may still be going, so only the other helpers are asked.")));
@@ -268,9 +292,46 @@ public static class WakePlanner
             : null;
     }
 
+    /// What a person running the held commands again walks: [unheld], the plan as if nothing were
+    /// held, with each step a hold is on marked as a second run. Null unless [held] skips a helper
+    /// for a hold and no other helper could be asked instead. With another one there, asking it is
+    /// the way past, and it frees the held command for the next press without running it twice now.
+    /// With none, this is the only way past: a hold on a helper that keeps no records is otherwise
+    /// released only by the machine answering or the helper leaving the setup.
+    public static WakePlan? RunAgain(WakePlan held, WakePlan unheld, IReadOnlyList<WakeHold> holds, string targetName)
+    {
+        if (!held.IsHeld || OtherHelpers(held, unheld, holds, targetName) is not null) return null;
+        return unheld with
+        {
+            Steps = unheld.Steps
+                .Select(step => step is WakeStep.ViaHelper helper && IsHeldBy(helper, holds) ? helper with { Again = true } : step)
+                .ToList(),
+        };
+    }
+
+    private static bool IsHeldBy(WakeStep.ViaHelper step, IReadOnlyList<WakeHold> holds) =>
+        holds.Any(hold => hold.Helper == step.Helper.Machine && hold.Action == step.Helper.Action);
+
     /// What to say when a person asks for the other helpers and there is none to ask.
     public static string NoOtherHelper(string targetName) =>
         $"No other helper could be asked to wake {targetName}. The helper command run for it earlier may still be going, so it is not run again, and its hold stands.";
+
+    /// What to say when a person asks to run a held command again while another helper could be
+    /// asked instead.
+    public static string OtherHelperFirst(string targetName) =>
+        $"Another helper could be asked to wake {targetName}, so the command held for it is not run again. Trying the other helpers releases its hold, and the next wake asks every helper.";
+
+    /// What running the held commands of [again], a plan from [RunAgain], is called where a person
+    /// chooses it.
+    public static string RunAgainLabel(WakePlan again) => again.RunsAgain is [var helper]
+        ? $"Run {helper}'s command again"
+        : "Run the held commands again";
+
+    /// What a person is told before running the held commands of [again]: that a run may still be
+    /// going, and that this can make it two.
+    public static string RunAgainWarning(WakePlan again, string targetName) => again.RunsAgain is [var helper]
+        ? $"{helper}'s command to wake {targetName} has not reported how it ended, so it may still be running, and no other helper could be asked instead. Running it again can run it a second time beside the first."
+        : $"The commands {string.Join(" and ", again.RunsAgain)} ran to wake {targetName} have not reported how they ended, so they may still be running, and no other helper could be asked instead. Running them again can run each a second time beside the first.";
 
     public static string SkipSentence(string reason, string targetName, WakeHelper entry, string helperName) => reason switch
     {
@@ -331,10 +392,10 @@ public sealed record WakeReport(
 /// acknowledges it, and a switch that drops broadcast traffic swallows it in silence. So the only
 /// evidence accepted is an authenticated answer from the machine afterwards.
 ///
-/// The other thing it will not do is run one command twice. A helper action that is not a declared
-/// wol can do anything, and when its run ended without a terminal record it is held: the operation
-/// carries the target in this device's own history, and until the hold is released no other
-/// helper's command runs for that target, the held helper's own included.
+/// The other thing it will not do is run one command twice unless a person chose that. A helper
+/// action that is not a declared wol can do anything, and when its run ended without a terminal
+/// record it is held: the operation carries the target in this device's own history, and until the
+/// hold is released no other helper's command runs for that target, the held helper's own included.
 public sealed class WakeRunner(OperationTracker tracker)
 {
     private readonly OperationTracker _tracker = tracker;
