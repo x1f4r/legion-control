@@ -11,14 +11,11 @@ import com.x1f4r.legioncontrol.agent.SignedTarball
 import com.x1f4r.legioncontrol.agent.AgentAction
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.Contract
+import com.x1f4r.legioncontrol.agent.AgentStatus
 import com.x1f4r.legioncontrol.agent.ControllerFetch
 import com.x1f4r.legioncontrol.agent.Machine
-import com.x1f4r.legioncontrol.agent.SetupDecision
+import com.x1f4r.legioncontrol.agent.SetupPeerState
 import com.x1f4r.legioncontrol.agent.SetupProvenance
-import com.x1f4r.legioncontrol.agent.decideFromMeta
-import com.x1f4r.legioncontrol.agent.decideFromStatus
-import com.x1f4r.legioncontrol.agent.provenanceOf
-import com.x1f4r.legioncontrol.agent.shouldAskForMeta
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.DocumentProblem
 import com.x1f4r.legioncontrol.data.EXAMPLE_CONTROLLER_CONFIG
@@ -52,7 +49,6 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.Instant
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * The app, which is a list of machines, a shared setup, and this phone.
@@ -164,8 +160,11 @@ class AppModel(
 
     private data class Handover(val line: String, val at: Long)
 
-    /** Machines whose setup this device is currently publishing to, so nothing is pushed twice. */
-    private val publishing = ConcurrentHashMap.newKeySet<String>()
+    /** Setup sync with every machine: what to send, when, and what to take (contract section 9.5). */
+    private val sync = SetupPeerSync(services)
+
+    /** Why the setup is not being sent to each machine, by machine id, while it is not. Drawn from. */
+    private val holds = mutableStateMapOf<String, String>()
 
     val hasMachines: Boolean get() = machines.isNotEmpty()
 
@@ -243,12 +242,18 @@ class AppModel(
     }
 
     private val setup = object : SetupSync {
+        override fun state(machineId: String): SetupPeerState = sync.state(machineId)
+
         override suspend fun reconcile(
             client: MachineClient,
-            reportedHash: String?,
-            speaksV3: Boolean,
-            asked: MutableSet<String>,
-        ): String? = reconcileSetup(client, reportedHash, speaksV3, asked)
+            reply: AgentStatus,
+            localMutation: Boolean,
+            state: SetupPeerState,
+        ): String? = try {
+            sync.reconcile(client, reply, localMutation, state)
+        } finally {
+            noteHold(client.machine.id)
+        }
 
         override fun remember(machineId: String, line: String) {
             handovers[machineId] = Handover(line, System.currentTimeMillis())
@@ -256,6 +261,19 @@ class AppModel(
 
         override fun noteFor(machineId: String, now: Long): String? =
             handovers[machineId]?.takeIf { now - it.at < HANDOVER_NOTE_MS }?.line
+
+        override fun holdFor(machineId: String): String? = holds[machineId]
+
+        override fun retry(machineId: String) {
+            sync.retry(machineId)
+            noteHold(machineId)
+        }
+    }
+
+    /** Copies one machine's hold into what the screen draws from. */
+    private fun noteHold(machineId: String) {
+        val hold = sync.hold(machineId)
+        if (hold == null) holds.remove(machineId) else holds[machineId] = hold
     }
 
     init {
@@ -390,136 +408,6 @@ class AppModel(
 
     // MARK: - The setup
 
-    /**
-     * R1, for one machine, run on every successful poll.
-     *
-     * Two things happen without asking and both are along strict descent. Everything else either
-     * costs one `config meta` round trip or stops at a person, and neither ever happens twice for
-     * the same copy.
-     */
-    private suspend fun reconcileSetup(
-        client: MachineClient,
-        reportedHash: String?,
-        speaksV3: Boolean,
-        asked: MutableSet<String>,
-    ): String? {
-        val applied = services.provenance.value
-        val name = client.machine.name
-
-        return when (val decision = decideFromStatus(reportedHash, applied, speaksV3)) {
-            SetupDecision.InSync -> null
-
-            is SetupDecision.CannotCarry -> null
-
-            is SetupDecision.Push -> publish(client, decision.reason)
-
-            SetupDecision.AskForMeta -> {
-                if (applied == null) return fetchAndAdopt(client, reportedHash)
-                if (!shouldAskForMeta(reportedHash, applied.hash, asked)) return null
-                reportedHash?.let(asked::add)
-
-                val meta = client.configMeta().getOrNull()?.meta
-                if (meta == null) {
-                    // Nothing was learned, so nothing is remembered as asked: a round trip that
-                    // failed says nothing about the document and is worth repeating.
-                    reportedHash?.let(asked::remove)
-                    return null
-                }
-                val held = SetupProvenance(
-                    authority = meta.id,
-                    revision = meta.revision,
-                    hash = meta.hash ?: reportedHash,
-                    lineage = meta.lineage.orEmpty(),
-                    updatedAt = meta.updatedAt,
-                    sourceKind = meta.source,
-                    device = meta.device,
-                    readFrom = name,
-                )
-                when (val settled = decideFromMeta(held, applied)) {
-                    SetupDecision.InSync -> null
-                    is SetupDecision.Push -> publish(client, settled.reason)
-                    is SetupDecision.Adopt -> fetchAndAdopt(client, held.hash)
-                    is SetupDecision.DifferentSetup -> {
-                        val text = fetchText(client) ?: return null
-                        services.recordIdentityClash(name, settled.reason, text, held)
-                        "$name is carrying a different setup. It is waiting for a decision."
-                    }
-
-                    is SetupDecision.Diverged -> {
-                        val text = fetchText(client) ?: return null
-                        services.recordDivergence(name, settled.reason, text, held)
-                        "$name has a copy of the setup that was edited separately. " +
-                            "It is waiting to be merged."
-                    }
-
-                    SetupDecision.AskForMeta, is SetupDecision.CannotCarry -> null
-                }
-            }
-
-            is SetupDecision.Adopt -> fetchAndAdopt(client, reportedHash)
-            is SetupDecision.DifferentSetup, is SetupDecision.Diverged -> null
-        }
-    }
-
-    /**
-     * Publishes this device's copy to one machine.
-     *
-     * At most one attempt per machine at a time, and never while a change is running on it: the
-     * machine's own lock would refuse it anyway, and hammering it for the privilege is noise.
-     */
-    private suspend fun publish(client: MachineClient, reason: String): String? {
-        val document = services.document.value ?: return null
-        val identity = document.identity ?: return null
-        val machineId = client.machine.id
-        if (!publishing.add(machineId)) return null
-        return try {
-            client.configSet(
-                canonicalDocument = document.canonicalText,
-                setupId = identity.id,
-                revision = identity.revision,
-                replace = false,
-            ).fold(
-                onSuccess = { reply ->
-                    when {
-                        reply.unchanged -> null
-                        reply.stored -> "The setup was sent to ${client.machine.name}. $reason"
-                        else -> "${client.machine.name} would not take the setup: " +
-                            (reply.message ?: reply.reason?.sentence ?: "it refused it")
-                    }
-                },
-                onFailure = { failure ->
-                    // A push whose reply was lost is byte-identical when it is tried again and the
-                    // agent answers `noop`, so there is nothing to recover here: the next poll does
-                    // it. Nothing is reported for an ordinary unreachable machine.
-                    if (failure.dispatchStage.mayHaveRun) {
-                        "The setup may or may not have reached ${client.machine.name}. " +
-                            "The next check settles it."
-                    } else {
-                        null
-                    }
-                },
-            )
-        } finally {
-            publishing.remove(machineId)
-        }
-    }
-
-    private suspend fun fetchText(client: MachineClient): String? =
-        (client.fetchSetup().getOrNull() as? ControllerFetch.Document)?.text
-
-    /** The machine has a newer copy of the same setup, so take it. */
-    private suspend fun fetchAndAdopt(client: MachineClient, expectedHash: String?): String? {
-        val text = fetchText(client) ?: return null
-        return when (val outcome = services.adoptFromMachine(text, expectedHash, client.machine.name)) {
-            is SetupOutcome.Applied -> "Setup updated from ${client.machine.name}."
-            SetupOutcome.Unchanged -> null
-            is SetupOutcome.Invalid ->
-                "${client.machine.name} is carrying a setup this app cannot use. ${outcome.reason}"
-
-            is SetupOutcome.Diverged, is SetupOutcome.DifferentSetup -> null
-        }
-    }
-
     fun applyConfig() {
         // Shown once, as section 9.5 asks: a document that named no setup is given an id here.
         val named = ControllerDocument.parse(configDraft).getOrNull()?.setupId != null
@@ -548,12 +436,13 @@ class AppModel(
             "hardware address and agent paths in it before applying it."
     }
 
-    /** Takes the other side of a divergence wholesale. */
+    /**
+     * Take theirs: the other side's verified bytes, unchanged, over the document this screen was
+     * built against and no other.
+     */
     fun takeTheirs() {
         val divergence = divergence ?: return
-        val failure = services.adoptDivergent(divergence)
-        configError = failure
-        if (failure == null) configNote = "Took the copy from ${divergence.machineName}."
+        settled(services.adoptDivergent(divergence)) { "Took the copy from ${divergence.machineName}." }
     }
 
     /** Keeps this device's copy, as a revision that descends from both so every machine takes it. */
@@ -635,16 +524,37 @@ class AppModel(
                 "(${outcome.error}), so nothing was written. Take the other side of the entry that names it."
             return
         }
-        val failure = services.applyMerge(text)
-        configError = failure
-        if (failure == null) {
+        settled(services.applyMerge(text, divergence.mineProvenance?.hash)) {
             mergeChoices.clear()
-            configNote = done()
+            done()
         }
     }
 
     /** The kept base of a divergence, which the store already checked hashes to it. */
     private fun baseOf(divergence: SetupDivergence): String? = divergence.baseHash?.let(services::revision)
+
+    /**
+     * What a decision on a divergence or a different setup came to. A document that changed while
+     * the screen was open is not replaced: the screen closes, and the next check compares again.
+     */
+    private fun settled(outcome: SetupOutcome, done: () -> String) {
+        when (outcome) {
+            is SetupOutcome.Applied, SetupOutcome.Unchanged -> {
+                configError = null
+                configNote = done()
+            }
+
+            SetupOutcome.HeadMoved -> {
+                services.clearDivergence()
+                services.clearIdentityClash()
+                mergeChoices.clear()
+                configError = null
+                configNote = "The setup here changed while this was open; comparing again."
+            }
+
+            is SetupOutcome.Invalid -> configError = outcome.reason
+        }
+    }
 
     /** What adopting the other setup would change, for the identity question. */
     fun clashPreview(): SetupChangePreview? {
@@ -716,14 +626,15 @@ class AppModel(
     /** Adopts the other setup entirely, dropping this device's. */
     fun adoptTheirSetup() {
         val clash = identityClash ?: return
-        val failure = services.adoptOtherSetup(clash)
-        configError = failure
-        if (failure == null) {
-            configNote = "This device now follows the setup from ${clash.machineName}."
-        }
+        settled(services.adoptOtherSetup(clash)) { "This device now follows the setup from ${clash.machineName}." }
     }
 
-    fun dismissIdentityClash() = services.clearIdentityClash()
+    /** Leave it: not asked about again until this device's setup or the machine's copy changes. */
+    fun dismissIdentityClash() {
+        val clash = identityClash ?: return
+        clients.firstOrNull { it.machine.name == clash.machineName }?.let { sync.leave(it.machine.id, clash.theirProvenance.hash) }
+        services.clearIdentityClash()
+    }
 
     // MARK: - Bootstrap
 
@@ -887,6 +798,9 @@ class AppModel(
 
     private fun followDocument() {
         editor.reset(services.document.value)
+        // A hold is for one revision, so a new one lifts it on screen at once rather than at the
+        // next check.
+        machines.forEach { noteHold(it.machine.id) }
         // The field follows what is in force only while nobody is halfway through typing into it.
         // Losing an edit to a document that arrived from another peer is exactly the thing the whole
         // reconciliation is meant to prevent, and clobbering the field would do it locally instead.

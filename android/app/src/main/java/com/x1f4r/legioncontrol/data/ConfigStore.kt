@@ -22,15 +22,19 @@ data class SetupSource(
  * Held rather than resolved. This is the state the whole lineage machinery exists to produce
  * instead of a silent overwrite: somebody edited on two devices while one of them was offline, and
  * the only thing that can decide which parts of each to keep is a person.
+ *
+ * Recorded only from bytes that hash to what the machine reported, and [theirProvenance] is what
+ * those bytes say about themselves. [mineProvenance] is the document this screen was built against:
+ * Merge, Keep mine and Take theirs each replace it only if it is still the one in force.
  */
 data class SetupDivergence(
     val machineName: String,
     val reason: String,
-    /** Their document, exactly as the machine served it. */
+    /** Their document, exactly as the machine stores it. */
     val theirText: String,
     val theirProvenance: SetupProvenance,
     val mineProvenance: SetupProvenance?,
-    /** The newest ancestor both sides share, when this device kept a copy of it. */
+    /** The newest ancestor both sides share, when this device kept a copy of it whose bytes still hash to it. */
     val baseHash: String?,
     val at: Long,
 )
@@ -45,12 +49,16 @@ data class SetupIdentityClash(
     val at: Long,
 )
 
-/** What became of a document a machine offered. */
+/** What became of a document a machine offered, or of a merge. */
 sealed interface SetupOutcome {
     data class Applied(val reason: String) : SetupOutcome
     data object Unchanged : SetupOutcome
-    data class Diverged(val reason: String) : SetupOutcome
-    data class DifferentSetup(val reason: String) : SetupOutcome
+
+    /**
+     * The document in force is no longer the one the decision was made against, so nothing was
+     * written: an edit saved meanwhile stays, and the next status decides from it.
+     */
+    data object HeadMoved : SetupOutcome
     data class Invalid(val reason: String) : SetupOutcome
 }
 
@@ -70,6 +78,12 @@ sealed interface SetupOutcome {
  * Beside the text sits this device's record of the commands it approved (contract section 9.9), in
  * the same preferences and written in the same edit. Adopting a document never approves anything in
  * it: [launch] is what every machine is driven from, and it holds only what this device approved.
+ *
+ * Every write that replaces the document with something read elsewhere is a compare-and-swap
+ * (contract section 9.5): it goes ahead only if the hash in storage, read again under [HEAD_LOCK]
+ * at the moment of writing, is still the one the decision was made against. A decision to fetch is
+ * made from one status and the bytes arrive a round trip later; without the check, an edit saved in
+ * between was replaced by bytes that were chosen against the document it replaced (A15).
  */
 class ConfigStore internal constructor(
     private val prefs: SharedPreferences,
@@ -197,7 +211,7 @@ class ConfigStore internal constructor(
 
             else -> parsed
         }
-        return store(document, approving = approving)
+        return store(document, approving = approving).failure
     }
 
     /**
@@ -209,9 +223,9 @@ class ConfigStore internal constructor(
      */
     fun applyEdit(edited: ControllerDocument, deviceName: String?): String? {
         val applied = _document.value
-            ?: return store(edited.withFreshIdentity(deviceName, now()), approving = Approving.EDIT)
+            ?: return store(edited.withFreshIdentity(deviceName, now()), approving = Approving.EDIT).failure
         if (edited.canonicalText == applied.canonicalText) return null
-        return store(edited.asEditOf(applied, deviceName, now()), approving = Approving.EDIT)
+        return store(edited.asEditOf(applied, deviceName, now()), approving = Approving.EDIT).failure
     }
 
     /**
@@ -224,65 +238,74 @@ class ConfigStore internal constructor(
     fun approveLaunch(entries: List<LaunchReviewEntry>): String? {
         val changes = entries.filter { it.approvable }.map { it.change() }
         if (changes.isEmpty()) return "Nothing here can be approved. It can only be reverted or left."
-        val editor = prefs.edit()
-        val record = approvals.update(editor, _document.value?.root, changes)
-        editor.apply()
+        val record = synchronized(HEAD_LOCK) {
+            val editor = prefs.edit()
+            approvals.update(editor, _document.value?.root, changes).also { editor.commit() }
+        }
         announce(record)
         return null
     }
 
     /**
-     * Takes a copy off a machine, which is only ever called when it descends from this one.
+     * The hash of the document in force, read from storage, which is what every compare-and-swap
+     * here is made against. Null when there is none.
+     */
+    fun appliedHash(): String? = synchronized(HEAD_LOCK) { storedHash() }
+
+    /**
+     * Takes a copy off a machine: automatically along strict descent, or as Take theirs or following
+     * another setup, each of which a person asked for.
      *
-     * The hash is checked against what the machine said it was serving before anything is applied: a
-     * document whose bytes do not hash to the hash that was reported is not the document that was
-     * promised, and it is refused rather than repaired. A machine that reported no hash promised
-     * nothing, and nothing it serves is taken.
+     * [text] is stored exactly as it was read (canonicalised, never re-serialised), and only if it
+     * hashes to [expectedRemoteHash], the hash that justified taking it: bytes that do not are not the
+     * document that was promised, and they are refused rather than repaired. They replace the
+     * document in force only if that is still [expectedLocalHash], the head the decision was made
+     * against, null meaning none; otherwise nothing is written and [SetupOutcome.HeadMoved] says so.
      */
     fun adoptFromMachine(
         text: String,
-        expectedHash: String?,
+        expectedRemoteHash: String?,
+        expectedLocalHash: String?,
         machineName: String,
     ): SetupOutcome {
-        if (expectedHash.isNullOrBlank()) {
+        if (expectedRemoteHash.isNullOrBlank()) {
             return SetupOutcome.Invalid("$machineName did not say which setup it holds, so nothing was applied.")
         }
         val parsed = ControllerDocument.parse(text).getOrElse {
             return SetupOutcome.Invalid(it.message ?: "That setup could not be read.")
         }
-        if (parsed.hash != expectedHash) {
+        if (parsed.hash != expectedRemoteHash) {
             return SetupOutcome.Invalid(
                 "$machineName served a setup whose contents do not match the hash it reported. " +
                     "Nothing was applied.",
             )
         }
-        if (parsed.canonicalText == _text.value) return SetupOutcome.Unchanged
-        val failure = store(parsed, readFrom = machineName)
-        return if (failure == null) {
-            SetupOutcome.Applied("Updated from $machineName.")
-        } else {
-            SetupOutcome.Invalid(failure)
+        return when (val stored = store(parsed, readFrom = machineName, head = Head.Is(expectedLocalHash))) {
+            Stored.Written -> SetupOutcome.Applied("Updated from $machineName.")
+            Stored.Unchanged -> SetupOutcome.Unchanged
+            Stored.HeadMoved -> SetupOutcome.HeadMoved
+            is Stored.Refused -> SetupOutcome.Invalid(stored.reason)
         }
     }
 
-    /** Remembers a divergence for the user to settle. Nothing is applied while one is outstanding. */
-    fun recordDivergence(
-        machineName: String,
-        reason: String,
-        theirText: String,
-        theirProvenance: SetupProvenance,
-    ) {
+    /**
+     * Remembers a divergence for the user to settle. Nothing is applied while one is outstanding.
+     *
+     * [theirText] is the machine's document, already checked to hash to what it reported, and what
+     * the screen says about the other side comes from those bytes. The base is the newest ancestor of
+     * this device's document that theirs descends from too and whose kept copy still hashes to it
+     * (contract section 9.8); a copy that does not is no base at all.
+     */
+    fun recordDivergence(machineName: String, reason: String, theirText: String) {
+        val theirs = ControllerDocument.parse(theirText).getOrNull() ?: return
         val mine = _provenance.value
-        // The newest ancestor both sides share whose kept copy still hashes to it (contract
-        // section 9.8); a copy that does not is no base at all.
-        val base = SetupMerge.commonBase(mine?.hash, theirProvenance.hash, mine?.lineage.orEmpty(), theirProvenance.lineage, revisions::get)
         _divergence.value = SetupDivergence(
             machineName = machineName,
             reason = reason,
-            theirText = theirText,
-            theirProvenance = theirProvenance,
+            theirText = theirs.canonicalText,
+            theirProvenance = provenanceOf(theirs, machineName),
             mineProvenance = mine,
-            baseHash = base,
+            baseHash = SetupMerge.commonBase(mine?.hash, theirs.hash, mine?.lineage.orEmpty(), theirs.lineage, revisions::get),
             at = System.currentTimeMillis(),
         )
     }
@@ -291,17 +314,14 @@ class ConfigStore internal constructor(
         _divergence.value = null
     }
 
-    fun recordIdentityClash(
-        machineName: String,
-        reason: String,
-        theirText: String,
-        theirProvenance: SetupProvenance,
-    ) {
+    /** Remembers a machine carrying another setup entirely, from its verified bytes. */
+    fun recordIdentityClash(machineName: String, reason: String, theirText: String) {
+        val theirs = ControllerDocument.parse(theirText).getOrNull() ?: return
         _clash.value = SetupIdentityClash(
             machineName = machineName,
             reason = reason,
-            theirText = theirText,
-            theirProvenance = theirProvenance,
+            theirText = theirs.canonicalText,
+            theirProvenance = provenanceOf(theirs, machineName),
             mineProvenance = _provenance.value,
             at = System.currentTimeMillis(),
         )
@@ -315,14 +335,20 @@ class ConfigStore internal constructor(
      * Puts a merged document into force: Merge, or Keep mine, which is Merge with every entry
      * answered mine (contract section 9.8). The merge already wrote its identity, a lineage that
      * carries both heads, so every machine on either branch takes it as an ordinary fast-forward.
+     *
+     * It replaces the document in force only if that is still [expectedHead], the one the
+     * divergence screen was built from.
      */
-    fun applyMerge(mergedText: String): String? {
+    fun applyMerge(mergedText: String, expectedHead: String?): SetupOutcome {
         val merged = ControllerDocument.parse(mergedText).getOrElse {
-            return it.message ?: "The merged setup could not be read."
+            return SetupOutcome.Invalid(it.message ?: "The merged setup could not be read.")
         }
-        val failure = store(merged)
-        if (failure == null) clearDivergence()
-        return failure
+        return when (val stored = store(merged, head = Head.Is(expectedHead))) {
+            Stored.Written -> SetupOutcome.Applied("Merged.")
+            Stored.Unchanged -> SetupOutcome.Unchanged
+            Stored.HeadMoved -> SetupOutcome.HeadMoved
+            is Stored.Refused -> SetupOutcome.Invalid(stored.reason)
+        }
     }
 
     /** The document a machine is holding, kept so a merge has a base to work from. */
@@ -341,6 +367,25 @@ class ConfigStore internal constructor(
         _source.value = source
     }
 
+    /** What the document in force has to be at the moment of writing for a write to go ahead. */
+    private sealed interface Head {
+        /** Whatever it is: an edit made here, a paste, enrolment. */
+        data object Any : Head
+
+        /** Exactly the document with this hash, or none at all when it is null. */
+        data class Is(val hash: String?) : Head
+    }
+
+    /** What became of a write. */
+    private sealed interface Stored {
+        data object Written : Stored
+        data object Unchanged : Stored
+        data object HeadMoved : Stored
+        data class Refused(val reason: String) : Stored
+
+        val failure: String? get() = (this as? Refused)?.reason
+    }
+
     /**
      * Stores [document] as the one in force.
      *
@@ -348,22 +393,19 @@ class ConfigStore internal constructor(
      * Taking a copy off a machine, a merge, keeping this device's copy and following another setup
      * are all adoption: the document applies in full, and each command in it this device did not
      * approve waits.
+     *
+     * The check of [head] and the write are one step under [HEAD_LOCK], and the write is a commit,
+     * so no other store in this process can come between reading the head and replacing it.
      */
     private fun store(
         document: ControllerDocument,
         readFrom: String? = null,
         approving: Approving = Approving.NOTHING,
-    ): String? {
+        head: Head = Head.Any,
+    ): Stored {
         val text = document.canonicalText
         val accepted = acceptControllerConfig(text).getOrElse {
-            return it.message ?: "That configuration could not be read."
-        }
-
-        val after = LaunchValues.projection(document.root)
-        val changes = when (approving) {
-            Approving.NOTHING -> emptyList()
-            Approving.EDIT -> LaunchValues.changes(_document.value?.let { LaunchValues.projection(it.root) }, after)
-            Approving.EVERYTHING -> LaunchValues.changes(null, after)
+            return Stored.Refused(it.message ?: "That configuration could not be read.")
         }
 
         val identity = document.identity
@@ -378,33 +420,67 @@ class ConfigStore internal constructor(
             readFrom = readFrom ?: "this device",
         )
 
-        // The approvals go into the same edit as the document they belong to, recorded before
-        // anything can read the document back, so an edit made here never shows up for review.
-        val editor = prefs.edit()
-            .putString(KEY_TEXT, text)
-            .putString(KEY_HASH, provenance.hash)
-            .putString(KEY_AUTHORITY, provenance.authority)
-            .putString(KEY_REVISION, provenance.revision?.toString())
-            .putString(KEY_UPDATED_AT, provenance.updatedAt)
-            .putString(KEY_LINEAGE, provenance.lineage.joinToString("\n"))
-            .putString(KEY_SOURCE_KIND, provenance.sourceKind)
-            .putString(KEY_DEVICE, provenance.device)
-            .putString(KEY_PROVENANCE_SOURCE, provenance.readFrom)
-        val record = approvals.update(editor, document.root, changes)
-        editor.apply()
+        val record = synchronized(HEAD_LOCK) {
+            if (head is Head.Is) {
+                val current = storedHash()
+                if (current == document.hash) return Stored.Unchanged
+                if (current != head.hash) return Stored.HeadMoved
+            }
 
-        // Kept before it is announced, so a merge that needs this revision as a base can find it
-        // even if the app is killed in the next moment.
-        revisions.remember(document.hash, text)
+            val after = LaunchValues.projection(document.root)
+            val changes = when (approving) {
+                Approving.NOTHING -> emptyList()
+                Approving.EDIT -> LaunchValues.changes(_document.value?.let { LaunchValues.projection(it.root) }, after)
+                Approving.EVERYTHING -> LaunchValues.changes(null, after)
+            }
 
-        _provenance.value = provenance
-        _text.value = text
-        _document.value = document
-        _config.value = accepted.config
-        _acceptance.value = accepted.verdict
-        _divergence.value = null
+            // The approvals go into the same edit as the document they belong to, recorded before
+            // anything can read the document back, so an edit made here never shows up for review.
+            val editor = prefs.edit()
+                .putString(KEY_TEXT, text)
+                .putString(KEY_HASH, provenance.hash)
+                .putString(KEY_AUTHORITY, provenance.authority)
+                .putString(KEY_REVISION, provenance.revision?.toString())
+                .putString(KEY_UPDATED_AT, provenance.updatedAt)
+                .putString(KEY_LINEAGE, provenance.lineage.joinToString("\n"))
+                .putString(KEY_SOURCE_KIND, provenance.sourceKind)
+                .putString(KEY_DEVICE, provenance.device)
+                .putString(KEY_PROVENANCE_SOURCE, provenance.readFrom)
+            val record = approvals.update(editor, document.root, changes)
+            editor.commit()
+
+            // Kept before it is announced, so a merge that needs this revision as a base can find
+            // it even if the app is killed in the next moment.
+            revisions.remember(document.hash, text)
+
+            _provenance.value = provenance
+            _text.value = text
+            _document.value = document
+            _config.value = accepted.config
+            _acceptance.value = accepted.verdict
+            _divergence.value = null
+            record
+        }
         announce(record)
-        return null
+        return Stored.Written
+    }
+
+    /** The hash in storage, which only [store] writes. Called under [HEAD_LOCK]. */
+    private fun storedHash(): String? = prefs.getString(KEY_HASH, null)?.takeIf { it.isNotBlank() }
+
+    /** What a document says about itself, for the divergence and different-setup screens. */
+    private fun provenanceOf(document: ControllerDocument, machineName: String): SetupProvenance {
+        val identity = document.identity
+        return SetupProvenance(
+            authority = identity?.id,
+            revision = identity?.revision,
+            hash = document.hash,
+            lineage = identity?.lineage.orEmpty(),
+            updatedAt = identity?.updatedAt,
+            sourceKind = identity?.source,
+            device = identity?.device,
+            readFrom = machineName,
+        )
     }
 
     /** What an applied document approves. */
@@ -471,6 +547,12 @@ class ConfigStore internal constructor(
     private fun now(): String = Instant.now().toString()
 
     private companion object {
+        /**
+         * One lock for every store in the process. Two models of the same preferences, such as the
+         * one a rebuilt activity makes beside the old one, still take turns at the head (A6).
+         */
+        val HEAD_LOCK = Any()
+
         const val KEY_TEXT = "controller-config"
         const val KEY_HASH = "controller-hash"
         const val KEY_AUTHORITY = "controller-authority"

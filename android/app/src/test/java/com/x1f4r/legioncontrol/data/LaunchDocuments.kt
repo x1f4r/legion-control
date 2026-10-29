@@ -95,7 +95,7 @@ internal object LaunchDocuments {
  * document in force.
  */
 internal fun ConfigStore.adoptAsFetched(text: String, machineName: String = "Tower"): SetupOutcome =
-    adoptFromMachine(text, CanonicalSetup.hashOf(text), machineName)
+    adoptFromMachine(text, CanonicalSetup.hashOf(text), appliedHash(), machineName)
 
 /** [this] with [change] made to one machine. */
 internal fun JsonObject.editedMachine(id: String, change: (JsonObject) -> JsonObject): JsonObject =

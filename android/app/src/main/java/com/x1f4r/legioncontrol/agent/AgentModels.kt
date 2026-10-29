@@ -762,6 +762,8 @@ data class ConfigSetReply(
     val divergent: Boolean? = null,
     /** What the machine is keeping, on a refusal. */
     val current: ControllerMeta? = null,
+    /** Every rule the document broke, on a `config-invalid` refusal. */
+    val problems: List<ConfigProblem>? = null,
 ) {
     val stored: Boolean get() = action == "stored" || action == "replaced"
     val unchanged: Boolean get() = action == "noop"

@@ -349,40 +349,38 @@ interface ControlServices {
      */
     val acceptance: StateFlow<DocumentAcceptance.Verdict?>
 
-    /** Takes a copy off a machine. Only ever called when it descends from this device's copy. */
-    fun adoptFromMachine(text: String, expectedHash: String?, machineName: String): SetupOutcome
+    /** The hash of the document in force as storage has it, which every adoption is compared against. */
+    fun appliedHash(): String?
 
-    fun recordDivergence(
-        machineName: String,
-        reason: String,
-        theirText: String,
-        theirProvenance: SetupProvenance,
-    )
+    /**
+     * Takes a copy off a machine, stored exactly as read, if it hashes to [expectedRemoteHash] and
+     * the document in force is still [expectedLocalHash]. See [com.x1f4r.legioncontrol.data.ConfigStore.adoptFromMachine].
+     */
+    fun adoptFromMachine(text: String, expectedRemoteHash: String?, expectedLocalHash: String?, machineName: String): SetupOutcome
 
-    fun recordIdentityClash(
-        machineName: String,
-        reason: String,
-        theirText: String,
-        theirProvenance: SetupProvenance,
-    )
+    /** A copy of the same setup that neither side descends from, from the machine's verified bytes. */
+    fun recordDivergence(machineName: String, reason: String, theirText: String)
+
+    /** A machine carrying another setup entirely, from its verified bytes. */
+    fun recordIdentityClash(machineName: String, reason: String, theirText: String)
 
     fun clearDivergence()
 
     fun clearIdentityClash()
 
-    /** Takes the other side of a divergence wholesale. */
-    fun adoptDivergent(divergence: SetupDivergence): String?
+    /** Takes the other side of a divergence wholesale, if this device's copy is still the one it was built from. */
+    fun adoptDivergent(divergence: SetupDivergence): SetupOutcome
 
     /**
-     * Puts the result of Merge or Keep mine in force.
+     * Puts the result of Merge or Keep mine in force, if this device's copy is still [expectedHead].
      *
      * Not `--replace`: a revision whose ancestry contains the other machine's hash is one that every
      * machine on either branch accepts as an ordinary fast-forward, so nothing has to be overridden.
      */
-    fun applyMerge(mergedText: String): String?
+    fun applyMerge(mergedText: String, expectedHead: String?): SetupOutcome
 
-    /** Drops this device's setup and follows the other one. */
-    fun adoptOtherSetup(clash: SetupIdentityClash): String?
+    /** Drops this device's setup and follows the other one, if this device's copy is still the one it was asked about. */
+    fun adoptOtherSetup(clash: SetupIdentityClash): SetupOutcome
 
     /** The document with that hash, when this device kept a copy. The base for a three-way merge. */
     fun revision(hash: String?): String?

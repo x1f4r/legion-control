@@ -157,14 +157,14 @@ class LaunchApprovalsTest {
         val paths = mapOf<String, (ConfigStore, String) -> Unit>(
             "automatic fetch" to { store, text -> store.adoptAsFetched(text) },
             "take theirs" to { store, text ->
-                val theirs = ControllerDocument.parse(text).getOrThrow()
-                store.recordDivergence("Tower", "edited twice", text, provenanceOf(theirs))
-                store.adoptAsFetched(store.divergence.value!!.theirText)
+                store.recordDivergence("Tower", "edited twice", text)
+                val divergence = store.divergence.value!!
+                store.adoptFromMachine(divergence.theirText, divergence.theirProvenance.hash, divergence.mineProvenance?.hash, "Tower")
             },
             "merge" to { store, text ->
                 val mine = store.text.value
                 val merged = SetupMerge.merge(null, mine, text, CanonicalSetup.hashOf(mine), CanonicalSetup.hashOf(text), writer)
-                store.applyMerge(merged.resultText!!)
+                store.applyMerge(merged.resultText!!, store.appliedHash())
             },
             "keep mine" to { store, text ->
                 // Mine is the document a peer changed here, kept as a revision descending from both.
@@ -172,7 +172,7 @@ class LaunchApprovalsTest {
                 store.adoptAsFetched(text)
                 val choices = SetupMerge.differences(text, theirs, null).associate { it.entry to SetupMerge.Choice.MINE }
                 val kept = SetupMerge.merge(null, text, theirs, CanonicalSetup.hashOf(text), CanonicalSetup.hashOf(theirs), writer, choices)
-                store.applyMerge(kept.resultText!!)
+                store.applyMerge(kept.resultText!!, store.appliedHash())
             },
             "another setup" to { store, text ->
                 val other = ControllerDocument.of(
@@ -309,11 +309,4 @@ class LaunchApprovalsTest {
         assertEquals(tuple(PI, "dispatch"), store.offered("pi", "linux"))
         assertEquals(tuple(WINDOWS, "cmd"), recorded(prefs, tower, "windows"))
     }
-
-    private fun provenanceOf(document: ControllerDocument) = com.x1f4r.legioncontrol.agent.SetupProvenance(
-        authority = document.setupId,
-        revision = document.revision,
-        hash = document.hash,
-        lineage = document.lineage,
-    )
 }

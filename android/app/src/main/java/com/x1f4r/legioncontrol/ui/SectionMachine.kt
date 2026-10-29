@@ -119,7 +119,12 @@ fun MachineSection(model: MachineModel, app: AppModel) {
                 DetailRow("Address") { ValueText(model.route?.label, "not known") }
                 model.lastChecked?.let { checked -> DetailRow("Checked") { QuietText(localTime(checked)) } }
                 DetailRow("Setup") { SetupRow(model, app) }
-                model.setupNote?.let { QuietText(it) }
+                model.setupNote?.takeIf { it != model.setupHold }?.let { QuietText(it) }
+                // A refusal no retry can cure holds the push until the setup changes or this is pressed.
+                model.setupHold?.let { hold ->
+                    StatusLine(Mark.Attention, hold)
+                    Actions { PlainAction("Try again", enabled = !model.isWorking) { model.retrySetup() } }
+                }
                 model.status?.config?.problems.orEmpty().forEach { QuietText(listOfNotNull(it.path, it.message).joinToString(": ")) }
                 model.status?.notes.orEmpty().forEach { QuietText(it) }
                 WakeExplanation(model, app)

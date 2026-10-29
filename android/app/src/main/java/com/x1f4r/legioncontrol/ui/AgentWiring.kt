@@ -109,67 +109,44 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override val acceptance: StateFlow<DocumentAcceptance.Verdict?> get() = control.config.acceptance
 
+    override fun appliedHash(): String? = control.config.appliedHash()
+
     override fun adoptFromMachine(
         text: String,
-        expectedHash: String?,
+        expectedRemoteHash: String?,
+        expectedLocalHash: String?,
         machineName: String,
-    ): SetupOutcome = control.config.adoptFromMachine(text, expectedHash, machineName)
+    ): SetupOutcome = control.config.adoptFromMachine(text, expectedRemoteHash, expectedLocalHash, machineName)
 
-    override fun recordDivergence(
-        machineName: String,
-        reason: String,
-        theirText: String,
-        theirProvenance: SetupProvenance,
-    ) = control.config.recordDivergence(machineName, reason, theirText, theirProvenance)
+    override fun recordDivergence(machineName: String, reason: String, theirText: String) =
+        control.config.recordDivergence(machineName, reason, theirText)
 
-    override fun recordIdentityClash(
-        machineName: String,
-        reason: String,
-        theirText: String,
-        theirProvenance: SetupProvenance,
-    ) = control.config.recordIdentityClash(machineName, reason, theirText, theirProvenance)
+    override fun recordIdentityClash(machineName: String, reason: String, theirText: String) =
+        control.config.recordIdentityClash(machineName, reason, theirText)
 
     override fun clearDivergence() = control.config.clearDivergence()
 
     override fun clearIdentityClash() = control.config.clearIdentityClash()
 
-    override fun adoptDivergent(divergence: SetupDivergence): String? {
-        val outcome = control.config.adoptFromMachine(
+    /** Take theirs: the verified bytes the screen showed, over the document the screen was built against. */
+    override fun adoptDivergent(divergence: SetupDivergence): SetupOutcome =
+        control.config.adoptFromMachine(
             text = divergence.theirText,
-            expectedHash = divergence.theirProvenance.hash,
+            expectedRemoteHash = divergence.theirProvenance.hash,
+            expectedLocalHash = divergence.mineProvenance?.hash,
             machineName = divergence.machineName,
-        )
-        return when (outcome) {
-            is SetupOutcome.Applied, SetupOutcome.Unchanged -> {
-                control.config.clearDivergence()
-                null
-            }
+        ).also { if (it is SetupOutcome.Applied || it == SetupOutcome.Unchanged) control.config.clearDivergence() }
 
-            is SetupOutcome.Invalid -> outcome.reason
-            is SetupOutcome.Diverged -> outcome.reason
-            is SetupOutcome.DifferentSetup -> outcome.reason
-        }
-    }
+    override fun applyMerge(mergedText: String, expectedHead: String?): SetupOutcome =
+        control.config.applyMerge(mergedText, expectedHead)
 
-    override fun applyMerge(mergedText: String): String? = control.config.applyMerge(mergedText)
-
-    override fun adoptOtherSetup(clash: SetupIdentityClash): String? {
-        val outcome = control.config.adoptFromMachine(
+    override fun adoptOtherSetup(clash: SetupIdentityClash): SetupOutcome =
+        control.config.adoptFromMachine(
             text = clash.theirText,
-            expectedHash = clash.theirProvenance.hash,
+            expectedRemoteHash = clash.theirProvenance.hash,
+            expectedLocalHash = clash.mineProvenance?.hash,
             machineName = clash.machineName,
-        )
-        return when (outcome) {
-            is SetupOutcome.Applied, SetupOutcome.Unchanged -> {
-                control.config.clearIdentityClash()
-                null
-            }
-
-            is SetupOutcome.Invalid -> outcome.reason
-            is SetupOutcome.Diverged -> outcome.reason
-            is SetupOutcome.DifferentSetup -> outcome.reason
-        }
-    }
+        ).also { if (it is SetupOutcome.Applied || it == SetupOutcome.Unchanged) control.config.clearIdentityClash() }
 
     override fun revision(hash: String?): String? = control.config.revision(hash)
 

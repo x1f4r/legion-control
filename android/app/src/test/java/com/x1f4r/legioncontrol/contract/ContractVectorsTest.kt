@@ -1,6 +1,19 @@
 package com.x1f4r.legioncontrol.contract
 
 import com.x1f4r.legioncontrol.agent.Addresses
+import com.x1f4r.legioncontrol.agent.AgentJson
+import com.x1f4r.legioncontrol.agent.ConfigSetReply
+import com.x1f4r.legioncontrol.agent.ControllerMark
+import com.x1f4r.legioncontrol.agent.SetupDecision
+import com.x1f4r.legioncontrol.agent.SetupExpectation
+import com.x1f4r.legioncontrol.agent.SetupFetched
+import com.x1f4r.legioncontrol.agent.SetupHead
+import com.x1f4r.legioncontrol.agent.SetupMeta
+import com.x1f4r.legioncontrol.agent.SetupPeerState
+import com.x1f4r.legioncontrol.agent.admit
+import com.x1f4r.legioncontrol.agent.afterPush
+import com.x1f4r.legioncontrol.agent.decide
+import com.x1f4r.legioncontrol.agent.gate
 import com.x1f4r.legioncontrol.agent.AttemptClassifier
 import com.x1f4r.legioncontrol.agent.AttemptReading
 import com.x1f4r.legioncontrol.agent.AttemptWalk
@@ -63,6 +76,9 @@ class ContractVectorsTest {
 
     @Test
     fun `which setup documents are accepted matches the contract`() = runFamily("setup-acceptance")
+
+    @Test
+    fun `deciding, admitting, gating and reading push replies match the contract`() = runFamily("setup-reconcile")
 
     @Test
     fun `merges, bases and number equality match the contract`() = runFamily("setup-merge")
@@ -292,6 +308,75 @@ class ContractVectorsTest {
             }
         },
 
+        "setup-reconcile/decide" to { input ->
+            val local = input["local"] as? JsonObject
+            val status = input["status"] as? JsonObject
+            val mark = status?.get("controller") as? JsonObject
+            val decided = decide(
+                head = local?.let { SetupHead(it.string("hash")!!, it.string("id"), it.strings("lineage")) },
+                contract = status?.long("contract")?.toInt(),
+                mark = mark?.let { ControllerMark(hash = it.string("hash"), id = it.string("id")) },
+                metaByHash = (input["metaByHash"] as JsonObject).mapValues { (_, meta) ->
+                    meta as JsonObject
+                    SetupMeta(meta.string("id"), meta.strings("lineage"))
+                },
+            )
+            buildJsonObject {
+                put("decision", decided.decision.wire)
+                put("reason", text(decided.reason))
+                put("expect", text(decided.expect))
+            }
+        },
+
+        "setup-reconcile/admit" to { input ->
+            val expected = input["expected"] as JsonObject
+            val fetched = input["fetched"] as JsonObject
+            val admission = admit(
+                SetupExpectation(expected.string("localHash")!!, expected.string("localId")!!, expected.string("remoteHash")!!),
+                input.string("currentLocalHash"),
+                SetupFetched(fetched.string("hash")!!, fetched.string("replyHash")!!, fetched.string("id"), fetched.strings("lineage")),
+                input.boolean("accepted")!!,
+            )
+            buildJsonObject { put("admission", admission.wire) }
+        },
+
+        "setup-reconcile/gate" to { input ->
+            val given = input["state"] as JsonObject
+            val state = SetupPeerState().apply {
+                inFlight = given.boolean("inFlight")!!
+                (given["failedAt"] as JsonObject).forEach { (hash, at) -> failedAt[hash] = (at as JsonPrimitive).content.toLong() }
+                (given["held"] as JsonObject).forEach { (hash, code) -> held[hash] = (code as JsonPrimitive).content }
+                localInvalid = given.boolean("localInvalid")!!
+                localMutation = given.boolean("localMutation")!!
+                runningOperations = given.long("runningOperations")!!.toInt()
+                lockedAt = given.long("lockedAt")
+                statusAt = given.long("statusAt")
+                settled += given.strings("settled")
+            }
+            val gated = gate(
+                SetupDecision.entries.single { it.wire == input.string("decision") },
+                input.string("localHash")!!,
+                input.string("remoteHash"),
+                input.string("agentVersion"),
+                input.long("now")!!,
+                state,
+            )
+            buildJsonObject {
+                put("action", gated.action.wire)
+                put("reason", text(gated.reason))
+            }
+        },
+
+        // The reply is read by the same decoder a real `config set` reply goes through.
+        "setup-reconcile/pushReply" to { input ->
+            val reply = (input["reply"] as? JsonObject)?.let { AgentJson.decodeFromJsonElement(ConfigSetReply.serializer(), it) }
+            val effect = afterPush(reply, input.string("localHash")!!)
+            buildJsonObject {
+                put("effect", effect.effect.wire)
+                put("metaHash", text(effect.metaHash))
+            }
+        },
+
         "setup-merge/merges" to { input ->
             val writer = input["writer"] as JsonObject
             val choices = (input["choices"] as JsonObject).mapValues { (_, side) ->
@@ -363,6 +448,6 @@ class ContractVectorsTest {
          * adapted, or when the index stops listing it, and the list is empty once the Android port
          * of every reference has landed.
          */
-        val PENDING_FAMILIES = setOf("outcome", "setup-reconcile", "wake")
+        val PENDING_FAMILIES = setOf("outcome", "wake")
     }
 }

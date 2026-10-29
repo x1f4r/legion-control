@@ -258,29 +258,6 @@ class ControllerSetupTest {
     }
 
     /**
-     * The rule that keeps a machine from being interrogated about the same copy on every poll.
-     */
-    @Test
-    fun `a machine is asked about its ancestry once per distinct copy`() {
-        // An agent that says nothing about a setup has nothing to ask about.
-        assertFalse(shouldAskForMeta(reportedHash = null, applied = "a", asked = emptySet()))
-        assertFalse(shouldAskForMeta(reportedHash = "", applied = null, asked = emptySet()))
-
-        // This device already has the copy that machine is carrying.
-        assertFalse(shouldAskForMeta(reportedHash = "a", applied = "a", asked = emptySet()))
-
-        // A different copy, and nothing has been asked about it yet.
-        assertTrue(shouldAskForMeta(reportedHash = "b", applied = "a", asked = emptySet()))
-
-        // The same copy that was asked about a moment ago. A copy that is genuinely diverged gives
-        // the same answer every time, so asking again is a round trip for nothing.
-        assertFalse(shouldAskForMeta(reportedHash = "b", applied = "a", asked = setOf("b")))
-
-        // A copy that has moved on since is a new question.
-        assertTrue(shouldAskForMeta(reportedHash = "c", applied = "a", asked = setOf("b")))
-    }
-
-    /**
      * C1: an agent from 3.1.0 on returns the document as it stores it, under `raw`, and that is what
      * is hashed and adopted. The shared fixture's `raw` hashes to its `hash`; a rebuild of its parsed
      * `controller` in this app's spelling would only match when that spelling happened to agree.

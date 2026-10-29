@@ -243,6 +243,13 @@ reach, and travels on the next poll of each one. Behind that:
 - The phone pushes only where its copy descends from the machine's, and adopts only where the
   machine's descends from its own. Descent has a direction, so two devices can never take turns
   overwriting each other.
+- Adopting is a compare-and-swap. The machine's stored bytes, checked against the hash it
+  reported, replace this phone's copy only if that is still the one the decision was made from,
+  so an edit saved while the read was out stays and the next poll shows the two as diverged.
+- Pushes keep to the guardrails of section 9.5: one setup request at a time per machine, a
+  minute's pause after one fails, nothing while a change runs on the machine, and none from a
+  copy with an error in it. A push the machine refuses for a restricted key or an invalid
+  document is held for that revision, with the reason under the machine and **Try again**.
 - Anything else is a question. **Setup edited twice** shows both revisions, who wrote them, and
   a difference per machine, address, system, wake block, site or unknown key, defaulting to
   whichever side actually changed each one; a deletion against an edit is asked about. Merging

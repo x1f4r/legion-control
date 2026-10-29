@@ -8,6 +8,7 @@ import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentAction
 import com.x1f4r.legioncontrol.agent.AgentDeploymentPath
 import com.x1f4r.legioncontrol.agent.AgentStatus
+import com.x1f4r.legioncontrol.agent.SetupPeerState
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.DoctorReport
 import com.x1f4r.legioncontrol.agent.EndpointDiagnosis
@@ -303,8 +304,12 @@ class MachineModel(
     private var rebootUntil: Long = 0L
     private var sleepUntil: Long = 0L
 
-    /** The setup hashes already asked about, so a diverged machine is not interrogated on a loop. */
-    private val askedAboutSetup = mutableSetOf<String>()
+    /**
+     * What this device remembers about this machine's copy of the setup: the guardrails and the meta
+     * it filed (contract section 9.5). Kept by the setup sync rather than here, so it outlives this
+     * model when a new document rebuilds every machine.
+     */
+    private val setupState: SetupPeerState = setup.state(machine.id)
 
     val isWorking: Boolean get() = activity != null
 
@@ -348,6 +353,15 @@ class MachineModel(
 
     /** What this machine's last handover of the setup did, while that is still news. */
     val setupNote: String? get() = setup.noteFor(machine.id, now)
+
+    /** Why this device's setup is not being sent to this machine, while it is not. */
+    val setupHold: String? get() = setup.holdFor(machine.id)
+
+    /** "Try again" on a held setup: sent once more on the next check. */
+    fun retrySetup() {
+        setup.retry(machine.id)
+        refreshNow()
+    }
 
     val actions: List<AgentAction> get() = runnableActions(status?.actions)
 
@@ -510,15 +524,11 @@ class MachineModel(
      *
      * Every peer edits, so every poll is also a reconciliation. Only two things happen without
      * asking, and both are along strict descent: push when this device's copy was made from theirs,
-     * fetch when theirs was made from this device's. Everything else stops at a person.
+     * fetch when theirs was made from this device's. Everything else stops at a person. Nothing is
+     * pushed while this device has an action in flight here or the status lists one running.
      */
     private suspend fun reconcileSetup(reply: AgentStatus) {
-        val note = setup.reconcile(
-            client = client,
-            reportedHash = reply.controller?.hash,
-            speaksV3 = reply.speaksV3,
-            asked = askedAboutSetup,
-        )
+        val note = setup.reconcile(client, reply, localMutation = isWorking, state = setupState)
         if (note != null) setup.remember(machine.id, note)
     }
 
@@ -1438,20 +1448,31 @@ interface FleetContext {
  * the model that earned a line is thrown away by the very change it made.
  */
 interface SetupSync {
+    /** What this device remembers about one machine's copy, which outlives the model of it. */
+    fun state(machineId: String): SetupPeerState
+
     /**
      * R1 for one machine: decide from the status, ask for the ancestry when that is not enough, and
-     * act only along strict descent. Returns a line worth showing, or null.
+     * act only along strict descent and only when the guardrails allow (contract section 9.5).
+     * [localMutation] is whether this device has an action in flight on it. Returns a line worth
+     * showing, or null.
      */
     suspend fun reconcile(
         client: MachineClient,
-        reportedHash: String?,
-        speaksV3: Boolean,
-        asked: MutableSet<String>,
+        reply: AgentStatus,
+        localMutation: Boolean,
+        state: SetupPeerState,
     ): String?
 
     fun remember(machineId: String, line: String)
 
     fun noteFor(machineId: String, now: Long): String?
+
+    /** Why pushes to the machine are held for the document in force, or null when they are not. */
+    fun holdFor(machineId: String): String?
+
+    /** "Try again" on a held push. */
+    fun retry(machineId: String)
 }
 
 /** How old a reading is, in words. Nothing polls while the app is away, so this has to be visible. */
