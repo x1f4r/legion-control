@@ -268,13 +268,12 @@ class MachineModel(
 
     private var messageGeneration = 0L
     private var lastMessage by mutableStateOf(MachineMessage())
-    private var operationRecords by mutableStateOf(operations.records.value)
 
-    init {
-        scope.launch {
-            operations.records.collect { operationRecords = it }
-        }
-    }
+    /**
+     * Every record, read through the state the screen observes. Everything this model says about
+     * changes is derived from this one read, so what draws it follows the records as they move.
+     */
+    private val operationRecords: List<OperationRecord> get() = operations.observed
 
     var statusLine: String
         get() = lastMessage.resolve(operationRecords).line
@@ -392,9 +391,9 @@ class MachineModel(
     val actions: List<AgentAction> get() = runnableActions(status?.actions)
 
     /** Every change this app has asked this machine for, newest first. */
-    val history: List<OperationRecord> get() = operations.forMachine(machine.id)
+    val history: List<OperationRecord> get() = operationRecords.filter { it.machineId == machine.id }
 
-    val pending: List<OperationRecord> get() = operations.pendingFor(machine.id)
+    val pending: List<OperationRecord> get() = history.filter { it.isPending }
 
     /** What the agent says it is running or has queued, which may include other devices' work. */
     val agentOperations: List<OpSummary>

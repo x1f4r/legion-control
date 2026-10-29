@@ -1,5 +1,8 @@
 package com.x1f4r.legioncontrol.ui
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentActionResult
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.Contract
@@ -51,10 +54,23 @@ class OperationCenter(
 ) {
     val records: StateFlow<List<OperationRecord>> get() = store.records
 
+    /**
+     * Every record, as state the screen reads, so whatever draws them is drawn again when they
+     * change. A value read straight off [records] is a value Compose never hears about: Changes and
+     * Recent changes stayed as they were until something else happened to redraw the page.
+     *
+     * Collected here, once for the process, rather than once per machine model. The models are
+     * rebuilt with every change to the setup, and a collector each was a collector nobody stopped.
+     */
+    var observed: List<OperationRecord> by mutableStateOf(store.records.value)
+        private set
+
     /** The ids currently being worked on here, so nothing is dispatched or reconciled twice. */
     private val inFlight = ConcurrentHashMap.newKeySet<String>()
 
-    fun forMachine(machineId: String): List<OperationRecord> = store.forMachine(machineId)
+    init {
+        scope.launch { store.records.collect { observed = it } }
+    }
 
     fun pendingFor(machineId: String): List<OperationRecord> =
         store.forMachine(machineId).filter { it.isPending }

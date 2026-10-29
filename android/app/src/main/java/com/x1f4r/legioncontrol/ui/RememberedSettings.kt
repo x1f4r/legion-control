@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.ui
 
 import android.content.Context
+import android.content.SharedPreferences
 
 /**
  * The last value each system reported for automatic updates, and when it was read.
@@ -24,9 +25,10 @@ data class RememberedService(
     val name: String,
 )
 
-class RememberedSettings(context: Context) {
-    private val prefs = context.applicationContext
-        .getSharedPreferences("legion-remembered", Context.MODE_PRIVATE)
+class RememberedSettings(private val prefs: SharedPreferences) {
+    constructor(context: Context) : this(
+        context.applicationContext.getSharedPreferences("legion-remembered", Context.MODE_PRIVATE),
+    )
 
     fun load(machineId: String, systemIds: List<String>): Map<String, RememberedSystem> =
         systemIds.associateWith { systemId ->

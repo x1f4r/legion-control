@@ -209,7 +209,7 @@ class WakeWalkTest {
 
         operations.releaseWakeHolds("tower", before = hold.startedAt + 1, reason = "Tower answered.")
         assertTrue(operations.wakeHolds("tower").isEmpty())
-        val held = operations.forMachine("pi").single()
+        val held = operations.records.value.single { it.machineId == "pi" }
         assertFalse("the record is still unresolved, and still followed", held.isOver)
     }
 
