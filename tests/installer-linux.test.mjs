@@ -218,8 +218,10 @@ test('linux installer writes units that systemd reads back as the paths it meant
   ]);
   const execStart = values(service, 'ExecStart', { exec: true });
   assert.deepEqual(execStart, [[path.join(home, '.legion-control', 'bin', 'legionctl'), 'cycle']]);
-  // What the cycle writes, and what it runs writes, is this user's alone.
+  // What the cycle writes, and what it runs writes, is this user's alone, and so is what the
+  // installer wrote: the units say where the agent and its records live.
   assert.deepEqual(values(service, 'UMask'), [['0077']]);
+  for (const name of ['legion-control-update.service', 'legion-control-update.timer']) assert.equal(fs.statSync(path.join(units, name)).mode & 0o077, 0, name);
   // And that is the launcher, which runs.
   const launched = spawnSync(execStart[0][0], ['status'], { encoding: 'utf8' });
   assert.equal(launched.status, 0, launched.stderr);
@@ -276,6 +278,7 @@ test('linux installer quotes and escapes the npm prefix in both units it writes 
   const update = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 'legion-control-update.service'), 'utf8');
   assert.equal(values(update, 'Environment')[0][0], unitPath);
   const unit = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 't3-code.service'), 'utf8');
+  assert.equal(fs.statSync(path.join(home, '.config', 'systemd', 'user', 't3-code.service')).mode & 0o077, 0);
   assert.deepEqual(values(unit, 'Environment'), [[unitPath]]);
   assert.deepEqual(values(unit, 'ExecStart', { exec: true }), [
     [path.join(npmBin, 't3'), 'start', '--mode', 'web', '--host', '127.0.0.1', '--port', String(port), '--no-browser'],

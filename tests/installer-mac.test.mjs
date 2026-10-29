@@ -71,6 +71,8 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
     const umask = spawnSync('/usr/bin/plutil', ['-extract', 'Umask', 'raw', '-o', '-', renderedPath], { encoding: 'utf8' });
     assert.equal(umask.status, 0, umask.stderr);
     assert.equal(Number(umask.stdout.trim()), 0o77);
+    // The plist says where the agent and its records live, and is this user's alone as well.
+    assert.equal(fs.statSync(renderedPath).mode & 0o077, 0);
   }
 });
 
