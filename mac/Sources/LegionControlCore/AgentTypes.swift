@@ -559,6 +559,8 @@ struct AgentConfigResult: Decodable, Sendable {
     /// True on a refusal where neither side descends from the other, as opposed to one where this
     /// device is simply behind.
     var divergent: Bool?
+    /// What a `config-invalid` refusal found wrong with the document, at most fifty.
+    var problems: [DocumentProblem]?
     /// `stored`, `noop` or `replaced`.
     var action: String?
     /// How big the stored document is.
@@ -575,6 +577,11 @@ struct AgentConfigResult: Decodable, Sendable {
         if let meta { return meta.identity }
         if let current { return current.identity }
         return ControllerIdentity(id: id, revision: revision, updatedAt: updatedAt, source: source)
+    }
+
+    struct DocumentProblem: Decodable, Sendable, Equatable {
+        var path: String?
+        var message: String?
     }
 
     /// True when the machine took the document.

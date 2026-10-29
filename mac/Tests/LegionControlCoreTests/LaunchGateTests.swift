@@ -95,7 +95,7 @@ struct LaunchGateTests {
             ],
         ]
         change(&root)
-        return try JSONText.canonicalDocument(root)
+        return try SetupJSON.document(root)
     }
 
     /// A child of `parent` as another device writes it: the next revision, with the parent's hash
@@ -229,7 +229,7 @@ struct LaunchGateTests {
                                       ["id": "remote", "kind": "remote", "host": "tower.example.net", "user": "me"]]
             }
         }
-        #expect(app.config.adopt(next, describedAs: "adopted from Beacon") == nil)
+        #expect(app.config.adoptOverCurrent(next, describedAs: "adopted from Beacon") == nil)
         #expect(app.launchReview.isEmpty)
         #expect(!app.isReviewingLaunch)
 
@@ -253,7 +253,7 @@ struct LaunchGateTests {
         let app = try Self.app(held, in: home, recorder: recorder)
 
         let next = try Self.child(of: held) { Self.system(machineId, "linux", in: &$0, change) }
-        #expect(app.config.adopt(next, describedAs: "adopted from Tower") == nil)
+        #expect(app.config.adoptOverCurrent(next, describedAs: "adopted from Tower") == nil)
         #expect(app.config.hash == (try Canonical.hash(next)))
         #expect(app.launchReview.map(\.path) == ["machines[\(machineId)].systems[linux]"])
         #expect(app.isReviewingLaunch)
@@ -300,7 +300,7 @@ struct LaunchGateTests {
         let next = try Self.child(of: held) { root in
             Self.system("pi", "linux", in: &root) { $0["restricted"] = false; $0["shell"] = "powershell" }
         }
-        #expect(app.config.adopt(next, describedAs: "adopted from Tower") == nil)
+        #expect(app.config.adoptOverCurrent(next, describedAs: "adopted from Tower") == nil)
         #expect(app.launchReview.map(\.path) == ["machines[pi].systems[linux]"])
         let system = try #require(app.machine(id: "pi")?.machine.system(id: "linux"))
         #expect(system.grammar == .success(.dispatch))
@@ -318,7 +318,7 @@ struct LaunchGateTests {
         let app = try Self.app(document, in: home)
         for name in ["Tower", "Desk tower", "Tower upstairs"] {
             document = try Self.child(of: document) { root in Self.machine("tower", in: &root) { $0["name"] = name } }
-            #expect(app.config.adopt(document, describedAs: "adopted") == nil)
+            #expect(app.config.adoptOverCurrent(document, describedAs: "adopted") == nil)
             #expect(app.launchReview.isEmpty)
             let windows = try #require(app.machine(id: "tower")?.machine.system(id: "windows"))
             #expect(windows.agent == Self.windowsLauncher)
@@ -359,7 +359,7 @@ struct LaunchGateTests {
             root["appUpdates"] = ["githubRepo": "someone/elsewhere"]
             root["local"] = ["enabled": true, "name": "This Mac", "agent": "/Users/me/elsewhere/index.mjs"]
         }
-        #expect(app.config.adopt(next, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(next, describedAs: "adopted") == nil)
         #expect(app.launchReview.map(\.path) == ["appUpdates.githubRepo", "local"])
         #expect(app.appUpdates.repository == "me/legion-fork")
         #expect(app.mac === local)
@@ -376,7 +376,7 @@ struct LaunchGateTests {
             root["appUpdates"] = ["githubRepo": "someone/elsewhere"]
             root["local"] = ["enabled": true, "name": "This Mac", "agent": "/Users/me/elsewhere/index.mjs"]
         }
-        #expect(app.config.adopt(next, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(next, describedAs: "adopted") == nil)
         #expect(app.appUpdates.repository == ControllerConfig.AppUpdatesConfig.defaultRepo)
         #expect(app.mac == nil)
         #expect(app.launchReview.map(\.kind) == [.new, .new])
@@ -399,7 +399,7 @@ struct LaunchGateTests {
             root["appUpdates"] = ["githubRepo": "me/legion-fork"]
         }
         let identity = try JSONDecoder().decode(ControllerConfig.self, from: document).identity
-        #expect(app.takeSetup(document, identity: identity, from: "Tower") == .awaitingConfirmation)
+        #expect(app.takeSetup(document, identity: identity, from: "Tower", replacing: app.config.document?.hash) == .awaitingConfirmation)
         let enrolment = try #require(app.enrolment)
         #expect(enrolment.projection.machines.map(\.id) == ["tower", "pi"])
         #expect(enrolment.projection.machines.flatMap(\.systems).compactMap(\.tuple?.agent)
@@ -413,7 +413,7 @@ struct LaunchGateTests {
         #expect(Self.file(file) == nil)
         #expect(app.config.config == nil)
 
-        _ = app.takeSetup(document, identity: identity, from: "Tower")
+        _ = app.takeSetup(document, identity: identity, from: "Tower", replacing: app.config.document?.hash)
         #expect(app.confirmEnrolment() == nil)
         #expect(app.enrolment == nil)
         #expect(app.config.hash == (try Canonical.hash(document)))
@@ -429,7 +429,7 @@ struct LaunchGateTests {
                              "systems": [["id": "linux", "platform": "linux", "agent": ["/usr/bin/node", "/srv/nas/bin/launcher.mjs"]]]])
             root["machines"] = machines
         }
-        #expect(app.config.adopt(next, describedAs: "adopted from Tower") == nil)
+        #expect(app.config.adoptOverCurrent(next, describedAs: "adopted from Tower") == nil)
         #expect(app.launchReview.map(\.path) == ["machines[tower].systems[linux]", "machines[nas].systems[linux]"])
         let nas = try #require(app.machine(id: "nas"))
         #expect(nas.machine.system(id: "linux")?.launchState == .notDriven)
@@ -449,7 +449,7 @@ struct LaunchGateTests {
             Self.system("pi", "linux", in: &root) { $0["agent"] = Self.piLauncher + ["--verbose"] }
         }
         let identity = try JSONDecoder().decode(ControllerConfig.self, from: document).identity
-        #expect(app.takeSetup(document, identity: identity, from: "Tower") == .awaitingConfirmation)
+        #expect(app.takeSetup(document, identity: identity, from: "Tower", replacing: app.config.document?.hash) == .awaitingConfirmation)
         let marked = try #require(app.enrolment).unapprovable
         #expect(marked.map(\.path) == ["machines[tower].systems[linux]", "machines[pi].systems[linux]"])
         #expect(LaunchText.whyNotEnrolled(marked[0]).hasPrefix("It holds a control, invisible or direction-changing character"))
@@ -482,7 +482,7 @@ struct LaunchGateTests {
         let (model, _, directory) = try MacModelTests.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
         var taken: (bytes: Data, holder: String)?
-        model.takeSetup = { bytes, _, holder in
+        model.takeSetup = { bytes, _, holder, _ in
             taken = (bytes, holder)
             return .awaitingConfirmation
         }
@@ -506,7 +506,7 @@ struct LaunchGateTests {
             Self.system("tower", "linux", in: &root) { $0["agent"] = ["/usr/bin/node", "/srv/other/bin/launcher.mjs"] }
         }
         let identity = try JSONDecoder().decode(ControllerConfig.self, from: other).identity
-        #expect(app.takeSetup(other, identity: identity, from: "Tower") == .adopted)
+        #expect(app.takeSetup(other, identity: identity, from: "Tower", replacing: app.config.document?.hash) == .adopted)
         #expect(app.enrolment == nil)
         #expect(app.launchReview.map(\.path) == ["machines[tower].systems[linux]"])
         #expect(Self.file(app.config.approvalsURL) == record)
@@ -542,7 +542,7 @@ struct LaunchGateTests {
         let homeB = try Self.home()
         defer { try? FileManager.default.removeItem(at: homeB) }
         let b = try Self.app(held, in: homeB)
-        #expect(b.config.adopt(migrated, describedAs: "adopted from A") == nil)
+        #expect(b.config.adoptOverCurrent(migrated, describedAs: "adopted from A") == nil)
         #expect(b.launchReview.isEmpty)
         #expect(b.machine(id: "tower")?.machine.system(id: "linux")?.agent == Self.launcher)
         #expect(b.approvals.record.value(at: .system(machine: "tower", system: "linux"))
@@ -555,7 +555,7 @@ struct LaunchGateTests {
             defer { try? FileManager.default.removeItem(at: home) }
             let peer = try Self.app(held, in: home)
             let next = try Self.child(of: held) { Self.system("tower", "linux", in: &$0, change) }
-            #expect(peer.config.adopt(next, describedAs: "adopted") == nil)
+            #expect(peer.config.adoptOverCurrent(next, describedAs: "adopted") == nil)
             #expect(peer.launchReview.map(\.path) == ["machines[tower].systems[linux]"])
             #expect(peer.machine(id: "tower")?.machine.system(id: "linux")?.agent == entry)
         }
@@ -599,7 +599,7 @@ struct LaunchGateTests {
 
         let evil = ["sh", "-c", "touch /tmp/x"]
         let next = try Self.child(of: try #require(app.config.rawBytes)) { Self.system("tower", "linux", in: &$0) { $0["agent"] = evil } }
-        #expect(app.config.adopt(next, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(next, describedAs: "adopted") == nil)
         #expect(app.launchReview.map(\.path) == ["machines[tower].systems[linux]"])
 
         // One field of the waiting system changes here; the rest of it is still not this device's.
@@ -621,7 +621,7 @@ struct LaunchGateTests {
         // The same controller block, so this is an edit made on this device.
         var root = try #require(try JSONSerialization.jsonObject(with: held) as? [String: Any])
         Self.system("tower", "linux", in: &root) { $0["agent"] = edited }
-        try JSONText.canonicalDocument(root).write(to: file)
+        try SetupJSON.document(root).write(to: file)
         app.config.reloadIfChanged()
         #expect(app.config.config?.identity.revisionNumber == 8)
         #expect(app.launchReview.isEmpty)
@@ -698,7 +698,7 @@ struct LaunchGateTests {
         let app = try Self.app(held, in: home)
 
         let next = try Self.child(of: held) { Self.system("tower", "linux", in: &$0) { $0["agent"] = ["sh", "-c", "id"] } }
-        #expect(app.config.adopt(next, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(next, describedAs: "adopted") == nil)
         let entry = try #require(app.launchReview.first)
         #expect(entry.approved == .tuple(LaunchTuple(agent: Self.launcher, grammar: "posix")))
         #expect(app.revertLaunch(entry) == nil)
@@ -711,7 +711,7 @@ struct LaunchGateTests {
         let unrestricted = try Self.child(of: try #require(app.config.rawBytes)) { root in
             Self.system("pi", "linux", in: &root) { $0["restricted"] = false; $0["shell"] = "powershell" }
         }
-        #expect(app.config.adopt(unrestricted, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(unrestricted, describedAs: "adopted") == nil)
         let restricted = try #require(app.launchReview.first)
         #expect(app.revertLaunch(restricted) == nil)
         #expect(app.launchReview.isEmpty)
@@ -726,11 +726,11 @@ struct LaunchGateTests {
         let app = try Self.app(held, in: home)
         let shownArgv = ["/usr/bin/node", "/srv/a/bin/launcher.mjs"]
         let first = try Self.child(of: held) { Self.system("tower", "linux", in: &$0) { $0["agent"] = shownArgv } }
-        #expect(app.config.adopt(first, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(first, describedAs: "adopted") == nil)
         let shown = app.launchReview
 
         let second = try Self.child(of: first) { Self.system("tower", "linux", in: &$0) { $0["agent"] = ["/usr/bin/node", "/srv/b/bin/launcher.mjs"] } }
-        #expect(app.config.adopt(second, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(second, describedAs: "adopted") == nil)
         app.approveLaunch(shown)
 
         #expect(app.approvals.record.value(at: .system(machine: "tower", system: "linux"))
@@ -751,7 +751,7 @@ struct LaunchGateTests {
         let held = try Self.held()
         let app = try Self.app(held, in: home)
         let first = try Self.child(of: held) { Self.system("tower", "linux", in: &$0) { $0["agent"] = ["sh", "-c", "id"] } }
-        #expect(app.config.adopt(first, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(first, describedAs: "adopted") == nil)
         #expect(app.isReviewingLaunch)
 
         app.deferLaunchReview(app.config.hash)
@@ -761,7 +761,7 @@ struct LaunchGateTests {
         #expect(!app.launchReview.isEmpty)
 
         let second = try Self.child(of: first) { Self.machine("pi", in: &$0) { $0["name"] = "Pi" } }
-        #expect(app.config.adopt(second, describedAs: "adopted") == nil)
+        #expect(app.config.adoptOverCurrent(second, describedAs: "adopted") == nil)
         #expect(app.isReviewingLaunch)
     }
 
@@ -843,7 +843,7 @@ struct LaunchGateTests {
         try Data(#"{ "schema": 1, "seededFrom": "none", "note": "kept", "machines": { "a/b": { "extra": 1 } } }"#.utf8).write(to: url)
         let store = LaunchApprovalStore(url: url)
 
-        let document = try JSONText.canonicalDocument([
+        let document = try SetupJSON.document([
             "machines": [["id": "a/b", "systems": [
                 ["id": "x.y", "agent": ["/usr/bin/node", "/opt/lc/bin/launcher.mjs"]],
                 ["id": "hidden", "agent": ["/usr/bin/node", "/opt/lc/bin/\u{202E}sjm.rehcnual"]],

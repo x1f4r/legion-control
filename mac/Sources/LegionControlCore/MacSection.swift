@@ -470,6 +470,11 @@ struct MacSection: View {
             Text("the local agent cannot carry the setup").foregroundStyle(.secondary)
         case .failed(let sentence):
             StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
+        case .held(let sentence):
+            VStack(alignment: .leading, spacing: 8) {
+                StatusText(symbol: "pause.circle", text: sentence, tint: .secondary)
+                Button("Try again") { mac.tryAgainSharingSetup() }.controlSize(.small)
+            }
         case .conflict(let sentence):
             VStack(alignment: .leading, spacing: 8) {
                 StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)

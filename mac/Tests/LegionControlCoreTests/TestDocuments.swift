@@ -12,3 +12,23 @@ extension ControllerConfig {
         return try JSONDecoder().decode(ControllerConfig.self, from: data)
     }
 }
+
+extension ConfigStore {
+    /// Adopt over whatever is applied this instant, as a fetch decided and committed at once would:
+    /// nil when it was applied, otherwise why not.
+    @MainActor
+    func adoptOverCurrent(_ bytes: Data, describedAs description: String) -> String? {
+        switch adopt(bytes, describedAs: description, replacing: document?.hash) {
+        case .adopted: nil
+        case .headMoved(let current): "the applied setup moved to \(current ?? "nothing")"
+        case .refused(let problem): problem
+        }
+    }
+}
+
+extension SetupJSON {
+    /// A Foundation value as the document text this app writes, new keys in code point order.
+    static func document(_ value: Any) throws -> Data {
+        try SetupJSON(foundation: value).documentData
+    }
+}

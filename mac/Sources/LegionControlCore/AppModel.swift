@@ -226,11 +226,11 @@ final class AppModel {
         device.controllerConfig = { [weak self] in self?.config.document }
         device.operations = operations
         device.onOperationFinished = { [weak self] record in self?.announce(record) }
-        device.adoptSetup = { [weak self] bytes, description in
-            self?.config.adopt(bytes, describedAs: description)
+        device.adoptSetup = { [weak self] bytes, description, head in
+            self?.config.adopt(bytes, describedAs: description, replacing: head) ?? .refused("Legion Control is closing.")
         }
-        device.takeSetup = { [weak self] bytes, identity, holder in
-            self?.takeSetup(bytes, identity: identity, from: holder) ?? .refused("Legion Control is closing.")
+        device.takeSetup = { [weak self] bytes, identity, holder, head in
+            self?.takeSetup(bytes, identity: identity, from: holder, replacing: head) ?? .refused("Legion Control is closing.")
         }
         device.setupBase = { [weak self] mineHash, mineLineage, theirsHash, theirsLineage in
             self?.config.commonAncestor(mineHash: mineHash, mineLineage: mineLineage,
@@ -364,7 +364,8 @@ final class AppModel {
         guard let raw = config.rawBytes, config.config?.identity.id == nil else { return nil }
         do {
             let edited = try ControllerEditor.adopting(raw, deviceName: bindings.bindings.effectiveDeviceName)
-            let problem = config.adopt(edited.bytes, describedAs: "gave this setup an identity")
+            let problem = describe(config.adopt(edited.bytes, describedAs: "gave this setup an identity",
+                                                replacing: config.document?.hash))
             onStateChange?()
             return problem
         } catch let failure as ControllerEditor.EditFailure {
@@ -375,6 +376,10 @@ final class AppModel {
     }
 
     /// Settle a divergence by merging the two branches.
+    ///
+    /// The merge is built from the two documents the sheet showed and written only over the one it
+    /// was built from: a setup saved here while the sheet was open closes it, and the comparison is
+    /// made again from what is applied now.
     @discardableResult
     func resolveDivergence(_ divergence: SetupDivergence,
                            choices: [String: SetupMerge.Choice]) -> String? {
@@ -403,10 +408,8 @@ final class AppModel {
             // merge as a fast-forward.
             config.keepRevision(divergence.mine.bytes)
             config.keepRevision(divergence.theirsBytes)
-            let problem = config.adopt(merged, describedAs: "merged with \(divergence.machineName)")
-            if problem == nil { self.divergence = nil }
-            onStateChange?()
-            return problem
+            return settle(divergence, with: config.adopt(merged, describedAs: "merged with \(divergence.machineName)",
+                                                         replacing: divergence.mine.hash))
         } catch let failure as SetupMerge.MergeFailure {
             return failure.message
         } catch {
@@ -424,14 +427,45 @@ final class AppModel {
         return resolveDivergence(divergence, choices: choices)
     }
 
-    /// Settle a divergence by taking the machine's branch.
+    /// Settle a divergence by taking the machine's branch, unchanged.
     @discardableResult
     func takeTheirs(_ divergence: SetupDivergence) -> String? {
         config.keepRevision(divergence.mine.bytes)
-        let problem = config.adopt(divergence.theirsBytes, describedAs: "took the setup from \(divergence.machineName)")
-        if problem == nil { self.divergence = nil }
-        onStateChange?()
-        return problem
+        return settle(divergence, with: config.adopt(divergence.theirsBytes, describedAs: "took the setup from \(divergence.machineName)",
+                                                     replacing: divergence.mine.hash))
+    }
+
+    /// What one way of settling a divergence came to. A setup that changed here while the sheet was
+    /// open closes it, and the device the sheet was about compares again from what is applied now.
+    private func settle(_ divergence: SetupDivergence, with outcome: ConfigStore.AdoptOutcome) -> String? {
+        defer { onStateChange?() }
+        switch outcome {
+        case .adopted:
+            self.divergence = nil
+            return nil
+        case .headMoved:
+            self.divergence = nil
+            let note = "The setup here changed while this was open; comparing again."
+            if let machine = machine(id: divergence.machineId) {
+                machine.setStatus(note)
+                machine.compareSetupAgain()
+            } else if let mac, mac.historyMachineId == divergence.machineId {
+                mac.setStatus(note)
+                mac.compareSetupAgain()
+            }
+            return note
+        case .refused(let problem):
+            return problem
+        }
+    }
+
+    /// An adoption's outcome as the sentence an edit path returns: nil when it was applied.
+    private func describe(_ outcome: ConfigStore.AdoptOutcome) -> String? {
+        switch outcome {
+        case .adopted: nil
+        case .headMoved: "The setup here changed meanwhile, so nothing was written. Try again."
+        case .refused(let problem): problem
+        }
     }
 
     // MARK: - Commands from the shared setup
@@ -486,10 +520,13 @@ final class AppModel {
     /// With a setup applied here this adopts a different one, which approves nothing: what it runs
     /// waits for review like anything else that arrived. With none it is enrolment, and nothing is
     /// written until the person has seen every command it runs and confirmed them.
-    func takeSetup(_ bytes: Data, identity: ControllerIdentity, from holder: String) -> SetupTaking {
+    func takeSetup(_ bytes: Data, identity: ControllerIdentity, from holder: String, replacing head: String?) -> SetupTaking {
         guard config.config == nil else {
-            if let problem = config.adopt(bytes, describedAs: "took the setup from \(holder)") { return .refused(problem) }
-            return .adopted
+            switch config.adopt(bytes, describedAs: "took the setup from \(holder)", replacing: head) {
+            case .adopted: return .adopted
+            case .headMoved: return .refused("The setup here changed while the one on \(holder) was being read, so nothing was taken. Look at the two again first.")
+            case .refused(let problem): return .refused(problem)
+            }
         }
         let canonical = try? Canonical.bytes(bytes)
         enrolment = LaunchEnrolment(
@@ -514,7 +551,7 @@ final class AppModel {
             onStateChange?()
             return "A setup was applied on this device meanwhile, so nothing was enrolled."
         }
-        let problem = config.enrol(enrolment.bytes, describedAs: "enrolled with the setup from \(enrolment.holder)")
+        let problem = describe(config.enrol(enrolment.bytes, describedAs: "enrolled with the setup from \(enrolment.holder)"))
         if problem == nil { self.enrolment = nil }
         onStateChange?()
         return problem
@@ -792,7 +829,7 @@ final class AppModel {
             lines.append("link: \(machine.stateDescription)")
             lines.append("agent: \(machine.status?.version ?? "not read"), \(machine.dialect.description)")
             lines.append("route: \(machine.lastRoute?.label ?? "none recorded")")
-            lines.append("setup: \(machine.setupDecision)")
+            lines.append("setup: \(machine.setupDecision.decision.rawValue)\(machine.setupDecision.reason.map { " (\($0))" } ?? "")")
             for note in machine.notes { lines.append("note: \(note)") }
             for service in machine.services {
                 lines.append("service \(service.id): installed=\(service.installed ?? "-") latest=\(service.latest ?? "-") running=\(service.running.map(String.init) ?? "-") healthy=\(service.healthy.map(String.init) ?? "-") busy=\(service.busy?.summary ?? "-")")

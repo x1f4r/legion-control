@@ -367,13 +367,13 @@ struct MacModelTests {
         runner.answer("status", json: Self.status)
         let (model, _, directory) = try Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        let document = Self.document
         model.controllerConfig = { document }
         var asked: PendingDialog?
         model.ask = { asked = $0 }
 
         await model.refresh()
-        model.core.setup.decision = .diverged
+        model.core.setup.verdict = SetupSync.Verdict(.diverged)
         model.requestSetupReplacement()
         let question = try #require(asked)
         #expect(question.title == "Replace the setup the local agent is holding?")
@@ -385,6 +385,10 @@ struct MacModelTests {
     }
 
     // MARK: - A different agent
+
+    /// A setup with an identity, so it takes part in reconciliation (section 9.5, rule 3).
+    static let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef",
+                                             identity: ControllerIdentity(id: "setup-test", revision: 1, lineage: []))
 
     /// A status from an agent that can hold the setup and holds none yet, so the first read pushes.
     static let statusHoldingNoSetup = """
@@ -454,7 +458,7 @@ struct MacModelTests {
         old.answer("status", json: Self.statusHoldingNoSetup)
         let (model, _, directory) = try Self.model(old)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        let document = Self.document
         model.controllerConfig = { document }
 
         await model.refresh()
@@ -471,7 +475,7 @@ struct MacModelTests {
 
         let fresh = FakeRunner()
         fresh.answer("status", json: Self.statusHoldingNoSetup)
-        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored" }"#)
+        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored", "hash": "0123456789abcdef" }"#)
         let bound = Self.boundAgent(fresh)
         model.update(config: LocalConfig(enabled: true, name: "This Mac", agent: bound.argv.last ?? ""),
                      agent: bound.agent, boundMachineId: nil, boundAgentArgv: bound.argv)
@@ -528,7 +532,7 @@ struct MacModelTests {
         let gate = Gate(holding: "config")
         let (model, directory) = try Self.gatedModel(old, gate: gate)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        let document = Self.document
         model.controllerConfig = { document }
 
         await model.refresh()
@@ -536,7 +540,7 @@ struct MacModelTests {
         let fresh = FakeRunner()
         fresh.answer("status", json: Self.statusHoldingNoSetup)
         fresh.answer("status", json: Self.statusHoldingNoSetup)
-        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored" }"#)
+        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored", "hash": "0123456789abcdef" }"#)
         let bound = Self.boundAgent(fresh)
         model.update(config: LocalConfig(enabled: true, name: "This Mac", agent: bound.argv.last ?? ""),
                      agent: bound.agent, boundMachineId: nil, boundAgentArgv: bound.argv)
@@ -549,9 +553,10 @@ struct MacModelTests {
         gate.release()
         let deadline = Date().addingTimeInterval(2)
         while model.core.setup.isSharing, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
-        // The old agent's refusal is about the old agent.
+        // The old agent's refusal is about the old agent. The new one holds nothing, so the row says
+        // a push is on its way rather than that one failed.
         #expect(model.core.setup.lastShare == nil)
-        #expect(model.setupSharing == .unknown)
+        #expect(model.setupSharing == .publishing)
         #expect(!model.noteIsError)
 
         await model.refresh()

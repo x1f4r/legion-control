@@ -42,6 +42,60 @@ struct AppModelTests {
     }
     """
 
+    /// A setup with an identity, and the divergence sheet as a peer holding a sibling of it would
+    /// raise it: built from the document applied now.
+    static func diverged(in home: URL) throws -> (AppModel, SetupDivergence) {
+        let app = try Self.app(Self.twoMachines.replacingOccurrences(
+            of: #""version": 1,"#,
+            with: #""version": 1, "controller": { "id": "setup-home", "revision": 1, "lineage": [] },"#), in: home)
+        let mine = try #require(app.config.document)
+        let theirs = try ControllerEditor.apply(to: mine.bytes, parentHash: mine.hash, parentIdentity: mine.identity,
+                                                deviceName: "Pixel") { root in
+            try ControllerEditor.upsertMachine(["id": "pi", "name": "Kitchen Pi"], in: &root)
+        }.bytes
+        let differences = try SetupMerge.differences(base: mine.bytes, mine: mine.bytes, theirs: theirs)
+        let divergence = SetupDivergence(machineId: "pi", machineName: "Pi", mine: mine, theirsBytes: theirs,
+                                         theirsHash: try Canonical.hash(theirs),
+                                         theirsIdentity: ControllerIdentity(block: try SetupJSON.parse(theirs)["controller"]),
+                                         baseBytes: mine.bytes, differences: differences, isDifferentSetup: false,
+                                         mergeBlocker: nil)
+        app.divergence = divergence
+        return (app, divergence)
+    }
+
+    @Test("merging, keeping mine and taking theirs never write over a setup saved while the sheet was open")
+    func settlingIsACompareAndSwap() throws {
+        for settle in [{ (app: AppModel, divergence: SetupDivergence) in app.resolveDivergence(divergence, choices: [:]) },
+                       { app, divergence in app.keepMine(divergence) },
+                       { app, divergence in app.takeTheirs(divergence) }] {
+            let home = try Self.home()
+            defer { try? FileManager.default.removeItem(at: home) }
+            let (app, divergence) = try Self.diverged(in: home)
+            // An edit lands while the sheet is up.
+            #expect(app.editSetup("renamed") { root in
+                try ControllerEditor.upsertMachine(["id": "tower", "name": "Big Tower"], in: &root)
+            } == nil)
+            let edited = try #require(app.config.document?.hash)
+
+            #expect(settle(app, divergence) == "The setup here changed while this was open; comparing again.")
+            #expect(app.divergence == nil)
+            #expect(app.config.document?.hash == edited)
+            #expect(app.config.config?.machine(id: "tower")?.name == "Big Tower")
+        }
+    }
+
+    @Test("a merge over the document the sheet was built from is written, descending from both")
+    func mergeLands() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let (app, divergence) = try Self.diverged(in: home)
+        #expect(app.resolveDivergence(divergence, choices: [:]) == nil)
+        #expect(app.divergence == nil)
+        let merged = try #require(app.config.document)
+        #expect(merged.identity.ancestors.prefix(2) == [divergence.mine.hash, divergence.theirsHash])
+        #expect(app.config.config?.machine(id: "pi")?.name == "Kitchen Pi")
+    }
+
     @Test("an edit to a machine's entry updates its model rather than replacing it")
     func editKeepsMachineModels() throws {
         let home = try Self.home()

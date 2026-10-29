@@ -1,34 +1,19 @@
 import Foundation
 
-/// Writing a JSON document the way every other device writes it.
+/// Writing JSON the way JavaScript writes it.
 ///
-/// This exists because of one hard requirement: the hash the whole fleet compares is a hash of the
-/// document's bytes, so two devices that serialise the same object differently hold two different
-/// documents as far as everybody else is concerned. `JSONSerialization.prettyPrinted` is not the
-/// same as `JSON.stringify(value, null, 2)` — Foundation writes `"a" : 1` and JavaScript writes
-/// `"a": 1` — and the stored form in `contract/fixtures/config.read.json` is the JavaScript one.
-///
-/// So the writer is spelled out here rather than delegated, exactly as the canonicaliser is.
-///
-/// Keys are sorted. JavaScript preserves insertion order and a Swift dictionary has none to
-/// preserve, so sorting is the only rule two languages can both follow; see
-/// integration-notes-mac.txt for the open question about documents written by a client that does
-/// not sort.
+/// `JSONSerialization.prettyPrinted` is not `JSON.stringify(value, null, 2)`: Foundation writes
+/// `"a" : 1` and JavaScript writes `"a": 1`, and Foundation escapes a forward slash. The setup
+/// document itself is written by `SetupJSON`, which keeps the order and the number spelling it read;
+/// what is here is the part both share, how a string is quoted and how a number is spelled, and a
+/// writer with sorted keys for this device's own files, which no other device reads.
 enum JSONText {
 
     struct Unrepresentable: Error, Sendable {
         var message: String
     }
 
-    /// `JSON.stringify(value, null, 2)` with sorted keys, then one trailing newline, then the
-    /// canonical rule applied so the result is exactly what gets hashed and stored.
-    static func canonicalDocument(_ value: Any) throws -> Data {
-        var out = ""
-        try write(value, into: &out, indent: 0)
-        return try Canonical.bytes(Data((out + "\n").utf8))
-    }
-
-    /// The same, without the canonical pass, for anything that is not a controller document.
+    /// `JSON.stringify(value, null, 2)` with sorted keys, for a file only this device writes.
     static func stringify(_ value: Any) throws -> String {
         var out = ""
         try write(value, into: &out, indent: 0)

@@ -1038,4 +1038,269 @@ struct MachineModelTests {
         #expect(service.busy?.verdict == .unmonitored)
         #expect(model.sidebarSummary(for: service) == "not monitored")
     }
+
+    // MARK: - Sharing the setup
+
+    /// An agent's replies to the setup requests, told apart by subcommand, and the means to hold one
+    /// open while the test does something else.
+    final class SetupRunner: @unchecked Sendable {
+        private let lock = NSLock()
+        private var replies: [String: [String]] = [:]
+        private var holding: Set<String> = []
+        private var arrived: Set<String> = []
+        private(set) var requests: [String] = []
+        private(set) var pushed: [Data] = []
+
+        static func key(_ arguments: [String]) -> String {
+            let words = (arguments.last ?? "").split(separator: " ").dropFirst(2).map(String.init)
+            guard let verb = words.first else { return "" }
+            if verb == "config", words.count > 1, ["meta", "set"].contains(words[1]) { return "config \(words[1])" }
+            return verb
+        }
+
+        func answer(_ key: String, _ json: String...) {
+            lock.withLock { replies[key, default: []].append(contentsOf: json) }
+        }
+
+        func hold(_ key: String) { lock.withLock { _ = holding.insert(key) } }
+
+        func release(_ key: String) { lock.withLock { _ = holding.remove(key) } }
+
+        func isHolding(_ key: String) -> Bool { lock.withLock { arrived.contains(key) && holding.contains(key) } }
+
+        var sent: [String] { lock.withLock { requests } }
+
+        func run(_ arguments: [String], input: Data?) async -> CommandResult {
+            let key = Self.key(arguments)
+            lock.withLock {
+                requests.append(key)
+                arrived.insert(key)
+                if key == "config set", let input { pushed.append(input) }
+            }
+            while lock.withLock({ holding.contains(key) }) { try? await Task.sleep(for: .milliseconds(5)) }
+            let reply: String? = lock.withLock {
+                guard var queue = replies[key], !queue.isEmpty else { return nil }
+                let next = queue.removeFirst()
+                replies[key] = queue
+                return next
+            }
+            guard let reply else {
+                FakeSSH.writeLog("ssh: connect to host 10.0.0.5 port 22: Operation timed out\n", for: arguments)
+                return CommandResult(exitCode: 255, standardOutput: "", standardError: "", timedOut: false, launchFailure: nil)
+            }
+            return CommandResult(exitCode: 0, standardOutput: reply, standardError: "", timedOut: false, launchFailure: nil)
+        }
+    }
+
+    static let setupId = "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846"
+
+    /// The applied setup, in a store of its own, at revision 1 with no ancestors.
+    static func setupStore() throws -> (ConfigStore, URL) {
+        let home = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-setup-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let file = home.appending(path: "config.json")
+        try Data("""
+        { "version": 1,
+          "controller": { "id": "\(setupId)", "name": "Home", "revision": 1, "lineage": [] },
+          "machines": [
+            { "id": "pi", "name": "Pi", "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.5", "user": "me" } ],
+              "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] },
+            { "id": "nas", "name": "NAS", "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.6", "user": "me" } ],
+              "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] } ] }
+        """.utf8).write(to: file)
+        return (ConfigStore(url: file), home)
+    }
+
+    /// A revision of the store's document as another device would write it, without applying it.
+    @MainActor
+    static func revision(of store: ConfigStore, renamingPiTo name: String) throws -> Data {
+        let raw = try #require(store.rawBytes)
+        return try ControllerEditor.apply(to: raw, parentHash: try Canonical.hash(raw),
+                                          parentIdentity: try #require(store.config).identity, deviceName: "Pixel") { root in
+            try ControllerEditor.upsertMachine(["id": "pi", "name": name], in: &root)
+        }.bytes
+    }
+
+    static func setupStatus(holding hash: String) -> String {
+        """
+        { "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "linux", "name": "Linux" },
+          "agent": { "version": "3.1.0", "contract": 3 }, "services": [],
+          "controller": { "hash": "\(hash)", "id": "\(setupId)" } }
+        """
+    }
+
+    static func setupMeta(_ document: Data) throws -> String {
+        let hash = try Canonical.hash(document)
+        let identity = ControllerIdentity(block: try SetupJSON.parse(document)["controller"])
+        let lineage = identity.ancestors.map { "\"\($0)\"" }.joined(separator: ",")
+        return #"{ "ok": true, "contract": 3, "hash": "\#(hash)", "meta": { "hash": "\#(hash)", "id": "\#(setupId)", "revision": \#(identity.revisionNumber), "lineage": [\#(lineage)] } }"#
+    }
+
+    static func setupRead(_ document: Data) throws -> String {
+        let reply: [String: Any] = ["ok": true, "contract": 3, "raw": String(decoding: document, as: UTF8.self),
+                                    "hash": try Canonical.hash(document)]
+        return String(decoding: try JSONSerialization.data(withJSONObject: reply), as: UTF8.self)
+    }
+
+    /// A machine model wired to the store the way the app wires it. The entry is built in code, so
+    /// its system is one this device runs; read from the document it would wait for approval.
+    static func setupModel(_ id: String, runner: SetupRunner, store: ConfigStore, logs: URL) throws -> MachineModel {
+        let entry = Machine(id: id, name: id, endpoints: [Endpoint(id: "lan", kind: "lan", host: "10.0.0.5", user: "me")],
+                            systems: [SystemConfig(id: "linux", name: "Linux", platform: .linux, agent: ["node", "/a.mjs"])])
+        var agent = RemoteAgent(machine: entry)
+        agent.logDirectory = logs.appending(path: "\(id)-logs")
+        agent.runner = { _, arguments, _, input in await runner.run(arguments, input: input) }
+        let model = MachineModel(machine: entry, agent: agent)
+        model.controllerConfig = { store.document }
+        model.adoptSetup = { bytes, description, head in store.adopt(bytes, describedAs: description, replacing: head) }
+        return model
+    }
+
+    static func eventually(_ condition: @MainActor () -> Bool) async {
+        let deadline = Date().addingTimeInterval(5)
+        while !condition(), Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+    }
+
+    @Test("an edit saved while a fetch was being read stays applied, and the next status finds the branch")
+    func adoptionKeepsAnEditSavedDuringTheRead() async throws {
+        let (store, home) = try Self.setupStore()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let original = try #require(store.document)
+        let theirs = try Self.revision(of: store, renamingPiTo: "Kitchen Pi")
+        let runner = SetupRunner()
+        runner.answer("status", Self.setupStatus(holding: try Canonical.hash(theirs)), Self.setupStatus(holding: try Canonical.hash(theirs)))
+        runner.answer("config meta", try Self.setupMeta(theirs))
+        runner.answer("config", try Self.setupRead(theirs))
+        runner.hold("config")
+        let model = try Self.setupModel("pi", runner: runner, store: store, logs: home)
+
+        await model.refresh(userInitiated: false)
+        await Self.eventually { runner.isHolding("config") }
+        #expect(runner.isHolding("config"))
+
+        // A person saves an edit while the read is out.
+        #expect(store.applyEdit(describedAs: "renamed", deviceName: "MacBook") { root in
+            try ControllerEditor.upsertMachine(["id": "nas", "name": "Basement NAS"], in: &root)
+        } == nil)
+        let edit = try #require(store.document)
+        runner.release("config")
+        await Self.eventually { !model.core.setup.isSharing }
+
+        // M16: the bytes chosen against the document the edit replaced are not written over it.
+        #expect(store.document?.hash == edit.hash)
+        #expect(store.config?.machine(id: "nas")?.name == "Basement NAS")
+        #expect(edit.hash != original.hash)
+
+        // The next status decides from the new head, and both sides now have a change of their own.
+        await model.refresh(userInitiated: false)
+        await Self.eventually { !model.core.setup.isSharing }
+        #expect(model.setupDecision.decision == .diverged)
+        #expect(!runner.sent.contains("config set"))
+    }
+
+    @Test("two reads out at once cannot both adopt: the second finds the head the first one wrote")
+    func twoReadsCannotOverwriteANewHead() async throws {
+        let (store, home) = try Self.setupStore()
+        defer { try? FileManager.default.removeItem(at: home) }
+        // Two machines hold two different children of the applied document.
+        let first = try Self.revision(of: store, renamingPiTo: "Kitchen Pi")
+        let second = try Self.revision(of: store, renamingPiTo: "Hall Pi")
+        let runners = [SetupRunner(), SetupRunner()]
+        for (runner, document) in zip(runners, [first, second]) {
+            runner.answer("status", Self.setupStatus(holding: try Canonical.hash(document)))
+            runner.answer("config meta", try Self.setupMeta(document))
+            runner.answer("config", try Self.setupRead(document))
+            runner.hold("config")
+        }
+        let pi = try Self.setupModel("pi", runner: runners[0], store: store, logs: home)
+        let nas = try Self.setupModel("nas", runner: runners[1], store: store, logs: home)
+
+        await pi.refresh(userInitiated: false)
+        await nas.refresh(userInitiated: false)
+        await Self.eventually { runners.allSatisfy { $0.isHolding("config") } }
+
+        runners[0].release("config")
+        await Self.eventually { !pi.core.setup.isSharing }
+        #expect(store.document?.hash == (try Canonical.hash(first)))
+
+        runners[1].release("config")
+        await Self.eventually { !nas.core.setup.isSharing }
+        // The second read was decided against the document the first one replaced, so it writes
+        // nothing, and deciding again finds the two branches.
+        #expect(store.document?.hash == (try Canonical.hash(first)))
+        #expect(nas.setupDecision.decision == .diverged)
+    }
+
+    @Test("a machine that moves between the meta read and the fetch is decided again, not adopted")
+    func remoteMovingBetweenMetaAndFetchReevaluates() async throws {
+        let (store, home) = try Self.setupStore()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let original = try #require(store.document)
+        let theirs = try Self.revision(of: store, renamingPiTo: "Kitchen Pi")
+        // Written on top of `theirs` by yet another device, after the meta read.
+        let scratch = try ConfigStore.scratch(theirs, in: home)
+        let later = try Self.revision(of: scratch, renamingPiTo: "Hall Pi")
+        let runner = SetupRunner()
+        runner.answer("status", Self.setupStatus(holding: try Canonical.hash(theirs)), Self.setupStatus(holding: try Canonical.hash(later)))
+        runner.answer("config meta", try Self.setupMeta(theirs), try Self.setupMeta(later))
+        runner.answer("config", try Self.setupRead(later), try Self.setupRead(later))
+        let model = try Self.setupModel("pi", runner: runner, store: store, logs: home)
+
+        await model.refresh(userInitiated: false)
+        await Self.eventually { !model.core.setup.isSharing && runner.sent.contains("config") }
+        #expect(store.document?.hash == original.hash)
+
+        await model.refresh(userInitiated: false)
+        await Self.eventually { store.document?.hash == (try? Canonical.hash(later)) }
+        #expect(store.document?.hash == (try Canonical.hash(later)))
+        #expect(runner.sent == ["status", "config meta", "config", "status", "config meta", "config"])
+    }
+
+    @Test("a push refused as restricted is not sent again until the setup changes")
+    func restrictedRefusalHoldsUntilHashChanges() async throws {
+        let (store, home) = try Self.setupStore()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let held = try #require(store.document)
+        #expect(store.applyEdit(describedAs: "renamed", deviceName: "MacBook") { root in
+            try ControllerEditor.upsertMachine(["id": "pi", "name": "Attic Pi"], in: &root)
+        } == nil)
+        let runner = SetupRunner()
+        runner.answer("status", Self.setupStatus(holding: held.hash), Self.setupStatus(holding: held.hash),
+                      Self.setupStatus(holding: held.hash))
+        runner.answer("config set", #"{ "ok": false, "contract": 3, "reasonCode": "restricted", "current": { "hash": "\#(held.hash)", "id": "\#(Self.setupId)" } }"#)
+        let model = try Self.setupModel("pi", runner: runner, store: store, logs: home)
+
+        await model.refresh(userInitiated: false)
+        await Self.eventually { !model.core.setup.isSharing && runner.sent.contains("config set") }
+        guard case .held = model.setupSharing else {
+            Issue.record("the refusal is not held: \(model.setupSharing)")
+            return
+        }
+        await model.refresh(userInitiated: false)
+        await Self.eventually { !model.core.setup.isSharing }
+        #expect(runner.sent.filter { $0 == "config set" }.count == 1)
+
+        // A new revision is a new document, and the machine is offered it.
+        #expect(store.applyEdit(describedAs: "renamed again", deviceName: "MacBook") { root in
+            try ControllerEditor.upsertMachine(["id": "pi", "name": "Loft Pi"], in: &root)
+        } == nil)
+        let newer = try #require(store.document)
+        runner.answer("config set", #"{ "ok": true, "contract": 3, "action": "stored", "hash": "\#(newer.hash)" }"#)
+        await model.refresh(userInitiated: false)
+        await Self.eventually { runner.sent.filter { $0 == "config set" }.count == 2 && !model.core.setup.isSharing }
+        #expect(runner.pushed.last == newer.bytes)
+        #expect(model.core.setup.lastShare?.failure == nil)
+    }
+}
+
+extension ConfigStore {
+    /// A store of its own holding one document, for building revisions on top of it.
+    @MainActor
+    static func scratch(_ document: Data, in home: URL) throws -> ConfigStore {
+        let directory = home.appending(path: "scratch-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appending(path: "config.json")
+        try document.write(to: file)
+        return ConfigStore(url: file)
+    }
 }

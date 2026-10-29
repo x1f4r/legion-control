@@ -13,7 +13,7 @@ import Observation
 /// AgentDeviceSetup.swift, and a model adds only what is really its own: how its agent is reached,
 /// how its status is read, and what power means for the machine it is.
 @MainActor
-protocol AgentDevice: AnyObject, Sendable {
+protocol AgentDevice: SetupChannel {
     /// What every device keeps the same way.
     var core: DeviceCore { get }
     /// What sentences and the operation history call this device.
@@ -28,8 +28,6 @@ protocol AgentDevice: AnyObject, Sendable {
     var recordedSystem: (id: String?, name: String?) { get }
     /// The route the last call went over, for the operation record.
     var recordedRoute: String? { get }
-    /// What sentences about this device's copy of the setup call whoever holds it.
-    var setupHolder: String { get }
     /// Whether a fresh status read follows every action, rather than only the ones whose resolution
     /// asks for one.
     var readsAfterEveryAction: Bool { get }
@@ -78,8 +76,8 @@ final class DeviceCore {
     /// good read can put the last action's own outcome back.
     fileprivate(set) var lineIsRefreshFailure = false
 
-    /// What this device knows about its agent's copy of the setup. Kept by AgentDeviceSetup.swift.
-    var setup = SetupCopyState()
+    /// Sharing the setup with this device's agent (SetupPeerSync.swift).
+    let setup = SetupPeerSync()
 
     /// Counts the agents this device has been pointed at. A reply that set out before the count
     /// moved came from an agent the device no longer runs, and is not taken as the new one's.
@@ -105,12 +103,14 @@ final class DeviceCore {
     /// The setup this device is running on. Every agent gets a copy of it, the local one included:
     /// the file is the source of truth, and no device is an exception to that.
     var controllerConfig: (@MainActor () -> ControllerDocument?)?
-    /// Adopt a document read off this device's agent.
-    var adoptSetup: (@MainActor (Data, String) -> String?)?
-    /// Take a document a person asked to take from this device's agent. With no setup applied here
-    /// that is enrolment: every launch value in it is shown, and nothing is written until the
-    /// person confirms. With one applied it is adopting a different setup, which approves nothing.
-    var takeSetup: (@MainActor (Data, ControllerIdentity, String) -> SetupTaking)?
+    /// Adopt a document read off this device's agent, in place of the applied document with the
+    /// hash given, nil for none: a compare-and-swap (ConfigStore.adopt).
+    var adoptSetup: (@MainActor (Data, String, String?) -> ConfigStore.AdoptOutcome)?
+    /// Take a document a person asked to take from this device's agent, in place of the applied
+    /// document with the hash given. With no setup applied here that is enrolment: every launch
+    /// value in it is shown, and nothing is written until the person confirms. With one applied it
+    /// is adopting a different setup, which approves nothing.
+    var takeSetup: (@MainActor (Data, ControllerIdentity, String, String?) -> SetupTaking)?
     /// The bytes of the base a merge of the two documents needs (section 9.8), when this device
     /// kept them: mine's hash and lineage, then theirs'. Without it a merge can still be done, but
     /// every difference needs a decision instead of only the ones both sides touched.
@@ -132,7 +132,7 @@ final class DeviceCore {
         agentGeneration += 1
         doctor = nil
         doctorRanAt = nil
-        setup = SetupCopyState(isSharing: setup.isSharing)
+        setup.agentDidChange()
     }
 }
 
@@ -286,12 +286,12 @@ extension AgentDevice {
         set { core.controllerConfig = newValue }
     }
 
-    var adoptSetup: (@MainActor (Data, String) -> String?)? {
+    var adoptSetup: (@MainActor (Data, String, String?) -> ConfigStore.AdoptOutcome)? {
         get { core.adoptSetup }
         set { core.adoptSetup = newValue }
     }
 
-    var takeSetup: (@MainActor (Data, ControllerIdentity, String) -> SetupTaking)? {
+    var takeSetup: (@MainActor (Data, ControllerIdentity, String, String?) -> SetupTaking)? {
         get { core.takeSetup }
         set { core.takeSetup = newValue }
     }

@@ -686,42 +686,6 @@ struct ControllerDocument: Sendable, Equatable {
         self.errors = errors
     }
 
-    /// How this document stands against what a machine is holding.
-    ///
-    /// This replaces comparing revision numbers, which cannot tell "newer" from "different" once
-    /// more than one device may write. Descent can.
-    func standing(against remote: ControllerIdentity, remoteHash: String?) -> Standing {
-        guard let remoteId = remote.id, let mine = identity.id else {
-            // One side carries no identity at all: a hand written file, or a copy pushed by a client
-            // from before any of this. There is nothing to compare, and the push rules treat an
-            // unidentified copy as replaceable.
-            return remote.id == nil ? .remoteHasNoIdentity : .differentSetup
-        }
-        guard mine == remoteId else { return .differentSetup }
-        guard let remoteHash else { return .cannotTell }
-        if remoteHash == hash { return .same }
-        if identity.descends(from: remoteHash) { return .weAreAhead }
-        if remote.descends(from: hash) { return .weAreBehind }
-        return .diverged
-    }
-
-    enum Standing: Sendable, Equatable {
-        /// The machine holds exactly this document.
-        case same
-        /// The machine holds an ancestor of this one: safe to push.
-        case weAreAhead
-        /// This document is an ancestor of the machine's: safe to fetch.
-        case weAreBehind
-        /// Same setup, neither descends from the other. A person has to decide.
-        case diverged
-        /// A different setup id. A person has to decide.
-        case differentSetup
-        /// The machine holds something with no identity, so anything may be written over it.
-        case remoteHasNoIdentity
-        /// Not enough information yet: the machine's hash is not known.
-        case cannotTell
-    }
-
     /// Build one from whatever was read off disk. Throws for bytes that are not valid UTF-8, which
     /// have no canonical form and therefore no hash.
     init(raw: Data, identity: ControllerIdentity = ControllerIdentity()) throws {
@@ -762,6 +726,9 @@ enum SetupSharing: Sendable, Equatable {
     /// The machine is behind and is being given this document. Automatic: it descends from what
     /// they hold, so nothing of theirs is lost.
     case publishing
+    /// A push the machine refused for a reason trying again cannot fix, kept back until the setup
+    /// changes or a person asks. The sentence says why.
+    case held(String)
     /// Nothing to say: the machine has not been read, or this Mac has no usable config to share.
     case unknown
 }
@@ -1261,45 +1228,74 @@ final class ConfigStore {
         }
     }
 
-    /// Adopt a document read off a machine, or produced by a merge.
+    /// What became of an adoption.
+    enum AdoptOutcome: Sendable, Equatable {
+        /// The document is applied here, under this hash.
+        case adopted(hash: String)
+        /// The applied document is no longer the one the adoption was decided against, so nothing
+        /// was written. What is applied now, if anything, is `current`.
+        case headMoved(current: String?)
+        /// Nothing was written, and this says why.
+        case refused(String)
+    }
+
+    /// Adopt a document read off a machine, or produced by a merge, in place of the one applied.
     ///
-    /// The bytes are written exactly as they are: this device is not the author, and re-serialising
-    /// them would change the hash and turn a fast-forward into a divergence. Adopting approves no
-    /// launch value: an automatic fetch, taking theirs, a merge and keeping mine all come through
-    /// here, and what the document asks this device to run waits for a person.
-    @discardableResult
-    func adopt(_ bytes: Data, describedAs description: String) -> String? {
-        adopt(bytes, describedAs: description, enrolling: false)
+    /// A compare-and-swap (section 9.5). The decision to adopt was made against the document
+    /// applied then, `expectedHead`, nil when there was none; reading the bytes took a round trip,
+    /// and a person may have saved an edit meanwhile. So the file is read again first, and when the
+    /// applied hash is not the one expected, or a hand edit is waiting to be recorded, nothing is
+    /// written: the edit stays, and the next status decides from it (M16). Take theirs, Keep mine
+    /// and Merge come through here as well, expecting the document the divergence sheet was built
+    /// from.
+    ///
+    /// The bytes are written exactly as they are, canonicalised and never re-serialised: this device
+    /// is not their author, and writing them any other way would change the hash and turn a
+    /// fast-forward into a divergence. They are held to section 9.7 under peer intake first.
+    /// Adopting approves no launch value: what the document asks this device to run waits for a
+    /// person.
+    func adopt(_ bytes: Data, describedAs description: String, replacing expectedHead: String?) -> AdoptOutcome {
+        adopt(bytes, describedAs: description, replacing: expectedHead, enrolling: false)
     }
 
     /// Adopt a document as this device's first setup, approving every launch value in it.
     ///
     /// Only for enrolment: a device that applies no setup yet, taking one a person chose after every
     /// launch value in it was shown to them and they confirmed. The approvals are recorded before
-    /// the file is written, so nothing it runs flashes up for review.
+    /// the file is written, so nothing it runs flashes up for review. A setup applied meanwhile
+    /// makes this a moved head like any other.
     @discardableResult
-    func enrol(_ bytes: Data, describedAs description: String) -> String? {
-        adopt(bytes, describedAs: description, enrolling: true)
+    func enrol(_ bytes: Data, describedAs description: String) -> AdoptOutcome {
+        adopt(bytes, describedAs: description, replacing: nil, enrolling: true)
     }
 
-    private func adopt(_ bytes: Data, describedAs description: String, enrolling: Bool) -> String? {
+    private func adopt(_ bytes: Data, describedAs description: String, replacing expectedHead: String?,
+                       enrolling: Bool) -> AdoptOutcome {
+        reloadIfChanged()
+        // A hand edit not yet recorded as a revision is an edit all the same, made after whatever
+        // the adoption was decided against.
+        let current = hasPendingExternalEdit ? hash : document?.hash
+        guard !hasPendingExternalEdit, current == expectedHead else { return .headMoved(current: current) }
+        if let refusal = Canonical.rejection(bytes) {
+            return .refused("That setup could not be adopted: \(refusal.sentence)")
+        }
+        if let error = DocumentAcceptance.check(bytes, intake: .peer).errors.first {
+            return .refused("That setup could not be adopted: \(error.message)")
+        }
         do {
-            if let refusal = Canonical.rejection(bytes) { throw ConfigProblem(refusal.sentence) }
-            if let error = DocumentAcceptance.check(bytes, intake: .peer).errors.first { throw ConfigProblem(error.message) }
             let canonical = try Canonical.bytes(bytes)
             if enrolling { onLocalEdit?(nil, canonical) }
             if let raw = rawBytes ?? (try? Data(contentsOf: url)) {
                 keepRevision(try Canonical.bytes(raw))
             }
-            expectedWriteHash = Canonical.sha256(canonical)
+            let adopted = Canonical.sha256(canonical)
+            expectedWriteHash = adopted
             try AtomicFile.write(canonical, to: url)
             lastEditDescription = description
             load()
-            return nil
-        } catch let problem as ConfigProblem {
-            return "That setup could not be adopted: \(problem.message)"
+            return .adopted(hash: adopted)
         } catch {
-            return "That setup could not be written to \(path). \(error.localizedDescription)"
+            return .refused("That setup could not be written to \(path). \(error.localizedDescription)")
         }
     }
 

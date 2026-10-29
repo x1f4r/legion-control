@@ -176,9 +176,12 @@ struct ConfigTests {
         #expect(store.errors.map(\.code) == ["helper-unknown"])
         // The machine the error is inside is not driven, and the other one still is.
         #expect(store.config?.machines.map(\.id) == ["pi"])
-        // And it is still the document this device decides from, carrying its errors.
+        // And it decides and merges as it is, but is never published.
         let document = try #require(store.document)
         #expect(!document.errors.isEmpty)
+        let gate = SetupSync.gate(decision: .push, localHash: document.hash, remoteHash: nil, agentVersion: nil, now: Date(),
+                                  state: SetupSync.PeerState(localInvalid: !document.errors.isEmpty))
+        #expect(gate == SetupSync.Gate(.hold, reason: "local-invalid"))
     }
 
     @Test("a setup that already breaks a rule can still be edited, and fixed, but not broken further")
@@ -373,6 +376,111 @@ struct ConfigTests {
         #expect(store.config?.identity.name == "Cabin")
     }
 
+    // MARK: - Adopting
+
+    /// A store applying a setup with an identity, and a child of it as another device wrote it.
+    static func storeWithChild() throws -> (ConfigStore, URL, child: Data) {
+        let (store, home) = try Self.store(Self.twoMachines)
+        #expect(store.applyEdit(describedAs: "identity", deviceName: "MacBook") { _ in } == nil)
+        let raw = try #require(store.rawBytes)
+        let child = try ControllerEditor.apply(to: raw, parentHash: try Canonical.hash(raw),
+                                               parentIdentity: try #require(store.config).identity, deviceName: "Pixel") { root in
+            try ControllerEditor.upsertMachine(["id": "pi", "name": "Kitchen Pi"], in: &root)
+        }.bytes
+        return (store, home, child)
+    }
+
+    @Test("an adoption is written over the head it was decided against, and over nothing else")
+    func adoptionIsACompareAndSwap() throws {
+        let (store, home, child) = try Self.storeWithChild()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let head = try #require(store.document?.hash)
+
+        // A person saves an edit between the decision and the write (M16).
+        #expect(store.applyEdit(describedAs: "edit", deviceName: "MacBook") { root in
+            try ControllerEditor.upsertMachine(["id": "tower", "name": "Big Tower"], in: &root)
+        } == nil)
+        let edited = try #require(store.document?.hash)
+        #expect(store.adopt(child, describedAs: "adopted", replacing: head) == .headMoved(current: edited))
+        #expect(store.document?.hash == edited)
+        #expect(store.config?.machine(id: "tower")?.name == "Big Tower")
+
+        // Against the head as it is now, the same bytes are written exactly as they came.
+        #expect(store.adopt(child, describedAs: "adopted", replacing: edited) == .adopted(hash: try Canonical.hash(child)))
+        #expect(store.rawBytes == child)
+    }
+
+    @Test("an edit saved by another program is noticed at the moment of writing")
+    func adoptionRereadsTheFile() throws {
+        let (store, home, child) = try Self.storeWithChild()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let head = try #require(store.document?.hash)
+
+        // A revision written straight to the file, which the watcher has not reported yet.
+        let raw = try #require(store.rawBytes)
+        let other = try ControllerEditor.apply(to: raw, parentHash: head, parentIdentity: try #require(store.config).identity,
+                                               deviceName: "Editor") { root in
+            try ControllerEditor.upsertMachine(["id": "tower", "name": "Hand Tower"], in: &root)
+        }.bytes
+        Thread.sleep(forTimeInterval: 0.01)
+        try other.write(to: store.url)
+        #expect(store.adopt(child, describedAs: "adopted", replacing: head) == .headMoved(current: try Canonical.hash(other)))
+        #expect(store.rawBytes == other)
+    }
+
+    @Test("a hand edit not yet recorded as a revision always reads as a moved head")
+    func pendingHandEditIsAMovedHead() throws {
+        let (store, home, child) = try Self.storeWithChild()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let head = try #require(store.document?.hash)
+
+        // The same controller block, so this is an edit waiting to be given a revision.
+        let raw = String(decoding: try #require(store.rawBytes), as: UTF8.self)
+        Thread.sleep(forTimeInterval: 0.01)
+        try Data(raw.replacingOccurrences(of: "\"Tower\"", with: "\"Hand Tower\"").utf8).write(to: store.url)
+        store.reloadIfChanged()
+        #expect(store.hasPendingExternalEdit)
+        guard case .headMoved = store.adopt(child, describedAs: "adopted", replacing: head) else {
+            Issue.record("a pending hand edit was overwritten")
+            return
+        }
+        #expect(store.config?.machine(id: "tower")?.name == "Hand Tower")
+    }
+
+    @Test("two adoptions decided against one head cannot both land")
+    func secondAdoptionFindsTheFirst() throws {
+        let (store, home, child) = try Self.storeWithChild()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let head = try #require(store.document?.hash)
+        let raw = try #require(store.rawBytes)
+        let sibling = try ControllerEditor.apply(to: raw, parentHash: head, parentIdentity: try #require(store.config).identity,
+                                                 deviceName: "Desk tower") { root in
+            try ControllerEditor.upsertMachine(["id": "pi", "name": "Hall Pi"], in: &root)
+        }.bytes
+
+        #expect(store.adopt(child, describedAs: "first", replacing: head) == .adopted(hash: try Canonical.hash(child)))
+        #expect(store.adopt(sibling, describedAs: "second", replacing: head) == .headMoved(current: try Canonical.hash(child)))
+        #expect(store.rawBytes == child)
+    }
+
+    @Test("an adoption is refused for bytes section 12 or 9.7 refuses")
+    func adoptionChecksTheBytes() throws {
+        let (store, home, child) = try Self.storeWithChild()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let head = try #require(store.document?.hash)
+        let broken = Data(String(decoding: child, as: UTF8.self).replacingOccurrences(of: "\"machine\": \"pi\"", with: "\"machine\": \"ghost\"").utf8)
+        guard case .refused(let why) = store.adopt(broken, describedAs: "adopted", replacing: head) else {
+            Issue.record("a document with an unknown helper was adopted")
+            return
+        }
+        #expect(why.contains("ghost"))
+        guard case .refused = store.adopt(Data([0xEF, 0xBB, 0xBF, 0xEF, 0xBB, 0xBF]) + child, describedAs: "adopted", replacing: head) else {
+            Issue.record("a document behind two byte order marks was adopted")
+            return
+        }
+        #expect(store.document?.hash == head)
+    }
+
     @Test("setting helpers writes the compatibility alias too")
     func helpersWriteTheAlias() throws {
         let (store, home) = try Self.store(Self.twoMachines)
@@ -482,7 +590,8 @@ struct ConfigTests {
         #expect(adopted.identity.id?.hasPrefix("setup-") == true)
         #expect(adopted.identity.revisionNumber == 1)
         #expect(adopted.identity.ancestors.isEmpty)
-        #expect(store.adopt(adopted.bytes, describedAs: "gave it an identity") == nil)
+        #expect(store.adopt(adopted.bytes, describedAs: "gave it an identity", replacing: store.document?.hash)
+                == .adopted(hash: try Canonical.hash(adopted.bytes)))
         #expect(store.config?.identity.id == adopted.identity.id)
     }
 

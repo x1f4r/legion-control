@@ -13,7 +13,7 @@ struct ContractVectorTests {
 
     /// The families this suite runs. A family joins when this app has a port of its reference to
     /// run, and the contract has nine.
-    static let families = ["hash", "identifiers", "transport", "setup-acceptance", "launch", "setup-merge"]
+    static let families = ["hash", "identifiers", "transport", "setup-acceptance", "launch", "setup-reconcile", "setup-merge"]
 
     typealias Adapter = @Sendable (VectorJSON) throws -> VectorJSON
 
@@ -48,6 +48,11 @@ struct ContractVectorTests {
             guard let value = item.string else { throw BadInput(description: "\(key) holds a non-string") }
             return value
         }
+    }
+
+    /// A time the vectors write as integer milliseconds.
+    static func date(_ value: VectorJSON?) -> Date? {
+        value?.number.map { Date(timeIntervalSince1970: $0 / 1000) }
     }
 
     /// The codes of a list of problems as the vectors list them: sorted, each once.
@@ -212,6 +217,67 @@ struct ContractVectorTests {
             let verdict = DocumentAcceptance.check(Data(try string(input, "text").utf8), intake: intake)
             return ["valid": .bool(verdict.valid), "errors": codes(verdict.errors), "warnings": codes(verdict.warnings),
                     "assignsIdentity": .bool(verdict.assignsIdentity), "keep": .bool(verdict.keep)]
+        },
+
+        // Section 9.5.
+        "setup-reconcile/decide": { input in
+            let local = try input["local"].flatMap { local -> SetupSync.Local? in
+                if local.isNull { return nil }
+                return SetupSync.Local(hash: try string(local, "hash"), id: local["id"]?.string, lineage: try strings(local, "lineage"))
+            }
+            let status = input["status"].flatMap { $0.isNull ? nil : $0 }
+            let remote = status?["controller"].flatMap { controller -> ControllerCopy? in
+                controller.isNull ? nil : ControllerCopy(hash: controller["hash"]?.string, id: controller["id"]?.string)
+            }
+            var metaByHash: [String: SetupSync.Meta] = [:]
+            for (hash, meta) in input["metaByHash"]?.object ?? [:] {
+                metaByHash[hash] = SetupSync.Meta(id: meta["id"]?.string, lineage: try strings(meta, "lineage"))
+            }
+            let verdict = SetupSync.decide(local: local, contract: status?["contract"]?.int, remote: remote, metaByHash: metaByHash)
+            return ["decision": .string(verdict.decision.rawValue), "reason": VectorJSON(verdict.reason), "expect": VectorJSON(verdict.expect)]
+        },
+        "setup-reconcile/admit": { input in
+            let expected = try #require(input["expected"])
+            let fetched = try #require(input["fetched"])
+            let admission = SetupSync.admit(
+                expected: SetupSync.Expected(localHash: try string(expected, "localHash"), localId: try string(expected, "localId"),
+                                             remoteHash: try string(expected, "remoteHash")),
+                currentLocalHash: input["currentLocalHash"]?.string,
+                fetched: SetupSync.Fetched(hash: fetched["hash"]?.string, replyHash: try string(fetched, "replyHash"),
+                                           id: fetched["id"]?.string, lineage: try strings(fetched, "lineage")),
+                accepted: input["accepted"]?.bool ?? false
+            )
+            return ["admission": .string(admission.rawValue)]
+        },
+        "setup-reconcile/gate": { input in
+            guard let decision = SetupSync.Decision(rawValue: try string(input, "decision")), let state = input["state"] else {
+                throw BadInput(description: "unknown decision or no state")
+            }
+            var peer = SetupSync.PeerState()
+            peer.inFlight = state["inFlight"]?.bool ?? false
+            peer.failedAt = (state["failedAt"]?.object ?? [:]).compactMapValues(date)
+            peer.held = (state["held"]?.object ?? [:]).compactMapValues(\.string)
+            peer.localInvalid = state["localInvalid"]?.bool ?? false
+            peer.localMutation = state["localMutation"]?.bool ?? false
+            peer.runningOperations = state["runningOperations"]?.int ?? 0
+            peer.lockedAt = date(state["lockedAt"])
+            peer.statusAt = date(state["statusAt"])
+            peer.settled = Set(try strings(state, "settled"))
+            let gate = SetupSync.gate(decision: decision, localHash: try string(input, "localHash"),
+                                      remoteHash: input["remoteHash"]?.string, agentVersion: input["agentVersion"]?.string,
+                                      now: try #require(date(input["now"])), state: peer)
+            return ["action": .string(gate.action.rawValue), "reason": VectorJSON(gate.reason)]
+        },
+        "setup-reconcile/pushReply": { input in
+            // The reply as the transport hands it over: decoded, or nothing when it would not decode.
+            let reply = try input["reply"].flatMap { reply -> AgentConfigResult? in
+                if reply.isNull { return nil }
+                let data = try JSONSerialization.data(withJSONObject: reply.foundation)
+                return try? JSONDecoder().decode(AgentConfigResult.self, from: data)
+            }
+            let effect = SetupSync.afterPush(reply, localHash: try string(input, "localHash"))
+            let metaHash: String? = if case .fileMeta(let hash, _) = effect { hash } else { nil }
+            return ["effect": .string(effect.name), "metaHash": VectorJSON(metaHash)]
         },
 
         // Section 9.8.
