@@ -181,13 +181,14 @@ configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configu
 }
 
 // Shared contract and signature fixtures are test inputs even though they live outside Android.
-// The corpus is found through legion.contract rather than by guessing at working directories, so a
-// test that cannot find it fails instead of skipping.
+// They are found through legion.contract and legion.trust rather than by guessing at working
+// directories, so a test that cannot find them fails instead of skipping.
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     systemProperty("legion.contract", rootProject.file("../contract").absolutePath)
     inputs.files(rootProject.fileTree("../contract") {
         include("fixtures/*.json", "vectors/*.json", "schemas/*.json", "hash-vectors.json", "release-public-key.pem", "bootstrap/*.cjs")
     })
+    systemProperty("legion.trust", rootProject.file("../tests/fixtures/trust").absolutePath)
     inputs.files(rootProject.fileTree("../tests/fixtures/trust") { include("*") })
     // The manifest is a test input too: the configuration changes the activity absorbs and what it
     // declares for the service that keeps a change running are rules, and are held to tests.

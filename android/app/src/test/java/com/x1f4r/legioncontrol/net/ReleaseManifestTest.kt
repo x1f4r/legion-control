@@ -1,10 +1,10 @@
 package com.x1f4r.legioncontrol.net
 
+import com.x1f4r.legioncontrol.contract.TrustFixtures
 import com.x1f4r.legioncontrol.data.Trust
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
 
@@ -20,15 +20,12 @@ import java.io.File
  */
 class ReleaseManifestTest {
 
-    private fun fixture(name: String): File? = listOf(
-        File("../../tests/fixtures/trust/$name"),
-        File("../tests/fixtures/trust/$name"),
-    ).firstOrNull { it.isFile }
+    private fun fixture(name: String): File = TrustFixtures.file(name)
 
-    private fun verified(): VerifiedManifest? {
-        val manifest = fixture("manifest.json") ?: return null
-        val signature = fixture("manifest.json.sig") ?: return null
-        return ReleaseVerification.verify(manifest.readBytes(), signature.readText(), null).getOrNull()
+    private fun verified(): VerifiedManifest {
+        val manifest = fixture("manifest.json")
+        val signature = fixture("manifest.json.sig")
+        return ReleaseVerification.verify(manifest.readBytes(), signature.readText(), null).getOrThrow()
     }
 
     @Test
@@ -54,11 +51,9 @@ class ReleaseManifestTest {
     fun `a version that does not match the tag is refused`() {
         val manifest = fixture("manifest.json")
         val signature = fixture("manifest.json.sig")
-        assumeTrue("the shared trust fixture is not in this checkout", manifest != null)
-
         val outcome = ReleaseVerification.verify(
-            manifest!!.readBytes(),
-            signature!!.readText(),
+            manifest.readBytes(),
+            signature.readText(),
             expectedVersion = "2.0.0",
         )
         val problem = (outcome.exceptionOrNull() as ManifestVerificationFailed).problem
@@ -70,17 +65,14 @@ class ReleaseManifestTest {
     @Test
     fun `an artifact the manifest does not list is refused`() {
         val manifest = verified()
-        assumeTrue("the shared trust fixture is not in this checkout", manifest != null)
-        val problem = ReleaseVerification.checkArtifact(manifest!!, "not-listed.apk", ByteArray(3))
+        val problem = ReleaseVerification.checkArtifact(manifest, "not-listed.apk", ByteArray(3))
         assertTrue(problem is ManifestProblem.MissingArtifact)
     }
 
     @Test
     fun `the wrong size and the wrong hash are told apart`() {
         val manifest = verified()
-        assumeTrue("the shared trust fixture is not in this checkout", manifest != null)
-
-        val wrongSize = ReleaseVerification.checkArtifact(manifest!!, "fixture.bin", "abcd".toByteArray())
+        val wrongSize = ReleaseVerification.checkArtifact(manifest, "fixture.bin", "abcd".toByteArray())
         assertTrue(wrongSize is ManifestProblem.WrongSize)
         assertTrue(wrongSize!!.sentence.contains("4 bytes"))
 
