@@ -126,8 +126,8 @@ jobs:
             android/gradle/wrapper/gradle-wrapper.properties
       - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
-          # The runner's command-line tools no longer offer the legacy "tools" package the
-          # action asks for by default, and sdkmanager then fails the job before Gradle starts.
+          # The action's default today, spelled out so that a later default cannot change what
+          # is installed.
           packages: platform-tools
       - run: bash scripts/check.sh android
 
@@ -184,6 +184,7 @@ jobs:
             android/gradle/wrapper/gradle-wrapper.properties
       - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
+          # As in the Android job: the default today, spelled out.
           packages: platform-tools
       - name: Build and lint the release APK, unsigned
         working-directory: android

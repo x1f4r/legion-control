@@ -90,7 +90,7 @@ test('the release dry run builds what release.sh builds, and reads no secret', (
   assert.match(job('private-data'), /run: node scripts\/check-private-data\.mjs\n\s+env:\n\s+LEGION_PRIVATE_TERMS: \$\{\{ secrets\.LEGION_PRIVATE_TERMS \}\}/);
 });
 
-test('the Gradle wrapper is validated before Gradle runs, and Gradle and NuGet are cached', () => {
+test('the Gradle wrapper is validated before Gradle runs, the SDK is named, and Gradle and NuGet are cached', () => {
   // The jar is checked by CI and the distribution it downloads by the wrapper itself.
   assert.match(read('android/gradle/wrapper/gradle-wrapper.properties'), /^distributionSha256Sum=[0-9a-f]{64}$/m);
   for (const id of ['android', 'release-android']) {
@@ -99,6 +99,8 @@ test('the Gradle wrapper is validated before Gradle runs, and Gradle and NuGet a
     assert.ok(validated >= 0, `${id} does not validate the Gradle wrapper`);
     assert.ok(validated < lines.indexOf('actions/setup-java@'), `${id} sets Java up before it validates the wrapper`);
     assert.match(lines, /cache: gradle\n\s+cache-dependency-path: \|\n(?:\s+android\/.+\n){4}/);
+    // Both jobs install the same SDK packages, named rather than left to the action's default.
+    assert.match(lines, /uses: android-actions\/setup-android@[0-9a-f]{40} # v[\d.]+\n\s+with:\n\s+packages: platform-tools\n/, `${id} leaves the SDK packages to the action`);
   }
   for (const id of ['desktop', 'release-desktop']) {
     assert.match(job(id), /uses: actions\/cache@[0-9a-f]{40} # v[\d.]+\n\s+with:\n\s+path: ~\/\.nuget\/packages\n\s+key: nuget-\$\{\{ runner\.os \}\}-\$\{\{ hashFiles\('desktop\/\*\*\/\*\.csproj'\) \}\}/);
