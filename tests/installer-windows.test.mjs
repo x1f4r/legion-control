@@ -27,6 +27,23 @@ test('scheduler template invokes only the stable launcher and cycles all service
   assert.doesNotMatch(service, /src\/index\.mjs/);
 });
 
+// The principal rule, read off the script: what can be checked without Windows. The real runs below
+// check what it does.
+test('the Windows installer judges who the task runs as before it changes anything, and leaves no task XML behind', () => {
+  assert.match(installer, /\[switch\] \$AllowSystemPrincipal/);
+  const judged = installer.indexOf("Step 'Principal'");
+  const protectedBase = installer.indexOf("Step 'Base'");
+  const agent = installer.indexOf("Step 'Agent'");
+  assert.ok(judged > 0 && protectedBase > judged && agent > protectedBase, 'principal, then base, then agent');
+  // Every principal but the installing user's is refused, and SYSTEM is kept only with the flag.
+  assert.match(installer, /if \(\$sid -eq \$UserSid\) \{[\s\S]*?\} elseif \(\$sid -eq \$SystemSid -and \$AllowSystemPrincipal\) \{[\s\S]*?\} elseif \(\$sid -eq \$SystemSid\) \{\s*throw[\s\S]*?\} else \{\s*throw/);
+  // A new task is created as the installing user.
+  assert.match(installer, /New-ScheduledTaskPrincipal -UserId \$identity\.Name -LogonType S4U/);
+  // The XML schtasks imports is removed however the import went, and nothing is left for later.
+  assert.match(installer, /\$doc\.Save\(\$xmlPath\)\s*try \{[^}]*schtasks\.exe[^}]*\} finally \{\s*Remove-Item -LiteralPath \$xmlPath/);
+  assert.doesNotMatch(installer, /ONE STEP LEFT|RegisterCommand|exit 2/);
+});
+
 test('the Windows task gets the cycle budget as its time limit, new or rewritten', () => {
   assert.match(installer, /\$TimeLimit\s+= 'PT30M'/);
   assert.match(installer, /\$TimeLimitSpan = New-TimeSpan -Minutes 30/);
@@ -34,6 +51,13 @@ test('the Windows task gets the cycle budget as its time limit, new or rewritten
   assert.match(installer, /\$limitNode\.InnerText = \$TimeLimit/);
   // The same 30 minutes the systemd unit gives one cycle.
   assert.match(service, /^TimeoutStartSec=1800$/m);
+});
+
+test('the Windows installer gives the base to the task\'s account alone', () => {
+  assert.match(installer, /Protect-Base -Sids @\(\$UserSid\)/);
+  assert.match(installer, /Protect-Base -Sids @\(\$AdministratorsSid, \$SystemSid\) -Owner \$AdministratorsSid/);
+  assert.match(installer, /'\/inheritance:r', '\/grant:r'/);
+  assert.match(installer, /'\*' \+ \$_ \+ ':\(OI\)\(CI\)F'/);
 });
 
 // What sshd hands a command to decides how the clients quote it, so the installer says, as the
@@ -62,16 +86,47 @@ test('every PowerShell script is ASCII, which Windows PowerShell reads the same 
 
 // --- A real install, on Windows ---------------------------------------------------
 
-// Windows PowerShell, the way an SSH session and the documented command run the installer, with the
-// scheduler left alone: the test runs as whoever the runner is and must not leave a task behind.
-function runInstaller(source, base, home, args = []) {
+// Windows PowerShell, the way an SSH session and the documented command run the installer.
+function runScript(source, base, home, args = []) {
   const script = path.join(source, 'install', 'install-windows.ps1');
-  return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-SkipScheduler', ...args], {
+  return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...args], {
     encoding: 'utf8',
     timeout: 180000,
     env: { ...process.env, PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`, LEGIONCTL_HOME: base, USERPROFILE: home },
   });
 }
+
+// With the scheduler left alone: the test runs as whoever the runner is and must not leave a task
+// behind.
+const runInstaller = (source, base, home, args = []) => runScript(source, base, home, ['-SkipScheduler', ...args]);
+
+// What Windows PowerShell answers to `script`, read as JSON. Values reach it through the
+// environment, so nothing has to be quoted for it.
+function powershellJson(script, env) {
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 60000, env: { ...process.env, ...env } });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  return JSON.parse(result.stdout);
+}
+
+// Who the ACL of `directory` lets in, by SID, whether it inherits anything, who owns it, and the
+// SID of the account the test runs as.
+const accessOf = (directory) => powershellJson(
+  '$acl = Get-Acl -LiteralPath $env:LEGION_TEST_PATH; $sid = [Security.Principal.SecurityIdentifier]; ' +
+  '[pscustomobject] @{ protected = $acl.AreAccessRulesProtected; owner = $acl.GetOwner($sid).Value; ' +
+  'holders = @($acl.GetAccessRules($true, $true, $sid) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique); ' +
+  'user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } | ConvertTo-Json -Compress',
+  { LEGION_TEST_PATH: directory },
+);
+
+// The scheduled task `name` as the scheduler has it: whom it runs as, by SID, its time limit, its
+// action and its state.
+const taskOf = (name) => powershellJson(
+  '$task = Get-ScheduledTask -TaskName $env:LEGION_TEST_TASK; ' +
+  '$account = New-Object Security.Principal.NTAccount($task.Principal.UserId); ' +
+  '[pscustomobject] @{ sid = $account.Translate([Security.Principal.SecurityIdentifier]).Value; limit = $task.Settings.ExecutionTimeLimit; ' +
+  'execute = $task.Actions[0].Execute; arguments = $task.Actions[0].Arguments; state = [string] $task.State } | ConvertTo-Json -Compress',
+  { LEGION_TEST_TASK: name },
+);
 
 // The agent of this checkout, copied where its path needs quoting: the installer stages it, runs
 // its self-check and promotes it exactly as it would a release.
@@ -102,6 +157,10 @@ test('the Windows installer installs and verifies a real agent, and leaves the s
   const first = runInstaller(source, base, home, ['-TaskName', name]);
   assert.equal(first.status, 0, `${first.stdout}\n${first.stderr}`);
   assert.match(first.stdout, /source verification: unsigned source checkout/);
+  // The base, and so everything in it, is the installing account's alone.
+  const access = accessOf(base);
+  assert.equal(access.protected, true);
+  assert.deepEqual(access.holders, [access.user]);
   assert.match(first.stdout, /sshd DefaultShell: /);
   assert.match(first.stdout, /stable launcher installed at .* and passed version --check/);
   assert.match(first.stdout, /scheduled task left untouched by -SkipScheduler/);
@@ -145,4 +204,95 @@ test('the Windows installer keeps the live agent when the staged one fails its s
   assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
   assert.match(`${refused.stdout}\n${refused.stderr}`, /did not pass version --check/);
   assert.equal(versionOf(path.join(base, 'agent')), version);
+});
+
+// --- The scheduler, on CI's Windows only ---------------------------------------------
+
+// These register real tasks, one of them as SYSTEM, and so run only on a throwaway runner, which is
+// elevated. Each task has a name of its own and is deleted again whatever happens.
+const windowsCi = process.platform === 'win32' && process.env.GITHUB_ACTIONS === 'true';
+const sameFile = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+
+test('the Windows installer registers the task as the installing user with the cycle budget', { skip: !windowsCi }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows task '));
+  const name = taskName();
+  t.after(() => {
+    spawnSync('schtasks.exe', ['/Delete', '/TN', name, '/F']);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const home = path.join(root, "home with ' apostrophe");
+  const base = path.join(home, '.legion-control');
+  const source = agentSource(root);
+
+  const created = runScript(source, base, home, ['-TaskName', name]);
+  assert.equal(created.status, 0, `${created.stdout}\n${created.stderr}`);
+  assert.match(created.stdout, /does not exist yet/);
+  let task = taskOf(name);
+  const access = accessOf(base);
+  assert.equal(task.sid, access.user);
+  assert.equal(task.limit, 'PT30M');
+  assert.ok(sameFile(task.execute, process.execPath), task.execute);
+  assert.equal(task.arguments, `"${path.join(base, 'bin', 'launcher.mjs')}" cycle`);
+  assert.deepEqual(access.holders, [access.user]);
+  // So that no cycle starts while the test runs. A disabled task stays disabled when rewritten.
+  assert.equal(spawnSync('schtasks.exe', ['/Change', '/TN', name, '/DISABLE'], { encoding: 'utf8' }).status, 0);
+
+  // Run again, the task is rewritten in place, and the XML it was rewritten from is gone.
+  const rewritten = runScript(source, base, home, ['-TaskName', name]);
+  assert.equal(rewritten.status, 0, `${rewritten.stdout}\n${rewritten.stderr}`);
+  assert.match(rewritten.stdout, /runs as .*, the account installing it/);
+  assert.match(rewritten.stdout, /time limit: +already PT30M/);
+  assert.match(rewritten.stdout, /re-registered/);
+  assert.deepEqual(fs.readdirSync(base).filter((entry) => entry.toLowerCase().endsWith('.xml')), []);
+  task = taskOf(name);
+  assert.equal(task.sid, access.user);
+  assert.equal(task.limit, 'PT30M');
+});
+
+test('the Windows installer refuses a task that runs as SYSTEM, and keeps one only on -AllowSystemPrincipal\'s terms', { skip: !windowsCi }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows system '));
+  const name = taskName();
+  const machineBase = path.join(process.env.ProgramData ?? 'C:\\ProgramData', `legion-control-test-${process.pid}-${Date.now()}`);
+  t.after(() => {
+    spawnSync('schtasks.exe', ['/Delete', '/TN', name, '/F']);
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(machineBase, { recursive: true, force: true });
+  });
+  const home = path.join(root, 'home');
+  const base = path.join(home, '.legion-control');
+  const source = agentSource(root);
+  // A task that runs as SYSTEM, first due a year from now.
+  powershellJson(
+    "Register-ScheduledTask -TaskName $env:LEGION_TEST_TASK -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 0') " +
+    "-Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1)) " +
+    "-Principal (New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\\SYSTEM' -LogonType ServiceAccount -RunLevel Highest) | Out-Null; '{}'",
+    { LEGION_TEST_TASK: name },
+  );
+
+  // Refused, before anything was installed, with -SkipScheduler as well.
+  for (const args of [[], ['-SkipScheduler']]) {
+    const refused = runScript(source, base, home, ['-TaskName', name, ...args]);
+    assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
+    assert.match(`${refused.stdout}\n${refused.stderr}`, /runs as SYSTEM, and whoever can write the agent's files would run code as SYSTEM through it\. Nothing was changed\./);
+    assert.equal(fs.existsSync(base), false);
+  }
+
+  // Kept only from a base outside every profile.
+  const inProfile = runScript(source, base, home, ['-TaskName', name, '-AllowSystemPrincipal']);
+  assert.equal(inProfile.status, 1, `${inProfile.stdout}\n${inProfile.stderr}`);
+  assert.match(`${inProfile.stdout}\n${inProfile.stderr}`, /is inside a user profile, and that user could change what SYSTEM runs/);
+  assert.equal(fs.existsSync(base), false);
+
+  const kept = runScript(source, machineBase, home, ['-TaskName', name, '-AllowSystemPrincipal']);
+  assert.equal(kept.status, 0, `${kept.stdout}\n${kept.stderr}`);
+  assert.match(kept.stdout, /runs as SYSTEM, kept by -AllowSystemPrincipal/);
+  const task = taskOf(name);
+  assert.equal(task.sid, 'S-1-5-18');
+  assert.equal(task.limit, 'PT30M');
+  assert.equal(task.arguments, `"${path.join(machineBase, 'bin', 'launcher.mjs')}" cycle`);
+  const access = accessOf(machineBase);
+  assert.equal(access.protected, true);
+  assert.deepEqual(access.holders, ['S-1-5-18', 'S-1-5-32-544']);
+  assert.equal(access.owner, 'S-1-5-32-544');
+  assert.equal(accessOf(path.join(machineBase, 'bin', 'launcher.mjs')).owner, 'S-1-5-32-544');
 });

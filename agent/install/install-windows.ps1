@@ -8,12 +8,14 @@
         ssh <machine> "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\<you>\legion-control\agent\install\install-windows.ps1"
 
     What it does:
-      1. Stages and self-checks the complete agent tree before replacing it.
-      2. Points a scheduled task at the agent's update cycle, every 15 minutes.
-         If the task named by -TaskName does not exist it is created, running as
-         the account this script runs under. If it does exist, its action, its
-         repetition and its time limit are rewritten and everything else about
-         it (principal, conditions) is left exactly as found.
+      1. Gives the base (LEGIONCTL_HOME, normally .legion-control in your
+         profile) to your account alone, then stages and self-checks the
+         complete agent tree before replacing the live one.
+      2. Points a scheduled task at the agent's update cycle, every 15 minutes,
+         running as you. If the task named by -TaskName does not exist it is
+         created. If it does exist, its action, its repetition and its time
+         limit are rewritten and everything else about it (principal,
+         conditions) is left exactly as found.
       3. Says which shell OpenSSH runs commands with, which decides what the
          setup has to say for this system's "shell".
 
@@ -23,18 +25,26 @@
       firmware at boot is none of this script's business. The agent starts and
       stops services through the config, and it never registers tasks.
 
-    Elevation. A task that runs as SYSTEM cannot be re-registered without an
-    elevated session; a task that runs as the current user can. Worth knowing,
-    because it is the opposite of what you would expect: an SSH login as a
-    member of the Administrators group IS elevated. Windows OpenSSH does not
-    apply UAC filtering to those sessions, so there is no prompt to answer.
+    Principal. The task runs the agent as the account that installs it, the
+    account whose base holds the launcher, the agent tree and config.json.
+    Anything that can write those runs code as the task's principal, so a task
+    running as anybody else would hand that account's rights to whoever can
+    write them, and a task running as SYSTEM out of a profile hands them the
+    machine. An existing task with any other principal is refused before
+    anything is changed.
 
-    The script still handles the unelevated case rather than relying on that,
-    because it also has to work when run from a normal desktop PowerShell where
-    UAC filtering does apply. So when it is rewriting an existing task it always
-    writes the finished task XML to disk, then either registers it right away
-    when the session is elevated, or prints the exact one line command to paste
-    into an elevated PowerShell.
+    -AllowSystemPrincipal keeps an existing task that runs as SYSTEM, on these
+    terms only: the session is elevated, the base and node are outside every
+    user profile, nobody but Administrators and SYSTEM may rename or
+    re-permission a folder above the base, and the base is then given to
+    Administrators and SYSTEM alone. Nothing a user can write is run as SYSTEM.
+
+    Elevation. A task that runs as the current user can be registered and
+    re-registered without it, so only -AllowSystemPrincipal needs an elevated
+    session. Worth knowing, because it is the opposite of what you would
+    expect: an SSH login as a member of the Administrators group IS elevated.
+    Windows OpenSSH does not apply UAC filtering to those sessions, so there is
+    no prompt to answer.
 
     Safe to re-run.
 #>
@@ -53,7 +63,10 @@ param(
     [switch] $SkipCopy,
 
     # Install and verify files without creating or changing a scheduled task.
-    [switch] $SkipScheduler
+    [switch] $SkipScheduler,
+
+    # Keep an existing task that runs as SYSTEM, on the terms described above.
+    [switch] $AllowSystemPrincipal
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,6 +84,11 @@ $TimeLimit     = 'PT30M'
 $TimeLimitSpan = New-TimeSpan -Minutes 30
 $MinNodeMajor  = 24
 
+# Well-known SIDs, which mean the same in every Windows language.
+$SystemSid           = 'S-1-5-18'
+$AdministratorsSid   = 'S-1-5-32-544'
+$TrustedInstallerSid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+
 $UserProfile = $env:USERPROFILE
 $Base        = if ($env:LEGIONCTL_HOME) { $env:LEGIONCTL_HOME } else { Join-Path $UserProfile '.legion-control' }
 if (-not [IO.Path]::IsPathRooted($Base)) {
@@ -83,7 +101,11 @@ $AgentEntry  = Join-Path $AgentDir 'src\index.mjs'
 $BinDir      = Join-Path $Base 'bin'
 $LauncherModule = Join-Path $BinDir 'launcher.mjs'
 $LauncherScript = Join-Path $BinDir 'legionctl.ps1'
-$XmlPath     = Join-Path $Base (($TaskName -replace '[^\w\-]', '-') + '.xml')
+
+# Where an older installer left the task XML for an elevated session to import
+# by hand. Nothing writes it any more, and one still lying around is removed:
+# whoever could write it chose what that import would have registered.
+$OldXmlPath  = Join-Path $Base (($TaskName -replace '[^\w\-]', '-') + '.xml')
 
 $Summary = New-Object System.Collections.Generic.List[string]
 
@@ -101,6 +123,159 @@ function Step([string] $Text) {
     Write-Host ("== " + $Text)
 }
 
+# PowerShell 5.1 turns any stderr line from a native command into a terminating
+# NativeCommandError while ErrorActionPreference is Stop, and schtasks and
+# icacls report their failures on stderr. Relax it just around the call so the
+# real exit code and message can be read instead of a wrapper exception.
+function Invoke-Native([string] $Command, [string[]] $Arguments) {
+    $exitCode = -1
+    $output = @()
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $Command @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return [pscustomobject] @{
+        ExitCode = $exitCode
+        Output   = (@($output) | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+    }
+}
+
+# The SID an account name or SID stands for, or $null for an account this
+# machine cannot name. Task Scheduler hands back either form.
+function Resolve-AccountSid([string] $Account) {
+    if ($Account -match '^S-1-[0-9]+(-[0-9]+)+$') {
+        return $Account
+    }
+    try {
+        return (New-Object Security.Principal.NTAccount($Account)).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return $null
+    }
+}
+
+# Every folder a user profile lives in: the folder profiles are made in, and
+# every profile the machine knows, wherever it is. The service accounts' own
+# profiles are not user profiles and are left out.
+function Get-ProfileRoot {
+    $list = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    $roots = New-Object System.Collections.Generic.List[string]
+    $roots.Add($UserProfile)
+    $directory = (Get-ItemProperty -LiteralPath $list -ErrorAction SilentlyContinue).ProfilesDirectory
+    if ($directory) { $roots.Add([Environment]::ExpandEnvironmentVariables($directory)) }
+    foreach ($key in @(Get-ChildItem -LiteralPath $list -ErrorAction SilentlyContinue)) {
+        if (@($SystemSid, 'S-1-5-19', 'S-1-5-20') -contains $key.PSChildName) { continue }
+        $image = (Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+        if ($image) { $roots.Add([Environment]::ExpandEnvironmentVariables($image)) }
+    }
+    return $roots
+}
+
+# Whether $Path is one of $Roots or lies inside one.
+function Test-Inside([string] $Path, [string[]] $Roots) {
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    foreach ($root in $Roots) {
+        if (-not $root) { continue }
+        $prefix = [IO.Path]::GetFullPath($root).TrimEnd('\')
+        if ($full.Equals($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+            $full.StartsWith($prefix + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# Who besides Administrators and SYSTEM could put another folder where $Path
+# is: whoever owns a folder above it or may delete, rename or re-permission one,
+# or what it holds, and any link on the way. Nobody, when the list is empty.
+function Get-PathTakeover([string] $Path) {
+    $trusted = @($SystemSid, $AdministratorsSid, $TrustedInstallerSid)
+    # Generic all and generic write, besides the rights that move or re-permission a folder.
+    $dangerous = [int] ([Security.AccessControl.FileSystemRights] 'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership') -bor 0x10000000 -bor 0x40000000
+    $found = New-Object System.Collections.Generic.List[string]
+    if ((Test-Path -LiteralPath $Path) -and (Get-Item -LiteralPath $Path -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
+        $found.Add("$Path is a link")
+    }
+    $folder = Split-Path -Parent $Path
+    while ($folder) {
+        # A folder that is not there yet is made by this elevated session, as
+        # Administrators', inside the first one that is.
+        if (Test-Path -LiteralPath $folder) {
+            if ((Get-Item -LiteralPath $folder -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
+                $found.Add("$folder is a link")
+            }
+            $acl = Get-Acl -LiteralPath $folder
+            $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+            if ($trusted -notcontains $owner) {
+                $found.Add("$owner owns $folder")
+            }
+            foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+                if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+                if ($rule.PropagationFlags.HasFlag([Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+                if ($trusted -contains $rule.IdentityReference.Value) { continue }
+                if (([int] $rule.FileSystemRights -band $dangerous) -ne 0) {
+                    $found.Add("$($rule.IdentityReference.Value) may move or re-permission $folder")
+                }
+            }
+        }
+        $parent = Split-Path -Parent $folder
+        if ($parent -eq $folder) { break }
+        $folder = $parent
+    }
+    return $found
+}
+
+function Invoke-IcaclsCommand([string[]] $Arguments) {
+    $result = Invoke-Native -Command 'icacls.exe' -Arguments $Arguments
+    if ($result.ExitCode -ne 0) {
+        throw ("icacls " + ($Arguments -join ' ') + " exited with " + $result.ExitCode + ": " + $result.Output)
+    }
+}
+
+# Gives the base to $Sids alone: full control for each of them is all that is
+# left on it, nothing comes from the folder above, and everything inside goes
+# back to inheriting just that. With $Owner, that account owns every file and
+# folder in it as well, so one made there by somebody else is no longer theirs
+# to re-permission. The base is closed first and opened to nobody on the way.
+# icacls is given SIDs, never names, which are spelled differently in another
+# language.
+function Protect-Base([string[]] $Sids, [string] $Owner) {
+    if (-not (Test-Path -LiteralPath $Base -PathType Container)) {
+        New-Item -ItemType Directory -Path $Base -Force | Out-Null
+    }
+    $grants = @($Sids | ForEach-Object { '*' + $_ + ':(OI)(CI)F' })
+    Invoke-IcaclsCommand -Arguments (@($Base, '/inheritance:r', '/grant:r') + $grants)
+
+    # /grant:r replaces what the named accounts had, and leaves an entry
+    # somebody added for another account where it is.
+    $acl = Get-Acl -LiteralPath $Base
+    foreach ($rule in $acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])) {
+        if ($Sids -notcontains $rule.IdentityReference.Value) {
+            Invoke-IcaclsCommand -Arguments @($Base, '/remove', ('*' + $rule.IdentityReference.Value))
+        }
+    }
+
+    if ($Owner) {
+        Invoke-IcaclsCommand -Arguments @($Base, '/setowner', ('*' + $Owner), '/T', '/C', '/Q')
+    }
+    if (Get-ChildItem -LiteralPath $Base -Force | Select-Object -First 1) {
+        Invoke-IcaclsCommand -Arguments @((Join-Path $Base '*'), '/reset', '/T', '/C', '/Q')
+    }
+
+    $acl = Get-Acl -LiteralPath $Base
+    $holders = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+    $wanted = @($Sids | Sort-Object -Unique)
+    if (-not $acl.AreAccessRulesProtected -or ($holders -join ',') -ne ($wanted -join ',')) {
+        throw ("$Base could not be given to " + ($wanted -join ', ') + " alone; it lists " + ($holders -join ', ') + ". Nothing was installed.")
+    }
+    if ($Owner -and $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $Owner) {
+        throw "$Base could not be given to the owner $Owner. Nothing was installed."
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
@@ -110,7 +285,8 @@ Step 'Preflight'
 $identity   = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal  = New-Object Security.Principal.WindowsPrincipal($identity)
 $IsElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Note ("running as " + $identity.Name + ", elevated=" + $IsElevated)
+$UserSid    = $identity.User.Value
+Note ("running as " + $identity.Name + " (" + $UserSid + "), elevated=" + $IsElevated)
 
 if ($Base.Contains("`n") -or $Base.Contains("`r")) {
     throw 'Install paths containing a line break are unsupported.'
@@ -140,13 +316,94 @@ if ($nodeMajor -lt $MinNodeMajor) {
 }
 Note ("node $nodeVersion at $NodeExe")
 
-# A task can be registered to run as SYSTEM, whose PATH is the machine PATH and
-# does not include a per user shim directory. Pin the absolute node path into
-# the task instead of trusting that "node" resolves over there.
+# The task does not start with this session's PATH, which may hold a per user
+# shim directory. Pin the absolute node path into the task instead of trusting
+# that "node" resolves over there.
 if ($NodeExe.ToLowerInvariant().StartsWith($UserProfile.ToLowerInvariant())) {
-    Note ("WARNING: node lives inside the user profile. A task running as another")
-    Note ("         principal can still run it, but a per user Node manager would")
-    Note ("         break the task the moment it moves.")
+    Note ("WARNING: node lives inside the user profile. A per user Node manager")
+    Note ("         would break the task the moment it moves node.")
+}
+
+# ---------------------------------------------------------------------------
+# Who the task runs as
+# ---------------------------------------------------------------------------
+
+# Judged before anything is changed, and with -SkipScheduler as well: what this
+# script installs is what the task runs, whoever it runs as.
+Step 'Principal'
+
+$TaskRunsAsSystem = $false
+$current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if (-not $current) {
+    Note "'$TaskName' does not exist yet"
+} else {
+    $account = [string] $current.Principal.UserId
+    $group   = [string] $current.Principal.GroupId
+    $who     = if ($group) { "the group $group" } elseif ($account) { $account } else { 'an account this script cannot name' }
+    $sid     = if ($group -or -not $account) { $null } else { Resolve-AccountSid $account }
+    $removal = "Unregister-ScheduledTask -TaskName '" + $TaskName.Replace("'", "''") + "' -Confirm:`$false"
+
+    if ($sid -eq $UserSid) {
+        Note "'$TaskName' runs as $who, the account installing it"
+    } elseif ($sid -eq $SystemSid -and $AllowSystemPrincipal) {
+        $TaskRunsAsSystem = $true
+        Note "'$TaskName' runs as SYSTEM, kept by -AllowSystemPrincipal"
+    } elseif ($sid -eq $SystemSid) {
+        throw ("'$TaskName' runs as SYSTEM, and whoever can write the agent's files would run code as SYSTEM through it. " +
+            "Nothing was changed. Remove the task from an elevated session, and this script creates it again running as you: $removal. " +
+            "Or keep it with -AllowSystemPrincipal, from an elevated session and with LEGIONCTL_HOME outside every user profile.")
+    } else {
+        throw ("'$TaskName' runs as $who, not as $($identity.Name), who is installing it, and whoever can write the agent's files would run code as $who through it. " +
+            "Nothing was changed. Remove the task, and this script creates it again running as you: $removal")
+    }
+}
+
+if ($TaskRunsAsSystem) {
+    if (-not $IsElevated) {
+        throw '-AllowSystemPrincipal needs an elevated session, which this is not. Nothing was changed.'
+    }
+    $profileRoots = @(Get-ProfileRoot)
+    if (Test-Inside $Base $profileRoots) {
+        throw ("The base $Base is inside a user profile, and that user could change what SYSTEM runs. " +
+            "Set LEGIONCTL_HOME to a folder outside every profile, such as " + (Join-Path $env:ProgramData 'legion-control') + ", and run this again. Nothing was changed.")
+    }
+    if (Test-Inside $NodeExe $profileRoots) {
+        throw "node at $NodeExe is inside a user profile, and that user could change what SYSTEM runs. Install Node.js for all users and run this again. Nothing was changed."
+    }
+    $takeover = @(Get-PathTakeover $Base)
+    if ($takeover.Count -gt 0) {
+        throw ("Somebody besides Administrators and SYSTEM could put another folder where the base is: " + ($takeover -join '; ') + ". Nothing was changed.")
+    }
+} elseif ($AllowSystemPrincipal) {
+    Note '-AllowSystemPrincipal only keeps a task that already runs as SYSTEM; this one runs as you'
+}
+
+# ---------------------------------------------------------------------------
+# Base
+# ---------------------------------------------------------------------------
+
+# Before anything goes in, so nothing in it is anyone else's from the start.
+# The base holds every command the agent was configured with, the setup and the
+# record of every operation, and the task runs what is in it.
+Step 'Base'
+
+if ($TaskRunsAsSystem) {
+    Protect-Base -Sids @($AdministratorsSid, $SystemSid) -Owner $AdministratorsSid
+    # A link left inside by whoever could write here before would carry what
+    # this script installs out to where they still can.
+    $links = @(Get-ChildItem -LiteralPath $Base -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
+    if ($links.Count -gt 0) {
+        throw ("$Base holds links, which could lead what SYSTEM runs somewhere a user can write: " + (($links | ForEach-Object { $_.FullName }) -join ', ') + ". Remove them and run this again.")
+    }
+    Note "$Base is Administrators' and SYSTEM's alone"
+} else {
+    Protect-Base -Sids @($UserSid)
+    Note ("$Base is " + $identity.Name + "'s alone")
+}
+
+if (Test-Path -LiteralPath $OldXmlPath -PathType Leaf) {
+    Remove-Item -LiteralPath $OldXmlPath -Force
+    Note ("removed " + $OldXmlPath + ", which an older installer left for an elevated import")
 }
 
 # ---------------------------------------------------------------------------
@@ -269,6 +526,13 @@ try {
 }
 Note "stable launcher installed at $LauncherScript and passed version --check"
 
+# What this session just wrote belongs to Administrators too. Where policy
+# makes whoever creates a file its owner, that is the installing account, and
+# an owner may re-permission what it owns without being elevated.
+if ($TaskRunsAsSystem) {
+    Invoke-IcaclsCommand -Arguments @($Base, '/setowner', ('*' + $AdministratorsSid), '/T', '/C', '/Q')
+}
+
 # config.json and state.json are deliberately not written here. The agent falls
 # back to its own defaults when they are absent, and stamping a fresh config
 # over the top would silently flip auto update back on at every install.
@@ -298,7 +562,6 @@ try {
 # ---------------------------------------------------------------------------
 
 $TaskRegistered = $false
-$RegisterCommand = $null
 $taskPath       = '\'
 $existing       = $null
 
@@ -314,9 +577,8 @@ if (-not $existing) {
 
     # --- create it ----------------------------------------------------------
 
-    # A task that runs as this account needs no elevation to register, which is
-    # why nothing here reaches for SYSTEM. The agent only ever touches files and
-    # services this account owns.
+    # A task that runs as this account needs no elevation to register, and the
+    # agent only ever touches files and services this account owns.
     Note "'$TaskName' does not exist, creating it"
 
     $action = New-ScheduledTaskAction -Execute $NodeExe -Argument $LauncherArguments -WorkingDirectory $Base
@@ -394,14 +656,6 @@ if (-not $existing) {
         $oldIntervalText = (($oldIntervals | ForEach-Object { $_.InnerText }) -join ', ')
     }
     Note ("old interval: " + $oldIntervalText)
-
-    $principalNode = $doc.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:UserId', $ns)
-    $runsAsSystem  = $false
-    if ($principalNode) {
-        # Left exactly as found. S-1-5-18 is SYSTEM.
-        Note ("principal:    " + $principalNode.InnerText + " (preserved)")
-        $runsAsSystem = ($principalNode.InnerText -eq 'S-1-5-18')
-    }
 
     # --- action -------------------------------------------------------------
 
@@ -542,52 +796,31 @@ if (-not $existing) {
     }
     $limitNode.InnerText = $TimeLimit
 
-    # --- write the XML ------------------------------------------------------
+    # --- register -----------------------------------------------------------
 
-    if (-not (Test-Path $Base)) {
-        New-Item -ItemType Directory -Path $Base -Force | Out-Null
-    }
-
+    # schtasks rather than Register-ScheduledTask, because it imports the XML
+    # exactly as Export-ScheduledTask wrote it and says what it rejects. The file
+    # goes into the base, which only the task's own principal may write, and is
+    # removed as soon as schtasks has read it: there is never a task definition
+    # lying around for somebody else to change, or for an admin to import later.
+    #
     # Save() honours the encoding in the XML declaration, which Export-ScheduledTask
     # emits as UTF-16. Writing it any other way gives schtasks a file whose bytes
     # disagree with its own header.
-    $doc.Save($XmlPath)
-    Note ("task XML written to " + $XmlPath)
-
-    # --- register -----------------------------------------------------------
-
-    $RegisterCommand = 'schtasks /Create /TN "' + $FullTaskName + '" /XML "' + $XmlPath + '" /F'
-
-    if ($IsElevated -or -not $runsAsSystem) {
-        # schtasks rather than Register-ScheduledTask, for one reason: the command
-        # run here is then character for character the command printed further down
-        # for the unelevated case, so there is only ever one thing to debug.
-        #
-        # PowerShell 5.1 turns any stderr line from a native command into a
-        # terminating NativeCommandError while ErrorActionPreference is Stop, and
-        # schtasks reports its failures on stderr. Relax it just around the call so
-        # the real exit code and message can be read instead of a wrapper exception.
-        $exitCode = -1
-        $output = @()
-        $previousPreference = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        try {
-            $output = & schtasks.exe /Create /TN $FullTaskName /XML $XmlPath /F 2>&1
-            $exitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousPreference
-        }
-
-        if ($exitCode -ne 0) {
-            Say ''
-            Say (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
-            throw "schtasks exited with $exitCode. The XML it rejected is at $XmlPath. Check the task in taskschd.msc before rerunning, then: $RegisterCommand"
-        }
-        $TaskRegistered = $true
-        Note "task '$FullTaskName' re-registered"
-    } else {
-        Note "NOT registered: this task runs as SYSTEM and this session is not elevated."
+    $xmlPath = Join-Path $Base ('task.' + [Guid]::NewGuid().ToString('N') + '.xml')
+    $doc.Save($xmlPath)
+    try {
+        $registered = Invoke-Native -Command 'schtasks.exe' -Arguments @('/Create', '/TN', $FullTaskName, '/XML', $xmlPath, '/F')
+    } finally {
+        Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
     }
+    if ($registered.ExitCode -ne 0) {
+        Say ''
+        Say $registered.Output
+        throw "schtasks exited with $($registered.ExitCode) re-registering '$FullTaskName'. Check the task in taskschd.msc before rerunning."
+    }
+    $TaskRegistered = $true
+    Note "task '$FullTaskName' re-registered"
 }
 
 # ---------------------------------------------------------------------------
@@ -612,6 +845,15 @@ if ($TaskRegistered) {
     if ($liveInterval) { Note ("live interval:  " + $liveInterval.InnerText) }
     if ($liveUser)     { Note ("live principal: " + $liveUser.InnerText) }
     if ($liveLimit)    { Note ("live limit:     " + $liveLimit.InnerText) }
+
+    # Checked, not assumed: the base was given to the account the task was to
+    # run as, and a task running as anybody else would run what that account
+    # can write.
+    $expectedSid = if ($TaskRunsAsSystem) { $SystemSid } else { $UserSid }
+    $liveSid = if ($liveUser) { Resolve-AccountSid $liveUser.InnerText } else { $null }
+    if ($liveSid -ne $expectedSid) {
+        throw ("'$TaskName' was registered, but it runs as " + $(if ($liveUser) { $liveUser.InnerText } else { 'an account this script cannot name' }) + " rather than " + $expectedSid + ". Check it in taskschd.msc.")
+    }
 }
 }
 
@@ -649,19 +891,6 @@ foreach ($line in $Summary) {
     Say ('  ' + $line)
 }
 
-if (-not $TaskRegistered -and $RegisterCommand) {
-    Say ''
-    Say '  ONE STEP LEFT. The task XML is ready but this task runs as SYSTEM and'
-    Say '  can only be registered from an elevated session, which this is not. An'
-    Say '  ssh login as an administrator normally is elevated, so if you are seeing'
-    Say '  this from ssh something is unusual. Open PowerShell as administrator on'
-    Say '  the machine itself and run exactly this:'
-    Say ''
-    Say ('      ' + $RegisterCommand)
-    Say ''
-    Say '  Then rerun this script to see the verification output.'
-}
-
 Say ''
 Say ('  Agent:  ' + $NodeExe + ' ' + $LauncherModule + ' status')
 Say ('  Config: ' + (Join-Path $Base 'config.json'))
@@ -672,9 +901,5 @@ Say ''
 # Exit codes, so a script driving this over SSH can tell the outcomes apart
 # instead of reading the prose:
 #   0  fully installed, the task now runs the agent
-#   2  agent installed, but the task still needs the elevated command above
-#   1  something threw, see the message
-if (-not $TaskRegistered -and -not $SkipScheduler) {
-    exit 2
-}
+#   1  something threw, see the message; a refused principal changed nothing
 exit 0
