@@ -183,6 +183,14 @@ step somebody can take, because a cascade is how the tower nobody wanted on ends
 A packet is never evidence. Nothing acknowledges one, so the only thing this app accepts as a wake
 is the machine's own agent answering afterwards.
 
+A helper's command that is not a declared `wol` action could do anything, so it is never run twice
+by accident. When one ends without saying how it went, the machine is held: this device notes it in
+its own operation history, says so under the machine's name, and runs no other helper's command for
+it until the helper's record says it finished, the helper has no such operation, the machine
+answers, or the helper leaves the setup. Time, a restart and the helper being away never release a
+hold. "Try the other helpers" in the wake options, or `--try-other-helpers` beside `--yes`, is a
+person choosing to go past it; the held command is not run again.
+
 ## Trust
 
 The release public key is compiled into the binary from `contract/release-public-key.pem` and read
