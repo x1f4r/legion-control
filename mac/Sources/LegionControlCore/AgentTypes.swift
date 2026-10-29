@@ -85,9 +85,8 @@ struct BusyStatus: Decodable, Sendable, Equatable {
     var unknown: Bool?
     var threads: [BusyThread]?
     var threadsTruncated: Int?
-    /// False when the service declares no busy probe at all. The distinction matters more than it
-    /// looks: an unmonitored service is not an idle one, and treating the two the same is how a
-    /// disruptive action gets through while work is running.
+    /// What the agent says about whether a probe watches the service. Kept as it was sent; whether
+    /// anything watches is `isMonitored`'s to say, from the evidence.
     var monitored: Bool?
     /// t3-sqlite | command | http | none | unmonitored | probe-error | timed-out
     var evidence: String?
@@ -100,8 +99,17 @@ struct BusyStatus: Decodable, Sendable, Equatable {
     /// Whether the answer is "we do not know", which blocks disruptive work exactly as busy does.
     var isUnknown: Bool { unknown == true }
 
-    /// Whether the service says anything at all about being busy.
-    var isMonitored: Bool { monitored ?? (evidence != "unmonitored") }
+    /// Whether anything watches the service: false only when the agent's evidence is `unmonitored`,
+    /// which is what a service with no busy probe configured reads as.
+    ///
+    /// The distinction matters more than it looks: an unmonitored service is not an idle one, and
+    /// treating the two the same is how a disruptive action gets through while work is running. But
+    /// only the evidence says so. A service configured `busy.type: "none"` is declared never busy,
+    /// which is an answer rather than a gap (section 6), and agents before 3.1.0 send it, and a
+    /// machine with no services, with `monitored: false` beside `evidence: "none"`. Read off that
+    /// flag, every such service was drawn as not monitored and every action on it asked to be
+    /// forced past a setting somebody chose (C2).
+    var isMonitored: Bool { evidence != "unmonitored" }
 
     var summary: String {
         if let reason, !reason.isEmpty { return reason }

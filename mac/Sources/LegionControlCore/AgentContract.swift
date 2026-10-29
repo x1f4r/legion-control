@@ -785,11 +785,11 @@ struct AgentBusyResult: Decodable, Sendable {
         var threadsTruncated: Int?
 
         /// The same three-way verdict the status path uses, so the two cannot disagree about what
-        /// "not busy" means.
+        /// "not busy" means, and the same evidence for whether anything watches the service.
         var verdict: BusyStatus.Verdict {
             if busy == true { return .busy }
             if unknown == true { return .unknown }
-            if monitored == false { return .unmonitored }
+            if evidence == "unmonitored" { return .unmonitored }
             return .idle
         }
     }
