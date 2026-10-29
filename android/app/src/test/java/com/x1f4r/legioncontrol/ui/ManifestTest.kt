@@ -67,6 +67,9 @@ class ManifestTest {
                 setOf("android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_DATA_SYNC"),
             ),
         )
+        // Without it the wake lock throws when the service takes it, and a locked phone suspends
+        // under a change still waiting for its next look at the machine.
+        assertTrue("the service keeps the CPU running", "android.permission.WAKE_LOCK" in permissions)
     }
 
     private companion object {

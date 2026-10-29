@@ -495,17 +495,20 @@ class OperationCenter(
     /** The kinds [observe] can settle by looking at the machine, whatever its agent keeps. */
     private val OpKind.leavesEvidence: Boolean get() = this == OpKind.BOOT || this == OpKind.UPDATE
 
-    private companion object {
+    internal companion object {
         /** How long `op ID --wait` holds the connection. Long enough to be cheap, short enough to cancel. */
-        const val OP_WAIT_SECONDS = 20
+        private const val OP_WAIT_SECONDS = 20
 
-        /** How long a change is watched before the app admits it does not know. */
+        /**
+         * How long a change is watched before the app admits it does not know. Read by
+         * [ChangeService] too, whose hold on the CPU has to outlast one watch.
+         */
         const val WATCH_BUDGET_MS = 30 * 60_000L
 
-        const val RETRY_DELAY_MS = 15_000L
+        private const val RETRY_DELAY_MS = 15_000L
 
         /** The gap between looks at a machine when the agent keeps no records of its own. */
-        const val OBSERVE_DELAY_MS = 10_000L
+        private const val OBSERVE_DELAY_MS = 10_000L
     }
 }
 

@@ -20,6 +20,10 @@
          nothing to ask. The second is the one Android 14 and later require for the dataSync type. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- The same service keeps the CPU running while it runs, screen off: a locked phone on battery
+         otherwise suspends, and a wake's readiness polls or the pause before reading an operation
+         again wait for the screen to come back. Granted at install too. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name="com.x1f4r.legioncontrol.ui.LegionApplication"

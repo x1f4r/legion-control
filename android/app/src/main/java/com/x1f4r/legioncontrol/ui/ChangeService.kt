@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -33,10 +34,18 @@ import kotlinx.coroutines.launch
  * ends a process whose foreground service is stopped before it has gone into the foreground, and
  * only this service knows when it has.
  *
+ * The foreground keeps the process from being frozen, not the phone from sleeping. A locked phone
+ * on battery suspends its CPU, and while it is suspended no delay runs out: the readiness polls after
+ * a wake packet, the pause before reading an operation again and the looks at a machine whose agent
+ * keeps no records all wait for the screen, and only a reply already on its way moves anything. So
+ * the service also keeps the CPU running, screen off, with a partial wake lock that ends with it.
+ * The lock is timed besides, a little past one watch and armed again whenever what is held moves,
+ * so a hold that is never given back cannot keep the phone awake for good.
+ *
  * `dataSync`, because that is what this is: commands sent over the network and replies waited for.
  * It needs nothing the user is asked for. Android 15 caps it at six hours a day, and a change is
- * watched for half an hour at the most, so the cap is a backstop rather than a limit anybody meets;
- * when it is met, the work goes on unheld, as it did before there was a service.
+ * held for little more than one half-hour watch, so the cap is a backstop rather than a limit
+ * anybody meets; when it is met, the work goes on unheld, as it did before there was a service.
  */
 class ChangeService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler("ChangeService"))
@@ -44,6 +53,16 @@ class ChangeService : Service() {
 
     /** The newest start. A stop for an older one is ignored by Android, which is what makes it safe. */
     private var latestStart = 0
+
+    /**
+     * Keeps the CPU running while this service does. Not reference counted: it is armed again with
+     * every start and every move of the count, and released once, when the service ends.
+     */
+    private val awake: PowerManager.WakeLock? by lazy {
+        getSystemService<PowerManager>()
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+            ?.apply { setReferenceCounted(false) }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -56,9 +75,10 @@ class ChangeService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        stayAwake()
         if (watching == null) {
             watching = scope.launch {
-                holds.collect { held -> if (held == 0) stopSelf(latestStart) }
+                holds.collect { held -> if (held == 0) stopSelf(latestStart) else stayAwake() }
             }
         }
         // Not restarted after the process dies. A new process starts with no change in flight, and
@@ -71,9 +91,16 @@ class ChangeService : Service() {
         stopSelf()
     }
 
+    /** Every way this service ends comes through here, a stop for the daily allowance included. */
     override fun onDestroy() {
         scope.cancel()
+        awake?.takeIf { it.isHeld }?.release()
         super.onDestroy()
+    }
+
+    /** Keeps the CPU running for [WAKE_LOCK_MS] from now, however long it already had. */
+    private fun stayAwake() {
+        awake?.acquire(WAKE_LOCK_MS)
     }
 
     private fun enterForeground(): Boolean = try {
@@ -130,6 +157,15 @@ class ChangeService : Service() {
         private const val TAG = "ChangeService"
         private const val CHANNEL = "legion-changes-in-progress"
         private const val NOTIFICATION_ID = 1
+
+        /** In the `app:component` form Android's own tools read a wake lock's owner from. */
+        private const val WAKE_LOCK_TAG = "LegionControl:ChangeService"
+
+        /**
+         * How long the CPU is kept running after the newest start or move of the count: one watch
+         * and a few minutes, for the send or the read that comes before it.
+         */
+        private const val WAKE_LOCK_MS = OperationCenter.WATCH_BUDGET_MS + 5 * 60_000L
 
         /**
          * Asks for the service. A refusal is logged and nothing more: Android 12 and later refuse a
