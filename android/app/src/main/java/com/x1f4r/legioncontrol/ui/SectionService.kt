@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.selection.triStateToggleable
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -22,6 +22,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.agent.BusyStatus
@@ -504,14 +507,18 @@ private fun AutoUpdateRow(model: MachineModel, system: MachineSystem, serviceId:
     val isLive = model.currentSystem?.id == system.id
     val value = model.autoUpdateValue(system)
     val enabled = isLive && !model.isWorking
+    val state = autoUpdateState(value)
 
     val row = Modifier
         .fillMaxWidth()
         .defaultMinSize(minHeight = 60.dp)
-        .toggleable(value = value == true, enabled = enabled, role = Role.Switch) { to ->
+        .triStateToggleable(state = state, enabled = enabled, role = Role.Switch) {
             haptics.tick()
-            model.setAutoUpdate(to, system, serviceId)
+            // Not known turns it on, as a press on the drawn switch, which is off, would.
+            model.setAutoUpdate(state != ToggleableState.On, system, serviceId)
         }
+        // Said in words, because Android's own word for the third state is about check boxes.
+        .semantics { if (state == ToggleableState.Indeterminate) stateDescription = "Not known" }
         .padding(vertical = 8.dp)
 
     Row(row, verticalAlignment = Alignment.CenterVertically) {
@@ -532,6 +539,14 @@ private fun AutoUpdateRow(model: MachineModel, system: MachineSystem, serviceId:
         Switch(checked = value == true, onCheckedChange = null, enabled = enabled)
     }
 }
+
+/**
+ * What the automatic-update row tells a screen reader its switch is. A setting the machine has not
+ * reported is neither: the drawn switch has no third position and shows off, but announced as off
+ * it would state a value nobody knows.
+ */
+internal fun autoUpdateState(value: Boolean?): ToggleableState =
+    if (value == null) ToggleableState.Indeterminate else ToggleableState(value)
 
 private fun autoUpdateNote(
     model: MachineModel,
