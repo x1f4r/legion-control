@@ -80,8 +80,26 @@ test('the Windows installer judges a base and node for SYSTEM before it changes 
   const judged = installer.indexOf('$intrusion = @(Get-BaseTakeover)');
   assert.ok(judged > installer.indexOf("Step 'Principal'") && judged < installer.indexOf("Step 'Base'"), 'judged in the principal step');
   assert.match(installer, /\$realNode = Resolve-LinkedPath \$NodeExe\s[\s\S]*?Test-Inside \$realNode \$profileRoots[\s\S]*?Get-ForeignAccess \(Split-Path -Parent \$realNode\) \$ChangeRights[\s\S]*?\$NodeExe = \$realNode/);
-  assert.match(installer, /New-Item -ItemType Directory -Path \$Base -ErrorAction Stop \|/);
-  assert.match(installer, /Protect-Base -Sids @\(\$AdministratorsSid, \$SystemSid\) -Owner \$AdministratorsSid -Fresh:\$fresh/);
+  // Whether the base is new, and which folders are missing, is decided once, where the base is judged.
+  const decided = installer.indexOf('$BaseIsNew = $BaseFolders.Contains($Base)');
+  assert.ok(decided > installer.indexOf("Step 'Principal'") && decided < judged, 'decided before the base is judged');
+  assert.match(installer, /if \(-not \$BaseIsNew\) \{\s*\$intrusion = @\(Get-BaseTakeover\)/);
+});
+
+// A folder somebody makes between the judging and the making would otherwise be found there and taken
+// over, the base or one above it, so the base step looks at none of them again: it makes every one
+// that was missing, none with -Force, and judges the folders above once the base is closed.
+test('the Windows installer makes a new SYSTEM base and the folders above it without looking again whether they are there', () => {
+  const from = installer.indexOf("Step 'Base'");
+  // The code alone: the comment says what it does without -Force.
+  const system = installer.slice(installer.indexOf('if ($TaskRunsAsSystem) {', from), installer.indexOf('} else {', from)).replace(/^\s*#.*\n/gm, '');
+  assert.doesNotMatch(system, /Test-Path/);
+  assert.doesNotMatch(system, /-Force/);
+  assert.match(system, /foreach \(\$folder in \$BaseFolders\) \{\s*try \{\s*New-Item -ItemType Directory -Path \$folder -ErrorAction Stop \| Out-Null\s*\} catch \{\s*throw/);
+  assert.match(system, /\$madeBy = \(Get-Acl -LiteralPath \$folder\)[\s\S]*?if \(@\(\$AdministratorsSid, \$UserSid\) -notcontains \$madeBy\) \{\s*throw/);
+  const protect = system.indexOf('Protect-Base -Sids @($AdministratorsSid, $SystemSid) -Owner $AdministratorsSid -Fresh:$BaseIsNew');
+  assert.ok(protect > 0, system);
+  assert.match(system.slice(protect), /\$takeover = @\(Get-PathTakeover \$Base\)\s*if \(\$takeover\.Count -gt 0\) \{\s*throw/);
 });
 
 // Where policy makes whoever creates a file its owner, as Windows does outside Windows Server, the
@@ -592,11 +610,13 @@ function nodeIn(directory, users) {
 test('the Windows installer refuses a task that runs as SYSTEM, and keeps one only on -AllowSystemPrincipal\'s terms', { skip: !windowsCi }, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows system '));
   const name = taskName();
-  const machineBase = machineFolder('base');
+  // Two folders down from one that is there, so the installer makes the folders above the base too.
+  const machineTop = machineFolder('base');
+  const machineBase = path.join(machineTop, 'nested', 'legion-control');
   const node = nodeIn(machineFolder('node'), 'RX');
   t.after(() => {
     spawnSync('schtasks.exe', ['/Delete', '/TN', name, '/F']);
-    for (const folder of [root, machineBase, node]) fs.rmSync(folder, { recursive: true, force: true });
+    for (const folder of [root, machineTop, node]) fs.rmSync(folder, { recursive: true, force: true });
   });
   const home = path.join(root, 'home');
   const base = path.join(home, '.legion-control');
@@ -632,12 +652,13 @@ test('the Windows installer refuses a task that runs as SYSTEM, and keeps one on
   assert.equal(accessOf(path.join(machineBase, 'bin', 'launcher.mjs')).owner, 'S-1-5-32-544');
 
   // Run again, the base an earlier run made is taken as it is. Where policy makes whoever creates a
-  // file its owner, which Windows Server does not, the account installing owns what clients wrote in
-  // the base over ssh as it, such as a config: that does not stop the run, and the config goes back
-  // to Administrators, as it was.
+  // file its owner, which Windows Server does not, the account installing owns the folders it made
+  // above the base and what clients wrote in the base over ssh as it, such as a config: neither stops
+  // the run, and the config goes back to Administrators, as it was.
   const config = path.join(machineBase, 'config.json');
   fs.writeFileSync(config, '{"sentinel":"leave exactly alone"}\n');
   icacls(config, '/setowner', `*${access.user}`);
+  icacls(path.join(machineTop, 'nested'), '/setowner', `*${access.user}`);
   assert.equal(accessOf(config).owner, access.user);
   const again = runScript(source, machineBase, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node });
   assert.equal(again.status, 0, `${again.stdout}\n${again.stderr}`);

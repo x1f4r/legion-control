@@ -266,8 +266,9 @@ function Get-PathTakeover([string] $Path) {
     }
     $folder = Split-Path -Parent $Path
     while ($folder) {
-        # A folder that is not there yet is made by this elevated session, as
-        # Administrators', inside the first one that is.
+        # A folder that is not there yet is made by this elevated session,
+        # inside the first one that is, and kept only as Administrators' or
+        # this account's.
         if (Test-Path -LiteralPath $folder) {
             if ((Get-Item -LiteralPath $folder -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
                 $found.Add("$folder is a link")
@@ -751,10 +752,19 @@ if ($TaskRunsAsSystem) {
         throw ("Somebody besides Administrators and SYSTEM could put another folder where the base is: " + ($takeover -join '; ') + ". Nothing was changed.")
     }
 
+    # What is not there now is made in the base step, by this session, and
+    # whether the base is new is decided here, once: a folder somebody makes in
+    # the meantime has to stop that step, not be found there and taken.
+    $BaseFolders = New-Object System.Collections.Generic.List[string]
+    for ($missing = $Base; $missing -and -not (Test-Path -LiteralPath $missing); $missing = Split-Path -Parent $missing) {
+        $BaseFolders.Insert(0, $missing)
+    }
+    $BaseIsNew = $BaseFolders.Contains($Base)
+
     # A base that is there already is taken only as an earlier run left it.
     # Anybody may make a folder in ProgramData, and what they put in it would
     # run as SYSTEM once it was Administrators' like the rest.
-    if (Test-Path -LiteralPath $Base) {
+    if (-not $BaseIsNew) {
         $intrusion = @(Get-BaseTakeover)
         if ($intrusion.Count -gt 0) {
             throw ("$Base is already there, and was not made for Administrators and SYSTEM alone: " + ($intrusion -join '; ') + ". " +
@@ -776,29 +786,31 @@ if ($TaskRunsAsSystem) {
 Step 'Base'
 
 if ($TaskRunsAsSystem) {
-    # Made here, not found: New-Item without -Force fails on a folder that is
-    # there, so one somebody made since it was looked at above stops this
-    # instead of being taken over. Protect-Base then closes it, and refuses it
-    # if anything was put in it before that.
-    $fresh = -not (Test-Path -LiteralPath $Base)
-    if ($fresh) {
-        $above = Split-Path -Parent $Base
-        if (-not (Test-Path -LiteralPath $above -PathType Container)) {
-            New-Item -ItemType Directory -Path $above -Force | Out-Null
-        }
+    # Made here, not found: each folder that was not there when it was looked
+    # at above is made with New-Item without -Force, which fails on a folder
+    # that is there, from the outermost in, and kept only if Administrators or
+    # this account own it. One somebody made since then stops this instead of
+    # being taken over. Protect-Base then closes the base, and refuses it if
+    # anything was put in it before that, and the folders above are judged
+    # again as they are now.
+    foreach ($folder in $BaseFolders) {
         try {
-            New-Item -ItemType Directory -Path $Base -ErrorAction Stop | Out-Null
+            New-Item -ItemType Directory -Path $folder -ErrorAction Stop | Out-Null
         } catch {
-            throw "$Base could not be made, or somebody else made it since it was looked at: $($_.Exception.Message). Run this again. Nothing was installed."
+            throw "$folder could not be made, or somebody else made it since it was looked at: $($_.Exception.Message). Run this again. Nothing was installed."
         }
         # Administrators', as what an elevated session makes, or this account's
         # where policy makes whoever creates a folder its owner.
-        $madeBy = (Get-Acl -LiteralPath $Base).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        $madeBy = (Get-Acl -LiteralPath $folder).GetOwner([Security.Principal.SecurityIdentifier]).Value
         if (@($AdministratorsSid, $UserSid) -notcontains $madeBy) {
-            throw "$Base was made, but $madeBy owns it, not Administrators or this account. Nothing was installed."
+            throw "$folder was made, but $madeBy owns it, not Administrators or this account. Nothing was installed."
         }
     }
-    Protect-Base -Sids @($AdministratorsSid, $SystemSid) -Owner $AdministratorsSid -Fresh:$fresh
+    Protect-Base -Sids @($AdministratorsSid, $SystemSid) -Owner $AdministratorsSid -Fresh:$BaseIsNew
+    $takeover = @(Get-PathTakeover $Base)
+    if ($takeover.Count -gt 0) {
+        throw ("Somebody besides Administrators and SYSTEM could put another folder where the base is: " + ($takeover -join '; ') + ". Nothing was installed.")
+    }
     Note "$Base is Administrators' and SYSTEM's alone"
 } else {
     Protect-Base -Sids @($UserSid)
