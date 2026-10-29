@@ -83,8 +83,8 @@ answers, and none of them happens on its own. Each acts on the machine's documen
 then, verified against its hash, and only while this device's setup is still the one it was compared
 with; `--hash HASH` adds that the machine's document is still the one you looked at. Merging keeps
 both sides: entries only one device changed are taken from that device, and entries both changed,
-or every differing entry when no shared revision is kept here, are the only ones anybody is asked
-about. From the command line those take the machine's side.
+or every differing entry when no shared revision this device accepts is kept here, are the only ones
+anybody is asked about. From the command line those take the machine's side.
 
 A machine that refuses a revision because this device's key is restricted there, or because the
 document breaks one of its rules, is not sent that revision again until the setup here changes or a

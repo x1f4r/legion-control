@@ -391,15 +391,16 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
                 return (new MergeSession(mine, theirs, theirsHash, null, Array.Empty<SetupDifference>(), preview,
                     DifferentSetup: true, MergeProblem: null, takeProblem, WhyNotReplace(machine)), null);
 
-            var baseHash = SetupSync.CommonBase(mine.Hash, theirs.Hash, mine.Identity.Lineage, theirs.Identity.Lineage,
-                hash => _config.Ledger.Read(hash)?.Text);
-            var baseDocument = baseHash is null ? null : _config.Ledger.Read(baseHash);
             // A kept revision is held to peer intake like anything else a merge reads. One this
-            // build refuses, kept by an older one, is no base: every difference is then asked
-            // about, which fails toward a question rather than toward a merge that cannot start.
-            // Section 9.8 has not settled this yet, and the reference merge refuses such a base
-            // instead, so Merge and Keep mine wait there where they are offered here.
-            if (baseDocument is not null && SetupMerge.WhyTheirsCannotMerge(baseDocument.Text) is not null) baseDocument = null;
+            // build refuses, kept by an older one, is skipped exactly like one that is not kept:
+            // the next revision both sides descend from is the base, and with none every
+            // difference is asked about, which fails toward a question rather than toward a merge
+            // that cannot start. Section 9.8 has not settled this yet, and the reference merge
+            // refuses such a base instead, so Merge and Keep mine wait there where they are
+            // offered here.
+            var baseHash = SetupSync.CommonBase(mine.Hash, theirs.Hash, mine.Identity.Lineage, theirs.Identity.Lineage,
+                hash => _config.Ledger.Read(hash) is { } kept && SetupMerge.WhyTheirsCannotMerge(kept.Text) is null ? kept.Text : null);
+            var baseDocument = baseHash is null ? null : _config.Ledger.Read(baseHash);
             var mergeProblem = SetupMerge.WhyMineCannotMerge(mine.Text);
             var differences = mergeProblem is null
                 ? SetupMerge.Differences(mine.Text, theirs.Text, baseDocument?.Text)
