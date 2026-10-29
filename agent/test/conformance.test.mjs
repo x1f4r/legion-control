@@ -21,12 +21,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { checkReply, schemaForCommand } from '../../contract/validate.mjs';
 import { OK_REPLY_ACTIONS } from '../../contract/tools/outcome.mjs';
 import { canonicalBytes, canonicalHash } from '../src/controller.mjs';
 import { acquireOperationLock } from '../src/lock.mjs';
 import {
-  cli, commandService, ENTRY, FIXTURE, fixtureConfig, fixtureData, withHome, writeConfig, writeFixture,
+  cli, commandService, ENTRY, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture,
 } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
@@ -85,14 +86,14 @@ function conforms(argv, run, { restricted = false } = {}) {
  * the way a restricted key sends it: as SSH_ORIGINAL_COMMAND, through the
  * dispatcher, behind the agent's own interpreter and entry point.
  */
-function invoke(home, argv, { stdin = null, env = {}, restricted = false } = {}) {
+function invoke(home, argv, { stdin = null, env = {}, restricted = false, nodeArgs = [] } = {}) {
   const run = restricted
     ? cli(['dispatch'], {
       home,
       stdin,
       env: { ...env, LEGIONCTL_RESTRICTED: '1', SSH_ORIGINAL_COMMAND: [process.execPath, ENTRY, ...argv].map(quote).join(' ') },
     })
-    : cli(argv, { home, stdin, env });
+    : cli(argv, { home, stdin, env, nodeArgs });
   return conforms(argv, run, { restricted });
 }
 
@@ -438,6 +439,169 @@ test('run conforms when it runs, fails, times out, is unknown and is detached', 
     const replayed = invoke(home, ['run', 'say', '--detach', '--op', id]);
     assert.equal(replayed.action, 'ran');
     assert.equal(replayed.replayed, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Commands that outlive their deadline, or their agent
+// ---------------------------------------------------------------------------
+
+const posix = process.platform !== 'win32';
+
+/** A command whose child writes `marker` after `ms`, while the command itself never exits. */
+function lateWriter(marker, ms) {
+  const child = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'too late'), ${ms})`;
+  return node(`require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(child)}], { stdio: 'ignore' }); setInterval(() => {}, 1000)`);
+}
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+function ledger(home) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(home, 'state', 'unsettled.json'), 'utf8')).commands;
+  } catch {
+    return [];
+  }
+}
+
+async function until(what, done, ms = 30000) {
+  const deadline = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() >= deadline) throw new Error(`${what} did not happen within ${ms} ms`);
+    await delay(50);
+  }
+}
+
+test('a run that times out is stopped with everything it started before it answers', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home);
+    const late = path.join(home, 'late');
+    writeConfig(home, fixtureConfig(dir, {
+      actions: [
+        { id: 'late', command: lateWriter(late, 3000), timeoutSeconds: 1 },
+        { id: 'say', command: call(dir, 'action') },
+      ],
+    }));
+    const timedOut = invoke(home, ['run', 'late']);
+    assert.equal(timedOut.reasonCode, 'timed-out');
+    assert.equal(timedOut.outcome, 'unknown');
+    assert.match(timedOut.message, /did not finish within 1 s and was stopped/);
+    // The sequence the second review ran: the lock is free again, another
+    // operation takes it, and the timed-out run's child must not still be at
+    // work underneath it.
+    assert.equal(invoke(home, ['run', 'say']).action, 'ran');
+    await delay(3000);
+    assert.equal(fs.existsSync(late), false, 'the child went with the run that started it');
+    assert.deepEqual(ledger(home), []);
+  });
+});
+
+test('an update whose drain runs out of time answers only once the drain is gone, and stops nothing', async () => {
+  await withHome(async (home) => {
+    const late = path.join(home, 'late');
+    const dir = oneService(home, { initial: { latest: '2.0.0' }, service: { drain: { command: lateWriter(late, 3000), timeoutSeconds: 1 } } });
+    const failed = invoke(home, ['update']);
+    assert.equal(failed.action, 'failed');
+    assert.match(failed.message, /the drain command failed: node timed out/);
+    assert.equal(readFixture(dir, 'stop-runs'), '', 'a drain that did not finish is never followed by a stop');
+    await delay(3000);
+    assert.equal(fs.existsSync(late), false);
+    assert.deepEqual(ledger(home), []);
+  });
+});
+
+test('a command the agent could not see stop holds every mutation, and each names its operation', { skip: !posix && 'POSIX process groups' }, async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    writeConfig(home, fixtureConfig(dir, {
+      actions: [
+        { id: 'hang', command: node('setInterval(() => {}, 1000)'), timeoutSeconds: 1 },
+        { id: 'say', command: call(dir, 'action') },
+      ],
+    }));
+    // The agent may signal nothing in the group: what a member running as
+    // another user, or stuck in the kernel, looks like from here.
+    const stand = path.join(home, 'no-group-signals.mjs');
+    fs.writeFileSync(stand, [
+      'const kill = process.kill.bind(process);',
+      'process.kill = (pid, signal) => {',
+      "  if (pid < 0 && signal !== 0) throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });",
+      '  return kill(pid, signal);',
+      '};',
+      '',
+    ].join('\n'));
+    const id = 'unsettled-run-0001';
+    const first = invoke(home, ['run', 'hang', '--op', id], { nodeArgs: ['--import', pathToFileURL(stand).href] });
+    assert.equal(first.reasonCode, 'timed-out');
+    assert.equal(first.outcome, 'unknown');
+    assert.match(first.message, /could not be confirmed stopped/);
+    const [entry] = ledger(home);
+    assert.equal(entry.state, 'unconfirmed');
+    try {
+      for (const argv of [['run', 'say'], ['update'], ['restart'], ['boot', 'test'], ['cycle']]) {
+        const held = invoke(home, argv);
+        assert.equal(held.action, 'conflict', argv.join(' '));
+        assert.equal(held.reasonCode, 'operation-in-progress');
+        assert.equal(held.outcome, 'deferred');
+        assert.equal(held.conflict.opId, id);
+        assert.equal(held.conflict.kind, 'run');
+        assert.equal(held.conflict.phase, 'running');
+      }
+      assert.equal(readFixture(dir, 'action-runs'), '', 'nothing ran while it was held');
+      assert.equal(readFixture(dir, 'update-runs'), '');
+    } finally {
+      try { process.kill(-entry.group, 'SIGKILL'); } catch { /* already gone */ }
+    }
+    await until('the held command ending', () => !alive(entry.pid));
+    assert.equal(invoke(home, ['run', 'say']).action, 'ran');
+    assert.deepEqual(ledger(home), []);
+  });
+});
+
+test('an installer whose agent was killed holds recovery and every update until it ends', { skip: !posix && 'Windows ends a dead agent\'s own children with it' }, async () => {
+  await withHome(async (home) => {
+    const dir = oneService(home, { initial: { latest: '2.0.0' } });
+    writeFixture(dir, 'update-gate', 'closed');
+    const id = 'killed-update-0001';
+    const agent = spawn(process.execPath, [ENTRY, 'update', '--op', id], { env: { ...process.env, LEGIONCTL_HOME: home }, stdio: 'ignore' });
+    let installer;
+    try {
+      await until('the update reaching its install', () => {
+        installer = ledger(home).find((entry) => Number.isInteger(entry.pid) && entry.phase === 'installing');
+        return installer !== undefined;
+      });
+      agent.kill('SIGKILL');
+      await new Promise((resolve) => (agent.exitCode !== null || agent.signalCode !== null ? resolve() : agent.once('exit', resolve)));
+      assert.equal(alive(installer.pid), true, 'the installer outlived the agent that started it');
+      assert.equal(readFixture(dir, 'running'), 'off', 'the service was stopped for the install');
+
+      const update = invoke(home, ['update']);
+      assert.equal(update.action, 'conflict');
+      assert.equal(update.conflict.opId, id);
+      assert.equal(update.conflict.phase, 'installing');
+      // Recovery would start the service the killed update stopped, over an
+      // installer that is still writing. It waits instead.
+      assert.equal(invoke(home, ['cycle']).action, 'conflict');
+      assert.equal(readFixture(dir, 'start-runs'), '');
+    } finally {
+      fs.rmSync(path.join(dir, 'update-gate'), { force: true });
+      if (agent.exitCode === null && agent.signalCode === null) agent.kill('SIGKILL');
+    }
+
+    await until('the installer finishing', () => !alive(installer.pid));
+    const cycled = invoke(home, ['cycle']);
+    assert.equal(cycled.action, 'cycled');
+    assert.equal(readFixture(dir, 'running'), 'on', 'with the installer gone, recovery puts the service back');
+    assert.equal(readFixture(dir, 'update-runs'), '1', 'the update was never run a second time');
+    assert.equal(invoke(home, ['op', id]).op.result.action, 'interrupted');
+    assert.deepEqual(ledger(home), []);
   });
 });
 

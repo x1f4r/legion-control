@@ -15,6 +15,7 @@ import {
   globalModulesDir,
   runCommand,
 } from '../config.mjs';
+import { runMutation } from '../process-runner.mjs';
 import { loadCache, saveCache } from '../state.mjs';
 
 const LATEST_CACHE_MS = 10 * 60 * 1000;
@@ -83,16 +84,32 @@ export function npmInvocation(prefix, { platform = process.platform, nodePath = 
   return { file: 'npm', lead: [], shell: false };
 }
 
-export function runNpm(args, options = {}) {
-  const invocation = npmInvocation(options.prefix);
-  if (invocation.error) return {
+function npmUnavailable(invocation) {
+  return {
     ok: false, code: null, signal: null, stdout: '', stderr: '', timedOut: false,
     error: invocation.error, command: 'npm',
   };
+}
+
+export function runNpm(args, options = {}) {
+  const invocation = npmInvocation(options.prefix);
+  if (invocation.error) return npmUnavailable(invocation);
   return runCommand(invocation.file, [...invocation.lead, ...args], {
     timeoutMs: options.timeoutMs ?? 60000,
     shell: invocation.shell,
   });
+}
+
+/**
+ * npm, for the one thing it does here that changes the machine. An install
+ * runs package scripts that start processes of their own, so it goes through
+ * the mutation runner: at its deadline every one of them is stopped and seen
+ * gone before a rollback can reinstall over them.
+ */
+async function runNpmMutation(args, options = {}) {
+  const invocation = npmInvocation(options.prefix);
+  if (invocation.error) return npmUnavailable(invocation);
+  return runMutation(invocation.file, [...invocation.lead, ...args], { timeoutMs: options.timeoutMs ?? 60000 });
 }
 
 /**
@@ -269,8 +286,8 @@ function allowScriptsArgs(service, prefix) {
   return [`--allow-scripts=${packages.join(',')}`];
 }
 
-export function installVersion(service, version, prefix) {
-  const result = runNpm(
+export async function installVersion(service, version, prefix) {
+  const result = await runNpmMutation(
     [
       'install',
       '--global',

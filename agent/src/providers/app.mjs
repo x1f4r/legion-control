@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import https from 'node:https';
 import path from 'node:path';
 import { compilePattern, describeFailure, runCommand, sleep, LEGACY_DEFAULTS } from '../config.mjs';
+import { runMutation } from '../process-runner.mjs';
 import { cachedLookup, channelCacheKey } from './npm.mjs';
 
 // How long we are willing to wait for a polite quit before giving up. An app
@@ -260,10 +261,14 @@ export function isAppRunning(service) {
  * Ask the app to quit, politely. This is the step that lets the updater swap in
  * a staged build, so the graceful path is not a nicety, it is the whole
  * mechanism.
+ *
+ * osascript goes through the mutation runner like every other command that
+ * changes the machine. A deadline stops osascript and nothing else: the app is
+ * launchd's child, never the agent's, so it is still only ever asked.
  */
-export function askAppToQuit(service) {
+export async function askAppToQuit(service) {
   if (!service.bundleId) return { ok: false, message: 'no bundle id is configured for this service' };
-  const result = runCommand('osascript', ['-e', `quit app id "${service.bundleId}"`], { timeoutMs: 30000 });
+  const result = await runMutation('osascript', ['-e', `quit app id "${service.bundleId}"`], { timeoutMs: 30000 });
   return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
 }
 
@@ -274,7 +279,7 @@ export function askAppToQuit(service) {
 export async function quitAndWait(service, timeoutMs = QUIT_WAIT_MS) {
   if (!isAppRunning(service)) return { ok: true, notRunning: true, message: 'the app was not running' };
 
-  const asked = askAppToQuit(service);
+  const asked = await askAppToQuit(service);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!isAppRunning(service)) return { ok: true, message: null };
@@ -300,15 +305,15 @@ export async function quitAndWait(service, timeoutMs = QUIT_WAIT_MS) {
   };
 }
 
-export function launchApp(service) {
+export async function launchApp(service) {
   if (!service.path) return { ok: false, message: 'no app path is configured for this service' };
-  const result = runCommand('open', ['-a', service.path], { timeoutMs: 30000 });
+  const result = await runMutation('open', ['-a', service.path], { timeoutMs: 30000 });
   return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
 }
 
 /** Launch and give the app a moment to bind its port before anyone health-checks it. */
 export async function launchAndSettle(service) {
-  const started = launchApp(service);
+  const started = await launchApp(service);
   await sleep(LAUNCH_GRACE_MS);
   return started;
 }

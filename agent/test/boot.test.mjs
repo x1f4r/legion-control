@@ -57,14 +57,14 @@ test('a command boot target with no verify cannot be armed for a reboot', async 
     ).config;
 
     // A reboot is going to follow, and nothing here can prove the arming took.
-    const refused = armNextBoot(config, 'other', { requireVerification: true });
+    const refused = await armNextBoot(config, 'other', { requireVerification: true });
     assert.equal(refused.ok, false);
     assert.equal(refused.verified, false);
     assert.match(refused.message, /no verify command/);
     assert.match(refused.message, /--force overrides the busy gate, not the evidence/);
 
     // Arming alone, with nobody about to lose their session over it, is allowed.
-    const armed = armNextBoot(config, 'other', { requireVerification: false });
+    const armed = await armNextBoot(config, 'other', { requireVerification: false });
     assert.equal(armed.ok, true);
     assert.equal(armed.verified, false);
   });
@@ -76,7 +76,7 @@ test('a command boot target with a verify command is armed and read back', async
       { services: [], boot: { targets: { other: { method: 'command', arm: SUCCEEDS, verify: SUCCEEDS } } } },
       { platform: 'linux', base: '/tmp/x' },
     ).config;
-    const armed = armNextBoot(config, 'other', { requireVerification: true });
+    const armed = await armNextBoot(config, 'other', { requireVerification: true });
     assert.equal(armed.ok, true);
     assert.equal(armed.verified, true);
   });
@@ -88,7 +88,7 @@ test('an arm command that fails is never followed by a reboot', async () => {
       { services: [], boot: { targets: { other: { method: 'command', arm: FAILS, verify: SUCCEEDS } } } },
       { platform: 'linux', base: '/tmp/x' },
     ).config;
-    const armed = armNextBoot(config, 'other', { requireVerification: true });
+    const armed = await armNextBoot(config, 'other', { requireVerification: true });
     assert.equal(armed.ok, false);
     assert.match(armed.message, /arm command failed/);
   });
@@ -100,19 +100,19 @@ test('an arm that runs but does not verify is a failure', async () => {
       { services: [], boot: { targets: { other: { method: 'command', arm: SUCCEEDS, verify: FAILS } } } },
       { platform: 'linux', base: '/tmp/x' },
     ).config;
-    const armed = armNextBoot(config, 'other', { requireVerification: true });
+    const armed = await armNextBoot(config, 'other', { requireVerification: true });
     assert.equal(armed.ok, false);
     assert.match(armed.message, /verification failed/);
   });
 });
 
-test('boot targets are listed from the config, and an unknown one is refused', () => {
+test('boot targets are listed from the config, and an unknown one is refused', async () => {
   const config = normalizeConfig(
     { services: [], boot: { targets: { windows: { method: 'efi-bootnext', match: '^Windows', name: 'Windows 11' } } } },
     { platform: 'linux', base: '/tmp/x' },
   ).config;
   assert.deepEqual(bootTargets(config), [{ id: 'windows', name: 'Windows 11' }]);
-  assert.equal(armNextBoot(config, 'haiku').ok, false);
+  assert.equal((await armNextBoot(config, 'haiku')).ok, false);
 });
 
 test('the suspend command is chosen per platform, and Windows resolves a real tool', () => {

@@ -16,6 +16,7 @@
 // none           nothing to start or stop.
 
 import { deadline, describeFailure, detectPlatform, runArgv, runCommand, runCommandAsync } from '../config.mjs';
+import { runMutation, runMutationArgv } from '../process-runner.mjs';
 import * as appProvider from '../providers/app.mjs';
 import { packageRoot } from '../providers/npm.mjs';
 
@@ -59,14 +60,22 @@ export function taskMatch(service, { readOnly = false } = {}) {
   return service.name;
 }
 
-function systemctl(service, verb, timeoutMs) {
+/** The systemctl argv for one verb on the service's unit. */
+function systemctlArgv(service, verb) {
   const unit = service.process.unit;
-  if (service.process.type === 'systemd-system') {
-    // Non-interactive sudo on purpose: an ssh session has nowhere to type a
-    // password and a prompt would hang here until the timeout.
-    return runCommand('sudo', ['-n', 'systemctl', verb, unit], { timeoutMs });
-  }
-  return runCommand('systemctl', ['--user', verb, unit], { timeoutMs });
+  // Non-interactive sudo on purpose: an ssh session has nowhere to type a
+  // password and a prompt would hang here until the timeout.
+  if (service.process.type === 'systemd-system') return ['sudo', '-n', 'systemctl', verb, unit];
+  return ['systemctl', '--user', verb, unit];
+}
+
+function systemctl(service, verb, timeoutMs) {
+  return runArgv(systemctlArgv(service, verb), { timeoutMs });
+}
+
+/** A systemctl verb that changes the unit, through the mutation runner. */
+export function systemctlMutation(service, verb, timeoutMs) {
+  return runMutationArgv(systemctlArgv(service, verb), { timeoutMs });
 }
 
 function systemdProbe(service) {
@@ -380,40 +389,46 @@ export function isRunning(service) {
   return probe.running;
 }
 
-export function startProcess(service) {
+/**
+ * Start and stop go through the mutation runner, which answers only once the
+ * command has ended or its whole tree has been stopped. A start command is done
+ * when it exits, and the daemon it leaves running is the whole point of it, so
+ * it is never stopped for outliving the command that started it.
+ */
+export async function startProcess(service) {
   const type = service.process?.type;
   if (type === 'systemd-user' || type === 'systemd-system') {
-    const result = systemctl(service, 'start', 60000);
+    const result = await systemctlMutation(service, 'start', 60000);
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'scheduled-task') {
-    const result = runPowerShell(`Start-ScheduledTask -TaskName ${psLiteral(service.process.task)}`, 60000);
+    const result = await runMutation('powershell.exe', powerShellArgs(`Start-ScheduledTask -TaskName ${psLiteral(service.process.task)}`), { timeoutMs: 60000 });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'app') return appProvider.launchApp(service);
   if (type === 'command') {
     if (!service.process.start) return { ok: false, message: `${service.name} has no start command configured` };
-    const result = runArgv(service.process.start, { timeoutMs: 60000 });
+    const result = await runMutationArgv(service.process.start, { timeoutMs: 60000 });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   return { ok: true, message: `${service.name} has nothing to start` };
 }
 
-export function stopProcess(service) {
+export async function stopProcess(service) {
   const type = service.process?.type;
   if (type === 'systemd-user' || type === 'systemd-system') {
-    const result = systemctl(service, 'stop', 60000);
+    const result = await systemctlMutation(service, 'stop', 60000);
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'scheduled-task') {
-    const result = runPowerShell(`Stop-ScheduledTask -TaskName ${psLiteral(service.process.task)}`, 60000);
+    const result = await runMutation('powershell.exe', powerShellArgs(`Stop-ScheduledTask -TaskName ${psLiteral(service.process.task)}`), { timeoutMs: 60000 });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   // Asking is all we ever do to an app. There is no forced stop here.
   if (type === 'app') return appProvider.askAppToQuit(service);
   if (type === 'command') {
     if (!service.process.stop) return { ok: false, message: `${service.name} has no stop command configured` };
-    const result = runArgv(service.process.stop, { timeoutMs: 60000 });
+    const result = await runMutationArgv(service.process.stop, { timeoutMs: 60000 });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   return { ok: true, message: `${service.name} has nothing to stop` };

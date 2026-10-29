@@ -15,10 +15,15 @@
 // contract lists for that kind. The one exception is an --op id that already
 // names a different request: nothing was attempted, so there is no action, and
 // the reply carries `refusal` for the caller to answer in the refusal shape.
+//
+// It is also where the command ledger is honoured (process-runner.mjs). A
+// command an earlier operation could not see stop may still be changing the
+// machine, and the next operation waits for it exactly as it waits for a lock.
 
 import { MUTATING_PHASES, REASON } from './contract.mjs';
 import { acquireOperationLock, acquireServiceLock } from './lock.mjs';
 import { log } from './log.mjs';
+import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import {
   appendLog,
   beginOperation,
@@ -178,6 +183,16 @@ export async function withOperation(options, body) {
       const finished = finishOperation(id, result);
       return { ...result, opId: id, op: summarize(finished) };
     }
+    // Replacing the agent touches no service, and is how a machine gets the
+    // fix for whatever is holding it, so only it goes ahead regardless.
+    const unsettled = kind === 'self-update' ? null : await unsettledWork();
+    if (unsettled) {
+      const result = unsettled.conflict
+        ? { ok: false, action: 'conflict', reasonCode: REASON.operationInProgress, message: unsettled.message, conflict: unsettled.conflict }
+        : { ok: false, action: 'failed', reasonCode: REASON.internal, message: unsettled.message };
+      const finished = finishOperation(id, result);
+      return { ...result, opId: id, op: summarize(finished) };
+    }
     if (!ownLock && serviceLockFile && lock.compatFile !== serviceLockFile) {
       serviceLock = acquireServiceLock(serviceLockFile, target ?? kind);
       if (!serviceLock.ok) {
@@ -186,7 +201,11 @@ export async function withOperation(options, body) {
         return { ...result, opId: id, op: summarize(finished) };
       }
     }
-    const { pendingTransition = false, ...result } = await body({ opId: id, lock });
+    const { pendingTransition = false, ...result } = await withOperationContext(id, () => body({ opId: id, lock }));
+    // A command of this operation that ran out of time and could not be seen
+    // to stop may still be doing its work, so whatever the body concluded, the
+    // outcome is unknown and no client sends it again.
+    if (await unsettledWork({ opId: id })) result.outcome = 'unknown';
     if (pendingTransition) {
       const pending = updateOperation(id, { dispatchAcknowledgement: result });
       return { ...result, opId: id, op: summarize(pending) };
@@ -203,7 +222,7 @@ export async function withOperation(options, body) {
     // A body that threw once it was changing the machine left it in a state
     // nobody observed. Its failure is reported as unknown, so a client checks
     // again rather than sending the same work a second time.
-    const changing = MUTATING_PHASES.has(readOperation(id)?.phase);
+    const changing = MUTATING_PHASES.has(readOperation(id)?.phase) || Boolean(await unsettledWork({ opId: id }));
     const result = { ok: false, action: 'failed', reasonCode: REASON.internal, message, ...(changing ? { outcome: 'unknown' } : {}) };
     const finished = finishOperation(id, result);
     return { ...result, opId: id, op: summarize(finished) };

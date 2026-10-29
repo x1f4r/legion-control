@@ -45,6 +45,7 @@ import {
   updateOperation,
 } from './operations.mjs';
 import { orderServices, scheduledEligibility } from './policy.mjs';
+import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { isRunning, livenessOf, startAndSettle, waitForServiceHealth } from './service.mjs';
 import { runRestart, runUpdate } from './update.mjs';
@@ -187,7 +188,9 @@ export async function drainQueue(config, { lock, force = false } = {}) {
     }
     note(`running the queued ${record.kind}${record.service ? ` of ${record.service}` : ''}`, 'queue');
     results.push(await runQueued(config, record, { lock }));
-    if (pendingPowerOperation()) break;
+    // A request taken up now would only be refused, and a refusal would spend
+    // it. Like everything after a power transition, it waits in the queue.
+    if (pendingPowerOperation() || (await unsettledWork())) break;
   }
   return results;
 }
@@ -294,9 +297,20 @@ export async function runCycle(config, options = {}) {
       finishOperation(id, result);
       return { ...result, opId: id, ...report };
     }
+    // Recovery starts services, so it waits for a command an earlier run could
+    // not see stop just as every other mutation does. Putting a service back
+    // while its installer may still be running is the damage it exists to undo.
+    const unsettled = await unsettledWork();
+    if (unsettled) {
+      const result = unsettled.conflict
+        ? { ok: false, action: 'conflict', reasonCode: REASON.operationInProgress, message: unsettled.message, conflict: unsettled.conflict }
+        : { ok: false, action: 'failed', reasonCode: REASON.internal, message: unsettled.message };
+      finishOperation(id, result);
+      return { ...result, opId: id, ...report };
+    }
     lock.phase('recovering');
     recordPhase(id, 'recovering');
-    report.recovery = await recoverMachine(config, { lockFiles: config.services.map((service) => service.lockFile) });
+    report.recovery = await withOperationContext(id, () => recoverMachine(config, { lockFiles: config.services.map((service) => service.lockFile) }));
 
     lock.phase('queued');
     recordPhase(id, 'queued');

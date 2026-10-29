@@ -106,7 +106,7 @@ export async function runBoot(config, target, options = {}) {
       recordPhase(opId, 'arming');
       // Verification is required whenever a reboot follows. A command target
       // with no verify command is refused here, and --force does not lift it.
-      const armed = armNextBoot(config, target, { requireVerification: !noReboot });
+      const armed = await armNextBoot(config, target, { requireVerification: !noReboot });
       if (!armed.ok) {
         log(`boot to ${target} failed: ${armed.message}`, 'boot');
         return {

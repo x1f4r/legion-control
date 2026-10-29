@@ -5,11 +5,17 @@
 // reboots. A reboot that was not verifiably armed is refused, because rebooting
 // an unarmed machine just returns to the system it was already on, and the
 // controller apps would then sit waiting for one that never comes.
+//
+// Every command that arms, and a target's own verify command, goes through the
+// mutation runner, so a deadline stops the whole command before the reply says
+// anything about the firmware. Reading the firmware back changes nothing and
+// stays on the plain runner.
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describeFailure, detectPlatform, runArgv, runCommand, sleep } from './config.mjs';
+import { runMutation, runMutationArgv } from './process-runner.mjs';
 
 // ---------------------------------------------------------------------------
 // efi-bootnext
@@ -83,12 +89,12 @@ export function resolveEfiEntry(matchSource) {
   return matchEfiEntry(listing.entries, matchSource);
 }
 
-function armEfiBootNext(target) {
+async function armEfiBootNext(target) {
   const resolved = resolveEfiEntry(target.match);
   if (!resolved.ok) return { ok: false, message: resolved.message };
 
   const number = resolved.entry.number;
-  const set = runCommand('sudo', ['-n', 'efibootmgr', '--bootnext', number], { timeoutMs: 20000 });
+  const set = await runMutation('sudo', ['-n', 'efibootmgr', '--bootnext', number], { timeoutMs: 20000 });
   if (!set.ok) return { ok: false, message: `could not set BootNext=${number}: ${describeFailure(set)}` };
 
   const verify = readEfiBootManager();
@@ -117,14 +123,14 @@ function readBootSequence() {
   return { ok: true, value: line ? line.replace(/^\s*bootsequence\s*/i, '').trim() : null, message: null };
 }
 
-function armClearBootSequence() {
+async function armClearBootSequence() {
   const before = readBootSequence();
   if (!before.ok) return { ok: false, message: `could not read {fwbootmgr}: ${before.message}` };
   if (!before.value) {
     return { ok: true, message: 'bootsequence was already clear; the next boot falls through BootOrder' };
   }
 
-  const cleared = runCommand('bcdedit', ['/deletevalue', '{fwbootmgr}', 'bootsequence'], { timeoutMs: 20000 });
+  const cleared = await runMutation('bcdedit', ['/deletevalue', '{fwbootmgr}', 'bootsequence'], { timeoutMs: 20000 });
   if (!cleared.ok) return { ok: false, message: `could not clear bootsequence: ${describeFailure(cleared)}` };
 
   const after = readBootSequence();
@@ -132,8 +138,8 @@ function armClearBootSequence() {
   return { ok: true, message: 'cleared {fwbootmgr} bootsequence; the next boot falls through BootOrder' };
 }
 
-function armBootSequence(target) {
-  const set = runCommand('bcdedit', ['/set', '{fwbootmgr}', 'bootsequence', target.entry], { timeoutMs: 20000 });
+async function armBootSequence(target) {
+  const set = await runMutation('bcdedit', ['/set', '{fwbootmgr}', 'bootsequence', target.entry], { timeoutMs: 20000 });
   if (!set.ok) return { ok: false, message: `could not set bootsequence: ${describeFailure(set)}` };
 
   const after = readBootSequence();
@@ -156,8 +162,8 @@ function readGrubNextEntry() {
   return { ok: true, value: match ? match[1].trim() : null, message: null };
 }
 
-function armGrubReboot(target) {
-  const set = runCommand('sudo', ['-n', 'grub-reboot', target.entry], { timeoutMs: 20000 });
+async function armGrubReboot(target) {
+  const set = await runMutation('sudo', ['-n', 'grub-reboot', target.entry], { timeoutMs: 20000 });
   if (!set.ok) return { ok: false, message: `grub-reboot failed: ${describeFailure(set)}` };
 
   const after = readGrubNextEntry();
@@ -186,7 +192,7 @@ function armGrubReboot(target) {
  * `boot --no-reboot` still arms it, because nothing is lost by trying when
  * nobody is about to close the session on the strength of it.
  */
-function armCommand(target, { requireVerification }) {
+async function armCommand(target, { requireVerification }) {
   if (!target.verify && requireVerification) {
     return {
       ok: false,
@@ -198,13 +204,13 @@ function armCommand(target, { requireVerification }) {
     };
   }
 
-  const armed = runArgv(target.arm, { timeoutMs: 60000 });
+  const armed = await runMutationArgv(target.arm, { timeoutMs: 60000 });
   if (!armed.ok) return { ok: false, verified: false, message: `the arm command failed: ${describeFailure(armed)}` };
 
   if (!target.verify) {
     return { ok: true, verified: false, message: `${target.id} armed (no verify command is configured, so this was not read back)` };
   }
-  const verified = runArgv(target.verify, { timeoutMs: 30000 });
+  const verified = await runMutationArgv(target.verify, { timeoutMs: 30000 });
   if (!verified.ok) {
     return { ok: false, verified: false, message: `the arm command ran but verification failed: ${describeFailure(verified)}` };
   }
@@ -227,19 +233,19 @@ export function findBootTarget(config, id) {
  * every path except `--no-reboot`. Every firmware method reads itself back
  * regardless; it only changes what a command-described target is allowed to do.
  */
-export function armNextBoot(config, id, { requireVerification = true } = {}) {
+export async function armNextBoot(config, id, { requireVerification = true } = {}) {
   const target = findBootTarget(config, id);
   if (!target) return { ok: false, verified: false, message: `unknown boot target: ${id}` };
 
   switch (target.method) {
     case 'efi-bootnext':
-      return { verified: true, ...armEfiBootNext(target) };
+      return { verified: true, ...(await armEfiBootNext(target)) };
     case 'clear-bootsequence':
-      return { verified: true, ...armClearBootSequence() };
+      return { verified: true, ...(await armClearBootSequence()) };
     case 'bootsequence':
-      return { verified: true, ...armBootSequence(target) };
+      return { verified: true, ...(await armBootSequence(target)) };
     case 'grub-reboot':
-      return { verified: true, ...armGrubReboot(target) };
+      return { verified: true, ...(await armGrubReboot(target)) };
     case 'command':
       return armCommand(target, { requireVerification });
     default:

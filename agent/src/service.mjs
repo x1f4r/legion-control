@@ -4,9 +4,10 @@
 // Everything here takes a normalized service object. Nothing in this file knows
 // which product it is looking after.
 
-import { describeFailure, detectPlatform, runArgv, runCommand, sleep } from './config.mjs';
+import { describeFailure, detectPlatform, sleep } from './config.mjs';
+import { runMutationArgv } from './process-runner.mjs';
 import { checkHealth, healthPort } from './probes/health.mjs';
-import { isRunning, probeProcess, processStartedAt, startProcess, stopProcess } from './probes/process.mjs';
+import { isRunning, probeProcess, processStartedAt, startProcess, stopProcess, systemctlMutation } from './probes/process.mjs';
 import { NO_RELAY, probeRelay } from './probes/relay.mjs';
 import * as appProvider from './providers/app.mjs';
 
@@ -85,11 +86,11 @@ export async function waitForServiceHealth(service, timeoutMs, { intervalMs = 20
   }
 }
 
-export function startService(service) {
+export async function startService(service) {
   return startProcess(service);
 }
 
-export function stopService(service) {
+export async function stopService(service) {
   return stopProcess(service);
 }
 
@@ -112,9 +113,9 @@ export function canDrain(service) {
  * has just told us it is not ready, which is the thing the drain existed to
  * avoid.
  */
-export function drainService(service) {
+export async function drainService(service) {
   if (!canDrain(service)) return { ok: true, drained: false, message: null };
-  const result = runArgv(service.drain.command, { timeoutMs: service.drain.timeoutSeconds * 1000 });
+  const result = await runMutationArgv(service.drain.command, { timeoutMs: service.drain.timeoutSeconds * 1000 });
   return {
     ok: result.ok,
     drained: result.ok,
@@ -134,7 +135,7 @@ export async function stopAndWait(service, timeoutMs = 20000) {
     return appProvider.quitAndWait(service, Math.max(timeoutMs, appProvider.QUIT_WAIT_MS));
   }
 
-  const stopped = stopService(service);
+  const stopped = await stopService(service);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!isRunning(service)) return { ok: true, message: null };
@@ -150,7 +151,7 @@ export async function stopAndWait(service, timeoutMs = 20000) {
 
 /** Start and give the service a moment to bind before anyone health-checks it. */
 export async function startAndSettle(service) {
-  const started = startService(service);
+  const started = await startService(service);
   await sleep(BIND_GRACE_MS);
   return started;
 }
@@ -175,11 +176,7 @@ export async function restartService(service) {
   if (type === 'systemd-user' || type === 'systemd-system') {
     // One `systemctl restart` rather than a stop/start pair: it keeps the unit's
     // own ordering and its restart policy intact.
-    const unit = service.process.unit;
-    const result =
-      type === 'systemd-system'
-        ? runCommand('sudo', ['-n', 'systemctl', 'restart', unit], { timeoutMs: 90000 })
-        : runCommand('systemctl', ['--user', 'restart', unit], { timeoutMs: 90000 });
+    const result = await systemctlMutation(service, 'restart', 90000);
     await sleep(BIND_GRACE_MS);
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }

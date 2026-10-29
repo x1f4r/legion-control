@@ -11,10 +11,10 @@
 // ones are safe.
 
 import dgram from 'node:dgram';
-import { runArgv } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { recordPhase } from './operations.mjs';
+import { runMutationArgv } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { log, note } from './log.mjs';
 
@@ -204,11 +204,33 @@ export async function runAction(config, id, options = {}) {
         return { ok: true, action: 'ran', reasonCode: null, id: action.id, exitCode: 0, output, message };
       }
 
-      const run = runArgv(action.command, { timeoutMs: action.timeoutSeconds * 1000 });
+      // The mutation runner answers once the action has exited, or once its
+      // deadline has stopped everything it started and that has been seen
+      // gone, so nothing it started can still be at work after this reply and
+      // the lock it releases. What it leaves running after exiting by itself,
+      // an app it opened, it left there on purpose.
+      const run = await runMutationArgv(action.command, { timeoutMs: action.timeoutSeconds * 1000 });
       const output = shapeOutput(run.stdout, run.stderr);
 
+      if (run.refused) {
+        // It never started: an earlier command may still be running. That is
+        // something in the way, and it is named when it can be.
+        log(`${action.name} was ${run.error}`, 'run');
+        return {
+          ok: false,
+          action: run.conflict ? 'conflict' : 'failed',
+          reasonCode: run.conflict ? REASON.operationInProgress : REASON.internal,
+          id: action.id,
+          exitCode: null,
+          output: '',
+          message: `${action.name} was ${run.error}`,
+          ...(run.conflict ? { conflict: run.conflict } : {}),
+        };
+      }
       if (run.timedOut) {
-        const message = `${action.name} did not finish within ${action.timeoutSeconds} s and was stopped`;
+        const message = run.terminated
+          ? `${action.name} did not finish within ${action.timeoutSeconds} s and was stopped`
+          : `${action.name} did not finish within ${action.timeoutSeconds} s and could not be confirmed stopped; nothing else changes this machine until it has`;
         log(message, 'run');
         return {
           ok: false,

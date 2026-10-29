@@ -33,10 +33,11 @@
 // lazily starts failing on files that changed under it. Deferring costs a delay;
 // installing under a live turn costs the user's work.
 
-import { describeFailure, runArgv } from './config.mjs';
+import { describeFailure } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { appendLog, recordPhase } from './operations.mjs';
+import { runMutationArgv, unsettledWork } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
 import { hasUpdatePath, scheduledEligibility } from './policy.mjs';
@@ -81,6 +82,13 @@ function recordLastUpdate(service, result, from, to, message) {
 async function ensureServiceUp(service) {
   const health = await serviceHealth(service);
   if (health.ok) return true;
+  // Except over a command that may still be running: a service started while
+  // its installer is still writing is the collision every lock here prevents.
+  const unsettled = await unsettledWork();
+  if (unsettled) {
+    log(`${service.name} was not started again: ${unsettled.message}`, 'update');
+    return false;
+  }
   await startAndSettle(service);
   const second = await waitForServiceHealth(service, 60000);
   if (!second.ok) log(`WARNING: ${service.name} is not answering after the recovery start`, 'update');
@@ -209,7 +217,7 @@ export async function runRestart(config, service, options = {}) {
 async function performUpgrade(service, to, prefix, opId, lock) {
   lock.phase('stopping');
   recordPhase(opId, 'stopping');
-  const drained = drainService(service);
+  const drained = await drainService(service);
   if (!drained.ok) throw new Error(drained.message);
   if (drained.drained) appendLog(opId, drained.message);
 
@@ -218,7 +226,7 @@ async function performUpgrade(service, to, prefix, opId, lock) {
 
   lock.phase('installing');
   recordPhase(opId, 'installing', { note: `npm install ${service.package}@${to}` });
-  const installed = npmProvider.installVersion(service, to, prefix);
+  const installed = await npmProvider.installVersion(service, to, prefix);
   if (!installed.ok) throw new Error(installed.message);
 
   // Verify at the prefix we installed into, not by re-running prefix discovery.
@@ -241,7 +249,22 @@ async function performUpgrade(service, to, prefix, opId, lock) {
   return { to };
 }
 
+/**
+ * Nothing is rolled back over a command that may still be running. The runner
+ * answers only once a timed-out install has been stopped and seen gone; when it
+ * could not see that, the install may still be writing, and reinstalling or
+ * starting anything over it would be two writers on one service. The operation
+ * then reports its outcome as unknown (operate.mjs), and the ledger keeps every
+ * later mutation off the machine until it has gone.
+ */
+async function rollbackHeld() {
+  const unsettled = await unsettledWork();
+  return unsettled ? `nothing was rolled back or restarted, because ${unsettled.message}` : null;
+}
+
 async function rollBack(service, previous, prefix, opId, lock) {
+  const held = await rollbackHeld();
+  if (held) return { ok: false, message: held };
   if (!previous) {
     await ensureServiceUp(service);
     return { ok: false, message: 'nothing to roll back to: no previous version was installed' };
@@ -260,7 +283,7 @@ async function rollBack(service, previous, prefix, opId, lock) {
     return { ok: false, message: `rollback skipped, ${service.name} would not stop: ${stopped.message}` };
   }
 
-  const reinstalled = npmProvider.installVersion(service, previous, prefix);
+  const reinstalled = await npmProvider.installVersion(service, previous, prefix);
   if (!reinstalled.ok) {
     await ensureServiceUp(service);
     return { ok: false, message: `rollback install failed: ${reinstalled.message}` };
@@ -579,7 +602,7 @@ async function runAppUpdate(config, service, { force, opId, lock }) {
  * With NEITHER available there is no postcondition, and no flag creates one.
  * --force overrides the busy gate; it cannot make an unverifiable thing verified.
  */
-function checkPostcondition(service, { to }) {
+async function checkPostcondition(service, { to }) {
   const installed = commandProvider.installedVersion(service);
 
   // The version this service is ACTUALLY on, or null when it cannot be read.
@@ -598,7 +621,7 @@ function checkPostcondition(service, { to }) {
   }
 
   if (service.verify) {
-    const result = runArgv(service.verify, { timeoutMs: 120000 });
+    const result = await runMutationArgv(service.verify, { timeoutMs: 120000 });
     if (!result.ok) {
       return {
         ok: false,
@@ -662,6 +685,8 @@ async function rollBackCommand(service, opId, lock) {
   // taken before it would name a version that is no longer there.
   const finalVersion = () => commandProvider.installedVersion(service);
 
+  const held = await rollbackHeld();
+  if (held) return { ok: false, installed: finalVersion(), message: held };
   if (!service.rollback) {
     const recovered = await ensureServiceUp(service);
     return {
@@ -674,7 +699,7 @@ async function rollBackCommand(service, opId, lock) {
   }
   lock.phase('rolling-back');
   recordPhase(opId, 'rolling-back');
-  const result = runArgv(service.rollback, { timeoutMs: 600000 });
+  const result = await runMutationArgv(service.rollback, { timeoutMs: 600000 });
   if (!result.ok) {
     await ensureServiceUp(service);
     return { ok: false, installed: finalVersion(), message: `the rollback command failed: ${describeFailure(result)}` };
@@ -758,7 +783,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
 
   lock.phase('stopping');
   recordPhase(opId, 'stopping');
-  const drained = drainService(service);
+  const drained = await drainService(service);
   if (!drained.ok) {
     log(drained.message, 'update');
     recordLastUpdate(service, 'failed', from, to, drained.message);
@@ -785,7 +810,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
 
   lock.phase('installing');
   recordPhase(opId, 'installing');
-  const updated = commandProvider.update(service);
+  const updated = await commandProvider.update(service);
   if (!updated.ok) {
     const rolled = await rollBackCommand(service, opId, lock);
     const message = `the update command failed: ${updated.message}; ${rolled.message}`;
@@ -839,7 +864,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
 
   lock.phase('verifying');
   recordPhase(opId, 'verifying');
-  const postcondition = checkPostcondition(service, { to });
+  const postcondition = await checkPostcondition(service, { to });
   if (!postcondition.ok) {
     const rolled = await rollBackCommand(service, opId, lock);
     const message = `${postcondition.message}; ${rolled.message}`;

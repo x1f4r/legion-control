@@ -1689,6 +1689,11 @@ export function commandLabel(file) {
 /**
  * Shared process runner. Always an argv array, never a shell string, so a
  * Windows npm prefix or "C:\Program Files\nodejs" cannot break quoting.
+ *
+ * For reading the machine only. Its timeout stops the command and nothing the
+ * command started, which a probe can live with and a mutation cannot: every
+ * command that changes the machine goes through runMutation in
+ * process-runner.mjs instead.
  */
 export function runCommand(file, args = [], options = {}) {
   const result = spawnSync(file, args, {
@@ -1925,8 +1930,12 @@ export async function mapWithLimit(items, limit, worker) {
   return results;
 }
 
-/** One-line failure description for a runCommand result. */
+/** One-line failure description for a runCommand or runMutation result. */
 export function describeFailure(result) {
+  // A command the mutation runner refused to start, because an earlier one may
+  // still be running, never ran: it did not fail, and has no exit code to give.
+  if (result.refused) return `${result.command} was ${result.error}`;
+  if (result.timedOut && result.terminated === false) return `${result.command} timed out and could not be confirmed stopped`;
   if (result.timedOut) return `${result.command} timed out`;
   const output = (result.stderr || result.stdout || '').trim().split('\n').slice(0, 3).join(' ');
   const reason = output || result.error || '';

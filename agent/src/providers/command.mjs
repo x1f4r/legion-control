@@ -7,6 +7,7 @@
 // checked; without update the service can only be restarted.
 
 import { compilePattern, describeFailure, runArgv } from '../config.mjs';
+import { runMutationArgv } from '../process-runner.mjs';
 import { cachedLookup, channelCacheKey } from './npm.mjs';
 
 /** First line of stdout, trimmed. Anything else is not a version. */
@@ -53,8 +54,13 @@ export function cachedLatestVersion(service, options = {}) {
   );
 }
 
-export function update(service, { timeoutMs = 600000 } = {}) {
+/**
+ * Run the update command. It changes the machine, so it goes through the
+ * mutation runner: a deadline stops everything it started before anything
+ * after it, a rollback included, may begin.
+ */
+export async function update(service, { timeoutMs = 600000 } = {}) {
   if (!service.update) return { ok: false, message: `${service.name} has no update command configured` };
-  const result = runArgv(service.update, { timeoutMs });
+  const result = await runMutationArgv(service.update, { timeoutMs });
   return { ok: result.ok, message: result.ok ? null : describeFailure(result), result };
 }

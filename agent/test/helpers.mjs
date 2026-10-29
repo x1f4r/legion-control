@@ -43,9 +43,12 @@ export async function fresh(relative) {
   return import(`${pathToFileURL(path.join(SRC, relative)).href}?t=${Date.now()}-${Math.random()}`);
 }
 
-/** Run the CLI once and parse its single JSON object. */
-export function cli(args, { home, stdin = null, env = {} } = {}) {
-  const result = spawnSync(process.execPath, [ENTRY, ...args], {
+/**
+ * Run the CLI once and parse its single JSON object. `nodeArgs` go to Node
+ * itself, in front of the entry point, for a test that loads stand-ins.
+ */
+export function cli(args, { home, stdin = null, env = {}, nodeArgs = [] } = {}) {
+  const result = spawnSync(process.execPath, [...nodeArgs, ENTRY, ...args], {
     encoding: 'utf8',
     input: stdin ?? undefined,
     env: { ...process.env, LEGIONCTL_HOME: home, ...env },

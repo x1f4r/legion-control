@@ -1347,7 +1347,7 @@ async function commandVersion(flags, loaded) {
       'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'args.mjs', 'boot.mjs', 'config.mjs', 'contract.mjs', 'controller.mjs',
       'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'launch.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
       'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
-      'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs',
+      'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs', 'process-runner.mjs',
       'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'redact.mjs', 'scheduler.mjs',
       'selfupdate.mjs', 'service.mjs', 'setup-document.mjs', 'state.mjs', 'status.mjs', 'trust.mjs', 'update.mjs',
     ];
