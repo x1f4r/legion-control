@@ -44,6 +44,7 @@ import {
   summarize,
   updateOperation,
 } from './operations.mjs';
+import { stillAtWork } from './operate.mjs';
 import { orderServices, scheduledEligibility } from './policy.mjs';
 import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
@@ -388,15 +389,18 @@ export async function runCycle(config, options = {}) {
 
     // A failed cycle says why with the reason of the first service that failed,
     // so it is never the failure with no code that contract 3 exists to remove.
-    const summary = {
+    // And a cycle whose own recovery left a start command that could not be
+    // seen to stop ends as any operation does in that case (operate.mjs).
+    const concluded = {
       ok: failed.length === 0,
       action: failed.length === 0 ? 'cycled' : 'failed',
       reasonCode: failed.length === 0 ? null : failed[0].reasonCode ?? REASON.internal,
       message,
-      durationMs: Date.now() - started,
-      ...report,
     };
-    finishOperation(id, { ok: summary.ok, action: summary.action, reasonCode: summary.reasonCode, message });
+    const ownUnsettled = await unsettledWork({ opId: id });
+    const ending = ownUnsettled ? stillAtWork(concluded, ownUnsettled) : concluded;
+    const summary = { ...ending, durationMs: Date.now() - started, ...report };
+    finishOperation(id, ending);
     return { ...summary, opId: id };
   } catch (err) {
     const message = err?.message ?? String(err);

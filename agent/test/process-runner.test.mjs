@@ -12,7 +12,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { beginOperation, bootIdentity, updateOperation } from '../src/operations.mjs';
+import { producedOutcome } from '../src/contract.mjs';
+import { withOperation } from '../src/operate.mjs';
+import { beginOperation, bootIdentity, readOperation, updateOperation, wireRecord } from '../src/operations.mjs';
 import { ledgerPath, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
 import { deadPid, withHome } from './helpers.mjs';
 
@@ -201,6 +203,46 @@ test('a command run after a reboot holds the machine even for an operation queue
       assert.equal(blocked.conflict.phase, 'installing');
       assert.equal((await run(node('process.exit(0)'), { timeoutMs: 5000 })).refused, true);
       await release(entry.group);
+    });
+  });
+});
+
+test('an operation whose own command could not be confirmed stopped is unknown, in its reply and its record alike', { skip: !posix && 'POSIX process groups' }, async () => {
+  await withHome(async () => {
+    const hang = () => run(node('setInterval(() => {}, 1000)'), { timeoutMs: 200, graceMs: 200, settleMs: 300 });
+    await withoutGroupSignals(async ({ held, release }) => {
+      // What an update does that recovers its service first: the start runs
+      // out of time and will not go, and the update then has nothing to do or
+      // finds the machine busy. Neither is an ending it can stand behind.
+      const deferredAfter = await withOperation({ kind: 'update', service: 'demo', opId: 'unsettled-deferred-01', systemId: 'test' }, async () => {
+        assert.equal((await hang()).terminated, false);
+        return { ok: true, action: 'deferred', reasonCode: 'busy', message: 'the machine is busy (a turn is running)' };
+      });
+      held(ledger()[0].group);
+      assert.equal(deferredAfter.action, 'failed');
+      assert.equal(deferredAfter.reasonCode, 'timed-out');
+      assert.match(deferredAfter.message, /^the machine is busy \(a turn is running\), but node from operation unsettled-deferred-01 .*could not be confirmed stopped/);
+      assert.equal(deferredAfter.outcome, 'unknown');
+      assert.equal(producedOutcome(deferredAfter), 'unknown', 'what the reply is reduced to');
+      assert.equal(deferredAfter.op.outcome, 'unknown');
+      const stored = wireRecord(readOperation('unsettled-deferred-01'));
+      assert.equal(stored.result.action, 'failed');
+      assert.equal(stored.result.outcome, 'unknown');
+      assert.equal(stored.outcome, 'unknown');
+      await release(ledger()[0].group);
+
+      // A failure is stated as unknown and otherwise left as it was.
+      const failedAfter = await withOperation({ kind: 'run', actionId: 'say', opId: 'unsettled-failed-01', systemId: 'test' }, async () => {
+        assert.equal((await hang()).terminated, false);
+        return { ok: false, action: 'failed', reasonCode: 'internal', message: 'say exited 1' };
+      });
+      held(ledger()[0].group);
+      assert.equal(failedAfter.action, 'failed');
+      assert.equal(failedAfter.reasonCode, 'internal');
+      assert.equal(failedAfter.message, 'say exited 1');
+      assert.equal(failedAfter.outcome, 'unknown');
+      assert.equal(wireRecord(readOperation('unsettled-failed-01')).outcome, 'unknown');
+      await release(ledger()[0].group);
     });
   });
 });

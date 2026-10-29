@@ -20,7 +20,7 @@
 // command an earlier operation could not see stop may still be changing the
 // machine, and the next operation waits for it exactly as it waits for a lock.
 
-import { MUTATING_PHASES, REASON } from './contract.mjs';
+import { MUTATING_PHASES, producedOutcome, REASON } from './contract.mjs';
 import { acquireOperationLock, acquireServiceLock } from './lock.mjs';
 import { log } from './log.mjs';
 import { unsettledWork, withOperationContext } from './process-runner.mjs';
@@ -37,6 +37,35 @@ import {
   summarize,
   updateOperation,
 } from './operations.mjs';
+
+/**
+ * What an operation concluded, once one of its own commands ran out of time
+ * and could not be seen to stop. That command may still be doing its work, so
+ * the outcome is unknown and no client sends the operation again.
+ *
+ * Section 5.6 lets a producer state unknown only where the result says it
+ * failed, which is what keeps a reply and its record, each reduced from its
+ * own fields, saying the same. A failure is stated as unknown as it stands.
+ * Anything else the body came to after that command, a deferral or a no-op, is
+ * not something the operation can stand behind while the command may still be
+ * at work, so it becomes the command's timeout. A result that is still pending
+ * is left alone: the work is still owned, and its ending is judged when it
+ * comes.
+ */
+export function stillAtWork(result, unsettled) {
+  const outcome = producedOutcome(result);
+  if (outcome === 'failed') return { ...result, outcome: 'unknown' };
+  if (outcome === 'unknown' || outcome === 'pending') return result;
+  const { conflict, ...rest } = result;
+  return {
+    ...rest,
+    ok: false,
+    action: 'failed',
+    reasonCode: REASON.timedOut,
+    message: result.message ? `${result.message}, but ${unsettled.message}` : unsettled.message,
+    outcome: 'unknown',
+  };
+}
 
 /**
  * Open a record, take the lock, run the body, close the record.
@@ -201,11 +230,11 @@ export async function withOperation(options, body) {
         return { ...result, opId: id, op: summarize(finished) };
       }
     }
-    const { pendingTransition = false, ...result } = await withOperationContext(id, () => body({ opId: id, lock }));
+    const { pendingTransition = false, ...concluded } = await withOperationContext(id, () => body({ opId: id, lock }));
     // A command of this operation that ran out of time and could not be seen
-    // to stop may still be doing its work, so whatever the body concluded, the
-    // outcome is unknown and no client sends it again.
-    if (await unsettledWork({ opId: id })) result.outcome = 'unknown';
+    // to stop may still be doing its work, whatever the body concluded.
+    const ownUnsettled = await unsettledWork({ opId: id });
+    const result = ownUnsettled ? stillAtWork(concluded, ownUnsettled) : concluded;
     if (pendingTransition) {
       const pending = updateOperation(id, { dispatchAcknowledgement: result });
       return { ...result, opId: id, op: summarize(pending) };
