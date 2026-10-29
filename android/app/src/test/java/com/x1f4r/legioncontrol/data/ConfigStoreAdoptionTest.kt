@@ -117,6 +117,31 @@ class ConfigStoreAdoptionTest {
         assertEquals(copy, store.text.value)
     }
 
+    /**
+     * Only what the refused write wrote is put back. Where the setup was fetched from is remembered
+     * by an apply outside the head lock, and one that lands while that write is still on its way to
+     * a disk that refuses it stays remembered.
+     */
+    @Test
+    fun `a write the disk refused puts back only the keys it wrote`() {
+        val prefs = MemoryPreferences()
+        val store = enrolled(prefs)
+        val head = store.appliedHash()!!
+        val text = store.text.value
+        val copy = newer(text, "Beacon two")
+        val source = SetupSource("tower.example", 22, "me")
+
+        prefs.diskRefuses = true
+        prefs.duringNextCommit = { store.rememberSource(source) }
+        val outcome = store.adoptFromMachine(copy, hashOf(copy), head, "Pi")
+        assertTrue("$outcome", outcome is SetupOutcome.NotSaved)
+
+        assertEquals(head, store.appliedHash())
+        assertEquals(text, store.text.value)
+        assertEquals("tower.example", prefs.values["setup-source-host"])
+        assertEquals(source, LaunchDocuments.store(prefs).source.value)
+    }
+
     @Test
     fun `the document in force is kept on load even when this build would refuse it`() {
         // A setup id the old token grammar allowed and the setup-id grammar does not (C10), stored

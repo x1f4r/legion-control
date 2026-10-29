@@ -257,6 +257,28 @@ class LaunchApprovalsTest {
     }
 
     @Test
+    fun `an approval the disk refused puts back a record that was not text, as it was`() {
+        val prefs = MemoryPreferences().apply {
+            values["controller-config"] = ControllerDocument.parse(HELD).getOrThrow().canonicalText
+            values[LaunchApprovals.KEY] = 7
+        }
+        val store = store(prefs)
+        assertNotNull(store.launchProblem.value)
+        val saved = prefs.values.toMap()
+
+        prefs.diskRefuses = true
+        assertNotNull(store.approveLaunch(store.launch.value.review.take(1)))
+        assertEquals(saved, prefs.values)
+
+        // Nothing was approved, so the next start still finds a record it cannot read, and
+        // everything waits.
+        prefs.diskRefuses = false
+        val next = store(prefs)
+        assertNotNull(next.launchProblem.value)
+        assertEquals(listOf(TOWER_LINUX, TOWER_WINDOWS, PI_LINUX), next.launch.value.review.map { it.path })
+    }
+
+    @Test
     fun `a value that cannot be shown faithfully is never approved`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)

@@ -254,10 +254,9 @@ class ConfigStore internal constructor(
         val changes = entries.filter { it.approvable }.map { it.change() }
         if (changes.isEmpty()) return "Nothing here can be approved. It can only be reverted or left."
         val record = synchronized(HEAD_LOCK) {
-            val before = prefs.all
-            val editor = prefs.edit()
+            val editor = KeyedEditor(prefs.edit())
             val record = approvals.update(editor, _document.value?.root, changes)
-            if (!committed(editor, before)) return "This device could not save the approval just now, so nothing was approved."
+            if (!committed(editor)) return "This device could not save the approval just now, so nothing was approved."
             record
         }
         announce(record)
@@ -467,8 +466,7 @@ class ConfigStore internal constructor(
 
             // The approvals go into the same edit as the document they belong to, recorded before
             // anything can read the document back, so an edit made here never shows up for review.
-            val before = prefs.all
-            val editor = prefs.edit()
+            val editor = KeyedEditor(prefs.edit())
                 .putString(KEY_TEXT, text)
                 .putString(KEY_HASH, provenance.hash)
                 .putString(KEY_AUTHORITY, provenance.authority)
@@ -479,7 +477,7 @@ class ConfigStore internal constructor(
                 .putString(KEY_DEVICE, provenance.device)
                 .putString(KEY_PROVENANCE_SOURCE, provenance.readFrom)
             val record = approvals.update(editor, document.root, changes)
-            if (!committed(editor, before)) {
+            if (!committed(editor)) {
                 return Stored.NotSaved("This device could not save the setup just now, so nothing changed.")
             }
 
@@ -503,32 +501,75 @@ class ConfigStore internal constructor(
     private fun storedHash(): String? = prefs.getString(KEY_HASH, null)?.takeIf { it.isNotBlank() }
 
     /**
-     * Writes [editor] to disk, or puts the preferences back to [before] and says it did not.
+     * Writes [editor] to disk, or puts back every key it wrote and says it did not.
      *
      * A commit and not an apply, because what is announced is what gets published: a document sent
      * to machines must still be the one in force here if the app is killed a moment later, and the
      * next compare-and-swap must read the head the last write left. A commit that could not reach
      * the disk has changed the preferences in memory all the same, which is where that head is read
      * from, so it is undone there: a store left ahead of what it announced would refuse every
-     * adoption as a moved head and read the machine again on every status. Only text is written
-     * beside the document, so text is all there is to put back.
+     * adoption as a moved head and read the machine again on every status.
+     *
+     * Only the keys [editor] wrote are put back, each as what it held just before, whatever its
+     * type: a record of approvals somebody turned into a number is a number again rather than an
+     * approval nobody saved. A key it did not write is left alone: where the setup was last fetched
+     * from, remembered by an apply outside [HEAD_LOCK] while the disk was refusing this commit, stays
+     * remembered.
      */
-    private fun committed(editor: SharedPreferences.Editor, before: Map<String, *>): Boolean {
+    private fun committed(editor: KeyedEditor): Boolean {
+        // Read before the commit, while the edit is still only staged, so it is what each key held.
+        val before = prefs.all.filterKeys { it in editor.keys }
         if (editor.commit()) return true
-        val after = prefs.all
         // An apply: memory is what has to be right at once. The disk still holds what it held
         // before the refused write, and this brings it back to the same on its own time.
         prefs.edit {
-            for (key in after.keys + before.keys) {
-                val was = before[key]
-                if (was == after[key]) continue
-                when (was) {
+            for (key in editor.keys) {
+                when (val was = before[key]) {
                     null -> remove(key)
                     is String -> putString(key, was)
+                    is Int -> putInt(key, was)
+                    is Long -> putLong(key, was)
+                    is Float -> putFloat(key, was)
+                    is Boolean -> putBoolean(key, was)
+                    // The only set preferences hold is a set of strings.
+                    is Set<*> -> putStringSet(key, was.filterIsInstance<String>().toSet())
                 }
             }
         }
         return false
+    }
+
+    /**
+     * An edit that keeps the name of every key it writes, so a commit the disk refused can be put
+     * back key by key without touching anything written beside it.
+     *
+     * Clearing would write every key there is, which no write here does and none should: it is
+     * refused rather than left to slip past the record.
+     */
+    private class KeyedEditor(private val editor: SharedPreferences.Editor) : SharedPreferences.Editor by editor {
+        val keys = linkedSetOf<String>()
+
+        private fun writing(key: String?, write: () -> Unit): KeyedEditor = apply {
+            key?.let(keys::add)
+            write()
+        }
+
+        override fun putString(key: String?, value: String?) = writing(key) { editor.putString(key, value) }
+
+        override fun putStringSet(key: String?, values: MutableSet<String>?) = writing(key) { editor.putStringSet(key, values) }
+
+        override fun putInt(key: String?, value: Int) = writing(key) { editor.putInt(key, value) }
+
+        override fun putLong(key: String?, value: Long) = writing(key) { editor.putLong(key, value) }
+
+        override fun putFloat(key: String?, value: Float) = writing(key) { editor.putFloat(key, value) }
+
+        override fun putBoolean(key: String?, value: Boolean) = writing(key) { editor.putBoolean(key, value) }
+
+        override fun remove(key: String?) = writing(key) { editor.remove(key) }
+
+        override fun clear(): SharedPreferences.Editor =
+            throw UnsupportedOperationException("A setup write names each key it changes.")
     }
 
     /** What a document says about itself, for the divergence and different-setup screens. */

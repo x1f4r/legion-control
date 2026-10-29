@@ -21,6 +21,12 @@ class MemoryPreferences : SharedPreferences {
      */
     var diskRefuses = false
 
+    /**
+     * Runs once, inside the next commit and after it reached the map: a write from elsewhere in the
+     * process that lands while that commit is still on its way to the disk.
+     */
+    var duringNextCommit: (() -> Unit)? = null
+
     override fun getAll(): MutableMap<String, *> = values.toMutableMap()
 
     override fun getString(key: String?, defValue: String?): String? =
@@ -83,6 +89,10 @@ class MemoryPreferences : SharedPreferences {
             removed.forEach { values.remove(it) }
             values.putAll(pending)
             writes += pending.keys + removed
+            duringNextCommit?.let {
+                duringNextCommit = null
+                it()
+            }
             return !diskRefuses
         }
 
