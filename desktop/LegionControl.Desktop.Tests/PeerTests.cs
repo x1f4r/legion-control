@@ -617,6 +617,29 @@ public class ReconcilerTests
     }
 
     [Fact]
+    public async Task APreviewOfADocumentThisDeviceRefusesHidesNothingInItsIds()
+    {
+        // A different setup this device refuses still gets a screen, and its machine ids are
+        // whatever the peer wrote. A bidirectional override in one would turn the rest of the line
+        // around in the sheet a person reads before overwriting the machine.
+        using var home = new TempHome();
+        var (store, model, fake) = Build(home, Documents.Make("setup-a", 2, Array.Empty<string>()));
+        var refused = JsonNode.Parse(Documents.Make("setup-b", 9, Array.Empty<string>()).Text)!.AsObject();
+        refused["machines"]![0]!["id"] = "pi‮exe.txt";
+        fake.Held = ControllerDocument.FromText(refused.ToJsonString());
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+
+        var (session, problem) = await reconciler.PrepareMergeAsync(model);
+        Assert.Null(problem);
+        Assert.Contains("does not accept", session!.TakeProblem);
+        var lines = session.Preview.Lines().ToList();
+        Assert.Contains("Machines added: \"pi\\u202Eexe.txt\"", lines);
+        Assert.Contains("Machines removed: pi", lines);
+        Assert.DoesNotContain(lines, line => line.Contains('‮'));
+    }
+
+    [Fact]
     public async Task AReplacementGoesOnlyOverTheCopyThePreviewShowed()
     {
         // `--replace` takes whatever the machine holds by the time it arrives, so a machine whose

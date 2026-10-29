@@ -1,4 +1,5 @@
 using System.Text;
+using LegionControl.Desktop.Contract;
 
 namespace LegionControl.Desktop.Config;
 
@@ -106,12 +107,19 @@ public sealed record SetupConflictPreview(
 
     public IEnumerable<string> Lines()
     {
-        if (MachinesAdded.Count > 0) yield return $"Machines added: {string.Join(", ", MachinesAdded)}";
-        if (MachinesRemoved.Count > 0) yield return $"Machines removed: {string.Join(", ", MachinesRemoved)}";
-        if (MachinesChanged.Count > 0) yield return $"Machines changed: {string.Join(", ", MachinesChanged)}";
+        if (MachinesAdded.Count > 0) yield return $"Machines added: {Ids(MachinesAdded)}";
+        if (MachinesRemoved.Count > 0) yield return $"Machines removed: {Ids(MachinesRemoved)}";
+        if (MachinesChanged.Count > 0) yield return $"Machines changed: {Ids(MachinesChanged)}";
         if (EndpointsBefore != EndpointsAfter) yield return $"Addresses: {EndpointsBefore} before, {EndpointsAfter} after";
         if (IsEmpty) yield return "Nothing this app reads would change.";
     }
+
+    /// Machine ids in one line, with nothing a peer wrote hidden in them. A preview is also built
+    /// from a document this device refuses, and an id in that is whatever the peer wrote: one that
+    /// is not a plain token is shown as a JSON string, so neither a bidirectional override nor a
+    /// comma in it can pass for something else on the line.
+    private static string Ids(IEnumerable<string> ids) =>
+        string.Join(", ", ids.Select(id => CommandSurface.IsValidToken(id) ? id : LaunchGate.Quote(id)));
 
     /// What one document would do to another, in the terms the setup section shows.
     public static SetupConflictPreview Between(ControllerConfig? current, ControllerConfig incoming)
