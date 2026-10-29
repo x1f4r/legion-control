@@ -76,7 +76,6 @@ import { aggregateBusy, checkAllBusy } from './probes/busy.mjs';
 import { runCycle } from './scheduler.mjs';
 import { livenessOf, selectService } from './service.mjs';
 import { buildStatus, DEFAULT_STATUS_BUDGET_MS } from './status.mjs';
-import { serviceState } from './state.mjs';
 import { checkBundle, resolveBootstrapLayout, runBootstrapInstall, runRollback, runSelfUpdate } from './selfupdate.mjs';
 import { runRestart, runUpdate } from './update.mjs';
 import { authorize, isRestrictedSession, parseCommandLine } from './dispatch.mjs';
@@ -726,7 +725,7 @@ function policyReply(config, serviceId, { message = null, changed = [] } = {}) {
       // client does not need one round trip per service to render the page.
       services: config.services.map((service) => ({
         id: service.id,
-        updates: policyUpdates(describeServiceUpdates(config, service, { state: serviceState(service, { readOnly: true }) }), service),
+        updates: policyUpdates(describeServiceUpdates(config, service), service),
       })),
     });
   }
@@ -736,7 +735,7 @@ function policyReply(config, serviceId, { message = null, changed = [] } = {}) {
   return ok({
     ...(message ? { message } : {}),
     service: serviceId,
-    updates: policyUpdates(describeServiceUpdates(config, service, { state: serviceState(service, { readOnly: true }) }), service),
+    updates: policyUpdates(describeServiceUpdates(config, service), service),
     autoUpdate: config.updates.automatic === true,
     changed,
   });
@@ -782,9 +781,9 @@ async function commandPolicy(config, positional, options) {
   const changed = Object.keys(patch);
   if (changed.length === 0) return policyReply(config, serviceId, { message: 'nothing in the patch changed anything' });
 
-  // A pause set from a client is operational, not a change to the document the
-  // machine's owner wrote, so it lands in state rather than rewriting config.json
-  // — except at the machine level, where there is no per-service state to hold it.
+  // The policy lives in config.json, the pause included: a service's in its own
+  // updates block, where a null removes the key so the machine's value is
+  // inherited again, and the machine's in the top-level one.
   const saved = saveConfig((stored) => {
     const next = { ...stored };
     if (serviceId) {

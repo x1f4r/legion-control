@@ -221,7 +221,7 @@ async function describeService(config, service, { isFirst, clock, notes, operati
     // the thing people press twenty times a day into an Internet round trip.
     // `doctor --deep` is where that question is actually asked.
     endpoint: { configured: Boolean(service.endpoint), reachable: null },
-    updates: statusUpdates(describeServiceUpdates(config, service, { state, busy })),
+    updates: statusUpdates(describeServiceUpdates(config, service, { busy })),
     pendingVersion: state.pendingVersion ?? null,
     drain: canDrain(service),
     lastOperation: last

@@ -70,7 +70,7 @@ import {
   updateWorstCaseMs,
 } from './update.mjs';
 import { actionWorstCaseMs, findAction, runAction } from './actions.mjs';
-import { ensureServiceStateWritable, removeOrphanedTemporaries, serviceState } from './state.mjs';
+import { ensureServiceStateWritable, removeOrphanedTemporaries } from './state.mjs';
 
 /**
  * How long a cycle may run before its scheduler ends it: systemd stops the
@@ -366,7 +366,7 @@ export function previewCycle(config) {
     orderingCycles: cycles.map((path) => path.join(' -> ')),
     queued: dueQueue().map(summarize),
     children: ordered.map((service) => {
-      const eligibility = scheduledEligibility(config, service, { state: serviceState(service, { readOnly: true }) });
+      const eligibility = scheduledEligibility(config, service);
       return {
         service: service.id,
         name: service.name,
