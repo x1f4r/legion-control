@@ -242,12 +242,25 @@ async function windowsLeft(entry, options = {}) {
 /**
  * Whether a ledger entry may still be running.
  *
- * An entry that was still running when its agent stopped is judged by the
- * command's own process: once that has ended, the command ended, and whatever
- * it started is what it meant to leave, as for any command that exits by
- * itself. An entry that ran out of time is judged by its whole tree, every part
- * of which was meant to be stopped. Nothing outlives a reboot, and anything the
- * agent cannot read counts as running.
+ * An entry that ran out of time is judged by its whole tree, every part of
+ * which was meant to be stopped. One that was still running when its agent
+ * stopped is judged, on POSIX, by the command's own process: the command is in
+ * a process group of its own, so it outlives its agent, and once it has ended
+ * by itself whatever it started is what it meant to leave, as for any command
+ * that exits by itself.
+ *
+ * Windows ends the command with its agent instead. Node puts every child it
+ * does not detach in a job that closes with Node, and that child's own
+ * children leave the job without a word and carry on: the installer an update
+ * script started, whatever an npm script runs. So there an entry another agent
+ * left is judged by its whole tree too. Its command need not have ended by
+ * itself, and then nothing it left behind is there on purpose. Only this
+ * agent's own entry, for a command it saw end and could not take out of the
+ * ledger, is judged by the command alone. An agent that is still alive counts
+ * as another: its process id may be somebody else's by now.
+ *
+ * Nothing outlives a reboot, and anything the agent cannot read counts as
+ * running.
  */
 async function stillRunning(entry, { bootId }) {
   if (entry.bootId && bootId && entry.bootId !== bootId) return false;
@@ -256,7 +269,7 @@ async function stillRunning(entry, { bootId }) {
   if (!Number.isInteger(entry.pid)) return entry.agentPid !== process.pid && processIsAlive(entry.agentPid);
   const whole = entry.state === 'unconfirmed';
   if (IS_WINDOWS) {
-    const left = await windowsLeft(entry, { treeOf: whole });
+    const left = await windowsLeft(entry, { treeOf: whole || entry.agentPid !== process.pid });
     return left === null || left.length > 0;
   }
   return whole ? posixGroupLeft(entry) : posixLeaderLeft(entry);

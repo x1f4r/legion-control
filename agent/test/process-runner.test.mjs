@@ -8,6 +8,7 @@
 // timed-out command started is gone before anything after it begins.
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -253,7 +254,8 @@ test('a command left behind, running or unconfirmed, holds later mutations only 
     await withHome(async () => {
       // What the ledger keeps when an agent dies mid-command, and when a
       // deadline could not be seen to stop one. The first is judged by the
-      // command's own process, the second by its whole tree.
+      // command's own process on POSIX, the second, and on Windows both, by
+      // its whole tree.
       const orphan = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
       const entry = {
         id: `left-${state}`, pid: orphan.pid, group: posix ? orphan.pid : null, platform: process.platform, command: 'node',
@@ -278,21 +280,63 @@ test('a command left behind, running or unconfirmed, holds later mutations only 
   }
 });
 
+test('what a command left when its agent died holds the machine on Windows, where the command died with the agent', async () => {
+  await withHome(async () => {
+    // The command has ended, and a child it started is still running. On
+    // POSIX the command had a process group of its own and outlived its
+    // agent, so it ended by itself and the child is what it meant to leave,
+    // as with a start command's daemon. On Windows it ended because its agent
+    // did, and the child is whatever it had not finished.
+    const leaver = node("const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); child.unref(); process.stdout.write(String(child.pid))");
+    const startedAt = new Date().toISOString();
+    const command = spawnSync(leaver[0], leaver.slice(1), { encoding: 'utf8' });
+    const left = Number(command.stdout);
+    assert.ok(Number.isInteger(left) && left > 0, command.stderr);
+    const entry = {
+      id: 'left-by-a-dead-agent', pid: command.pid, group: posix ? command.pid : null, platform: process.platform, command: 'node',
+      state: 'running', startedAt, endedAt: null, agentPid: deadPid(), bootId: bootIdentity(),
+      opId: 'killed-update-0002', kind: 'update', service: 'demo', phase: 'installing', opStartedAt: startedAt,
+    };
+    fs.mkdirSync(path.dirname(ledgerPath()), { recursive: true });
+    fs.writeFileSync(ledgerPath(), JSON.stringify({ commands: [entry] }));
+    try {
+      if (posix) {
+        assert.equal(await unsettledWork(), null, 'a command that ended by itself lets go, whatever it left');
+      } else {
+        const blocked = await unsettledWork();
+        assert.ok(blocked, 'what the command left behind holds the machine');
+        assert.equal(blocked.conflict.opId, 'killed-update-0002');
+      }
+    } finally {
+      try { process.kill(left, 'SIGKILL'); } catch { /* already gone */ }
+    }
+    for (let tries = 0; tries < 100 && alive(left); tries += 1) await delay(50);
+    assert.equal(await unsettledWork(), null, 'and lets go once that is gone too');
+    assert.deepEqual(ledger(), []);
+  });
+});
+
 test('a process id handed to a newer process, or a reboot since, does not hold the machine', async () => {
+  const { spawn } = await import('node:child_process');
   await withHome(async () => {
     const hour = 60 * 60 * 1000;
     const written = new Date(Date.now() - hour).toISOString();
+    // A process started just now, so long after the entry was written that it
+    // cannot be the command the entry names, and with no children of its own.
+    const newer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
     const base = { platform: process.platform, command: 'node', endedAt: null, agentPid: deadPid(), opId: null, kind: null, service: null, phase: null, opStartedAt: null };
     fs.mkdirSync(path.dirname(ledgerPath()), { recursive: true });
     fs.writeFileSync(ledgerPath(), JSON.stringify({
       commands: [
-        // This test's own process started long after the entry was written, so
-        // it cannot be the command the entry names.
-        { ...base, id: 'reused', pid: process.pid, group: posix ? process.pid : null, state: 'running', startedAt: written, bootId: bootIdentity() },
-        { ...base, id: 'rebooted', pid: process.pid, group: posix ? process.pid : null, state: 'unconfirmed', startedAt: new Date().toISOString(), bootId: 'an-earlier-boot' },
+        { ...base, id: 'reused', pid: newer.pid, group: posix ? newer.pid : null, state: 'running', startedAt: written, bootId: bootIdentity() },
+        { ...base, id: 'rebooted', pid: newer.pid, group: posix ? newer.pid : null, state: 'unconfirmed', startedAt: new Date().toISOString(), bootId: 'an-earlier-boot' },
       ],
     }));
-    assert.equal(await unsettledWork(), null);
+    try {
+      assert.equal(await unsettledWork(), null);
+    } finally {
+      newer.kill('SIGKILL');
+    }
     assert.deepEqual(ledger(), []);
   });
 });

@@ -565,7 +565,11 @@ test('a command the agent could not see stop holds every mutation, and each name
   });
 });
 
-test('an installer whose agent was killed holds recovery and every update until it ends', { skip: !posix && 'Windows ends a dead agent\'s own children with it' }, async () => {
+// On Windows the installer here dies with its agent: Node puts every child it
+// does not detach in a job that closes with it. What such an installer leaves
+// behind, children that leave the job and carry on, holds the machine there
+// instead, and process-runner.test.mjs has that case.
+test('an installer whose agent was killed holds recovery and every update until it ends', { skip: !posix && 'Windows ends the installer itself with its agent' }, async () => {
   await withHome(async (home) => {
     const dir = oneService(home, { initial: { latest: '2.0.0' } });
     writeFixture(dir, 'update-gate', 'closed');
