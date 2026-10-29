@@ -624,6 +624,24 @@ public class WakeTests
     }
 
     [Fact]
+    public async Task DrawingTheWakeMenuLeavesWhereThisDeviceIsAloneAndAWakePlacesItAgain()
+    {
+        // The menu plans on every rebuild of the window. Reading every interface there, and moving
+        // every machine somewhere else from inside drawing code, is the poll's work and a wake's.
+        using var home = new TempHome();
+        using var app = Device(home, Fleet, HeldOnPi());
+        var tower = app.Machine("tower")!;
+        var placed = app.Presence;
+        app.PlanWake(tower);
+        Assert.Same(placed, app.Presence);
+        Assert.All(app.Machines, machine => Assert.Same(placed, machine.Presence));
+
+        await app.WakeAsync(tower);
+        Assert.NotSame(placed, app.Presence);
+        Assert.All(app.Machines, machine => Assert.Same(app.Presence, machine.Presence));
+    }
+
+    [Fact]
     public async Task AHoldEndsWhenItsHelperLeavesTheSetup()
     {
         using var home = new TempHome();

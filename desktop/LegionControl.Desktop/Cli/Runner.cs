@@ -670,7 +670,7 @@ public static class Runner
         if (machine is null) return Failed;
         var others = line.Has("try-other-helpers");
         await app.ReleaseWakeHoldsAsync(machine, token);
-        var plan = app.PlanWake(machine);
+        var plan = app.PlanWake(machine, refreshPresence: true);
         output.WriteLine(plan.Sentence(machine.Name));
         foreach (var obstacle in plan.Obstacles) output.WriteLine($"  {obstacle}");
         foreach (var offer in plan.OfferToWakeFirst) output.WriteLine($"  \"{offer}\" could be woken first, as a separate step.");

@@ -141,8 +141,9 @@ public sealed class AppModel : IDisposable
     }
 
     /// Works out where this device is from its addresses as they are now, for every machine. Done on
-    /// every poll and immediately before a wake is planned: a laptop that moved house since the
-    /// last reading is somewhere else.
+    /// every poll and immediately before a wake is walked: a laptop that moved house since the last
+    /// reading is somewhere else. Never while the window draws: reading every interface is slow on
+    /// some systems, and drawing a menu is no reason to move every machine somewhere else.
     private void RefreshPresence()
     {
         Presence = SitePresence.Decide(Config.Config, Bindings);
@@ -345,11 +346,13 @@ public sealed class AppModel : IDisposable
 
     // MARK: waking
 
-    /// What could be tried to wake a machine, in order, from where this device is now, what each
-    /// helper's last reading said and the wake holds recorded for the machine (contract section 10.2).
-    public WakePlan PlanWake(MachineModel target)
+    /// What could be tried to wake a machine, in order, from where this device was last placed, what
+    /// each helper's last reading said and the wake holds recorded for the machine (contract section
+    /// 10.2). [refreshPresence] places this device again first, as a wake that is about to be walked
+    /// does; the menu goes by the last poll's placing.
+    public WakePlan PlanWake(MachineModel target, bool refreshPresence = false)
     {
-        RefreshPresence();
+        if (refreshPresence) RefreshPresence();
         var machines = Machines;
         // A model the window still draws in the moment after its machine left the setup is planned
         // as the only machine there is, rather than not at all.
@@ -399,7 +402,7 @@ public sealed class AppModel : IDisposable
         await ReleaseWakeHoldsAsync(target, cancellationToken);
         var passed = tryOtherHelpers ? WakeHoldsFor(target) : Array.Empty<WakeHold>();
         if (passed.Count > 0) Tracker.ReleaseWakeHolds(target.Id, DateTimeOffset.MaxValue);
-        var plan = WakePlanner.Without(PlanWake(target), passed, target.Name);
+        var plan = WakePlanner.Without(PlanWake(target, refreshPresence: true), passed, target.Name);
         var report = await new WakeRunner(Tracker).RunAsync(
             target, plan,
             Machines.ToDictionary(machine => machine.Id, machine => machine, StringComparer.Ordinal),
