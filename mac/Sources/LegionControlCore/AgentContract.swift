@@ -679,39 +679,60 @@ struct AgentBundleResult: Sendable {
 ///
 /// The exact bytes matter here in a way they do not anywhere else. The hash both sides compare is a
 /// hash of the canonical bytes, and re-serialising a decoded JSON object does not reproduce them:
-/// key order, spacing and number formatting are all free. So the raw text is preferred wherever the
-/// agent sends it, and a re-encoded object is only ever used when its hash matches what the machine
-/// reports — which is checked at the call site before anything is adopted.
-struct RemoteControllerDocument: Decodable, Sendable {
+/// key order, spacing and number spelling are all free. So the stored text is taken from `raw`,
+/// which agent 3.1 sends, and adopted exactly as it is (C1).
+struct RemoteControllerDocument: Decodable, Sendable, ReadsReplyText {
     var ok: Bool?
     var contract: Int?
     var message: String?
     var reasonCode: String?
     var hash: String?
     var meta: ControllerCopy?
-    /// The document as text, when the agent sends it that way.
+    /// The document exactly as the agent stored it.
     var raw: String?
-    /// The document as an object, when it does not.
-    var controller: JSONAny?
+    /// The reply's `controller` object, which is all an agent before 3.1 sends, written out again as
+    /// `JSON.stringify(controller, null, 2)` would, in the order its members arrived. Read from the
+    /// reply text, because a decoded object has no order left; nil when there is no object.
+    var receivedControllerText: String?
 
     private enum CodingKeys: String, CodingKey {
-        case ok, contract, message, reasonCode, hash, meta, raw, controller
+        case ok, contract, message, reasonCode, hash, meta, raw
     }
 
     var reason: AgentReason? { AgentReason(code: reasonCode) }
 
     /// The bytes to hash and adopt, or nil when the reply carried no document.
     ///
-    /// A `raw` field, when the agent sends one, is the document exactly as it is stored and needs no
-    /// reconstruction. Without it the object is written out again with the shared writer, which
-    /// reproduces the stored bytes for any document written by a client that sorts its keys. The
-    /// caller checks the result against the hash the machine reports and refuses to adopt anything
-    /// that does not match, so a document written some other way is a visible message rather than a
-    /// silent divergence.
+    /// `raw` is the stored document and needs no reconstruction. An agent before 3.1 sends only the
+    /// parsed object, which can be written out again only in the order it was received: a JSON
+    /// object has no other order, and sorting the keys, as this app once did, reproduced only
+    /// documents a Mac had written. The caller checks the result against the hash the agent reports
+    /// and adopts nothing that does not match, so a document the rebuild cannot reproduce is said
+    /// to need a newer agent rather than diverging from everybody on the next poll.
     var documentBytes: Data? {
         if let raw, !raw.isEmpty { return Data(raw.utf8) }
-        guard let object = controller?.value as? [String: Any] else { return nil }
-        return try? JSONText.canonicalDocument(object)
+        return receivedControllerText.map { Data($0.utf8) }
+    }
+
+    mutating func read(replyText: Data) {
+        guard let controller = (try? SetupJSON.parse(replyText, repeats: .lastWins))?["controller"],
+              controller.isObject else { return }
+        receivedControllerText = controller.documentText
+    }
+}
+
+/// A reply that needs the text it arrived as, not only the values in it.
+protocol ReadsReplyText {
+    mutating func read(replyText: Data)
+}
+
+/// Decoding an agent's reply, the one way both transports do it.
+enum AgentReplyDecoder {
+    static func decode<Value: Decodable>(_ type: Value.Type, from json: Data) throws -> Value {
+        let value = try JSONDecoder().decode(Value.self, from: json)
+        guard var textual = value as? any ReadsReplyText else { return value }
+        textual.read(replyText: json)
+        return (textual as? Value) ?? value
     }
 }
 

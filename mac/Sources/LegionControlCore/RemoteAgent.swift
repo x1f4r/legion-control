@@ -254,7 +254,7 @@ struct RemoteAgent: Sendable {
                 // exit with a good reply still means the agent spoke.
                 let json = AttemptClassifier.jsonObjectSlice(result.standardOutput) ?? Data()
                 do {
-                    let value = try JSONDecoder().decode(Value.self, from: json)
+                    let value = try AgentReplyDecoder.decode(Value.self, from: json)
                     backoff.clear(attempt.route.target)
                     if request.isStatusRead { sessions.record(json, target: attempt.route.target) }
                     return AgentReply(value: value, system: attempt.system, route: attempt.route, attempts: made)

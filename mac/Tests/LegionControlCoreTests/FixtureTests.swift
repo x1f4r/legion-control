@@ -320,34 +320,30 @@ struct FixtureTests {
         #expect(result.identity.lineageIsValid)
     }
 
-    /// The one place the Mac cannot yet close the loop on its own.
-    ///
-    /// `config` returns the document as a parsed object rather than as the bytes that were stored,
-    /// so adopting it means writing those bytes again and hoping they match. They do when the writer
-    /// sorted its keys, and they cannot when it wrote them in insertion order. Rather than adopt a
-    /// document whose hash will not match and diverge from everybody on the next poll, the fetch path
-    /// refuses and says so. See integration-notes-mac.txt.
-    @Test("a fetched document is only adopted when its bytes reproduce the hash the machine reports")
+    @Test("a fetched document is the agent's own text, and an agent without it is rebuilt in the order it sent")
     func fetchedDocumentIsVerified() throws {
-        let reply = try JSONDecoder().decode(RemoteControllerDocument.self, from: try Self.bytes("config.read.json"))
-        let bytes = try #require(reply.documentBytes)
-        let reconstructed = try Canonical.hash(bytes)
-        let matches = reconstructed == reply.hash
+        // Agent 3.1 sends the stored text, and that is what is hashed and adopted.
+        let current = try AgentReplyDecoder.decode(RemoteControllerDocument.self, from: try Self.bytes("config.read.json"))
+        let raw = try #require(current.documentBytes)
+        #expect(raw == Data(try #require(current.raw).utf8))
+        #expect(try Canonical.hash(raw) == current.hash)
 
-        // Whichever way this goes, the behaviour has to be safe. When the bytes reproduce the hash,
-        // the document is this machine's and may be adopted. When they do not — because the writer
-        // did not sort its keys, and insertion order cannot be recovered from a parsed object — the
-        // fetch path refuses rather than adopting a document that would differ from the machine's on
-        // the very next poll.
-        //
-        // The shared fixture is currently the second case, which is recorded in
-        // integration-notes-mac.txt as a request for the stored text on the `config` reply.
-        #expect(!bytes.isEmpty)
-        if matches {
-            #expect(reconstructed == reply.hash)
-        } else {
-            #expect(reply.hash != nil, "a machine that cannot be verified against must at least report a hash")
-        }
+        // Agent 3.0 sends only the parsed object. Written out again in the order its members arrived,
+        // it reproduces the stored bytes; sorted, as this app once wrote it, it did not (C1).
+        let older = try AgentReplyDecoder.decode(RemoteControllerDocument.self, from: try Self.bytes("config.read-without-raw.json"))
+        #expect(older.raw == nil)
+        let rebuilt = try #require(older.documentBytes)
+        #expect(try Canonical.hash(rebuilt) == older.hash)
+        #expect(rebuilt == raw)
+
+        // Without the reply's own text there is no order to rebuild in, and nothing to adopt.
+        let decodedOnly = try JSONDecoder().decode(RemoteControllerDocument.self, from: try Self.bytes("config.read-without-raw.json"))
+        #expect(decodedOnly.documentBytes == nil)
+
+        // A machine holding nothing sends no document and no hash.
+        let empty = try AgentReplyDecoder.decode(RemoteControllerDocument.self, from: try Self.bytes("config.read-empty.json"))
+        #expect(empty.documentBytes == nil)
+        #expect(empty.hash == nil)
     }
 
     @Test("a document with keys this build has never seen still decodes and keeps them")
