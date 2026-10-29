@@ -252,6 +252,19 @@ function runScript(source, base, home, args = [], { node = path.dirname(process.
 // behind.
 const runInstaller = (source, base, home, args = []) => runScript(source, base, home, ['-SkipScheduler', ...args]);
 
+// Windows PowerShell writes the error a script throws through its formatter, which may break a long
+// message into lines at the width of a console the test cannot see, wherever in a word that falls.
+// So what the installer said is read with no whitespace at all, and each phrase is looked for the
+// same way; a list is a phrase that may be said in any of its ways.
+const squeeze = (text) => text.replace(/\s+/g, '').toLowerCase();
+function assertSays(result, ...phrases) {
+  const said = squeeze(`${result.stdout}${result.stderr}`);
+  for (const phrase of phrases) {
+    const ways = [phrase].flat();
+    assert.ok(ways.some((way) => said.includes(squeeze(way))), `${ways.join(' or ')}\n${result.stdout}\n${result.stderr}`);
+  }
+}
+
 // What Windows PowerShell answers to `script`, read as JSON. Values reach it through the
 // environment, so nothing has to be quoted for it.
 function powershellJson(script, env) {
@@ -359,7 +372,7 @@ test('the Windows installer keeps the live agent when the staged one fails its s
   fs.writeFileSync(path.join(bad, 'src', 'index.mjs'), "process.stdout.write(JSON.stringify({ ok: true, agentVersion: '9.9.9', contract: 3, selfTest: { ok: false } }) + '\\n');\n");
   const refused = runInstaller(bad, base, home);
   assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
-  assert.match(`${refused.stdout}\n${refused.stderr}`, /did not pass version --check/);
+  assertSays(refused, 'did not pass version --check');
   assert.equal(versionOf(path.join(base, 'agent')), version);
 });
 
@@ -409,7 +422,7 @@ test('the Windows installer refuses a base that holds a link before it changes a
 
   const refused = runInstaller(agentSource(root), base, home);
   assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
-  assert.match(`${refused.stdout}\n${refused.stderr}`, /holds links, which would carry what this script changes somewhere else: .*records\. Remove them and run this again\. Nothing was changed\./);
+  assertSays(refused, 'holds links, which would carry what this script changes somewhere else: ', 'records. Remove them and run this again. Nothing was changed.');
   assert.deepEqual({ base: accessOf(base), elsewhere: accessOf(elsewhere), inside: accessOf(path.join(elsewhere, 'inside')) }, before);
   assert.equal(before.base.protected, false);
   assert.equal(fs.lstatSync(path.join(base, 'state', 'records')).isSymbolicLink(), true);
@@ -448,7 +461,7 @@ test('the Windows installer refuses a base that is a profile, installing or unin
   for (const args of [['-SkipScheduler'], ['-Uninstall'], ['-Uninstall', '-Purge']]) {
     const refused = runScript(source, home, home, ['-TaskName', taskName(), ...args]);
     assert.equal(refused.status, 1, `${args.join(' ')}\n${refused.stdout}\n${refused.stderr}`);
-    assert.match(`${refused.stdout}\n${refused.stderr}`, /LEGIONCTL_HOME is .*, which is not a folder of the agent's own\. .* Nothing was changed\./);
+    assertSays(refused, 'LEGIONCTL_HOME is ', ", which is not a folder of the agent's own. Point it at one", 'Nothing was changed.');
   }
   assert.deepEqual(accessOf(home), before);
   assert.deepEqual(fs.readdirSync(home), ['bin']);
@@ -531,7 +544,10 @@ test('the Windows installer refuses a task that runs as another account or as a 
   const base = path.join(home, '.legion-control');
   const source = agentSource(root);
   // Named as the runner's English Windows names them, like SYSTEM above.
-  const principals = [["-UserId 'NT AUTHORITY\\LOCAL SERVICE' -LogonType ServiceAccount", /runs as .*LOCAL ?SERVICE|runs as S-1-5-19/i], ["-GroupId 'BUILTIN\\Users'", /runs as the group /]];
+  const principals = [
+    ["-UserId 'NT AUTHORITY\\LOCAL SERVICE' -LogonType ServiceAccount", ['runs as NT AUTHORITY\\LOCAL SERVICE', 'runs as LOCAL SERVICE', 'runs as S-1-5-19']],
+    ["-GroupId 'BUILTIN\\Users'", 'runs as the group '],
+  ];
   const actionOf = (name) => powershellJson('[pscustomobject] @{ execute = (Get-ScheduledTask -TaskName $env:LEGION_TEST_TASK).Actions[0].Execute } | ConvertTo-Json -Compress', { LEGION_TEST_TASK: name }).execute;
   for (const [principal, who] of principals) {
     const name = taskName();
@@ -539,10 +555,8 @@ test('the Windows installer refuses a task that runs as another account or as a 
     taskAs(name, principal);
     for (const args of [[], ['-SkipScheduler']]) {
       const refused = runScript(source, base, home, ['-TaskName', name, ...args]);
-      const output = `${refused.stdout}\n${refused.stderr}`;
-      assert.equal(refused.status, 1, output);
-      assert.match(output, who);
-      assert.match(output, /who is installing it, and whoever can write the agent's files would run code as .* through it\. Nothing was changed\./);
+      assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
+      assertSays(refused, who, "who is installing it, and whoever can write the agent's files would run code as ", 'through it. Nothing was changed.');
       assert.equal(fs.existsSync(base), false);
     }
     assert.equal(actionOf(name), 'cmd.exe');
@@ -581,14 +595,14 @@ test('the Windows installer refuses a task that runs as SYSTEM, and keeps one on
   for (const args of [[], ['-SkipScheduler']]) {
     const refused = runScript(source, base, home, ['-TaskName', name, ...args]);
     assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
-    assert.match(`${refused.stdout}\n${refused.stderr}`, /runs as SYSTEM, and whoever can write the agent's files would run code as SYSTEM through it\. Nothing was changed\./);
+    assertSays(refused, "runs as SYSTEM, and whoever can write the agent's files would run code as SYSTEM through it. Nothing was changed.");
     assert.equal(fs.existsSync(base), false);
   }
 
   // Kept only from a base outside every profile.
   const inProfile = runScript(source, base, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node });
   assert.equal(inProfile.status, 1, `${inProfile.stdout}\n${inProfile.stderr}`);
-  assert.match(`${inProfile.stdout}\n${inProfile.stderr}`, /is inside a user profile, and that user could change what SYSTEM runs/);
+  assertSays(inProfile, 'is inside a user profile, and that user could change what SYSTEM runs');
   assert.equal(fs.existsSync(base), false);
 
   const kept = runScript(source, machineBase, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node });
@@ -636,19 +650,19 @@ test('the Windows installer keeps a SYSTEM task only with a node and a base nobo
   const run = (base, nodeFolder) => {
     const result = runScript(source, base, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node: nodeFolder });
     assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
-    return `${result.stdout}\n${result.stderr}`;
+    return result;
   };
 
   // A node that Users may change, or put a DLL beside.
   const fresh = machineFolder('base');
-  assert.match(run(fresh, openNode), /could change node at .*, which SYSTEM would run: .*S-1-5-32-545 may change .*node\.exe/);
+  assertSays(run(fresh, openNode), 'could change node at ', ', which SYSTEM would run: ', 'S-1-5-32-545 may change ', 'node.exe');
   assert.equal(fs.existsSync(fresh), false);
 
   // A base in a folder that Users may delete in, and so put another base in its place.
   fs.mkdirSync(openParent);
   icacls(openParent, '/grant', '*S-1-5-32-545:(OI)(CI)M');
   const underOpen = path.join(openParent, 'legion-control');
-  assert.match(run(underOpen, node), /could put another folder where the base is: S-1-5-32-545 may move or re-permission /);
+  assertSays(run(underOpen, node), 'could put another folder where the base is: ', 'S-1-5-32-545 may move or re-permission ');
   assert.equal(fs.existsSync(underOpen), false);
 
   // A base somebody made first, that Users may change, with a config in it and a junction that
@@ -660,12 +674,8 @@ test('the Windows installer keeps a SYSTEM task only with a node and a base nobo
   fs.writeFileSync(path.join(planted, 'config.json'), '{"sentinel":"planted"}\n');
   fs.symlinkSync(elsewhere, path.join(planted, 'agent'), 'junction');
   const before = { base: accessOf(planted), config: accessOf(path.join(planted, 'config.json')), elsewhere: accessOf(elsewhere), inside: accessOf(path.join(elsewhere, 'inside')) };
-  const refused = run(planted, node);
-  assert.match(refused, /is already there, and was not made for Administrators and SYSTEM alone: /);
-  assert.match(refused, /S-1-5-32-545 is in the ACL of /);
-  assert.match(refused, /agent is a link/);
-  assert.match(refused, /S-1-5-32-545 may change .*config\.json/);
-  assert.match(refused, /Nothing was changed\./);
+  assertSays(run(planted, node), 'is already there, and was not made for Administrators and SYSTEM alone: ', 'S-1-5-32-545 is in the ACL of ',
+    `${path.join(planted, 'agent')} is a link`, `S-1-5-32-545 may change ${path.join(planted, 'config.json')}`, 'Nothing was changed.');
   assert.deepEqual({ base: accessOf(planted), config: accessOf(path.join(planted, 'config.json')), elsewhere: accessOf(elsewhere), inside: accessOf(path.join(elsewhere, 'inside')) }, before);
   assert.deepEqual(fs.readdirSync(planted).sort(), ['agent', 'config.json']);
   assert.equal(fs.readFileSync(path.join(planted, 'config.json'), 'utf8'), '{"sentinel":"planted"}\n');
