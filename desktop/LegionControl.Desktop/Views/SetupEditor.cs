@@ -20,6 +20,9 @@ public sealed class SetupEditor : Window
     private readonly AppModel _app;
     private readonly TextBox _text;
     private readonly StackPanel _report = Ui.Column(2);
+    /// The hash of the document the text was read from, null for none. Apply saves the text only
+    /// over that document: over a later one it would put back what this one held and approve it.
+    private string? _base;
 
     public SetupEditor(AppModel app)
     {
@@ -29,13 +32,15 @@ public sealed class SetupEditor : Window
         Height = 720;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
 
+        var opened = app.Config.Document;
+        _base = opened?.Hash;
         _text = new TextBox
         {
             AcceptsReturn = true,
             AcceptsTab = true,
             TextWrapping = TextWrapping.NoWrap,
             FontFamily = new FontFamily("monospace"),
-            Text = app.Config.Document?.Text ?? SetupTemplates.Example,
+            Text = opened?.Text ?? SetupTemplates.Example,
             MinHeight = 320,
         };
 
@@ -162,28 +167,29 @@ public sealed class SetupEditor : Window
     {
         var plan = ControllerEditor.Plan(_text.Text ?? "", _app.Config.Config, "check", _ => { });
         var decoded = ControllerConfig.From(Contract.Value.Parse(plan.Text));
-        Report(plan.Problems, plan.Preview.Lines().Concat(decoded.Warnings()).ToList(), _app.LaunchEditProblems(_text.Text ?? ""));
+        Report(plan.Problems, plan.Preview.Lines().Concat(decoded.Warnings()).ToList(), _app.LaunchEditProblems(_text.Text ?? "", _base));
     }
 
     private void Apply()
     {
         // Saving here approves every command it changes, so a command waiting for approval is
-        // approved or reverted on its own first, never carried along by an edit to its shell.
-        if (_app.LaunchEditProblems(_text.Text ?? "") is { Count: > 0 } refused)
+        // approved or reverted on its own first, never carried along by an edit to its shell, and
+        // text read from an earlier setup is never saved over a later one.
+        var (document, problem, refused) = _app.ApplyEdit(_text.Text ?? "", _base, "edited here");
+        if (refused.Count > 0)
         {
             Report(Array.Empty<string>(), Array.Empty<string>(), refused);
             return;
         }
-        var (document, problem) = _app.Config.ApplyEdit(_text.Text ?? "", "edited here");
         if (problem is not null)
         {
             Report(new[] { problem }, Array.Empty<string>());
             return;
         }
-        _text.Text = document!.Text;
+        ReadFrom(document!);
         Report(Array.Empty<string>(), new[]
         {
-            $"Applied as revision {document.Identity.RevisionNumber}.",
+            $"Applied as revision {document!.Identity.RevisionNumber}.",
             "Every machine that holds an earlier version of this setup will be given it on the next reading.",
         });
     }
@@ -191,8 +197,26 @@ public sealed class SetupEditor : Window
     private async void Import()
     {
         await new ImportSetup(_app).ShowDialog(this);
-        _text.Text = _app.Config.Document?.Text ?? _text.Text;
+        if (_app.Config.Document is { } document) ReadFrom(document);
         Check();
+    }
+
+    /// Puts the setup as it is now in the editor, in place of whatever was typed.
+    private void StartAgain()
+    {
+        if (_app.Config.Document is { } document) ReadFrom(document);
+        else
+        {
+            _text.Text = SetupTemplates.Example;
+            _base = null;
+        }
+        Check();
+    }
+
+    private void ReadFrom(ControllerDocument document)
+    {
+        _text.Text = document.Text;
+        _base = document.Hash;
     }
 
     private void Report(IReadOnlyList<string> problems, IReadOnlyList<string> notes,
@@ -202,6 +226,11 @@ public sealed class SetupEditor : Window
         _report.Children.Clear();
         _report.Children.Add(Ui.SectionHeading(problems.Count == 0 && launch.Count == 0 ? "Ready" : "Not yet"));
         foreach (var problem in problems) _report.Children.Add(Ui.Note(problem, Ui.Bad));
+        if (_app.Config.Document?.Hash != _base)
+        {
+            _report.Children.Add(Ui.Actions(Ui.Action("Start again from the current setup", StartAgain,
+                explanation: "Replaces the document below with the setup as it is now. Copy anything you typed that you want to keep first.")));
+        }
         foreach (var problem in launch)
         {
             _report.Children.Add(Ui.Note(problem.Sentence, Ui.Bad));

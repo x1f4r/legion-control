@@ -795,11 +795,13 @@ public sealed class MainWindow : Window
             $"The upgrade succeeded. Update only this system's script argument in the shared setup to {argv[script]}? The remaining arguments are preserved.", "Update launcher path")) return;
         if (_app.Config.Document?.Hash != document.Hash)
         { Sheets.Text(this, "Setup changed", "The setup changed while this choice was open. Review its current agent path before editing it."); return; }
-        var root = System.Text.Json.Nodes.JsonNode.Parse(document.Text)!.AsObject();
-        var configured = root["machines"]!.AsArray().First(item => item?["id"]?.GetValue<string>() == machine.Id)!;
-        var os = configured["systems"]!.AsArray().First(item => item?["id"]?.GetValue<string>() == system.Id)!;
-        os["agent"] = new System.Text.Json.Nodes.JsonArray(argv.Select(item => (System.Text.Json.Nodes.JsonNode)item).ToArray());
-        var (_, problem) = _app.Config.ApplyEdit(root.ToJsonString(), "selected stable launcher");
+        var (_, problem, refused) = _app.MigrateAgentCommand(machine.Id, system.Id, argv, document.Hash);
+        if (refused.Count > 0)
+        {
+            Sheets.Text(this, "Launcher path", string.Join("\n", refused.Select(refusal => refusal.Sentence))
+                + "\nThe agent was upgraded; its launcher path in the setup was left as it is.");
+            return;
+        }
         if (problem is not null) Sheets.Text(this, "Launcher path", problem);
     }
 

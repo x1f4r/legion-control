@@ -795,15 +795,30 @@ public static class Runner
                 output.WriteLine($"Could not read {input}: {error.Message}");
                 return Failed;
             }
+            // The file was read out from one revision and is applied as an edit of it. Over any
+            // other it would put back what that one held, a command reverted since included, and an
+            // edit approves what it changes. A file without a controller block says nothing about
+            // where it came from, and is taken as written against the setup as it is.
+            var applied = app.Config.Document;
+            var readFrom = ControllerIdentity.From(Value.Parse(text)["controller"]);
+            if (applied is not null && readFrom.HasIdentity
+                && (readFrom.Id != applied.Identity.Id || readFrom.RevisionNumber != applied.Identity.RevisionNumber
+                    || readFrom.UpdatedAt != applied.Identity.UpdatedAt
+                    || !readFrom.Lineage.SequenceEqual(applied.Identity.Lineage, StringComparer.Ordinal)))
+            {
+                output.WriteLine($"{input} was not read out from the setup this device holds now (revision {applied.Identity.RevisionNumber}, hash {applied.Hash}). Nothing was applied.");
+                output.WriteLine("Read it out again with --command edit --out PATH, make the change there, and apply that.");
+                return Failed;
+            }
             // The same refusals as the window's editor: an edit approves the commands it changes, so
             // it may not change one that is waiting for approval.
-            if (app.LaunchEditProblems(text) is { Count: > 0 } refused)
+            var (document, problem, refused) = app.ApplyEdit(text, applied?.Hash, $"applied from {Path.GetFileName(input)}");
+            if (refused.Count > 0)
             {
                 foreach (var refusal in refused) output.WriteLine(refusal.Sentence);
                 output.WriteLine("Nothing was applied. Approve or revert a waiting value with --command setup --approve-launch PATH or --revert-launch PATH.");
                 return Failed;
             }
-            var (document, problem) = app.Config.ApplyEdit(text, $"applied from {Path.GetFileName(input)}");
             if (document is null)
             {
                 output.WriteLine(problem ?? "The document was refused.");

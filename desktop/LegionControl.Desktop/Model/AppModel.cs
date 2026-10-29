@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Transport;
@@ -175,12 +176,54 @@ public sealed class AppModel : IDisposable
         if (Config.Document is not { } document) return "There is no setup to change.";
         var (text, problem) = LaunchGate.Reverted(document, entry);
         if (text is null) return problem;
-        return Config.ApplyEdit(text, $"reverted {entry.Path}").Problem;
+        var (_, applyProblem, refused) = ApplyEdit(text, document.Hash, $"reverted {entry.Path}");
+        return applyProblem ?? (refused.Count > 0 ? string.Join(" ", refused.Select(refusal => refusal.Sentence)) : null);
     }
 
-    /// What an editor refuses about saving [editedText] over the current setup.
-    public IReadOnlyList<LaunchGate.EditProblem> LaunchEditProblems(string editedText) =>
-        LaunchGate.EditProblems(Config.Document, LaunchReview, editedText);
+    // MARK: editing
+
+    /// What an editor refuses about saving [editedText], read from the document [baseHash] (null
+    /// when there was none). An edit made to an earlier document than the one applied now is
+    /// refused outright: its text holds whatever that document held, and saving it would approve
+    /// a value nobody here typed, a peer's value since reverted for one.
+    public IReadOnlyList<LaunchGate.EditProblem> LaunchEditProblems(string editedText, string? baseHash)
+    {
+        var document = Config.Document;
+        if (document?.Hash != baseHash) return new[] { new LaunchGate.EditProblem(ConfigStore.MovedOn) };
+        // What waits is worked out for exactly the document the edit is checked against, never
+        // taken from a review an earlier one left behind.
+        var review = LaunchValues.Review(Approvals.Current, LaunchProjection.Of(document));
+        return LaunchGate.EditProblems(document, review, editedText);
+    }
+
+    /// Applies an edit made on this device to the document [baseHash]: what the editor, the command
+    /// line, Revert and the launcher migration all save through. It approves the launch values it
+    /// changes (contract section 9.9), so nothing is applied while [LaunchEditProblems] refuses it,
+    /// and nothing if the setup moved on between that check and the write.
+    public (ControllerDocument? Document, string? Problem, IReadOnlyList<LaunchGate.EditProblem> Refused) ApplyEdit(
+        string editedText, string? baseHash, string description)
+    {
+        if (LaunchEditProblems(editedText, baseHash) is { Count: > 0 } refused) return (null, null, refused);
+        var (document, problem) = Config.ApplyEditIfCurrent(editedText, baseHash, description);
+        return (document, problem, Array.Empty<LaunchGate.EditProblem>());
+    }
+
+    /// Points one system's command at the stable launcher after an agent upgrade, as an edit of the
+    /// document [baseHash] that changes nothing else. [agent] is the command this device runs there
+    /// with that one item moved. While a changed command for the system waits, this is refused like
+    /// any other edit of it: written over the waiting shell or restriction, the approved argv would
+    /// be approved again with a grammar nobody here reviewed.
+    public (ControllerDocument? Document, string? Problem, IReadOnlyList<LaunchGate.EditProblem> Refused) MigrateAgentCommand(
+        string machineId, string systemId, IReadOnlyList<string> agent, string baseHash)
+    {
+        if (Config.Document is not { } document || document.Hash != baseHash)
+            return (null, null, new[] { new LaunchGate.EditProblem(ConfigStore.MovedOn) });
+        var root = JsonNode.Parse(document.Text) as JsonObject;
+        if (LaunchGate.Find(LaunchGate.Find(root, "machines", machineId), "systems", systemId) is not { } system)
+            return (null, $"{LaunchValues.SystemPath(machineId, systemId)} is no longer in the setup.", Array.Empty<LaunchGate.EditProblem>());
+        system["agent"] = new JsonArray(agent.Select(item => (JsonNode)item!).ToArray());
+        return ApplyEdit(root!.ToJsonString(), baseHash, "selected stable launcher");
+    }
 
     /// "Not now": the review does not open by itself again for this revision while the app runs.
     /// What waits is still shown.

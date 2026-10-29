@@ -73,10 +73,11 @@ public sealed class ConfigStore : IDisposable
     /// (contract section 9.9), and this is raised before the write so the approval is in place
     /// before the document is applied and nobody is asked about what they just typed.
     ///
-    /// Raised by [ApplyEdit], by a hand edit of the file that keeps its `controller` block, by a
-    /// file with no identity that is given one here, and by [WriteExample]. Never by [Apply] or
-    /// [ApplyIfCurrent], and never for a document either of those wrote, here or in another process
-    /// on this device: what another peer wrote, a merge and a kept revision approve nothing.
+    /// Raised by [ApplyEdit] and [ApplyEditIfCurrent], by a hand edit of the file that keeps its
+    /// `controller` block, by a file with no identity that is given one here, and by
+    /// [WriteExample]. Never by [Apply] or [ApplyIfCurrent], and never for a document either of
+    /// those wrote, here or in another process on this device: what another peer wrote, a merge
+    /// and a kept revision approve nothing.
     public event Action<byte[]?, ControllerDocument>? LocalEdit;
 
     public IReadOnlyList<MachineConfig> Machines => Config?.Machines ?? Array.Empty<MachineConfig>();
@@ -331,6 +332,23 @@ public sealed class ConfigStore : IDisposable
     {
         lock (_gate) return ApplyEditCore(editedText, description);
     }
+
+    /// Applies an edit only while the setup is still [expectedHash], the document its text was read
+    /// from (null for none). Saved over a later one, the text would put back whatever the earlier
+    /// document held, a value reverted since included, and an edit approves what it changes.
+    public (ControllerDocument? Document, string? Problem) ApplyEditIfCurrent(string editedText, string? expectedHash, string description)
+    {
+        lock (_gate)
+        {
+            if (Signature(Path) != _lastSignature) LoadCore();
+            if (Document?.Hash != expectedHash) return (null, MovedOn);
+            return ApplyEditCore(editedText, description);
+        }
+    }
+
+    /// Why an edit of an earlier document was not applied.
+    public const string MovedOn =
+        "The setup changed since this edit started from it. Nothing was applied: start again from the setup as it is now.";
 
     private (ControllerDocument? Document, string? Problem) ApplyEditCore(string editedText, string description)
     {

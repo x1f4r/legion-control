@@ -389,7 +389,7 @@ public class LaunchGateTests
         using var b = Device(home, "b", applied: d0);
         var migrated = new[] { "/usr/bin/node", "/home/me/.legion-control/bin/launcher.mjs" };
 
-        // A: "Update command" is an edit made here. The record holds the new tuple before the
+        // A: "Update launcher path" is an edit made here. The record holds the new tuple before the
         // setup file is written, so this device never asks about its own edit.
         var recordedFirst = false;
         a.Config.LocalEdit += (_, _) =>
@@ -398,10 +398,9 @@ public class LaunchGateTests
             recordedFirst = tuple?.Agent!.SequenceEqual(migrated) == true
                             && File.ReadAllText(Path.Combine(home.Path, "a", "config.json")).Contains("agent/src/index.mjs");
         };
-        var edited = JsonNode.Parse(d0.Text)!.AsObject();
-        LaunchDocuments.System(edited, "tower", "linux")["agent"] = LaunchDocuments.Argv(migrated);
-        var (d1, problem) = a.Config.ApplyEdit(edited.ToJsonString(), "selected stable launcher");
+        var (d1, problem, refused) = a.MigrateAgentCommand("tower", "linux", migrated, d0.Hash);
         Assert.Null(problem);
+        Assert.Empty(refused);
         Assert.True(recordedFirst);
         Assert.Empty(a.LaunchReview);
 
@@ -428,6 +427,36 @@ public class LaunchGateTests
             Assert.Null(peer.Config.Apply(changed, "adopted from a"));
             Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(peer.LaunchReview).Path);
         }
+    }
+
+    [Fact]
+    public void TheLauncherPathIsNotMovedUnderACommandThatWaits()
+    {
+        using var home = new TempHome();
+        var root = LaunchDocuments.Root();
+        LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs");
+        var d0 = LaunchDocuments.Of(root);
+        using var app = Device(home, "laptop", applied: d0);
+        // A peer moved the system to PowerShell. The approved command still runs, and its argv is
+        // what an agent upgrade here would move to the stable launcher.
+        var d1 = LaunchDocuments.Descendant(d0, next => LaunchDocuments.System(next, "tower", "linux")["shell"] = "powershell");
+        Assert.Null(app.Config.Apply(d1, "adopted from pi"));
+        var system = Gated(app, "tower", "linux");
+        Assert.Equal(LaunchState.ApprovedWithChangeWaiting, system.LaunchState);
+        var approved = Record(home, "laptop").ToJsonString();
+
+        var migrated = system.Agent.Select(item => item.Replace("agent/src/index.mjs", "bin/launcher.mjs")).ToArray();
+        var (document, problem, refused) = app.MigrateAgentCommand("tower", "linux", migrated, d1.Hash);
+
+        Assert.Null(document);
+        Assert.Null(problem);
+        Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(refused).Waiting!.Path);
+        Assert.Equal(d1.Hash, app.Config.Document!.Hash);
+        Assert.Equal(approved, Record(home, "laptop").ToJsonString());
+
+        // Asked about a setup that has moved on since the upgrade read it, nothing is written.
+        Assert.Equal(ConfigStore.MovedOn, Assert.Single(app.MigrateAgentCommand("tower", "linux", migrated, d0.Hash).Refused).Sentence);
+        Assert.Equal(d1.Hash, app.Config.Document!.Hash);
     }
 
     [Fact]
@@ -496,7 +525,7 @@ public class LaunchGateTests
         // An edit here to pi's command approves pi's command, and only that.
         var edited = JsonNode.Parse(d1.Text)!.AsObject();
         LaunchDocuments.System(edited, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/srv/pi/bin/launcher.mjs");
-        Assert.Null(app.Config.ApplyEdit(edited.ToJsonString()).Problem);
+        Assert.NotNull(app.ApplyEdit(edited.ToJsonString(), d1.Hash, "edited here").Document);
         Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(app.LaunchReview).Path);
         Assert.Equal(new[] { "node", "/srv/pi/bin/launcher.mjs" }, Gated(app, "pi", "linux").Agent);
         var afterEdit = Record(home, "laptop").ToJsonString();
@@ -783,6 +812,42 @@ public class LaunchGateTests
         Assert.Empty(LaunchGate.EditProblems(d1, review, reverted!));
     }
 
+    /// The editor opens on a document whose tower command waits, so its text holds the peer's
+    /// command; the command is reverted from the review; then the editor applies a rename.
+    [Fact]
+    public void AnEditOfAnEarlierSetupNeitherUndoesARevertNorApprovesWhatItCarries()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        using var app = Device(home, "laptop", applied: d0);
+        Assert.Null(app.Config.Apply(LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "touch /tmp/x")), "adopted from pi"));
+        var opened = app.Config.Document!;
+        var edited = JsonNode.Parse(opened.Text)!.AsObject();
+        LaunchDocuments.Machine(edited, "pi")["name"] = "Pi upstairs";
+
+        Assert.Null(app.RevertLaunch(Assert.Single(app.LaunchReview)));
+        var reverted = app.Config.Document!;
+        var approved = Record(home, "laptop").ToJsonString();
+        Assert.Equal(ConfigStore.MovedOn, Assert.Single(app.LaunchEditProblems(edited.ToJsonString(), opened.Hash)).Sentence);
+        var (document, _, refused) = app.ApplyEdit(edited.ToJsonString(), opened.Hash, "edited here");
+
+        Assert.Null(document);
+        Assert.Equal(ConfigStore.MovedOn, Assert.Single(refused).Sentence);
+        Assert.Equal(reverted.Hash, app.Config.Document!.Hash);
+        Assert.Equal(approved, Record(home, "laptop").ToJsonString());
+        Assert.Equal(LaunchDocuments.Tower, LaunchProjection.Of(app.Config.Document).TupleAt("tower", "linux")!.Agent);
+        // The store checks again under its own lock, for a setup that moves on after the check.
+        Assert.Equal(ConfigStore.MovedOn, app.Config.ApplyEditIfCurrent(edited.ToJsonString(), opened.Hash, "edited here").Problem);
+
+        // Started again from the setup as it is now, the same rename applies.
+        var again = JsonNode.Parse(reverted.Text)!.AsObject();
+        LaunchDocuments.Machine(again, "pi")["name"] = "Pi upstairs";
+        Assert.NotNull(app.ApplyEdit(again.ToJsonString(), reverted.Hash, "edited here").Document);
+        Assert.Equal("Pi upstairs", app.Machine("pi")!.Name);
+        Assert.Empty(app.LaunchReview);
+    }
+
     // MARK: the record itself
 
     [Fact]
@@ -906,6 +971,47 @@ public class LaunchGateTests
             Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "edit", "--in", input }, output));
             Assert.Contains("waiting for approval", output.ToString());
             Assert.Equal(d1.Bytes, File.ReadAllBytes(home.ConfigPath));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, null);
+        }
+    }
+
+    [Fact]
+    public async Task TheCommandLineEditRefusesAFileReadOutFromAnEarlierRevision()
+    {
+        using var home = new TempHome();
+        var record = Path.Combine(home.Path, "approved-launch.json");
+        var d0 = LaunchDocuments.Of(Unreachable(LaunchDocuments.Root()));
+        File.WriteAllText(record, LaunchRecord.Seeded(LaunchProjection.Of(d0), d0.Hash).ToJson().ToJsonString());
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "id"));
+        File.WriteAllBytes(home.ConfigPath, d1.Bytes);
+        var exported = Path.Combine(home.Path, "exported.json");
+        Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, home.ConfigPath);
+        try
+        {
+            // Read out while tower's command waits, so the file holds it; then the command is
+            // reverted, and the file comes back with an unrelated rename.
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--out", exported }, new StringWriter()));
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(
+                new[] { "--command", "setup", "--revert-launch", "machines[tower].systems[linux]" }, new StringWriter()));
+            var reverted = File.ReadAllBytes(home.ConfigPath);
+            var approved = File.ReadAllText(record);
+            File.WriteAllText(exported, File.ReadAllText(exported).Replace("\"Beacon\"", "\"Pi upstairs\""));
+
+            var output = new StringWriter();
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "edit", "--in", exported }, output));
+            Assert.Contains("was not read out from the setup this device holds now", output.ToString());
+            Assert.Equal(reverted, File.ReadAllBytes(home.ConfigPath));
+            Assert.Equal(approved, File.ReadAllText(record));
+
+            // Read out from the setup as it is now, the same rename applies.
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--out", exported }, new StringWriter()));
+            File.WriteAllText(exported, File.ReadAllText(exported).Replace("\"Beacon\"", "\"Pi upstairs\""));
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--in", exported }, new StringWriter()));
+            Assert.Equal("Pi upstairs", ControllerDocument.FromRaw(File.ReadAllBytes(home.ConfigPath)).Decoded.Machine("pi")!.Name);
         }
         finally
         {

@@ -156,7 +156,8 @@ public static class LaunchGate
         return LaunchProjection.TupleOf(parsed.RootElement).Grammar;
     }
 
-    private static JsonObject? Find(JsonObject? owner, string list, string id) =>
+    /// The first item of [owner]'s [list] with [id], as the projection reads a repeated id.
+    internal static JsonObject? Find(JsonObject? owner, string list, string id) =>
         (owner?[list] as JsonArray)?.OfType<JsonObject>().FirstOrDefault(item => LaunchValues.Text(item["id"]) == id);
 
     private static JsonObject Child(JsonObject parent, string key)
