@@ -444,9 +444,10 @@ enum AppUpdates {
     /// build failing to launch would leave a user with no app and nothing to run to fix it.
     ///
     /// The sequence: wait for this process to exit, move the current bundle aside, move the staged
-    /// one into place, launch it, and wait for it to say it came up. If it does not, put the old
-    /// bundle back and launch that instead. Every path ends with exactly one bundle at the real
-    /// path, and it is always one of the two whole bundles rather than a mixture.
+    /// one into place, launch it, and wait for it to say it came up. If it does not, stop it if it is
+    /// still on its way up, put the old bundle back and launch that instead. Every path ends with
+    /// exactly one bundle at the real path, and it is always one of the two whole bundles rather
+    /// than a mixture, and with one copy of the app running rather than two.
     ///
     /// `launcher` is the argv every path starts a bundle with, the bundle's path appended.
     static func swapScript(
@@ -467,11 +468,41 @@ enum AppUpdates {
         STAGED=\(quoted(staged))
         PREVIOUS=\(quoted(previous))
         MARKER=\(quoted(marker))
+        STARTING=\(quoted(launchingURL(support: marker.deletingLastPathComponent())))
         PID=\(pid)
 
         # Every path below starts a bundle through this one function.
         launch() {
             \(launcher.map(CommandGrammar.posixQuoted).joined(separator: " ")) "$1" 2>/dev/null || true
+        }
+
+        # The new build writes its pid to STARTING as it starts and to the marker once it is up. A
+        # build that is still coming up when the wait runs out, slowly or never, is stopped here
+        # before the old one is started, so the two never end up running side by side.
+        stop_new_build() {
+            for record in "$STARTING" "$MARKER"; do
+                [ -f "$record" ] || continue
+                found=""
+                read -r found < "$record" || true
+                case "$found" in
+                    ''|*[!0-9]*) continue ;;
+                esac
+                # Only a process running out of the bundle this helper put in place. A pid that has
+                # since gone to something else, or a marker an older build wrote without one, is
+                # left alone.
+                case "$(/bin/ps -p "$found" -o comm= 2>/dev/null)" in
+                    "$CURRENT"/*) ;;
+                    *) continue ;;
+                esac
+                kill -TERM "$found" 2>/dev/null
+                j=0
+                while [ $j -lt 50 ] && kill -0 "$found" 2>/dev/null; do
+                    sleep 0.1
+                    j=$((j + 1))
+                done
+                kill -KILL "$found" 2>/dev/null
+            done
+            return 0
         }
 
         # Wait for the app to actually be gone. Moving a bundle out from under a running process is
@@ -489,7 +520,7 @@ enum AppUpdates {
             exit 3
         fi
 
-        rm -f "$MARKER"
+        rm -f "$MARKER" "$STARTING"
         rm -rf "$PREVIOUS"
 
         if ! mv "$CURRENT" "$PREVIOUS"; then
@@ -520,6 +551,7 @@ enum AppUpdates {
 
         # Recovery. The new build is put where the previous one was rather than deleted, so a failure
         # that turns out to be about something else is still diagnosable.
+        stop_new_build
         rm -rf "$STAGED"
         if mv "$CURRENT" "$STAGED" && mv "$PREVIOUS" "$CURRENT"; then
             launch "$CURRENT"
@@ -531,6 +563,12 @@ enum AppUpdates {
     /// Where the new build says "I came up".
     static func launchMarkerURL(support: URL) -> URL {
         support.appending(path: "launched-ok")
+    }
+
+    /// Where a build says "I am starting", before it has come up. The marker cannot say this: a
+    /// helper from an older release reads the marker's mere existence as a launch that worked.
+    static func launchingURL(support: URL) -> URL {
+        support.appending(path: "launching")
     }
 
     /// Write the swap helper and start it detached, then it is out of this process's hands.
@@ -578,12 +616,21 @@ enum AppUpdates {
         }
     }
 
-    /// Called on launch. Writing the marker is how the helper learns the new build actually came up,
-    /// and clearing the kept bundle is the last step of an update that worked.
-    static func confirmLaunch(support: URL) {
+    /// Called first thing, before the app has done anything that could hang or crash. A helper
+    /// waiting on this build can then stop it if it never comes up, rather than starting the old one
+    /// beside it.
+    static func recordLaunching(support: URL, pid: Int32 = ProcessInfo.processInfo.processIdentifier) {
+        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try? Data("\(pid)\n".utf8).write(to: launchingURL(support: support), options: .atomic)
+    }
+
+    /// Called on launch. Writing the marker is how the helper learns the new build actually came up.
+    /// It carries this build's pid; a helper only reads it to be sure of what it is stopping, and an
+    /// older helper reads nothing but the file's existence.
+    static func confirmLaunch(support: URL, pid: Int32 = ProcessInfo.processInfo.processIdentifier) {
         let marker = launchMarkerURL(support: support)
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        try? Data("ok".utf8).write(to: marker, options: .atomic)
+        try? Data("\(pid)\n".utf8).write(to: marker, options: .atomic)
     }
 
     /// The bundle kept from the last update, if one is still there.

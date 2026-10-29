@@ -53,6 +53,14 @@ final class AppUpdateModel {
     @ObservationIgnored var bundleURL: URL = Bundle.main.bundleURL
     /// Where the launch marker lives.
     @ObservationIgnored var supportDirectory: URL = AppPaths.support
+    /// True when `LEGION_CONTROL_HOME` or `LEGION_CONTROL_CONFIG` points this run somewhere else.
+    ///
+    /// Such a run never replaces, rolls back or discards a build, for the same reason it never
+    /// changes the login items. The bundle belongs to the ordinary installation, not to the run, and
+    /// `open -n` starts the next build without this run's environment: it would come up reading the
+    /// real setup, write its marker where this run is not looking, and be rolled back with both
+    /// copies left running.
+    @ObservationIgnored var isIsolatedRun: Bool = AppPaths.isRedirected
     /// Set in tests so nothing is ever actually swapped or relaunched.
     @ObservationIgnored var performSwap: @MainActor (AppUpdates.Staged, URL, URL) throws -> Void = {
         try AppUpdates.startSwap(staged: $0, current: $1, marker: $2)
@@ -226,10 +234,17 @@ final class AppUpdateModel {
                 establish that it is a genuine Legion Control release and will not install it.
                 """
         }
+        if let blocked = swapBlockedReason { return blocked }
         if bundleURL.pathExtension != "app" {
             return "Legion Control is not running out of an app bundle, so it cannot replace itself. Build and install it with mac/build.sh."
         }
         return nil
+    }
+
+    /// Why this run may not change which build is installed: install, roll back or discard.
+    var swapBlockedReason: String? {
+        guard isIsolatedRun else { return nil }
+        return "This run was pointed at its own home with LEGION_CONTROL_HOME or LEGION_CONTROL_CONFIG, so it does not install, roll back or discard builds of the app. Do that from an ordinary run."
     }
 
     /// The kept bundle from the last update, when there is one.
@@ -323,6 +338,10 @@ final class AppUpdateModel {
     /// Put the kept build back, because the user asked for it.
     func rollBack() {
         guard phase == .idle, let previous = AppUpdates.retainedPrevious(beside: bundleURL) else { return }
+        if let blocked = swapBlockedReason {
+            failure = blocked
+            return
+        }
         phase = .installing
         failure = nil
         let marker = AppUpdates.launchMarkerURL(support: supportDirectory)

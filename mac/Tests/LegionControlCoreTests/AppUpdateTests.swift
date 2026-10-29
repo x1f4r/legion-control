@@ -242,6 +242,82 @@ struct AppUpdateTests {
         #expect(!FileManager.default.fileExists(atPath: previous.path))
     }
 
+    @Test("recovery stops a new build that is still coming up before the old one is started")
+    func swapHelperStopsLateBuild() async throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tools = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tools) }
+        let current = root.appending(path: "Legion Control.app")
+        let staged = root.appending(path: "Legion Control.new.app")
+        let previous = root.appending(path: "Legion Control.previous.app")
+        let marker = root.appending(path: "launched-ok")
+        let starting = AppUpdates.launchingURL(support: root)
+        try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
+        try Self.makeBundle(at: staged, identifier: "id", executable: "LegionControl", version: "1.4.0")
+        // A new build that hangs on its way up: it writes its pid as it starts and never confirms.
+        // A link to sleep, so ps names the process by its path inside the bundle, as it would the
+        // real executable.
+        try FileManager.default.createSymbolicLink(at: staged.appending(path: "Contents/MacOS/hang"),
+                                                   withDestinationURL: URL(fileURLWithPath: "/bin/sleep"))
+        let started = CommandGrammar.posixQuoted(starting.path)
+        let launch = try Self.recordingLauncher(in: tools, then: """
+            if [ -e "$1/Contents/MacOS/hang" ]; then
+                "$1/Contents/MacOS/hang" 30 </dev/null >/dev/null 2>&1 &
+                printf '%s\\n' "$!" > \(started)
+            elif kill -0 "$(cat \(started))" 2>/dev/null; then
+                echo new-build-still-running >> "$LOG"
+            fi
+
+            """)
+        let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1,
+                                           launcher: launch.argv)
+        let run = try await Self.runHelper(script, in: root)
+        let hung = try #require(Int32(String(contentsOf: starting, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        defer { kill(hung, SIGKILL) }
+
+        #expect(run.exitCode == 2)
+        // The old build was started only once the new one had been stopped.
+        #expect(Self.launched(launch.log) == [current.path(percentEncoded: false), current.path(percentEncoded: false)])
+        #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
+        #expect(AppUpdates.version(ofBundleAt: staged) == "1.4.0")
+        #expect(kill(hung, 0) != 0)
+    }
+
+    @Test("recovery leaves alone a recorded pid that is not running out of the new bundle")
+    func swapHelperSparesOtherProcesses() async throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tools = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tools) }
+        let current = root.appending(path: "Legion Control.app")
+        let staged = root.appending(path: "Legion Control.new.app")
+        let previous = root.appending(path: "Legion Control.previous.app")
+        let marker = root.appending(path: "launched-ok")
+        try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
+        try Self.makeBundle(at: staged, identifier: "id", executable: "LegionControl", version: "1.4.0")
+
+        // The pid the new build wrote has since been given to something else entirely.
+        let bystander = Process()
+        bystander.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        bystander.arguments = ["30"]
+        try bystander.run()
+        defer { if bystander.isRunning { bystander.terminate() } }
+        let launch = try Self.recordingLauncher(in: tools, then: """
+            printf '%s\\n' \(bystander.processIdentifier) > \(CommandGrammar.posixQuoted(AppUpdates.launchingURL(support: root).path))
+
+            """)
+        let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1,
+                                           launcher: launch.argv)
+        let run = try await Self.runHelper(script, in: root)
+        #expect(run.exitCode == 2)
+        #expect(bystander.isRunning)
+        #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
+    }
+
     @Test("the helper puts everything back when the staged bundle cannot be moved into place")
     func swapHelperHandlesMissingStage() async throws {
         let root = try Self.temporaryDirectory()
@@ -390,11 +466,16 @@ struct AppUpdateTests {
         #expect(AppUpdates.version(ofBundleAt: previous) == "1.3.0")
     }
 
-    @Test("the launch marker is written where the helper looks for it")
+    @Test("the launch records are written where the helper looks for them, carrying this build's pid")
     func launchMarker() throws {
         let root = try Self.temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
+        let pid = "\(ProcessInfo.processInfo.processIdentifier)\n"
+        AppUpdates.recordLaunching(support: root)
+        #expect(try String(contentsOf: AppUpdates.launchingURL(support: root), encoding: .utf8) == pid)
+        // Starting is not coming up: an older helper reads the marker's existence as success.
+        #expect(!FileManager.default.fileExists(atPath: AppUpdates.launchMarkerURL(support: root).path))
         AppUpdates.confirmLaunch(support: root)
-        #expect(FileManager.default.fileExists(atPath: AppUpdates.launchMarkerURL(support: root).path))
+        #expect(try String(contentsOf: AppUpdates.launchMarkerURL(support: root), encoding: .utf8) == pid)
     }
 }

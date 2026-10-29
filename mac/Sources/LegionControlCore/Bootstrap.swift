@@ -11,6 +11,9 @@ public enum LegionControlMain {
     private static let delegate = AppDelegate()
 
     public static func main() {
+        // Before anything else, so an update helper waiting on this build knows which process to
+        // stop if it never comes up.
+        AppUpdates.recordLaunching(support: AppPaths.support)
         // Before anything is run: the first ssh call waits for this rather than going out with the
         // bare PATH launchd gives an app.
         LoginShellPath.shared.resolveInBackground()

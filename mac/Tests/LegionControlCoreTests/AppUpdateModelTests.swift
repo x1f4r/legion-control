@@ -19,6 +19,9 @@ struct AppUpdateModelTests {
         let preferences = FilePreferences(url: directory.appending(path: "preferences.json"))
         let model = AppUpdateModel(preferences: preferences, installedVersion: "3.0.0")
         model.bundleURL = directory.appending(path: "Legion Control.app")
+        // Whatever the environment running the tests says: the cases that want an isolated run
+        // ask for one.
+        model.isIsolatedRun = false
         return (model, preferences, directory)
     }
 
@@ -92,6 +95,7 @@ struct AppUpdateModelTests {
         #expect(model.installBlockedReason == nil)
         let restored = AppUpdateModel(preferences: preferences, installedVersion: "3.0.0")
         restored.bundleURL = model.bundleURL
+        restored.isIsolatedRun = false
         #expect(restored.check == .available(Self.release))
         #expect(restored.installBlockedReason == nil)
 
@@ -318,6 +322,7 @@ struct AppUpdateModelTests {
         preferences.set(try JSONSerialization.data(withJSONObject: cached), forKey: "appUpdateLastCheck")
         let model = AppUpdateModel(preferences: preferences, installedVersion: "3.0.0")
         model.bundleURL = directory.appending(path: "Legion Control.app")
+        model.isIsolatedRun = false
         #expect(model.installBlockedReason != nil)
         var calls = 0
         model.fetchRelease = { _, _ in calls += 1; return .available(Self.release) }
@@ -325,5 +330,35 @@ struct AppUpdateModelTests {
         await settle(model)
         #expect(calls == 1)
         #expect(model.installBlockedReason == nil)
+    }
+
+    @Test("an isolated run never installs, rolls back or discards a build")
+    func isolatedRunRefusesSwaps() async throws {
+        let (model, _, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.isIsolatedRun = true
+        model.fetchRelease = { _, _ in .available(Self.release) }
+        model.checkNow()
+        await settle(model)
+        // Looking is still fine; it is changing the installation that is refused.
+        #expect(model.availableVersion == "3.1.0")
+        let previous = directory.appending(path: "Legion Control.previous.app")
+        try AppUpdateTests.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "2.9.0")
+        var downloads = 0
+        var swaps = 0
+        var quits = 0
+        model.downloadRelease = { _ in downloads += 1; throw AppUpdates.InstallFailure("not reached") }
+        model.performSwap = { _, _, _ in swaps += 1 }
+        model.quit = { quits += 1 }
+
+        #expect(model.installBlockedReason == model.swapBlockedReason)
+        model.install()
+        model.rollBack()
+        await settle(model)
+        #expect(downloads == 0)
+        #expect(swaps == 0)
+        #expect(quits == 0)
+        #expect(model.failure == model.swapBlockedReason)
+        #expect(model.rollbackVersion == "2.9.0")
     }
 }
