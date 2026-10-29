@@ -130,7 +130,7 @@ test('the checks answer in the order of contract section 9.4', async () => {
     // part of no document, so a document saved with one is parsed without it.
     assert.equal(storeController('[]').reasonCode, 'bad-argument');
     assert.equal(storeController('{ not json').reasonCode, 'bad-argument');
-    const bom = storeController(`﻿${setup()}`);
+    const bom = storeController(`\uFEFF${setup()}`);
     assert.equal(bom.ok, true, bom.error);
 
     const first = canonicalHash(setup());

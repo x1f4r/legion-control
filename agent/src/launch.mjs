@@ -56,7 +56,7 @@ export function resolveGrammar({ platform, shell, restricted, restrictedSession 
 // Control characters, C1 controls, zero-width and bidirectional formatting,
 // word joiners and the byte order mark: each can make what a person approves
 // look different from what runs.
-const LAUNCH_TEXT = /^[^\u0000-\u001F\u007F-\u009F​-‏‪-‮⁠-⁤⁦-⁩﻿]+$/u;
+const LAUNCH_TEXT = /^[^\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]+$/u;
 
 /** Whether an argv item, an identityFile or local.agent can be shown to a person and approved. */
 export function isLaunchText(text) {
