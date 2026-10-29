@@ -9,12 +9,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { checkReply } from '../../contract/validate.mjs';
 import { canonicalHash, readController, storeController } from '../src/controller.mjs';
 import { isLauncherMigration, launchProjection } from '../src/launch.mjs';
-import { withHome } from './helpers.mjs';
+import { ENTRY, cli, withHome } from './helpers.mjs';
 
 const SETUP = 'setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846';
-const ENTRY = '/home/me/.legion-control/agent/src/index.mjs';
+const OLD_ENTRY = '/home/me/.legion-control/agent/src/index.mjs';
 const LAUNCHER = '/home/me/.legion-control/bin/launcher.mjs';
 
 const D0 = {
@@ -26,7 +27,7 @@ const D0 = {
       id: 'tower', name: 'Tower', site: 'home',
       endpoints: [{ id: 'lan', kind: 'lan', host: 'desk-tower.local', user: 'me', port: 22 }],
       systems: [
-        { id: 'linux', name: 'Linux', platform: 'linux', shell: 'posix', agent: ['/usr/bin/node', ENTRY] },
+        { id: 'linux', name: 'Linux', platform: 'linux', shell: 'posix', agent: ['/usr/bin/node', OLD_ENTRY] },
         { id: 'windows', name: 'Windows 11', platform: 'windows', agent: ['C:\\Program Files\\nodejs\\node.exe', 'C:\\Users\\me\\.legion-control\\bin\\launcher.mjs'] },
       ],
     },
@@ -112,7 +113,7 @@ test('the launcher migration of a held tuple is accepted, and nothing else like 
   refused(await pushOver((document) => { system(document, 'tower', 'linux').agent = ['/usr/local/bin/node', LAUNCHER]; }), ['machines[tower].systems[linux]']);
   refused(await pushOver((document) => { system(document, 'tower', 'linux').agent = ['/usr/bin/node', '/home/other/.legion-control/bin/launcher.mjs']; }), ['machines[tower].systems[linux]']);
   // Back from the launcher to the entry is never a migration.
-  refused(await pushOver((document) => { system(document, 'pi', 'linux').agent = ['node', ENTRY]; }), ['machines[pi].systems[linux]']);
+  refused(await pushOver((document) => { system(document, 'pi', 'linux').agent = ['node', OLD_ENTRY]; }), ['machines[pi].systems[linux]']);
   assert.equal(isLauncherMigration({ agent: ['node', '/a/../b/agent/src/index.mjs'], grammar: 'posix' }, { agent: ['node', '/a/../b/bin/launcher.mjs'], grammar: 'posix' }), false);
 });
 
@@ -198,6 +199,10 @@ test('with nothing held the ordinary rules apply; a copy that cannot be read can
       assert.equal(result.launchChanges, undefined, 'there are no held values to name a change against');
       assert.match(result.error, /cannot read/);
       assert.deepEqual(fs.readFileSync(path.join(home, 'controller.json')), bytes);
+      // The same refusal through the dispatcher, in the contract's shape.
+      const run = cli(['dispatch'], { home, stdin: text(D0), env: { LEGIONCTL_RESTRICTED: '1', SSH_ORIGINAL_COMMAND: `node '${ENTRY.replaceAll("'", "'\\''")}' config set` } });
+      assert.equal(run.payload.reasonCode, 'restricted');
+      assert.deepEqual(checkReply('config-set.schema.json', run.payload, { where: 'restricted config set over an unreadable copy' }), []);
       // An ordinary session may replace it.
       assert.equal(storeController(text(D0)).action, 'stored');
     });
