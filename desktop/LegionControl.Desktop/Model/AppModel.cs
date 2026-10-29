@@ -19,6 +19,8 @@ public sealed class AppModel : IDisposable
     /// The revisions whose launch review a person put off with "Not now" in this run.
     private readonly HashSet<string> _deferredReviews = new(StringComparer.Ordinal);
 
+    /// [readOnly] makes the stores this builds for itself write nothing at all, for a run that
+    /// reads everything and changes nothing on disk, as a smoke run does.
     public AppModel(
         ConfigStore? configStore = null,
         IProcessRunner? runner = null,
@@ -27,16 +29,17 @@ public sealed class AppModel : IDisposable
         INotificationSink? notifications = null,
         Bindings? bindings = null,
         AppUpdateSuggestions? updateSuggestions = null,
-        LaunchApprovals? approvals = null)
+        LaunchApprovals? approvals = null,
+        bool readOnly = false)
     {
         _runner = runner ?? new ProcessRunner();
         Bindings = bindings ?? Bindings.Load();
         // The record before the document: the first read of the setup can already be an edit made
         // on this device, and that edit approves what it changed.
-        Approvals = approvals ?? new LaunchApprovals();
+        Approvals = approvals ?? new LaunchApprovals(readOnly: readOnly);
         if (configStore is null)
         {
-            Config = new ConfigStore(deviceName: Bindings.Device, localEdit: RecordLocalEdit);
+            Config = new ConfigStore(deviceName: Bindings.Device, localEdit: RecordLocalEdit, readOnly: readOnly);
         }
         else
         {
@@ -47,7 +50,7 @@ public sealed class AppModel : IDisposable
         // evaluated against the record, so an upgrade drives what it drove before. Only here: by
         // the time anything evaluates the record again, the document may be one a peer wrote.
         Approvals.SeedIfMissing(Config.Document);
-        Tracker = tracker ?? new OperationTracker();
+        Tracker = tracker ?? new OperationTracker(readOnly: readOnly);
         Settings = settings ?? DesktopSettings.Load();
         Notifications = notifications ?? Model.Notifications.ForThisSystem();
         UpdateSuggestions = updateSuggestions ?? new AppUpdateSuggestions((repo, token) =>

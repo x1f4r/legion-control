@@ -31,13 +31,19 @@ public sealed class LaunchApprovals
     /// Set once the start has had its one chance to seed.
     private bool _started;
 
-    public LaunchApprovals(string? path = null)
+    /// [readOnly] is for a run that changes nothing on disk, as a smoke run does. Every change is
+    /// then made to the record in memory only: a first start's seed is evaluated as the start would
+    /// write it, so the run shows what a start would drive, and nothing is written or locked.
+    public LaunchApprovals(string? path = null, bool readOnly = false)
     {
         Path = path ?? System.IO.Path.Combine(AppPaths.Home, "approved-launch.json");
+        ReadOnly = readOnly;
         lock (Sync) Reload();
     }
 
     public string Path { get; }
+
+    public bool ReadOnly { get; }
 
     /// The record as last read, or null when there is none or it cannot be read.
     public LaunchRecord? Record { get; private set; }
@@ -198,6 +204,15 @@ public sealed class LaunchApprovals
     {
         lock (Sync)
         {
+            if (ReadOnly)
+            {
+                if (change(new OnDisk(Record, IsMissing)) is { } next)
+                {
+                    Record = next;
+                    IsMissing = false;
+                }
+                return null;
+            }
             try
             {
                 Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path) ?? ".");

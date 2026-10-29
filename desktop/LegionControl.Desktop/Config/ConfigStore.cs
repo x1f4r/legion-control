@@ -21,6 +21,8 @@ namespace LegionControl.Desktop.Config;
 public sealed class ConfigStore : IDisposable
 {
     public string Path { get; }
+    /// Whether this store writes nothing at all (see the constructor).
+    public bool ReadOnly { get; }
     /// Where the applied hash is remembered, so a hand edit can be told from this app's own write.
     public string StatePath { get; }
     public SetupLedger Ledger { get; }
@@ -35,14 +37,20 @@ public sealed class ConfigStore : IDisposable
 
     /// [localEdit] is subscribed to [LocalEdit] before the file is first read, because that first
     /// read can already be an edit made on this device: a hand edit made while the app was closed.
+    ///
+    /// [readOnly] is for a run that reads and changes nothing, as a smoke run does: the file is
+    /// applied in memory exactly as it is, an identity it lacks or a hand edit it holds is said
+    /// rather than recorded, and nothing is written, here or in the ledger.
     public ConfigStore(
         string? path = null,
         string? statePath = null,
         SetupLedger? ledger = null,
         string? deviceName = null,
         bool watch = true,
-        Action<byte[]?, ControllerDocument>? localEdit = null)
+        Action<byte[]?, ControllerDocument>? localEdit = null,
+        bool readOnly = false)
     {
+        ReadOnly = readOnly;
         Path = path ?? AppPaths.ConfigFile;
         StatePath = statePath ?? System.IO.Path.Combine(AppPaths.Home, "setup-state.json");
         Ledger = ledger ?? new SetupLedger();
@@ -182,10 +190,21 @@ public sealed class ConfigStore : IDisposable
             return;
         }
 
+        // A run that writes nothing applies the file as it is, and says what the next run that may
+        // write will make of it.
+        string? unrecorded = null;
+        if (ReadOnly && repeated is null)
+        {
+            if (DocumentAcceptance.NeedsIdentity(tree))
+                unrecorded = "The setup file has no controller block yet. The next run that may change something gives it one, as a setup of its own.";
+            else if (IsHandEdit(document))
+                unrecorded = "The setup file was edited by hand since this device applied it. The next run that may change something records the edit as the next revision.";
+        }
+
         // A document that carries no identity of its own becomes a setup here and now, before it is
         // applied or published. Without one, two devices holding the same hand-written file would
         // look like two different setups to every machine they reach.
-        if (repeated is null && DocumentAcceptance.NeedsIdentity(tree))
+        if (!ReadOnly && repeated is null && DocumentAcceptance.NeedsIdentity(tree))
         {
             var assigned = ControllerIdentity.NewSetup(decoded.Identity.Name, DeviceName);
             // A file with no identity becomes a setup of its own, so it is no edit of the one
@@ -212,18 +231,9 @@ public sealed class ConfigStore : IDisposable
         // A file somebody edited by hand carries the identity of the revision it was edited from.
         // That is an edit like any other: it gets the next revision, and the document it came from
         // goes into the lineage so every machine holding that document fast-forwards to this one.
-        //
-        // Two branches edited from the same parent carry the same identity, so a sibling that a
-        // process here adopted looks exactly like a hand edit of the one it replaced, and would
-        // approve every launch value it changed. It is told apart by being kept, which it already
-        // is when the file changes.
-        if (repeated is null
-            && _applied.Hash is { } applied
-            && applied != document.Hash
-            && _applied.MatchesIdentityOf(document.Identity)
-            && !WasAdopted(document))
+        if (!ReadOnly && repeated is null && IsHandEdit(document))
         {
-            var next = document.Identity.Next(applied, DeviceName);
+            var next = document.Identity.Next(_applied.Hash!, DeviceName);
             if (StampIdentity(next, data, "hand-edit", AppliedEditedFrom()) is { } stampProblem)
             {
                 Problem = stampProblem;
@@ -239,18 +249,36 @@ public sealed class ConfigStore : IDisposable
             : $"{acceptance.Sentence} Nothing is published until this is fixed"
               + (acceptance.BrokenMachines.Count > 0 ? ", and a machine it is inside is not reached or run from here." : ".");
         Acceptance = acceptance;
-        Warnings = acceptance.Warnings.Select(warning => warning.Message).ToList();
+        Warnings = acceptance.Warnings.Select(warning => warning.Message)
+            .Concat(unrecorded is null ? Array.Empty<string>() : new[] { unrecorded })
+            .ToList();
         IsPendingEdit = false;
         RawBytes = data;
         var usable = decoded.WithoutMachinesAt(acceptance.BrokenMachines);
         var unchanged = Config == usable && Document?.Hash == document.Hash;
         Document = document;
-        Ledger.Remember(document);
-        RecordApplied(document);
+        if (!ReadOnly)
+        {
+            Ledger.Remember(document);
+            RecordApplied(document);
+        }
         if (unchanged) return;
         Config = usable;
         Changed?.Invoke();
     }
+
+    /// Whether [document] is a hand edit of the one applied here: it carries that one's identity
+    /// and is not it.
+    ///
+    /// Two branches edited from the same parent carry the same identity, so a sibling that a
+    /// process here adopted looks exactly like a hand edit of the one it replaced, and would
+    /// approve every launch value it changed. It is told apart by being kept, which it already is
+    /// when the file changes.
+    private bool IsHandEdit(ControllerDocument document) =>
+        _applied.Hash is { } applied
+        && applied != document.Hash
+        && _applied.MatchesIdentityOf(document.Identity)
+        && !WasAdopted(document);
 
     /// The document a local edit was made to: [Bytes] null when nothing was applied before it.
     private sealed record EditedFrom(byte[]? Bytes);
@@ -389,8 +417,12 @@ public sealed class ConfigStore : IDisposable
         }
     }
 
+    /// Why a read-only store applied nothing.
+    public const string ReadOnlySentence = "This run changes nothing on disk, so nothing was written.";
+
     private string? ApplyCore(ControllerDocument document, string description)
     {
+        if (ReadOnly) return ReadOnlySentence;
         try
         {
             // What is adopted came from a peer, a kept revision or a merge, which contract section
@@ -473,6 +505,7 @@ public sealed class ConfigStore : IDisposable
     /// Writes the example into empty space, and only into empty space.
     public string? WriteExample()
     {
+        if (ReadOnly) return ReadOnlySentence;
         if (File.Exists(Path)) return $"There is already a setup file at {Path}.";
         try
         {

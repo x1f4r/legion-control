@@ -36,12 +36,18 @@ public static class Runner
     };
 
     public static Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output) =>
-        RunAsync(arguments, output, () => new AppModel());
+        RunAsync(arguments, output, readOnly => new AppModel(readOnly: readOnly));
 
     /// The same, with the app [open] makes in place of the one this device's own files make. A
     /// test passes one that drives a runner of its own, so the command line it checks is the one
     /// that ships.
-    public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output, Func<AppModel> open)
+    public static Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output, Func<AppModel> open) =>
+        RunAsync(arguments, output, _ => open());
+
+    /// The same, with [open] told whether the run may change anything on disk. A smoke run may
+    /// not: it reads everything and changes nothing, so a setup with no identity yet is not given
+    /// one, a first start's approvals are not recorded, and no wake hold is released.
+    public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output, Func<bool, AppModel> open)
     {
         if (arguments.Contains("-h")) { WriteUsage(output); return Ok; }
         var command = arguments.Count > 0 && !arguments[0].StartsWith("--", StringComparison.Ordinal)
@@ -71,7 +77,7 @@ public static class Runner
 
         if (command == "version") return Version(output);
         var json = line.Has("json");
-        using var app = open();
+        using var app = open(command == "smoke");
         using var cancellation = new CancellationTokenSource(
             TimeSpan.FromSeconds(line.Number("timeout") ?? 300));
         var token = cancellation.Token;
@@ -116,11 +122,14 @@ public static class Runner
     /// Everything a person setting this up would want to check, in one pass and without changing
     /// anything: the document, this device's own settings, where it thinks it is, and what every
     /// machine answers.
+    ///
+    /// With --json only the report is printed, so whatever reads it reads JSON and nothing else.
     private static async Task<int> SmokeAsync(
-        AppModel app, CommandLine line, TextWriter output, bool json, CancellationToken token)
+        AppModel app, CommandLine line, TextWriter standardOutput, bool json, CancellationToken token)
     {
         var report = new List<object>();
         var worst = Ok;
+        var output = json ? TextWriter.Null : standardOutput;
 
         output.WriteLine($"Legion Control {AgentContract.ClientVersion}, contract {AgentContract.RequiredContract} required");
         output.WriteLine($"Setup document   {app.Config.Path}");
@@ -158,6 +167,7 @@ public static class Runner
         if (machines.Count == 0)
         {
             output.WriteLine(only is null ? "The setup lists no machines." : $"No machine called \"{only}\".");
+            if (json) standardOutput.WriteLine(JsonSerializer.Serialize(report, Indented));
             return Failed;
         }
 
@@ -220,7 +230,7 @@ public static class Runner
             output.WriteLine();
         }
 
-        if (json) output.WriteLine(JsonSerializer.Serialize(report, Indented));
+        if (json) standardOutput.WriteLine(JsonSerializer.Serialize(report, Indented));
         return worst;
     }
 

@@ -109,6 +109,7 @@ public sealed record TrackedOperation
 public sealed class OperationTracker
 {
     private readonly string _path;
+    private readonly bool _readOnly;
     private readonly object _gate = new();
     private readonly Dictionary<string, TrackedOperation> _operations = new(StringComparer.Ordinal);
     /// The file's time and size when this tracker last read or wrote it, and the ids it held then.
@@ -117,9 +118,12 @@ public sealed class OperationTracker
     /// Why the file could not be read when this tracker last tried, or null.
     private string? _unreadable;
 
-    public OperationTracker(string? path = null)
+    /// [readOnly] is for a run that changes nothing on disk, as a smoke run does: changes are made
+    /// to the list in memory, and nothing is written or locked.
+    public OperationTracker(string? path = null, bool readOnly = false)
     {
         _path = path ?? AppPaths.OperationsFile;
+        _readOnly = readOnly;
         ReloadIfChanged();
     }
 
@@ -375,6 +379,7 @@ public sealed class OperationTracker
     /// all, as it was before there was one.
     private FileStream? Lock()
     {
+        if (_readOnly) return null;
         var until = DateTimeOffset.UtcNow.AddSeconds(10);
         while (true)
         {
@@ -480,6 +485,7 @@ public sealed class OperationTracker
 
     private void Save()
     {
+        if (_readOnly) return;
         try
         {
             if (_unreadable is { } why && File.Exists(_path))
