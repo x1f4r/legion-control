@@ -49,3 +49,15 @@ test('build output git ignores is not the checkout, and a clean checkout passes'
   assert.equal(run.status, 0, run.stderr);
   assert.equal(run.stdout, 'Syntax checked 1 JavaScript files.\n');
 });
+
+test('outside a git checkout the check says why in one line, not in a stack trace', (t) => {
+  // A source archive has no .git, and git is kept from finding one further up.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'legion-syntax-archive-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'index.mjs'), 'export default 1;\n');
+  const run = spawnSync(process.execPath, [script, root], { encoding: 'utf8', env: { ...process.env, GIT_CEILING_DIRECTORIES: path.dirname(root), LC_ALL: 'C' } });
+  assert.equal(run.status, 2);
+  assert.equal(run.stdout, '');
+  assert.match(run.stderr, /^git could not list the files of .+: fatal: not a git repository/);
+  assert.equal(run.stderr.trim().split('\n').length, 1, run.stderr);
+});

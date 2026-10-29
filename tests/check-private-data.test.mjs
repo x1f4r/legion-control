@@ -189,3 +189,15 @@ test('what git ignores and what is binary is not read, and a clean checkout pass
   assert.match(result.stdout, /\nChecked 3 files: no private home directories, addresses or terms\.\n$/);
   assert.equal(fs.existsSync(path.join(tree, 'build', 'output.txt')), true);
 });
+
+test('outside a git checkout the check says why in one line, as the syntax check does', (t) => {
+  // A source archive has no .git, and git is kept from finding one further up.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'legion-private-archive-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'README.md'), 'clean\n');
+  const run = spawnSync(process.execPath, [script, root], { encoding: 'utf8', env: { ...process.env, LEGION_PRIVATE_TERMS: '', HOME: root, USERPROFILE: root, GIT_CEILING_DIRECTORIES: path.dirname(root), LC_ALL: 'C' } });
+  assert.equal(run.status, 2);
+  assert.equal(run.stdout, '');
+  assert.match(run.stderr, /^git could not list the files of .+: fatal: not a git repository/);
+  assert.equal(run.stderr.trim().split('\n').length, 1, run.stderr);
+});

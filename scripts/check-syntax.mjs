@@ -49,7 +49,15 @@ export async function checkSyntax(root = repository) {
 // runs the check and the gate passes having looked at nothing.
 const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
 if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
-  const result = await checkSyntax(path.resolve(process.argv[2] ?? repository));
+  // Outside a git checkout, a source archive for one, there is no list of files to read. That is
+  // said in a line, as check-private-data.mjs says it, rather than in a stack trace.
+  let result;
+  try {
+    result = await checkSyntax(path.resolve(process.argv[2] ?? repository));
+  } catch (error) {
+    console.error(error.message);
+    process.exit(2);
+  }
   for (const { file, message } of result.problems) console.error(`${file} does not parse:\n${message}\n`);
   if (result.problems.length) {
     console.error(`${result.problems.length} of ${result.files} JavaScript files do not parse.`);
