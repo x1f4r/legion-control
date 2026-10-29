@@ -609,6 +609,35 @@ test('an installer whose agent was killed holds recovery and every update until 
   });
 });
 
+test('a run the ledger would not record once it had started is unknown, not refused', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home);
+    writeConfig(home, fixtureConfig(dir, { actions: [{ id: 'say', command: call(dir, 'action') }] }));
+    // The ledger takes the entry and then not its process id: the disk has
+    // filled in between. The action was running by then and is stopped.
+    const stand = path.join(home, 'ledger-fills-up.mjs');
+    fs.writeFileSync(stand, [
+      "import fs from 'node:fs';",
+      'const rename = fs.renameSync;',
+      'let writes = 0;',
+      'fs.renameSync = (from, to) => {',
+      "  if (String(to).endsWith('unsettled.json') && (writes += 1) === 2) throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });",
+      '  return rename.call(fs, from, to);',
+      '};',
+      '',
+    ].join('\n'));
+    const id = 'ledger-full-run-0001';
+    const stopped = invoke(home, ['run', 'say', '--op', id], { nodeArgs: ['--import', pathToFileURL(stand).href] });
+    assert.equal(stopped.action, 'failed');
+    assert.equal(stopped.reasonCode, 'internal');
+    assert.match(stopped.message, /stopped as it started, because the command ledger would not record it/);
+    assert.equal(stopped.outcome, 'unknown', 'it ran for a moment, so it is never sent again as if it had not');
+    assert.equal(stopped.op.outcome, 'unknown');
+    assert.deepEqual(ledger(home), []);
+    assert.equal(invoke(home, ['run', 'say']).action, 'ran');
+  });
+});
+
 test('boot and sleep conform without ever rebooting or suspending anything', async () => {
   await withHome(async (home) => {
     const marker = path.join(home, 'reboot-requested');

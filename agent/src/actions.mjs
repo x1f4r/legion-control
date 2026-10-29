@@ -242,6 +242,23 @@ export async function runAction(config, id, options = {}) {
           message,
         };
       }
+      if (run.terminated !== null) {
+        // Stopped as it started, by a runner whose ledger would not record
+        // it. It ran for that moment, so what it did is as unknown as for a
+        // deadline, and no client may send it again.
+        const message = `${action.name} was not let run: ${run.error}; what it did before it was stopped is unknown`;
+        log(message, 'run');
+        return {
+          ok: false,
+          action: 'failed',
+          reasonCode: REASON.internal,
+          id: action.id,
+          exitCode: null,
+          output,
+          message,
+          outcome: 'unknown',
+        };
+      }
       if (!run.ok) {
         const message = `${action.name} exited ${run.code ?? 'without a code'}`;
         log(message, 'run');

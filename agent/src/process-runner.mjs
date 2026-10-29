@@ -436,10 +436,14 @@ function notStarted(command, error, extra = {}) {
  * Run one command that changes the machine, and answer once it has ended.
  *
  * The result has runCommand's shape, plus `terminated`: null when the command
- * ended by itself, true when its deadline stopped it and the whole tree was seen
- * gone, false when that could not be seen. A command refused because an earlier
- * one may still be running was never started, and says so with `refused` and the
- * `conflict` naming that earlier command's operation.
+ * ended by itself, true when the runner stopped it and the whole tree was seen
+ * gone, false when that could not be seen. The runner stops a command at its
+ * deadline, `timedOut`, and once in a while as it starts, when the ledger took
+ * the entry and would not take its process id; either way it ran for a while,
+ * and what it did in that while is unknown. A command refused because an
+ * earlier one may still be running, or because the ledger would not take it at
+ * all, was never started, and says so with `refused` and the `conflict` naming
+ * that earlier command's operation.
  *
  * `graceMs` and `settleMs` are how long a timed-out tree gets after SIGTERM, and
  * after it is killed outright, before the runner stops waiting for it.
@@ -582,7 +586,9 @@ function supervise(file, args, options, entry) {
     });
 
     // Stop the whole tree, and answer only once it is seen gone or the wait
-    // for that has run out. `reason` is set when the deadline is not why.
+    // for that has run out. `reason` is set when the deadline is not why. The
+    // command was running either way, so it is never `refused`: that tells a
+    // caller nothing happened, and here something may have.
     const stopAll = async (reason = null) => {
       stopping = true;
       clearTimeout(timer);
@@ -596,10 +602,11 @@ function supervise(file, args, options, entry) {
         signal: exit?.signal ?? null,
         timedOut: reason === null,
         terminated: gone,
-        error: reason ?? (gone
-          ? `${command} did not finish within ${duration(timeoutMs)} and was stopped`
-          : `${command} did not finish within ${duration(timeoutMs)} and could not be confirmed stopped`),
-        ...(reason ? { refused: true, conflict: null } : {}),
+        error: reason
+          ? `${reason}${gone ? '' : ', and could not be confirmed stopped'}`
+          : gone
+            ? `${command} did not finish within ${duration(timeoutMs)} and was stopped`
+            : `${command} did not finish within ${duration(timeoutMs)} and could not be confirmed stopped`,
       };
       if (gone) {
         finish(result);
@@ -618,7 +625,7 @@ function supervise(file, args, options, entry) {
     if (!recorded.ok) {
       // The ledger took the entry a moment ago and would not take its pid. A
       // command nobody could find again after a crash may not go on.
-      stopAll('stopped as it started, because the command ledger would not record it');
+      stopAll(`${command} was stopped as it started, because the command ledger would not record it`);
       return;
     }
     timer = setTimeout(() => { stopAll(); }, timeoutMs);

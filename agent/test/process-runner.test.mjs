@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { describeFailure } from '../src/config.mjs';
 import { producedOutcome } from '../src/contract.mjs';
 import { withOperation } from '../src/operate.mjs';
 import { beginOperation, bootIdentity, readOperation, updateOperation, wireRecord } from '../src/operations.mjs';
@@ -388,5 +389,33 @@ test('output is read in full when the command exits, and bounded', async () => {
     assert.equal(result.stdout, 'abc');
     assert.equal(result.stderr, 'ghi');
     assert.equal(result.timedOut, false);
+  });
+});
+
+test('a command the ledger would not record once it had started is stopped, and was not refused', async () => {
+  await withHome(async (home) => {
+    // The entry went in, and the write that adds its process id did not. The
+    // command ran for that moment, so it is a failure whose effect nobody
+    // knows, never the "not started" a refusal tells its caller.
+    const marker = path.join(home, 'started');
+    const rename = fs.renameSync;
+    let writes = 0;
+    fs.renameSync = (from, to) => {
+      if (to === ledgerPath() && (writes += 1) === 2) throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+      return rename.call(fs, from, to);
+    };
+    let result;
+    try {
+      result = await run(node(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran'); setInterval(() => {}, 1000)`), { timeoutMs: 10000, graceMs: 1000 });
+    } finally {
+      fs.renameSync = rename;
+    }
+    assert.equal(result.ok, false);
+    assert.equal(result.refused, undefined);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.terminated, true, result.error);
+    assert.match(result.error, /^node was stopped as it started, because the command ledger would not record it$/);
+    assert.equal(describeFailure(result), result.error);
+    assert.deepEqual(ledger(), [], 'stopped and seen gone, so nothing is held');
   });
 });

@@ -1942,6 +1942,9 @@ export function describeFailure(result) {
   if (result.refused) return `${result.command} was ${result.error}`;
   if (result.timedOut && result.terminated === false) return `${result.command} timed out and could not be confirmed stopped`;
   if (result.timedOut) return `${result.command} timed out`;
+  // Stopped by the mutation runner for a reason other than its deadline, which
+  // its message gives, along with the command's name.
+  if (typeof result.terminated === 'boolean') return result.error;
   const output = (result.stderr || result.stdout || '').trim().split('\n').slice(0, 3).join(' ');
   const reason = output || result.error || '';
   const code = result.code === null || result.code === undefined ? 'no exit code' : `exit ${result.code}`;
