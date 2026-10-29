@@ -78,6 +78,7 @@ import { serviceState } from './state.mjs';
 import { checkBundle, resolveBootstrapLayout, runBootstrapInstall, runRollback, runSelfUpdate } from './selfupdate.mjs';
 import { runRestart, runUpdate } from './update.mjs';
 import { authorize, isRestrictedSession, parseCommandLine } from './dispatch.mjs';
+import { PATH_OPTIONS, parseArgs } from './args.mjs';
 
 /**
  * The command table. `flags` stand alone, `options` take a value, `positional`
@@ -140,23 +141,6 @@ const COMMANDS = {
   help: { flags: [], options: [], mutates: false, summary: 'print this list' },
 };
 
-const VALUE_OPTIONS = new Set([
-  'service',
-  'op',
-  'expires',
-  'budget-ms',
-  'wait',
-  'limit',
-  'kind',
-  'lines',
-  'controller-id',
-  'revision',
-  'from',
-]);
-
-/** Options whose value is a path and therefore not held to the token grammar. */
-const PATH_OPTIONS = new Set(['from']);
-
 /**
  * Write the one reply. A restricted key reads it redacted (contract section
  * 13): the configured values of config.json and its last good copy are
@@ -192,38 +176,6 @@ function emit(payload, exitCode) {
   }
   process.stdout.write(`${JSON.stringify(reply)}\n`);
   process.exitCode = code;
-}
-
-function parseArgs(argv) {
-  const flags = new Set();
-  const options = new Map();
-  const positional = [];
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === '-h' || arg === '--help') {
-      flags.add('help');
-      continue;
-    }
-    if (!arg.startsWith('--')) {
-      positional.push(arg);
-      continue;
-    }
-    const body = arg.slice(2);
-    const equals = body.indexOf('=');
-    if (equals !== -1) {
-      options.set(body.slice(0, equals), body.slice(equals + 1));
-      continue;
-    }
-    if (VALUE_OPTIONS.has(body)) {
-      // The value is the next argument, consumed here so it cannot be mistaken
-      // for the command's own positional argument.
-      options.set(body, argv[index + 1] ?? '');
-      index += 1;
-      continue;
-    }
-    flags.add(body);
-  }
-  return { flags, options, positional };
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,7 +1344,7 @@ async function commandVersion(flags, loaded) {
     // still in place — which is why self-update runs it on the staged tree
     // before swapping anything.
     const modules = [
-      'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'boot.mjs', 'config.mjs', 'contract.mjs', 'controller.mjs',
+      'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'args.mjs', 'boot.mjs', 'config.mjs', 'contract.mjs', 'controller.mjs',
       'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'launch.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
       'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
       'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs',

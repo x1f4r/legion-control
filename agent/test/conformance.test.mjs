@@ -663,7 +663,8 @@ test('self-update conforms for a bad bundle, an empty rollback and restricted sh
     assert.equal(floored(invoke(home, ['self-update', '--rollback'])).outcome, 'failed');
     assert.equal(floored(invoke(home, ['self-update', '--rollback', '--allow-downgrade'])).reasonCode, 'not-configured');
     assert.equal(invoke(home, ['self-update', '--from', junk], { restricted: true }).outcome, 'failed');
-    invoke(home, ['self-update', '--check', '--stdin', '--install=1'], { restricted: true, stdin: 'not a bundle' });
+    // The dispatcher reads the shape with the CLI's own parser (T10).
+    assert.equal(invoke(home, ['self-update', '--check', '--stdin', '--install=1'], { restricted: true, stdin: 'not a bundle' }).reasonCode, 'restricted');
     assert.equal(invoke(home, ['self-update', '--rollback', '--allow-downgrade'], { restricted: true }).reasonCode, 'restricted');
     assert.equal(invoke(home, ['self-update', '--rollback', '--allow-downgrade'], { env: { LEGIONCTL_RESTRICTED: '1' } }).reasonCode, 'restricted');
   });

@@ -132,6 +132,41 @@ test('a restricted key may upload a bundle but may not run one from a path', () 
   assert.match(install.message, /tree this session provided/);
 });
 
+test('the shape of a restricted command is judged on the argv the agent will parse', () => {
+  // Each of these is --install, --from or --allow-downgrade to the CLI's parser,
+  // whatever its spelling, so each is refused before the agent runs it.
+  for (const shape of [
+    'self-update --check --stdin --install=1',
+    'self-update --stdin --install=',
+    'self-update --check --from=bundle.tgz',
+    'self-update --rollback --allow-downgrade=yes',
+    'self-update --stdin --install',
+  ]) {
+    const refused = authorize(`${NODE} ${ENTRY} ${shape}`);
+    assert.equal(refused.ok, false, shape);
+    assert.equal(refused.reasonCode, 'restricted', shape);
+  }
+  // A value an option consumes is not a flag: here --op takes "--install" as its
+  // id, which the CLI then refuses as a bad id rather than as an install.
+  assert.equal(authorize(`${NODE} ${ENTRY} self-update --stdin --op --install`).ok, true);
+  assert.equal(authorize(`${NODE} ${ENTRY} self-update --op 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3 --stdin`).ok, true);
+  // Asking for none of the three shapes a restricted key has is refused too.
+  assert.equal(authorize(`${NODE} ${ENTRY} self-update --op 6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3`).reasonCode, 'restricted');
+});
+
+test('a restricted --install=1 never reaches the agent', async () => {
+  await withHome(async (home) => {
+    const run = cli(['dispatch'], {
+      home,
+      stdin: 'not a bundle',
+      env: { LEGIONCTL_RESTRICTED: '1', SSH_ORIGINAL_COMMAND: `node ${ENTRY} self-update --check --stdin --install=1` },
+    });
+    assert.equal(run.payload.reasonCode, 'restricted');
+    assert.match(run.payload.message, /tree this session provided/);
+    assert.equal(run.payload.outcome, undefined, 'a check changes nothing, refused or not');
+  });
+});
+
 test('a restricted key may not ask to go below the installed agent or the version floor', () => {
   for (const flag of ['--allow-downgrade', '--allow-downgrade=1']) {
     for (const mode of ['--stdin', '--rollback', '--check']) {

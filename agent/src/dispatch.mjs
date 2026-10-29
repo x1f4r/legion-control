@@ -38,6 +38,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { parseArgs } from './args.mjs';
 import { REASON, TOKEN_PATTERN } from './contract.mjs';
 
 export const MAX_COMMAND_BYTES = 16 * 1024;
@@ -181,20 +182,23 @@ export const RESTRICTED_COMMANDS = new Set([
   'help',
 ]);
 
-/** What a restricted session may never do, whatever the flags say. */
-function refuseRestrictedShape(command, rest) {
+/**
+ * What a restricted session may never do, whatever the flags say.
+ *
+ * `parsed` is the argv after the command, read by the CLI's own parser, so
+ * this judges exactly what the CLI will act on: `--install`, `--install=1`
+ * and `--install=` are all the same request to it, and so they are here.
+ */
+function refuseRestrictedShape(command, parsed) {
+  const has = (name) => parsed.flags.has(name) || parsed.options.has(name);
   if (command === 'dispatch') return 'dispatch cannot dispatch itself';
   if (command === 'self-update') {
-    if (rest.includes('--install')) return 'self-update --install runs a tree this session provided, so it is not available to a restricted key';
-    if (rest.some((token) => token === '--from' || token.startsWith('--from='))) {
-      return 'self-update --from runs a tree from a path this session chose; a restricted key uploads with --stdin instead';
-    }
-    if (rest.some((token) => token === '--allow-downgrade' || token.startsWith('--allow-downgrade='))) {
+    if (has('install')) return 'self-update --install runs a tree this session provided, so it is not available to a restricted key';
+    if (has('from')) return 'self-update --from runs a tree from a path this session chose; a restricted key uploads with --stdin instead';
+    if (has('allow-downgrade')) {
       return 'self-update --allow-downgrade takes the agent below the installed one or the version floor, which only an unrestricted session may decide';
     }
-    if (!rest.includes('--stdin') && !rest.includes('--check') && !rest.includes('--rollback')) {
-      return 'self-update from a restricted key needs --stdin, --check or --rollback';
-    }
+    if (!has('stdin') && !has('check') && !has('rollback')) return 'self-update from a restricted key needs --stdin, --check or --rollback';
   }
   return null;
 }
@@ -285,8 +289,7 @@ export function authorize(commandLine, { entry = ownEntry() } = {}) {
     );
   }
 
-  const rest = tokens.slice(3);
-  const shapeProblem = refuseRestrictedShape(command, rest);
+  const shapeProblem = refuseRestrictedShape(command, parseArgs(tokens.slice(3)));
   if (shapeProblem) return refuse(shapeProblem, command);
 
   return { ok: true, argv: tokens.slice(2), command, reasonCode: null, message: null };
