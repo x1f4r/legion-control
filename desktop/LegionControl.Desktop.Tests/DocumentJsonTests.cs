@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Numerics;
 using System.Text;
 using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
@@ -133,6 +135,30 @@ public class DocumentJsonTests
         Assert.Equal(text, DocumentJson.Print(DocumentJson.Parse(text)));
         Assert.True(JsonEquality.Equal(new DocumentNumber("22.0"), new DocumentNumber("2.2e1")));
         Assert.False(JsonEquality.Equal(new DocumentNumber("0.1"), new DocumentNumber("0.10000000000000001")));
+    }
+
+    [Fact]
+    public void ComparesNumbersAlikeWhateverACultureWritesAMinusSignAs()
+    {
+        // Some cultures write the minus sign U+2212, some with a bidirectional mark in front. A
+        // parse in the culture of the person's desktop took the `-` of 1e-5 for no sign at all and
+        // threw in the middle of a merge.
+        var before = CultureInfo.CurrentCulture;
+        var culture = (CultureInfo)CultureInfo.InvariantCulture.Clone();
+        culture.NumberFormat.NegativeSign = "\u200F\u2212";
+        CultureInfo.CurrentCulture = culture;
+        try
+        {
+            Assert.Equal("1e-5", JsonEquality.DecimalKey("0.00001"));
+            Assert.True(JsonEquality.Equal(new DocumentNumber("1e-5"), new DocumentNumber("0.00001")));
+            Assert.Equal(new BigInteger(-25), JsonEquality.Integer("-2.5e1"));
+            Assert.Null(JsonEquality.Integer("25e-1"));
+            Assert.Equal(8, LanPrefix.Parse("10.0.0.0/8")?.Length);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = before;
+        }
     }
 
     [Fact]

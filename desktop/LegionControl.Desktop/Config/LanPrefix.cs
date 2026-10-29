@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace LegionControl.Desktop.Config;
@@ -40,7 +41,7 @@ public readonly record struct LanPrefix(uint Network, int Length, bool Dotted)
         {
             var lengthText = text[(slash + 1)..];
             if (ParseIPv4(text[..slash]) is not { } network || !CidrLength.IsMatch(lengthText)) return null;
-            var length = int.Parse(lengthText);
+            var length = int.Parse(lengthText, CultureInfo.InvariantCulture);
             if ((network & ~MaskOf(length)) != 0) return null;
             return new LanPrefix(network, length, Dotted: false);
         }
@@ -70,7 +71,7 @@ public readonly record struct LanPrefix(uint Network, int Length, bool Dotted)
     private static uint? OctetOf(string text)
     {
         if (!Octet.IsMatch(text)) return null;
-        var value = uint.Parse(text);
+        var value = uint.Parse(text, CultureInfo.InvariantCulture);
         return value <= 255 ? value : null;
     }
 }

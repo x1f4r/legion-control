@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Numerics;
 using System.Text.RegularExpressions;
 
@@ -50,12 +51,12 @@ public static class JsonEquality
         var sign = match.Groups[1].Value;
         var whole = match.Groups[2].Value;
         var fraction = match.Groups[3].Value;
-        var exponent = match.Groups[4].Success ? BigInteger.Parse(match.Groups[4].Value) : BigInteger.Zero;
+        var exponent = match.Groups[4].Success ? Whole(match.Groups[4].Value) : BigInteger.Zero;
         var digits = (whole + fraction).TrimStart('0');
         if (digits.Length == 0) return "0";
         var significant = digits.TrimEnd('0');
         var scale = exponent - fraction.Length + (digits.Length - significant.Length);
-        return $"{sign}{significant}e{scale}";
+        return $"{sign}{significant}e{scale.ToString(CultureInfo.InvariantCulture)}";
     }
 
     /// The whole number a lexeme spells exactly, or null when it spells a fraction.
@@ -64,8 +65,13 @@ public static class JsonEquality
         var key = DecimalKey(lexeme);
         if (key == "0") return BigInteger.Zero;
         var at = key.IndexOf('e');
-        var scale = BigInteger.Parse(key[(at + 1)..]);
+        var scale = Whole(key[(at + 1)..]);
         if (scale < 0) return null;
-        return BigInteger.Parse(key[..at]) * BigInteger.Pow(10, (int)scale);
+        return Whole(key[..at]) * BigInteger.Pow(10, (int)scale);
     }
+
+    /// Digits with an ASCII sign, as JSON writes them, whatever the culture says a minus sign
+    /// looks like: some write it U+2212, some with a bidirectional mark in front.
+    private static BigInteger Whole(string digits) =>
+        BigInteger.Parse(digits, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture);
 }
