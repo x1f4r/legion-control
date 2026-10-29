@@ -39,6 +39,7 @@ import {
   newOperationId,
   pruneOperations,
   pendingPowerOperation,
+  readOperation,
   recordPhase,
   recoverOperations,
   servicesNeedingRecovery,
@@ -70,30 +71,33 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
   const cleared = clearStaleLocks(lockFiles);
   const restored = [];
   const pending = listOperations({ recoveryPending: true, limit: 200 });
-  const completed = (service) => {
-    for (const record of pending.filter((entry) => entry.service === service)) updateOperation(record.id, { recoveryPending: false });
+  const completed = (owing) => {
+    for (const record of owing) updateOperation(record.id, { recoveryPending: false });
   };
-  // How an obligation ended, or why it stays, is written on the record that
+  // How an obligation ended, or why it stays, is written on every record that
   // owed it, so `op ID` answers the question a cycle cannot: what recovery did
   // about that run, or what is still wrong and what it is waiting for. A
-  // reason to wait is written once, and again only when it changes.
-  const settled = (record, service, action, message) => {
+  // reason to wait is written once, and again only when it changes. `record`
+  // is the run the answer is about.
+  const settled = (owing, record, service, action, message) => {
     restored.push({ service: service.id, action, settled: true, message, opId: record.id, phase: record.phase ?? null });
     log(message, 'recover');
-    appendLog(record.id, `recovered: ${message}`);
-    completed(service.id);
+    for (const entry of owing) appendLog(entry.id, `recovered: ${message}`);
+    completed(owing);
   };
-  const owed = (record, service, action, message, reasonCode = null) => {
+  const owed = (owing, record, service, action, message, reasonCode = null) => {
     restored.push({ service: service.id, action, settled: false, reasonCode, message, opId: record.id, phase: record.phase ?? null });
     log(message, 'recover');
     const line = `recovery is still owed: ${message}`;
-    if (record.log?.at(-1)?.line !== line) appendLog(record.id, line);
+    for (const entry of owing) {
+      if (readOperation(entry.id)?.log?.at(-1)?.line !== line) appendLog(entry.id, line);
+    }
   };
 
-  for (const record of servicesNeedingRecovery(pending)) {
-    const service = config.services.find((entry) => entry.id === record.service);
+  for (const { service: id, records: owing } of servicesNeedingRecovery(pending)) {
+    const service = config.services.find((entry) => entry.id === id);
     if (!service) {
-      completed(record.service);
+      completed(owing);
       continue;
     }
     // Only a positive reading settles anything (contract section 5.5). The stop
@@ -102,39 +106,29 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
     // service an interrupted update had stopped stayed off for good.
     const evidence = processEvidence(service);
     if (evidence.state === 'unknown') {
-      owed(record, service, 'unknown', `${service.name} was neither started nor taken for running, because nothing can tell whether it is: ${evidence.error}`);
+      owed(owing, owing[0], service, 'unknown', `${service.name} was neither started nor taken for running, because nothing can tell whether it is: ${evidence.error}`);
       continue;
     }
-    const rollback = rollbackOwed(service, record);
-    if (evidence.state === 'running' && !rollback) {
-      settled(record, service, 'already-running', `${service.name} was already running after an interrupted ${record.kind} (${record.phase})`);
+    const rollback = rollbackOwed(service, owing);
+    const record = rollback.record ?? owing[0];
+    if (evidence.state === 'running' && rollback.state !== 'owed') {
+      settled(owing, record, service, 'already-running', `${service.name} was already running after an interrupted ${record.kind} (${record.phase})${unrolled(rollback)}`);
       continue;
     }
     // The cycle owns the machine mutex, but the external watchdog understands
     // only this service lock. Recovery must obey it just like an update does.
     const serviceLock = acquireServiceLock(service.lockFile, 'recovery');
     if (!serviceLock.ok) {
-      owed(record, service, 'conflict', `${service.name} was not put back: ${serviceLock.message}`, serviceLock.reasonCode);
+      owed(owing, record, service, 'conflict', `${service.name} was not put back: ${serviceLock.message}`, serviceLock.reasonCode);
       continue;
     }
     try {
       ensureServiceStateWritable(service);
-      if (rollback) {
-        const rolled = await rollBackInterrupted(config, service, record, rollback, { running: evidence.state === 'running' });
-        if (rolled.settled) settled(record, service, rolled.action, rolled.message);
-        else owed(record, service, rolled.action, rolled.message, rolled.reasonCode);
-      } else {
-        note(`${service.name} was left stopped by an interrupted ${record.kind}; starting it`, 'recover');
-        await startAndSettle(service);
-        const health = await waitForServiceHealth(service, 60000);
-        if (health.ok) {
-          settled(record, service, 'started', `${service.name} was restarted after an interrupted ${record.kind} (${record.phase})`);
-        } else {
-          owed(record, service, 'start-failed', `${service.name} could not be restarted after an interrupted ${record.kind} (${record.phase}): ${describeHealth(health)}`);
-        }
-      }
+      const ending = await putBack(config, service, owing, { evidence, rollback });
+      if (ending.settled) settled(owing, ending.record, service, ending.action, ending.message);
+      else owed(owing, ending.record, service, ending.action, ending.message, ending.reasonCode ?? null);
     } catch (error) {
-      owed(record, service, 'start-failed', `${service.name} could not be put back: ${error?.message ?? String(error)}`, REASON.internal);
+      owed(owing, record, service, 'start-failed', `${service.name} could not be put back: ${error?.message ?? String(error)}`, REASON.internal);
     } finally {
       serviceLock.release();
     }
@@ -147,6 +141,37 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
     restored,
     pruned: pruned.removed.length,
   };
+}
+
+/** Why nothing was rolled back, where the version could not say whether anything was owed. */
+function unrolled(rollback) {
+  return rollback.state === 'unknown' ? `; nothing was rolled back, because ${rollback.error}` : '';
+}
+
+/**
+ * Put one service back, with its lock held: roll it back where its version
+ * says an interrupted update left it half installed, and otherwise start it.
+ * Returns how that ended, { settled, record, action, reasonCode, message },
+ * for recoverMachine to note on the records that owed it.
+ */
+async function putBack(config, service, owing, { evidence, rollback }) {
+  if (rollback.state === 'owed') {
+    return { record: rollback.record, ...(await rollBackInterrupted(config, service, rollback, { running: evidence.state === 'running' })) };
+  }
+
+  const record = rollback.record ?? owing[0];
+  const after = `after an interrupted ${record.kind} (${record.phase})`;
+  note(`${service.name} was left stopped by an interrupted ${record.kind}; starting it`, 'recover');
+  await startAndSettle(service);
+  const health = await waitForServiceHealth(service, 60000);
+  if (!health.ok) return { settled: false, record, action: 'start-failed', message: `${service.name} could not be restarted ${after}: ${describeHealth(health)}` };
+
+  // A version command can need the service it asks about, so a version that
+  // could not be read with the service down is read again now that it is up.
+  // What that reading owes goes through the gate any running service gets.
+  const again = rollback.state === 'unknown' ? rollbackOwed(service, owing) : rollback;
+  if (again.state !== 'owed') return { settled: true, record, action: 'started', message: `${service.name} was restarted ${after}${unrolled(again)}` };
+  return { record: again.record, ...(await rollBackInterrupted(config, service, again, { running: true })) };
 }
 
 /** Run one queued request now, reusing the cycle's lock and the record's own id. */

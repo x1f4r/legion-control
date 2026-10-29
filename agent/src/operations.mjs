@@ -920,21 +920,24 @@ export function deriveState(record, { systemId = null, bootId = bootIdentity(), 
 }
 
 /**
- * Services an interrupted operation may have left stopped, with the phase it
- * reached, so the caller can decide what putting them back means. One record
- * per service: of several still owed, the oldest, whose `from` is the last
- * version known to have worked. `records` come newest first, as every listing
- * does.
+ * Services an interrupted operation may have left stopped, each with every
+ * record that still owes it something, oldest first and with the phase each
+ * reached, so the caller can decide what putting it back means. All of them,
+ * not one: a restart interrupted before an update that was killed part way
+ * through its install owes the service a start, the update owes it a look at
+ * the version, and settling the first must not quietly settle the second.
+ * `records` come newest first, as every listing does.
  */
 export function servicesNeedingRecovery(records) {
   const needing = new Map();
-  for (const record of records) {
+  for (const record of [...records].reverse()) {
     if (!record.service) continue;
     const phase = record.phase ?? '';
     if (!DISRUPTED_PHASES.has(phase)) continue;
-    needing.set(record.service, record);
+    if (!needing.has(record.service)) needing.set(record.service, []);
+    needing.get(record.service).push(record);
   }
-  return [...needing.values()];
+  return [...needing].map(([service, owing]) => ({ service, records: owing }));
 }
 
 // ---------------------------------------------------------------------------

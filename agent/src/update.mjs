@@ -959,41 +959,94 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Whether an update of the same service asked for after this one has since
+ * The phases in which an interrupted update may have changed what is
+ * installed. One that died in `stopping` never reached its install, so the
+ * version on disk is still the one the service was running, whatever a
+ * version command says about it now, and rolling it back would be a
+ * disruptive step taken for nothing.
+ */
+const INSTALL_BEGUN = new Set(['installing', 'verifying', 'starting', 'rolling-back']);
+
+/**
+ * Whether an update of the same service that started after this one has since
  * finished and settled its version: installed and verified it, rolled back, or
  * found it already on its target. What is installed is then that run's doing,
  * and rolling it back to the version an older run started from would undo it.
+ * Started after, not asked for after: an update queued before this one was
+ * asked for can be taken up once it is over.
  */
 function versionSettledSince(record) {
+  const since = String(record.startedAt ?? record.requestedAt ?? '');
   return listOperations({ service: record.service, kind: 'update', state: 'finished', limit: 200 }).some(
     (later) =>
       later.id !== record.id &&
-      String(later.requestedAt ?? '') > String(record.requestedAt ?? '') &&
+      String(later.startedAt ?? later.requestedAt ?? '') > since &&
       (['updated', 'rolled-back'].includes(later.result?.action) || later.result?.reasonCode === REASON.alreadyOnTarget),
   );
 }
 
 /**
- * The rollback an interrupted update still owes, or null when it owes none
- * (contract section 5.5): only when the version installed now is neither the
- * one it started from nor the one it was going to. A run that noted no `from`,
- * because nothing was installed before it or because an agent before 3.1.0
- * wrote its record, has nothing known to go back to, and an app keeps no
- * previous build to restore. A version that cannot be read now is neither: a
- * half-written install is exactly what reads that way.
+ * What is installed now, or null with the reason it cannot be read. For npm a
+ * package.json that is missing or unparseable is a reading, not a failure to
+ * read: it is exactly what an install that took the old tree away and never
+ * wrote the new one leaves behind.
  */
-export function rollbackOwed(service, record) {
-  if (record.kind !== 'update' || (service.kind !== 'npm' && service.kind !== 'command')) return null;
-  const from = record.from ?? null;
-  const to = record.to ?? null;
-  if (from === null) return null;
-  const installed =
-    service.kind === 'npm'
-      ? npmProvider.installedVersionAt(service, record.npmPrefix ?? npmProvider.resolveNpmPrefix(service))
-      : commandProvider.installedVersion(service);
-  if (installed === from || (to !== null && installed === to)) return null;
-  if (versionSettledSince(record)) return null;
-  return { from, to, installed };
+function installedNow(service, record) {
+  if (service.kind === 'npm') {
+    return { version: npmProvider.installedVersionAt(service, record.npmPrefix ?? npmProvider.resolveNpmPrefix(service)), error: null };
+  }
+  return commandProvider.readInstalledVersion(service);
+}
+
+/**
+ * What the version of a service owes the updates an interruption left behind
+ * (contract section 5.5), judged from every record still owing it, oldest
+ * first. Like a process reading, it is one of three states:
+ *
+ *   none     nothing is to be rolled back;
+ *   owed     the version installed is neither the `from` of the run that
+ *            decides nor a version it or a later run was going to, so it goes
+ *            back to that `from`;
+ *   unknown  nothing can say, with `error` saying why, and nothing is rolled
+ *            back on it.
+ *
+ * Only runs that reached their install count. The one that decides is the
+ * oldest of them that noted a `from` and that no later update has settled,
+ * because its `from` is the last version known to be whole. A later run's own
+ * `from` is only what it found on disk, which can be the very half-written
+ * install this is looking for, so it never counts as whole; a `to` is where
+ * an install lands when it finishes. A run that noted no `from`, because
+ * nothing was installed before it or because an agent before 3.1.0 wrote its
+ * record, has nothing known to go back to, and an app keeps no previous build
+ * to restore.
+ *
+ * A version that cannot be read is unknown, never neither. npm's own reading
+ * cannot fail that way, but a version command can, timing out or needing the
+ * service up to answer, and a rollback is too disruptive to take on that. So
+ * is a version other than `from` after an update that named none it was going
+ * to, as one confirmed by `verify` alone does: that is as likely to be the
+ * finished install as a half-done one.
+ */
+export function rollbackOwed(service, records) {
+  if (service.kind !== 'npm' && service.kind !== 'command') return { state: 'none' };
+  const installs = records.filter((record) => record.kind === 'update' && INSTALL_BEGUN.has(record.phase));
+  const first = installs.findIndex((record) => (record.from ?? null) !== null && !versionSettledSince(record));
+  if (first === -1) return { state: 'none' };
+  const record = installs[first];
+  const after = installs.slice(first);
+  const from = record.from;
+  const to = [...new Set(after.map((entry) => entry.to ?? null).filter((version) => version !== null))];
+  const reading = installedNow(service, record);
+  if (reading.error) return { state: 'unknown', record, error: `its version could not be read: ${reading.error}` };
+  if (reading.version === from || to.includes(reading.version)) return { state: 'none' };
+  if (after.some((entry) => (entry.to ?? null) === null)) {
+    return {
+      state: 'unknown',
+      record,
+      error: `it is on ${reading.version ?? 'no version'}, and nothing names the version the update was going to, so that cannot be told from an install it did not finish`,
+    };
+  }
+  return { state: 'owed', record, from, to, installed: reading.version };
 }
 
 /**
@@ -1013,22 +1066,23 @@ export function rollbackOwed(service, record) {
  * not: putting the version right is then an update's business, and stopping a
  * running service on every cycle to try again would be damage of its own.
  */
-export async function rollBackInterrupted(config, service, record, owed, { running }) {
-  const found = `${service.name} is on ${owed.installed ?? 'a version that cannot be read'}, neither ${owed.from} nor ${owed.to ?? 'the version it was going to'}`;
+export async function rollBackInterrupted(config, service, owed, { running }) {
+  const { record, from } = owed;
+  const found = `${service.name} is on ${owed.installed ?? 'a version that cannot be read'}, neither ${[from, ...owed.to].join(' nor ')}`;
   const held = await rollbackHeld();
   if (held) return { settled: false, action: 'conflict', reasonCode: REASON.operationInProgress, message: `${found}, and ${held}` };
   const waiting = (busy, why = '') => ({
     settled: false,
     action: 'deferred',
     reasonCode: busyReasonCode(busy),
-    message: `${found}, and the rollback to ${owed.from} waits for an idle machine (${why}${busy.reason})`,
+    message: `${found}, and the rollback to ${from} waits for an idle machine (${why}${busy.reason})`,
   });
   if (running && (service.kind === 'npm' || service.rollback)) {
     const { busy } = await busyNow(config, service);
     if (busy.busy) return waiting(busy);
     const drained = await drainService(service);
     if (!drained.ok) {
-      return { settled: false, action: 'drain-refused', reasonCode: REASON.busy, message: `${found}, and ${service.name} was not rolled back to ${owed.from}: ${drained.message}` };
+      return { settled: false, action: 'drain-refused', reasonCode: REASON.busy, message: `${found}, and ${service.name} was not rolled back to ${from}: ${drained.message}` };
     }
     if (drained.drained) appendLog(record.id, `recovery: ${drained.message}`);
     const fresh = await busyNow(config, service);
@@ -1038,7 +1092,7 @@ export async function rollBackInterrupted(config, service, record, owed, { runni
   const enter = (phase, progress = null) => appendLog(record.id, `recovery: ${phase}${progress?.note ? `, ${progress.note}` : ''}`);
   const rolled =
     service.kind === 'npm'
-      ? await rollBack(service, owed.from, record.npmPrefix ?? npmProvider.resolveNpmPrefix(service), enter)
+      ? await rollBack(service, from, record.npmPrefix ?? npmProvider.resolveNpmPrefix(service), enter)
       : await rollBackCommand(service, enter);
   const message = `${found}; ${rolled.message}`;
   if (rolled.ok) return { settled: true, action: 'rolled-back', reasonCode: null, message };

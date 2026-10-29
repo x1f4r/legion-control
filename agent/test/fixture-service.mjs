@@ -30,6 +30,9 @@ async function heldWhile(name) {
 switch (verb) {
   case 'installed':
     if (read('installed-unreadable') === 'on') process.exit(1);
+    // A version command that asks the service itself, and so has no answer
+    // while it is stopped.
+    if (read('installed-needs-running') === 'on' && read('running', 'on') !== 'on') process.exit(1);
     process.stdout.write(read('installed', '1.0.0'));
     break;
   case 'latest':

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { beginOperation, pruneOperations, readOperation, recoverOperations, updateOperation, wireRecord } from '../src/operations.mjs';
+import { beginOperation, finishOperation, pruneOperations, readOperation, recoverOperations, updateOperation, wireRecord } from '../src/operations.mjs';
 import { isRunning, processEvidence } from '../src/probes/process.mjs';
 import {
   cli, commandService, deadPid, fakeNpm, FIXTURE, fixtureConfig, fixtureData, npmCalls, npmPackageVersion, npmService, readFixture, withHome, writeConfig,
@@ -257,6 +257,25 @@ test('an update that settled the version later is never undone by an older inter
   });
 });
 
+test('an update queued before the interrupted one and taken up after it is the later of the two', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { running: 'off', installed: '3.0.0', 'rollback-to': '1.0.0' });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    const id = 'interrupted-overtaken-001';
+    leftInterrupted(id, { from: '1.0.0', to: '2.0.0', requestedAt: '2026-01-01T10:05:00.000Z', startedAt: '2026-01-01T10:05:00.000Z' });
+    // Asked for while the machine was busy, and run once the interrupted
+    // update was over: what it installed is not the older run's to undo.
+    const queued = 'queued-update-001';
+    beginOperation({ id: queued, kind: 'update', service: 'demo', systemId: 'test' });
+    finishOperation(queued, { ok: true, action: 'updated', reasonCode: null, from: '1.5.0', to: '3.0.0', message: 'updated 1.5.0 -> 3.0.0' });
+    updateOperation(queued, { requestedAt: '2026-01-01T10:00:00.000Z', startedAt: '2026-01-01T10:20:00.000Z' });
+    cli(['cycle'], { home });
+    assert.equal(readFixture(dir, 'rollback-runs'), '');
+    assert.equal(readFixture(dir, 'installed'), '3.0.0');
+    assert.equal(readOperation(id).recoveryPending, false);
+  });
+});
+
 test('a rollback that fails settles once the service is running again, rather than stop it every cycle', async () => {
   await withHome(async (home) => {
     const dir = fixtureData(home, { running: 'off', 'npm-install-fails': '1.0.0' });
@@ -270,6 +289,78 @@ test('a rollback that fails settles once the service is running again, rather th
     assert.match(readOperation(id).log.map((entry) => entry.line).join('\n'), /rollback install failed/);
     cli(['cycle'], { home, nodeArgs: npm.nodeArgs });
     assert.equal(npmCalls(dir).filter((call) => call.startsWith('install ')).length, 1, 'tried once');
+  });
+});
+
+test('an update killed before its install is only started again, whatever its version command says', async () => {
+  await withHome(async (home) => {
+    // A version command that needs the service it asks about, such as one
+    // that asks it over http, has no answer while the drain or the stop has
+    // it down. Nothing was installed, so there is nothing to roll back.
+    const dir = fixtureData(home, { running: 'off', 'installed-unreadable': 'on', 'rollback-to': '0.9.0' });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    const id = 'interrupted-stopping-001';
+    leftInterrupted(id, { phase: 'stopping', from: '1.0.0', to: '2.0.0' });
+    const { payload } = cli(['cycle'], { home });
+    assert.doesNotMatch(payload.message, /still owed/);
+    assert.equal(readFixture(dir, 'rollback-runs'), '', 'a stop that was interrupted installed nothing');
+    assert.equal(readFixture(dir, 'installed'), '1.0.0');
+    assert.equal(readFixture(dir, 'start-runs'), '1');
+    assert.equal(readFixture(dir, 'running'), 'on');
+    assert.equal(readOperation(id).recoveryPending, false);
+  });
+});
+
+test('a version that cannot be read is never taken for one an install left half done', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { running: 'off', installed: '1.5.0', 'installed-unreadable': 'on', 'rollback-to': '0.9.0' });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    const id = 'interrupted-unreadable-001';
+    leftInterrupted(id, { from: '1.0.0', to: '2.0.0' });
+    const { payload } = cli(['cycle'], { home });
+    assert.doesNotMatch(payload.message, /still owed/);
+    assert.equal(readFixture(dir, 'rollback-runs'), '', 'unknown is not neither');
+    assert.equal(readFixture(dir, 'installed'), '1.5.0');
+    assert.equal(readFixture(dir, 'running'), 'on', 'the service is put back all the same');
+    assert.equal(readOperation(id).recoveryPending, false);
+    assert.match(
+      readOperation(id).log.at(-1).line,
+      /^recovered: Demo was restarted after an interrupted update \(installing\); nothing was rolled back, because its version could not be read: /,
+    );
+  });
+});
+
+test('a version that can only be read with the service up is read once it is, and rolled back through the drain', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { running: 'off', installed: '1.5.0', 'installed-needs-running': 'on', 'rollback-to': '1.0.0' });
+    const drain = { command: [process.execPath, FIXTURE, 'drain', dir], timeoutSeconds: 10 };
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false }, services: [commandService(dir, { drain })] }));
+    const id = 'interrupted-needs-running-001';
+    leftInterrupted(id, { from: '1.0.0', to: '2.0.0' });
+    cli(['cycle'], { home });
+    assert.equal(readFixture(dir, 'drain-runs'), '1', 'once it is up it takes work, so it is drained like any running service');
+    assert.equal(readFixture(dir, 'rollback-runs'), '1');
+    assert.equal(readFixture(dir, 'installed'), '1.0.0');
+    assert.equal(readFixture(dir, 'running'), 'on');
+    assert.equal(readOperation(id).recoveryPending, false);
+  });
+});
+
+test('an update that named no version to go to is not rolled back for leaving a new one', async () => {
+  await withHome(async (home) => {
+    // Confirmed by verify alone, so there was no target to note. Killed in its
+    // start, after an install that worked.
+    const dir = fixtureData(home, { running: 'off', installed: '2.0.0', 'rollback-to': '1.0.0' });
+    const service = commandService(dir, { latestVersion: undefined, verify: [process.execPath, FIXTURE, 'verify', dir] });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false }, services: [service] }));
+    const id = 'interrupted-no-target-001';
+    leftInterrupted(id, { phase: 'starting', from: '1.0.0', to: null });
+    cli(['cycle'], { home });
+    assert.equal(readFixture(dir, 'rollback-runs'), '');
+    assert.equal(readFixture(dir, 'installed'), '2.0.0');
+    assert.equal(readFixture(dir, 'start-runs'), '1');
+    assert.equal(readOperation(id).recoveryPending, false);
+    assert.match(readOperation(id).log.at(-1).line, /nothing was rolled back, because it is on 2\.0\.0, and nothing names the version the update was going to/);
   });
 });
 
@@ -305,5 +396,44 @@ test('a running npm service whose drain refuses is neither stopped nor reinstall
     assert.equal(npmPackageVersion(npm.prefix, npm.pkg), '1.0.0');
     assert.equal(readFixture(dir, 'running'), 'on');
     assert.equal(readOperation(id).recoveryPending, false);
+  });
+});
+
+test('an interrupted restart does not hide the rollback a later interrupted update owes', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { running: 'off', installed: '1.5.0', 'rollback-to': '1.0.0' });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    const restart = 'interrupted-restart-002';
+    const update = 'interrupted-update-002';
+    leftInterrupted(restart, { kind: 'restart', phase: 'restarting', requestedAt: '2026-01-01T10:00:00.000Z', startedAt: '2026-01-01T10:00:00.000Z' });
+    leftInterrupted(update, { from: '1.0.0', to: '2.0.0', requestedAt: '2026-01-01T10:05:00.000Z', startedAt: '2026-01-01T10:05:00.000Z' });
+    cli(['cycle'], { home });
+    assert.equal(readFixture(dir, 'rollback-runs'), '1');
+    assert.equal(readFixture(dir, 'installed'), '1.0.0');
+    assert.equal(readFixture(dir, 'running'), 'on');
+    for (const id of [restart, update]) {
+      assert.equal(readOperation(id).recoveryPending, false);
+      assert.match(readOperation(id).log.at(-1).line, /^recovered: Demo is on 1\.5\.0, neither 1\.0\.0 nor 2\.0\.0; the rollback command ran/, 'each record says how it ended');
+    }
+  });
+});
+
+test('of two interrupted updates, the later one\'s from is not taken for a whole version, and its to is', async () => {
+  const twoUpdates = async (installed, body) => withHome(async (home) => {
+    const dir = fixtureData(home, { running: 'off', installed, 'rollback-to': '1.0.0' });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    leftInterrupted('interrupted-first-003', { from: '1.0.0', to: '2.0.0', requestedAt: '2026-01-01T10:00:00.000Z', startedAt: '2026-01-01T10:00:00.000Z' });
+    // What the second found on disk was what the first had left half written.
+    leftInterrupted('interrupted-second-003', { from: '1.5.0', to: '3.0.0', requestedAt: '2026-01-01T10:05:00.000Z', startedAt: '2026-01-01T10:05:00.000Z' });
+    cli(['cycle'], { home });
+    await body(dir);
+  });
+  await twoUpdates('1.5.0', (dir) => {
+    assert.equal(readFixture(dir, 'rollback-runs'), '1');
+    assert.equal(readFixture(dir, 'installed'), '1.0.0', 'back to where the oldest of them started');
+  });
+  await twoUpdates('3.0.0', (dir) => {
+    assert.equal(readFixture(dir, 'rollback-runs'), '', 'a version one of them was going to is a whole install');
+    assert.equal(readFixture(dir, 'start-runs'), '1');
   });
 });

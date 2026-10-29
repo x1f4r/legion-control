@@ -20,10 +20,24 @@ function firstLine(stdout) {
 }
 
 export function installedVersion(service, { timeoutMs = 15000 } = {}) {
-  if (!service.installedVersion) return null;
+  return readInstalledVersion(service, { timeoutMs }).version;
+}
+
+/**
+ * The installed version as a reading: the version, or null with the reason
+ * nothing could be read. installedVersion() folds a failure into null, which
+ * is right for a version shown beside the service and wrong for anything that
+ * acts on it. A version command can fail for reasons that say nothing about
+ * what is installed, a timeout or one that needs the service up to answer, and
+ * recovery must never take that for a version that is neither of the ones an
+ * update noted.
+ */
+export function readInstalledVersion(service, { timeoutMs = 15000 } = {}) {
+  if (!service.installedVersion) return { version: null, error: `${service.name} has no installedVersion command` };
   const result = runArgv(service.installedVersion, { timeoutMs });
-  if (!result.ok) return null;
-  return firstLine(result.stdout);
+  if (!result.ok) return { version: null, error: describeFailure(result) };
+  const version = firstLine(result.stdout);
+  return version ? { version, error: null } : { version: null, error: `${result.command} printed no version` };
 }
 
 /**
