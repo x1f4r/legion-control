@@ -534,14 +534,18 @@ test('history is bounded, and pruning keeps the newest', async () => {
   });
 });
 
-test('a record from another host is left alone rather than declared dead', async () => {
+test('a record written on another machine is judged like any other, never left running', async () => {
   await withHome(async () => {
     const ops = await fresh('operations.mjs');
+    // A home directory restored from another machine: its boot and its pid
+    // mean nothing here. What it was doing stopped when that machine stopped
+    // running it, so it is interrupted rather than left running for good.
     const { record } = ops.beginOperation({ id: '99999999-1111-4111-8111-111111111111', ...base });
-    ops.updateOperation(record.id, { pid: 99999999, owner: { pid: 99999999, host: 'somebody-elses-machine' } });
-    // The pid means nothing here; the record belongs to a home directory that was
-    // restored or is shared.
-    const derived = ops.deriveState(ops.readOperation(record.id));
-    assert.equal(derived.state, 'finished', 'a dead pid on this host is still judged');
+    ops.recordPhase(record.id, 'installing');
+    ops.updateOperation(record.id, { pid: process.pid, bootId: 'a-boot-of-another-machine' });
+    assert.equal(ops.deriveState(ops.readOperation(record.id)).state, 'finished', 'a pid alive here is not its owner');
+    const recovered = ops.recoverOperations({ systemId: 'linux' });
+    assert.deepEqual(recovered.map((entry) => entry.id), [record.id]);
+    assert.equal(recovered[0].result.action, 'interrupted');
   });
 });
