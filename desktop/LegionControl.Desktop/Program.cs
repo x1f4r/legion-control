@@ -41,6 +41,16 @@ internal static class Program
             return Runner.RunAsync(args, Console.Out).GetAwaiter().GetResult();
         }
 
+        // One window to a state directory. A run that closes itself again, as a remote screenshot
+        // does, is let through beside it.
+        using var window = args.Contains("--quit-after") ? null : InstanceLock.Window();
+        if (window is null && !args.Contains("--quit-after"))
+        {
+            Console.Error.WriteLine("Legion Control is already open.");
+            AppLog.Write("a second window was not opened: one is already open on this state directory");
+            return Runner.Ok;
+        }
+
         return BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
     }
 

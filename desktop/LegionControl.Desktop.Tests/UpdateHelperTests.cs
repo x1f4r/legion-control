@@ -395,6 +395,22 @@ public class UpdateHelperTests
         Assert.Throws<IOException>(() => new FileStream(InstanceLock.SharedPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
     }
 
+    [Fact]
+    public void OnlyOneWindowOpensOnAStateDirectory()
+    {
+        using var home = new TempHome();
+        Assert.False(InstanceLock.IsWindowOpen());
+        using (var first = InstanceLock.Window())
+        {
+            Assert.NotNull(first);
+            Assert.True(InstanceLock.IsWindowOpen());
+            Assert.Null(InstanceLock.Window());
+        }
+        Assert.False(InstanceLock.IsWindowOpen());
+        using var again = InstanceLock.Window();
+        Assert.NotNull(again);
+    }
+
     private static void SetMode(string path, UnixFileMode mode)
     {
         if (OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
