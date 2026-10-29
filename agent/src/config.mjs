@@ -31,7 +31,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CLOCK_TIME_PATTERN, CONFIGURED_ID_PATTERN, CONTRACT_VERSION } from './contract.mjs';
-import { acquireFileLock, stateLockPath, writeJsonAtomic } from './state.mjs';
+import { acquireFileLock, stateLockPath, writeJsonAtomic, writePrivateAtomic } from './state.mjs';
 
 /** The running agent's own tree: the directory above src/, holding package.json and, in a release, the signed manifest. */
 export const AGENT_TREE = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -1369,15 +1369,6 @@ export function normalizeConfig(raw, options = {}) {
 // Reading and writing
 // ---------------------------------------------------------------------------
 
-function ensureBaseDir() {
-  try {
-    fs.mkdirSync(basePath(), { recursive: true });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Read a JSON document, telling the cases apart.
  *
@@ -1519,10 +1510,7 @@ function rememberLastGood(raw) {
   try {
     const file = lastGoodConfigPath();
     if (fs.existsSync(file) && fs.readFileSync(file, 'utf8') === raw) return;
-    ensureBaseDir();
-    const tmp = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, raw, 'utf8');
-    fs.renameSync(tmp, file);
+    writePrivateAtomic(file, raw);
   } catch {
     /* the last-good copy is a convenience, never a requirement */
   }

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { AGENT_VERSION, cli, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
+import { AGENT_VERSION, REPO, cli, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
 
 /** A home with the fixture service configured and running. */
 async function withService(body, { config = null, initial = {} } = {}) {
@@ -485,7 +485,7 @@ test('doctor reports the scheduler, the busy source and the lock, with fixes', a
   await withService(async ({ home }) => {
     const { payload } = cli(['doctor'], { home });
     const ids = payload.checks.map((check) => check.id);
-    for (const id of ['config.parse', 'config.validate', 'base.writable', 'node.version', 'locks', 'ops.dir', 'clock', 'session.restricted', 'agent.floor', 'agent.signed', 'controller.copy', 'sleep.tool', 'scheduler.present', 'scheduler.command', 'scheduler.lastRun', 'service.demo.process', 'service.demo.health', 'service.demo.busy']) {
+    for (const id of ['config.parse', 'config.validate', 'base.writable', 'files.private', 'node.version', 'locks', 'ops.dir', 'clock', 'session.restricted', 'agent.floor', 'agent.signed', 'controller.copy', 'sleep.tool', 'scheduler.present', 'scheduler.command', 'scheduler.lastRun', 'service.demo.process', 'service.demo.health', 'service.demo.busy']) {
       assert.ok(ids.includes(id), `doctor should check ${id}`);
     }
     for (const check of payload.checks) {
@@ -494,7 +494,8 @@ test('doctor reports the scheduler, the busy source and the lock, with fixes', a
     assert.equal(typeof payload.counts.ok, 'number');
     assert.equal(payload.counts.ok + payload.counts.warn + payload.counts.fail, payload.checks.length);
     // Every check id has to be one the contract names, or a client cannot render it.
-    const allowed = /^(?:config\.(?:parse|validate)|base\.writable|node\.(?:version|sqlite)|npm\.(?:available|prefix)|service\.[A-Za-z0-9][A-Za-z0-9._-]*\.(?:process|health|busy|relay|latest|endpoint)|scheduler\.(?:present|command|lastRun)|privileges\.(?:sudo|boot)|sleep\.tool|locks|ops\.dir|controller\.copy|session\.restricted|clock|agent\.(?:floor|signed))$/;
+    const common = JSON.parse(fs.readFileSync(path.join(REPO, 'contract', 'schemas', 'common.schema.json'), 'utf8'));
+    const allowed = new RegExp(common.$defs.doctorCheck.properties.id.pattern, 'u');
     for (const check of payload.checks) assert.match(check.id, allowed, `${check.id} is not a contract check id`);
   });
 });

@@ -16,6 +16,7 @@ import {
   AGENT_VERSION,
   basePath,
   configPath,
+  describeFailure,
   detectPlatform,
   lastGoodConfigPath,
   lastGoodInfo,
@@ -131,6 +132,125 @@ function configChecks(loaded) {
   return checks;
 }
 
+/**
+ * The files under the base that the agent writes and that hold what it was
+ * configured with or did: the configuration and its last good copy, the setup
+ * and its commit, the version floor and the log. Operation records and service
+ * state are the JSON files in ops/ and state/. Lock databases hold nothing.
+ */
+const PRIVATE_FILES = [
+  'config.json', 'config.last-good.json', 'controller.json', 'controller.json.staged', 'controller.meta.json',
+  'controller.commit.json', 'agent-floor.json', 'legionctl.log', 'legionctl.log.1',
+];
+
+/**
+ * Every agent directory and file under `base` that its group or anybody else
+ * may read or enter, as `{ path, mode }` with the mode in octal (POSIX).
+ */
+export function exposedFiles(base = basePath()) {
+  const exposed = [];
+  const look = (file) => {
+    try {
+      const mode = fs.statSync(file).mode & 0o777;
+      if ((mode & 0o077) !== 0) exposed.push({ path: file, mode: mode.toString(8).padStart(3, '0') });
+    } catch { /* not there, which exposes nothing */ }
+  };
+  look(base);
+  for (const dir of [path.join(base, 'ops'), path.join(base, 'state')]) {
+    look(dir);
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { /* not created yet */ }
+    for (const name of names.filter((entry) => entry.endsWith('.json')).sort()) look(path.join(dir, name));
+  }
+  for (const name of PRIVATE_FILES) look(path.join(base, name));
+  return exposed;
+}
+
+/** Well-known groups whose access to the base lets any other account read it, by SDDL alias and by SID. */
+const BROAD_GROUPS = {
+  WD: 'Everyone', 'S-1-1-0': 'Everyone',
+  BU: 'Users', 'S-1-5-32-545': 'Users',
+  AU: 'Authenticated Users', 'S-1-5-11': 'Authenticated Users',
+};
+
+/**
+ * The broad groups an allow entry of an SDDL descriptor's DACL names. SDDL
+ * spells them the same in every Windows language, which icacls output does
+ * not: a German machine lists Users as "VORDEFINIERT\Benutzer".
+ */
+export function broadAclGroups(sddl) {
+  const dacl = /D:[^(]*((?:\([^)]*\))*)/.exec(String(sddl ?? ''))?.[1] ?? '';
+  const groups = new Set();
+  for (const [, ace] of dacl.matchAll(/\(([^)]*)\)/g)) {
+    const fields = ace.split(';');
+    if (fields[0] === 'A' && BROAD_GROUPS[fields[5]]) groups.add(BROAD_GROUPS[fields[5]]);
+  }
+  return [...groups];
+}
+
+/**
+ * Whether only this user can read what the agent keeps (T8). The base holds
+ * every configured command, the setup and the record of every operation.
+ */
+export function privateFilesCheck({ platform = process.platform, base = basePath(), run = runCommand } = {}) {
+  if (platform === 'win32') {
+    const acl = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '(Get-Acl -LiteralPath $env:LEGIONCTL_DOCTOR_PATH).Sddl'], {
+      timeoutMs: 20000, env: { ...process.env, LEGIONCTL_DOCTOR_PATH: base },
+    });
+    if (!acl.ok) {
+      return check('files.private', 'warn', `who may read ${base} could not be read`, describeFailure(acl), 're-run agent/install/install-windows.ps1, which gives the base to your account alone');
+    }
+    const groups = broadAclGroups(acl.stdout.trim());
+    return groups.length === 0
+      ? check('files.private', 'ok', `only named accounts may read ${base}`, 'Everyone, Users and Authenticated Users have no access', null)
+      : check(
+          'files.private',
+          'warn',
+          `${groups.join(', ')} may read ${base}`,
+          'the base holds every configured command, the setup and the record of every operation',
+          `re-run agent/install/install-windows.ps1, or run: icacls "${base}" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"`,
+        );
+  }
+  const exposed = exposedFiles(base);
+  return exposed.length === 0
+    ? check('files.private', 'ok', 'only this user can read what the agent keeps', `${base} is 0700 and the agent's files are 0600`, null)
+    : check(
+        'files.private',
+        'warn',
+        `${exposed.length} of the agent's directories and files can be read by other users`,
+        exposed.slice(0, 10).map((entry) => `${entry.path} (${entry.mode})`).join(', ') + (exposed.length > 10 ? ', …' : ''),
+        `chmod -R go-rwx "${base}"`,
+      );
+}
+
+/**
+ * Which shell this Windows account's OpenSSH runs (contract section 15.1).
+ * A system with no `shell` in the setup is driven with cmd, which is what a
+ * stock install runs; an account whose OpenSSH runs PowerShell needs the setup
+ * to say so, or every command it is sent fails to parse.
+ */
+export function sshShellCheck(result) {
+  const value = /^\s*DefaultShell\s+REG_(?:EXPAND_)?SZ\s+(.*?)\s*$/im.exec(result.stdout ?? '')?.[1] ?? null;
+  if (value === null) {
+    // reg query exits 1 with an error on stderr when the value is not there.
+    return result.error
+      ? check('ssh.shell', 'warn', 'the shell OpenSSH runs could not be read', `reg query failed: ${result.error}`, 'read HKLM\\SOFTWARE\\OpenSSH DefaultShell by hand; a system without "shell" in the setup is driven with cmd')
+      : check('ssh.shell', 'ok', 'OpenSSH runs cmd.exe, the default', 'HKLM\\SOFTWARE\\OpenSSH sets no DefaultShell, so a system without "shell" in the setup is driven with cmd', null);
+  }
+  const name = value.split(/[\\/]/).at(-1).toLowerCase();
+  if (name === 'cmd.exe') return check('ssh.shell', 'ok', 'OpenSSH runs cmd.exe', value, null);
+  if (name === 'powershell.exe' || name === 'pwsh.exe') {
+    return check('ssh.shell', 'ok', `OpenSSH runs ${name}`, `${value}; set "shell": "powershell" on this system in the setup, or every command sent to it is quoted for cmd`, null);
+  }
+  return check(
+    'ssh.shell',
+    'warn',
+    `OpenSSH runs ${value}`,
+    'clients quote commands for cmd or PowerShell, and for no other shell',
+    'set HKLM\\SOFTWARE\\OpenSSH DefaultShell to cmd.exe or powershell.exe, or remove it',
+  );
+}
+
 function environmentChecks() {
   const checks = [];
   const base = basePath();
@@ -138,7 +258,8 @@ function environmentChecks() {
   let writable = false;
   let writeError = null;
   try {
-    fs.mkdirSync(base, { recursive: true });
+    // Created as the agent creates it, so asking leaves nothing more readable.
+    fs.mkdirSync(base, { recursive: true, mode: 0o700 });
     const probe = path.join(base, `.doctor-${process.pid}`);
     fs.writeFileSync(probe, 'x');
     fs.rmSync(probe, { force: true });
@@ -157,6 +278,7 @@ function environmentChecks() {
           'the agent keeps its state, operation records and locks here; fix the ownership or permissions of that directory',
         ),
   );
+  checks.push(privateFilesCheck({ base }));
 
   const major = nodeMajor();
   checks.push(
@@ -195,7 +317,7 @@ function environmentChecks() {
   const unwritable = [];
   for (const dir of [operationsDir(), stateDir()]) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       fs.accessSync(dir, fs.constants.W_OK);
     } catch {
       unwritable.push(dir);
@@ -261,6 +383,10 @@ function environmentChecks() {
       null,
     ),
   );
+
+  if (process.platform === 'win32') {
+    checks.push(sshShellCheck(runCommand('reg', ['query', 'HKLM\\SOFTWARE\\OpenSSH', '/v', 'DefaultShell'], { timeoutMs: 10000 })));
+  }
 
   // A clock that is badly wrong makes every timestamp, every expiry and every
   // maintenance window meaningless, and it is invisible until it bites.

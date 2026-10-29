@@ -69,8 +69,22 @@ export function processIsAlive(pid) {
   }
 }
 
-function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+/**
+ * A directory only this user can enter (T8). The base and everything the agent
+ * writes under it hold configured commands, the setup and the record of every
+ * operation, so they are 0700 whatever the umask was. A directory created with
+ * more, by an older agent or an installer, is narrowed when the agent next
+ * writes into it. Windows has no mode bits worth setting here; its installer
+ * sets the ACL, and doctor says when it allows too much.
+ */
+export function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform === 'win32') return;
+  try {
+    if ((fs.statSync(dir).mode & 0o077) !== 0) fs.chmodSync(dir, 0o700);
+  } catch {
+    /* not ours to change; doctor's files.private says so */
+  }
 }
 
 /**
@@ -124,25 +138,24 @@ export function readJsonStore(file) {
  * writers wrote into the same temp file and renamed each other's half-written
  * bytes into place. The pid and a random suffix make that impossible, and the
  * directory fsync makes the rename durable rather than merely ordered.
+ *
+ * Every file the agent writes this way is private, as writePrivateAtomic's are.
  */
 export function writeJsonAtomic(file, value) {
-  return writeAtomic(file, `${JSON.stringify(value, null, 2)}\n`, 0o666);
+  return writePrivateAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 /**
- * The same atomic write for exact bytes that only this user may read: the temp
- * file is created 0600, so the rename puts a private file in place rather than
- * one a later chmod has to catch up with.
+ * The atomic write for exact bytes that only this user may read: the temp file
+ * is created 0600 in a 0700 directory, so the rename puts a private file in
+ * place rather than one a later chmod has to catch up with. A rename replaces
+ * the file, so a chmod somebody made by hand never lasted past the next write.
  */
 export function writePrivateAtomic(file, data) {
-  return writeAtomic(file, data, 0o600);
-}
-
-function writeAtomic(file, data, mode) {
-  ensureDir(path.dirname(file));
+  ensurePrivateDir(path.dirname(file));
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
   try {
-    const fd = fs.openSync(tmp, 'wx', mode);
+    const fd = fs.openSync(tmp, 'wx', 0o600);
     try {
       fs.writeFileSync(fd, data);
       fs.fsyncSync(fd);

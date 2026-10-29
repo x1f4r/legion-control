@@ -469,6 +469,6 @@ export async function runRollback(config, options = {}) {
 
 export function ensureIncoming() {
   const dir = incomingDir();
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
 }

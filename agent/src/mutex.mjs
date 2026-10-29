@@ -130,7 +130,8 @@ export function acquireMutex(dbFile, { waitMs = 0 } = {}) {
 
   const directory = path.dirname(dbFile);
   try {
-    fs.mkdirSync(directory, { recursive: true });
+    // Lock databases live in the agent's own directories, which are private (state.mjs).
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   } catch (err) {
     return {
       ok: false,

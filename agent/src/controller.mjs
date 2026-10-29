@@ -34,6 +34,7 @@ import { basePath, jsonParseProblem } from './config.mjs';
 import { REASON, SETUP_ID_PATTERN } from './contract.mjs';
 import { approvalsFrom, launchProjection, launchReview } from './launch.mjs';
 import { findRepeatedMember, validateSetupDocument } from './setup-document.mjs';
+import { ensurePrivateDir } from './state.mjs';
 
 /** Room for far more machines than anyone has, and small enough to refuse a mistake. */
 export const MAX_CONTROLLER_BYTES = 1024 * 1024;
@@ -154,7 +155,8 @@ function replaceAtomic(source, target) {
 function writeFileAtomic(file, contents) {
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
   try {
-    const fd = fs.openSync(tmp, 'wx');
+    // Created private, so the rename puts a private file in place (T8).
+    const fd = fs.openSync(tmp, 'wx', 0o600);
     try {
       fs.writeFileSync(fd, contents);
       fs.fsyncSync(fd);
@@ -760,7 +762,7 @@ export function storeController(input, { id = null, revision = null, source = nu
   };
 
   try {
-    fs.mkdirSync(basePath(), { recursive: true });
+    ensurePrivateDir(basePath());
     // 1. Stage the document beside its destination.
     const staged = `${controllerPath()}.staged`;
     writeFileAtomic(staged, body);
