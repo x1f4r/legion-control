@@ -510,7 +510,7 @@ struct MacSection: View {
             Text(model.placement.description(sites: model.sites))
                 .fixedSize(horizontal: false, vertical: true)
             if !model.sites.isEmpty {
-                Picker("", selection: Binding(
+                Picker("Site", selection: Binding(
                     get: { model.bindings.bindings.currentSite ?? "" },
                     set: { editProblem = model.confirmSite($0.isEmpty ? nil : $0) }
                 )) {

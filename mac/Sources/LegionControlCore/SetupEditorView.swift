@@ -31,7 +31,7 @@ struct SetupEditorView: View {
                     .padding(.bottom, 16)
             }
 
-            Picker("", selection: $selection) {
+            Picker("Part of the setup", selection: $selection) {
                 Text("Sites").tag(Selection.sites)
                 Text("This device").tag(Selection.bindings)
                 ForEach(config?.machines ?? []) { machine in
@@ -184,7 +184,7 @@ private struct MachineEditor: View {
             VStack(alignment: .leading, spacing: 12) {
                 DetailRow("Id", machine.id)
                 DetailRow(label: "Site") {
-                    Picker("", selection: Binding(
+                    Picker("Site", selection: Binding(
                         get: { machine.site ?? "" },
                         set: { site in
                             problem = model.editSetup("moved \(machine.name) to a different site") { root in
@@ -374,7 +374,7 @@ private struct MachineEditor: View {
                 .padding(.bottom, 12)
 
                 HStack(spacing: 10) {
-                    Picker("", selection: $helperMachine) {
+                    Picker("Helper machine", selection: $helperMachine) {
                         Text("Choose a machine").tag("")
                         ForEach((config?.machines ?? []).filter { $0.id != machine.id }) { candidate in
                             Text(candidate.name).tag(candidate.id)
@@ -432,7 +432,7 @@ private struct NewMachineEditor: View {
 
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Platform").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                Picker("", selection: $platform) {
+                Picker("Platform", selection: $platform) {
                     ForEach(Platform.allCases, id: \.self) { value in
                         Text(value.defaultName).tag(value)
                     }
@@ -445,7 +445,7 @@ private struct NewMachineEditor: View {
             if platform == .windows {
                 HStack(alignment: .firstTextBaseline, spacing: 18) {
                     Text("Shell").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                    Picker("", selection: $windowsShell) {
+                    Picker("Shell", selection: $windowsShell) {
                         Text("cmd").tag("cmd")
                         Text("powershell").tag("powershell")
                     }
@@ -549,7 +549,7 @@ private struct EndpointForm: View {
 
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Kind").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                Picker("", selection: $kind) {
+                Picker("Kind", selection: $kind) {
                     Text("On the LAN").tag("lan")
                     Text("Remote").tag("remote")
                 }
@@ -560,7 +560,7 @@ private struct EndpointForm: View {
                 HStack(alignment: .firstTextBaseline, spacing: 18) {
                     Text("Only when running").font(.subheadline).foregroundStyle(.secondary)
                         .frame(width: 140, alignment: .leading)
-                    Picker("", selection: $system) {
+                    Picker("Only when running", selection: $system) {
                         Text("Any system").tag("")
                         ForEach(systems) { entry in Text(entry.name).tag(entry.id) }
                     }
@@ -624,7 +624,7 @@ private struct SystemForm: View {
 
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Platform").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                Picker("", selection: $platform) {
+                Picker("Platform", selection: $platform) {
                     ForEach(Platform.allCases, id: \.self) { value in Text(value.defaultName).tag(value) }
                 }
                 .labelsHidden().pickerStyle(.segmented).fixedSize()
@@ -632,7 +632,7 @@ private struct SystemForm: View {
 
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Shell").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                Picker("", selection: $shell) {
+                Picker("Shell", selection: $shell) {
                     // A Windows system always names its shell: no client guesses one for it.
                     if platform != .windows { Text("What the platform implies").tag("") }
                     ForEach(["posix", "cmd", "powershell"], id: \.self) { value in Text(value).tag(value) }

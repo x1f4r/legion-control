@@ -138,7 +138,7 @@ struct DivergenceView: View {
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 if difference.needsDecision {
-                    Picker("", selection: Binding(
+                    Picker("Keep", selection: Binding(
                         get: { choices[difference.id] ?? difference.defaultChoice },
                         set: { choices[difference.id] = $0 }
                     )) {
