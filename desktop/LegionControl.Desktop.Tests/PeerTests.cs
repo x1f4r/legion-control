@@ -36,7 +36,12 @@ internal sealed class FakeMachine
 
     public IProcessRunner Runner => new FakeRunner(Answer);
 
-    private static readonly JsonSerializerOptions AsAnAgentPrints = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    private static readonly JsonSerializerOptions AsAnAgentPrints = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        // An agent prints a document of any depth, one level down in its reply.
+        MaxDepth = DocumentJson.MaxDepth + 1,
+    };
 
     private CommandResult Answer(FakeCall call)
     {
@@ -111,7 +116,7 @@ internal sealed class FakeMachine
         return Reply(SendsRaw ? "config.read" : "config.read-without-raw", reply =>
         {
             Stamp(reply);
-            reply["controller"] = JsonNode.Parse(held.Text);
+            reply["controller"] = JsonNode.Parse(held.Text, documentOptions: DocumentJson.Nesting);
             if (SendsRaw) reply["raw"] = held.Text;
             reply["hash"] = held.Hash;
             reply["bytes"] = held.Bytes.Length;
@@ -300,6 +305,30 @@ public class ReconcilerTests
         await model.RefreshAsync();
         Assert.IsType<ReconcileOutcome.Adopted>(await reconciler.ReconcileAsync(model));
         Assert.Equal(theirs.Hash, store.Document!.Hash);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ADocumentAsDeepAsAcceptanceAllowsIsAdoptedFromAMachine(bool sendsRaw)
+    {
+        // A key nobody knows, nested as deep as section 9.7 lets this app hold a document. The
+        // client refused it at 65 levels, where validate.mjs and the agent read on, and a peer's
+        // valid document was then never adopted here.
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 4, Array.Empty<string>());
+        var theirs = ControllerDocument.FromText(DocumentJsonTests.Deep(DocumentJson.MaxDepth,
+            Documents.Make("setup-a", 5, new[] { mine.Hash }, "Beacon from elsewhere")));
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = theirs;
+        fake.SendsRaw = sendsRaw;
+        if (!sendsRaw) fake.AgentVersion = "3.0.1";
+        var reconciler = new Reconciler(store, Bindings.Empty);
+
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Adopted>(await reconciler.ReconcileAsync(model));
+        Assert.Equal(theirs.Hash, store.Document!.Hash);
+        Assert.Equal("Beacon from elsewhere", store.Config!.Machines[0].Name);
     }
 
     [Fact]

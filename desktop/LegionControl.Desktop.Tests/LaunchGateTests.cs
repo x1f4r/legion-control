@@ -16,7 +16,7 @@ internal static class LaunchDocuments
     public static readonly string[] Tower = { "/usr/bin/node", TowerLauncher };
     public static readonly string[] Pi = { "node", "/home/me/.legion-control/bin/launcher.mjs" };
 
-    private static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions Indented = new() { WriteIndented = true, MaxDepth = DocumentJson.MaxDepth };
 
     public static JsonObject Root(long revision = 1, IReadOnlyList<string>? lineage = null) => new()
     {
@@ -60,7 +60,7 @@ internal static class LaunchDocuments
     /// peer's edit does.
     public static ControllerDocument Descendant(ControllerDocument parent, Action<JsonObject> change)
     {
-        var root = (JsonObject)JsonNode.Parse(parent.Text)!;
+        var root = (JsonObject)JsonNode.Parse(parent.Text, documentOptions: DocumentJson.Nesting)!;
         change(root);
         var controller = (JsonObject)root["controller"]!;
         controller["revision"] = parent.Identity.RevisionNumber + 1;
@@ -1042,6 +1042,59 @@ public class LaunchGateTests
         // Nothing but the launch values moved.
         Assert.Equal(d1.Identity.RevisionNumber, document.Identity.RevisionNumber);
         Assert.Equal("Tower", document.Decoded.Machine("tower")!.Name);
+    }
+
+    [Fact]
+    public void ADocumentAsDeepAsAcceptanceAllowsIsRevertedAndMigratedLikeAnyOther()
+    {
+        // A key nobody knows, inside the system a revert changes, nested as deep as section 9.7
+        // lets this app hold a document. The readers that change a document stopped at 64 levels,
+        // so a document accepted here could not be changed here.
+        using var home = new TempHome();
+        var root = LaunchDocuments.Root();
+        JsonNode deep = new JsonArray();
+        for (var level = 6; level < DocumentJson.MaxDepth; level += 1) deep = new JsonArray(deep);
+        LaunchDocuments.System(root, "pi", "linux")["future"] = deep;
+        var d0 = LaunchDocuments.Of(root);
+        Assert.Equal(DocumentJson.MaxDepth, DepthOf(d0.Text));
+        var accepted = DocumentAcceptance.Check(d0.Bytes, Intake.Peer);
+        Assert.True(accepted.Valid, accepted.Sentence);
+
+        var record = LaunchRecord.Seeded(LaunchProjection.Of(d0), d0.Hash);
+        var d1 = LaunchDocuments.Descendant(d0, edited => LaunchDocuments.System(edited, "pi", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "id"));
+        var (reverted, problem) = LaunchGate.Reverted(d1, Assert.Single(LaunchValues.Review(record, LaunchProjection.Of(d1))));
+        Assert.Null(problem);
+        Assert.Empty(LaunchValues.Review(record, LaunchProjection.Of(ControllerDocument.FromText(reverted!))));
+        Assert.Equal(DocumentJson.MaxDepth, DepthOf(reverted!));
+
+        using var app = Device(home, "a", applied: d0);
+        var (migrated, migrateProblem, refused) = app.MigrateAgentCommand("tower", "linux",
+            new[] { "/usr/bin/node", "/home/me/.legion-control/bin/launcher.mjs" }, d0.Hash);
+        Assert.Null(migrateProblem);
+        Assert.Empty(refused);
+        Assert.Equal(DocumentJson.MaxDepth, DepthOf(migrated!.Text));
+    }
+
+    /// How deeply a document's objects and arrays nest, the document itself counted.
+    private static int DepthOf(string text)
+    {
+        int depth = 0, deepest = 0;
+        for (var index = 0; index < text.Length; index += 1)
+        {
+            switch (text[index])
+            {
+                case '"':
+                    for (index += 1; text[index] != '"'; index += text[index] == '\\' ? 2 : 1) { }
+                    break;
+                case '{' or '[':
+                    deepest = Math.Max(deepest, depth += 1);
+                    break;
+                case '}' or ']':
+                    depth -= 1;
+                    break;
+            }
+        }
+        return deepest;
     }
 
     // MARK: editors

@@ -218,7 +218,7 @@ public sealed class AppModel : IDisposable
     {
         if (Config.Document is not { } document || document.Hash != baseHash)
             return (null, null, new[] { new LaunchGate.EditProblem(ConfigStore.MovedOn) });
-        var root = JsonNode.Parse(document.Text) as JsonObject;
+        var root = JsonNode.Parse(document.Text, documentOptions: DocumentJson.Nesting) as JsonObject;
         if (LaunchGate.Find(LaunchGate.Find(root, "machines", machineId), "systems", systemId) is not { } system)
             return (null, $"{LaunchValues.SystemPath(machineId, systemId)} is no longer in the setup.", Array.Empty<LaunchGate.EditProblem>());
         system["agent"] = new JsonArray(agent.Select(item => (JsonNode)item!).ToArray());

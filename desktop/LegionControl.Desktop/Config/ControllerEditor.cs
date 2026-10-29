@@ -34,7 +34,7 @@ public static class ControllerEditor
         JsonObject root;
         try
         {
-            root = JsonNode.Parse(string.IsNullOrWhiteSpace(currentText) ? "{}" : currentText) as JsonObject
+            root = JsonNode.Parse(string.IsNullOrWhiteSpace(currentText) ? "{}" : currentText, documentOptions: DocumentJson.Nesting) as JsonObject
                    ?? new JsonObject();
         }
         catch (JsonException error)

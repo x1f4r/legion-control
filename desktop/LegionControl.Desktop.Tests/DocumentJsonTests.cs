@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
@@ -92,6 +91,39 @@ public class DocumentJsonTests
             index /= digits.Length;
         } while (index > 0);
         return name.ToString();
+    }
+
+    [Fact]
+    public void ReadsAndEditsADocumentAsDeepAsItAccepts()
+    {
+        // Section 9.7 lets a key nobody knows hold anything, nested as deep as its writer liked.
+        // This client refused a document 65 levels deep, which validate.mjs and the agent read, and
+        // the readers it edits documents with stopped at 64. A document accepted here has to open
+        // in every one of them.
+        var deepest = Deep(DocumentJson.MaxDepth);
+        Assert.True(DocumentAcceptance.Check(deepest, Intake.Peer).Valid, DocumentAcceptance.Check(deepest, Intake.Peer).Sentence);
+        Assert.Equal(deepest, DocumentJson.Print(DocumentJson.Parse(deepest)));
+        var document = ControllerDocument.FromText(deepest);
+        Assert.Equal("setup-a", document.Identity.Id);
+        Assert.Equal("pi", Assert.Single(document.Decoded.Machines).Id);
+
+        var plan = ControllerEditor.Plan(deepest, document.Decoded, "rename", root => root["machines"]![0]!["name"] = "Renamed");
+        Assert.True(plan.IsApplicable, string.Join(" ", plan.Problems));
+        Assert.Equal(deepest.Replace("\"Beacon\"", "\"Renamed\""), plan.Text);
+
+        // One level deeper is no document at all, under every intake.
+        Assert.Equal("not-a-json-object", Canonical.Rejection(Encoding.UTF8.GetBytes(Deep(DocumentJson.MaxDepth + 1))));
+    }
+
+    /// [of], or a valid document of its own, with an array [levels] down, counting the document
+    /// itself, under a key nobody knows. Written the way JSON.stringify(document, null, 2) writes it.
+    internal static string Deep(int levels, ControllerDocument? of = null)
+    {
+        var root = (DocumentObject)DocumentJson.Parse((of ?? Documents.Make("setup-a", 1, Array.Empty<string>())).Text);
+        DocumentValue nested = new DocumentArray();
+        for (var level = 2; level < levels; level += 1) nested = new DocumentArray(new[] { nested });
+        root.Set("deep", nested);
+        return DocumentJson.Print(root);
     }
 
     [Fact]

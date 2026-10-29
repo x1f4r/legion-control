@@ -126,10 +126,17 @@ public sealed class DocumentLiteral : DocumentValue
 /// document goes through [Print] or [Write].
 public static class DocumentJson
 {
-    /// How deeply a document may nest. The .NET readers the rest of this app edits documents with
-    /// stop at 64 levels, so a deeper one could be accepted here and then not be edited at all; a
-    /// setup needs six.
-    public const int MaxDepth = 64;
+    /// How deeply a document may nest: an object or an array 512 levels down is read, and one more
+    /// is not. Section 12 sets no limit and validate.mjs reads any depth, but every reader stops
+    /// somewhere: the reference merge's own parser runs out of stack a few thousand levels down,
+    /// and a walk over a tree on a thread with a megabyte of stack has to stop well before that. So
+    /// this is the one limit this client has. Every System.Text.Json reader and writer it opens a
+    /// document with is given the same ([Nesting]), so a document accepted here can be edited
+    /// here, and every walk over a tree is safe to this depth. A setup needs six.
+    public const int MaxDepth = 512;
+
+    /// The options every System.Text.Json reader of a setup document is opened with.
+    public static readonly JsonDocumentOptions Nesting = new() { MaxDepth = MaxDepth };
 
     /// Why a text is not one JSON value, with where it went wrong.
     public sealed class Malformed(string message) : Exception(message);

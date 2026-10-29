@@ -34,7 +34,10 @@ public readonly struct Value
             {
                 AllowTrailingCommas = true,
                 CommentHandling = JsonCommentHandling.Skip,
-                MaxDepth = 128,
+                // As deep as the transport reads a reply (AttemptClassifier.JsonObjectSlice), which
+                // is deeper than any setup document this app holds with the config reply around it.
+                // The reader keeps no stack of its own, so the depth costs nothing.
+                MaxDepth = 4096,
             });
             // The document is disposed on the way out of this method, so the element has to be
             // cloned or every later read is a use-after-free.

@@ -21,7 +21,7 @@ public static class LaunchGate
         IReadOnlyList<LaunchReviewEntry> Review,
         IReadOnlyList<EffectiveLaunch> Launches);
 
-    private static readonly JsonSerializerOptions Writing = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions Writing = new() { WriteIndented = true, MaxDepth = DocumentJson.MaxDepth };
 
     /// Shown escaped, never as they are, when a value holds a character [LaunchValues.IsLaunchText]
     /// refuses: a person cannot see a bidirectional override, only what it does to the text after it.
@@ -106,7 +106,7 @@ public static class LaunchGate
         JsonObject root;
         try
         {
-            root = JsonNode.Parse(document.Text) as JsonObject ?? throw new JsonException("not an object");
+            root = JsonNode.Parse(document.Text, documentOptions: DocumentJson.Nesting) as JsonObject ?? throw new JsonException("not an object");
         }
         catch (JsonException error)
         {
@@ -152,7 +152,7 @@ public static class LaunchGate
 
     private static string? GrammarOf(JsonObject system)
     {
-        using var parsed = JsonDocument.Parse(system.ToJsonString());
+        using var parsed = JsonDocument.Parse(system.ToJsonString(), DocumentJson.Nesting);
         return LaunchProjection.TupleOf(parsed.RootElement).Grammar;
     }
 
