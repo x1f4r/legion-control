@@ -47,7 +47,7 @@ class SetupEditorLaunchTest {
         val editor = editor(enrolled())
 
         assertNotNull(editor.addSystem("tower", "mac", "macOS", "mac", emptyList()))
-        assertNotNull(editor.addSystem("tower", "mac", "macOS", "mac", listOf("/usr/bin/node", "/Users/me/​launcher.mjs")))
+        assertNotNull(editor.addSystem("tower", "mac", "macOS", "mac", listOf("/usr/bin/node", "/Users/me/\u200Blauncher.mjs")))
         assertFalse(editor.hasChanges)
 
         assertNull(editor.addSystem("tower", "mac", "macOS", "mac", argvOf(" /usr/local/bin/node   /Users/me/.legion-control/bin/launcher.mjs ")))
@@ -57,12 +57,23 @@ class SetupEditorLaunchTest {
 
     @Test
     fun `a command emptied in the editor cannot be applied`() {
-        val editor = editor(enrolled())
-        editor.setSystemAgent("tower", "linux", "   ")
+        val store = enrolled()
+        val held = store.text.value
+        // Empty, and one a person could not check by reading it. The store's own checks let the
+        // second through, so the editor is what refuses it, whatever presses Apply.
+        for (line in listOf("   ", "/usr/bin/node /home/me/\u200B.legion-control/bin/launcher.mjs")) {
+            val editor = editor(store)
+            editor.setSystemAgent("tower", "linux", line)
 
-        assertFalse(editor.isValid)
-        assertNotNull(editor.problem)
-        assertTrue(editor.commandProblem!!.startsWith("linux on tower: "))
+            assertFalse(line, editor.isValid)
+            assertNotNull(line, editor.problem)
+            assertTrue(line, editor.commandProblem!!.startsWith("linux on tower: "))
+            assertFalse(line, editor.apply())
+            assertEquals(line, editor.commandProblem, editor.error)
+            assertTrue(line, editor.hasChanges)
+            assertEquals(line, held, store.text.value)
+            assertEquals(line, emptyList<String>(), store.launch.value.review.map { it.path })
+        }
     }
 
     @Test

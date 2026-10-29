@@ -380,9 +380,17 @@ class SetupEditorModel(
      * It becomes this device's document at once and is published on the next poll of every machine
      * that will take it. Nothing is sent from here: publishing is reconciliation's job, and doing it
      * here would mean an edit made with no machine in reach was not an edit.
+     *
+     * A command this edit writes that [agentProblem] refuses is refused here too, and not only by a
+     * button that is off: the store's own checks let an invisible character through, and applying
+     * the edit would approve it on this device.
      */
     fun apply(): Boolean {
         val document = working ?: return false
+        commandProblem?.let { problem ->
+            error = problem
+            return false
+        }
         val failure = services.applyEdit(document, services.deviceName())
         if (failure != null) {
             error = failure
