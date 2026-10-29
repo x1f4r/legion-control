@@ -624,6 +624,60 @@ public class WakeTests
     }
 
     [Fact]
+    public async Task WithTheHeldHelperTheOnlyOneThereIsNoOtherHelperToTryAndTheHoldStands()
+    {
+        // Going past the only helper's hold asks nobody, and the next ordinary press would then run
+        // the command the confirmation said is not run again. So it is not offered, and asking for
+        // it anyway changes nothing.
+        using var home = new TempHome();
+        var runner = HeldOnPi();
+        var onlyPi = JsonNode.Parse(Fleet)!.AsObject();
+        onlyPi["machines"]![2]!["wake"]!["helpers"]!.AsArray().RemoveAt(1);
+        using var app = Device(home, onlyPi.ToJsonString(), runner);
+        var tower = app.Machine("tower")!;
+
+        await app.WakeAsync(tower);
+        Assert.Equal(1, Runs(runner, "pi"));
+        Assert.True(app.PlanWake(tower).IsHeld);
+        Assert.Null(app.PlanOtherHelpers(tower));
+
+        var others = await app.WakeAsync(tower, tryOtherHelpers: true);
+        Assert.False(others.AnythingTried);
+        Assert.Contains("No other helper", others.Sentence);
+        Assert.Single(app.Tracker.WakeHoldsFor("tower"));
+
+        // The hold stands, so the next press still holds pi's command back once pi answers again.
+        AMinuteLater(app.Machine("pi")!);
+        await app.WakeAsync(tower);
+        Assert.Equal(1, Runs(runner, "pi"));
+        Assert.Single(app.Tracker.WakeHoldsFor("tower"));
+    }
+
+    [Fact]
+    public void TheOtherHelpersAreOnlyThoseAHoldKeepsBack()
+    {
+        var config = Config();
+        var presence = SitePresence.Decide(config, Bindings.Empty, Array.Empty<string>());
+        var ready = new Dictionary<string, HelperState>(StringComparer.Ordinal)
+        {
+            ["pi"] = new(HelperReadiness.Ready, new Dictionary<string, string?> { ["wake-tower"] = "command" }),
+            ["nas"] = new(HelperReadiness.Ready, new Dictionary<string, string?> { ["wake-tower"] = "command" }),
+        };
+        var holds = new[] { new WakeHold("pi", "wake-tower") };
+        var held = WakePlanner.Plan(config, "tower", presence, ready, holds);
+        var unheld = WakePlanner.Plan(config, "tower", presence, ready, Array.Empty<WakeHold>());
+        var others = WakePlanner.OtherHelpers(held, unheld, holds, "Tower");
+        Assert.Equal(new[] { "nas" }, others!.Steps.Cast<WakeStep.ViaHelper>().Select(step => step.Helper.Machine));
+
+        // A wol on nas runs while the hold stands, so going past the hold would add nobody.
+        ready["nas"] = new(HelperReadiness.Ready, new Dictionary<string, string?> { ["wake-tower"] = "wol" });
+        held = WakePlanner.Plan(config, "tower", presence, ready, holds);
+        unheld = WakePlanner.Plan(config, "tower", presence, ready, Array.Empty<WakeHold>());
+        Assert.Null(WakePlanner.OtherHelpers(held, unheld, holds, "Tower"));
+        Assert.Null(WakePlanner.OtherHelpers(unheld, unheld, Array.Empty<WakeHold>(), "Tower"));
+    }
+
+    [Fact]
     public async Task DrawingTheWakeMenuLeavesWhereThisDeviceIsAloneAndAWakePlacesItAgain()
     {
         // The menu plans on every rebuild of the window. Reading every interface there, and moving

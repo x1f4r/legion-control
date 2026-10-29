@@ -668,23 +668,32 @@ public static class Runner
     {
         var machine = Pick(app, line, output);
         if (machine is null) return Failed;
-        var others = line.Has("try-other-helpers");
         await app.ReleaseWakeHoldsAsync(machine, token);
         var plan = app.PlanWake(machine, refreshPresence: true);
-        output.WriteLine(plan.Sentence(machine.Name));
-        foreach (var obstacle in plan.Obstacles) output.WriteLine($"  {obstacle}");
-        foreach (var offer in plan.OfferToWakeFirst) output.WriteLine($"  \"{offer}\" could be woken first, as a separate step.");
-        if (plan.IsHeld && !others)
+        // --try-other-helpers goes past a hold only when another helper is there to ask. Past the
+        // only one, it would run nothing, and leave the held command free to run again later.
+        var others = plan.IsHeld ? app.PlanOtherHelpers(machine) : null;
+        var goPast = line.Has("try-other-helpers") && others is not null;
+        var walked = goPast ? others! : plan;
+        output.WriteLine(walked.Sentence(machine.Name));
+        foreach (var obstacle in walked.Obstacles) output.WriteLine($"  {obstacle}");
+        foreach (var offer in walked.OfferToWakeFirst) output.WriteLine($"  \"{offer}\" could be woken first, as a separate step.");
+        if (line.Has("try-other-helpers") && plan.IsHeld && others is null)
+        {
+            output.WriteLine($"  {WakePlanner.NoOtherHelper(machine.Name)}");
+            return Failed;
+        }
+        if (!goPast && others is not null)
         {
             output.WriteLine("  A helper command run for it earlier may still be going. Add --try-other-helpers to run the other helpers' commands anyway.");
         }
-        if (plan.IsEmpty && !(others && plan.IsHeld)) return Failed;
+        if (walked.IsEmpty) return Failed;
         if (!line.Has("yes"))
         {
             output.WriteLine("Add --yes to actually try it.");
             return Ok;
         }
-        var report = await app.WakeAsync(machine, tryOtherHelpers: others, cancellationToken: token);
+        var report = await app.WakeAsync(machine, tryOtherHelpers: goPast, cancellationToken: token);
         foreach (var attempt in report.Attempts) output.WriteLine($"  {attempt}");
         output.WriteLine(report.Sentence);
         return report.Confirmed ? Ok : NotKnown;

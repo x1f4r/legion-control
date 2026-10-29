@@ -531,8 +531,11 @@ public sealed class MainWindow : Window
             foreach (var helperId in plan.OfferToWakeFirst)
                 if (_app.Machine(helperId) is { } helper)
                     wake.Add(Ui.MenuAction("Wake " + helper.Name + " first", () => Wake(helper)));
-            // Only a person lifts a hold: the command held may still be running on its helper.
-            if (plan.IsHeld) wake.Add(Ui.MenuAction("Try the other helpers", () => TryOtherHelpers(machine)));
+            // Only a person lifts a hold: the command held may still be running on its helper. And
+            // only for another helper to ask: going past the only one would run nothing, and leave
+            // its command free to run again on the next press.
+            if (plan.IsHeld && _app.PlanOtherHelpers(machine) is not null)
+                wake.Add(Ui.MenuAction("Try the other helpers", () => TryOtherHelpers(machine)));
             wake.Add(Ui.MenuAction("Wake details", () => Sheets.Text(this, "Wake", plan.Sentence(machine.Name) + "\n" + string.Join("\n", plan.Obstacles))));
             items.Add(new MenuItem { Header = "Wake options", ItemsSource = wake });
         }

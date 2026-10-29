@@ -254,6 +254,24 @@ public static class WakePlanner
         return plan with { Steps = plan.Steps.Where(step => !Passed(step)).ToList(), Skipped = skipped.ToList() };
     }
 
+    /// What a person trying the other helpers walks: [unheld], the plan as if nothing were held,
+    /// without the helper steps of [holds]. Null unless that asks a helper [held], the plan as it
+    /// stands, skips for a hold. With the held helper the only one, going past its hold would ask
+    /// nobody new, and the next ordinary press would run the held command a second time.
+    public static WakePlan? OtherHelpers(WakePlan held, WakePlan unheld, IReadOnlyList<WakeHold> holds, string targetName)
+    {
+        if (holds.Count == 0) return null;
+        var others = Without(unheld, holds, targetName);
+        var heldBack = held.Skipped.Where(skip => skip.Reason == WakeSkip.Held).Select(skip => (skip.Machine, skip.Action)).ToHashSet();
+        return others.Steps.OfType<WakeStep.ViaHelper>().Any(step => heldBack.Contains((step.Helper.Machine, step.Helper.Action)))
+            ? others
+            : null;
+    }
+
+    /// What to say when a person asks for the other helpers and there is none to ask.
+    public static string NoOtherHelper(string targetName) =>
+        $"No other helper could be asked to wake {targetName}. The helper command run for it earlier may still be going, so it is not run again, and its hold stands.";
+
     public static string SkipSentence(string reason, string targetName, WakeHelper entry, string helperName) => reason switch
     {
         WakeSkip.Missing => $"The helper \"{entry.Machine}\" is not a machine in this setup.",

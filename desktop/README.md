@@ -189,7 +189,9 @@ its own operation history, says so under the machine's name, and runs no other h
 it until the helper's record says it finished, the helper has no such operation, the machine
 answers, or the helper leaves the setup. Time, a restart and the helper being away never release a
 hold. "Try the other helpers" in the wake options, or `--try-other-helpers` beside `--yes`, is a
-person choosing to go past it; the held command is not run again.
+person choosing to go past it; the held command is not run again. It is there only while the hold
+keeps another helper back: going past the only one would ask nobody, and leave the held command
+free to run again on the next press, so then the hold stands and the app says there is no other.
 
 ## Trust
 

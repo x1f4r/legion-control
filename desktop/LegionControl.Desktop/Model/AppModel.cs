@@ -353,6 +353,21 @@ public sealed class AppModel : IDisposable
     public WakePlan PlanWake(MachineModel target, bool refreshPresence = false)
     {
         if (refreshPresence) RefreshPresence();
+        return Plan(target, WakeHoldsFor(target));
+    }
+
+    /// What trying the other helpers for a machine would walk, or null when it would ask no helper
+    /// that a hold keeps back now: then there is nothing to offer, and no hold to go past.
+    public WakePlan? PlanOtherHelpers(MachineModel target)
+    {
+        var holds = WakeHoldsFor(target);
+        return holds.Count == 0
+            ? null
+            : WakePlanner.OtherHelpers(Plan(target, holds), Plan(target, Array.Empty<WakeHold>()), holds, target.Name);
+    }
+
+    private WakePlan Plan(MachineModel target, IReadOnlyList<WakeHold> holds)
+    {
         var machines = Machines;
         // A model the window still draws in the moment after its machine left the setup is planned
         // as the only machine there is, rather than not at all.
@@ -364,7 +379,7 @@ public sealed class AppModel : IDisposable
             target.Id,
             Presence,
             machines.ToDictionary(machine => machine.Id, HelperState.Of, StringComparer.Ordinal),
-            WakeHoldsFor(target));
+            holds);
     }
 
     /// The wake holds recorded for a machine, as the plan reads them.
@@ -395,14 +410,20 @@ public sealed class AppModel : IDisposable
     /// [tryOtherHelpers] is a person's explicit decision to run the other helpers' commands while
     /// one may still be running: it releases the holds for the machine that are still standing once
     /// their records were read, and nothing else ever does that on their behalf. The helpers those
-    /// holds were on are not asked in this walk; the others are.
+    /// holds were on are not asked in this walk; the others are. When a hold keeps back no other
+    /// helper, nothing is walked and the hold stands: releasing it would ask nobody new, and leave
+    /// the held command free to run a second time on the next press.
     public async Task<WakeReport> WakeAsync(
         MachineModel target, bool tryOtherHelpers = false, CancellationToken cancellationToken = default)
     {
         await ReleaseWakeHoldsAsync(target, cancellationToken);
-        var passed = tryOtherHelpers ? WakeHoldsFor(target) : Array.Empty<WakeHold>();
-        if (passed.Count > 0) Tracker.ReleaseWakeHolds(target.Id, DateTimeOffset.MaxValue);
-        var plan = WakePlanner.Without(PlanWake(target, refreshPresence: true), passed, target.Name);
+        var plan = PlanWake(target, refreshPresence: true);
+        if (tryOtherHelpers && plan.IsHeld)
+        {
+            if (PlanOtherHelpers(target) is not { } others) return WakeReport.NothingToTry(WakePlanner.NoOtherHelper(target.Name));
+            Tracker.ReleaseWakeHolds(target.Id, DateTimeOffset.MaxValue);
+            plan = others;
+        }
         var report = await new WakeRunner(Tracker).RunAsync(
             target, plan,
             Machines.ToDictionary(machine => machine.Id, machine => machine, StringComparer.Ordinal),
