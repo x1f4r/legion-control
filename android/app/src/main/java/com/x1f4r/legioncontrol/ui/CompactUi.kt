@@ -63,7 +63,7 @@ internal fun MenuAction(label: String, enabled: Boolean = true, close: () -> Uni
 /** Unknown activity is kept distinct from observed work even when the safety gate reports busy. */
 internal fun compactActivityState(busy: com.x1f4r.legioncontrol.agent.BusyStatus?): String? = when {
     busy?.isUnknown == true -> "Activity unknown"
-    busy?.monitored == false || busy?.evidence == "unmonitored" -> "Not monitored"
+    busy?.isUnmonitored == true -> "Not monitored"
     busy?.isBusy == true -> "Busy"
     else -> null
 }

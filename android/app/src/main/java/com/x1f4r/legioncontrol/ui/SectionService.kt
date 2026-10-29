@@ -433,7 +433,7 @@ private fun ActivityVerdict(busy: BusyStatus?) {
             "Cannot tell: " + (busy.error ?: "the agent could not read the probe"),
         )
 
-        busy.monitored == false || busy.evidence == "unmonitored" -> StatusLine(Mark.Unknown, "Not monitored")
+        busy.isUnmonitored -> StatusLine(Mark.Unknown, "Not monitored")
 
         busy.isBusy -> StatusLine(Mark.Busy, busy.summary)
         else -> StatusLine(Mark.Idle, "Idle")

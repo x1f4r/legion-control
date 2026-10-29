@@ -69,9 +69,9 @@ data class BusyStatus(
     /**
      * v3: whether anything is watching this service at all.
      *
-     * A service with no busy configuration is not idle, it is
-     * unwatched, and a disruptive change against it is a guess. False here is a warning, not a
-     * verdict.
+     * Not what decides the warning: see [isUnmonitored]. Agents before 3.1.0 also say false for a
+     * service declared never busy, and for a machine with no services, neither of which is
+     * unwatched.
      */
     val monitored: Boolean? = null,
 
@@ -85,15 +85,26 @@ data class BusyStatus(
     /** True when the answer is "cannot tell", which blocks exactly as busy does. */
     val isUnknown: Boolean get() = unknown == true
 
+    /**
+     * Whether nothing is watching this service: the agent said its evidence is `unmonitored`.
+     *
+     * A service with no busy configuration is not idle, it is unwatched, and a disruptive change
+     * against it is a guess, which is worth a warning. A service declared never busy reads `none`
+     * and is idle by design. Agents before 3.1.0 send `monitored: false` for it as well, which is why
+     * this reads the evidence and not that flag: on the flag alone every such service, and every
+     * machine with no services at all, was warned about.
+     */
+    val isUnmonitored: Boolean get() = evidence == "unmonitored"
+
     /** True only when something actually looked and found nothing running. */
-    val isIdleForSure: Boolean get() = busy == false && unknown != true && monitored != false
+    val isIdleForSure: Boolean get() = busy == false && unknown != true && !isUnmonitored
 
     val summary: String
         get() = reason?.takeIf { it.isNotBlank() }
             ?: when {
                 isUnknown -> "cannot tell"
                 isBusy -> "working"
-                monitored == false -> "not monitored"
+                isUnmonitored -> "not monitored"
                 else -> "idle"
             }
 }
