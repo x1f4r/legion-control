@@ -914,6 +914,36 @@ struct ConfigTests {
         #expect(Bindings.problems(in: Data(#"{"knownHostsFile":"~/kh","machines":{"pi":{"sshAlias":"pi","port":2222}}}"#.utf8)).isEmpty)
     }
 
+    @Test("a bindings file refused at launch is never written over, and is edited as it is once fixed")
+    func refusedBindingsAreNotWrittenOver() throws {
+        let home = try Self.temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let url = home.appending(path: "bindings.json")
+        // Everything this device knows about itself, and one key this build refuses.
+        let refused = Data(#"{"self":{"machine":"tower"},"identityFile":"~/.ssh/legion","machines":{"pi":{"sshAlias":"pi"}},"localAgent":{"argv":["node","/a.mjs"],"shell":"cmd"}}"#.utf8)
+        try refused.write(to: url)
+        let store = BindingsStore(url: url)
+        #expect(store.bindings == .empty)
+        #expect(store.isRefused)
+
+        // Picking a site used to write `.empty` plus the site over all of it.
+        let refusal = store.update { $0.currentSite = "home" }
+        #expect(refusal?.contains("Nothing was saved") == true)
+        #expect(try Data(contentsOf: url) == refused)
+        #expect(store.bindings.currentSite == nil)
+
+        // Fixed by hand, the file is read again and the change lands on what it holds.
+        try Data(#"{"self":{"machine":"tower"},"identityFile":"~/.ssh/legion","machines":{"pi":{"sshAlias":"pi"}},"localAgent":{"argv":["node","/a.mjs"]}}"#.utf8)
+            .write(to: url)
+        #expect(store.update { $0.currentSite = "home" } == nil)
+        let reopened = BindingsStore(url: url)
+        #expect(!reopened.isRefused)
+        #expect(reopened.bindings.isSelf("tower"))
+        #expect(reopened.bindings.identityFile == "~/.ssh/legion")
+        #expect(reopened.bindings.machines?["pi"]?.sshAlias == "pi")
+        #expect(reopened.bindings.currentSite == "home")
+    }
+
     @Test("private bindings retire the deprecated shared local block on this device")
     func bindingsReplaceSharedLocal() throws {
         let home = try Self.temporaryHome()

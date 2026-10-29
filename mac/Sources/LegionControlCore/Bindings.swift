@@ -151,6 +151,9 @@ final class BindingsStore {
     private(set) var isPresent = false
     /// Why the file could not be read or written, when that happened.
     private(set) var problem: String?
+    /// True while the file on disk is one this build does not use, so `bindings` are the ones from
+    /// before it, or none at all when it was refused at launch.
+    private(set) var isRefused = false
 
     let url: URL
 
@@ -177,6 +180,7 @@ final class BindingsStore {
             bindings = .empty
             isPresent = false
             problem = nil
+            isRefused = false
             return
         }
         isPresent = true
@@ -184,20 +188,34 @@ final class BindingsStore {
         guard problems.isEmpty else {
             // Kept as it was, for the same reason as a file that does not decode.
             problem = "\(path) is not used, so this device's private settings are the ones from before it. \(problems.joined(separator: " "))"
+            isRefused = true
             return
         }
         do {
             bindings = try JSONDecoder().decode(Bindings.self, from: data)
             problem = nil
+            isRefused = false
         } catch {
             // Kept as it was rather than reset. A broken bindings file is a file someone is editing,
             // and throwing away which machine this device is would be a surprising way to react.
             problem = "\(path) could not be read, so this device's private settings are the ones from before it. \(error.localizedDescription)"
+            isRefused = true
         }
     }
 
+    /// Change one thing and write the file back.
+    ///
+    /// The file is read again first, and the change is made to what it holds now. A file this
+    /// build refuses is left exactly as it is. It used to be written over from memory, which is
+    /// nothing at all when the file was refused at launch, so picking a site in a menu threw away
+    /// which machine this device is, its keys and every override, in a file that was waiting only
+    /// for one key to be fixed.
     @discardableResult
     func update(_ change: (inout Bindings) -> Void) -> String? {
+        reloadIfChanged()
+        if isRefused {
+            return "Nothing was saved, because saving would write over \(path), which this device is not using. Fix or remove it first."
+        }
         var edited = bindings
         change(&edited)
         do {
