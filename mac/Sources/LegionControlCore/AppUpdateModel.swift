@@ -251,6 +251,7 @@ final class AppUpdateModel {
 
     /// Why this run may not change which build is installed: install, roll back or discard.
     var swapBlockedReason: String? {
+        if let sibling = AppUpdates.siblingReason(for: bundleURL) { return sibling }
         guard isIsolatedRun else { return nil }
         return "This run was pointed at its own home with LEGION_CONTROL_HOME or LEGION_CONTROL_CONFIG, so it does not install, roll back or discard builds of the app. Do that from an ordinary run."
     }

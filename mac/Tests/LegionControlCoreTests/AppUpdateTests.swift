@@ -733,6 +733,29 @@ struct AppUpdateTests {
         try Self.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "1.3.0")
         #expect(AppUpdates.retainedPrevious(beside: current) == previous)
         #expect(AppUpdates.version(ofBundleAt: previous) == "1.3.0")
+        // A copy started from the kept bundle itself has nothing kept beside it, however its URL is
+        // spelled.
+        #expect(AppUpdates.retainedPrevious(beside: previous) == nil)
+        #expect(AppUpdates.retainedPrevious(beside: root.appending(path: "Legion Control.previous.app", directoryHint: .isDirectory)) == nil)
+    }
+
+    @Test("a copy running from the kept or staged bundle is never staged over")
+    func stageRefusesSibling() async throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifact = ReleaseTrust.Manifest.Artifact(name: AppUpdates.assetName, sha256: String(repeating: "a", count: 64), size: 1)
+        let download = AppUpdates.Download(directory: root, archive: root.appending(path: AppUpdates.assetName),
+                                           manifest: .init(schema: 1, version: "1.4.0", artifacts: [artifact]), artifact: artifact)
+        #expect(AppUpdates.siblingReason(for: root.appending(path: "Legion Control.app")) == nil)
+        for name in [AppUpdates.previousName, AppUpdates.stagedName] {
+            let running = root.appending(path: name, directoryHint: .isDirectory)
+            try Self.makeBundle(at: running, identifier: "id", executable: "LegionControl", version: "1.3.0")
+            #expect(AppUpdates.siblingReason(for: running) != nil)
+            await #expect(throws: AppUpdates.InstallFailure.self) {
+                try await AppUpdates.stage(download, version: "1.4.0", replacing: running)
+            }
+            #expect(AppUpdates.version(ofBundleAt: running) == "1.3.0")
+        }
     }
 
     @Test("only an outcome naming a swap is read as one")

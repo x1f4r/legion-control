@@ -697,4 +697,34 @@ struct AppUpdateModelTests {
         model.discardPrevious()
         #expect(model.failure == nil)
     }
+
+    @Test("a copy started from the kept build neither discards, goes back to nor installs over itself")
+    func copyRunningFromKeptBuild() async throws {
+        let (model, _, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try AppUpdateTests.makeBundle(at: model.bundleURL, identifier: "id", executable: "LegionControl", version: "3.0.0")
+        let previous = directory.appending(path: "Legion Control.previous.app")
+        try AppUpdateTests.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "2.9.0")
+        // As Bundle.main spells it, with a trailing slash.
+        model.bundleURL = directory.appending(path: "Legion Control.previous.app", directoryHint: .isDirectory)
+        model.fetchRelease = { _, _ in .available(Self.release) }
+        model.checkNow()
+        await settle(model)
+        var downloads = 0
+        var swaps = 0
+        model.downloadRelease = { _ in downloads += 1; throw AppUpdates.InstallFailure("not reached") }
+        model.performSwap = { _, _, _, _, _ in swaps += 1 }
+        model.quit = { Issue.record("quit from the kept build") }
+
+        #expect(model.rollbackVersion == nil)
+        #expect(model.installBlockedReason?.contains("Legion Control.previous.app") == true)
+        model.discardPrevious()
+        model.rollBack()
+        model.install()
+        await settle(model)
+        #expect(downloads == 0)
+        #expect(swaps == 0)
+        #expect(AppUpdates.version(ofBundleAt: previous) == "2.9.0")
+        #expect(AppUpdates.version(ofBundleAt: directory.appending(path: "Legion Control.app")) == "3.0.0")
+    }
 }

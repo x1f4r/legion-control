@@ -443,6 +443,7 @@ enum AppUpdates {
         guard bundleURL.pathExtension == "app" else {
             throw InstallFailure("Legion Control is not running out of an app bundle, so there is nothing to replace. Build and install it with mac/build.sh instead.")
         }
+        if let sibling = siblingReason(for: bundleURL) { throw InstallFailure(sibling) }
         let parent = bundleURL.deletingLastPathComponent()
         guard FileManager.default.isWritableFile(atPath: parent.path(percentEncoded: false)) else {
             throw InstallFailure("\(parent.path(percentEncoded: false)) is not writable, so the update cannot be staged. Move Legion Control to a folder you can write to.")
@@ -473,14 +474,14 @@ enum AppUpdates {
                 timeout: 120
             )
 
-            let staged = parent.appending(path: "Legion Control.new.app")
+            let staged = parent.appending(path: stagedName)
             try? FileManager.default.removeItem(at: staged)
             try FileManager.default.moveItem(at: unpacked, to: staged)
             try? FileManager.default.removeItem(at: staging)
 
             return Staged(
                 bundle: staged,
-                previous: parent.appending(path: "Legion Control.previous.app"),
+                previous: parent.appending(path: previousName),
                 version: version
             )
         } catch {
@@ -885,9 +886,27 @@ enum AppUpdates {
     }
 
     /// The bundle kept from the last update, if one is still there.
+    ///
+    /// Never the bundle running now. A copy started straight from the kept bundle, which Spotlight
+    /// finds as readily as the real one, is not a build kept beside itself: going back would hand the
+    /// helper the bundle it runs out of, and discarding would delete it.
     static func retainedPrevious(beside bundleURL: URL) -> URL? {
-        let previous = bundleURL.deletingLastPathComponent().appending(path: "Legion Control.previous.app")
+        let previous = bundleURL.deletingLastPathComponent().appending(path: previousName)
+        guard bundlePath(previous) != bundlePath(bundleURL) else { return nil }
         return FileManager.default.fileExists(atPath: previous.path(percentEncoded: false)) ? previous : nil
+    }
+
+    /// The names the swap gives the two bundles beside the real one: the staged replacement and the
+    /// build kept from the last update.
+    static let stagedName = "Legion Control.new.app"
+    static let previousName = "Legion Control.previous.app"
+
+    /// Why a copy running from `bundleURL` must not swap, when it is one of those two rather than the
+    /// installed app: staging deletes whatever sits at the staged name and the helper whatever sits
+    /// at the kept one, and either would be the bundle it runs out of.
+    static func siblingReason(for bundleURL: URL) -> String? {
+        guard [stagedName, previousName].contains(bundleURL.lastPathComponent) else { return nil }
+        return "Legion Control is running from \(bundleURL.lastPathComponent), a copy beside the installed app, so it does not install, roll back or discard builds. Do that from the installed app."
     }
 
     /// The version of the kept bundle, for the "roll back to X" action.
@@ -902,7 +921,7 @@ enum AppUpdates {
         to previous: URL, current: URL, marker: URL,
         start: (Staged, URL, URL) throws -> Void = { try startSwap(staged: $0, current: $1, marker: $2) }
     ) throws {
-        let staged = current.deletingLastPathComponent().appending(path: "Legion Control.new.app")
+        let staged = current.deletingLastPathComponent().appending(path: stagedName)
         // The helper's own vocabulary: "staged" is what goes in, "previous" is what comes out. Rolling
         // back is the same two renames with the roles swapped.
         try start(
