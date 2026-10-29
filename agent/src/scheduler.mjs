@@ -349,6 +349,8 @@ export async function runCycle(config, options = {}) {
   // half done, so its failure is unknown rather than failed (see the catch).
   let servicesReached = false;
   try {
+    // The cycle's record, and every child's, lives as long as this hold on the lock.
+    updateOperation(id, { lockOwner: lock.opId });
     const transitioning = pendingPowerOperation({ excludeId: id });
     if (transitioning) {
       const result = { ok: false, action: 'conflict', reasonCode: REASON.operationInProgress, message: `operation ${transitioning.id} is awaiting a power transition` };

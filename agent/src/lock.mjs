@@ -122,10 +122,15 @@ function describeHolder(holder) {
  * This applies only to the per-service compatibility file, which is written by
  * something outside this agent and identifies its owner by pid. The agent's own
  * locks are not judged this way at all — the operating system holds those.
+ *
+ * A pid is checked against the time the file says it was taken, where it says
+ * one: a process that holds that id now and started after it did not take it,
+ * and a file it named would otherwise stay held for as long as the id was in
+ * use by somebody else.
  */
 export function holderIsStale(holder) {
   if (!holder) return true;
-  if (Number.isInteger(holder.pid)) return !processIsAlive(holder.pid);
+  if (Number.isInteger(holder.pid)) return !processIsAlive(holder.pid, { startedAt: holder.started ?? null });
   return holder.ageMs > LEGACY_LOCK_STALE_MS;
 }
 
@@ -279,6 +284,8 @@ export function acquireOperationLock({
     message: null,
     lock: {
       file,
+      /** The operation the sidecar names as holding the lock, which a record notes as its evidence of life. */
+      opId,
       compatFile: compat.held ? compat.file : null,
       compatWarning: compat.held || !compat.message ? null : compat.message,
       /** Record the phase in the sidecar so a reader can name what is running. */
@@ -310,24 +317,33 @@ export function acquireOperationLock({
 }
 
 /**
- * Who holds the machine lock right now, or null.
+ * What the mutex says about the machine lock, `held`, `free` or `unknown`,
+ * with the sidecar as it stands, or null where there is none.
  *
  * Read-only in the strictest sense: it never creates the lock database, so a
  * status poll on a machine that has never run an operation leaves no trace.
+ */
+export function probeOperationLock() {
+  const file = operationLockPath();
+  const probe = probeMutex(mutexPath(file));
+  return { state: probe.state, sidecar: readHolder(file), error: probe.error ?? null, hint: probe.hint ?? null };
+}
+
+/**
+ * Who holds the machine lock right now, or null.
+ *
  * `held` comes from the mutex, which is the truth; the sidecar only supplies the
  * detail. A sidecar with no lock behind it is a leftover, and says so.
  */
 export function currentHolder() {
-  const file = operationLockPath();
-  const probe = probeMutex(mutexPath(file));
-  const sidecar = readHolder(file);
-  if (!sidecar && probe.state !== 'held') return null;
+  const { state, sidecar, error, hint } = probeOperationLock();
+  if (!sidecar && state !== 'held') return null;
   return {
     ...(sidecar ?? {}),
-    held: probe.state === 'held',
-    stale: Boolean(sidecar) && probe.state === 'free',
-    lockError: probe.error ?? null,
-    lockHint: probe.hint ?? null,
+    held: state === 'held',
+    stale: Boolean(sidecar) && state === 'free',
+    lockError: error,
+    lockHint: hint,
   };
 }
 

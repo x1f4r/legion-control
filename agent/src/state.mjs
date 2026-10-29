@@ -23,7 +23,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath, stateDir } from './config.mjs';
+import { basePath, runCommand, stateDir } from './config.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
 
 /** How long we are willing to wait for another process to finish its write. */
@@ -52,21 +52,74 @@ export function legacyStatePath() {
 }
 
 /**
+ * How far apart two start times may be and still name the same process. Process
+ * ids are reused, so a record of one is checked against when it started, and
+ * the clocks on either side of that comparison are not read at the same moment.
+ */
+export const SAME_PROCESS_SLACK_MS = 2000;
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * A start time as `ps -o lstart=` prints it in the C locale, "Thu Oct 29
+ * 10:15:42 2026" in local time, in milliseconds; null for anything else.
+ */
+export function parseProcessStart(text) {
+  const match = /^\s*[A-Z][a-z]{2}\s+([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(String(text ?? ''));
+  const month = match ? MONTHS.indexOf(match[1]) : -1;
+  if (month < 0) return null;
+  const [day, hours, minutes, seconds, year] = match.slice(2).map(Number);
+  return new Date(year, month, day, hours, minutes, seconds).getTime();
+}
+
+/** When this process started, as a record keeps it beside the pid. */
+export function ownStartTime() {
+  return new Date(Date.now() - process.uptime() * 1000).toISOString();
+}
+
+/**
+ * When a process started, in milliseconds, or null when nothing here can say.
+ *
+ * ps prints the time in the format of its locale, and an ssh session passes on
+ * whatever locale its client had, so it is always asked in the C locale.
+ * Windows has no ps; CIM keeps the creation date of every process.
+ */
+export function processStartTime(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (process.platform === 'win32') {
+    const script = `$process = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = ${pid}'; ` +
+      'if ($process.CreationDate) { ([DateTimeOffset]$process.CreationDate).ToUnixTimeMilliseconds() }';
+    const result = runCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { timeoutMs: 15000 });
+    const text = result.ok ? result.stdout.trim() : '';
+    return /^[0-9]+$/.test(text) ? Number(text) : null;
+  }
+  const result = runCommand('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], { timeoutMs: 5000, env: { ...process.env, LC_ALL: 'C' } });
+  return result.ok ? parseProcessStart(result.stdout) : null;
+}
+
+/**
  * True when the pid is still running. EPERM means it exists but is not ours.
  *
- * The locks no longer use this — exclusion is the operating system's job now, and
- * a lock is held exactly while its owner's process is alive, with nothing here
- * having to work that out. It stays because the Windows watchdog's own lock file
- * records a pid, and doctor reports on it.
+ * A pid on its own only says that SOME process has it now, and process ids are
+ * handed out again, on Windows soon. So whoever wrote the pid down also writes
+ * down when that process started, no later than which it must have, and a
+ * process that holds the id now and started well after that is somebody else's:
+ * the one that was named is gone. A start time that cannot be read cannot prove
+ * that, and the pid is taken for running, as it always was. The locks do not
+ * depend on any of this, the operating system holds those; the records of
+ * operations, the command ledger and the Windows watchdog's lock file do.
  */
-export function processIsAlive(pid) {
+export function processIsAlive(pid, { startedAt = null } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
-    return err.code === 'EPERM';
+    if (err.code !== 'EPERM') return false;
   }
+  const named = Date.parse(startedAt ?? '');
+  if (Number.isNaN(named)) return true;
+  const started = pid === process.pid ? Date.parse(ownStartTime()) : processStartTime(pid);
+  return started === null || started <= named + SAME_PROCESS_SLACK_MS;
 }
 
 /**

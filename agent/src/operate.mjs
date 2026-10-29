@@ -206,6 +206,9 @@ export async function withOperation(options, body) {
   }
 
   try {
+    // From here the record lives exactly as long as the operation holding the
+    // lock for it, which is what recovery and every read judge it by.
+    if (lock.opId) updateOperation(id, { lockOwner: lock.opId });
     const transitioning = pendingPowerOperation({ excludeId: id });
     if (transitioning) {
       const result = { ok: false, action: 'conflict', reasonCode: REASON.operationInProgress, message: `operation ${transitioning.id} is awaiting a power transition` };
@@ -241,7 +244,9 @@ export async function withOperation(options, body) {
     const ownUnsettled = await unsettledWork({ opId: id });
     const result = ownUnsettled ? stillAtWork(concluded, ownUnsettled) : concluded;
     if (pendingTransition) {
-      const pending = updateOperation(id, { dispatchAcknowledgement: result });
+      // The lock is given back while the record stays open for the transition,
+      // so the lock is no longer what says whether it is anybody's.
+      const pending = updateOperation(id, { dispatchAcknowledgement: result, lockOwner: null });
       return { ...result, opId: id, op: summarize(pending) };
     }
     if (existingOpId && readOperation(id)?.queueRequested === true && result.action === 'deferred' && [REASON.busy, REASON.busyUnknown].includes(result.reasonCode)) {

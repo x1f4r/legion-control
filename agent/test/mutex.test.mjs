@@ -155,6 +155,30 @@ test('probing reports a held lock without disturbing it', async () => {
   });
 });
 
+test('probing from the process that holds a lock leaves it held', async () => {
+  // Recovery runs inside a cycle that holds the machine lock, and asks the
+  // mutex about the records it finds. Closing any descriptor of a locked file
+  // drops every lock the process has on it, so the probe must go through
+  // SQLite, which keeps the descriptor open while its other connection holds.
+  await withHome(async (home) => {
+    const db = mutexPath(path.join(home, 'op.lock'));
+    const held = acquireMutex(db, { waitMs: 0 });
+    assert.equal(held.ok, true);
+    try {
+      assert.equal(probeMutex(db).state, 'held');
+      assert.equal(probeMutex(db).state, 'held');
+      const source = `
+        import { acquireMutex } from ${JSON.stringify(pathToFileURL(path.join(SRC, 'mutex.mjs')).href)};
+        process.stdout.write(JSON.stringify(acquireMutex(${JSON.stringify(db)}, { waitMs: 0 })));
+      `;
+      const other = JSON.parse(spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8' }).stdout);
+      assert.equal(other.busy, true, 'another process must still find the lock taken');
+    } finally {
+      held.release();
+    }
+  });
+});
+
 test('a file that is not a database is refused with a usable hint', async () => {
   await withHome(async (home) => {
     const db = mutexPath(path.join(home, 'op.lock'));

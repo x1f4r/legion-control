@@ -4,7 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { cli, deadPid, fixtureConfig, fixtureData, readFixture, withHome, writeConfig } from './helpers.mjs';
 import { outcomeOf } from '../src/contract.mjs';
-import { acquireOperationLock } from '../src/lock.mjs';
+import { acquireOperationLock, holderIsStale } from '../src/lock.mjs';
 import {
   beginOperation, deriveState, judgeInterrupted, operationPath,
   readOperation, recoverOperations, updateOperation,
@@ -242,6 +242,22 @@ test('cycle children honor live watchdog locks, even with force, and preserve th
       assert.equal(fs.readFileSync(lock, 'utf8'), contents);
     }
   });
+});
+
+test('a watchdog lock whose pid another process holds now is stale, and one without a time is judged as before', async () => {
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  await new Promise((resolve) => child.once('spawn', resolve));
+  try {
+    const taken = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    assert.equal(holderIsStale({ pid: child.pid, started: taken, ageMs: 0 }), true, 'that pid was handed out again after the file was written');
+    assert.equal(holderIsStale({ pid: child.pid, started: new Date().toISOString(), ageMs: 0 }), false);
+    assert.equal(holderIsStale({ pid: child.pid, ageMs: 0 }), false, 'a file naming no time keeps the pid check alone');
+    assert.equal(holderIsStale({ pid: child.pid, started: 'whenever', ageMs: 0 }), false);
+    assert.equal(holderIsStale({ pid: deadPid(), started: new Date().toISOString(), ageMs: 0 }), true);
+  } finally {
+    child.kill('SIGKILL');
+  }
 });
 
 test('a fresh busy response returns a claimed request to its queue with the original expiry', async () => {

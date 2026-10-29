@@ -25,9 +25,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { AGENT_VERSION, operationsDir, runArgv } from './config.mjs';
 import { CONTRACT_VERSION, DISRUPTED_PHASES, OPERATION_ID_PATTERN, outcomeOf, PHASES, producedOutcome, REASON } from './contract.mjs';
+import { probeOperationLock } from './lock.mjs';
 import { log } from './log.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
-import { processIsAlive, writeJsonAtomic } from './state.mjs';
+import { ownStartTime, processIsAlive, writeJsonAtomic } from './state.mjs';
 
 /** How many finished records are kept, and for how long. */
 export const HISTORY_LIMIT = 200;
@@ -179,8 +180,13 @@ export function writeOperation(record) {
   }
 }
 
-/** Every record on disk, newest first. Never throws. */
-export function listOperations({ limit = 30, service = null, kind = null, state = null, recoveryPending = false } = {}) {
+/**
+ * Every record on disk that matches, newest first, however many there are.
+ * Never throws. What the agent itself has to find, a record still running or
+ * still owing a service its recovery, is looked for here, among all of them:
+ * one older than the newest HISTORY_LIMIT is no less unfinished.
+ */
+function scanOperations({ service = null, kind = null, state = null, recoveryPending = false } = {}) {
   let names = [];
   try {
     names = fs.readdirSync(operationsDir());
@@ -199,7 +205,12 @@ export function listOperations({ limit = 30, service = null, kind = null, state 
     records.push(record);
   }
   records.sort((a, b) => String(b.requestedAt ?? '').localeCompare(String(a.requestedAt ?? '')));
-  return records.slice(0, Math.min(limit, HISTORY_LIMIT));
+  return records;
+}
+
+/** Every record on disk, newest first, at most HISTORY_LIMIT of them. Never throws. */
+export function listOperations({ limit = 30, ...filter } = {}) {
+  return scanOperations(filter).slice(0, Math.min(limit, HISTORY_LIMIT));
 }
 
 /**
@@ -371,6 +382,11 @@ function baseRecord(input) {
     finishedAt: null,
     expiresAt: input.expiresAt ?? null,
     pid: input.state === 'queued' ? null : process.pid,
+    // What tells this pid's process from a later one with the same id, and
+    // the operation whose hold on the machine lock is this owner's evidence of
+    // life once it takes it (see stillOwned). Neither is on the wire.
+    ownerStartedAt: input.state === 'queued' ? null : ownStartTime(),
+    lockOwner: null,
     detached: input.detached === true,
     workerClaimed: input.state !== 'queued' && input.detached !== true,
     bootId: bootIdentity(),
@@ -608,6 +624,8 @@ export function claimOperation(id, { pid = process.pid, parentPid = process.ppid
         startedAt: record.startedAt ?? nowIso(),
         updatedAt: nowIso(),
         pid,
+        ownerStartedAt: pid === process.pid ? ownStartTime() : null,
+        lockOwner: null,
         workerClaimed: true,
         launchPendingUntil: null,
         mode: record.state === 'queued' ? 'queued' : record.mode,
@@ -784,7 +802,7 @@ export function deferQueuedOperation(id, result) {
       return finishOperationUnlocked(id, { ok: true, action: 'expired', reasonCode: REASON.expired, message: 'the queued request expired while waiting for an idle window' });
     }
     return updateOperationUnlocked(id, {
-      state: 'queued', phase: 'queued', pid: null, startedAt: null, workerClaimed: false, result: null,
+      state: 'queued', phase: 'queued', pid: null, ownerStartedAt: null, lockOwner: null, startedAt: null, workerClaimed: false, result: null,
       log: appendLine(record.log, `waiting for idle: ${result.message ?? result.reasonCode ?? 'busy'}`),
     });
   });
@@ -805,7 +823,59 @@ function powerTransitionPending(record, bootId, now = Date.now()) {
 
 export function pendingPowerOperation({ excludeId = null } = {}) {
   const bootId = bootIdentity();
-  return listOperations({ state: 'running' }).find((record) => record.id !== excludeId && powerTransitionPending(record, bootId)) ?? null;
+  return scanOperations({ state: 'running' }).find((record) => record.id !== excludeId && powerTransitionPending(record, bootId)) ?? null;
+}
+
+/**
+ * Whether the process that owns a running record is still at work on it.
+ *
+ * kill(pid, 0) on its own cannot say. Process ids are handed out again, and a
+ * record whose owner died long ago used to read as running for as long as some
+ * other process had its pid, which on Windows is soon: the operation never
+ * ended, and a service it had stopped was never put back. So two better kinds
+ * of evidence come first.
+ *
+ *   The machine lock. An owner that took it holds it until it has finished
+ *   the record, and the operating system takes it away the moment the owner
+ *   dies. A record that names the operation holding the lock for it is alive
+ *   while the sidecar says that operation, in that process, holds the lock,
+ *   and gone once the lock is free or another operation has it.
+ *
+ *   The start time. Beside its pid the record keeps when that process
+ *   started, and a process holding the pid now that started after that is not
+ *   its owner (processIsAlive).
+ *
+ * Only where neither can say is a live pid taken at its word, as before:
+ * judging a live operation dead would start a service under an install that
+ * is still running. A boot or a sleep that has dispatched its transition
+ * gives the lock back on purpose and clears its claim to it first.
+ */
+function ownerAlive(record) {
+  if (!Number.isInteger(record.pid)) return false;
+  if (record.lockOwner) {
+    const { state, sidecar } = probeOperationLock();
+    if (state === 'free') return false;
+    if (state === 'held' && sidecar?.op === record.lockOwner && sidecar.pid === record.pid) return true;
+    if (state === 'held' && sidecar?.op && sidecar.op !== record.lockOwner) return false;
+  }
+  return processIsAlive(record.pid, { startedAt: record.ownerStartedAt ?? null });
+}
+
+/**
+ * Whether a running record is still somebody's, which recovery and every read
+ * ask alike: one waiting out its power transition, one a detached worker is
+ * still being launched for, and one whose owner is alive (ownerAlive). A
+ * record from an earlier boot is nobody's, whatever its pid names now.
+ */
+function stillOwned(record, { bootId, now }) {
+  if (powerTransitionPending(record, bootId, now)) return true;
+  const sameBoot = !record.bootId || !bootId || record.bootId === bootId;
+  if (!sameBoot) return false;
+  // A detached launcher gets a bounded grace period in which to create the
+  // worker and let it claim the record. The launcher pid may disappear
+  // before the child reaches Node, especially through Windows CIM.
+  if (record.workerClaimed !== true && Date.parse(record.launchPendingUntil ?? '') > now) return true;
+  return ownerAlive(record);
 }
 
 /**
@@ -883,25 +953,13 @@ export function judgeInterrupted(record, { systemId = null, bootId = bootIdentit
 }
 
 /**
- * Finish every record whose process is gone.
- *
- * Only records this host owns are judged. A record written on another host (a
- * restored home directory, a shared profile) is left alone rather than declared
- * dead on the strength of a pid that means nothing here.
+ * Finish every running record whose owner is gone (stillOwned), however old.
  */
 export function recoverOperations({ systemId = null, bootId = bootIdentity(), now = Date.now() } = {}) {
   return withOperationsStore(() => {
     const recovered = [];
-    for (const record of listOperations({ limit: HISTORY_LIMIT })) {
-      if (record.state !== 'running') continue;
-      if (powerTransitionPending(record, bootId, now)) continue;
-      const sameBoot = !record.bootId || !bootId || record.bootId === bootId;
-      // A detached launcher gets a bounded grace period in which to create the
-      // worker and let it claim the record. The launcher pid may disappear
-      // before the child reaches Node, especially through Windows CIM.
-      if (sameBoot && record.workerClaimed !== true && Date.parse(record.launchPendingUntil ?? '') > now) continue;
-      if (sameBoot && record.pid === process.pid) continue;
-      if (sameBoot && Number.isInteger(record.pid) && processIsAlive(record.pid)) continue;
+    for (const record of scanOperations({ state: 'running' })) {
+      if (stillOwned(record, { bootId, now })) continue;
       const verdict = judgeInterrupted(record, { systemId, bootId });
       const finished = finishOperationUnlocked(record.id, { ...verdict, from: record.from, to: record.to }, { keepPhase: true });
       if (finished) recovered.push(finished);
@@ -919,11 +977,10 @@ export function recoverOperations({ systemId = null, bootId = bootIdentity(), no
  */
 export function deriveState(record, { systemId = null, bootId = bootIdentity(), now = Date.now() } = {}) {
   if (record.state !== 'running') return record;
-  if (powerTransitionPending(record, bootId, now)) return record;
-  const sameBoot = !record.bootId || !bootId || record.bootId === bootId;
-  if (sameBoot && record.workerClaimed !== true && Date.parse(record.launchPendingUntil ?? '') > now) return record;
-  if (sameBoot && record.pid === process.pid) return record;
-  if (sameBoot && Number.isInteger(record.pid) && processIsAlive(record.pid)) return record;
+  if (stillOwned(record, { bootId, now })) return record;
+  // The owner may have finished it a moment ago and let the lock go since.
+  const current = readOperation(record.id);
+  if (current && current.state !== 'running') return current;
   const verdict = judgeInterrupted(record, { systemId, bootId });
   return { ...record, state: 'finished', derived: true, pid: null, finishedAt: new Date(now).toISOString(), result: { ...verdict, from: record.from, to: record.to } };
 }

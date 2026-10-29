@@ -17,7 +17,8 @@ import { describeFailure } from '../src/config.mjs';
 import { producedOutcome } from '../src/contract.mjs';
 import { withOperation } from '../src/operate.mjs';
 import { beginOperation, bootIdentity, readOperation, updateOperation, wireRecord } from '../src/operations.mjs';
-import { ledgerPath, parseProcessStart, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
+import { ledgerPath, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
+import { parseProcessStart } from '../src/state.mjs';
 import { deadPid, withHome } from './helpers.mjs';
 
 const posix = process.platform !== 'win32';

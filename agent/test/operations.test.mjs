@@ -145,7 +145,7 @@ test('the wire record carries only what the contract names', async () => {
     const ops = await fresh('operations.mjs');
     const { record } = ops.beginOperation({ id: 'eeeeeeee-1111-4111-8111-111111111111', ...base });
     const wire = ops.wireRecord(ops.readOperation(record.id));
-    for (const internal of ['bootId', 'queueRequested', 'force', 'contract', 'workerClaimed', 'launchPendingUntil']) {
+    for (const internal of ['bootId', 'queueRequested', 'force', 'contract', 'workerClaimed', 'launchPendingUntil', 'ownerStartedAt', 'lockOwner']) {
       assert.equal(internal in wire, false, `${internal} is internal and must not reach a client`);
     }
     for (const required of ['id', 'kind', 'service', 'target', 'actionId', 'mode', 'initiator', 'state', 'phase', 'progress', 'requestedAt', 'startedAt', 'updatedAt', 'finishedAt', 'expiresAt', 'pid', 'detached', 'result', 'log', 'agentVersion', 'systemId']) {
@@ -167,6 +167,141 @@ test('an operation whose process is gone is finished as interrupted', async () =
     assert.equal(recovered[0].result.action, 'interrupted');
     assert.match(recovered[0].result.message, /installing/);
     assert.deepEqual(ops.servicesNeedingRecovery(recovered).map((entry) => entry.service), ['demo']);
+  });
+});
+
+/**
+ * A process that stays up until it is killed, started now, for a record to
+ * name whose pid is plainly alive. With `lock`, it also takes the machine lock
+ * for that operation id, as an operation's own process would.
+ */
+async function liveProcess(home, { lock = null } = {}) {
+  const source = lock
+    ? `import { acquireOperationLock } from ${JSON.stringify(pathToFileURL(path.join(SRC, 'lock.mjs')).href)};
+       const held = acquireOperationLock({ kind: 'update', opId: ${JSON.stringify(lock)}, service: 'demo', waitMs: 5000 });
+       process.stdout.write(held.ok ? 'ready\\n' : 'failed: ' + held.message + '\\n');
+       setInterval(() => {}, 1000);`
+    : `process.stdout.write('ready\\n'); setInterval(() => {}, 1000);`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+    env: { ...process.env, LEGIONCTL_HOME: home },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  await new Promise((resolve, reject) => {
+    let out = '';
+    child.stdout.on('data', (chunk) => {
+      out += chunk;
+      if (out.includes('ready')) resolve();
+      if (out.includes('failed')) reject(new Error(out));
+    });
+    child.once('exit', () => reject(new Error(`the live process exited early: ${out}`)));
+  });
+  return {
+    pid: child.pid,
+    async stop() {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      child.kill('SIGKILL');
+      await exited;
+    },
+  };
+}
+
+const anHourAgo = () => new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+test('a pid another process holds now does not keep a record running', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const other = await liveProcess(home);
+    try {
+      // Its owner started an hour ago, and the process with that id now started
+      // a moment ago: the id was handed out again, and the owner is gone.
+      const reused = '12121212-1111-4111-8111-111111111111';
+      ops.beginOperation({ id: reused, ...base });
+      ops.recordPhase(reused, 'installing');
+      ops.updateOperation(reused, { pid: other.pid, ownerStartedAt: anHourAgo() });
+      assert.equal(ops.deriveState(ops.readOperation(reused)).state, 'finished');
+
+      // The same live pid, with an owner that started before it was written
+      // down, is that owner still at work.
+      const owned = '13131313-1111-4111-8111-111111111111';
+      ops.beginOperation({ id: owned, ...base });
+      ops.updateOperation(owned, { pid: other.pid, ownerStartedAt: new Date().toISOString() });
+      assert.equal(ops.deriveState(ops.readOperation(owned)).state, 'running');
+
+      // A record from before 3.1.0 names no start time, and a live pid is
+      // taken at its word as it always was.
+      const legacy = '14141414-1111-4111-8111-111111111111';
+      ops.beginOperation({ id: legacy, ...base });
+      ops.updateOperation(legacy, { pid: other.pid, ownerStartedAt: undefined });
+      assert.equal(ops.deriveState(ops.readOperation(legacy)).state, 'running');
+
+      const recovered = ops.recoverOperations({ systemId: 'linux' });
+      assert.deepEqual(recovered.map((record) => record.id), [reused]);
+      assert.equal(recovered[0].result.action, 'interrupted');
+      assert.deepEqual(ops.servicesNeedingRecovery(recovered).map((entry) => entry.service), ['demo'], 'what it stopped is still put back');
+      assert.equal(ops.readOperation(owned).state, 'running');
+    } finally {
+      await other.stop();
+    }
+  });
+});
+
+test('this process is not the owner of a record an earlier process with its pid left', async () => {
+  await withHome(async () => {
+    const ops = await fresh('operations.mjs');
+    const left = '15151515-1111-4111-8111-111111111111';
+    ops.beginOperation({ id: left, ...base });
+    ops.updateOperation(left, { pid: process.pid, ownerStartedAt: anHourAgo() });
+    const mine = '16161616-1111-4111-8111-111111111111';
+    ops.beginOperation({ id: mine, ...base });
+    assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id), [left]);
+    assert.equal(ops.readOperation(mine).state, 'running', 'a record this process opened is its own');
+  });
+});
+
+test('a record that took the machine lock lives exactly as long as that hold', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const id = '17171717-1111-4111-8111-111111111111';
+    const holder = await liveProcess(home, { lock: id });
+    const bystander = await liveProcess(home);
+    try {
+      ops.beginOperation({ id, ...base });
+      ops.updateOperation(id, { pid: holder.pid, ownerStartedAt: new Date().toISOString(), lockOwner: id });
+      assert.equal(ops.deriveState(ops.readOperation(id)).state, 'running', 'the lock is held for it, by its own process');
+
+      // A live pid whose process holds no lock for the record is not its
+      // owner, whatever its start time says: the owner would still hold it.
+      const orphan = '18181818-1111-4111-8111-111111111111';
+      ops.beginOperation({ id: orphan, ...base });
+      ops.updateOperation(orphan, { pid: bystander.pid, ownerStartedAt: new Date().toISOString(), lockOwner: orphan });
+      assert.equal(ops.deriveState(ops.readOperation(orphan)).state, 'finished', 'another operation holds the lock it would hold');
+
+      await holder.stop();
+      assert.equal(ops.deriveState(ops.readOperation(orphan)).state, 'finished', 'the lock is free');
+      ops.updateOperation(id, { pid: bystander.pid });
+      assert.equal(ops.deriveState(ops.readOperation(id)).state, 'finished', 'its hold ended with its process');
+      assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id).sort(), [id, orphan]);
+    } finally {
+      await holder.stop();
+      await bystander.stop();
+    }
+  });
+});
+
+test('recovery finds a running record however many newer ones there are', async () => {
+  await withHome(async () => {
+    const ops = await fresh('operations.mjs');
+    const stuck = '19191919-1111-4111-8111-111111111111';
+    ops.beginOperation({ id: stuck, ...base });
+    ops.updateOperation(stuck, { pid: 99999999, requestedAt: '2026-01-01T00:00:00.000Z' });
+    for (let index = 0; index < ops.HISTORY_LIMIT + 5; index += 1) {
+      const id = `${String(index).padStart(8, '0')}-2222-4222-8222-222222222222`;
+      ops.beginOperation({ id, ...base });
+      ops.finishOperation(id, { ok: true, action: 'noop', reasonCode: null, message: `run ${index}` });
+    }
+    assert.equal(ops.listOperations({ limit: 500 }).some((record) => record.id === stuck), false, 'it is past the newest the history lists');
+    assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id), [stuck]);
   });
 });
 

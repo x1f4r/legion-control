@@ -39,7 +39,7 @@ import { commandLabel, runCommandAsync, sleep, stateDir } from './config.mjs';
 import { OPERATION_ID_PATTERN, OPERATION_KINDS, PHASES } from './contract.mjs';
 import { log } from './log.mjs';
 import { bootIdentity, readOperation } from './operations.mjs';
-import { processIsAlive, readJsonStore, withStore } from './state.mjs';
+import { parseProcessStart, processIsAlive, readJsonStore, SAME_PROCESS_SLACK_MS, withStore } from './state.mjs';
 
 const IS_WINDOWS = process.platform === 'win32';
 
@@ -54,12 +54,6 @@ export const SETTLE_MS = 2000;
 /** How long output still in the pipes is read once the command has exited. */
 const DRAIN_MS = 200;
 const POLL_MS = 50;
-/**
- * How far apart two start times may be and still name the same process. Process
- * ids are reused, so a record of one is checked against when it started, and
- * the clocks on either side of that comparison are not read at the same moment.
- */
-const SAME_PROCESS_SLACK_MS = 2000;
 
 const PHASE_NAMES = new Set(Object.values(PHASES).flat());
 
@@ -133,22 +127,9 @@ function changeLedger(mutate) {
   return changed;
 }
 
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
 /**
- * A start time as `ps -o lstart=` prints it in the C locale, "Thu Oct 29
- * 10:15:42 2026" in local time, in milliseconds; null for anything else.
- */
-export function parseProcessStart(text) {
-  const match = /^\s*[A-Z][a-z]{2}\s+([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(String(text ?? ''));
-  const month = match ? MONTHS.indexOf(match[1]) : -1;
-  if (month < 0) return null;
-  const [day, hours, minutes, seconds, year] = match.slice(2).map(Number);
-  return new Date(year, month, day, hours, minutes, seconds).getTime();
-}
-
-/**
- * When a process started, from ps, or null when ps cannot say.
+ * When a process started, from ps, or null when ps cannot say. It is
+ * processStartTime() in state.mjs without blocking the event loop.
  *
  * ps prints the time in the format of its locale, and an ssh session passes on
  * whatever locale its client had: a start time in German reads as no start
@@ -318,7 +299,9 @@ async function stillRunning(entry, { bootId }) {
   if (entry.platform !== process.platform) return false;
   const own = written.has(entry.id);
   // Written before the command was started, and its writer never got further.
-  if (!Number.isInteger(entry.pid)) return !own && entry.agentPid !== process.pid && processIsAlive(entry.agentPid);
+  // The writer started before it wrote the entry, so a process holding its id
+  // that started later is not it.
+  if (!Number.isInteger(entry.pid)) return !own && entry.agentPid !== process.pid && processIsAlive(entry.agentPid, { startedAt: entry.startedAt });
   const whole = entry.state === 'unconfirmed';
   if (IS_WINDOWS) {
     const left = await windowsLeft(entry, { treeOf: whole || !own });
