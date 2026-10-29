@@ -6,7 +6,7 @@
 
 import { describeFailure, detectPlatform, sleep } from './config.mjs';
 import { runMutationArgv } from './process-runner.mjs';
-import { checkHealth, healthPort } from './probes/health.mjs';
+import { checkHealth, describeHealth, healthPort } from './probes/health.mjs';
 import { isRunning, probeProcess, processEvidence, processStartedAt, startProcess, stopProcess, systemctlMutation } from './probes/process.mjs';
 import { NO_RELAY, probeRelay } from './probes/relay.mjs';
 import * as appProvider from './providers/app.mjs';
@@ -67,6 +67,27 @@ export async function serviceHealth(service, { running, timeoutMs = null, useAsy
   const dependsOnProcess = (service.health?.type ?? 'none') === 'none';
   const up = running ?? (dependsOnProcess ? isRunning(service) : true);
   return checkHealth(service, { running: up, timeoutMs, useAsync });
+}
+
+/**
+ * What recovery may act on to say whether a service is up: the process probe's
+ * reading, whose unknown is neither of the others (processEvidence says why).
+ *
+ * Except for a command process with no running command, which has no probe
+ * that could fail, only none at all. Its health check is then the one reading
+ * there is of it. One that passes is a positive reading that it is up, which
+ * is all an obligation to put it back asks for. One that fails is no reading
+ * that it is stopped, because a service can be up and not answering, so it
+ * stays unknown: recovery neither starts it nor takes it for running.
+ */
+export async function recoveryEvidence(service) {
+  const evidence = processEvidence(service);
+  const unprobed = service.process?.type === 'command' && !service.process.running;
+  const checked = service.health?.type === 'http' || service.health?.type === 'command';
+  if (evidence.state !== 'unknown' || !unprobed || !checked) return evidence;
+  const health = await checkHealth(service);
+  if (health.ok) return { state: 'running', error: null };
+  return { state: 'unknown', error: `${evidence.error}, and its health check does not pass: ${describeHealth(health)}` };
 }
 
 /**

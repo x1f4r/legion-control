@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { beginOperation, finishOperation, pruneOperations, readOperation, recoverOperations, updateOperation, wireRecord } from '../src/operations.mjs';
 import { isRunning, processEvidence } from '../src/probes/process.mjs';
+import { recoveryEvidence } from '../src/service.mjs';
 import {
   cli, commandService, deadPid, fakeNpm, FIXTURE, fixtureConfig, fixtureData, npmCalls, npmPackageVersion, npmService, readFixture, withHome, writeConfig,
 } from './helpers.mjs';
@@ -435,5 +436,42 @@ test('of two interrupted updates, the later one\'s from is not taken for a whole
   await twoUpdates('3.0.0', (dir) => {
     assert.equal(readFixture(dir, 'rollback-runs'), '', 'a version one of them was going to is a whole install');
     assert.equal(readFixture(dir, 'start-runs'), '1');
+  });
+});
+
+test('a service with no running command settles its recovery on a health check that passes, and is never started blind', async () => {
+  await withHome(async (home) => {
+    const { config, dir, id } = interruptedService(home);
+    const call = (verb) => [process.execPath, FIXTURE, verb, dir];
+    config.services[0].process = { type: 'command', start: call('start'), stop: call('stop') };
+    writeConfig(home, config);
+    const { payload } = cli(['cycle'], { home });
+    assert.match(payload.message, /recovery is still owed: .*has no running command, so nothing here can say whether it is up, and its health check does not pass/);
+    assert.equal(readFixture(dir, 'start-runs'), '', 'not answering is not stopped');
+    assert.equal(readOperation(id).recoveryPending, true);
+
+    // Somebody started it by hand.
+    fs.writeFileSync(path.join(dir, 'running'), 'on');
+    assert.doesNotMatch(cli(['cycle'], { home }).payload.message, /still owed/);
+    assert.equal(readFixture(dir, 'start-runs'), '');
+    assert.equal(readOperation(id).recoveryPending, false);
+  });
+});
+
+test('recovery reads a service with no running command by its health check, and a probe that fails by nothing', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home);
+    const call = (verb) => [process.execPath, FIXTURE, verb, dir];
+    const unprobed = (health) => commandService(dir, { process: { type: 'command', start: call('start') }, health });
+    const checked = { type: 'command', command: call('health') };
+    assert.deepEqual(await recoveryEvidence(unprobed(checked)), { state: 'running', error: null });
+    assert.equal((await recoveryEvidence(unprobed({ type: 'none' }))).state, 'unknown', 'with no health check either, nothing can be read');
+    // Section 5.5: a probe that fails keeps the obligation, whatever the
+    // health check says.
+    assert.equal((await recoveryEvidence(commandService(dir, { process: unreadableProbe(home, dir) }))).state, 'unknown');
+    fs.writeFileSync(path.join(dir, 'running'), 'off');
+    const down = await recoveryEvidence(unprobed(checked));
+    assert.equal(down.state, 'unknown', 'not answering is not stopped');
+    assert.match(down.error, /has no running command, so nothing here can say whether it is up, and its health check does not pass/);
   });
 });

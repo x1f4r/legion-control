@@ -58,7 +58,7 @@ import {
   drainService,
   isRunning,
   livenessOf,
-  processEvidence,
+  recoveryEvidence,
   restartService,
   serviceHealth,
   startAndSettle,
@@ -1096,7 +1096,7 @@ export async function rollBackInterrupted(config, service, owed, { running }) {
       : await rollBackCommand(service, enter);
   const message = `${found}; ${rolled.message}`;
   if (rolled.ok) return { settled: true, action: 'rolled-back', reasonCode: null, message };
-  return { settled: processEvidence(service).state === 'running', action: 'rollback-failed', reasonCode: REASON.applyFailed, message };
+  return { settled: (await recoveryEvidence(service)).state === 'running', action: 'rollback-failed', reasonCode: REASON.applyFailed, message };
 }
 
 // ---------------------------------------------------------------------------

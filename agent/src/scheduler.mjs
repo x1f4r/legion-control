@@ -51,7 +51,7 @@ import { orderServices, scheduledEligibility } from './policy.mjs';
 import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
-import { livenessOf, processEvidence, startAndSettle, waitForServiceHealth } from './service.mjs';
+import { livenessOf, recoveryEvidence, startAndSettle, waitForServiceHealth } from './service.mjs';
 import { rollBackInterrupted, rollbackOwed, runRestart, runUpdate } from './update.mjs';
 import { runAction } from './actions.mjs';
 import { ensureServiceStateWritable, serviceState } from './state.mjs';
@@ -104,7 +104,7 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
     // loop's isRunning() fails closed, and recovery used to read that as "it is
     // up": a process probe that could not run dropped the obligation, and the
     // service an interrupted update had stopped stayed off for good.
-    const evidence = processEvidence(service);
+    const evidence = await recoveryEvidence(service);
     if (evidence.state === 'unknown') {
       owed(owing, owing[0], service, 'unknown', `${service.name} was neither started nor taken for running, because nothing can tell whether it is: ${evidence.error}`);
       continue;
