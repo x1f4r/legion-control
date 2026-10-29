@@ -203,10 +203,19 @@ test('a reboot is only believed with both a new boot and the right system', asyn
     assert.equal(rebooted.action, 'rebooted');
     assert.equal(rebooted.ok, true);
 
-    // The machine came back, but into the system it was already in: the arming
-    // silently failed, and calling this a success sends a client off waiting.
-    const wrongSystem = ops.judgeInterrupted(record, { systemId: 'linux', bootId: 'boot-after' });
-    assert.equal(wrongSystem.action, 'failed');
+    // A new boot into another system is not the one asked for, but it is not a
+    // failure either: on a dual-boot machine the record is judged by the system
+    // that wrote it, after the machine came back from the target. Calling it a
+    // success would send a client off waiting; calling it failed would tell it
+    // a reboot that most likely worked did not.
+    const otherSystem = ops.judgeInterrupted(record, { systemId: 'linux', bootId: 'boot-after' });
+    assert.equal(otherSystem.action, 'interrupted');
+    assert.equal(otherSystem.ok, false);
+    assert.equal(otherSystem.reasonCode, 'interrupted');
+    assert.match(otherSystem.message, /running linux now; whether it reached windows in between cannot be told/);
+    const unknownSystem = ops.judgeInterrupted(record, { systemId: null, bootId: 'boot-after' });
+    assert.equal(unknownSystem.action, 'interrupted');
+    assert.match(unknownSystem.message, /an unknown system/);
 
     // No reboot happened at all.
     const noReboot = ops.judgeInterrupted(record, { systemId: 'linux', bootId: 'boot-before' });

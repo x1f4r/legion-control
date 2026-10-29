@@ -819,6 +819,13 @@ export function pendingPowerOperation({ excludeId = null } = {}) {
  * BOTH the boot identity changed AND the system now running is the one that was
  * asked for. Anything less is an outcome nobody observed, and it says so.
  *
+ * That includes a new boot into some other system. Every system on a dual-boot
+ * machine keeps its own agent and its own records, so a reboot from Linux into
+ * Windows is only ever judged by the Linux agent, once the machine is back in
+ * Linux: by then the boot identity has changed and the system running is not
+ * the target, whether or not Windows came up in between. Calling that a
+ * failure would tell a client a reboot that most likely worked did not.
+ *
  * A suspend leaves no trace at all once the machine is awake again, so an
  * interrupted sleep is always reported as unknown rather than guessed at.
  */
@@ -847,9 +854,11 @@ export function judgeInterrupted(record, { systemId = null, bootId = bootIdentit
     }
     return {
       ok: false,
-      action: 'failed',
+      action: 'interrupted',
       reasonCode: REASON.interrupted,
-      message: `the machine rebooted but is running ${systemId ?? 'an unknown system'}, not the requested ${record.target}`,
+      message:
+        `the machine has rebooted since the reboot into ${record.target} was dispatched, and is running ` +
+        `${systemId ?? 'an unknown system'} now; whether it reached ${record.target} in between cannot be told from here`,
     };
   }
 

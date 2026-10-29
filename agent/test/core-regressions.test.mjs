@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { cli, fixtureConfig, fixtureData, readFixture, withHome, writeConfig } from './helpers.mjs';
+import { cli, deadPid, fixtureConfig, fixtureData, readFixture, withHome, writeConfig } from './helpers.mjs';
+import { outcomeOf } from '../src/contract.mjs';
 import { acquireOperationLock } from '../src/lock.mjs';
 import {
   beginOperation, deriveState, judgeInterrupted, operationPath,
@@ -143,7 +144,30 @@ test('pre-dispatch, arm-only, same-boot, and unknown-identity records never prov
   assert.equal(judgeInterrupted(record, { systemId: 'other', bootId: null }).action, 'interrupted');
   assert.equal(judgeInterrupted({ ...record, phase: 'arming' }, { systemId: 'other', bootId: 'after' }).action, 'interrupted');
   assert.equal(judgeInterrupted({ ...record, noReboot: true }, { systemId: 'other', bootId: 'after' }).action, 'interrupted');
-  assert.equal(judgeInterrupted(record, { systemId: 'wrong', bootId: 'after' }).action, 'failed');
+  // A new boot into some other system is no evidence either way: the target
+  // may well have come up and been left again before this system judged it.
+  const elsewhere = judgeInterrupted(record, { systemId: 'wrong', bootId: 'after' });
+  assert.equal(elsewhere.action, 'interrupted');
+  assert.equal(outcomeOf(elsewhere), 'unknown');
+});
+
+test('a reboot into another system, judged once the machine is back, reads as unknown rather than failed', async () => {
+  await withHome(async (home) => {
+    powerFixture(home);
+    const id = 'boot-cross-system-001';
+    // Written by this system's agent before a reboot into `other`, which keeps
+    // records of its own; the machine is back on `test` with a new boot.
+    beginOperation({ id, kind: 'boot', target: 'other', systemId: 'test' });
+    updateOperation(id, { phase: 'rebooting', bootId: 'boot-before-the-switch', pid: deadPid() });
+    const observed = cli(['op', id], { home }).payload;
+    assert.equal(observed.op.state, 'finished');
+    assert.equal(observed.op.result.action, 'interrupted');
+    assert.equal(observed.op.outcome, 'unknown');
+    assert.match(observed.op.result.message, /running test now; whether it reached other in between cannot be told/);
+    const cycled = cli(['cycle'], { home }).payload;
+    assert.deepEqual(cycled.recovered.map((entry) => [entry.opId, entry.action]), [[id, 'interrupted']]);
+    assert.equal(readOperation(id).result.outcome, 'unknown');
+  });
 });
 
 test('unobserved power acknowledgements expire into unknown outcomes rather than success', async () => {
