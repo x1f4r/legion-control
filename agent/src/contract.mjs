@@ -101,9 +101,11 @@ export const PHASES = {
  * The phases during which an interrupted operation can have left a service down.
  * Recovery only acts on these: a run that died while resolving a version never
  * touched anything, and starting a service somebody stopped on purpose would be
- * damage of its own.
+ * damage of its own. A restart is one of them: for a command, a scheduled task
+ * or an app it is a stop and then a start, and a run that dies between the two
+ * leaves the service stopped like any update.
  */
-export const DISRUPTED_PHASES = new Set(['stopping', 'installing', 'verifying', 'starting', 'rolling-back']);
+export const DISRUPTED_PHASES = new Set(['stopping', 'installing', 'verifying', 'starting', 'rolling-back', 'restarting']);
 
 /**
  * The phases in which a run may already have changed the machine, whether or
@@ -114,7 +116,6 @@ export const DISRUPTED_PHASES = new Set(['stopping', 'installing', 'verifying', 
  */
 export const MUTATING_PHASES = new Set([
   ...DISRUPTED_PHASES,
-  'restarting',
   'arming',
   'rebooting',
   'preparing',

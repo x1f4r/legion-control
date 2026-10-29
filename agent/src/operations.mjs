@@ -493,6 +493,17 @@ export function finishOperation(id, result, { keepPhase = false } = {}) {
 }
 
 /**
+ * The version a finished record keeps. An update notes its versions on the
+ * record while it runs, and a result that names one, null included, is the
+ * version it read at the end: a rollback that left the version unreadable must
+ * not come back as the target it was going to. Only a result that names none,
+ * a throw or a conflict, keeps what the record noted.
+ */
+function versionOf(fromResult, fromRecord) {
+  return fromResult !== undefined ? fromResult : fromRecord ?? null;
+}
+
+/**
  * The result a finished record stores, with its outcome.
  *
  * A record's `ok` is exactly "it finished without a reason code" (contract
@@ -513,8 +524,8 @@ function storedResult(record, result) {
     action: result.action,
     reasonCode,
     message: result.message ?? '',
-    from: result.from ?? record.from ?? null,
-    to: result.to ?? record.to ?? null,
+    from: versionOf(result.from, record.from),
+    to: versionOf(result.to, record.to),
     exitCode: result.exitCode ?? null,
     output: result.output ?? null,
   };
@@ -534,8 +545,8 @@ function finishOperationUnlocked(id, result, { keepPhase = false } = {}) {
     // interrupted run, so a crash or a live watchdog cannot lose the retry.
     recoveryPending: record.recoveryPending === true || Boolean(keepPhase && result.action === 'interrupted' && record.service && DISRUPTED_PHASES.has(record.phase)),
     finishedAt: nowIso(),
-    from: result.from ?? record.from ?? null,
-    to: result.to ?? record.to ?? null,
+    from: versionOf(result.from, record.from),
+    to: versionOf(result.to, record.to),
     result: storedResult(record, result),
     log: appendLine(record.log, `finished: ${result.action}${result.reasonCode ? ` (${result.reasonCode})` : ''}`),
   }));
@@ -910,7 +921,10 @@ export function deriveState(record, { systemId = null, bootId = bootIdentity(), 
 
 /**
  * Services an interrupted operation may have left stopped, with the phase it
- * reached, so the caller can decide what putting them back means.
+ * reached, so the caller can decide what putting them back means. One record
+ * per service: of several still owed, the oldest, whose `from` is the last
+ * version known to have worked. `records` come newest first, as every listing
+ * does.
  */
 export function servicesNeedingRecovery(records) {
   const needing = new Map();

@@ -28,7 +28,7 @@ import { canonicalBytes, canonicalHash } from '../src/controller.mjs';
 import { acquireOperationLock } from '../src/lock.mjs';
 import { beginOperation, updateOperation } from '../src/operations.mjs';
 import {
-  cli, commandService, deadPid, ENTRY, fakeNpm, FIXTURE, fixtureConfig, fixtureData, npmService, readFixture, withHome, writeConfig, writeFixture,
+  cli, commandService, deadPid, ENTRY, fakeNpm, FIXTURE, fixtureConfig, fixtureData, npmPackageVersion, npmService, readFixture, withHome, writeConfig, writeFixture,
 } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
@@ -681,6 +681,50 @@ test('an installer whose agent was killed holds recovery and every update until 
     assert.equal(readFixture(dir, 'running'), 'on', 'with the installer gone, recovery puts the service back');
     assert.equal(readFixture(dir, 'update-runs'), '1', 'the update was never run a second time');
     assert.equal(invoke(home, ['op', id]).op.result.action, 'interrupted');
+    assert.deepEqual(ledger(home), []);
+  });
+});
+
+test('an npm install killed part way with its agent is rolled back by the next cycle', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const npm = fakeNpm(home, dir);
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false, maintenanceWindows: [] }, services: [npmService(dir, npm)] }));
+    writeFixture(dir, 'npm-install-gate', 'closed');
+    const id = 'killed-npm-install-0001';
+    const agent = spawn(process.execPath, [...npm.nodeArgs, ENTRY, 'update', '--op', id], { env: { ...process.env, LEGIONCTL_HOME: home }, stdio: 'ignore' });
+    let install;
+    try {
+      await until('the npm install starting', () => {
+        install = ledger(home).find((entry) => Number.isInteger(entry.pid) && entry.phase === 'installing');
+        return install !== undefined;
+      });
+      await until('the install moving the old tree aside', () => npmPackageVersion(npm.prefix, npm.pkg) === null);
+      agent.kill('SIGKILL');
+      await new Promise((resolve) => (agent.exitCode !== null || agent.signalCode !== null ? resolve() : agent.once('exit', resolve)));
+      // The install goes too, part way: the old tree already moved aside and
+      // the new one never written. Windows ends it with its agent.
+      if (posix) {
+        try { process.kill(-install.group, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      await until('the install ending', () => !alive(install.pid));
+    } finally {
+      fs.rmSync(path.join(dir, 'npm-install-gate'), { force: true });
+      if (agent.exitCode === null && agent.signalCode === null) agent.kill('SIGKILL');
+    }
+    assert.equal(npmPackageVersion(npm.prefix, npm.pkg), null, 'neither version is on disk');
+    assert.equal(readFixture(dir, 'running'), 'off');
+
+    // Section 5.5: neither from nor to is installed, so recovery rolls back to from.
+    const run = (argv) => invoke(home, argv, { nodeArgs: npm.nodeArgs });
+    const cycled = run(['cycle']);
+    assert.equal(cycled.action, 'cycled');
+    assert.deepEqual(cycled.recovered.map((entry) => [entry.opId, entry.action]), [[id, 'interrupted']]);
+    assert.equal(npmPackageVersion(npm.prefix, npm.pkg), '1.0.0');
+    assert.equal(readFixture(dir, 'running'), 'on');
+    const { op } = run(['op', id]);
+    assert.deepEqual([op.from, op.to], ['1.0.0', '2.0.0'], 'the record kept what the run was going from and to');
+    assert.ok(op.log.some((entry) => entry.line.startsWith('recovered: Demo is on a version that cannot be read, neither 1.0.0 nor 2.0.0')));
     assert.deepEqual(ledger(home), []);
   });
 });

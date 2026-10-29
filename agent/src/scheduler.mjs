@@ -51,7 +51,7 @@ import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
 import { livenessOf, processEvidence, startAndSettle, waitForServiceHealth } from './service.mjs';
-import { runRestart, runUpdate } from './update.mjs';
+import { rollBackInterrupted, rollbackOwed, runRestart, runUpdate } from './update.mjs';
 import { runAction } from './actions.mjs';
 import { ensureServiceStateWritable, serviceState } from './state.mjs';
 
@@ -61,7 +61,9 @@ import { ensureServiceStateWritable, serviceState } from './state.mjs';
  * Only services an interrupted operation actually reached a disruptive phase for
  * are touched. A cycle that died while resolving a version never stopped
  * anything, and starting a service somebody deliberately stopped would be its
- * own kind of damage.
+ * own kind of damage. Putting one back means what contract section 5.5 says:
+ * up again, and, where an update left a version that is neither the one it
+ * started from nor the one it was going to, rolled back to the first.
  */
 export async function recoverMachine(config, { lockFiles = [] } = {}) {
   const interrupted = recoverOperations({ systemId: config.system.id });
@@ -71,14 +73,16 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
   const completed = (service) => {
     for (const record of pending.filter((entry) => entry.service === service)) updateOperation(record.id, { recoveryPending: false });
   };
+  // How an obligation ended, or why it stays, is written on the record that
+  // owed it, so `op ID` answers the question a cycle cannot: what recovery did
+  // about that run, or what is still wrong and what it is waiting for. A
+  // reason to wait is written once, and again only when it changes.
   const settled = (record, service, action, message) => {
     restored.push({ service: service.id, action, settled: true, message, opId: record.id, phase: record.phase ?? null });
     log(message, 'recover');
+    appendLog(record.id, `recovered: ${message}`);
     completed(service.id);
   };
-  // An obligation that stays says why, on the record that owes it, so `op ID`
-  // answers the question a cycle cannot: what is still wrong, and what it is
-  // waiting for. A reason is written once, and again only when it changes.
   const owed = (record, service, action, message, reasonCode = null) => {
     restored.push({ service: service.id, action, settled: false, reasonCode, message, opId: record.id, phase: record.phase ?? null });
     log(message, 'recover');
@@ -101,7 +105,8 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
       owed(record, service, 'unknown', `${service.name} was neither started nor taken for running, because nothing can tell whether it is: ${evidence.error}`);
       continue;
     }
-    if (evidence.state === 'running') {
+    const rollback = rollbackOwed(service, record);
+    if (evidence.state === 'running' && !rollback) {
       settled(record, service, 'already-running', `${service.name} was already running after an interrupted ${record.kind} (${record.phase})`);
       continue;
     }
@@ -109,21 +114,27 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
     // only this service lock. Recovery must obey it just like an update does.
     const serviceLock = acquireServiceLock(service.lockFile, 'recovery');
     if (!serviceLock.ok) {
-      owed(record, service, 'conflict', `${service.name} was not started: ${serviceLock.message}`, serviceLock.reasonCode);
+      owed(record, service, 'conflict', `${service.name} was not put back: ${serviceLock.message}`, serviceLock.reasonCode);
       continue;
     }
     try {
       ensureServiceStateWritable(service);
-      note(`${service.name} was left stopped by an interrupted ${record.kind}; starting it`, 'recover');
-      await startAndSettle(service);
-      const health = await waitForServiceHealth(service, 60000);
-      if (health.ok) {
-        settled(record, service, 'started', `${service.name} was restarted after an interrupted ${record.kind} (${record.phase})`);
+      if (rollback) {
+        const rolled = await rollBackInterrupted(config, service, record, rollback, { running: evidence.state === 'running' });
+        if (rolled.settled) settled(record, service, rolled.action, rolled.message);
+        else owed(record, service, rolled.action, rolled.message, rolled.reasonCode);
       } else {
-        owed(record, service, 'start-failed', `${service.name} could not be restarted after an interrupted ${record.kind} (${record.phase}): ${describeHealth(health)}`);
+        note(`${service.name} was left stopped by an interrupted ${record.kind}; starting it`, 'recover');
+        await startAndSettle(service);
+        const health = await waitForServiceHealth(service, 60000);
+        if (health.ok) {
+          settled(record, service, 'started', `${service.name} was restarted after an interrupted ${record.kind} (${record.phase})`);
+        } else {
+          owed(record, service, 'start-failed', `${service.name} could not be restarted after an interrupted ${record.kind} (${record.phase}): ${describeHealth(health)}`);
+        }
       }
     } catch (error) {
-      owed(record, service, 'start-failed', `${service.name} could not be restarted: ${error?.message ?? String(error)}`, REASON.internal);
+      owed(record, service, 'start-failed', `${service.name} could not be put back: ${error?.message ?? String(error)}`, REASON.internal);
     } finally {
       serviceLock.release();
     }

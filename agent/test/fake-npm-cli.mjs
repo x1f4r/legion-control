@@ -52,13 +52,13 @@ if (verb === '--version') {
 } else if (verb === 'prefix') {
   process.stdout.write(`${ownPrefix}\n`);
 } else if (verb === 'install') {
-  await heldWhile('npm-install-gate');
   const prefix = args[args.indexOf('--prefix') + 1];
   const wanted = spec(args[args.length - 1]);
   const root = path.join(modulesOf(prefix), wanted.name);
   // npm moves the old tree out of the way before it writes the new one, so an
-  // install that fails part way can leave no package behind at all.
+  // install that fails or is killed part way can leave no package behind.
   fs.rmSync(root, { recursive: true, force: true });
+  await heldWhile('npm-install-gate');
   if (read('npm-install-fails') === wanted.version) {
     process.stderr.write(`npm error could not install ${wanted.name}@${wanted.version}\n`);
     process.exit(1);

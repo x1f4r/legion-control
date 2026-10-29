@@ -43,7 +43,7 @@
 import { describeFailure } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
-import { appendLog, recordPhase } from './operations.mjs';
+import { appendLog, listOperations, recordPhase, updateOperation } from './operations.mjs';
 import { runMutationArgv, unsettledWork } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
@@ -58,6 +58,7 @@ import {
   drainService,
   isRunning,
   livenessOf,
+  processEvidence,
   restartService,
   serviceHealth,
   startAndSettle,
@@ -267,15 +268,27 @@ async function rollbackHeld() {
   return unsettled ? `nothing was rolled back or restarted, because ${unsettled.message}` : null;
 }
 
-async function rollBack(service, previous, prefix, opId, lock) {
+/**
+ * Enter a phase the way every step of a run does, on the lock a second
+ * mutation reads and on the record a client polls. A rollback is handed this
+ * rather than the run itself, because recovery rolls back for a run that is
+ * already over and notes each step on that run's record instead.
+ */
+function entering(opId, lock) {
+  return (phase, progress = null) => {
+    lock.phase(phase);
+    recordPhase(opId, phase, progress);
+  };
+}
+
+async function rollBack(service, previous, prefix, enter) {
   const held = await rollbackHeld();
   if (held) return { ok: false, message: held };
   if (!previous) {
     await ensureServiceUp(service);
     return { ok: false, message: 'nothing to roll back to: no previous version was installed' };
   }
-  lock.phase('rolling-back');
-  recordPhase(opId, 'rolling-back', { note: `back to ${previous}` });
+  enter('rolling-back', { note: `back to ${previous}` });
   note(`rolling back to ${previous}`, 'update');
 
   // The same rule as the forward install: npm may not rewrite the package while
@@ -376,6 +389,10 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
     return { ok: false, action: 'failed', reasonCode: REASON.latestUnknown, from, to: null, message };
   }
 
+  // What recovery reads if this run dies part way through: the version it is
+  // going from and to, and the prefix it installs into (contract section 5.5).
+  updateOperation(opId, { from, to, npmPrefix: prefix });
+
   if (from === to) return alreadyOnTarget(config, service, from, to, { force, opId });
 
   lock.phase('checking-busy');
@@ -447,7 +464,7 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
       recordLastUpdate(service, 'failed', from, to, message);
       return { ok: false, action: 'failed', reasonCode: REASON.internal, from, to, message };
     }
-    const rolledBack = await rollBack(service, from, prefix, opId, lock);
+    const rolledBack = await rollBack(service, from, prefix, entering(opId, lock));
     const message = `${failure}; ${rolledBack.message}`;
     if (rolledBack.ok) {
       recordLastUpdate(service, 'rolled-back', from, to, message);
@@ -712,7 +729,7 @@ async function checkPostcondition(service, { to }) {
  * so this is only ever the rollback hook the config supplies — and saying "there
  * is no rollback" out loud is better than implying the machine is fine.
  */
-async function rollBackCommand(service, opId, lock) {
+async function rollBackCommand(service, enter) {
   // Whatever happens here, the version reported afterwards is read fresh from
   // the service. A rollback changes what is installed, so echoing the reading
   // taken before it would name a version that is no longer there.
@@ -730,8 +747,7 @@ async function rollBackCommand(service, opId, lock) {
         : 'no rollback command is configured, and the service could not be restarted; this machine needs attention',
     };
   }
-  lock.phase('rolling-back');
-  recordPhase(opId, 'rolling-back');
+  enter('rolling-back');
   const result = await runMutationArgv(service.rollback, { timeoutMs: 600000 });
   if (!result.ok) {
     await ensureServiceUp(service);
@@ -799,6 +815,9 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
     return { ok: false, action: 'failed', reasonCode: REASON.postconditionFailed, from, to: null, message };
   }
 
+  // What recovery reads if this run dies part way through (contract section 5.5).
+  updateOperation(opId, { from, to });
+
   if (to && from === to) return alreadyOnTarget(config, service, from, to, { force, opId });
 
   lock.phase('checking-busy');
@@ -845,7 +864,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
   recordPhase(opId, 'installing');
   const updated = await commandProvider.update(service);
   if (!updated.ok) {
-    const rolled = await rollBackCommand(service, opId, lock);
+    const rolled = await rollBackCommand(service, entering(opId, lock));
     const message = `the update command failed: ${updated.message}; ${rolled.message}`;
     log(message, 'update');
     recordLastUpdate(service, rolled.ok ? 'rolled-back' : 'failed', from, to, message);
@@ -863,7 +882,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
   recordPhase(opId, 'starting');
   const started = await startAndSettle(service);
   if (!started.ok) {
-    const rolled = await rollBackCommand(service, opId, lock);
+    const rolled = await rollBackCommand(service, entering(opId, lock));
     const message = `${service.name} was updated but would not start: ${started.message}; ${rolled.message}`;
     log(message, 'update');
     recordLastUpdate(service, rolled.ok ? 'rolled-back' : 'failed', from, to, message);
@@ -881,7 +900,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
   recordPhase(opId, 'health');
   const health = await waitForServiceHealth(service, HEALTH_WAIT_MS);
   if (!health.ok) {
-    const rolled = await rollBackCommand(service, opId, lock);
+    const rolled = await rollBackCommand(service, entering(opId, lock));
     const message = `${service.name} was updated but is not answering: ${describeHealth(health)}; ${rolled.message}`;
     log(message, 'update');
     recordLastUpdate(service, rolled.ok ? 'rolled-back' : 'failed', from, to, message);
@@ -899,7 +918,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
   recordPhase(opId, 'verifying');
   const postcondition = await checkPostcondition(service, { to });
   if (!postcondition.ok) {
-    const rolled = await rollBackCommand(service, opId, lock);
+    const rolled = await rollBackCommand(service, entering(opId, lock));
     const message = `${postcondition.message}; ${rolled.message}`;
     log(message, 'update');
     recordLastUpdate(service, rolled.ok ? 'rolled-back' : 'failed', from, to, message);
@@ -933,6 +952,87 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
     verified: true,
     message,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Recovery
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether an update of the same service asked for after this one has since
+ * finished and settled its version: installed and verified it, rolled back, or
+ * found it already on its target. What is installed is then that run's doing,
+ * and rolling it back to the version an older run started from would undo it.
+ */
+function versionSettledSince(record) {
+  return listOperations({ service: record.service, kind: 'update', state: 'finished', limit: 200 }).some(
+    (later) =>
+      later.id !== record.id &&
+      String(later.requestedAt ?? '') > String(record.requestedAt ?? '') &&
+      (['updated', 'rolled-back'].includes(later.result?.action) || later.result?.reasonCode === REASON.alreadyOnTarget),
+  );
+}
+
+/**
+ * The rollback an interrupted update still owes, or null when it owes none
+ * (contract section 5.5): only when the version installed now is neither the
+ * one it started from nor the one it was going to. A run that noted no `from`,
+ * because nothing was installed before it or because an agent before 3.1.0
+ * wrote its record, has nothing known to go back to, and an app keeps no
+ * previous build to restore. A version that cannot be read now is neither: a
+ * half-written install is exactly what reads that way.
+ */
+export function rollbackOwed(service, record) {
+  if (record.kind !== 'update' || (service.kind !== 'npm' && service.kind !== 'command')) return null;
+  const from = record.from ?? null;
+  const to = record.to ?? null;
+  if (from === null) return null;
+  const installed =
+    service.kind === 'npm'
+      ? npmProvider.installedVersionAt(service, record.npmPrefix ?? npmProvider.resolveNpmPrefix(service))
+      : commandProvider.installedVersion(service);
+  if (installed === from || (to !== null && installed === to)) return null;
+  if (versionSettledSince(record)) return null;
+  return { from, to, installed };
+}
+
+/**
+ * Roll a service back for an update that was interrupted half way, from the
+ * cycle that found it. The rollback is the update's own, the npm reinstall or
+ * the configured rollback command, with each step noted on the interrupted
+ * record rather than entered as a phase of the cycle. A service that is
+ * running again is only stopped for it while the machine is idle, as for any
+ * update.
+ *
+ * Returns { settled, action, reasonCode, message }. The obligation is met once
+ * the rollback took, or once the service is seen running even though it did
+ * not: putting the version right is then an update's business, and stopping a
+ * running service on every cycle to try again would be damage of its own.
+ */
+export async function rollBackInterrupted(config, service, record, owed, { running }) {
+  const found = `${service.name} is on ${owed.installed ?? 'a version that cannot be read'}, neither ${owed.from} nor ${owed.to ?? 'the version it was going to'}`;
+  const held = await rollbackHeld();
+  if (held) return { settled: false, action: 'conflict', reasonCode: REASON.operationInProgress, message: `${found}, and ${held}` };
+  if (running && (service.kind === 'npm' || service.rollback)) {
+    const { busy } = await busyNow(config, service);
+    if (busy.busy) {
+      return {
+        settled: false,
+        action: 'deferred',
+        reasonCode: busyReasonCode(busy),
+        message: `${found}, and the rollback to ${owed.from} waits for an idle machine (${busy.reason})`,
+      };
+    }
+  }
+  note(`${found} after an interrupted update; rolling it back`, 'recover');
+  const enter = (phase, progress = null) => appendLog(record.id, `recovery: ${phase}${progress?.note ? `, ${progress.note}` : ''}`);
+  const rolled =
+    service.kind === 'npm'
+      ? await rollBack(service, owed.from, record.npmPrefix ?? npmProvider.resolveNpmPrefix(service), enter)
+      : await rollBackCommand(service, enter);
+  const message = `${found}; ${rolled.message}`;
+  if (rolled.ok) return { settled: true, action: 'rolled-back', reasonCode: null, message };
+  return { settled: processEvidence(service).state === 'running', action: 'rollback-failed', reasonCode: REASON.applyFailed, message };
 }
 
 // ---------------------------------------------------------------------------
