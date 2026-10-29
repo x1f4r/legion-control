@@ -39,9 +39,9 @@ const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 // beside their users' own.
 export const PLACEHOLDER_HOMES = new Set(['me', 'runner', 'runneradmin', 'Shared', 'Public', 'Default']);
 
-// Private addresses that are nobody's network. The wake and acceptance vectors need values just
-// across the boundaries a prefix or a CIDR block draws, which no placeholder range can stand in for;
-// three are blocks or prefixes the contract describes as a whole; and an Android emulator reaches
+// Private addresses that are nobody's network. The wake and acceptance vectors and the wake
+// reference need blocks named as a whole, and values on either side of the boundary a prefix or a
+// CIDR block draws, which no placeholder range can stand in for. And an Android emulator reaches
 // the machine it runs on at 10.0.2.2, wherever that is.
 export const SHARED_ADDRESSES = new Set([
   '10.0.2.2',
