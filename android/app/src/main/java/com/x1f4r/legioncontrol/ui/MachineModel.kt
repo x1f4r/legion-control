@@ -769,16 +769,27 @@ class MachineModel(
 
     fun sleep(force: Boolean = false, whenIdle: Boolean = false) {
         val request = InterruptRequest(force = force, whenIdle = whenIdle, expires = QUEUE_EXPIRY)
-        change(
-            task = Task.SLEEP,
-            label = "Putting ${machine.name} to sleep",
-            intent = OperationIntent(
+        sendSleep(
+            request,
+            OperationIntent(
                 kind = OpKind.SLEEP,
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
                 repeatable = true,
             ),
+        )
+    }
+
+    /**
+     * A sleep as the button asks for it and Try again asks for it again: the request, and then the
+     * grace in which a machine that stops answering reads as one that may be asleep.
+     */
+    private fun sendSleep(request: InterruptRequest, intent: OperationIntent) {
+        change(
+            task = Task.SLEEP,
+            label = "Putting ${machine.name} to sleep",
+            intent = intent,
             subjectName = machine.name,
         ) { id ->
             client.sleep(request, id)
@@ -792,10 +803,10 @@ class MachineModel(
 
     fun boot(target: MachineSystem, force: Boolean = false, whenIdle: Boolean = false) {
         val request = InterruptRequest(force = force, whenIdle = whenIdle, expires = QUEUE_EXPIRY)
-        change(
-            task = Task.BOOT,
-            label = "Switching to ${target.name}",
-            intent = OperationIntent(
+        sendBoot(
+            target,
+            request,
+            OperationIntent(
                 kind = OpKind.BOOT,
                 target = target.id,
                 force = force,
@@ -803,6 +814,19 @@ class MachineModel(
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
                 repeatable = true,
             ),
+        )
+    }
+
+    /**
+     * A boot into [target] as the button asks for it and Try again asks for it again: the request,
+     * and then what the page expects of a machine that is rebooting, so a dead link reads as waiting
+     * for [target] and the next status is dialled where [target] answers.
+     */
+    private fun sendBoot(target: MachineSystem, request: InterruptRequest, intent: OperationIntent) {
+        change(
+            task = Task.BOOT,
+            label = "Switching to ${target.name}",
+            intent = intent,
             subjectName = target.name,
             subjectId = target.id,
         ) { id ->
@@ -1023,37 +1047,35 @@ class MachineModel(
      *
      * What is sent is [tryAgainFor]'s answer and nothing else, the same answer that decides whether
      * the button can be pressed, so a record the screen offers nothing for cannot be sent here either.
+     * A boot and a sleep go through the buttons' own senders, so the page then waits for the reboot
+     * or the sleep it asked for, exactly as it does after the first press.
      */
     fun retry(record: OperationRecord) {
-        val again = tryAgainFor(record, status, detach = speaksV3) ?: return
+        val again = tryAgainFor(record, machine, status, detach = speaksV3) ?: return
         val intent = record.intent
-        val task = when (again) {
-            is RetryRequest.Update -> Task.UPDATE
-            is RetryRequest.Restart -> Task.RESTART
-            is RetryRequest.Boot -> Task.BOOT
-            is RetryRequest.Sleep -> Task.SLEEP
-            is RetryRequest.Run -> Task.RUN
-        }
-        change(
-            task = task,
-            label = "${intent.kind.label} on ${record.subjectName}",
-            intent = intent,
-            subjectName = record.subjectName,
-            subjectId = intent.service ?: intent.target ?: intent.actionId,
-        ) { id ->
-            when (again) {
-                is RetryRequest.Update -> client.update(again.request, id)
-                is RetryRequest.Restart -> client.restart(again.service, again.request, id)
-                is RetryRequest.Boot -> client.boot(again.target, again.request, noReboot = false, operationId = id)
-                is RetryRequest.Sleep -> client.sleep(again.request, id)
-                is RetryRequest.Run -> client.run(again.actionId, again.request, id)
-            }
+
+        fun resend(task: Task, dispatch: suspend (String) -> Result<com.x1f4r.legioncontrol.agent.AgentActionResult>) =
+            change(
+                task = task,
+                label = "${intent.kind.label} on ${record.subjectName}",
+                intent = intent,
+                subjectName = record.subjectName,
+                subjectId = intent.service ?: intent.actionId,
+                dispatch = dispatch,
+            )
+
+        when (again) {
+            is RetryRequest.Update -> resend(Task.UPDATE) { id -> client.update(again.request, id) }
+            is RetryRequest.Restart -> resend(Task.RESTART) { id -> client.restart(again.service, again.request, id) }
+            is RetryRequest.Run -> resend(Task.RUN) { id -> client.run(again.actionId, again.request, id) }
+            is RetryRequest.Boot -> sendBoot(machine.system(again.target) ?: return, again.request, intent)
+            is RetryRequest.Sleep -> sendSleep(again.request, intent)
         }
     }
 
     /** Whether Try again on [record] can be pressed now: [tryAgainFor], from the reading on screen. */
     fun canTryAgain(record: OperationRecord): Boolean =
-        !isWorking && tryAgainFor(record, status, detach = speaksV3) != null
+        !isWorking && tryAgainFor(record, machine, status, detach = speaksV3) != null
 
     /**
      * Reads an unresolved change again by its own id, and sends nothing (contract section 5.6).
@@ -1519,17 +1541,27 @@ internal fun agentDeploymentFor(
 }
 
 /**
- * What Try again sends for [record] from the reading on screen, [status], or null when it sends
- * nothing now.
+ * What Try again sends for [record] to [machine] from the reading on screen, [status], or null when
+ * it sends nothing now.
  *
  * The button is enabled from this and the press sends it, so neither goes further than the other,
  * and neither goes further than the buttons the change was first asked for with. A service is named
  * the way [status] says this agent takes one, and nothing that names a service is rebuilt while there
  * is no reading that says, which is after any failed read and before the first: an update sent then
- * without `--service` would stop and reinstall the first service instead.
+ * without `--service` would stop and reinstall the first service instead. A boot is only asked for
+ * into a system this setup still has, the only kind the button offers and the only kind the page
+ * can then wait for.
  */
-internal fun tryAgainFor(record: OperationRecord, status: AgentStatus?, detach: Boolean): RetryRequest? =
-    record.retryRequest(detach, ServiceNaming.of(status))
+internal fun tryAgainFor(
+    record: OperationRecord,
+    machine: Machine,
+    status: AgentStatus?,
+    detach: Boolean,
+): RetryRequest? {
+    val again = record.retryRequest(detach, ServiceNaming.of(status)) ?: return null
+    if (again is RetryRequest.Boot && machine.system(again.target) == null) return null
+    return again
+}
 
 /**
  * The actions an agent offered, as far as this app can send them back.
