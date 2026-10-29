@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { cli, deadPid, fixtureConfig, fixtureData, readFixture, withHome, writeConfig } from './helpers.mjs';
+import { cli, commandService, deadPid, fixtureConfig, fixtureData, readFixture, withHome, writeConfig } from './helpers.mjs';
 import { outcomeOf } from '../src/contract.mjs';
 import { acquireOperationLock, holderIsStale } from '../src/lock.mjs';
 import {
@@ -349,5 +349,22 @@ test('a detached worker finishes a record whose service or action was removed, r
     const cycled = cli(['cycle'], { home }).payload;
     assert.deepEqual(cycled.queued.map((entry) => [entry.opId, entry.action, entry.reasonCode]), [['queued-gone-action', 'failed', 'unknown-action']]);
     assert.equal(readOperation('queued-gone-action').state, 'finished');
+  });
+});
+
+test('a forced cycle overrides the busy gate and nothing else', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0', busy: 'on' });
+    writeConfig(home, fixtureConfig(dir, {
+      services: [commandService(dir), commandService(dir, { id: 'paused', name: 'Paused', updates: { automatic: false } })],
+    }));
+    const busy = cli(['cycle'], { home }).payload;
+    assert.deepEqual(busy.children.map((child) => [child.service, child.action, child.reasonCode]), [['demo', 'deferred', 'busy'], ['paused', 'deferred', 'policy-off']]);
+    const forced = cli(['cycle', '--force'], { home }).payload;
+    assert.deepEqual(forced.children.map((child) => [child.service, child.opId === null, child.action, child.reasonCode]), [
+      ['demo', false, 'updated', null],
+      ['paused', true, 'deferred', 'policy-off'],
+    ]);
+    assert.equal(readFixture(dir, 'update-runs'), '1', 'the paused service was not updated as well');
   });
 });

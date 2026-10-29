@@ -492,9 +492,10 @@ export async function runCycle(config, options = {}) {
 
     for (const [index, service] of ordered.entries()) {
       updateOperation(id, { progress: { step: index + 1, of: ordered.length, note: service.name } });
-      const eligibility = force
-        ? { eligible: true, reasonCode: null, reason: 'forced' }
-        : scheduledEligibility(config, service, {});
+      // --force overrides the busy gate and nothing else (policy.mjs), so a
+      // forced cycle still leaves alone what the policy says is not to be
+      // updated now, as the update itself would.
+      const eligibility = scheduledEligibility(config, service, {});
       // One the cycle could not finish even if everything before its stop took
       // no time at all is not begun. The update checks again at its stop,
       // with the time it took to get there spent.
