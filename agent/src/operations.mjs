@@ -30,8 +30,13 @@ import { log } from './log.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
 import { ownStartTime, processIsAlive, writeJsonAtomic } from './state.mjs';
 
-/** How many finished records are kept, and for how long. */
+/**
+ * How many finished records are kept whatever they say, how long one that
+ * failed or whose outcome is unknown is kept however many came after it, and
+ * the longest any record is kept (pruneOperations).
+ */
 export const HISTORY_LIMIT = 200;
+export const FAILURE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** A queued request with no expiry of its own, and the bounds of any it names. */
 export const DEFAULT_QUEUE_TTL_MS = 4 * 60 * 60 * 1000;
@@ -212,6 +217,11 @@ function scanOperations({ service = null, kind = null, state = null, recoveryPen
 /** Every record on disk, newest first, at most HISTORY_LIMIT of them. Never throws. */
 export function listOperations({ limit = 30, ...filter } = {}) {
   return scanOperations(filter).slice(0, Math.min(limit, HISTORY_LIMIT));
+}
+
+/** How many records the machine holds, which retention lets go past HISTORY_LIMIT. */
+export function countOperations() {
+  return scanOperations().length;
 }
 
 /**
@@ -1064,7 +1074,18 @@ export function servicesNeedingRecovery(records) {
 // Retention
 // ---------------------------------------------------------------------------
 
-/** Keep the newest HISTORY_LIMIT finished records, and nothing older than 30 days. */
+/**
+ * Let go of finished records nobody needs any more.
+ *
+ * The newest HISTORY_LIMIT are kept, whatever they say. That alone was a
+ * count, and a quarter-hourly cycle writes a record of its own and one for
+ * every service it looks at, so two services filled it in about seventeen
+ * hours: a failure on Friday night was gone before anybody looked on Saturday.
+ * So a record that failed, or whose outcome is unknown, is kept for a week
+ * however many came after it; what that can add is bounded by the same clock,
+ * at worst a week of cycles that all failed. Nothing is kept past thirty days,
+ * and a record still owing a service its recovery is never let go.
+ */
 export function pruneOperations({ now = Date.now() } = {}) {
   return withOperationsStore(() => pruneOperationsUnlocked({ now }));
 }
@@ -1089,8 +1110,11 @@ function pruneOperationsUnlocked({ now = Date.now() } = {}) {
   const removed = [];
   finished.forEach((record, index) => {
     const at = Date.parse(record.finishedAt ?? record.requestedAt ?? '');
-    const tooOld = !Number.isNaN(at) && now - at > HISTORY_MAX_AGE_MS;
-    if (index < HISTORY_LIMIT && !tooOld) return;
+    const age = Number.isNaN(at) ? 0 : now - at;
+    if (age <= HISTORY_MAX_AGE_MS) {
+      if (index < HISTORY_LIMIT) return;
+      if (['failed', 'unknown'].includes(recordOutcome(record)) && age <= FAILURE_RETENTION_MS) return;
+    }
     try {
       fs.rmSync(operationPath(record.id), { force: true });
       removed.push(record.id);

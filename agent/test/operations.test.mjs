@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { fresh, SRC, withHome } from './helpers.mjs';
+import { cli, fresh, SRC, withHome } from './helpers.mjs';
 
 const base = { kind: 'update', service: 'demo', systemId: 'linux' };
 
@@ -587,6 +587,43 @@ test('history is bounded, and pruning keeps the newest', async () => {
     const pruned = ops.pruneOperations();
     assert.equal(pruned.removed.length, 10);
     assert.equal(ops.listOperations({ limit: 500 }).length, 200);
+  });
+});
+
+test('a failure outlives the newest records by a week, and nothing outlives thirty days', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const day = 24 * 60 * 60 * 1000;
+    const finished = (id, result, daysAgo) => {
+      ops.beginOperation({ id, ...base });
+      ops.finishOperation(id, result);
+      const at = new Date(Date.now() - daysAgo * day).toISOString();
+      ops.updateOperation(id, { requestedAt: at, finishedAt: at });
+    };
+    const failed = { ok: false, action: 'failed', reasonCode: 'latest-unknown', message: 'the registry did not answer' };
+    finished('aaaaaaa1-3333-4333-8333-333333333333', failed, 3);
+    finished('aaaaaaa2-3333-4333-8333-333333333333', { ok: false, action: 'interrupted', reasonCode: 'interrupted', message: 'cut off' }, 6);
+    finished('aaaaaaa3-3333-4333-8333-333333333333', failed, 8);
+    finished('aaaaaaa4-3333-4333-8333-333333333333', { ok: true, action: 'noop', reasonCode: null, message: 'already there' }, 3);
+    // A quarter-hourly cycle's worth of routine records, every one newer.
+    for (let index = 0; index < ops.HISTORY_LIMIT; index += 1) {
+      finished(`${String(index).padStart(8, '0')}-3333-4333-8333-333333333333`, { ok: true, action: 'noop', reasonCode: null, message: 'nothing new' }, index / (4 * 24));
+    }
+    // And a failure past thirty days, which nothing keeps.
+    finished('aaaaaaa5-3333-4333-8333-333333333333', failed, 31);
+
+    const pruned = ops.pruneOperations();
+    assert.deepEqual(pruned.removed.sort(), [
+      'aaaaaaa3-3333-4333-8333-333333333333',
+      'aaaaaaa4-3333-4333-8333-333333333333',
+      'aaaaaaa5-3333-4333-8333-333333333333',
+    ]);
+    assert.ok(ops.readOperation('aaaaaaa1-3333-4333-8333-333333333333'), 'a failure three days old is kept');
+    assert.ok(ops.readOperation('aaaaaaa2-3333-4333-8333-333333333333'), 'so is an outcome nobody knows');
+    assert.equal(ops.countOperations(), ops.HISTORY_LIMIT + 2);
+    const history = cli(['history', '--limit', '5'], { home }).payload;
+    assert.equal(history.returned, 5);
+    assert.equal(history.retained, ops.HISTORY_LIMIT + 2, 'what the machine holds, past the newest it lists');
   });
 });
 

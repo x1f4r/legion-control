@@ -56,6 +56,7 @@ import { redactReply, restrictedRedactor } from './redact.mjs';
 import {
   beginOperation,
   cancelOperation,
+  countOperations,
   currentInitiator,
   deriveState,
   listOperations,
@@ -943,7 +944,7 @@ function commandHistory(config, options) {
   const service = options.get('service') ?? null;
   const kind = options.get('kind') ?? null;
   const records = listOperations({ limit, service, kind }).map((record) => deriveState(record, { systemId: config?.system.id ?? null }));
-  const retained = listOperations({ limit: 200 }).length;
+  const retained = countOperations();
   return ok({
     operations: records.map(summarize),
     limit,
