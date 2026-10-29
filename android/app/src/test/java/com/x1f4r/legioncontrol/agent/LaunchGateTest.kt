@@ -60,13 +60,13 @@ class LaunchGateTest {
 
     // MARK: - A transport that records everything
 
-    private data class Sent(val host: String, val line: String)
+    private data class Sent(val host: String, val line: String, val stdin: String?)
 
     private class Recording(private val status: String = V3_STATUS) : CommandTransport {
         val sent = mutableListOf<Sent>()
 
         override suspend fun run(endpoint: Endpoint, command: String, timeoutMillis: Long, stdin: StdinSource?): CommandOutcome {
-            sent += Sent(endpoint.host, command)
+            sent += Sent(endpoint.host, command, (stdin as? StdinSource.Bytes)?.bytes?.toString(Charsets.UTF_8))
             return CommandOutcome(0, status, "")
         }
 
@@ -243,8 +243,15 @@ class LaunchGateTest {
         val client = store.client(tower, transport)
         client.status()
         client.config()
-        assertTrue(transport.sent.isNotEmpty())
+        // Published the way reconciliation publishes it: the held document on standard input, under
+        // the command this device approved.
+        val held = store.document.value!!
+        client.configSet(held.canonicalText, held.identity!!.id, held.identity!!.revision)
         val approved = buildRemoteCommand(RemoteShell.POSIX, LINUX)
+        val published = transport.sent.last()
+        assertTrue(published.line, published.line.startsWith("$approved config set "))
+        assertEquals(malicious, published.stdin)
+        assertEquals(3, transport.sent.size)
         for (sent in transport.sent) {
             assertTrue(sent.line, sent.line.startsWith("$approved "))
             assertFalse(sent.line, "touch" in sent.line || sent.line.startsWith("sh "))
