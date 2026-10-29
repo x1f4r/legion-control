@@ -577,10 +577,14 @@ enum AppUpdates {
     /// and then moves `current`, so any other bundle would be swapped under a process that is not
     /// running out of it. The same check is what stops a test that forgot to replace this from
     /// starting a helper over its fake bundles.
+    ///
+    /// `onExit` hears the helper's exit status, which this process only ever lives to hear when the
+    /// helper gave up: it moves nothing until this process has gone.
     static func startSwap(
         staged: Staged, current: URL, marker: URL,
         launcher: [String] = launcher,
-        runningFrom running: URL = Bundle.main.bundleURL
+        runningFrom running: URL = Bundle.main.bundleURL,
+        onExit: (@Sendable (Int32) -> Void)? = nil
     ) throws {
         guard current.standardizedFileURL.path(percentEncoded: false)
                 == running.standardizedFileURL.path(percentEncoded: false) else {
@@ -609,6 +613,11 @@ enum AppUpdates {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
+        if let onExit {
+            // The handler holds the process, so it is still there to report when the helper exits
+            // whatever becomes of the call that started it.
+            process.terminationHandler = { _ in onExit(process.terminationStatus) }
+        }
         do {
             try process.run()
         } catch {

@@ -27,7 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, Menu
 
         // Tell the update helper this build came up. Without the marker it puts the previous bundle
         // back after forty-five seconds, which is exactly what should happen to a build that crashes
-        // on launch and exactly what must not happen to one that does not.
+        // on launch and exactly what must not happen to one that does not. This is also where an
+        // update the last run handed over is found to have worked or not.
         model.appUpdates.confirmLaunch()
         model.appUpdates.startAutomaticChecks()
 

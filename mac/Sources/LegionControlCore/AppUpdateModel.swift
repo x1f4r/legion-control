@@ -61,9 +61,10 @@ final class AppUpdateModel {
     /// real setup, write its marker where this run is not looking, and be rolled back with both
     /// copies left running.
     @ObservationIgnored var isIsolatedRun: Bool = AppPaths.isRedirected
-    /// Set in tests so nothing is ever actually swapped or relaunched.
-    @ObservationIgnored var performSwap: @MainActor (AppUpdates.Staged, URL, URL) throws -> Void = {
-        try AppUpdates.startSwap(staged: $0, current: $1, marker: $2)
+    /// Set in tests so nothing is ever actually swapped or relaunched. The last argument hears the
+    /// helper's exit status, which this process only lives to hear when the helper gave up.
+    @ObservationIgnored var performSwap: @MainActor (AppUpdates.Staged, URL, URL, @escaping @Sendable (Int32) -> Void) throws -> Void = {
+        try AppUpdates.startSwap(staged: $0, current: $1, marker: $2, onExit: $3)
     }
     @ObservationIgnored var downloadRelease: @MainActor (AppUpdates.Release) async throws -> AppUpdates.Download = { try await AppUpdates.download($0) }
     @ObservationIgnored var stageRelease: @MainActor (AppUpdates.Download, String, URL) async throws -> AppUpdates.Staged = { try await AppUpdates.stage($0, version: $1, replacing: $2) }
@@ -145,8 +146,7 @@ final class AppUpdateModel {
         lastChecked = nil
         checkFailure = nil
         failure = nil
-        if let preferences { preferences.removeObject(forKey: Self.storageKey) }
-        else { AppPreferences.removeObject(forKey: Self.storageKey) }
+        forget(Self.storageKey)
         onStateChange?()
     }
 
@@ -259,6 +259,10 @@ final class AppUpdateModel {
     /// Nothing here touches the bundle this app is running out of. The staged replacement is a whole
     /// sibling directory, and the only thing that moves anything is the helper, after this process
     /// has exited.
+    ///
+    /// Nothing here says the update worked either. Handing the swap over proves nothing about the
+    /// build that comes up after it, so the operation stays open and the offer stays on screen until
+    /// the next launch finds out which build is running (`confirmLaunch`).
     func install() {
         repositoryDidChange()
         guard checkedRepo == repo() else { checkIfStale(); return }
@@ -300,21 +304,25 @@ final class AppUpdateModel {
                 try self.requireCurrent(repository: repository, epoch: epoch)
                 self.operations?.addPhase(record.id, name: "staged", detail: staged.bundle.lastPathComponent)
 
-                // Written down before the swap, so the new copy comes up knowing it is current rather
-                // than offering to install the version it already is.
-                self.check = .upToDate(note: "Updated to \(release.version).")
-                self.lastChecked = Date()
-                self.remember(self.check!)
+                // Written down before the helper starts, because the build that comes up after it is
+                // the only one that can say whether it worked, and it has to know what was meant.
+                let pending = PendingSwap(
+                    id: record.id, kind: .update, version: release.version, from: self.installedVersion,
+                    operationId: record.id, repository: repository, checkedAt: self.lastChecked
+                )
+                self.rememberPendingSwap(pending)
 
                 // The marker is removed by the helper before it launches the new build, and written
                 // again by the new build once it is up. Its absence is what triggers the recovery.
-                try self.requireCurrent(repository: repository, epoch: epoch)
-                try self.performSwap(staged, bundleURL, marker)
-                self.operations?.finish(
-                    record.id,
-                    state: .succeeded,
-                    summary: "Legion Control \(release.version) was staged and the swap was handed to the update helper.",
-                    detail: "The previous build is kept beside it. If the new one does not come up within 45 seconds the helper puts the old one back."
+                do {
+                    try self.performSwap(staged, bundleURL, marker, self.helperExit(pending, discarding: staged.bundle))
+                } catch {
+                    self.forgetPendingSwap()
+                    throw error
+                }
+                self.operations?.addPhase(
+                    record.id, name: "handed over",
+                    detail: "The update helper swaps the bundles once this build has quit, and puts the previous one back if the new one does not come up within 45 seconds. The build that comes up records the outcome."
                 )
                 self.quit()
             } catch let changed as RepositoryChanged {
@@ -323,14 +331,14 @@ final class AppUpdateModel {
                 self.phase = .idle
                 self.operations?.finish(record.id, state: .cancelled, summary: changed.message)
                 self.checkIfStale()
-            } catch let problem as AppUpdates.InstallFailure {
-                self.failure = problem.message
-                self.phase = .idle
-                self.operations?.finish(record.id, state: .failed, summary: problem.message)
             } catch {
-                self.failure = error.localizedDescription
+                // The offer was never touched, so it is still the answer on screen and on disk. The
+                // staged bundle goes: nothing will ever swap it in now.
+                if let prepared { try? FileManager.default.removeItem(at: prepared.bundle) }
+                let message = (error as? AppUpdates.InstallFailure)?.message ?? error.localizedDescription
+                self.failure = message
                 self.phase = .idle
-                self.operations?.finish(record.id, state: .failed, summary: error.localizedDescription)
+                self.operations?.finish(record.id, state: .failed, summary: message)
             }
         }
     }
@@ -345,24 +353,131 @@ final class AppUpdateModel {
         phase = .installing
         failure = nil
         let marker = AppUpdates.launchMarkerURL(support: supportDirectory)
+        // Only a build that says which version it is can be checked for on the way back up.
+        let pending = AppUpdates.version(ofBundleAt: previous).map {
+            PendingSwap(id: UUID().uuidString, kind: .rollBack, version: $0, from: installedVersion)
+        }
+        if let pending { rememberPendingSwap(pending) }
         do {
             // Through the same seam as an install, so nothing here can start the real helper unless
-            // the app itself asked for it.
-            try AppUpdates.rollBack(to: previous, current: bundleURL, marker: marker, start: performSwap)
+            // the app itself asked for it. The kept build is what goes in, so it is never deleted
+            // here, whatever the helper does.
+            let ignore: @Sendable (Int32) -> Void = { _ in }
+            let onExit = pending.map { helperExit($0, discarding: nil) } ?? ignore
+            try AppUpdates.rollBack(to: previous, current: bundleURL, marker: marker) { staged, current, marker in
+                try self.performSwap(staged, current, marker, onExit)
+            }
             quit()
-        } catch let problem as AppUpdates.InstallFailure {
-            failure = problem.message
-            phase = .idle
         } catch {
-            failure = error.localizedDescription
+            if pending != nil { forgetPendingSwap() }
+            failure = (error as? AppUpdates.InstallFailure)?.message ?? error.localizedDescription
             phase = .idle
         }
     }
 
+    /// What the helper exiting means to a process that is still here to hear it: that it gave up
+    /// waiting for this build to quit, because it moves nothing until then. So nothing was swapped.
+    private func helperExit(_ pending: PendingSwap, discarding staged: URL?) -> @Sendable (Int32) -> Void {
+        { [weak self] status in
+            Task { @MainActor in self?.helperGaveUp(pending, status: status, discarding: staged) }
+        }
+    }
+
+    private func helperGaveUp(_ pending: PendingSwap, status: Int32, discarding staged: URL?) {
+        guard loadPendingSwap()?.id == pending.id else { return }
+        forgetPendingSwap()
+        if let staged { try? FileManager.default.removeItem(at: staged) }
+        let message = switch pending.kind {
+        case .update: "Legion Control did not quit, so the update helper changed nothing and \(pending.version) was not installed."
+        case .rollBack: "Legion Control did not quit, so the update helper changed nothing and \(pending.version) was not put back."
+        }
+        failure = message
+        phase = .idle
+        if let id = pending.operationId {
+            operations?.finish(id, state: .failed, summary: message,
+                               detail: "The update helper exited with status \(status) while this build was still running.")
+        }
+        onStateChange?()
+    }
+
     /// Called once the app is up. Tells the update helper it launched, which is what stops the
-    /// recovery from putting the old build back over a perfectly good new one.
+    /// recovery from putting the old build back over a perfectly good new one, and settles the swap
+    /// the last run handed over, now that a build is up to say which one it is.
     func confirmLaunch() {
         AppUpdates.confirmLaunch(support: supportDirectory)
+        resolvePendingSwap()
+    }
+
+    /// The one place an install is recorded as done: the build running now is the one it installed.
+    /// Anything else means the helper put the previous build back, or never got to move anything,
+    /// and the record and the offer say so rather than "updated".
+    private func resolvePendingSwap() {
+        guard let pending = loadPendingSwap() else { return }
+        forgetPendingSwap()
+        let running = installedVersion
+        if running == pending.version, pending.kind == .update {
+            if let id = pending.operationId {
+                operations?.finish(id, state: .succeeded,
+                                   summary: "Legion Control \(running) is installed and came up.",
+                                   detail: "The previous build, \(pending.from), is kept beside it until it is discarded.")
+            }
+            // The check that offered this build found it the newest there was, and until the next
+            // check that is still the answer, so the new build does not come up with none. Not when
+            // the setup has since named another repository: that one has not been asked.
+            if pending.repository == nil || pending.repository == repo() {
+                let answer = AppUpdates.Check.upToDate(note: "Updated to \(running).")
+                checkedRepo = repo()
+                lastChecked = pending.checkedAt ?? now()
+                check = answer
+                remember(answer)
+            }
+        } else if running != pending.version {
+            let message = switch pending.kind {
+            case .update where running == pending.from:
+                "Legion Control \(pending.version) did not come up, so \(running) is still the build that runs. The update helper puts the previous build back when the new one does not start."
+            case .update:
+                "Legion Control \(pending.version) was not confirmed: the build running now is \(running)."
+            case .rollBack:
+                "Legion Control \(pending.version) did not come up, so \(running) is still the build that runs."
+            }
+            failure = message
+            if let id = pending.operationId { operations?.finish(id, state: .failed, summary: message) }
+        }
+        onStateChange?()
+    }
+
+    // MARK: - The swap in flight
+
+    /// A swap handed to the helper and not yet seen to land. Written before the helper starts and
+    /// read by whichever build comes up next.
+    struct PendingSwap: Codable, Equatable {
+        enum Kind: String, Codable { case update, rollBack }
+
+        var id: String
+        var kind: Kind
+        /// The build that should be running once it worked, and the one that was running before.
+        var version: String
+        var from: String
+        /// The operation record an install keeps. A roll back has none.
+        var operationId: String?
+        /// Where and when the check that offered the update looked.
+        var repository: String?
+        var checkedAt: Date?
+    }
+
+    private static let pendingKey = "appUpdatePendingSwap"
+
+    func loadPendingSwap() -> PendingSwap? {
+        storedData(Self.pendingKey).flatMap { try? JSONDecoder().decode(PendingSwap.self, from: $0) }
+    }
+
+    private func rememberPendingSwap(_ pending: PendingSwap) {
+        guard let data = try? JSONEncoder().encode(pending) else { return }
+        store(data, Self.pendingKey)
+    }
+
+    private func forgetPendingSwap() {
+        forget(Self.pendingKey)
     }
 
     // MARK: - Remembering the answer
@@ -373,6 +488,9 @@ final class AppUpdateModel {
     private struct Stored: Codable {
         var checkedAt: Date
         var repository: String?
+        /// The build that asked. An answer is only ever about the build that asked for it: after an
+        /// update, a roll back or a reinstall, "up to date" from another build is not an answer.
+        var installedVersion: String?
         var manifestURL: URL?
         var signatureURL: URL?
         var version: String?
@@ -389,7 +507,7 @@ final class AppUpdateModel {
     }
 
     private func remember(_ result: AppUpdates.Check) {
-        var stored = Stored(checkedAt: lastChecked ?? now(), repository: checkedRepo)
+        var stored = Stored(checkedAt: lastChecked ?? now(), repository: checkedRepo, installedVersion: installedVersion)
         switch result {
         case .available(let release):
             stored.version = release.version
@@ -403,22 +521,20 @@ final class AppUpdateModel {
         case .failed:
             // A failure is not an answer, so it is not written down. The next launch looks again
             // rather than coming up repeating a network error from hours ago.
-            if let preferences { preferences.removeObject(forKey: Self.storageKey) }
-            else { AppPreferences.removeObject(forKey: Self.storageKey) }
+            forget(Self.storageKey)
             return
         }
         guard let data = try? JSONEncoder().encode(stored) else { return }
-        if let preferences { preferences.set(data, forKey: Self.storageKey) }
-        else { AppPreferences.set(data, forKey: Self.storageKey) }
+        store(data, Self.storageKey)
     }
 
     private func restore() {
-        let saved: Data?
-        if let preferences { saved = preferences.data(forKey: Self.storageKey) }
-        else { saved = AppPreferences.data(forKey: Self.storageKey) }
-        guard let data = saved,
+        guard let data = storedData(Self.storageKey),
               let stored = try? JSONDecoder().decode(Stored.self, from: data)
         else { return }
+        // Another build's answer, so this one comes up having not asked yet and asks straight away.
+        // Older records do not say who asked, and are compared below instead.
+        if let asked = stored.installedVersion, asked != installedVersion { return }
 
         lastChecked = stored.checkedAt
         checkedRepo = stored.repository
@@ -440,5 +556,21 @@ final class AppUpdateModel {
         } else {
             check = .upToDate(note: stored.note)
         }
+    }
+
+    /// The injected preferences in tests, this app's own defaults otherwise.
+    private func storedData(_ key: String) -> Data? {
+        if let preferences { return preferences.data(forKey: key) }
+        return AppPreferences.data(forKey: key)
+    }
+
+    private func store(_ data: Data, _ key: String) {
+        if let preferences { preferences.set(data, forKey: key) }
+        else { AppPreferences.set(data, forKey: key) }
+    }
+
+    private func forget(_ key: String) {
+        if let preferences { preferences.removeObject(forKey: key) }
+        else { AppPreferences.removeObject(forKey: key) }
     }
 }

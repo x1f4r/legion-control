@@ -19,6 +19,8 @@ struct AppUpdateModelTests {
         let preferences = FilePreferences(url: directory.appending(path: "preferences.json"))
         let model = AppUpdateModel(preferences: preferences, installedVersion: "3.0.0")
         model.bundleURL = directory.appending(path: "Legion Control.app")
+        // Never the real Application Support: a launch confirmed here writes the marker.
+        model.supportDirectory = directory.appending(path: "support")
         // Whatever the environment running the tests says: the cases that want an isolated run
         // ask for one.
         model.isIsolatedRun = false
@@ -250,7 +252,7 @@ struct AppUpdateModelTests {
             if holdDuringStage { await withCheckedContinuation { resume = $0 } }
             return .init(bundle: stagedBundle, previous: previous, version: version)
         }
-        model.performSwap = { _, _, _ in swaps += 1 }
+        model.performSwap = { _, _, _, _ in swaps += 1 }
         model.quit = { quits += 1 }
         model.install()
         let deadline = Date().addingTimeInterval(2)
@@ -296,7 +298,7 @@ struct AppUpdateModelTests {
         }
         var handedOff = false
         var quitRequested = false
-        model.performSwap = { _, _, actualMarker in
+        model.performSwap = { _, _, actualMarker, _ in
             #expect(actualMarker == marker)
             let observed = try Data(contentsOf: marker)
             #expect(observed == proof)
@@ -332,6 +334,198 @@ struct AppUpdateModelTests {
         #expect(model.installBlockedReason == nil)
     }
 
+    // MARK: - Honest outcomes
+
+    typealias Swap = @MainActor (AppUpdates.Staged, URL, URL, @escaping @Sendable (Int32) -> Void) throws -> Void
+
+    /// An install taken as far as the handoff: a download and a staged bundle inside `directory`,
+    /// and whatever swap the test wants in place of the helper. Returns the staged bundle.
+    @discardableResult
+    func prepareInstall(_ model: AppUpdateModel, in directory: URL, swap: @escaping Swap) -> URL {
+        let downloadDirectory = directory.appending(path: "download")
+        let stagedBundle = directory.appending(path: "Legion Control.new.app")
+        model.downloadRelease = { _ in
+            try FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: true)
+            let artifact = ReleaseTrust.Manifest.Artifact(name: "app.zip", sha256: String(repeating: "a", count: 64), size: 1)
+            return .init(directory: downloadDirectory, archive: downloadDirectory.appending(path: "app.zip"),
+                         manifest: .init(schema: 1, version: "3.1.0", artifacts: [artifact]), artifact: artifact)
+        }
+        model.stageRelease = { _, version, _ in
+            try FileManager.default.createDirectory(at: stagedBundle, withIntermediateDirectories: true)
+            return .init(bundle: stagedBundle, previous: directory.appending(path: "Legion Control.previous.app"), version: version)
+        }
+        model.performSwap = swap
+        return stagedBundle
+    }
+
+    /// The model the next launch makes: the same preferences and history, a different build.
+    func relaunch(after model: AppUpdateModel, preferences: FilePreferences, store: OperationStore,
+                  as version: String) -> (AppUpdateModel, OperationStore) {
+        let next = AppUpdateModel(preferences: preferences, installedVersion: version)
+        next.bundleURL = model.bundleURL
+        next.supportDirectory = model.supportDirectory
+        next.isIsolatedRun = false
+        let history = OperationStore(url: store.url)
+        next.operations = history
+        return (next, history)
+    }
+
+    func offerAndInstall(_ model: AppUpdateModel, store: OperationStore) async {
+        model.operations = store
+        model.fetchRelease = { _, _ in .available(Self.release) }
+        model.checkNow()
+        await settle(model)
+        var quits = 0
+        model.quit = { quits += 1 }
+        model.install()
+        let deadline = Date().addingTimeInterval(2)
+        while quits == 0, model.phase != .idle || model.failure == nil, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    @Test("an install handed to the helper is only recorded as done by the launch of the new build")
+    func installConfirmedByNextLaunch() async throws {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        prepareInstall(model, in: directory) { _, _, _, _ in }
+        await offerAndInstall(model, store: store)
+
+        // Handing over proves nothing about the build that comes up after it, so nothing says
+        // "updated" yet: not the record, not the check, not what a relaunch of this build reads.
+        let pending = try #require(model.loadPendingSwap())
+        let id = try #require(pending.operationId)
+        #expect(pending.version == "3.1.0")
+        #expect(pending.from == "3.0.0")
+        #expect(store.record(id: id)?.state == .running)
+        #expect(model.check == .available(Self.release))
+        #expect(AppUpdateModel(preferences: preferences, installedVersion: "3.0.0").check == .available(Self.release))
+
+        let (next, history) = relaunch(after: model, preferences: preferences, store: store, as: "3.1.0")
+        next.confirmLaunch()
+        #expect(history.record(id: id)?.state == .succeeded)
+        #expect(next.check == .upToDate(note: "Updated to 3.1.0."))
+        #expect(next.failure == nil)
+        #expect(next.loadPendingSwap() == nil)
+        #expect(FileManager.default.fileExists(atPath: AppUpdates.launchMarkerURL(support: next.supportDirectory).path))
+    }
+
+    @Test("a launch that is not the new build records the install as failed and keeps the offer")
+    func installReversedByNextLaunch() async throws {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        prepareInstall(model, in: directory) { _, _, _, _ in }
+        await offerAndInstall(model, store: store)
+        let id = try #require(model.loadPendingSwap()?.operationId)
+
+        // The helper put the old build back, and the old build is what comes up.
+        let (next, history) = relaunch(after: model, preferences: preferences, store: store, as: "3.0.0")
+        next.confirmLaunch()
+        #expect(history.record(id: id)?.state == .failed)
+        #expect(next.check == .available(Self.release))
+        #expect(next.failure?.contains("3.1.0 did not come up") == true)
+        #expect(next.loadPendingSwap() == nil)
+    }
+
+    @Test("a swap that cannot be handed over keeps the offer and deletes the staged bundle")
+    func failedHandoffRestores() async throws {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        let staged = prepareInstall(model, in: directory) { _, _, _, _ in
+            throw AppUpdates.InstallFailure("The update helper could not be started.")
+        }
+        await offerAndInstall(model, store: store)
+
+        #expect(model.phase == .idle)
+        #expect(model.failure == "The update helper could not be started.")
+        #expect(store.newestFirst.first?.state == .failed)
+        #expect(model.loadPendingSwap() == nil)
+        #expect(!FileManager.default.fileExists(atPath: staged.path))
+        #expect(model.check == .available(Self.release))
+        #expect(AppUpdateModel(preferences: preferences, installedVersion: "3.0.0").check == .available(Self.release))
+    }
+
+    @Test("a helper that gives up while this build still runs means nothing was installed")
+    func helperGivingUpRestores() async throws {
+        let (model, _, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        var helperExited: (@Sendable (Int32) -> Void)?
+        let staged = prepareInstall(model, in: directory) { _, _, _, onExit in helperExited = onExit }
+        // quit() is answered by nothing: this build is still running when the helper gives up.
+        await offerAndInstall(model, store: store)
+        let exit = try #require(helperExited)
+        #expect(model.phase == .installing)
+
+        exit(3)
+        let deadline = Date().addingTimeInterval(2)
+        while model.phase != .idle, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+        #expect(model.phase == .idle)
+        #expect(model.failure?.contains("did not quit") == true)
+        #expect(store.newestFirst.first?.state == .failed)
+        #expect(model.loadPendingSwap() == nil)
+        #expect(!FileManager.default.fileExists(atPath: staged.path))
+        #expect(model.check == .available(Self.release))
+    }
+
+    @Test("an answer another build wrote down is asked again rather than shown")
+    func cacheBelongsToTheBuildThatAsked() async {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.fetchRelease = { _, _ in .upToDate(note: nil) }
+        model.checkNow()
+        await settle(model)
+        #expect(model.check == .upToDate(note: nil))
+
+        // A roll back to 2.9.0 must not come up saying 2.9.0 is up to date.
+        let older = AppUpdateModel(preferences: preferences, installedVersion: "2.9.0")
+        #expect(older.check == nil)
+        #expect(older.lastChecked == nil)
+        var calls = 0
+        older.fetchRelease = { _, _ in calls += 1; return .available(Self.release) }
+        older.checkIfStale()
+        await settle(older)
+        #expect(calls == 1)
+        #expect(older.availableVersion == "3.1.0")
+    }
+
+    @Test("a roll back goes through the swap seam and is checked for by the next launch")
+    func rollBackIsConfirmed() async throws {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        let previous = directory.appending(path: "Legion Control.previous.app")
+        try AppUpdateTests.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "2.9.0")
+        var handed: [AppUpdates.Staged] = []
+        var quits = 0
+        model.performSwap = { staged, _, _, _ in handed.append(staged) }
+        model.quit = { quits += 1 }
+        model.rollBack()
+        #expect(handed.map(\.bundle) == [previous])
+        #expect(quits == 1)
+        #expect(model.loadPendingSwap()?.version == "2.9.0")
+
+        let (back, _) = relaunch(after: model, preferences: preferences, store: store, as: "2.9.0")
+        back.confirmLaunch()
+        #expect(back.failure == nil)
+        #expect(back.loadPendingSwap() == nil)
+
+        // Asked again from 3.0.0, and this time the kept build does not come up.
+        let (again, _) = relaunch(after: model, preferences: preferences, store: store, as: "3.0.0")
+        again.performSwap = { _, _, _, _ in }
+        again.quit = { }
+        again.rollBack()
+        #expect(again.loadPendingSwap()?.version == "2.9.0")
+        let (stuck, _) = relaunch(after: model, preferences: preferences, store: store, as: "3.0.0")
+        stuck.confirmLaunch()
+        #expect(stuck.failure?.contains("2.9.0 did not come up") == true)
+        // The kept build is what was handed in, so nothing here deletes it.
+        #expect(FileManager.default.fileExists(atPath: previous.path))
+    }
+
     @Test("an isolated run never installs, rolls back or discards a build")
     func isolatedRunRefusesSwaps() async throws {
         let (model, _, directory) = fixture()
@@ -348,7 +542,7 @@ struct AppUpdateModelTests {
         var swaps = 0
         var quits = 0
         model.downloadRelease = { _ in downloads += 1; throw AppUpdates.InstallFailure("not reached") }
-        model.performSwap = { _, _, _ in swaps += 1 }
+        model.performSwap = { _, _, _, _ in swaps += 1 }
         model.quit = { quits += 1 }
 
         #expect(model.installBlockedReason == model.swapBlockedReason)
