@@ -90,6 +90,13 @@ internal object LaunchDocuments {
     fun tuple(agent: List<String>, grammar: String) = LaunchTuple(agent, grammar)
 }
 
+/**
+ * Adopts [text] the way a fetch along descent does: the bytes as the machine promised them, over the
+ * document in force.
+ */
+internal fun ConfigStore.adoptAsFetched(text: String, machineName: String = "Tower"): SetupOutcome =
+    adoptFromMachine(text, CanonicalSetup.hashOf(text), machineName)
+
 /** [this] with [change] made to one machine. */
 internal fun JsonObject.editedMachine(id: String, change: (JsonObject) -> JsonObject): JsonObject =
     ControllerDocument.of(this).editMachine(id, change).root

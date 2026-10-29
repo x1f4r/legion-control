@@ -274,7 +274,8 @@ The hash all of this turns on is the canonical form from `contract/hash-vectors.
 UTF-8, one leading byte order mark stripped, CRLF and CR to LF, a fixed six-character whitespace
 set trimmed from both ends, exactly one trailing newline. `data/CanonicalSetup.kt` implements
 that rule and the `hash` family of `ContractVectorsTest` checks every shared vector, including
-the ones that must be refused.
+the ones that must be refused. A copy read from a machine is hashed and stored as the bytes the
+agent keeps (`raw`), never printed again first.
 
 ## Testing on an emulator
 

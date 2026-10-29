@@ -6,6 +6,7 @@ import com.x1f4r.legioncontrol.data.LaunchDocuments.HELD
 import com.x1f4r.legioncontrol.data.LaunchDocuments.LINUX
 import com.x1f4r.legioncontrol.data.LaunchDocuments.descendant
 import com.x1f4r.legioncontrol.data.LaunchDocuments.tuple
+import com.x1f4r.legioncontrol.data.adoptAsFetched
 import com.x1f4r.legioncontrol.data.offered
 import com.x1f4r.legioncontrol.data.withSystemValue
 import org.junit.Assert.assertEquals
@@ -62,7 +63,7 @@ class SetupEditorLaunchTest {
     @Test
     fun `the launch inputs of a system whose command waits are read-only`() {
         val store = enrolled()
-        store.adoptFromMachine(descendant(store.text.value) { it.withSystemValue("tower", "linux", "agent", listOf("sh", "-c", "id")) }, null, "Tower")
+        store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue("tower", "linux", "agent", listOf("sh", "-c", "id")) })
         val editor = editor(store)
         assertNotNull(editor.pendingCommand("tower", "linux"))
 
@@ -84,7 +85,7 @@ class SetupEditorLaunchTest {
     @Test
     fun `Revert waits for an edit in progress, which it would otherwise throw away`() {
         val store = enrolled()
-        store.adoptFromMachine(descendant(store.text.value) { it.withSystemValue("tower", "linux", "agent", listOf("sh", "-c", "id")) }, null, "Tower")
+        store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue("tower", "linux", "agent", listOf("sh", "-c", "id")) })
         val editor = editor(store)
         val entry = editor.pendingCommand("tower", "linux")!!
 

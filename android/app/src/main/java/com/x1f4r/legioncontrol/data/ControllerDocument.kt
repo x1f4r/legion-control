@@ -1,6 +1,5 @@
 package com.x1f4r.legioncontrol.data
 
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -28,9 +27,22 @@ import java.util.UUID
 class ControllerDocument private constructor(
     /** The parsed tree, which is the source of truth for an edit. */
     val root: JsonObject,
+    /**
+     * The canonical text this document was read from, until it is edited.
+     *
+     * A document that came off a machine is those bytes and no others: their hash is the one the
+     * machine reports and the one every other peer compares against. Printing the tree again would
+     * give another peer's spacing, escaping or key order this device's spelling of them, and a
+     * document whose hash changes on the way in can never be verified or found in step (C1).
+     */
+    private val sourceText: String?,
 ) {
-    /** The exact text a machine would store and hash. */
-    val canonicalText: String by lazy { CanonicalSetup.canonicalText(Pretty.encodeToString(JsonObject.serializer(), root)) }
+    /**
+     * The exact text a machine would store and hash: the text it was read from, or, once edited, the
+     * tree printed the way `JSON.stringify(document, null, 2)` prints it, with every number spelled
+     * as it was read.
+     */
+    val canonicalText: String by lazy { sourceText ?: CanonicalSetup.canonicalText(SetupJson.of(root).print()) }
 
     val hash: String by lazy { CanonicalSetup.hashOf(canonicalText) }
 
@@ -44,8 +56,8 @@ class ControllerDocument private constructor(
     /** Everything this build understands, for the UI and the validator. */
     fun typed(): Result<ControllerConfig> = readControllerConfig(canonicalText)
 
-    /** The same document with a different tree. Used by every edit below. */
-    private fun with(tree: JsonObject) = ControllerDocument(tree)
+    /** The same document with a different tree. Used by every edit below; it has no source text any more. */
+    private fun with(tree: JsonObject) = ControllerDocument(tree, null)
 
     /**
      * A new revision of this document, descending from it.
@@ -202,40 +214,29 @@ class ControllerDocument private constructor(
         /** This client's kind, on the wire. Fixed by the contract's controllerSource enum. */
         const val CLIENT_KIND = "phone"
 
-        private val Lenient = Json {
-            ignoreUnknownKeys = true
-            isLenient = true
-        }
-
-        private val Pretty = Json {
-            prettyPrint = true
-            prettyPrintIndent = "  "
-        }
-
-        /** Reads a document, or explains in one sentence why it is not one. */
+        /**
+         * Reads a document, or explains in one sentence why it is not one.
+         *
+         * The text is read the way `JSON.parse` reads it, which is what every peer and the agent do,
+         * and kept: until it is edited, its canonical form is what this document is.
+         */
         fun parse(text: String): Result<ControllerDocument> {
-            val canonical = try {
-                CanonicalSetup.canonicalText(text)
-            } catch (failure: CanonicalSetup.NotUtf8) {
-                return Result.failure(IllegalArgumentException(failure.message))
-            }
+            val canonical = CanonicalSetup.canonicalText(text)
             val tree = try {
-                Lenient.parseToJsonElement(canonical)
-            } catch (failure: Exception) {
+                SetupJsonParser.parseAllowingRepeats(canonical).root
+            } catch (failure: SetupJsonParser.Malformed) {
                 return Result.failure(
-                    IllegalArgumentException(
-                        "That is not a configuration this app can read: " +
-                            (failure.message?.lineSequence()?.firstOrNull()?.trim() ?: "unreadable"),
-                    ),
+                    IllegalArgumentException("That is not a configuration this app can read: ${failure.message}"),
                 )
             }
-            if (tree !is JsonObject) {
+            if (tree !is SetupJson.Object) {
                 return Result.failure(IllegalArgumentException("A setup has to be a JSON object."))
             }
-            return Result.success(ControllerDocument(tree))
+            return Result.success(ControllerDocument(tree.toElement() as JsonObject, canonical))
         }
 
-        fun of(root: JsonObject): ControllerDocument = ControllerDocument(root)
+        /** A document made from a tree, which has no text until it is printed. */
+        fun of(root: JsonObject): ControllerDocument = ControllerDocument(root, null)
 
         /** A fresh setup id. A uuid, because two peers must never independently pick the same one. */
         fun newSetupId(): String = "setup-" + UUID.randomUUID().toString().lowercase(Locale.ROOT)

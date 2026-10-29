@@ -91,7 +91,7 @@ class LaunchApprovalsTest {
         assertTrue(store.launch.value.toMachines().flatMap { it.systems }.all { it.launchState == LaunchState.NOT_DRIVEN })
 
         // Anything that approves nothing leaves it alone, adoption included.
-        store.adoptFromMachine(descendant(store.text.value) { it.editedMachine(tower) { m -> JsonObject(m + ("name" to JsonPrimitive("Desk"))) } }, null, "Tower")
+        store.adoptAsFetched(descendant(store.text.value) { it.editedMachine(tower) { m -> JsonObject(m + ("name" to JsonPrimitive("Desk"))) } })
         assertEquals("{ not a record", prefs.values[LaunchApprovals.KEY])
 
         assertNull(store.approveLaunch(store.launch.value.review.take(1)))
@@ -118,7 +118,7 @@ class LaunchApprovalsTest {
         val store = store(prefs)
         store.applyEnrolment(HELD, "Test phone")
         // A peer changes the tower's Linux command, which waits.
-        store.adoptFromMachine(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("sh", "-c", "id")) }, null, "Tower")
+        store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("sh", "-c", "id")) })
         assertEquals(listOf(TOWER_LINUX), store.launch.value.review.map { it.path })
 
         val newWindows = listOf("C:\\Program Files\\nodejs\\node.exe", "D:\\lc\\bin\\launcher.mjs")
@@ -153,11 +153,11 @@ class LaunchApprovalsTest {
     fun `fetching, merging, keeping mine, taking theirs and following another setup approve nothing`() {
         val changed = listOf("sh", "-c", "touch /tmp/x")
         val paths = mapOf<String, (ConfigStore, String) -> Unit>(
-            "automatic fetch" to { store, text -> store.adoptFromMachine(text, null, "Tower") },
+            "automatic fetch" to { store, text -> store.adoptAsFetched(text) },
             "take theirs" to { store, text ->
                 val theirs = ControllerDocument.parse(text).getOrThrow()
                 store.recordDivergence("Tower", "edited twice", text, provenanceOf(theirs))
-                store.adoptFromMachine(store.divergence.value!!.theirText, null, "Tower")
+                store.adoptAsFetched(store.divergence.value!!.theirText)
             },
             "merge" to { store, text ->
                 val theirs = ControllerDocument.parse(text).getOrThrow()
@@ -166,7 +166,7 @@ class LaunchApprovalsTest {
             "keep mine" to { store, text ->
                 // Mine is the document a peer changed here, kept as a revision descending from both.
                 val mine = ControllerDocument.parse(text).getOrThrow()
-                store.adoptFromMachine(text, null, "Tower")
+                store.adoptAsFetched(text)
                 store.applyMerge(mine, provenanceOf(mine), "Test phone")
             },
             "another setup" to { store, text ->
@@ -175,7 +175,7 @@ class LaunchApprovalsTest {
                         DocumentIdentity(id = "setup-0b4f6a12-3c5d-4e7f-8a9b-0c1d2e3f4a5b", revision = 1),
                     ).root,
                 )
-                store.adoptFromMachine(other.canonicalText, null, "Tower")
+                store.adoptAsFetched(other.canonicalText)
             },
         )
         for ((name, path) in paths) {
@@ -214,11 +214,11 @@ class LaunchApprovalsTest {
         val store = store(prefs)
         store.applyEnrolment(HELD, "Test phone")
         val first = listOf("/usr/bin/node", "/opt/lc/bin/launcher.mjs")
-        store.adoptFromMachine(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", first) }, null, "Tower")
+        store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", first) })
         val shown = store.launch.value.review.single()
 
         val second = listOf("/usr/bin/node", "/opt/other/bin/launcher.mjs")
-        store.adoptFromMachine(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", second) }, null, "Tower")
+        store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", second) })
         assertNull(store.approveLaunch(listOf(shown)))
 
         assertEquals(tuple(first, "posix"), recorded(prefs, tower, "linux"))
@@ -236,10 +236,8 @@ class LaunchApprovalsTest {
         val prefs = MemoryPreferences()
         val store = store(prefs)
         store.applyEnrolment(HELD, "Test phone")
-        store.adoptFromMachine(
+        store.adoptAsFetched(
             descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("/usr/bin/node", "/home/me/\u202Esjm.rehcnual/nib/")) },
-            null,
-            "Tower",
         )
         val before = record(prefs)
         val entry = store.launch.value.review.single()
@@ -256,7 +254,7 @@ class LaunchApprovalsTest {
         store.applyEnrolment(HELD, "Test phone")
         val extended = JsonObject(record(prefs) + ("note" to JsonPrimitive("kept")))
         prefs.edit().putString(LaunchApprovals.KEY, extended.toString()).apply()
-        store.adoptFromMachine(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("/usr/bin/node", "/opt/lc/bin/launcher.mjs")) }, null, "Tower")
+        store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("/usr/bin/node", "/opt/lc/bin/launcher.mjs")) })
 
         store.approveLaunch(store.launch.value.review)
 
@@ -282,7 +280,7 @@ class LaunchApprovalsTest {
                     ),
             )
         }
-        store.adoptFromMachine(withNas, null, "Tower")
+        store.adoptAsFetched(withNas)
 
         assertEquals(emptyList<LaunchReviewEntry>(), store.launch.value.review)
         assertEquals(tuple(PI, "dispatch"), recorded(prefs, "nas", "linux"))
@@ -293,10 +291,8 @@ class LaunchApprovalsTest {
         val prefs = MemoryPreferences()
         val store = store(prefs)
         store.applyEnrolment(HELD, "Test phone")
-        store.adoptFromMachine(
+        store.adoptAsFetched(
             descendant(store.text.value) { it.withSystemValue("pi", "linux", "restricted", false).withSystemValue("pi", "linux", "shell", "powershell") },
-            null,
-            "Tower",
         )
         val entry = store.launch.value.review.single()
         assertEquals(PI_LINUX, entry.path)

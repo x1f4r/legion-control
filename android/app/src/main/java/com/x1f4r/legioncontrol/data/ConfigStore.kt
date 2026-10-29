@@ -236,17 +236,21 @@ class ConfigStore internal constructor(
      *
      * The hash is checked against what the machine said it was serving before anything is applied: a
      * document whose bytes do not hash to the hash that was reported is not the document that was
-     * promised, and it is refused rather than repaired.
+     * promised, and it is refused rather than repaired. A machine that reported no hash promised
+     * nothing, and nothing it serves is taken.
      */
     fun adoptFromMachine(
         text: String,
         expectedHash: String?,
         machineName: String,
     ): SetupOutcome {
+        if (expectedHash.isNullOrBlank()) {
+            return SetupOutcome.Invalid("$machineName did not say which setup it holds, so nothing was applied.")
+        }
         val parsed = ControllerDocument.parse(text).getOrElse {
             return SetupOutcome.Invalid(it.message ?: "That setup could not be read.")
         }
-        if (!expectedHash.isNullOrBlank() && parsed.hash != expectedHash) {
+        if (parsed.hash != expectedHash) {
             return SetupOutcome.Invalid(
                 "$machineName served a setup whose contents do not match the hash it reported. " +
                     "Nothing was applied.",

@@ -1,9 +1,9 @@
 package com.x1f4r.legioncontrol.agent
 
+import com.x1f4r.legioncontrol.data.SetupJson
 import com.x1f4r.legioncontrol.net.CommandOutcome
 import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -26,8 +26,19 @@ import java.util.Base64
  * who wrote it and which revision it is, because a copy that differs is not a copy that is newer.
  */
 sealed interface ControllerFetch {
-    /** A document, and everything the machine that served it said about where it came from. */
-    data class Document(val text: String, val provenance: SetupProvenance) : ControllerFetch
+    /**
+     * A document, and everything the machine that served it said about where it came from.
+     *
+     * [text] is the agent's stored bytes when it sent them as `raw`, and otherwise `controller`
+     * printed again in the order it arrived, which only an agent before 3.1.0 makes necessary and
+     * which the hash check then confirms or refutes. [replyHash] is the reply's own `hash`: what the
+     * machine says it holds, and null on a reply that names none, which is never adopted.
+     */
+    data class Document(
+        val text: String,
+        val provenance: SetupProvenance,
+        val replyHash: String? = provenance.hash,
+    ) : ControllerFetch
 
     /** The agent knows what a setup is and has none. Nothing has been shared with it yet. */
     data object NothingStored : ControllerFetch
@@ -166,9 +177,13 @@ fun readControllerReply(reply: JsonObject, source: String? = null): ControllerFe
     val document = reply["controller"] ?: return ControllerFetch.TooOld
     if (document is JsonNull) return ControllerFetch.NothingStored
     if (document !is JsonObject) return ControllerFetch.Unreadable
+    // The stored bytes, exactly: hashing anything rebuilt from the parsed object reproduces the
+    // machine's hash only when this app happens to print it the way its writer did (C1).
+    val raw = (reply["raw"] as? JsonPrimitive)?.takeIf { it.isString }?.content
     return ControllerFetch.Document(
-        text = SetupJson.encodeToString(JsonObject.serializer(), document),
+        text = raw ?: SetupJson.of(document).print(),
         provenance = provenanceOf(envelope = reply, document = document, readFrom = source),
+        replyHash = (reply["hash"] as? JsonPrimitive)?.takeIf { it.isString }?.content,
     )
 }
 
@@ -238,15 +253,6 @@ fun provenanceOf(
         sourceKind = text("source"),
         readFrom = readFrom,
     )
-}
-
-/**
- * Written back out rather than passed through, because the bytes on the far side are one line of
- * JSON and what lands in the field on screen is meant to be read and edited.
- */
-private val SetupJson: Json = Json {
-    prettyPrint = true
-    prettyPrintIndent = "  "
 }
 
 /** One command, on a link that has already been opened. Nothing here waits on the machine to work. */

@@ -20,6 +20,7 @@ import com.x1f4r.legioncontrol.data.LaunchDocuments.tuple
 import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.data.MachineHints
 import com.x1f4r.legioncontrol.data.MemoryPreferences
+import com.x1f4r.legioncontrol.data.adoptAsFetched
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.editedMachine
 import com.x1f4r.legioncontrol.data.withSystemValue
@@ -95,7 +96,7 @@ class LaunchGateTest {
     private fun ConfigStore.paths(): List<String> = launch.value.review.map { it.path }
 
     private fun ConfigStore.adopt(text: String) =
-        assertTrue(adoptFromMachine(text, null, "Tower") is SetupOutcome.Applied)
+        assertTrue(adoptAsFetched(text) is SetupOutcome.Applied)
 
     private fun enrolled(prefs: MemoryPreferences = MemoryPreferences(), text: String = HELD): ConfigStore =
         store(prefs).also { assertEquals(null, it.applyEnrolment(text, "Test phone")) }
@@ -142,7 +143,7 @@ class LaunchGateTest {
             (case.input["approvals"] as? JsonObject)?.let { prefs.values[LaunchApprovals.KEY] = it.toString() }
             val store = store(prefs)
 
-            when (val outcome = store.adoptFromMachine(case.input.string("offeredText")!!, null, "Tower")) {
+            when (val outcome = store.adoptAsFetched(case.input.string("offeredText")!!)) {
                 is SetupOutcome.Applied -> Unit
 
                 else -> {
