@@ -87,7 +87,12 @@ function operationOf() {
     service: record?.service ?? null,
     phase: record?.phase ?? null,
     opStartedAt: record?.startedAt ?? record?.requestedAt ?? null,
-    bootId: record?.bootId ?? bootIdentity(),
+    // The boot the command runs in, never the record's. A request queued with
+    // --when-idle keeps the boot it was queued in, and when a reboot comes
+    // between the queueing and the cycle that runs it, an entry stamped with
+    // that boot would be read as left over from before the reboot and dropped
+    // the moment it was written.
+    bootId: bootIdentity(),
   };
 }
 

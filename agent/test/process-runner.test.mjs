@@ -12,8 +12,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { bootIdentity } from '../src/operations.mjs';
-import { ledgerPath, runMutation, unsettledWork } from '../src/process-runner.mjs';
+import { beginOperation, bootIdentity, updateOperation } from '../src/operations.mjs';
+import { ledgerPath, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
 import { deadPid, withHome } from './helpers.mjs';
 
 const posix = process.platform !== 'win32';
@@ -34,6 +34,37 @@ function ledger() {
     return JSON.parse(fs.readFileSync(ledgerPath(), 'utf8')).commands;
   } catch {
     return [];
+  }
+}
+
+/**
+ * Run `body` with an agent that may signal nothing in a process group: what a
+ * member running as another user, or stuck in the kernel, looks like from
+ * here. `release` kills a group the runner left and waits until the ledger
+ * has let go of it, and whatever is still held at the end is released too, so
+ * nothing this process holds reaches the next test.
+ */
+async function withoutGroupSignals(body) {
+  const original = process.kill;
+  process.kill = (pid, signal) => {
+    if (pid < 0 && signal !== 0) {
+      const error = new Error('operation not permitted');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return original.call(process, pid, signal);
+  };
+  const groups = new Set();
+  const release = async (group) => {
+    try { original.call(process, -group, 'SIGKILL'); } catch { /* already gone */ }
+    groups.delete(group);
+    for (let tries = 0; tries < 100 && (await unsettledWork()) !== null; tries += 1) await delay(50);
+  };
+  try {
+    return await body({ held: (group) => groups.add(group), release });
+  } finally {
+    process.kill = original;
+    for (const group of groups) await release(group);
   }
 }
 
@@ -115,19 +146,7 @@ test('a child that ignores SIGTERM is killed after its grace and does not hang t
 
 test('a tree that cannot be confirmed stopped holds every later mutation until it is gone', { skip: !posix && 'POSIX process groups' }, async () => {
   await withHome(async (home) => {
-    const original = process.kill;
-    // The agent may signal nothing in the group: what a member running as
-    // another user, or stuck in the kernel, looks like from here.
-    process.kill = (pid, signal) => {
-      if (pid < 0 && signal !== 0) {
-        const error = new Error('operation not permitted');
-        error.code = 'EPERM';
-        throw error;
-      }
-      return original.call(process, pid, signal);
-    };
-    let group = null;
-    try {
+    await withoutGroupSignals(async ({ held }) => {
       const started = Date.now();
       const result = await run(node('setInterval(() => {}, 1000)'), { timeoutMs: 200, graceMs: 200, settleMs: 300 });
       assert.ok(Date.now() - started < 3000, 'a group that will not go does not hang the runner');
@@ -139,7 +158,7 @@ test('a tree that cannot be confirmed stopped holds every later mutation until i
       const [entry] = ledger();
       assert.equal(entry.state, 'unconfirmed');
       assert.equal(entry.group, entry.pid);
-      group = entry.group;
+      held(entry.group);
 
       // Durable, so the next agent finds it too, and in force for every command.
       const blocked = await unsettledWork();
@@ -151,17 +170,38 @@ test('a tree that cannot be confirmed stopped holds every later mutation until i
       assert.equal(next.refused, true);
       assert.match(next.error, /^not started: /);
       assert.equal(fs.existsSync(marker), false, 'a refused command never ran');
-    } finally {
-      process.kill = original;
-      if (group) {
-        try { process.kill(-group, 'SIGKILL'); } catch { /* already gone */ }
-      }
-    }
+    });
 
     await delay(200);
     assert.equal(await unsettledWork(), null, 'gone is gone, and the entry with it');
     assert.deepEqual(ledger(), []);
     assert.equal((await run(node('process.exit(0)'), { timeoutMs: 5000 })).ok, true);
+  });
+});
+
+test('a command run after a reboot holds the machine even for an operation queued before it', { skip: !posix && 'POSIX process groups' }, async () => {
+  await withHome(async () => {
+    // A --when-idle request keeps the boot it was queued in. Its commands run
+    // in this one, and an entry stamped with the old boot was dropped the
+    // moment it was written, guard and all.
+    const id = 'queued-before-reboot';
+    assert.equal(beginOperation({ id, kind: 'update', service: 'demo', systemId: 'test' }).ok, true);
+    updateOperation(id, { bootId: 'boot-before-the-reboot', phase: 'installing' });
+    await withoutGroupSignals(async ({ held, release }) => {
+      const result = await withOperationContext(id, () => run(node('setInterval(() => {}, 1000)'), { timeoutMs: 200, graceMs: 200, settleMs: 300 }));
+      assert.equal(result.terminated, false);
+      const [entry] = ledger();
+      held(entry.group);
+      assert.equal(entry.bootId, bootIdentity(), 'the boot the command ran in');
+      assert.equal(entry.opId, id);
+
+      const blocked = await unsettledWork();
+      assert.ok(blocked, 'the command is still held');
+      assert.equal(blocked.conflict.opId, id);
+      assert.equal(blocked.conflict.phase, 'installing');
+      assert.equal((await run(node('process.exit(0)'), { timeoutMs: 5000 })).refused, true);
+      await release(entry.group);
+    });
   });
 });
 
