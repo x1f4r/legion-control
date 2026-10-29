@@ -5,7 +5,6 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,6 +24,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -57,6 +58,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -271,7 +273,7 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                     val wide = maxWidth >= 840.dp
                     Row(Modifier.fillMaxSize()) {
                         if (wide) {
-                            Column(Modifier.width(208.dp).fillMaxHeight().verticalScroll(rememberScrollState()).padding(horizontal = 12.dp)) {
+                            Column(Modifier.width(208.dp).fillMaxHeight().verticalScroll(rememberScrollState()).padding(horizontal = 12.dp).selectableGroup()) {
                                 pages.forEachIndexed { index, page ->
                                     DrawerRow(page, index == pager.currentPage) { scope.launch { pager.animateScrollToPage(index) } }
                                 }
@@ -495,9 +497,11 @@ private fun PageDrawer(
             Spacer(Modifier.height(4.dp))
             Spacer(Modifier.height(20.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            pages.forEachIndexed { index, page ->
-                DrawerRow(page, index == current) { onSelect(index) }
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Column(Modifier.selectableGroup()) {
+                pages.forEachIndexed { index, page ->
+                    DrawerRow(page, index == current) { onSelect(index) }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                }
             }
         }
     }
@@ -505,7 +509,8 @@ private fun PageDrawer(
 
 /**
  * A name and a line about it, on a row a thumb can hit. What marks the current one is a short rule
- * on the leading edge and the ink getting darker, not a filled capsule behind the text.
+ * on the leading edge and the ink getting darker, not a filled capsule behind the text, and for a
+ * screen reader the row says it is the selected one: a rule and a weight are nothing it can hear.
  */
 @Composable
 private fun DrawerRow(page: Page, isSelected: Boolean, onSelect: () -> Unit) {
@@ -522,7 +527,7 @@ private fun DrawerRow(page: Page, isSelected: Boolean, onSelect: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .defaultMinSize(minHeight = 48.dp)
-            .clickable { onSelect() }
+            .selectable(selected = isSelected, role = Role.Tab, onClick = onSelect)
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

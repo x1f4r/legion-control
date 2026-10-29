@@ -1,14 +1,25 @@
 package com.x1f4r.legioncontrol.ui
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.data.*
 
 /** Local enrollment choices remain separate from the shared setup's suggested OS labels. */
@@ -45,15 +56,17 @@ fun HostTrustDialog(dialog: MachineModel.Dialog.ConfirmTrustHostKey, onDismiss: 
                 }
                 trust.unassigned.forEach { blob ->
                     Text("Assign existing key ${HostKeyStore.fingerprintOf(blob)}")
-                    systems.forEach { system ->
-                        TextButton(onClick = { assignments[blob] = system.id; selected = "" }) {
-                            Text((if (assignments[blob] == system.id) "Selected: " else "") + system.name)
+                    Column(Modifier.selectableGroup()) {
+                        systems.forEach { system ->
+                            Choice(system.name, assignments[blob] == system.id) { assignments[blob] = system.id; selected = "" }
                         }
                     }
                 }
                 Text("The offered key belongs to:")
-                eligible.forEach { system ->
-                    TextButton(onClick = { selected = system.id }) { Text((if (selected == system.id) "Selected: " else "") + system.name) }
+                Column(Modifier.selectableGroup()) {
+                    eligible.forEach { system ->
+                        Choice(system.name, selected == system.id) { selected = system.id }
+                    }
                 }
                 if (eligible.isEmpty()) Text("Every local identity already has keys. No existing key can be replaced here.")
             }
@@ -78,4 +91,23 @@ fun HostIdentitySettingsDialog(address: String, snapshot: HostTrustSnapshot, sug
         }
     }, confirmButton = { TextButton(enabled = valid, onClick = { onSave(ids.map { HostIdentitySystem(it) }) }) { Text("Save local reservations") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })
+}
+
+/**
+ * One answer of several, as a radio button with its name. A screen reader hears which one is chosen
+ * and that the others are the alternatives, which a word in front of a button's label never told it.
+ */
+@Composable
+private fun Choice(label: String, chosen: Boolean, onChoose: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .defaultMinSize(minHeight = 48.dp)
+            .selectable(selected = chosen, role = Role.RadioButton, onClick = onChoose),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(selected = chosen, onClick = null)
+        Spacer(Modifier.width(8.dp))
+        Text(label)
+    }
 }
