@@ -84,6 +84,18 @@ test('the Windows installer judges a base and node for SYSTEM before it changes 
   assert.match(installer, /Protect-Base -Sids @\(\$AdministratorsSid, \$SystemSid\) -Owner \$AdministratorsSid -Fresh:\$fresh/);
 });
 
+// Where policy makes whoever creates a file its owner, as Windows does outside Windows Server, the
+// account installing owns the folders it made above a SYSTEM base and what it writes in the base over
+// ssh. That is an administrator's, and a later run takes it; the base itself stays Administrators'.
+test('the Windows installer counts the account installing with Administrators in what a SYSTEM task runs', () => {
+  assert.match(installer, /function Get-ForeignAccess[^\n]*\n\s*\$trusted = @\(\$SystemSid, \$AdministratorsSid, \$TrustedInstallerSid, \$UserSid\)/);
+  const from = installer.indexOf('function Get-BaseTakeover');
+  const takeover = installer.slice(from, installer.indexOf('\n}\n', from));
+  assert.match(takeover, /if \(@\(\$AdministratorsSid, \$SystemSid\) -notcontains \$owner\) \{/);
+  assert.match(takeover, /@\(\$AdministratorsSid, \$SystemSid\) -notcontains \$rule\.IdentityReference\.Value/);
+  assert.match(takeover, /Get-ForeignAccess \$entry\.FullName \$ChangeRights 'change'/);
+});
+
 // What sshd hands a command to decides how the clients quote it, so the installer says, as the
 // agent's doctor does.
 test('the Windows installer says which shell sshd runs commands with', () => {
@@ -619,10 +631,20 @@ test('the Windows installer refuses a task that runs as SYSTEM, and keeps one on
   assert.equal(access.owner, 'S-1-5-32-544');
   assert.equal(accessOf(path.join(machineBase, 'bin', 'launcher.mjs')).owner, 'S-1-5-32-544');
 
-  // Run again, the base an earlier run made is taken as it is.
+  // Run again, the base an earlier run made is taken as it is. Where policy makes whoever creates a
+  // file its owner, which Windows Server does not, the account installing owns what clients wrote in
+  // the base over ssh as it, such as a config: that does not stop the run, and the config goes back
+  // to Administrators, as it was.
+  const config = path.join(machineBase, 'config.json');
+  fs.writeFileSync(config, '{"sentinel":"leave exactly alone"}\n');
+  icacls(config, '/setowner', `*${access.user}`);
+  assert.equal(accessOf(config).owner, access.user);
   const again = runScript(source, machineBase, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node });
   assert.equal(again.status, 0, `${again.stdout}\n${again.stderr}`);
   assert.match(again.stdout, /previous agent retained at /);
+  assert.match(again.stdout, /config\.json is already there and was left untouched/);
+  assert.equal(fs.readFileSync(config, 'utf8'), '{"sentinel":"leave exactly alone"}\n');
+  assert.equal(accessOf(config).owner, 'S-1-5-32-544');
 
   const removed = runScript(source, machineBase, home, ['-Uninstall', '-Purge', '-TaskName', name], { node });
   assert.equal(removed.status, 0, `${removed.stdout}\n${removed.stderr}`);

@@ -40,14 +40,19 @@
     -AllowSystemPrincipal keeps an existing task that runs as SYSTEM, on these
     terms only: the session is elevated; the base and node are outside every
     user profile, where they really are once every link is followed; nobody
-    but Administrators, SYSTEM and TrustedInstaller may change node or what is
-    in its folder, or rename or re-permission a folder above either; and the
-    base does not exist yet, so that it is made for Administrators and SYSTEM
-    alone before anything goes in, or an earlier run made it that way and
-    nothing in it is anybody else's, may be changed by anybody else or is a
-    link. A base somebody else made first is refused, not taken over: what they
-    put in it would run as SYSTEM. What the config has the agent run is the
-    config's business, and a command in it that a user can change runs as
+    but Administrators, SYSTEM, TrustedInstaller and the account installing
+    may change node or what is in its folder, or rename or re-permission a
+    folder above either; and the base does not exist yet, so that it is made
+    for Administrators and SYSTEM alone before anything goes in, or an earlier
+    run made it that way and nothing in it is anybody else's, may be changed
+    by anybody else or is a link. A base somebody else made first is refused,
+    not taken over: what they put in it would run as SYSTEM. The account
+    installing counts as one of the Administrators, which the elevated session
+    says it is. Where policy makes whoever creates a file its owner, as it
+    does by default outside Windows Server, it owns the folders it made above
+    the base and what it writes in the base over ssh, and a later run takes
+    those as an earlier one left them. What the config has the agent run is
+    the config's business, and a command in it that a user can change runs as
     SYSTEM too.
 
     Elevation. A task that runs as the current user can be registered and
@@ -215,12 +220,19 @@ function Test-Inside([string] $Path, [string[]] $Roots) {
     return $false
 }
 
-# Who besides Administrators, SYSTEM and TrustedInstaller holds any of $Rights
-# on $Path, by SID, said as what they "may $Verb": its owner, who may always
-# re-permission it and so grant itself the rest, and anybody an entry in its
-# ACL grants one of them. Nobody, when the list is empty.
+# Who besides Administrators, SYSTEM, TrustedInstaller and the account
+# installing holds any of $Rights on $Path, by SID, said as what they
+# "may $Verb": its owner, who may always re-permission it and so grant itself
+# the rest, and anybody an entry in its ACL grants one of them. Nobody, when the
+# list is empty. This is only asked for a task that runs as SYSTEM, which needs
+# an elevated session, and there the account installing is one of the
+# Administrators and could run anything as SYSTEM already. Where policy makes
+# whoever creates a file its owner, it owns what it made, the folders above a
+# base it made and what it wrote in the base over ssh, and a folder it made in
+# ProgramData, which gives whoever makes a folder in it full control of that
+# folder, has an entry for it as well.
 function Get-ForeignAccess([string] $Path, [int] $Rights, [string] $Verb) {
-    $trusted = @($SystemSid, $AdministratorsSid, $TrustedInstallerSid)
+    $trusted = @($SystemSid, $AdministratorsSid, $TrustedInstallerSid, $UserSid)
     $found = New-Object System.Collections.Generic.List[string]
     try {
         $acl = Get-Acl -LiteralPath $Path
@@ -326,7 +338,9 @@ function Get-BaseLink {
 # Who besides Administrators and SYSTEM has had a hand in the base, for a task
 # that runs what is in it as SYSTEM: its owner, anybody else in its ACL, the
 # folder above when it inherits from there, and inside it anything that
-# somebody else owns or may change, and every link. Nobody, when the list is
+# somebody else owns or may change, and every link. Inside, the account
+# installing is not somebody else (see Get-ForeignAccess), and what it owns
+# there goes back to Administrators with the rest. Nobody, when the list is
 # empty, which holds only for a base that was given to Administrators and
 # SYSTEM before anything went in. Whatever else is in one would look like
 # Administrators' own once Protect-Base had made it theirs.
