@@ -112,7 +112,9 @@ Uninstall first. That wipes the app's ssh key, so see the next section.
 **A setup, fetched from a machine.** Every machine carries the setup and every device is a
 peer: the phone edits and publishes it exactly as the Mac and the desktop do, and there is no
 device whose copy wins by rank. On first launch the Machines page asks for a host, a port and a
-user; **Fetch** runs `config` there with the phone's key and applies what comes back.
+user; **Fetch** runs `config` there with the phone's key and shows every machine's command, key
+file and update source in what comes back. **Confirm** applies it and approves those commands on
+this phone; **Cancel** applies nothing.
 
 After that it keeps itself in step on every poll. Two things happen without asking, and both
 only along strict descent: the phone pushes to a machine whose copy its own was made from, and
@@ -186,6 +188,7 @@ same state, so neither can be out of step with the other.
 | One per service on it | Versions, health, what it is doing now, the relay, the last update, when the schedule may touch it, Update now, Update when idle, Restart, Restart when idle |
 | Edit the setup | Machines, addresses, systems, sites and wake helpers, with the raw document one page along |
 | Setup edited twice | Two copies neither made from the other, with a per-entry merge |
+| Approve commands | Commands the shared setup changed, each beside the one this phone approved, with Approve, Revert and Not now |
 | This device | The app's version and self update, this phone's key, what this device is called and where it is standing, whether finished changes are announced, the setup, and everything this phone has asked for |
 
 **Service setup** edits the full agent configuration with templates, a validation preview, and an
@@ -243,6 +246,22 @@ reach, and travels on the next poll of each one. Behind that:
   then accepts as an ordinary fast-forward, so nothing is replaced.
 - A machine carrying an entirely different setup cannot be merged with, and is the one place the
   app ever sends `--replace`, after an explicit decision.
+
+**Commands wait for approval on each device** (contract section 9.9). Lineage shows that a
+document claims an ancestor, not who wrote it, and any key that may publish the setup, a
+restricted one included, can write a descendant. So the phone never takes what it runs from
+replication alone. A system's `agent` with the grammar its `platform`, `shell` and `restricted`
+give, and `appUpdates.githubRepo`, are launch values: the document is adopted as always, but the
+phone runs a launch value only once it approved it, and until then keeps running the one it
+approved at that place, or drives nothing there. What approves is **Approve** on the review, an
+edit or paste made on this phone, confirming a fetch on a phone with no setup yet, and the first
+start of this build, which approves what the phone already applies. Adopting from a machine,
+merging, keeping this phone's copy and following another setup approve nothing. The launcher
+migration of an approved command to `<base>/bin/launcher.mjs` is taken without asking. In the
+editor, a system whose command waits is read-only, with Approve and Revert, because changing its
+shell would otherwise approve the argv beside it. The record is the `approved-launch` preference
+beside the setup text, written in the same edit as the document; clearing the app's data clears
+both, and the next setup confirmed here counts as the first.
 
 The hash all of this turns on is the canonical form from `contract/hash-vectors.json`: strict
 UTF-8, one leading byte order mark stripped, CRLF and CR to LF, a fixed six-character whitespace
