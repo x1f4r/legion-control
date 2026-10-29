@@ -263,9 +263,9 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
         if (_config.Document is not { } mine) return (Array.Empty<SetupDifference>(), "this device has no setup");
         var (theirs, problem) = await machine.FetchSetupAsync(cancellationToken);
         if (theirs is null) return (Array.Empty<SetupDifference>(), problem);
-        var baseHash = _config.Ledger.CommonBase(mine.Identity.Lineage, theirs.Identity.Lineage);
-        var baseDocument = baseHash is null ? null : _config.Ledger.Read(baseHash);
-        return (SetupMerge.Compare(mine, theirs, baseDocument), null);
+        if ((SetupMerge.WhyTheirsCannotMerge(theirs.Text) ?? SetupMerge.WhyMineCannotMerge(mine.Text)) is { } refused)
+            return (Array.Empty<SetupDifference>(), refused);
+        return (SetupMerge.Differences(mine.Text, theirs.Text, Base(mine, theirs)?.Text), null);
     }
 
     public async Task<string?> MergeAsync(
@@ -275,15 +275,26 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
         if (_config.Document is not { } mine) return "this device has no setup";
         var (theirs, problem) = await machine.FetchSetupAsync(cancellationToken);
         if (theirs is null) return problem;
+        if ((SetupMerge.WhyTheirsCannotMerge(theirs.Text) ?? SetupMerge.WhyMineCannotMerge(mine.Text)) is { } refused) return refused;
 
-        var baseHash = _config.Ledger.CommonBase(mine.Identity.Lineage, theirs.Identity.Lineage);
-        var baseDocument = baseHash is null ? null : _config.Ledger.Read(baseHash);
-        var merged = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, choices, Bindings.Device);
+        var merged = SetupMerge.Merge(Base(mine, theirs)?.Text, mine.Text, theirs.Text, mine.Hash, theirs.Hash,
+            SetupMerge.Writer.Here(Bindings.Device), choices);
+        if (merged.Text is null)
+            return $"The merge would break the setup rule {merged.Error}, so nothing was written. Answer that entry the other way, or take one side whole.";
 
-        var applyProblem = _config.ApplyIfCurrent(merged, mine.Hash, $"merged with {machine.Id}");
+        var applyProblem = _config.ApplyIfCurrent(ControllerDocument.FromText(merged.Text), mine.Hash, $"merged with {machine.Id}");
         if (applyProblem is not null) return applyProblem;
         _pushedHash.Clear();
         return null;
+    }
+
+    /// The kept revision both branches descend from, when this device still has it and it is a
+    /// document a merge may read.
+    private ControllerDocument? Base(ControllerDocument mine, ControllerDocument theirs)
+    {
+        var baseHash = _config.Ledger.CommonBase(mine.Hash, theirs.Hash, mine.Identity.Lineage, theirs.Identity.Lineage);
+        var baseDocument = baseHash is null ? null : _config.Ledger.Read(baseHash);
+        return baseDocument is not null && SetupMerge.WhyTheirsCannotMerge(baseDocument.Text) is null ? baseDocument : null;
     }
 
     /// Sends the document with `--replace`, which is the one command that overwrites a different

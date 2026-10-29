@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
+using LegionControl.Desktop.Model;
 using LegionControl.Desktop.Transport;
 using Xunit;
 
@@ -20,7 +21,7 @@ public class VectorTests
 
     /// The families this client runs. A family joins this list when its port lands here, and from
     /// then on the accounting test holds it to the index exactly.
-    private static readonly string[] Families = { "hash", "identifiers", "transport", "launch", "setup-acceptance" };
+    private static readonly string[] Families = { "hash", "identifiers", "transport", "launch", "setup-acceptance", "setup-merge" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -114,6 +115,39 @@ public class VectorTests
                     ["assignsIdentity"] = verdict.AssignsIdentity,
                     ["keep"] = verdict.Keep,
                 };
+            },
+
+            ["setup-merge/merges"] = input =>
+            {
+                var writer = input["writer"]!;
+                var choices = input["choices"]!.AsObject().ToDictionary(
+                    entry => entry.Key, entry => Enum.Parse<SetupChoice>(entry.Value!.GetValue<string>(), ignoreCase: true), StringComparer.Ordinal);
+                var result = SetupMerge.Merge(Text(input["baseText"]), Text(input["mineText"])!, Text(input["theirsText"])!,
+                    Text(input["mineHash"])!, Text(input["theirsHash"])!,
+                    new SetupMerge.Writer(Text(writer["source"])!, Text(writer["device"])!, Text(writer["now"])!), choices);
+                return new JsonObject
+                {
+                    ["differences"] = new JsonArray(result.Differences.Select(difference => (JsonNode)new JsonObject
+                    {
+                        ["entry"] = difference.Entry,
+                        ["kind"] = difference.Kind == SetupChange.NoBase ? "noBase" : difference.Kind.ToString().ToLowerInvariant(),
+                    }).ToArray()),
+                    ["resultText"] = result.Text,
+                    ["error"] = result.Error,
+                };
+            },
+            ["setup-merge/bases"] = input =>
+            {
+                var kept = input["kept"]!.AsObject();
+                return new JsonObject
+                {
+                    ["base"] = SetupSync.CommonBase(Text(input["mineHash"])!, Text(input["theirsHash"])!,
+                        Strings(input["mineLineage"]), Strings(input["theirsLineage"]), hash => Text(kept[hash])),
+                };
+            },
+            ["setup-merge/numbers"] = input => new JsonObject
+            {
+                ["equal"] = JsonEquality.Equal(new DocumentNumber(Text(input["a"])!), new DocumentNumber(Text(input["b"])!)),
             },
 
             ["launch/review"] = Launch,
@@ -217,6 +251,9 @@ public class VectorTests
     private static JsonArray Codes(IReadOnlyList<DocumentProblem> problems) => new(problems
         .Select(problem => problem.Code).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)
         .Select(code => (JsonNode)code).ToArray());
+
+    private static IReadOnlyList<string> Strings(JsonNode? node) =>
+        node is JsonArray items ? items.Select(item => item!.GetValue<string>()).ToList() : Array.Empty<string>();
 
     private static string? Text(JsonNode? node) => node?.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() : null;
 

@@ -217,7 +217,7 @@ public static class Sheets
         body.Children.Add(Ui.Note(sentence));
         body.Children.Add(Ui.Note(differentSetup
             ? "Adopt the machine's setup here or explicitly replace its copy with this device's setup. Review the differences first."
-            : "Merging keeps both sides: every entry only one side changed is taken from that side. The entries below were changed on both, so they need an answer."));
+            : "Merging keeps both sides: every entry only one side changed is taken from that side. The entries below were changed on both, or nothing says which side changed them, so they need an answer."));
 
         body.Children.Add(Ui.SectionHeading("What differs"));
         foreach (var difference in differences)
@@ -237,7 +237,7 @@ public static class Sheets
                     SelectedIndex = 0,
                     MinWidth = 90,
                 };
-                var key = difference.Key;
+                var key = difference.Entry;
                 choices[key] = SetupChoice.Theirs;
                 picker.SelectionChanged += (_, _) =>
                     choices[key] = picker.SelectedIndex == 1 ? SetupChoice.Mine : SetupChoice.Theirs;
@@ -248,7 +248,7 @@ public static class Sheets
             {
                 var side = new TextBlock
                 {
-                    Text = difference.Change == SetupChange.Mine ? "kept from here" : "taken from there",
+                    Text = difference.Kind == SetupChange.Mine ? "kept from here" : "taken from there",
                     Foreground = Ui.Muted,
                     VerticalAlignment = VerticalAlignment.Center,
                 };

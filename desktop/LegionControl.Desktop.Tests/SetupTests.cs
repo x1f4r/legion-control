@@ -209,10 +209,12 @@ public class SetupLedgerTests
 
         var mine = new[] { newer.Hash, older.Hash };
         var theirs = new[] { "z".PadLeft(64, 'z'), newer.Hash, older.Hash };
-        Assert.Equal(newer.Hash, ledger.CommonBase(mine, theirs));
+        Assert.Equal(newer.Hash, ledger.CommonBase("m".PadLeft(64, 'm'), "t".PadLeft(64, 't'), mine, theirs));
 
         // A common hash whose bytes are gone is no use to a merge, and is not offered as one.
-        Assert.Null(ledger.CommonBase(new[] { "y".PadLeft(64, 'y') }, new[] { "y".PadLeft(64, 'y') }));
+        Assert.Null(ledger.CommonBase("m".PadLeft(64, 'm'), "t".PadLeft(64, 't'), new[] { "y".PadLeft(64, 'y') }, new[] { "y".PadLeft(64, 'y') }));
+        // Nor is either head: a base that is one side only ever takes the other.
+        Assert.Equal(older.Hash, ledger.CommonBase(newer.Hash, "t".PadLeft(64, 't'), mine, theirs));
     }
 }
 
@@ -603,11 +605,10 @@ public class DocumentFixtureTests
     }
 }
 
-/// Merging two branches, entry by entry.
+/// Merging two branches, entry by entry (contract section 9.8). The shared vectors pin each rule;
+/// these are the cases a person would describe.
 public class SetupMergeTests
 {
-    private static ControllerDocument Document(string json) => ControllerDocument.FromText(json);
-
     private const string Base = """
         {
           "version": 1,
@@ -619,76 +620,115 @@ public class SetupMergeTests
         }
         """;
 
+    private static readonly SetupMerge.Writer Writer = new("desktop", "test device", "2026-01-01T00:00:00.000Z");
+
+    private static SetupMerge.Result Merge(string mine, string theirs, string? baseText = Base,
+        IReadOnlyDictionary<string, SetupChoice>? choices = null) =>
+        SetupMerge.Merge(baseText, mine, theirs, Canonical.Hash(Encoding.UTF8.GetBytes(mine)),
+            Canonical.Hash(Encoding.UTF8.GetBytes(theirs)), Writer, choices);
+
     [Fact]
     public void KeepsBothSidesWhenTheyChangedDifferentThings()
     {
-        var baseDocument = Document(Base);
-        var mine = Document(Base.Replace("\"Beacon\"", "\"Beacon renamed here\""));
-        var theirs = Document(Base.Replace("\"Tower\"", "\"Tower renamed there\""));
+        var mine = Base.Replace("\"Beacon\"", "\"Beacon renamed here\"");
+        var theirs = Base.Replace("\"Tower\"", "\"Tower renamed there\"");
 
-        var differences = SetupMerge.Compare(mine, theirs, baseDocument);
-        Assert.Equal(2, differences.Count);
-        Assert.Contains(differences, difference => difference.Change == SetupChange.Mine);
-        Assert.Contains(differences, difference => difference.Change == SetupChange.Theirs);
-        Assert.DoesNotContain(differences, difference => difference.NeedsChoice);
-
-        var merged = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, null, "device");
-        Assert.Contains("Beacon renamed here", merged.Text);
-        Assert.Contains("Tower renamed there", merged.Text);
+        var result = Merge(mine, theirs);
+        Assert.Equal(new[] { new SetupDifference("machines[pi].fields", SetupChange.Mine), new SetupDifference("machines[tower].fields", SetupChange.Theirs) },
+            result.Differences);
+        Assert.DoesNotContain(result.Differences, difference => difference.NeedsChoice);
+        Assert.Contains("Beacon renamed here", result.Text);
+        Assert.Contains("Tower renamed there", result.Text);
     }
 
     [Fact]
     public void AsksWhenBothSidesChangedTheSameThing()
     {
-        var baseDocument = Document(Base);
-        var mine = Document(Base.Replace("\"Beacon\"", "\"Beacon mine\""));
-        var theirs = Document(Base.Replace("\"Beacon\"", "\"Beacon theirs\""));
+        var mine = Base.Replace("\"Beacon\"", "\"Beacon mine\"");
+        var theirs = Base.Replace("\"Beacon\"", "\"Beacon theirs\"");
 
-        var differences = SetupMerge.Compare(mine, theirs, baseDocument);
-        var contested = Assert.Single(differences);
+        var contested = Assert.Single(Merge(mine, theirs).Differences);
         Assert.True(contested.NeedsChoice);
 
         // The default is theirs: the side already on the machines is not the one to overwrite by
         // accident.
-        var byDefault = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, null, "device");
-        Assert.Contains("Beacon theirs", byDefault.Text);
+        Assert.Contains("Beacon theirs", Merge(mine, theirs).Text);
+        Assert.Contains("Beacon mine", Merge(mine, theirs, choices: new Dictionary<string, SetupChoice> { [contested.Entry] = SetupChoice.Mine }).Text);
+    }
 
-        var chosen = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument,
-            new Dictionary<string, SetupChoice> { [contested.Key] = SetupChoice.Mine }, "device");
-        Assert.Contains("Beacon mine", chosen.Text);
+    [Fact]
+    public void ADeletionAgainstAnEditIsAQuestionAndNeverDecidedSilently()
+    {
+        // Mine took tower out; theirs gave it an address. The merge before section 9.8 dropped the
+        // edit without saying so.
+        var root = JsonNode.Parse(Base)!.AsObject();
+        root["machines"]!.AsArray().RemoveAt(1);
+        var mine = root.ToJsonString();
+        var theirs = Base.Replace("{ \"id\": \"tower\", \"name\": \"Tower\" }",
+            "{ \"id\": \"tower\", \"name\": \"Tower\", \"endpoints\": [ { \"id\": \"lan\", \"host\": \"10.0.0.7\" } ] }");
+        var difference = Assert.Single(Merge(mine, theirs).Differences);
+        Assert.Equal(new SetupDifference("machines[tower]", SetupChange.Both), difference);
+        Assert.Contains("10.0.0.7", Merge(mine, theirs).Text);
+        Assert.DoesNotContain("\"tower\"", Merge(mine, theirs, choices: new Dictionary<string, SetupChoice> { ["machines[tower]"] = SetupChoice.Mine }).Text);
     }
 
     [Fact]
     public void WithoutACommonAncestorEveryDifferenceIsAQuestion()
     {
-        var mine = Document(Base.Replace("\"Beacon\"", "\"Beacon mine\""));
-        var theirs = Document(Base.Replace("\"Tower\"", "\"Tower theirs\""));
-        var differences = SetupMerge.Compare(mine, theirs, null);
+        var mine = Base.Replace("\"Beacon\"", "\"Beacon mine\"");
+        var theirs = Base.Replace("\"Tower\"", "\"Tower theirs\"");
+        var differences = Merge(mine, theirs, baseText: null).Differences;
+        Assert.Equal(2, differences.Count);
+        Assert.All(differences, difference => Assert.Equal(SetupChange.NoBase, difference.Kind));
         Assert.All(differences, difference => Assert.True(difference.NeedsChoice));
     }
 
     [Fact]
-    public void AMachineAddedOnOneSideSurvivesTheMerge()
+    public void AMachineAddedOnOneSideLandsAfterItsPredecessorThere()
     {
-        var baseDocument = Document(Base);
-        var mine = Document(Base);
-        var theirs = Document(Base.Replace(
-            "{ \"id\": \"tower\", \"name\": \"Tower\" }",
-            "{ \"id\": \"tower\", \"name\": \"Tower\" }, { \"id\": \"nas\", \"name\": \"NAS\" }"));
-        var merged = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, null, "device");
-        Assert.Contains("\"nas\"", merged.Text);
-        Assert.Contains("\"pi\"", merged.Text);
+        // Dial and wake order follow the list, so what theirs added goes where theirs put it.
+        var theirs = Base.Replace(
+            "{ \"id\": \"pi\", \"name\": \"Beacon\", \"endpoints\": [ { \"id\": \"lan\", \"host\": \"10.0.0.5\" } ] },",
+            "{ \"id\": \"pi\", \"name\": \"Beacon\", \"endpoints\": [ { \"id\": \"lan\", \"host\": \"10.0.0.5\" } ] }, { \"id\": \"nas\", \"name\": \"NAS\" },");
+        var merged = DocumentJson.Parse(Merge(Base, theirs).Text!);
+        var ids = ((DocumentArray)((DocumentObject)merged)["machines"]!).Items.Select(machine => ((DocumentString)((DocumentObject)machine)["id"]!).Value);
+        Assert.Equal(new[] { "pi", "nas", "tower" }, ids);
+    }
+
+    [Fact]
+    public void UnknownKeysAreEntriesOfTheirOwnAndKeepTheirSpelling()
+    {
+        var mine = Base.Replace("\"version\": 1,", "\"version\": 1, \"weight\": 22.0, \"notes\": \"here\",");
+        var theirs = Base.Replace("\"version\": 1,", "\"version\": 1, \"weight\": 2.2e1, \"notes\": \"there\",");
+        var result = Merge(mine, theirs);
+        // Two spellings of one number are one value; the note both added is asked about.
+        Assert.Equal(new SetupDifference("notes", SetupChange.Both), Assert.Single(result.Differences));
+        Assert.Contains("\"weight\": 22.0", result.Text);
     }
 
     [Fact]
     public void TheMergedDocumentDescendsFromBothAndIsValid()
     {
-        var baseDocument = Document(Base);
-        var mine = Document(Base.Replace("\"Beacon\"", "\"Beacon mine\""));
-        var theirs = Document(Base.Replace("\"Tower\"", "\"Tower theirs\""));
-        var merged = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, null, "device");
-        Assert.Contains(mine.Hash, merged.Identity.Lineage);
-        Assert.Contains(theirs.Hash, merged.Identity.Lineage);
+        var mine = Base.Replace("\"Beacon\"", "\"Beacon mine\"");
+        var theirs = Base.Replace("\"Tower\"", "\"Tower theirs\"");
+        var merged = ControllerDocument.FromText(Merge(mine, theirs).Text!);
+        Assert.Contains(Canonical.Hash(Encoding.UTF8.GetBytes(mine)), merged.Identity.Lineage);
+        Assert.Contains(Canonical.Hash(Encoding.UTF8.GetBytes(theirs)), merged.Identity.Lineage);
+        Assert.Equal(2, merged.Identity.RevisionNumber);
         Assert.True(DocumentAcceptance.Check(merged.Bytes, Intake.Peer).Valid);
+    }
+
+    [Fact]
+    public void AMergeThatWouldBreakARuleIsNotWritten()
+    {
+        // Theirs makes pi tower's wake helper; mine takes pi out. Keeping mine's side of pi leaves a
+        // helper that names nothing, so there is no result, and the rule is named.
+        var mine = Base.Replace("{ \"id\": \"pi\", \"name\": \"Beacon\", \"endpoints\": [ { \"id\": \"lan\", \"host\": \"10.0.0.5\" } ] },", "");
+        var theirs = Base.Replace("{ \"id\": \"tower\", \"name\": \"Tower\" }",
+            "{ \"id\": \"tower\", \"name\": \"Tower\", \"wake\": { \"mac\": \"02:00:00:00:00:01\", \"helpers\": [ { \"machine\": \"pi\", \"action\": \"wake-tower\" } ] } }")
+            .Replace("\"Beacon\"", "\"Beacon there\"");
+        var result = Merge(mine, theirs, choices: new Dictionary<string, SetupChoice> { ["machines[pi]"] = SetupChoice.Mine });
+        Assert.Null(result.Text);
+        Assert.Equal("helper-unknown", result.Error);
     }
 }

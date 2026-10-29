@@ -236,17 +236,11 @@ public sealed class SetupLedger(string? directory = null)
         }
     }
 
-    /// The newest hash the two lineages have in common, and whose bytes are still here. This is the
-    /// base a three-way merge needs.
-    public string? CommonBase(IReadOnlyList<string> mine, IReadOnlyList<string> theirs)
-    {
-        var theirSet = theirs.ToHashSet(StringComparer.Ordinal);
-        foreach (var hash in mine)
-        {
-            if (theirSet.Contains(hash) && Has(hash)) return hash;
-        }
-        return null;
-    }
+    /// The base a three-way merge needs (contract section 9.8): the newest hash of mine's lineage
+    /// that is also in theirs', whose bytes are still here and still hash to it. Neither head is
+    /// ever a base.
+    public string? CommonBase(string mineHash, string theirsHash, IReadOnlyList<string> mine, IReadOnlyList<string> theirs) =>
+        SetupSync.CommonBase(mineHash, theirsHash, mine, theirs, hash => Read(hash)?.Text);
 
     private void Prune()
     {

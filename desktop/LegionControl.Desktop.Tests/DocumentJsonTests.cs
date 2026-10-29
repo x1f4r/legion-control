@@ -44,6 +44,8 @@ public class DocumentJsonTests
     {
         var text = "{\n  \"a\": 22.0,\n  \"b\": 1E+2,\n  \"c\": -0,\n  \"d\": 123456789012345678901234567890\n}\n";
         Assert.Equal(text, DocumentJson.Print(DocumentJson.Parse(text)));
+        Assert.True(JsonEquality.Equal(new DocumentNumber("22.0"), new DocumentNumber("2.2e1")));
+        Assert.False(JsonEquality.Equal(new DocumentNumber("0.1"), new DocumentNumber("0.10000000000000001")));
     }
 
     [Fact]
