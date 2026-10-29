@@ -788,8 +788,12 @@ class AppModel(
     /** Set by Review: the review page shows even for a revision it was put off for. */
     private var reviewAsked: Boolean by mutableStateOf(false)
 
-    /** Bumped each time the review is asked for, so the screen can move to it. */
-    var launchReviewRequests: Int by mutableStateOf(0)
+    /**
+     * Review was pressed and the screen has not moved to the page yet. Taken once, as the machine a
+     * notification asked for is: this model outlives every screen, and a count of presses was read
+     * again by each screen built after them, which moved to the review page nobody had asked for.
+     */
+    var launchReviewRequested: Boolean by mutableStateOf(false)
         private set
 
     /** Whether the review page is up: something waits, and it was not put off for this revision. */
@@ -798,7 +802,12 @@ class AppModel(
 
     fun openLaunchReview() {
         reviewAsked = true
-        launchReviewRequests += 1
+        launchReviewRequested = true
+    }
+
+    /** The screen has moved to the review page, or had none to move to. */
+    fun openedLaunchReview() {
+        launchReviewRequested = false
     }
 
     /** Not now: the page does not come back for this revision in this run. The badge stays. */

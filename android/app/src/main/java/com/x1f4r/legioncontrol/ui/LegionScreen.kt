@@ -185,10 +185,17 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
             .collect { haptics.tick() }
     }
 
-    // Review, wherever it was pressed, moves to the page it brought back.
-    LaunchedEffect(app.launchReviewRequests) {
-        val index = pages.indexOf(Page.LaunchReview)
-        if (app.launchReviewRequests > 0 && index >= 0) pager.animateScrollToPage(index)
+    // Review, wherever it was pressed, moves to the page it brought back. Taken once, so a screen
+    // built later, after a configuration change or Back, does not move there again; taken however
+    // the move ends, since a swipe that interrupts it is the person choosing another page.
+    LaunchedEffect(app.launchReviewRequested) {
+        if (!app.launchReviewRequested) return@LaunchedEffect
+        try {
+            val index = pages.indexOf(Page.LaunchReview)
+            if (index >= 0) pager.animateScrollToPage(index)
+        } finally {
+            app.openedLaunchReview()
+        }
     }
 
     // A tapped notification opens the page of the machine its change was on. Taken once, so the
