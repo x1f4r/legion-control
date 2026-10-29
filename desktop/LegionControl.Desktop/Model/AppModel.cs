@@ -139,8 +139,9 @@ public sealed class AppModel : IDisposable
     /// is approved somewhere else, or is the launcher migration of an approved one, is then recorded
     /// where it now sits, and the gate runs once more over the record that wrote.
     ///
-    /// A record that is gone stays gone until the next start, which seeds it again (contract
-    /// section 11). Seeded here, it would approve whatever was adopted in the meantime.
+    /// A record that is gone stays gone until the next start, which seeds it again unless an
+    /// approval or an edit began a new one first (contract section 11). Seeded here, it would
+    /// approve whatever was adopted in the meantime.
     private void Gate()
     {
         Approvals.ReloadIfChanged();

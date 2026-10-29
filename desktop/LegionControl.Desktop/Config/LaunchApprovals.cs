@@ -17,8 +17,11 @@ namespace LegionControl.Desktop.Config;
 /// next write that approves something moves the old file aside to
 /// `approved-launch.json.corrupt-<unix time>` and starts a new one. A record that is not there is
 /// seeded at a start and only then (contract section 11): gone while the app runs, or not written
-/// at the start, it approves nothing until the next one. Seeded later, it would approve whatever
-/// a peer's revision had brought in by then.
+/// at the start, it approves nothing until the next one. Seeded later in the same run, it would
+/// approve whatever a peer's revision had brought in by then. The next start does record the
+/// setup as it is then, a peer's revision included, which is the local reset deleting the file
+/// asks for; every command-line run is a start of its own. An approval or an edit made before
+/// that writes a new record holding only what it approved, and a start never seeds over it.
 public sealed class LaunchApprovals
 {
     private static readonly object Sync = new();
@@ -255,7 +258,9 @@ public sealed class LaunchApprovals
         Record = record;
         IsMissing = record is null && problem is null;
         Problem = problem ?? (IsMissing && _started
-            ? $"There is no record of approved commands at {Path}, so nothing counts as approved on this device. The next start records the setup it applies then, as a first start does."
+            ? $"There is no record of approved commands at {Path}, so nothing counts as approved on this device. "
+              + "The next start of this app, and every command-line run is one, records the setup it applies then, as a first start does. "
+              + "An approval or an edit made before then starts a new record holding only what it approved: no start records the setup after that, and everything else waits for review."
             : null);
     }
 

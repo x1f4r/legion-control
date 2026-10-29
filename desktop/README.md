@@ -97,8 +97,12 @@ one this device approved there, and a system with no approved command is not dri
 person approves the new one here.
 
 `approved-launch.json` holds what this device approved. It is never published. The first start of
-this build approves everything in the setup it already applies; deleting the file makes the next
-start do that again, and until then nothing counts as approved.
+this build approves everything in the setup it already applies. Deleting the file makes the next
+start do that again, with the setup as it is then, whatever a peer brought in meanwhile, and every
+command-line run is a start: a scheduled `--reconcile-once`, or the `--command setup` that lists what
+waits. Until then nothing counts as approved, and an approval or an edit made in between begins a new
+record holding only what it approved. No start records the setup after that, and everything else
+waits for review.
 
 An edit made here approves what it changed. In the editor and with `--command edit --in`, it is
 refused when the setup moved on since the text was read (start again from the setup as it is now),

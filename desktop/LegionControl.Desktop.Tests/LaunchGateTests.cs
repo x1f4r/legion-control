@@ -747,7 +747,7 @@ public class LaunchGateTests
             Assert.Null(app.Config.Apply(d1, "adopted from pi"));
 
             Assert.False(File.Exists(RecordPath(home, "laptop")));
-            Assert.NotNull(app.Approvals.Problem);
+            Assert.Contains("every command-line run", app.Approvals.Problem);
             Assert.Contains(app.LaunchReview, entry => entry.Path == LaunchValues.SystemPath("tower", "linux"));
             Assert.Equal(LaunchState.NotDriven, Gated(app, "tower", "linux").LaunchState);
         }
@@ -755,23 +755,36 @@ public class LaunchGateTests
         using (Device(home, "laptop")) Assert.Equal(d1.Hash, Record(home, "laptop")["seededFrom"]!.GetValue<string>());
 
         // An edit made while it is gone approves what it changed, not the document it was made to.
-        using var desk = Device(home, "desk", applied: d0);
-        File.Delete(RecordPath(home, "desk"));
-        Assert.Null(desk.Config.Apply(d1, "adopted from pi"));
-        var edited = JsonNode.Parse(d1.Text)!.AsObject();
-        edited["machines"]!.AsArray().Add(new JsonObject
+        using (var desk = Device(home, "desk", applied: d0))
         {
-            ["id"] = "nas", ["name"] = "Storage",
-            ["systems"] = new JsonArray(new JsonObject { ["id"] = "linux", ["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/srv/nas/launcher.mjs") }),
-        });
-        Assert.NotNull(desk.ApplyEdit(edited.ToJsonString(), d1.Hash, "edited here").Document);
+            File.Delete(RecordPath(home, "desk"));
+            Assert.Null(desk.Config.Apply(d1, "adopted from pi"));
+            var edited = JsonNode.Parse(d1.Text)!.AsObject();
+            edited["machines"]!.AsArray().Add(new JsonObject
+            {
+                ["id"] = "nas", ["name"] = "Storage",
+                ["systems"] = new JsonArray(new JsonObject { ["id"] = "linux", ["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/srv/nas/launcher.mjs") }),
+            });
+            Assert.NotNull(desk.ApplyEdit(edited.ToJsonString(), d1.Hash, "edited here").Document);
+            Assert.Equal("nas", Assert.Single(Record(home, "desk")["machines"]!.AsObject()).Key);
+            Assert.Equal(LaunchState.Approved, Gated(desk, "nas", "linux").LaunchState);
+            Assert.Equal(LaunchState.NotDriven, Gated(desk, "tower", "linux").LaunchState);
+        }
+
+        // That edit began a new record, so the next start finds one and records nothing: what was
+        // approved before the file went waits for review, the pi's unchanged command included.
+        using var restarted = Device(home, "desk");
+        Assert.Null(restarted.Approvals.Problem);
         Assert.Equal("nas", Assert.Single(Record(home, "desk")["machines"]!.AsObject()).Key);
-        Assert.Equal(LaunchState.Approved, Gated(desk, "nas", "linux").LaunchState);
-        Assert.Equal(LaunchState.NotDriven, Gated(desk, "tower", "linux").LaunchState);
+        Assert.Equal(LaunchState.NotDriven, Gated(restarted, "pi", "linux").LaunchState);
+        Assert.Equal(new[] { LaunchValues.SystemPath("tower", "linux"), LaunchValues.SystemPath("pi", "linux") },
+            restarted.LaunchReview.Select(entry => entry.Path));
     }
 
+    /// Only within one run: the next start, and every command-line run is one, records the setup
+    /// as it is then (contract section 11), a revision a peer wrote meanwhile included.
     [Fact]
-    public void ASeedThatCouldNotBeWrittenIsNeverMadeLaterFromAPeersRevision()
+    public void ASeedThatCouldNotBeWrittenIsNeverMadeLaterInTheSameRun()
     {
         using var home = new TempHome();
         var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
@@ -789,6 +802,10 @@ public class LaunchGateTests
         Assert.False(File.Exists(RecordPath(home, "laptop")));
         Assert.Equal(LaunchState.NotDriven, Gated(app, "tower", "linux").LaunchState);
         Assert.Contains(app.LaunchReview, entry => entry.Path == LaunchValues.SystemPath("tower", "linux"));
+
+        using var next = Device(home, "laptop");
+        Assert.Equal(d1.Hash, Record(home, "laptop")["seededFrom"]!.GetValue<string>());
+        Assert.Empty(next.LaunchReview);
     }
 
     [Fact]
