@@ -159,6 +159,7 @@ async function whileLocked(body) {
 // Machines to run against
 // ---------------------------------------------------------------------------
 
+const posix = process.platform !== 'win32';
 const node = (source) => [process.execPath, '-e', source];
 const call = (dir, verb) => [process.execPath, FIXTURE, verb, dir];
 
@@ -233,6 +234,54 @@ test('a process probe that does not answer in time is reported as unknown, never
     const { process: probe } = status.services[0];
     assert.notEqual(probe.error, null, 'a probe that did not answer says why');
     assert.equal(probe.state, 'unknown');
+  });
+});
+
+/**
+ * A stand-in powershell.exe on PATH that answers every script the way a
+ * PowerShell whose process query was denied does: exit 1, after printing a
+ * well-formed "not running". Each script it is handed is kept in `scripts`.
+ */
+function deniedPowerShell(home) {
+  const bin = path.join(home, 'bin');
+  fs.mkdirSync(bin);
+  const scripts = path.join(home, 'powershell-scripts');
+  fs.writeFileSync(path.join(bin, 'powershell.exe'), [
+    '#!/bin/sh',
+    'for last; do :; done',
+    `printf '%s\\n--\\n' "$last" >> '${scripts}'`,
+    `printf '%s' '${JSON.stringify({ running: false, pids: '' })}'`,
+    "printf '%s' 'Get-CimInstance : Access denied' >&2",
+    'exit 1',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { env: { PATH: `${bin}${path.delimiter}${process.env.PATH}` }, scripts: () => readFixture(home, 'powershell-scripts') };
+}
+
+test('a task probe that fails is unknown in status, and the stop loop never takes it for stopped', { skip: !posix && 'a stand-in powershell.exe on PATH' }, async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    writeConfig(home, fixtureConfig(dir, {
+      services: [commandService(dir, { process: { type: 'scheduled-task', task: 'Demo', match: 'demo-server' } })],
+    }));
+    const powershell = deniedPowerShell(home);
+
+    // Section 8: a process reading is evidence only when its error is null.
+    const status = invoke(home, ['status'], { env: powershell.env });
+    const { process: probe } = status.services[0];
+    assert.notEqual(probe.error, null, 'a probe that failed says why');
+    assert.equal(probe.state, 'unknown');
+
+    // Section 6: and the stop guard holds. The stop is asked for, and the
+    // loop after it waits out its whole budget for evidence that never comes
+    // rather than install over a service that may still be running.
+    const update = invoke(home, ['update'], { env: powershell.env });
+    assert.equal(update.action, 'failed');
+    assert.equal(update.reasonCode, 'not-running');
+    assert.match(update.message, /would not stop/);
+    assert.match(powershell.scripts(), /Stop-ScheduledTask -TaskName 'Demo'/);
+    assert.equal(readFixture(dir, 'update-runs'), '', 'nothing was installed');
+    assert.equal(readFixture(dir, 'installed'), '1.0.0');
   });
 });
 
@@ -445,8 +494,6 @@ test('run conforms when it runs, fails, times out, is unknown and is detached', 
 // ---------------------------------------------------------------------------
 // Commands that outlive their deadline, or their agent
 // ---------------------------------------------------------------------------
-
-const posix = process.platform !== 'win32';
 
 /** A command whose child writes `marker` after `ms`, while the command itself never exits. */
 function lateWriter(marker, ms) {
