@@ -272,3 +272,38 @@ test('a rollback that fails settles once the service is running again, rather th
     assert.equal(npmCalls(dir).filter((call) => call.startsWith('install ')).length, 1, 'tried once');
   });
 });
+
+test('a running npm service whose drain refuses is neither stopped nor reinstalled for a rollback', async () => {
+  await withHome(async (home) => {
+    // A unit that came back by itself, on the tree a killed install left.
+    const dir = fixtureData(home, { running: 'on', 'drain-fails': 'on' });
+    const npm = fakeNpm(home, dir, { installed: null });
+    const drain = { command: [process.execPath, FIXTURE, 'drain', dir], timeoutSeconds: 10 };
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false }, services: [npmService(dir, npm, { drain })] }));
+    const id = 'interrupted-npm-drain-001';
+    leftInterrupted(id, { from: '1.0.0', to: '2.0.0', npmPrefix: npm.prefix });
+    const run = () => cli(['cycle'], { home, nodeArgs: npm.nodeArgs }).payload;
+
+    assert.match(run().message, /recovery is still owed: Demo is on a version that cannot be read, neither 1\.0\.0 nor 2\.0\.0, and Demo was not rolled back to 1\.0\.0: the drain command failed/);
+    assert.equal(readFixture(dir, 'stop-runs'), '', 'a refused drain stops nothing');
+    assert.deepEqual(npmCalls(dir), []);
+    assert.equal(readOperation(id).recoveryPending, true);
+
+    // Work that starts while the drain runs is seen by a second look, as on
+    // the way to an update's stop.
+    fs.writeFileSync(path.join(dir, 'drain-fails'), 'off');
+    fs.writeFileSync(path.join(dir, 'drain-makes-busy'), 'on');
+    assert.match(run().message, /the rollback to 1\.0\.0 waits for an idle machine \(work started while it was being prepared: /);
+    assert.equal(readFixture(dir, 'drain-runs'), '2');
+    assert.equal(readFixture(dir, 'stop-runs'), '');
+    assert.equal(readOperation(id).recoveryPending, true);
+
+    fs.writeFileSync(path.join(dir, 'drain-makes-busy'), 'off');
+    fs.writeFileSync(path.join(dir, 'busy'), 'off');
+    assert.doesNotMatch(run().message, /still owed/);
+    assert.deepEqual(npmCalls(dir).filter((call) => call.startsWith('install ')).map((call) => call.split(' ').pop()), ['demo-pkg@1.0.0']);
+    assert.equal(npmPackageVersion(npm.prefix, npm.pkg), '1.0.0');
+    assert.equal(readFixture(dir, 'running'), 'on');
+    assert.equal(readOperation(id).recoveryPending, false);
+  });
+});

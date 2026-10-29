@@ -1000,9 +1000,13 @@ export function rollbackOwed(service, record) {
  * Roll a service back for an update that was interrupted half way, from the
  * cycle that found it. The rollback is the update's own, the npm reinstall or
  * the configured rollback command, with each step noted on the interrupted
- * record rather than entered as a phase of the cycle. A service that is
- * running again is only stopped for it while the machine is idle, as for any
- * update.
+ * record rather than entered as a phase of the cycle.
+ *
+ * A service that is running again is stopped for it only through the gate the
+ * update's own stop goes through: a busy check, the drain, and a second check
+ * immediately before anything stops. A unit that came back by itself on a
+ * half-written tree takes new work like any other, and checking is not
+ * preventing. A drain it refuses leaves it running, and the rollback owed.
  *
  * Returns { settled, action, reasonCode, message }. The obligation is met once
  * the rollback took, or once the service is seen running even though it did
@@ -1013,16 +1017,22 @@ export async function rollBackInterrupted(config, service, record, owed, { runni
   const found = `${service.name} is on ${owed.installed ?? 'a version that cannot be read'}, neither ${owed.from} nor ${owed.to ?? 'the version it was going to'}`;
   const held = await rollbackHeld();
   if (held) return { settled: false, action: 'conflict', reasonCode: REASON.operationInProgress, message: `${found}, and ${held}` };
+  const waiting = (busy, why = '') => ({
+    settled: false,
+    action: 'deferred',
+    reasonCode: busyReasonCode(busy),
+    message: `${found}, and the rollback to ${owed.from} waits for an idle machine (${why}${busy.reason})`,
+  });
   if (running && (service.kind === 'npm' || service.rollback)) {
     const { busy } = await busyNow(config, service);
-    if (busy.busy) {
-      return {
-        settled: false,
-        action: 'deferred',
-        reasonCode: busyReasonCode(busy),
-        message: `${found}, and the rollback to ${owed.from} waits for an idle machine (${busy.reason})`,
-      };
+    if (busy.busy) return waiting(busy);
+    const drained = await drainService(service);
+    if (!drained.ok) {
+      return { settled: false, action: 'drain-refused', reasonCode: REASON.busy, message: `${found}, and ${service.name} was not rolled back to ${owed.from}: ${drained.message}` };
     }
+    if (drained.drained) appendLog(record.id, `recovery: ${drained.message}`);
+    const fresh = await busyNow(config, service);
+    if (fresh.busy.busy) return waiting(fresh.busy, 'work started while it was being prepared: ');
   }
   note(`${found} after an interrupted update; rolling it back`, 'recover');
   const enter = (phase, progress = null) => appendLog(record.id, `recovery: ${phase}${progress?.note ? `, ${progress.note}` : ''}`);
