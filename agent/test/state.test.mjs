@@ -118,6 +118,62 @@ test('eight concurrent writers keep every one of their four hundred writes', asy
   });
 });
 
+test('a rename Windows refuses for a moment is tried again, and nowhere else', async () => {
+  const state = await fresh('state.mjs');
+  const sharing = (times, code = 'EPERM') => {
+    let calls = 0;
+    return {
+      calls: () => calls,
+      operation() {
+        calls += 1;
+        if (calls <= times) throw Object.assign(new Error(`${code}: operation not permitted, rename`), { code });
+        return 'renamed';
+      },
+    };
+  };
+  for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+    const brief = sharing(2, code);
+    assert.equal(state.retryWindowsSharing(brief.operation, { platform: 'win32' }), 'renamed', code);
+    assert.equal(brief.calls(), 3);
+  }
+  const elsewhere = sharing(1);
+  assert.throws(() => state.retryWindowsSharing(elsewhere.operation, { platform: 'linux' }), /EPERM/);
+  assert.equal(elsewhere.calls(), 1, 'an error that means what it says is not waited out');
+  const held = sharing(Infinity);
+  assert.throws(() => state.retryWindowsSharing(held.operation, { platform: 'win32', waitMs: 50 }), /EPERM/, 'for a while, not for ever');
+  const missing = sharing(1, 'ENOENT');
+  assert.throws(() => state.retryWindowsSharing(missing.operation, { platform: 'win32' }), /ENOENT/);
+});
+
+test('an atomic write goes through the rename retry', async () => {
+  await withHome(async (home) => {
+    const state = await fresh('state.mjs');
+    const file = path.join(home, 'state', 'retried.json');
+    const rename = fs.renameSync;
+    let refused = 0;
+    try {
+      fs.renameSync = (source, target) => {
+        if (target === file && refused < 2) {
+          refused += 1;
+          throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY' });
+        }
+        return rename(source, target);
+      };
+      const written = state.writeJsonAtomic(file, { value: 1 });
+      if (process.platform === 'win32') {
+        assert.equal(written.ok, true, written.error);
+        assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { value: 1 });
+      } else {
+        assert.equal(written.ok, false);
+        assert.match(written.error, /EBUSY/);
+      }
+    } finally {
+      fs.renameSync = rename;
+    }
+    assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((name) => name.includes('.tmp-')), [], 'no temp file is left either way');
+  });
+});
+
 test('a pre-3.0 state.json is split into the new layout once', async () => {
   await withHome(async (home) => {
     fs.writeFileSync(

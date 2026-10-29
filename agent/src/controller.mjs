@@ -34,7 +34,7 @@ import { basePath, jsonParseProblem } from './config.mjs';
 import { REASON, SETUP_ID_PATTERN } from './contract.mjs';
 import { approvalsFrom, launchProjection, launchReview } from './launch.mjs';
 import { findRepeatedMember, validateSetupDocument } from './setup-document.mjs';
-import { ensurePrivateDir } from './state.mjs';
+import { ensurePrivateDir, retryWindowsSharing } from './state.mjs';
 
 /** Room for far more machines than anyone has, and small enough to refuse a mistake. */
 export const MAX_CONTROLLER_BYTES = 1024 * 1024;
@@ -129,25 +129,9 @@ export function canonicalHash(input) {
 // Crash-consistent commit
 // ---------------------------------------------------------------------------
 
-const publicationWait = new Int32Array(new SharedArrayBuffer(4));
-
-function retryWindowsSharing(operation) {
-  const deadline = performance.now() + 1000;
-  let pauseMs = 10;
-  for (;;) {
-    try { return operation(); }
-    catch (error) {
-      const remaining = deadline - performance.now();
-      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
-      // A reader or antivirus scanner can briefly deny Windows replacement.
-      // Retry the same atomic operation; deleting its destination first would
-      // expose a missing document and destroy the recoverable committed pair.
-      Atomics.wait(publicationWait, 0, 0, Math.min(pauseMs, remaining));
-      pauseMs = Math.min(pauseMs * 2, 100);
-    }
-  }
-}
-
+// A reader or an antivirus scanner can briefly deny a replacement on Windows,
+// and deleting the destination first would expose a missing document and
+// destroy the recoverable committed pair (state.mjs retryWindowsSharing).
 function replaceAtomic(source, target) {
   return retryWindowsSharing(() => fs.renameSync(source, target));
 }

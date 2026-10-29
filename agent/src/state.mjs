@@ -184,13 +184,39 @@ export function readJsonStore(file) {
   return readJson(file);
 }
 
+const sharingWait = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Run a file operation again, for up to a second, while Windows refuses it
+ * with EPERM, EACCES or EBUSY. A reader, the search indexer or an antivirus
+ * scanner holding the destination open for a moment makes a rename over it
+ * fail until it lets go, and deleting the destination first would leave a
+ * moment with no file at all. So the same atomic operation is tried again.
+ * Anywhere else those errors mean what they say, the first time.
+ */
+export function retryWindowsSharing(operation, { platform = process.platform, waitMs = 1000 } = {}) {
+  const deadline = performance.now() + waitMs;
+  let pauseMs = 10;
+  for (;;) {
+    try {
+      return operation();
+    } catch (error) {
+      const remaining = deadline - performance.now();
+      if (platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || remaining <= 0) throw error;
+      Atomics.wait(sharingWait, 0, 0, Math.min(pauseMs, remaining));
+      pauseMs = Math.min(pauseMs * 2, 100);
+    }
+  }
+}
+
 /**
  * Atomic write with a temp name unique to this process and call.
  *
  * The shared "<file>.tmp" name the first version used meant two concurrent
  * writers wrote into the same temp file and renamed each other's half-written
  * bytes into place. The pid and a random suffix make that impossible, and the
- * directory fsync makes the rename durable rather than merely ordered.
+ * directory fsync makes the rename durable rather than merely ordered. On
+ * Windows the rename waits out a reader holding the file (retryWindowsSharing).
  *
  * Every file the agent writes this way is private, as writePrivateAtomic's are.
  */
@@ -215,7 +241,7 @@ export function writePrivateAtomic(file, data) {
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmp, file);
+    retryWindowsSharing(() => fs.renameSync(tmp, file));
     try {
       const dirFd = fs.openSync(path.dirname(file), 'r');
       try {
