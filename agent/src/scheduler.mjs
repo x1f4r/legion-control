@@ -10,10 +10,10 @@
 // third:
 //
 //   1. RECOVER. Finish operations whose process is gone, put back services a
-//      killed run left stopped, drop locks nobody owns, prune old records. This
-//      comes first because everything after it assumes a machine in a known
-//      state — and because the run that needs recovering is exactly the run the
-//      same timer's time limit killed.
+//      killed run left stopped, drop locks and temp files nobody owns, prune
+//      old records. This comes first because everything after it assumes a
+//      machine in a known state — and because the run that needs recovering
+//      is exactly the run the same timer's time limit killed.
 //   2. DRAIN THE QUEUE. "Restart when idle" is a promise, and something has to
 //      keep it. That something is this, on every tick.
 //   3. UPDATE. Every eligible service, in order, each with its own policy, its
@@ -70,7 +70,7 @@ import {
   updateWorstCaseMs,
 } from './update.mjs';
 import { actionWorstCaseMs, findAction, runAction } from './actions.mjs';
-import { ensureServiceStateWritable, serviceState } from './state.mjs';
+import { ensureServiceStateWritable, removeOrphanedTemporaries, serviceState } from './state.mjs';
 
 /**
  * How long a cycle may run before its scheduler ends it: systemd stops the
@@ -196,11 +196,14 @@ export async function recoverMachine(config, { lockFiles = [], budget = null } =
   }
 
   const pruned = pruneOperations();
+  const temporaries = removeOrphanedTemporaries();
+  if (temporaries.length > 0) log(`removed ${temporaries.length} temp file${temporaries.length === 1 ? '' : 's'} an interrupted write left behind`, 'recover');
   return {
     interrupted: interrupted.map(summarize),
     locksCleared: cleared.map((entry) => entry.file),
     restored,
     pruned: pruned.removed.length,
+    temporaries: temporaries.length,
   };
 }
 

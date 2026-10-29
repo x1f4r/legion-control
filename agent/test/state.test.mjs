@@ -174,6 +174,30 @@ test('an atomic write goes through the rename retry', async () => {
   });
 });
 
+test('temp files a killed write left behind are removed, and a write still under way keeps its own', async () => {
+  await withHome(async (home) => {
+    const state = await fresh('state.mjs');
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    const files = {
+      record: path.join(home, 'ops', 'abcdefgh-1111-4111-8111-111111111111.json.tmp-4242-0a1b2c3d4e5f'),
+      sidecar: path.join(home, 'op.lock.tmp-4242'),
+      controller: path.join(home, 'controller.json.tmp-4242-0a1b2c3d'),
+      service: path.join(home, 'state', 'service-demo.json.tmp-4242-0a1b2c3d4e5f'),
+      fresh: path.join(home, 'state', 'cache.json.tmp-4343-0a1b2c3d4e5f'),
+      unrelated: path.join(home, 'state', 'notes.tmp'),
+    };
+    for (const [name, file] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, '{');
+      if (name !== 'fresh') fs.utimesSync(file, old, old);
+    }
+    const removed = state.removeOrphanedTemporaries();
+    assert.deepEqual(removed.sort(), [files.record, files.sidecar, files.controller, files.service].sort());
+    assert.equal(fs.existsSync(files.fresh), true);
+    assert.equal(fs.existsSync(files.unrelated), true, 'only the names an atomic write uses');
+  });
+});
+
 test('a pre-3.0 state.json is split into the new layout once', async () => {
   await withHome(async (home) => {
     fs.writeFileSync(

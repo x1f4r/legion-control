@@ -23,7 +23,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath, runCommand, stateDir } from './config.mjs';
+import { basePath, operationsDir, runCommand, stateDir } from './config.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
 
 /** How long we are willing to wait for another process to finish its write. */
@@ -262,6 +262,44 @@ export function writePrivateAtomic(file, data) {
     }
     return { ok: false, error: `${file} could not be written: ${err.message}` };
   }
+}
+
+/** The temp names an atomic write leaves while it runs: this file's, the controller's and the lock sidecar's. */
+const TEMP_NAME = /\.tmp-[0-9]+(?:-[0-9a-f]+)?$/;
+/** How old a temp file has to be before nobody can still be writing it. */
+const ORPHAN_AGE_MS = 10 * 60 * 1000;
+
+/**
+ * Remove the temp files of writes whose process died between creating the
+ * file and renaming it into place. Nothing reads them and nothing else would
+ * ever take them away, so a machine whose agent was killed now and then
+ * collected them for good. A temp file lives for as long as one write, so one
+ * ten minutes old has nobody left to finish it; anything younger is left to
+ * the write it may still belong to.
+ */
+export function removeOrphanedTemporaries({ dirs = [basePath(), stateDir(), operationsDir()], now = Date.now() } = {}) {
+  const removed = [];
+  for (const dir of dirs) {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!TEMP_NAME.test(name)) continue;
+      const file = path.join(dir, name);
+      try {
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || now - stat.mtimeMs < ORPHAN_AGE_MS) continue;
+        fs.rmSync(file, { force: true });
+        removed.push(file);
+      } catch {
+        /* it is looked at again by the next cycle */
+      }
+    }
+  }
+  return removed;
 }
 
 /**
