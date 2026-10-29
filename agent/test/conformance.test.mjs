@@ -27,7 +27,7 @@ import { OK_REPLY_ACTIONS } from '../../contract/tools/outcome.mjs';
 import { canonicalBytes, canonicalHash } from '../src/controller.mjs';
 import { acquireOperationLock } from '../src/lock.mjs';
 import {
-  cli, commandService, ENTRY, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture,
+  cli, commandService, ENTRY, fakeNpm, FIXTURE, fixtureConfig, fixtureData, npmService, readFixture, withHome, writeConfig, writeFixture,
 } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
@@ -389,6 +389,34 @@ test('update conforms through every ending a fixture service can produce', async
       assert.equal(conflict.ok, true);
       assert.equal(conflict.outcome, 'deferred');
     });
+  });
+});
+
+test('an npm update conforms when it updates, is refused a drain and rolls back', async () => {
+  // npm-update.test.mjs says what each of these leaves behind; here they are
+  // only held to the contract, since every other update in this file is one
+  // the command-kind fixture produced.
+  const npmHome = async (initial, body) => withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0', ...initial });
+    const npm = fakeNpm(home, dir);
+    writeConfig(home, fixtureConfig(dir, { services: [npmService(dir, npm, { drain: { command: call(dir, 'drain'), timeoutSeconds: 30 } })] }));
+    await body((argv) => invoke(home, argv, { nodeArgs: npm.nodeArgs }));
+  });
+
+  await npmHome({}, async (run) => {
+    const updated = run(['update']);
+    assert.equal(updated.action, 'updated');
+    assert.equal(updated.outcome, 'succeeded');
+  });
+  await npmHome({ 'drain-fails': 'on' }, async (run) => {
+    const refused = run(['update']);
+    assert.equal(refused.reasonCode, 'busy');
+    assert.equal(refused.outcome, 'failed');
+  });
+  await npmHome({ 'npm-install-fails': '2.0.0' }, async (run) => {
+    const rolled = run(['update']);
+    assert.equal(rolled.action, 'rolled-back');
+    assert.equal(rolled.op.result.outcome, 'failed');
   });
 });
 

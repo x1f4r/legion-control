@@ -5,7 +5,7 @@
 //
 //   open the record -> take the machine lock -> RECOVER anything a previous run
 //   left half done -> resolve the target version -> compare -> check busy ->
-//   pre-warm the cache -> CHECK BUSY AGAIN -> drain -> stop -> install ->
+//   pre-warm the cache -> drain -> CHECK BUSY AGAIN -> stop -> install ->
 //   verify -> start -> health -> close the record.
 //
 // Four of those steps are there because of a specific way this went wrong:
@@ -19,7 +19,9 @@
 //   The busy check happens TWICE, and the second one is immediately before the
 //   stop. Between the first check and the stop sits a cache warm that can take
 //   three attempts of up to three minutes each, and work started inside that
-//   window used to be thrown away by a decision made nine minutes earlier.
+//   window used to be thrown away by a decision made nine minutes earlier. The
+//   drain sits in that window too, so work that starts while it runs is seen by
+//   the second check rather than stopped.
 //
 //   A drain runs before the stop where the service has one. Checking is not
 //   preventing: only the service itself can refuse new work, and where it can,
@@ -27,6 +29,11 @@
 //
 //   An update is only reported as done when something PROVES it. A command that
 //   exits zero has proved that it ran, and nothing else.
+//
+// Only what the install changed is ever rolled back. A drain the service
+// refused, or a stop it did not complete, leaves it exactly as it was. The npm
+// path used to answer either with a rollback, which stopped the service that
+// had just said it was not ready and reinstalled the version it was running.
 //
 // We NEVER install while the machine is busy without being told to. An installer
 // replaces files underneath a running service, and a service that loads code
@@ -214,18 +221,16 @@ export async function runRestart(config, service, options = {}) {
 // npm
 // ---------------------------------------------------------------------------
 
-async function performUpgrade(service, to, prefix, opId, lock) {
-  lock.phase('stopping');
-  recordPhase(opId, 'stopping');
-  const drained = await drainService(service);
-  if (!drained.ok) throw new Error(drained.message);
-  if (drained.drained) appendLog(opId, drained.message);
-
-  const stopped = await stopAndWait(service, STOP_WAIT_MS);
-  if (!stopped.ok) throw new Error(stopped.message);
-
+/**
+ * Everything from the install on, with the service already stopped. Any step
+ * that fails throws, and `reached.installing` says whether the install had
+ * begun, which is the one thing that decides whether there is anything to roll
+ * back.
+ */
+async function performUpgrade(service, to, prefix, opId, lock, reached) {
   lock.phase('installing');
   recordPhase(opId, 'installing', { note: `npm install ${service.package}@${to}` });
+  reached.installing = true;
   const installed = await npmProvider.installVersion(service, to, prefix);
   if (!installed.ok) throw new Error(installed.message);
 
@@ -274,9 +279,9 @@ async function rollBack(service, previous, prefix, opId, lock) {
   note(`rolling back to ${previous}`, 'update');
 
   // The same rule as the forward install: npm may not rewrite the package while
-  // a process still has those files open. If the upgrade failed at the stop, the
-  // old service is still up on the version we would reinstall, so the honest
-  // move is to leave it alone rather than corrupt a working install.
+  // a process still has those files open. An upgrade that got as far as the
+  // start can have left the new version running, and one that will not stop
+  // now is left alone rather than reinstalled underneath.
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
   if (!stopped.ok) {
     await ensureServiceUp(service);
@@ -389,22 +394,42 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
   const warmed = npmProvider.warmCache(service, to);
   if (!warmed.ok) log(`npm cache add did not succeed after ${warmed.attempts} attempts: ${warmed.message}`, 'update');
 
-  // The second check, and the important one. The warm above can legitimately
-  // take minutes; anything that started during it would otherwise be destroyed
-  // by a decision made before it existed.
-  lock.phase('checking-busy');
+  note(`updating ${service.name} ${from ?? 'nothing'} -> ${to}`, 'update');
+
+  lock.phase('stopping');
+  recordPhase(opId, 'stopping');
+  const drained = await drainService(service);
+  if (!drained.ok) {
+    log(drained.message, 'update');
+    recordLastUpdate(service, 'failed', from, to, drained.message);
+    return { ok: false, action: 'failed', reasonCode: REASON.busy, from, to, message: drained.message };
+  }
+  if (drained.drained) appendLog(opId, drained.message);
+
+  // The second check, and the important one, immediately before the stop. The
+  // warm above can legitimately take minutes; anything that started during it,
+  // or that the drain left running, would otherwise be destroyed by a decision
+  // made before it existed.
   const fresh = await busyNow(config, service);
   if (fresh.busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `work started while the download was being prepared (${fresh.busy.reason}); ${to} is downloaded and will be installed at the next idle window`;
+    const message = `work started while the update was being prepared (${fresh.busy.reason}); ${to} is downloaded and will be installed at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy: fresh.busy, message });
   }
 
+  const stopped = await stopAndWait(service, STOP_WAIT_MS);
+  if (!stopped.ok) {
+    const message = `${service.name} would not stop: ${stopped.message}`;
+    log(message, 'update');
+    recordLastUpdate(service, 'failed', from, to, message);
+    return { ok: false, action: 'failed', reasonCode: REASON.notRunning, from, to, message };
+  }
+
+  const reached = { installing: false };
   try {
-    note(`updating ${service.name} ${from ?? 'nothing'} -> ${to}`, 'update');
-    await performUpgrade(service, to, prefix, opId, lock);
+    await performUpgrade(service, to, prefix, opId, lock, reached);
     saveServiceState(service, { pendingRestart: false, pendingVersion: null });
     const message = `updated ${from ?? 'nothing'} -> ${to}`;
     log(message, 'update');
@@ -414,6 +439,14 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
     if (err instanceof ServiceStateError) throw err;
     const failure = err?.message ?? String(err);
     log(`update to ${to} failed: ${failure}`, 'update');
+    if (!reached.installing) {
+      // Stopped, and nothing on disk has changed: the service only has to come
+      // back on the version it was already running.
+      const restarted = await ensureServiceUp(service);
+      const message = `${failure}; nothing was installed, and ${service.name} ${restarted ? 'was started again' : 'could not be started again'}`;
+      recordLastUpdate(service, 'failed', from, to, message);
+      return { ok: false, action: 'failed', reasonCode: REASON.internal, from, to, message };
+    }
     const rolledBack = await rollBack(service, from, prefix, opId, lock);
     const message = `${failure}; ${rolledBack.message}`;
     if (rolledBack.ok) {

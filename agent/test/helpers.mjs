@@ -104,6 +104,70 @@ export function commandService(dir, overrides = {}) {
   };
 }
 
+/** The stand-in for npm's own entry point, and the module that makes the agent use it. */
+export const FAKE_NPM = path.join(REPO, 'agent', 'test', 'fake-npm-cli.mjs');
+const HIDE_NODE_NPM = path.join(REPO, 'agent', 'test', 'hide-node-npm.mjs');
+
+/** Where a global prefix keeps its packages, as npm lays it out on this platform. */
+function modulesOf(prefix) {
+  return process.platform === 'win32' ? path.join(prefix, 'node_modules') : path.join(prefix, 'lib', 'node_modules');
+}
+
+/**
+ * A global npm prefix holding fake-npm-cli.mjs as its npm, and `installed` of
+ * the package already on disk. `nodeArgs` go to every agent run that should
+ * reach this npm and no other (hide-node-npm.mjs says how).
+ */
+export function fakeNpm(home, dir, { pkg = 'demo-pkg', installed = '1.0.0' } = {}) {
+  const prefix = path.join(home, 'npm-prefix');
+  const bin = path.join(modulesOf(prefix), 'npm', 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'npm-cli.js'), [
+    `process.argv.splice(2, 0, ${JSON.stringify(dir)}, ${JSON.stringify(prefix)});`,
+    `import(${JSON.stringify(pathToFileURL(FAKE_NPM).href)});`,
+    '',
+  ].join('\n'));
+  if (installed !== null) writeNpmPackage(prefix, pkg, installed);
+  return { prefix, pkg, nodeArgs: ['--import', pathToFileURL(HIDE_NODE_NPM).href] };
+}
+
+/** Put a version of the package on disk under the prefix, as a finished install leaves it. */
+export function writeNpmPackage(prefix, pkg, version) {
+  const root = path.join(modulesOf(prefix), pkg);
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), `${JSON.stringify({ name: pkg, version })}\n`);
+}
+
+/** The version of the package on disk under the prefix, or null when there is none. */
+export function npmPackageVersion(prefix, pkg) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(modulesOf(prefix), pkg, 'package.json'), 'utf8')).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Every npm call the fake was asked, one argv string each. */
+export function npmCalls(dir) {
+  return readFixture(dir, 'npm-calls').split('\n').filter(Boolean);
+}
+
+/** An npm-kind service installed by the fake npm, with the fixture's process, health and busy. */
+export function npmService(dir, npm, overrides = {}) {
+  const call = (verb) => [process.execPath, FIXTURE, verb, dir];
+  return {
+    id: 'demo',
+    name: 'Demo',
+    kind: 'npm',
+    package: npm.pkg,
+    npmPrefix: npm.prefix,
+    process: { type: 'command', running: call('running'), start: call('start'), stop: call('stop') },
+    health: { type: 'command', command: call('health') },
+    busy: { type: 'command', command: call('busy') },
+    ...overrides,
+  };
+}
+
 /** A whole config document around one fixture service. */
 export function fixtureConfig(dir, overrides = {}) {
   return {
