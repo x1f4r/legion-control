@@ -295,14 +295,22 @@ internal fun OperationsBlock(model: MachineModel, showHistory: Boolean = true) {
         }
         if (recentExpanded) {
             history.forEach { record ->
-                val mark = when (record.succeeded) {
-                    true -> Mark.Good
-                    false -> Mark.Bad
-                    null -> Mark.Unknown
+                val mark = when {
+                    record.succeeded == true -> Mark.Good
+                    record.succeeded == false -> Mark.Bad
+                    record.outcome == com.x1f4r.legioncontrol.agent.Outcome.DEFERRED -> Mark.Attention
+                    else -> Mark.Unknown
                 }
                 StatusLine(mark, record.summary, style = MaterialTheme.typography.bodySmall)
                 QuietText(localTime(record.updatedAt), Modifier.padding(start = 17.dp, bottom = 4.dp))
-                PlainAction("Details", enabled = !model.isWorking) { model.showOperation(record.id) }
+                Actions {
+                    PlainAction("Details", enabled = !model.isWorking) { model.showOperation(record.id) }
+                    // A new request with a new id, for a change that ended without doing anything
+                    // a second request could double.
+                    if (record.retryable) {
+                        PlainAction("Try again", enabled = !model.isWorking) { model.retry(record) }
+                    }
+                }
             }
             finishedServer.forEach { summary -> OperationRow(model, summary) }
         }
@@ -313,12 +321,12 @@ internal fun OperationsBlock(model: MachineModel, showHistory: Boolean = true) {
 private fun OperationRow(model: MachineModel, summary: com.x1f4r.legioncontrol.agent.OpSummary) {
     val what = listOfNotNull(summary.opKind?.label ?: summary.kind, summary.subject).joinToString(" ")
     val outcome = summary.action ?: summary.state ?: "outcome unknown"
-    val mark = when {
-        summary.state == "queued" -> Mark.Idle
-        summary.state == "running" -> Mark.Busy
-        com.x1f4r.legioncontrol.agent.OpAction.fromWire(summary.action)?.isSuccess == true -> Mark.Good
-        summary.action == "failed" -> Mark.Bad
-        else -> Mark.Unknown
+    val mark = when (summary.effectiveOutcome) {
+        com.x1f4r.legioncontrol.agent.Outcome.PENDING -> if (summary.state == "queued") Mark.Idle else Mark.Busy
+        com.x1f4r.legioncontrol.agent.Outcome.SUCCEEDED -> Mark.Good
+        com.x1f4r.legioncontrol.agent.Outcome.FAILED -> Mark.Bad
+        com.x1f4r.legioncontrol.agent.Outcome.DEFERRED -> Mark.Attention
+        com.x1f4r.legioncontrol.agent.Outcome.UNKNOWN -> Mark.Unknown
     }
     StatusLine(mark, "$what: $outcome")
     if (summary.state == "finished") localTime(summary.updatedAt ?: summary.requestedAt)?.let { time ->
@@ -337,7 +345,6 @@ private fun OperationRow(model: MachineModel, record: OperationRecord) {
     val mark = when (record.state) {
         TrackedState.OUTCOME_UNKNOWN -> Mark.Unknown
         TrackedState.QUEUED -> Mark.Idle
-        TrackedState.AWAITING_DECISION -> Mark.Attention
         else -> Mark.Busy
     }
     Column(Modifier.padding(vertical = 2.dp)) {
@@ -354,8 +361,8 @@ private fun OperationRow(model: MachineModel, record: OperationRecord) {
             if (record.isCancellable) {
                 PlainAction("Cancel", enabled = true) { model.cancel(record) }
             }
-            if (record.retryable && record.isOver) {
-                PlainAction("Try again", enabled = !model.isWorking) { model.retry(record) }
+            if (record.state == TrackedState.OUTCOME_UNKNOWN && record.trackable) {
+                PlainAction("Check again", enabled = true) { model.checkAgain(record) }
             }
         }
     }

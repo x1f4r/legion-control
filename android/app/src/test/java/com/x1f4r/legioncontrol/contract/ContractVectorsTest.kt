@@ -22,6 +22,9 @@ import com.x1f4r.legioncontrol.agent.CommandSafety
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.DispatchStage
 import com.x1f4r.legioncontrol.agent.FailureKind
+import com.x1f4r.legioncontrol.agent.OpRecord
+import com.x1f4r.legioncontrol.agent.OpSummary
+import com.x1f4r.legioncontrol.agent.Outcome
 import com.x1f4r.legioncontrol.agent.RemoteShell
 import com.x1f4r.legioncontrol.agent.buildRemoteCommand
 import com.x1f4r.legioncontrol.agent.grammarFor
@@ -83,6 +86,9 @@ class ContractVectorsTest {
     @Test
     fun `merges, bases and number equality match the contract`() = runFamily("setup-merge")
 
+    @Test
+    fun `outcomes of replies, records and summaries match the contract`() = runFamily("outcome")
+
     /**
      * Every adapter is for a group this client consumes, and every consumed family is either adapted
      * in full or still listed as pending.
@@ -136,6 +142,31 @@ class ContractVectorsTest {
         "identifiers/duration" to identifier(Contract::isDuration),
         "identifiers/clockTime" to identifier(Contract::isClockTime),
         "identifiers/sha256" to identifier(Contract::isSha256Hex),
+
+        // A key that is absent is absent from the reply, and the reducer reads it as null, exactly as
+        // it reads a null that is there.
+        "outcome/reduce" to { input ->
+            val outcome = Outcome.reduce(
+                outcome = input.string("outcome"),
+                state = input.string("state"),
+                ok = input.boolean("ok"),
+                action = input.string("action"),
+                reasonCode = input.string("reasonCode"),
+            )
+            buildJsonObject { put("outcome", outcome.wire) }
+        },
+
+        // Through the decoders a real record and a real summary go through, and the property every
+        // screen reads them by.
+        "outcome/records" to { input ->
+            val value = input["value"] as JsonObject
+            val outcome = when (input.string("kind")) {
+                "record" -> AgentJson.decodeFromJsonElement(OpRecord.serializer(), value).effectiveOutcome
+                "summary" -> AgentJson.decodeFromJsonElement(OpSummary.serializer(), value).effectiveOutcome
+                else -> throw AssertionError("an outcome record is a record or a summary, not ${input["kind"]}")
+            }
+            buildJsonObject { put("outcome", outcome.wire) }
+        },
 
         "transport/grammars" to { input ->
             val choice = grammarFor(
@@ -448,6 +479,6 @@ class ContractVectorsTest {
          * adapted, or when the index stops listing it, and the list is empty once the Android port
          * of every reference has landed.
          */
-        val PENDING_FAMILIES = setOf("outcome", "wake")
+        val PENDING_FAMILIES = setOf("wake")
     }
 }

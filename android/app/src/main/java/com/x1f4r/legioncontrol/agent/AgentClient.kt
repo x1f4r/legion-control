@@ -9,7 +9,10 @@ import com.x1f4r.legioncontrol.net.StdinSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
@@ -200,8 +203,10 @@ class AgentClient(
             }
         }
         val budget = waitSeconds?.let { (it * 1000L) + OP_WAIT_MARGIN_MILLIS } ?: SHORT_TIMEOUT_MILLIS
-        val reply = call(arguments, budget, OpEnvelope.serializer(), CommandSafety.READ)
-        return AgentReply(reply.value.record(), reply.route, reply.systemId)
+        // Read as a tree first, because "no such operation" is told by a key that is there and null,
+        // which a decoded class cannot tell from a key that is missing.
+        val reply = call(arguments, budget, JsonObject.serializer(), CommandSafety.READ)
+        return AgentReply(readOperation(operationId, reply.value), reply.route, reply.systemId)
     }
 
     suspend fun history(
@@ -1185,6 +1190,28 @@ internal data class OpEnvelope(
             replayed = replayed,
         )
     }
+}
+
+/**
+ * One `op ID` reply: the record, or [AgentFailure.NoSuchOperation] when the reply carries `op: null`.
+ *
+ * The null is read before `ok`, because it is the answer whatever the code beside it says: 3.1.0
+ * refuses with `not-configured` and 3.0.x with `bad-argument`, and both mean the machine never had
+ * the operation or has pruned it (contract section 4). Any other refusal is a read that failed.
+ */
+internal fun readOperation(operationId: String, reply: JsonObject): OpRecord {
+    if (reply["op"] is JsonNull) {
+        throw AgentFailure.NoSuchOperation(
+            operationId,
+            (reply["message"] as? JsonPrimitive)?.contentOrNull ?: "there is no operation $operationId on this machine",
+        )
+    }
+    val envelope = try {
+        AgentJson.decodeFromJsonElement(OpEnvelope.serializer(), reply)
+    } catch (failure: Exception) {
+        throw AgentFailure.BadOutput("The operation read could not be decoded.", failure, DispatchStage.ACKNOWLEDGED)
+    }
+    return envelope.record()
 }
 
 /** Refused reads cannot establish a route, capabilities, system identity or operation state. */

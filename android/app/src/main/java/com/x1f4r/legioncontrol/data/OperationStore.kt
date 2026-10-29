@@ -1,8 +1,8 @@
 package com.x1f4r.legioncontrol.data
 
 import android.content.Context
-import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.OperationRecord
+import com.x1f4r.legioncontrol.agent.TrackedState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,8 +21,9 @@ import java.io.File
  * The history is capped. It exists to answer "what happened to the thing I pressed", not to be an
  * audit log, and a phone that has been used for a year should not be carrying a year of it.
  */
-class OperationStore(context: Context) {
-    private val file = File(File(context.applicationContext.filesDir, "operations"), "operations.json")
+class OperationStore(private val file: File) {
+    constructor(context: Context) : this(File(File(context.applicationContext.filesDir, "operations"), "operations.json"))
+
     private val lock = Any()
 
     private val _records = MutableStateFlow(read())
@@ -109,7 +110,7 @@ class OperationStore(context: Context) {
                 // being sent again, which is the whole point of writing these down. Disconnection
                 // never proves a transition, and neither does the app being killed.
                 if (record.state == TrackedState.DISPATCHED || record.state == TrackedState.REQUESTED) {
-                    record.copy(state = TrackedState.OUTCOME_UNKNOWN, retryable = record.trackable)
+                    record.copy(state = TrackedState.OUTCOME_UNKNOWN, retryable = false)
                 } else {
                     record
                 }

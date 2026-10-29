@@ -438,6 +438,8 @@ data class OpResult(
      * without saying so, because force bypasses only the busy gate and never a missing postcondition.
      */
     val verified: Boolean? = null,
+    /** v3.1: how it ended, as the agent states it on a finished record. See [Outcome]. */
+    val outcome: String? = null,
 )
 
 @Serializable
@@ -453,7 +455,11 @@ data class OpChild(
     val service: String? = null,
     val action: String? = null,
     val reasonCode: String? = null,
-)
+    val outcome: String? = null,
+) {
+    /** How this service's part ended, stated or reduced from its own fields. */
+    val effectiveOutcome: Outcome get() = Outcome.reduce(outcome = outcome, action = action, reasonCode = reasonCode)
+}
 
 /**
  * One operation, exactly as the agent stores and returns it.
@@ -490,6 +496,8 @@ data class OpRecord(
     val systemId: String? = null,
     /** Set when this reply is the record of an earlier request with the same id. */
     val replayed: Boolean? = null,
+    /** v3.1: `pending` while queued or running, the result's outcome once finished. See [Outcome]. */
+    val outcome: String? = null,
 ) {
     val opState: OpState? get() = OpState.fromWire(state)
     val opKind: OpKind? get() = OpKind.fromWire(kind)
@@ -497,6 +505,19 @@ data class OpRecord(
     val opAction: OpAction? get() = OpAction.fromWire(result?.action)
 
     val isFinished: Boolean get() = opState == OpState.FINISHED
+
+    /**
+     * How this operation stands, as contract section 5.6 reduces a record: its result, read in the
+     * light of its state and of the outcome stated on the record or, failing that, on the result.
+     */
+    val effectiveOutcome: Outcome
+        get() = Outcome.reduce(
+            outcome = outcome ?: result?.outcome,
+            state = state,
+            ok = result?.ok,
+            action = result?.action,
+            reasonCode = result?.reasonCode,
+        )
 
     /** What this operation is about, for a heading: the service, the boot target, or the action. */
     val subject: String?
@@ -521,9 +542,16 @@ data class OpSummary(
     val requestedAt: String? = null,
     val updatedAt: String? = null,
     val expiresAt: String? = null,
+    /** v3.1. See [Outcome]. */
+    val outcome: String? = null,
 ) {
     val opState: OpState? get() = OpState.fromWire(state)
     val opKind: OpKind? get() = OpKind.fromWire(kind)
+
+    /** How this operation stands, stated or reduced from the summary's own fields. */
+    val effectiveOutcome: Outcome
+        get() = Outcome.reduce(outcome = outcome, state = state, action = action, reasonCode = reasonCode)
+
     val subject: String?
         get() = service?.takeIf { it.isNotBlank() }
             ?: target?.takeIf { it.isNotBlank() }
@@ -706,7 +734,18 @@ data class AgentActionResult(
 
     /** v3: what `self-update` verified. */
     val manifest: AgentManifestSummary? = null,
+
+    /** v3.1: how the request stands, which is what a client decides on. See [Outcome]. */
+    val outcome: String? = null,
 ) {
+    /**
+     * How the request stands, from the reply's own fields (contract section 5.6). A reply that
+     * embeds a record is followed by the record's [OpRecord.effectiveOutcome] instead: the reply to
+     * `cancel` says whether cancelling worked, and its record says what became of the change.
+     */
+    val effectiveOutcome: Outcome
+        get() = Outcome.reduce(outcome = outcome, ok = ok, action = action, reasonCode = reasonCode)
+
     /** The action, preferring the operation record's own result. */
     val effectiveAction: String? get() = op?.result?.action ?: action
 

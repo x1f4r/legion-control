@@ -337,15 +337,17 @@ enum class OpAction(val wire: String) {
     ;
 
     /**
-     * Whether this action is the end of the story.
+     * Whether this action is the end of the story: whether section 5.6 reduces it to anything but
+     * pending, which is the one outcome a client keeps following.
      *
      * `accepted` and `queued` are not: the work is still to come. `rebooting` and `sleeping` are not
      * either, and that is the correction that matters most here: the machine was told, and being
      * told is not the same as having done it. Only `rebooted` and `slept`, or an observation of the
-     * machine in that state, close a boot or a sleep.
+     * machine in that state, close a boot or a sleep. Read off [Outcome.reduce] rather than kept as
+     * a list of its own, so the two can never disagree about which actions are still running.
      */
     val isSettled: Boolean
-        get() = this !in setOf(ACCEPTED, QUEUED, REBOOTING, SLEEPING, ALREADY_RUNNING)
+        get() = Outcome.reduce(action = wire).isTerminal
 
     /** Whether it ended well. Only meaningful once [isSettled]. */
     val isSuccess: Boolean

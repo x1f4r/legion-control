@@ -98,6 +98,7 @@ class MachineModel(
         data class OfferForceBoot(val target: MachineSystem, override val message: String) : Dialog {
             override val title get() = "Switch to ${target.name} anyway?"
             override val confirmLabel get() = "Switch anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         data class ConfirmRestart(
@@ -121,6 +122,7 @@ class MachineModel(
         ) : Dialog {
             override val title get() = "Restart ${service.displayName} anyway?"
             override val confirmLabel get() = "Restart anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         data class OfferForceUpdate(
@@ -129,6 +131,7 @@ class MachineModel(
         ) : Dialog {
             override val title get() = "Update ${service.displayName} anyway?"
             override val confirmLabel get() = "Update anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         data class ConfirmSleep(val machineName: String, val busyReason: String?) : Dialog {
@@ -145,6 +148,7 @@ class MachineModel(
         data class OfferForceSleep(override val message: String) : Dialog {
             override val title get() = "Put it to sleep anyway?"
             override val confirmLabel get() = "Sleep anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         data class ConfirmRun(val action: AgentAction, override val message: String) : Dialog {
@@ -155,6 +159,7 @@ class MachineModel(
         data class OfferForceRun(val action: AgentAction, override val message: String) : Dialog {
             override val title get() = "${action.displayName} anyway?"
             override val confirmLabel get() = "Run it anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         /**
@@ -1024,13 +1029,33 @@ class MachineModel(
         operations.cancel(client, record)
     }
 
-    /** Sends a change again, but only one that is known not to have happened. */
+    /**
+     * Asks again for a change that is over, as a new request with a new id (contract section 5.6).
+     *
+     * Only for one that ended in a way a second request cannot double: nothing reached the machine,
+     * or the agent refused, held back or finished it. The old id is never sent again: the agent
+     * answers a known id with what it stored for it, so a refused change re-sent under its own id
+     * came back refused for as long as anybody kept pressing. An outcome nobody knows is never
+     * offered at all; it is only ever read again, with [checkAgain].
+     */
     fun retry(record: OperationRecord) {
-        if (!record.retryable) return
-        messageGeneration++
-        lastMessage = MachineMessage.forOperation(record)
+        if (!record.isOver || !record.retryable) return
         val intent = record.intent
-        operations.retry(client, record) { id ->
+        val task = when (intent.kind) {
+            OpKind.UPDATE -> Task.UPDATE
+            OpKind.RESTART -> Task.RESTART
+            OpKind.BOOT -> Task.BOOT
+            OpKind.SLEEP -> Task.SLEEP
+            OpKind.RUN -> Task.RUN
+            else -> return
+        }
+        change(
+            task = task,
+            label = "${intent.kind.label} on ${record.subjectName}",
+            intent = intent,
+            subjectName = record.subjectName,
+            subjectId = intent.service ?: intent.target ?: intent.actionId,
+        ) { id ->
             when (intent.kind) {
                 OpKind.UPDATE -> client.update(
                     UpdateRequest(
@@ -1061,15 +1086,26 @@ class MachineModel(
                     id,
                 )
 
-                OpKind.RUN -> client.run(
+                else -> client.run(
                     intent.actionId.orEmpty(),
                     InterruptRequest(intent.force, intent.whenIdle, intent.expires, speaksV3),
                     id,
                 )
-
-                else -> Result.failure(IllegalStateException("that change cannot be sent again"))
             }
         }
+    }
+
+    /**
+     * Reads an unresolved change again by its own id, and sends nothing (contract section 5.6).
+     *
+     * For a change whose reply was lost and whose watch has given up. The same id is a question the
+     * agent answers from its record, never a second request.
+     */
+    fun checkAgain(record: OperationRecord) {
+        if (record.isOver || !record.trackable) return
+        messageGeneration++
+        lastMessage = MachineMessage.forOperation(record)
+        operations.follow(client, record.id)
     }
 
     // MARK: - Diagnostics
@@ -1296,11 +1332,8 @@ class MachineModel(
             try {
                 while (isActive) {
                     val current = operations.get(record.id) ?: break
+                    // A change held back for a decision is over too, and the question is asked here.
                     if (current.isOver || current.state == TrackedState.QUEUED) {
-                        offerForce(current)
-                        break
-                    }
-                    if (current.state == TrackedState.AWAITING_DECISION) {
                         offerForce(current)
                         break
                     }

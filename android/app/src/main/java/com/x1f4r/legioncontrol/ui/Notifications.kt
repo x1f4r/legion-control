@@ -43,10 +43,11 @@ class AndroidOperationNotifier(
         }
 
         ensureChannel()
-        val title = when (record.succeeded) {
-            true -> "${record.kind.label} finished"
-            false -> "${record.kind.label} failed"
-            null -> "${record.kind.label}: outcome not known"
+        val title = when {
+            record.succeeded == true -> "${record.kind.label} finished"
+            record.succeeded == false -> "${record.kind.label} failed"
+            record.outcome == com.x1f4r.legioncontrol.agent.Outcome.DEFERRED -> "${record.kind.label} did not run"
+            else -> "${record.kind.label}: outcome not known"
         }
         val notification = NotificationCompat.Builder(app, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_notify_sync)

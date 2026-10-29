@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.ui
 
 import com.x1f4r.legioncontrol.agent.AgentActionResult
+import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.OpAction
 import com.x1f4r.legioncontrol.agent.OpKind
@@ -64,7 +65,9 @@ class OperationCenter(
      *
      * The record exists before anything is sent, which is what makes the press itself durable: an
      * app killed between the press and the reply comes back to an operation in "outcome unknown"
-     * rather than to nothing at all.
+     * rather than to nothing at all. Every start mints a new id, a second attempt at something that
+     * already ended included: re-sending an id only ever replays what the agent stored for it, which
+     * is how "Try again" on a refused change used to be refused forever.
      */
     fun start(
         client: MachineClient,
@@ -73,11 +76,27 @@ class OperationCenter(
         initiator: String,
         dispatch: suspend (operationId: String) -> Result<AgentActionResult>,
     ): OperationRecord {
-        val id = Contract.newOpId()
+        val record = record(client, intent, subjectName, initiator)
+        run(client, record, dispatch)
+        return record
+    }
+
+    /**
+     * Writes down a change about to be sent, under a new id, without sending it.
+     *
+     * For the one caller that has to wait for its own reply before deciding what comes next, which
+     * sends with [send] and reads the outcome itself.
+     */
+    fun record(
+        client: MachineClient,
+        intent: OperationIntent,
+        subjectName: String,
+        initiator: String,
+    ): OperationRecord {
         val now = System.currentTimeMillis()
-        val record = store.put(
+        return store.put(
             OperationRecord(
-                id = id,
+                id = Contract.newOpId(),
                 machineId = client.machine.id,
                 machineName = client.machine.name,
                 intent = intent,
@@ -89,33 +108,6 @@ class OperationCenter(
                 summary = "${intent.kind.label} on $subjectName was asked for.",
             ),
         )
-        run(client, record, dispatch)
-        return record
-    }
-
-    /**
-     * Sends a change again, reusing its id.
-     *
-     * Only ever offered for a record that says it is safe: either nothing reached the machine, or
-     * the machine keeps operation records and will answer the same id with what already happened
-     * rather than doing it twice. The intent is the record's own, unchanged, because an id binds its
-     * intent and the same id with a different request is a conflict rather than a retry.
-     */
-    fun retry(
-        client: MachineClient,
-        record: OperationRecord,
-        dispatch: suspend (operationId: String) -> Result<AgentActionResult>,
-    ): Boolean {
-        if (!record.retryable) return false
-        val revived = store.put(
-            record.copy(
-                state = TrackedState.REQUESTED,
-                updatedAt = System.currentTimeMillis(),
-                retryable = false,
-            ),
-        )
-        run(client, revived, dispatch)
-        return true
     }
 
     private fun run(
@@ -123,34 +115,62 @@ class OperationCenter(
         record: OperationRecord,
         dispatch: suspend (operationId: String) -> Result<AgentActionResult>,
     ) {
+        // Claimed before the launch, so a poll that lands in between cannot start following a change
+        // that has not been sent yet and leave it never sent at all.
         if (!inFlight.add(record.id)) return
         scope.launch {
             try {
-                val trackable = client.abilities.speaksV3
-                apply(record.id, OperationEvent.Dispatched(trackable, System.currentTimeMillis()))
-
-                dispatch(record.id).fold(
-                    onSuccess = { result ->
-                        apply(record.id, OperationEvent.Replied(result, System.currentTimeMillis()))
-                    },
-                    onFailure = { failure ->
-                        apply(
-                            record.id,
-                            OperationEvent.TransportFailed(
-                                summary = failure.sentence,
-                                detail = failure.rawDetail,
-                                stage = failure.dispatchStage,
-                                at = System.currentTimeMillis(),
-                            ),
-                        )
-                    },
-                )
+                dispatchClaimed(client, record.id, dispatch)
             } finally {
                 inFlight.remove(record.id)
             }
             // Whatever it ended in, anything still open is now watched rather than assumed.
             follow(client, record.id)
         }
+    }
+
+    /**
+     * Sends a recorded change once, here and now, and returns once the reply or the failure is on
+     * the record. False when it was already being sent or followed, and nothing was sent.
+     */
+    internal suspend fun send(
+        client: MachineClient,
+        id: String,
+        dispatch: suspend (operationId: String) -> Result<AgentActionResult>,
+    ): Boolean {
+        if (!inFlight.add(id)) return false
+        try {
+            dispatchClaimed(client, id, dispatch)
+        } finally {
+            inFlight.remove(id)
+        }
+        return true
+    }
+
+    private suspend fun dispatchClaimed(
+        client: MachineClient,
+        id: String,
+        dispatch: suspend (operationId: String) -> Result<AgentActionResult>,
+    ) {
+        val trackable = client.abilities.speaksV3
+        apply(id, OperationEvent.Dispatched(trackable, System.currentTimeMillis()))
+
+        dispatch(id).fold(
+            onSuccess = { result ->
+                apply(id, OperationEvent.Replied(result, System.currentTimeMillis()))
+            },
+            onFailure = { failure ->
+                apply(
+                    id,
+                    OperationEvent.TransportFailed(
+                        summary = failure.sentence,
+                        detail = failure.rawDetail,
+                        stage = failure.dispatchStage,
+                        at = System.currentTimeMillis(),
+                    ),
+                )
+            },
+        )
     }
 
     /**
@@ -181,35 +201,32 @@ class OperationCenter(
 
     private suspend fun watch(client: MachineClient, id: String) {
         val deadline = System.currentTimeMillis() + WATCH_BUDGET_MS
+        // Set once the agent's own record is finished. Reading it again only reads it again, and
+        // `op --wait` answers a finished record at once, so asking in a loop would be a tight one.
+        var agentDone = false
         while (scope.isActive && System.currentTimeMillis() < deadline) {
             val record = store.get(id) ?: return
             if (record.isOver) return
 
             // Expiry alone cannot prove that a queued change never started. Only the server's
             // operation record establishes expiration or completion after a disconnected interval.
-            if (record.trackable) {
+            if (record.trackable && !agentDone) {
                 val outcome = client.operation(id, waitSeconds = OP_WAIT_SECONDS)
                 outcome.fold(
                     onSuccess = { agentRecord ->
                         apply(id, OperationEvent.Observed(agentRecord, System.currentTimeMillis()))
+                        if (agentRecord.isFinished) agentDone = true
                     },
                     onFailure = { failure ->
                         // A read that failed says nothing about the change. It is worth trying
                         // again, and it is never a reason to conclude anything.
-                        apply(
-                            id,
-                            OperationEvent.Note(
-                                "Could not read the operation: ${failure.sentence}",
-                                isError = true,
-                                at = System.currentTimeMillis(),
-                            ),
-                        )
-                        delay(RETRY_DELAY_MS)
+                        if (!noteReadFailure(id, failure)) delay(RETRY_DELAY_MS)
                     },
                 )
             } else {
-                // No records on the far side. The only honest evidence left is the machine being in
-                // the state that was asked for, and only a boot, a sleep or an install leaves any.
+                // No records on the far side, or nothing more in the one it has. The only honest
+                // evidence left is the machine being in the state that was asked for, and only a
+                // boot, a sleep or an install leaves any.
                 if (!observe(client, id)) delay(OBSERVE_DELAY_MS)
             }
         }
@@ -225,6 +242,26 @@ class OperationCenter(
                 ),
             )
         }
+    }
+
+    /**
+     * Puts a failed `op ID` read on the record. True when the failure was itself the answer: the
+     * machine has no such operation, which settles a lost reply as a change that never arrived.
+     */
+    private fun noteReadFailure(id: String, failure: Throwable): Boolean {
+        if (failure is AgentFailure.NoSuchOperation) {
+            apply(id, OperationEvent.NotRecorded(System.currentTimeMillis()))
+            return true
+        }
+        apply(
+            id,
+            OperationEvent.Note(
+                "Could not read the operation: ${failure.sentence}",
+                isError = true,
+                at = System.currentTimeMillis(),
+            ),
+        )
+        return false
     }
 
     /**
@@ -328,7 +365,7 @@ class OperationCenter(
 
     fun exportText(): String = store.exportText()
 
-    private fun apply(id: String, event: OperationEvent) {
+    internal fun apply(id: String, event: OperationEvent) {
         store.update(id) { it.reduce(event) }
     }
 

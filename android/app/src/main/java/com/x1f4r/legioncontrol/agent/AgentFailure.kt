@@ -264,4 +264,17 @@ sealed class AgentFailure(
         "The control agent reported a problem.",
         detail,
     )
+
+    /**
+     * `op ID` answered that the machine has no such operation: a present `op: null`, whatever the
+     * code beside it (contract section 4). 3.1.0 says `not-configured` and 3.0.x said `bad-argument`.
+     *
+     * An answer, not a fault: it settles a change whose reply was lost as one that never arrived, and
+     * it releases a wake hold. Reading it as a failure to read is what kept this app asking a
+     * machine about an operation it never had, every fifteen seconds for half an hour.
+     */
+    class NoSuchOperation(val operationId: String, detail: String?) : AgentFailure(
+        "The machine has no record of that operation.",
+        detail,
+    )
 }

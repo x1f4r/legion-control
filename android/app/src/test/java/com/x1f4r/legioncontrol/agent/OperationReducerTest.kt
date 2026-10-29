@@ -149,9 +149,9 @@ class OperationReducerTest {
     }
 
     @Test
-    fun `an ambiguous change against a v3 agent may be sent again, because the id is a question`() {
-        // With `--op` the same id is a read: the agent answers with what already happened rather
-        // than doing it twice, so retrying is safe in a way it is not against a 2 x agent.
+    fun `an ambiguous change against a v3 agent is asked about by its id and never sent again`() {
+        // With `--op` the same id is a read: the agent answers with what already happened. That is
+        // what the record is followed by, and it is not a second request (contract section 5.6).
         val result = record()
             .reduce(OperationEvent.Dispatched(trackable = true, at = at))
             .reduce(
@@ -159,8 +159,36 @@ class OperationReducerTest {
             )
 
         assertEquals(TrackedState.OUTCOME_UNKNOWN, result.state)
-        assertTrue(result.retryable)
+        assertTrue("it is followed by its id", result.trackable)
+        assertFalse("an outcome nobody knows is never offered again", result.retryable)
         assertTrue(result.summary.contains("Asking Beacon"))
+    }
+
+    @Test
+    fun `a lost reply the agent has no record of never reached it`() {
+        val lost = record()
+            .reduce(OperationEvent.Dispatched(trackable = true, at = at))
+            .reduce(OperationEvent.TransportFailed("lost", null, DispatchStage.AMBIGUOUS, at))
+            .reduce(OperationEvent.NotRecorded(at + 1))
+
+        assertEquals(TrackedState.FINISHED, lost.state)
+        assertEquals(Outcome.FAILED, lost.outcome)
+        assertEquals(false, lost.succeeded)
+        assertTrue("it never arrived, so asking again cannot do it twice", lost.retryable)
+        assertTrue(lost.summary.contains("never reached Beacon"))
+    }
+
+    @Test
+    fun `a record the agent has pruned since is not known, and not offered again`() {
+        val pruned = record(kind = OpKind.UPDATE)
+            .reduce(OperationEvent.Dispatched(trackable = true, at = at))
+            .reduce(OperationEvent.Replied(v3(state = "running", phase = "installing"), at))
+            .reduce(OperationEvent.NotRecorded(at + 1))
+
+        assertEquals(TrackedState.FINISHED, pruned.state)
+        assertEquals(Outcome.UNKNOWN, pruned.outcome)
+        assertNull(pruned.succeeded)
+        assertFalse(pruned.retryable)
     }
 
     @Test
@@ -209,6 +237,14 @@ class OperationReducerTest {
         assertEquals(TrackedState.AWAITING_DECISION, result.state)
         assertTrue("a busy refusal is what force is for", result.invitesForce)
         assertTrue(result.summary.contains("the machine was working"))
+        assertEquals(Outcome.DEFERRED, result.outcome)
+        // Over: the agent is done with it, so nothing reads it again, and asking later is a new
+        // request. It used to stay pending and be read back in a tight loop for half an hour.
+        assertTrue(result.isOver)
+        assertFalse(result.isPending)
+        assertTrue(result.retryable)
+        assertNull("held back is neither a success nor a failure", result.succeeded)
+        assertFalse("the question is on screen; it is not a notification", result.isNoteworthyEnding)
     }
 
     @Test
@@ -417,9 +453,11 @@ class OperationReducerTest {
     fun `a cancelled change is over and safe to ask for again`() {
         val cancelled = record(whenIdle = true)
             .reduce(OperationEvent.Dispatched(true, at))
-            .reduce(OperationEvent.Replied(v3(state = "finished", action = "cancelled"), at))
+            .reduce(OperationEvent.Replied(v3(state = "finished", action = "cancelled", reasonCode = "cancelled"), at))
         assertEquals(TrackedState.FINISHED, cancelled.state)
+        assertEquals("a cancelled request was itself deferred", Outcome.DEFERRED, cancelled.outcome)
         assertTrue(cancelled.retryable)
+        assertTrue(cancelled.summary.contains("cancelled before it ran"))
     }
 
     // MARK: - Conflicts and endings
@@ -466,6 +504,113 @@ class OperationReducerTest {
         assertEquals(TrackedState.OUTCOME_UNKNOWN, given.state)
         assertNull(given.succeeded)
         assertFalse(given.retryable)
+    }
+
+    // MARK: - Outcomes (contract section 5.6)
+
+    @Test
+    fun `an action nobody knows is unknown, never a failure that is offered again`() {
+        // This app used to read every action it did not know as a failure and offer to send it
+        // again, while the desktop called the same reply a success.
+        val result = record()
+            .reduce(OperationEvent.Dispatched(true, at))
+            .reduce(OperationEvent.Replied(v3(state = "finished", action = "teleported"), at))
+
+        assertEquals(TrackedState.FINISHED, result.state)
+        assertEquals(Outcome.UNKNOWN, result.outcome)
+        assertNull(result.succeeded)
+        assertFalse(result.retryable)
+    }
+
+    @Test
+    fun `an outcome the agent states beats what its action would say`() {
+        // The agent's own producer marks a failure it may have left half done as unknown.
+        val reply = AgentActionResult(
+            ok = false,
+            contract = 3,
+            op = OpRecord(
+                state = "finished",
+                outcome = "unknown",
+                result = OpResult(ok = false, action = "failed", reasonCode = "apply-failed", outcome = "unknown"),
+            ),
+        )
+        val result = record(kind = OpKind.UPDATE)
+            .reduce(OperationEvent.Dispatched(true, at))
+            .reduce(OperationEvent.Replied(reply, at))
+
+        assertEquals(Outcome.UNKNOWN, result.outcome)
+        assertNull(result.succeeded)
+        assertFalse("nobody knows whether the first one took effect", result.retryable)
+    }
+
+    @Test
+    fun `a timed out action may have run, so it is not known and not sent again`() {
+        val result = record(kind = OpKind.RUN, service = null, actionId = "nightly")
+            .reduce(OperationEvent.Dispatched(true, at))
+            .reduce(OperationEvent.Replied(v3(state = "finished", action = "failed", reasonCode = "timed-out"), at))
+
+        assertEquals(TrackedState.FINISHED, result.state)
+        assertEquals(Outcome.UNKNOWN, result.outcome)
+        assertFalse(result.retryable)
+    }
+
+    @Test
+    fun `a refusal with a code is a failure, and one that only lacks the lock is held back`() {
+        val refused = record(kind = OpKind.UPDATE)
+            .reduce(OperationEvent.Dispatched(true, at))
+            .reduce(OperationEvent.Replied(AgentActionResult(ok = false, contract = 3, reasonCode = "not-installed"), at))
+        assertEquals(Outcome.FAILED, refused.outcome)
+        assertEquals(false, refused.succeeded)
+        assertTrue(refused.retryable)
+
+        val locked = record(kind = OpKind.UPDATE)
+            .reduce(OperationEvent.Dispatched(true, at))
+            .reduce(OperationEvent.Replied(AgentActionResult(ok = false, contract = 3, reasonCode = "lock-held"), at))
+        assertEquals(Outcome.DEFERRED, locked.outcome)
+        assertTrue(locked.isOver)
+        assertTrue(locked.summary.contains("could not start"))
+    }
+
+    @Test
+    fun `a reply that is still running is followed, never settled`() {
+        val result = record(kind = OpKind.UPDATE)
+            .reduce(OperationEvent.Dispatched(true, at))
+            .reduce(
+                OperationEvent.Replied(
+                    AgentActionResult(
+                        ok = true,
+                        contract = 3,
+                        action = "already-running",
+                        reasonCode = "already-running",
+                        outcome = "pending",
+                        op = OpRecord(state = "running", phase = "installing", outcome = "pending"),
+                    ),
+                    at,
+                ),
+            )
+        assertEquals(TrackedState.RUNNING, result.state)
+        assertEquals(Outcome.PENDING, result.outcome)
+        assertFalse(result.isOver)
+    }
+
+    @Test
+    fun `a record that says it is running never reopens a change already over`() {
+        val finished = record()
+            .reduce(OperationEvent.Dispatched(true, at))
+            .reduce(OperationEvent.Replied(v3(state = "finished", action = "restarted"), at))
+        val late = finished.reduce(OperationEvent.Observed(v3(state = "running", phase = "restarting").op!!, at + 1))
+        assertEquals(TrackedState.FINISHED, late.state)
+        assertEquals(true, late.succeeded)
+    }
+
+    @Test
+    fun `whether an action settles anything is the reducer's answer`() {
+        for (action in OpAction.entries) {
+            assertEquals(action.wire, Outcome.reduce(action = action.wire) != Outcome.PENDING, action.isSettled)
+        }
+        assertFalse(OpAction.ALREADY_RUNNING.isSettled)
+        assertFalse(OpAction.REBOOTING.isSettled)
+        assertTrue(OpAction.ARMED.isSettled)
     }
 
     // MARK: - Legacy replies

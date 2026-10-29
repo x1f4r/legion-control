@@ -344,19 +344,20 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
  * Never forced from the first question, however busy the last reading looked: force is the agent's
  * own check being skipped, and it is only ever offered back after the agent has looked at the
  * machine as it is now and said no. [whenIdle] is the quieter answer to the same question, which
- * queues the change rather than interrupting anything.
+ * queues the change rather than interrupting anything; after a refusal it is the "later" a held-back
+ * change is offered, as a new request (contract section 5.6).
  */
 private fun perform(model: MachineModel, dialog: MachineModel.Dialog, whenIdle: Boolean) {
     when (dialog) {
         is MachineModel.Dialog.ConfirmBoot -> model.boot(dialog.target, whenIdle = whenIdle)
-        is MachineModel.Dialog.OfferForceBoot -> model.boot(dialog.target, force = true)
+        is MachineModel.Dialog.OfferForceBoot -> model.boot(dialog.target, force = !whenIdle, whenIdle = whenIdle)
         is MachineModel.Dialog.ConfirmSleep -> model.sleep(whenIdle = whenIdle)
-        is MachineModel.Dialog.OfferForceSleep -> model.sleep(force = true)
+        is MachineModel.Dialog.OfferForceSleep -> model.sleep(force = !whenIdle, whenIdle = whenIdle)
         is MachineModel.Dialog.ConfirmRestart -> model.restart(dialog.service, whenIdle = whenIdle)
-        is MachineModel.Dialog.OfferForceRestart -> model.restart(dialog.service, force = true)
-        is MachineModel.Dialog.OfferForceUpdate -> model.update(dialog.service, force = true)
+        is MachineModel.Dialog.OfferForceRestart -> model.restart(dialog.service, force = !whenIdle, whenIdle = whenIdle)
+        is MachineModel.Dialog.OfferForceUpdate -> model.update(dialog.service, force = !whenIdle, whenIdle = whenIdle)
         is MachineModel.Dialog.ConfirmRun -> model.runAction(dialog.action, whenIdle = whenIdle)
-        is MachineModel.Dialog.OfferForceRun -> model.runAction(dialog.action, force = true)
+        is MachineModel.Dialog.OfferForceRun -> model.runAction(dialog.action, force = !whenIdle, whenIdle = whenIdle)
         is MachineModel.Dialog.ConfirmTrustHostKey -> Unit
 
         is MachineModel.Dialog.ConfirmAgentInstall -> model.installAgent()
