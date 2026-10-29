@@ -20,6 +20,10 @@
 # after logout and come up on boot without anyone signing in:
 #   sudo loginctl enable-linger "$(id -un)"
 #
+# --uninstall takes the timer, its units, the launchers and the agent trees
+# away again, and leaves what the agent was configured with and what it
+# recorded. --uninstall --purge removes those as well.
+#
 set -euo pipefail
 
 # Everything written from here on is this user's alone. The base holds every
@@ -61,6 +65,9 @@ SRC_AGENT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 
 MIN_NODE_MAJOR=24
 SKIP_SCHEDULER=0
+T3_ASKED=0
+UNINSTALL=0
+PURGE=0
 
 # Collected for the summary at the end.
 SUMMARY=()
@@ -70,17 +77,33 @@ die()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
 
 for arg in "$@"; do
   case "$arg" in
-    --with-t3) WITH_T3=1 ;;
+    --with-t3) WITH_T3=1; T3_ASKED=1 ;;
     --skip-scheduler) SKIP_SCHEDULER=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --purge) PURGE=1 ;;
     -h|--help)
-      printf 'usage: install-linux.sh [--with-t3] [--skip-scheduler]\n\n' >&2
+      printf 'usage: install-linux.sh [--with-t3] [--skip-scheduler]\n' >&2
+      printf '       install-linux.sh --uninstall [--purge]\n\n' >&2
       printf '  --with-t3   also install the reference example service (T3 Code)\n' >&2
       printf '  --skip-scheduler   install and verify files without changing systemd\n' >&2
+      printf '  --uninstall   remove the timer, its units, the launchers and the agent,\n' >&2
+      printf '                and keep its config and records\n' >&2
+      printf '  --purge       with --uninstall, remove the config and records too\n' >&2
       exit 0
       ;;
     *) die "unknown argument: $arg" ;;
   esac
 done
+if [ "$UNINSTALL" -eq 1 ]; then
+  if [ "$T3_ASKED" -eq 1 ] || [ "$SKIP_SCHEDULER" -eq 1 ]; then
+    die "--uninstall takes --purge and nothing else."
+  fi
+  # The reference service is not part of the agent, and uninstalling leaves it
+  # alone, so nothing it needs is checked for either.
+  WITH_T3=0
+elif [ "$PURGE" -eq 1 ]; then
+  die "--purge only goes with --uninstall."
+fi
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -143,6 +166,128 @@ fi
 
 if [ "$SKIP_SCHEDULER" -ne 1 ] && ! systemctl --user show-environment >/dev/null 2>&1; then
   die "no systemd user manager for this session. Check 'loginctl show-user $(id -un) -p Linger'."
+fi
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+# Remove the agent's own entries from the base. "code" is the launchers, every
+# agent tree, the swap journal and the inventory of a local baseline; "purge"
+# adds what the agent was configured with and what it recorded. Nothing else in
+# the base is touched: it is not the agent's, so it is named instead.
+#
+# It runs under the operation lock every mutating agent command takes, the way
+# an install promotes a tree, so an operation under way keeps its code and the
+# uninstall stops before anything is gone. The lock goes last, once released.
+# install-windows.ps1 runs the same code. Prints what it did, one line each.
+remove_agent_files() {
+  "$NODE_BIN" --input-type=module - "$BASE" "$1" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+const [base, scope] = process.argv.slice(2);
+const CODE = /^(?:bin|agent|agent\..+|agent-swap\.json|agent-baseline\.json)$/;
+const DATA = /^(?:config\..+|controller\..+|agent-floor\.json.*|state|state\.json.*|ops|incoming|legionctl\.log.*|launchd\.log|update\.lock.*|op\.lock.*)$/;
+const say = (line) => process.stdout.write(`${line}\n`);
+
+function remove() {
+  if (!fs.existsSync(base)) return;
+  const db = new DatabaseSync(path.join(base, 'op.lock.sqlite'));
+  try {
+    db.exec('PRAGMA busy_timeout = 250');
+    try { db.exec('BEGIN IMMEDIATE'); }
+    catch (error) {
+      if (error?.errcode === 5) throw new Error('another operation is running; nothing was removed');
+      throw error;
+    }
+    const doomed = fs.readdirSync(base).filter((name) => CODE.test(name) || (scope === 'purge' && DATA.test(name))).sort();
+    for (const name of doomed.filter((each) => !each.startsWith('op.lock'))) {
+      fs.rmSync(path.join(base, name), { recursive: true, force: true });
+      say(`removed ${path.join(base, name)}`);
+    }
+  } finally {
+    try { db.exec('ROLLBACK'); } catch { /* no transaction if acquisition failed */ }
+    db.close();
+  }
+  if (scope !== 'purge') return;
+  for (const name of fs.readdirSync(base).filter((each) => each.startsWith('op.lock'))) {
+    fs.rmSync(path.join(base, name), { recursive: true, force: true });
+  }
+  const kept = fs.readdirSync(base).sort();
+  if (kept.length === 0) {
+    fs.rmdirSync(base);
+    say(`removed ${base}`);
+  }
+  for (const name of kept) say(`kept ${path.join(base, name)}, which is not the agent's`);
+}
+
+try { remove(); }
+catch (error) {
+  process.stderr.write(`${error.message}\n`);
+  process.exitCode = 1;
+}
+NODE
+}
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  step "Uninstall"
+  # The summary is of what was removed; what the preflight found was said above.
+  SUMMARY=()
+
+  # A cycle the timer started is left to finish. Stopped part way it can leave
+  # a service down, and with the timer gone nothing comes back to recover it.
+  case "$(systemctl --user is-active legion-control-update.service 2>/dev/null || true)" in
+    active|activating|deactivating|reloading)
+      die "an update cycle is running right now. It finishes within 30 minutes; run this again then. Nothing was changed. Watch it with: journalctl --user -u legion-control-update.service -f"
+      ;;
+  esac
+
+  # The files first, so an operation holding the lock stops the uninstall
+  # before anything has changed. A timer that fires in the moment before its
+  # units go finds no launcher and fails, which does no harm.
+  SCOPE=code
+  if [ "$PURGE" -eq 1 ]; then SCOPE=purge; fi
+  if ! REMOVED="$(remove_agent_files "$SCOPE")"; then
+    die "uninstalling stopped there. The timer and its units were left as they were."
+  fi
+  while IFS= read -r line; do
+    [ -z "$line" ] || note "$line"
+  done <<< "$REMOVED"
+
+  for unit in legion-control-update.timer legion-control-update.service "${OLD_UNITS[@]}"; do
+    if [ -f "$UNIT_DIR/$unit" ]; then
+      systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
+      rm -f "$UNIT_DIR/$unit"
+      note "removed $unit"
+    fi
+  done
+  systemctl --user daemon-reload
+
+  # This copy of the installer may have been the installed agent's and gone with
+  # it, and then it is run again from a copy of the repository.
+  AGAIN='bash agent/install/install-linux.sh'
+  if [ -f "$SCRIPT_DIR/install-linux.sh" ]; then AGAIN="bash $(printf '%q' "$SCRIPT_DIR/install-linux.sh")"; fi
+
+  printf '\n== Legion Control, Linux side removed\n\n'
+  for line in "${SUMMARY[@]}"; do printf '  %s\n' "$line"; done
+  if [ "$PURGE" -ne 1 ] && [ -d "$BASE" ]; then
+    printf '\n  What the agent was configured with and what it recorded were left in:\n'
+    printf '    %s\n' "$BASE"
+    printf '\n  Remove those too:\n'
+    printf '    %s --uninstall --purge\n' "$AGAIN"
+  fi
+  if grep -qs 'dispatch\.sh' "$HOME/.ssh/authorized_keys"; then
+    printf '\n  A key in %s runs dispatch.sh, which is gone, so it is refused from now on.\n' "$HOME/.ssh/authorized_keys"
+    printf '  Take its line out.\n'
+  fi
+  if [ -f "$UNIT_DIR/t3-code.service" ]; then
+    printf '\n  t3-code.service is a service the agent looked after, not part of it, and was left as it is.\n'
+  fi
+  printf '\n  Put the agent back:\n'
+  printf '    %s\n\n' "$AGAIN"
+  exit 0
 fi
 
 # ---------------------------------------------------------------------------

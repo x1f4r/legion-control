@@ -162,7 +162,8 @@ const settings = (text) => text.split('\n').filter((line) => /^[A-Za-z]+=/.test(
 const values = (unit, key, options) => settings(unit).filter(([name]) => name === key).map(([, value]) => systemdWords(value, options));
 
 // A systemctl that only notes what it is asked. The units are rendered and written for real, on a
-// machine that may have no user manager, or one this test must not touch.
+// machine that may have no user manager, or one this test must not touch. LEGION_TEST_ACTIVE is
+// what it says a unit is doing.
 function fakeCommands(root) {
   const bin = path.join(root, 'fake-bin');
   fs.mkdirSync(bin, { recursive: true });
@@ -171,7 +172,7 @@ printf '%s\\n' "$*" >> "$LEGION_TEST_SYSTEMCTL"
 case "$*" in
   *' cat '*) exit 1 ;;
   *is-enabled*) echo enabled ;;
-  *is-active*) echo inactive ;;
+  *is-active*) echo "\${LEGION_TEST_ACTIVE:-inactive}" ;;
 esac
 exit 0
 `, { mode: 0o755 });
@@ -343,4 +344,111 @@ test('linux installer leaves nothing in the base that another user can read, als
   // Private, and still the launcher its user runs.
   const launched = spawnSync(path.join(base, 'bin', 'legionctl'), ['status'], { encoding: 'utf8' });
   assert.equal(launched.status, 0, launched.stderr);
+});
+
+// --- Uninstall ---------------------------------------------------------------------
+
+test('linux uninstall removes the timer, its units, the launchers and the agent, and keeps its config and records until --purge', { skip: unitSkip }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion uninstall '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, AWKWARD_HOME);
+  const base = path.join(home, '.legion-control');
+  const units = path.join(home, '.config', 'systemd', 'user');
+  const script = path.join(sourceFixture(root), 'install', 'install-linux.sh');
+  const { options, calls } = unitInstall(root, home);
+  // Installed twice, so the tree the second install replaced is retained beside the live one.
+  for (let run = 0; run < 2; run += 1) {
+    const installed = spawnSync('bash', [script], options);
+    assert.equal(installed.status, 0, installed.stderr);
+  }
+  assert.equal(fs.existsSync(path.join(base, 'agent.prev')), true);
+  // What the agent was configured with and what it recorded, and something that is not the agent's.
+  const records = {
+    'config.json': '{"sentinel":"leave exactly alone"}\n',
+    'config.last-good.json': '{}\n',
+    'controller.json': '{}\n',
+    'agent-floor.json': '{}\n',
+    'legionctl.log': 'one line\n',
+    [path.join('state', 'tower.json')]: '{}\n',
+    [path.join('ops', 'op-1.json')]: '{}\n',
+  };
+  for (const [file, text] of Object.entries(records)) {
+    fs.mkdirSync(path.dirname(path.join(base, file)), { recursive: true });
+    fs.writeFileSync(path.join(base, file), text);
+  }
+  fs.mkdirSync(path.join(base, 'private'));
+  fs.writeFileSync(path.join(base, 'private', 'terms.txt'), 'terms\n');
+  fs.mkdirSync(path.join(home, '.ssh'));
+  fs.writeFileSync(path.join(home, '.ssh', 'authorized_keys'), `command="${path.join(base, 'bin', 'dispatch.sh')}",restrict ssh-ed25519 AAAA phone\n`);
+
+  const removed = spawnSync('bash', [script, '--uninstall'], options);
+  assert.equal(removed.status, 0, removed.stderr);
+  for (const unit of ['legion-control-update.timer', 'legion-control-update.service']) assert.equal(fs.existsSync(path.join(units, unit)), false, unit);
+  const asked = calls();
+  assert.ok(asked.includes('--user disable --now legion-control-update.timer'), asked.join('\n'));
+  assert.equal(asked.at(-1), '--user daemon-reload');
+  for (const gone of ['bin', 'agent', 'agent.prev']) assert.equal(fs.existsSync(path.join(base, gone)), false, gone);
+  for (const [file, text] of Object.entries(records)) assert.equal(fs.readFileSync(path.join(base, file), 'utf8'), text, file);
+  assert.equal(fs.readFileSync(path.join(base, 'private', 'terms.txt'), 'utf8'), 'terms\n');
+  assert.match(removed.stdout, /were left in:\n {4}.+\n\n {2}Remove those too:\n {4}bash .+ --uninstall --purge\n/);
+  assert.match(removed.stdout, /runs dispatch\.sh, which is gone, so it is refused from now on/);
+
+  // Purged, everything of the agent's goes, and what is not the agent's stays and is named.
+  const purged = spawnSync('bash', [script, '--uninstall', '--purge'], options);
+  assert.equal(purged.status, 0, purged.stderr);
+  assert.deepEqual(fs.readdirSync(base), ['private']);
+  assert.ok(purged.stdout.includes(`kept ${path.join(base, 'private')}, which is not the agent's`), purged.stdout);
+  assert.equal(fs.readFileSync(path.join(base, 'private', 'terms.txt'), 'utf8'), 'terms\n');
+  fs.rmSync(path.join(base, 'private'), { recursive: true });
+  const emptied = spawnSync('bash', [script, '--uninstall', '--purge'], options);
+  assert.equal(emptied.status, 0, emptied.stderr);
+  assert.equal(fs.existsSync(base), false);
+});
+
+test('linux uninstall changes nothing while a cycle runs or an operation holds the lock', { skip: unitSkip }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion uninstall busy '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const base = path.join(home, '.legion-control');
+  const units = path.join(home, '.config', 'systemd', 'user');
+  const script = path.join(sourceFixture(root), 'install', 'install-linux.sh');
+  const { options } = unitInstall(root, home);
+  const installed = spawnSync('bash', [script], options);
+  assert.equal(installed.status, 0, installed.stderr);
+  const untouched = () => {
+    for (const entry of [path.join(base, 'bin', 'legionctl'), path.join(base, 'agent', 'src', 'index.mjs'), path.join(units, 'legion-control-update.timer'), path.join(units, 'legion-control-update.service')]) {
+      assert.equal(fs.existsSync(entry), true, entry);
+    }
+  };
+
+  const running = spawnSync('bash', [script, '--uninstall'], { ...options, env: { ...options.env, LEGION_TEST_ACTIVE: 'activating' } });
+  assert.equal(running.status, 1);
+  assert.match(running.stderr, /an update cycle is running right now\. .* Nothing was changed\./);
+  untouched();
+
+  const db = new DatabaseSync(path.join(base, 'op.lock.sqlite'));
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const locked = spawnSync('bash', [script, '--uninstall', '--purge'], options);
+    assert.equal(locked.status, 1);
+    assert.match(locked.stderr, /another operation is running; nothing was removed/);
+    untouched();
+  } finally { db.exec('ROLLBACK'); db.close(); }
+});
+
+test('linux installer takes --purge only with --uninstall, and --uninstall only with --purge', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion uninstall arguments '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const script = path.join(sourceFixture(root), 'install', 'install-linux.sh');
+  const env = { ...process.env, HOME: path.join(root, 'home'), LEGIONCTL_HOME: path.join(root, 'home', '.legion-control') };
+  for (const [args, message] of [
+    [['--purge'], /--purge only goes with --uninstall\./],
+    [['--uninstall', '--with-t3'], /--uninstall takes --purge and nothing else\./],
+    [['--uninstall', '--skip-scheduler'], /--uninstall takes --purge and nothing else\./],
+  ]) {
+    const result = spawnSync('bash', [script, ...args], { encoding: 'utf8', env });
+    assert.equal(result.status, 1, args.join(' '));
+    assert.match(result.stderr, message);
+  }
+  assert.equal(fs.existsSync(path.join(root, 'home')), false);
 });
