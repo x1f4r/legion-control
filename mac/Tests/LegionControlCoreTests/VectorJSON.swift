@@ -42,6 +42,19 @@ indirect enum VectorJSON: Decodable, Equatable, Sendable {
     var object: [String: VectorJSON]? { if case .object(let value) = self { value } else { nil } }
     var isNull: Bool { self == .null }
 
+    /// The value as `JSONSerialization` would have handed it over, for code that works on parsed
+    /// JSON rather than on a typed model: a bool stays a bool and never turns into a number.
+    var foundation: Any {
+        switch self {
+        case .null: NSNull()
+        case .bool(let value): value
+        case .number(let value): value.rounded() == value && abs(value) < 9_007_199_254_740_992 ? Int(value) : value
+        case .string(let value): value
+        case .array(let values): values.map(\.foundation)
+        case .object(let members): members.mapValues(\.foundation)
+        }
+    }
+
     /// The value as an integer, when it is a number with no fraction.
     var int: Int? {
         guard let number, number.rounded() == number, abs(number) < 9_007_199_254_740_992 else { return nil }

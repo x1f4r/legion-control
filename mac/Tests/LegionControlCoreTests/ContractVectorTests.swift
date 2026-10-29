@@ -13,7 +13,7 @@ struct ContractVectorTests {
 
     /// The families this suite runs. A family joins when this app has a port of its reference to
     /// run, and the contract has nine.
-    static let families = ["identifiers", "transport"]
+    static let families = ["identifiers", "transport", "launch"]
 
     typealias Adapter = @Sendable (VectorJSON) throws -> VectorJSON
 
@@ -41,6 +41,44 @@ struct ContractVectorTests {
         .hostKeyChanged, .hostKeyUnknown, .timedOut(seconds: 0), .linkLost, .interpreterMissing, .agentMissing,
         .unreadableOutput, .agentFailed, .badRequest
     ].map { ($0.contractName, $0) })
+
+    static func document(_ text: String) throws -> Any {
+        try JSONSerialization.jsonObject(with: Data(text.utf8))
+    }
+
+    /// Section 9.9 as the `launch/review` group reads it: the record is the case's `approvals`,
+    /// otherwise the one seeded from the held document, otherwise one that approves nothing.
+    static func launchReview(_ input: VectorJSON) throws -> VectorJSON {
+        let heldText = input["heldText"]?.string
+        let held = try heldText.map(document)
+        let record: LaunchRecord
+        if let approvals = input["approvals"], !approvals.isNull {
+            guard let object = approvals.foundation as? [String: Any] else { throw BadInput(description: "approvals is not an object") }
+            record = LaunchRecord(object: object)
+        } else if let heldText, let held {
+            record = LaunchValues.approvals(from: held, seededFrom: try Canonical.hash(Data(heldText.utf8)))
+        } else {
+            record = .nothingApproved
+        }
+        let projection = LaunchValues.projection(of: try document(try string(input, "offeredText")))
+        // What a 3.1 agent answers a restricted push of this over the held copy: refused exactly when
+        // a value would wait against the held document's own values, whatever this device approved.
+        let refused = held.map { !LaunchValues.review(record: LaunchValues.approvals(from: $0, seededFrom: "none"),
+                                                      projection: projection).isEmpty } ?? false
+        return [
+            "review": .array(LaunchValues.review(record: record, projection: projection).map { entry in
+                ["path": .string(entry.path), "scope": .string(entry.scope.rawValue),
+                 "kind": .string(entry.kind.rawValue), "approvable": .bool(entry.approvable)]
+            }),
+            "effective": .array(LaunchValues.effective(record: record, projection: projection).map { entry in
+                ["path": .string(entry.location.path), "scope": .string(entry.location.scope.rawValue),
+                 "state": .string(entry.state.rawValue),
+                 "agent": entry.tuple.map { .array($0.agent.map(VectorJSON.string)) } ?? .null,
+                 "grammar": VectorJSON(entry.tuple?.grammar), "text": VectorJSON(entry.text)]
+            }),
+            "restrictedRefused": .bool(refused),
+        ]
+    }
 
     static func verdict(_ verdict: AttemptClassifier.Verdict) -> VectorJSON {
         [
@@ -138,6 +176,13 @@ struct ContractVectorTests {
             // The document's decoder refuses a port that is not a JSON integer before it is ever a
             // number here, so a string or a fraction is not a port.
             ["valid": .bool(input["value"]?.int.map(Addresses.isPort) ?? false)]
+        },
+
+        // Section 9.9.
+        "launch/review": launchReview,
+        "launch/migration": { input in
+            ["migration": .bool(LaunchValues.isLauncherMigration(approved: LaunchTuple(json: input["approved"]?.foundation),
+                                                                 offered: LaunchTuple(json: input["offered"]?.foundation)))]
         },
     ]
 
