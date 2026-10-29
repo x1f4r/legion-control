@@ -668,6 +668,7 @@ public static class Runner
     {
         var machine = Pick(app, line, output);
         if (machine is null) return Failed;
+        await app.ReleaseWakeHoldsAsync(machine, token);
         var plan = app.PlanWake(machine);
         output.WriteLine(plan.Sentence(machine.Name));
         foreach (var obstacle in plan.Obstacles) output.WriteLine($"  {obstacle}");
@@ -678,8 +679,7 @@ public static class Runner
             output.WriteLine("Add --yes to actually try it.");
             return Ok;
         }
-        var report = await app.WakeAsync(machine,
-            TimeSpan.FromSeconds(line.Number("patience") ?? 120), token);
+        var report = await app.WakeAsync(machine, token);
         foreach (var attempt in report.Attempts) output.WriteLine($"  {attempt}");
         output.WriteLine(report.Sentence);
         return report.Confirmed ? Ok : NotKnown;

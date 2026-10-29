@@ -9,7 +9,7 @@ namespace LegionControl.Desktop.Transport;
 /// Sending one is not waking a machine. The packet is fire and forget: nothing acknowledges it,
 /// nothing reports it, and a switch that drops broadcast traffic swallows it in silence. So this
 /// says exactly what was sent and to where, and whether the machine came back is a separate
-/// question answered by a probe rather than by hope.
+/// question answered by its own authenticated status rather than by hope.
 public sealed record WakeAttempt(int PacketsSent, IReadOnlyList<string> Addresses, IReadOnlyList<string> Errors)
 {
     public bool AnythingSent => PacketsSent > 0;
@@ -34,20 +34,18 @@ public static class WakeOnLan
         return packet;
     }
 
-    /// Sends to every configured broadcast address on every configured port.
-    public static WakeAttempt Send(WakeConfig wake) => Send(wake, wake.Broadcast, wake.Ports);
+    /// Magic packets per broadcast address and port (contract section 10.2). A packet on a busy
+    /// link is easily lost and nothing ever acknowledges one, so each is sent three times.
+    public const int Repeats = 3;
 
-    /// The same, with the addresses worked out elsewhere: a machine at a site inherits that site's
-    /// broadcast when it names none of its own.
-    public static WakeAttempt Send(WakeConfig wake, IReadOnlyList<string> broadcasts, IReadOnlyList<int> ports)
+    /// Sends [repeats] packets for [mac] to every broadcast address on every port, from a socket
+    /// that may broadcast. The addresses are dotted IPv4 ones the wake plan already chose; nothing
+    /// here resolves a name. [send] stands in for the socket in a test.
+    public static WakeAttempt Send(
+        byte[] mac, IReadOnlyList<string> broadcasts, IReadOnlyList<int> ports, int repeats = Repeats,
+        Action<byte[], IPEndPoint>? send = null)
     {
-        var mac = wake.MacBytes;
-        if (mac is null)
-        {
-            return new WakeAttempt(0, Array.Empty<string>(),
-                new[] { wake.Mac is null ? "The wake block names no hardware address." : $"\"{wake.Mac}\" is not a six byte hardware address." });
-        }
-
+        send ??= Broadcast;
         var packet = MagicPacket(mac);
         var sent = 0;
         var addresses = new List<string>();
@@ -55,48 +53,38 @@ public static class WakeOnLan
 
         foreach (var address in broadcasts)
         {
-            if (!IPAddress.TryParse(address, out var parsed))
+            if (LanPrefix.ParseIPv4(address) is not { } parsed)
             {
-                errors.Add($"\"{address}\" is not an address.");
+                errors.Add($"\"{address}\" is not a dotted IPv4 address.");
                 continue;
             }
+            var endpoint = new IPAddress(new[] { (byte)(parsed >> 24), (byte)(parsed >> 16), (byte)(parsed >> 8), (byte)parsed });
             foreach (var port in ports)
             {
-                try
+                var before = sent;
+                for (var repeat = 0; repeat < repeats; repeat += 1)
                 {
-                    using var client = new UdpClient();
-                    client.EnableBroadcast = true;
-                    client.Send(packet, packet.Length, new IPEndPoint(parsed, port));
-                    sent += 1;
-                    addresses.Add($"{address}:{port}");
+                    try
+                    {
+                        send(packet, new IPEndPoint(endpoint, port));
+                        sent += 1;
+                    }
+                    catch (SocketException error)
+                    {
+                        errors.Add($"{address}:{port} refused the packet: {error.Message}");
+                        break;
+                    }
                 }
-                catch (SocketException error)
-                {
-                    errors.Add($"{address}:{port} refused the packet: {error.Message}");
-                }
+                if (sent > before) addresses.Add($"{address}:{port}");
             }
         }
         return new WakeAttempt(sent, addresses, errors);
     }
 
-    /// Whether something is listening yet.
-    ///
-    /// Probing is deliberately slow: no more often than every three seconds per address, because a
-    /// machine that is booting is doing something more useful than answering this, and a probe
-    /// storm on a tailnet address is indistinguishable from a scan.
-    public static async Task<bool> ProbeAsync(string host, int port, TimeSpan timeout, CancellationToken cancellationToken = default)
+    private static void Broadcast(byte[] packet, IPEndPoint endpoint)
     {
-        try
-        {
-            using var client = new TcpClient();
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            deadline.CancelAfter(timeout);
-            await client.ConnectAsync(host, port, deadline.Token);
-            return client.Connected;
-        }
-        catch (Exception)
-        {
-            return false;
-        }
+        using var client = new UdpClient();
+        client.EnableBroadcast = true;
+        client.Send(packet, packet.Length, endpoint);
     }
 }

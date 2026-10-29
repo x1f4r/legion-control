@@ -22,7 +22,7 @@ public class VectorTests
     /// The families this client runs. A family joins this list when its port lands here, and from
     /// then on the accounting test holds it to the index exactly.
     private static readonly string[] Families =
-        { "hash", "identifiers", "outcome", "transport", "launch", "setup-acceptance", "setup-reconcile", "setup-merge" };
+        { "hash", "identifiers", "outcome", "transport", "launch", "setup-acceptance", "setup-reconcile", "setup-merge", "wake" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -201,6 +201,25 @@ public class VectorTests
             ["setup-merge/numbers"] = input => new JsonObject
             {
                 ["equal"] = JsonEquality.Equal(new DocumentNumber(Text(input["a"])!), new DocumentNumber(Text(input["b"])!)),
+            },
+
+            ["wake/prefixes"] = input =>
+            {
+                var prefix = LanPrefix.Parse(Text(input["prefix"]));
+                return new JsonObject
+                {
+                    ["valid"] = prefix is not null,
+                    ["contains"] = new JsonArray(Strings(input["addresses"])
+                        .Select(address => (JsonNode)(prefix is { } parsed && LanPrefix.ParseIPv4(address) is { } value && parsed.Contains(value)))
+                        .ToArray()),
+                };
+            },
+            ["wake/broadcasts"] = input => Valid(WakePlanner.SendsTo(Text(input["text"])!)),
+            ["wake/plans"] = PlanOf,
+            ["wake/readiness"] = input => new JsonObject
+            {
+                ["pollStartsMs"] = new JsonArray(WakeRunner.ReadinessSchedule(input["sentAnything"]!.GetValue<bool>())
+                    .Select(start => (JsonNode)start).ToArray()),
             },
 
             ["launch/review"] = Launch,
@@ -406,6 +425,52 @@ public class VectorTests
                 ["text"] = launch.Text,
             }).ToArray()),
             ["restrictedRefused"] = restrictedRefused,
+        };
+    }
+
+    /// The plan for waking the target, from the document as this app reads one, this device's
+    /// placement from the given addresses and chosen site, each helper's last reading and the holds.
+    private static JsonNode PlanOf(JsonNode input)
+    {
+        var config = ControllerConfig.From(Value.Parse(Text(input["documentText"])!));
+        var here = input["here"]!;
+        var presence = SitePresence.Decide(config, new Bindings { CurrentSite = Text(here["currentSite"]) }, Strings(here["addresses"]));
+        var helpers = input["helpers"]!.AsObject().ToDictionary(
+            entry => entry.Key,
+            entry => new HelperState(
+                Enum.Parse<HelperReadiness>(Text(entry.Value!["state"])!.Replace("-", ""), ignoreCase: true),
+                entry.Value["actions"] is JsonObject actions
+                    ? actions.ToDictionary(action => action.Key, action => Text(action.Value), StringComparer.Ordinal)
+                    : null),
+            StringComparer.Ordinal);
+        var holds = input["holds"]!.AsArray().Select(hold => new WakeHold(Text(hold!["helper"])!, Text(hold["action"])!)).ToList();
+        var plan = WakePlanner.Plan(config, Text(input["target"])!, presence, helpers, holds);
+
+        static JsonArray Items(IEnumerable<string> items) => new(items.Select(item => (JsonNode)item!).ToArray());
+        static JsonArray Numbers(IEnumerable<int> items) => new(items.Select(item => (JsonNode)item).ToArray());
+        return new JsonObject
+        {
+            ["matching"] = Items(plan.Matching),
+            ["effective"] = plan.Effective,
+            ["steps"] = new JsonArray(plan.Steps.Select(step => (JsonNode)(step switch
+            {
+                WakeStep.Direct direct => new JsonObject
+                {
+                    ["kind"] = "direct", ["machine"] = null, ["action"] = null, ["readFirst"] = null,
+                    ["broadcast"] = Items(direct.Broadcast), ["ports"] = Numbers(direct.Ports), ["repeats"] = direct.Repeats,
+                },
+                WakeStep.ViaHelper helper => new JsonObject
+                {
+                    ["kind"] = "helper", ["machine"] = helper.Helper.Machine, ["action"] = helper.Helper.Action,
+                    ["readFirst"] = helper.ReadFirst, ["broadcast"] = null, ["ports"] = null, ["repeats"] = null,
+                },
+                _ => throw new InvalidOperationException($"no wire form for {step}"),
+            })).ToArray()),
+            ["skipped"] = new JsonArray(plan.Skipped.Select(skip => (JsonNode)new JsonObject
+            {
+                ["kind"] = skip.Kind, ["machine"] = skip.Machine, ["action"] = skip.Action, ["reason"] = skip.Reason,
+            }).ToArray()),
+            ["offerWakeFirst"] = Items(plan.OfferToWakeFirst),
         };
     }
 

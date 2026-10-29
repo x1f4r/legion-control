@@ -1,0 +1,595 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Text.Json.Nodes;
+using LegionControl.Desktop.Config;
+using LegionControl.Desktop.Contract;
+using LegionControl.Desktop.Model;
+using LegionControl.Desktop.Transport;
+using LegionControl.Desktop.Updates;
+using Xunit;
+
+namespace LegionControl.Desktop.Tests;
+
+/// Where this device thinks it is, and what that is worth. The shared rules run as the wake
+/// vectors; these are the facts the vectors do not spell out on their own.
+public class SiteSenseTests
+{
+    private static ControllerConfig TwoHousesWithTheSameSubnet => ControllerConfig.From(Value.Parse("""
+        {
+          "version": 1,
+          "sites": [
+            { "id": "attic", "lanPrefixes": [ "192.168.50." ] },
+            { "id": "flat",  "lanPrefixes": [ "192.168.50." ] },
+            { "id": "cabin" }
+          ],
+          "machines": [ { "id": "tower", "site": "attic", "wake": { "mac": "02:00:00:00:00:01" } } ]
+        }
+        """));
+
+    [Fact]
+    public void TwoSitesWithTheSameSubnetAreAmbiguousRatherThanTheFirstOne()
+    {
+        // The router default that every second home uses. A prefix match cannot tell them apart,
+        // and picking one would be a guess dressed up as a fact.
+        var presence = SitePresence.Decide(TwoHousesWithTheSameSubnet, Bindings.Empty, new[] { "192.168.50.34/24" });
+        Assert.Null(presence.SiteId);
+        Assert.True(presence.IsAmbiguous);
+        Assert.Equal(new[] { "attic", "flat" }, presence.Matching);
+        Assert.Contains("cannot be told", presence.Sentence);
+        Assert.False(presence.CanReach("attic"));
+        Assert.Equal(NetworkPlace.Ambiguous, presence.PlaceOf(TwoHousesWithTheSameSubnet.Machine("tower")!).Reason);
+    }
+
+    [Fact]
+    public void APersonSayingWhereTheyAreSettlesItWhileTheNetworkAgrees()
+    {
+        var presence = SitePresence.Decide(TwoHousesWithTheSameSubnet,
+            new Bindings { CurrentSite = "flat" }, new[] { "192.168.50.34/24" });
+        Assert.Equal("flat", presence.SiteId);
+        Assert.True(presence.Confirmed);
+        Assert.True(presence.CanReach("flat"));
+        Assert.False(presence.CanReach("attic"));
+
+        // The choice does not put this device on a network it is not on: away from home it is
+        // nowhere, however the settings read.
+        var away = SitePresence.Decide(TwoHousesWithTheSameSubnet, new Bindings { CurrentSite = "flat" }, new[] { "198.51.100.7/24" });
+        Assert.Null(away.SiteId);
+        Assert.False(away.Confirmed);
+        Assert.Contains("none of its addresses", away.Sentence);
+
+        // A site with no prefixes is taken on the person's word, and a choice naming no site is
+        // not a choice at all.
+        Assert.Equal("cabin", SitePresence.Decide(TwoHousesWithTheSameSubnet, new Bindings { CurrentSite = "cabin" }, new[] { "198.51.100.7/24" }).SiteId);
+        Assert.True(SitePresence.Decide(TwoHousesWithTheSameSubnet, new Bindings { CurrentSite = "nowhere" }, new[] { "192.168.50.34/24" }).IsAmbiguous);
+    }
+
+    [Fact]
+    public void OneMatchingSiteIsAHintAndSaysSo()
+    {
+        var config = ControllerConfig.From(Value.Parse("""
+            { "version": 1, "sites": [ { "id": "attic", "lanPrefixes": [ "10.0.0." ] } ], "machines": [] }
+            """));
+        var presence = SitePresence.Decide(config, Bindings.Empty, new[] { "10.0.0.7/24" });
+        Assert.Equal("attic", presence.SiteId);
+        Assert.False(presence.Confirmed);
+        Assert.Contains("Not confirmed", presence.Sentence);
+        Assert.True(presence.CanReach("attic"));
+    }
+
+    [Fact]
+    public void APrefixWithoutItsDotNeverTakesTheSubnetsItsTextBeginsLike()
+    {
+        // "10.0.1" is the /24 10.0.1.0. Compared as text it also takes 10.0.10.x to 10.0.19.x, and
+        // a device two subnets away would believe it is on the machine's network.
+        var machine = MachineConfig.From(Value.Parse("""
+            { "id": "old-box", "wake": { "mac": "02:00:00:00:00:04", "lanPrefix": "10.0.1" } }
+            """));
+        var config = new ControllerConfig { Machines = new[] { machine } };
+        Assert.True(SitePresence.Decide(config, Bindings.Empty, new[] { "10.0.1.12/24" }).IsOnNetworkOf(machine));
+        Assert.False(SitePresence.Decide(config, Bindings.Empty, new[] { "10.0.10.12/24" }).IsOnNetworkOf(machine));
+        Assert.False(SitePresence.Decide(config, Bindings.Empty, new[] { "10.0.19.12/24" }).IsOnNetworkOf(machine));
+
+        // A site's prefixes are parsed the same way.
+        var sites = ControllerConfig.From(Value.Parse("""
+            { "version": 1, "sites": [ { "id": "home", "lanPrefixes": [ "192.168.1" ] } ], "machines": [] }
+            """));
+        Assert.Empty(SitePresence.Decide(sites, Bindings.Empty, new[] { "192.168.10.7/24" }).Matching);
+        Assert.Equal(new[] { "home" }, SitePresence.Decide(sites, Bindings.Empty, new[] { "192.168.1.7/24" }).Matching);
+    }
+
+    [Fact]
+    public void AMachineWithNoSiteFallsBackToItsOwnPrefixAndOnlyThen()
+    {
+        var config = ControllerConfig.From(Value.Parse("""
+            { "version": 1, "sites": [ { "id": "attic", "lanPrefixes": [ "192.168.50." ] } ],
+              "machines": [
+                { "id": "old-box", "wake": { "mac": "02:00:00:00:00:04", "lanPrefix": "10.0.0." } },
+                { "id": "tower", "site": "attic", "wake": { "mac": "02:00:00:00:00:01", "lanPrefix": "10.0.0." } },
+                { "id": "nas", "wake": { "mac": "02:00:00:00:00:02", "lanPrefix": "10.0.0.1" } } ] }
+            """));
+        var here = SitePresence.Decide(config, Bindings.Empty, new[] { "10.0.0.9/24" });
+        var place = here.PlaceOf(config.Machine("old-box")!);
+        Assert.True(place.On);
+        Assert.Equal("10.0.0.9/24", place.Placing.ToString());
+        // A machine at a site is placed by the site, whatever its own prefix says.
+        Assert.Equal(NetworkPlace.Elsewhere, here.PlaceOf(config.Machine("tower")!).Reason);
+        // A full address is not a prefix: it places nothing.
+        Assert.Equal(NetworkPlace.Unplaced, here.PlaceOf(config.Machine("nas")!).Reason);
+        Assert.Equal(NetworkPlace.Elsewhere, SitePresence.Decide(config, Bindings.Empty, new[] { "198.51.100.7/24" }).PlaceOf(config.Machine("old-box")!).Reason);
+    }
+
+    [Fact]
+    public void LoopbackAndWhatIsNotAnAddressAreNoCandidates()
+    {
+        Assert.Null(LocalAddress.Parse("127.0.0.1/8"));
+        Assert.Null(LocalAddress.Parse("fd00::1"));
+        Assert.Null(LocalAddress.Parse("192.168.1.23/33"));
+        Assert.Equal(new LocalAddress(0xC0A80117, 24), LocalAddress.Parse("192.168.1.23/24"));
+        Assert.Equal(new LocalAddress(0xC0A80117, null), LocalAddress.Parse("192.168.1.23"));
+        var presence = SitePresence.Decide(TwoHousesWithTheSameSubnet, Bindings.Empty, new[] { "127.0.0.1/8", "nonsense" });
+        Assert.Empty(presence.Addresses);
+        Assert.False(presence.IsAmbiguous);
+    }
+
+    [Fact]
+    public void NoAddressesMeansNotOnAnySiteRatherThanOnAllOfThem()
+    {
+        var presence = SitePresence.Decide(TwoHousesWithTheSameSubnet, Bindings.Empty, Array.Empty<string>());
+        Assert.Null(presence.SiteId);
+        Assert.False(presence.IsAmbiguous);
+    }
+}
+
+/// How a machine gets woken, what holds a helper back, and what is said when nothing can be done.
+public class WakeTests
+{
+    /// tower is woken by pi and then nas. It names no site and no LAN prefix, so only its helpers
+    /// can wake it; nas is at home and is woken directly from there.
+    private const string Fleet = """
+        {
+          "version": 1,
+          "sites": [ { "id": "home", "lanPrefixes": [ "192.168.1." ], "broadcast": [ "192.168.1.255" ] } ],
+          "machines": [
+            { "id": "pi", "name": "Pi",
+              "endpoints": [ { "id": "lan", "host": "pi.example", "user": "me" } ],
+              "systems": [ { "id": "linux", "agent": [ "node", "/agent.mjs" ] } ] },
+            { "id": "nas", "name": "NAS", "site": "home",
+              "endpoints": [ { "id": "lan", "host": "nas.example", "user": "me" } ],
+              "systems": [ { "id": "linux", "agent": [ "node", "/agent.mjs" ] } ],
+              "wake": { "mac": "02:00:00:00:00:02" } },
+            { "id": "tower", "name": "Tower",
+              "endpoints": [ { "id": "lan", "host": "tower.example", "user": "me" } ],
+              "systems": [ { "id": "linux", "agent": [ "node", "/agent.mjs" ] } ],
+              "wake": { "mac": "02:00:00:00:00:01",
+                        "helpers": [ { "machine": "pi", "action": "wake-tower" },
+                                     { "machine": "nas", "action": "wake-tower" } ] } }
+          ]
+        }
+        """;
+
+    private static ControllerConfig Config(string text = Fleet) => ControllerConfig.From(Value.Parse(text));
+
+    private static string Status(string kind, int contract = 3) => contract >= 3
+        ? $$"""{ "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "linux" }, "actions": [ { "id": "wake-tower", "kind": "{{kind}}" } ] }"""
+        : $$"""{ "ok": true, "agentVersion": "2.1.0", "os": "linux", "actions": [ { "id": "wake-tower", "kind": "{{kind}}" } ] }""";
+
+    private static CommandResult Unreachable(string host) => FakeRunner.SshFailure($"ssh: connect to host {host} port 22: No route to host");
+
+    private static bool To(FakeCall call, string host) => call.Arguments.Any(argument => argument.Contains(host + ".example"));
+
+    private static Dictionary<string, MachineModel> Models(OperationTracker tracker, IProcessRunner runner, ControllerConfig config) =>
+        config.Machines.ToDictionary(machine => machine.Id, machine => new MachineModel(machine, runner, tracker), StringComparer.Ordinal);
+
+    private static Dictionary<string, HelperState> States(IReadOnlyDictionary<string, MachineModel> models) =>
+        models.ToDictionary(entry => entry.Key, entry => HelperState.Of(entry.Value), StringComparer.Ordinal);
+
+    private static IReadOnlyList<WakeHold> Holds(OperationTracker tracker, string target) =>
+        tracker.WakeHoldsFor(target).Select(hold => new WakeHold(hold.MachineId, hold.Intent.ActionId!)).ToList();
+
+    /// A walk that never waits and never sends a real packet.
+    private static WakeRunner Walk(OperationTracker tracker, List<(byte[] Packet, IPEndPoint To)>? packets = null, List<TimeSpan>? pauses = null)
+    {
+        var clock = new ManualClock();
+        return new WakeRunner(tracker)
+        {
+            Time = clock,
+            Pause = (span, _) => { pauses?.Add(span); clock.Now += span; return Task.CompletedTask; },
+            SendPacket = (packet, to) => packets?.Add((packet, to)),
+        };
+    }
+
+    /// The address that failed is dialled again by the ordinary poll a minute on.
+    private static void AMinuteLater(MachineModel model)
+    {
+        foreach (var route in model.Machine.Routes) model.Routes.NoteFailure(route.Id, DateTimeOffset.UtcNow - TimeSpan.FromSeconds(61));
+    }
+
+    private sealed class ManualClock : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
+
+    [Fact]
+    public void TheLastStatusReadOfAHelperIsWhatThePlanGoesBy()
+    {
+        using var home = new TempHome();
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var config = Config();
+        static MachineModel Read(ControllerConfig config, OperationTracker tracker, CommandResult answer)
+        {
+            var model = new MachineModel(config.Machine("pi")!, new FakeRunner(_ => answer), tracker);
+            model.RefreshAsync().GetAwaiter().GetResult();
+            return model;
+        }
+        Assert.Equal(HelperReadiness.Unknown, HelperState.Of(new MachineModel(config.Machine("pi")!, new FakeRunner(_ => FakeRunner.Ok("{}")), tracker)).Readiness);
+        var ready = HelperState.Of(Read(config, tracker, FakeRunner.Ok(Status("wol"))));
+        Assert.Equal(HelperReadiness.Ready, ready.Readiness);
+        Assert.True(ready.IsWol("wake-tower"));
+        Assert.Equal(HelperReadiness.Asleep, HelperState.Of(Read(config, tracker, Unreachable("pi.example"))).Readiness);
+        Assert.Equal(HelperReadiness.Unusable, HelperState.Of(Read(config, tracker, FakeRunner.SshFailure("me@pi.example: Permission denied (publickey)."))).Readiness);
+        Assert.Equal(HelperReadiness.Unknown, HelperState.Of(Read(config, tracker, FakeRunner.TimedOutResult())).Readiness);
+        // A status that lists no actions says nothing about whether it has one.
+        Assert.Null(HelperState.Of(Read(config, tracker, FakeRunner.Ok("""{ "ok": true, "contract": 3 }"""))).Actions);
+
+        var notDriven = config.Machine("pi")! with
+        {
+            Systems = new[] { config.Machine("pi")!.Systems[0] with { LaunchState = LaunchState.NotDriven } },
+        };
+        Assert.Equal(HelperReadiness.NotDriven, HelperState.Of(new MachineModel(notDriven, new FakeRunner(_ => FakeRunner.Ok("{}")), tracker)).Readiness);
+    }
+
+    [Fact]
+    public void AtHomeThePacketGoesToTheSitesBroadcastWhenTheMachineNamesNone()
+    {
+        // The site's own broadcast address comes before any guess. A default filled in by the
+        // reader used to stand in front of it, and the limited broadcast never left some routers.
+        var config = Config();
+        var presence = SitePresence.Decide(config, Bindings.Empty, new[] { "192.168.1.23/24" });
+        var plan = WakePlanner.Plan(config, "nas", presence, new Dictionary<string, HelperState>(), Array.Empty<WakeHold>());
+        var direct = Assert.IsType<WakeStep.Direct>(Assert.Single(plan.Steps));
+        Assert.Equal(new[] { "192.168.1.255" }, direct.Broadcast);
+        Assert.Equal(new[] { 9, 7 }, direct.Ports);
+        Assert.Equal(3, direct.Repeats);
+    }
+
+    [Fact]
+    public async Task EveryAddressAndPortGetsThreePacketsAndNothingSentWaitsForNothing()
+    {
+        using var home = new TempHome();
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var config = Config(Fleet.Replace("""
+            "wake": { "mac": "02:00:00:00:00:02" }
+            """.Trim(), """
+            "wake": { "mac": "02:00:00:00:00:02", "broadcast": [ "192.168.1.255", "studio.local", "192.168.1.127" ], "ports": [ 9, 7, 70000, 9.5 ] }
+            """.Trim()));
+        var runner = new FakeRunner(call => Unreachable("nas.example"));
+        var models = Models(tracker, runner, config);
+        var presence = SitePresence.Decide(config, Bindings.Empty, new[] { "192.168.1.23/24" });
+        var plan = WakePlanner.Plan(config, "nas", presence, States(models), Array.Empty<WakeHold>());
+
+        var packets = new List<(byte[] Packet, IPEndPoint To)>();
+        var pauses = new List<TimeSpan>();
+        var report = await Walk(tracker, packets, pauses).RunAsync(models["nas"], plan, models);
+        // Two dotted addresses times two usable ports times three. The name is never resolved.
+        Assert.Equal(2 * 2 * 3, packets.Count);
+        Assert.All(packets, packet => Assert.Equal(102, packet.Packet.Length));
+        Assert.Equal(3, packets.Count(packet => packet.To.Equals(new IPEndPoint(IPAddress.Parse("192.168.1.127"), 7))));
+        Assert.DoesNotContain(packets, packet => packet.To.Address.ToString() == "255.255.255.255");
+        Assert.False(report.Confirmed);
+        Assert.NotEmpty(pauses);
+
+        // A step from which nothing left waits for nothing, and moves on.
+        var refused = new WakeRunner(tracker)
+        {
+            Pause = (span, _) => { pauses.Add(span); return Task.CompletedTask; },
+            SendPacket = (_, _) => throw new SocketException((int)SocketError.NetworkUnreachable),
+        };
+        pauses.Clear();
+        var calls = runner.Calls.Count;
+        var nothing = await refused.RunAsync(models["nas"], plan, models);
+        Assert.Empty(pauses);
+        Assert.Equal(calls, runner.Calls.Count);
+        Assert.Contains("No packet went out", string.Join(" ", nothing.Attempts));
+    }
+
+    [Fact]
+    public async Task ReadinessPollsAtFiveSecondsGrowingToTwentyForTwoMinutes()
+    {
+        using var home = new TempHome();
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var config = Config();
+        var runner = new FakeRunner(call => Unreachable("nas.example"));
+        var models = Models(tracker, runner, config);
+        var presence = SitePresence.Decide(config, Bindings.Empty, new[] { "192.168.1.23/24" });
+        var plan = WakePlanner.Plan(config, "nas", presence, States(models), Array.Empty<WakeHold>());
+
+        var pauses = new List<TimeSpan>();
+        var report = await Walk(tracker, pauses: pauses).RunAsync(models["nas"], plan, models);
+        Assert.Equal(new[] { 5000, 8000, 12800, 20000, 20000, 20000, 20000 }, pauses.Select(pause => (int)pause.TotalMilliseconds));
+        // Every poll dials the machine, even within the minute after its address failed.
+        Assert.Equal(7, runner.Calls.Count(call => To(call, "nas") && call.RemoteCommand.Contains(" status")));
+        Assert.False(report.Confirmed);
+        Assert.Contains("has not answered", report.Sentence);
+    }
+
+    [Fact]
+    public async Task AWakeIsOnlyConfirmedByTheMachineAnswering()
+    {
+        using var home = new TempHome();
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var config = Config();
+        var polls = 0;
+        var runner = new FakeRunner(call =>
+        {
+            if (To(call, "tower") && ++polls < 3) return Unreachable("tower.example");
+            if (To(call, "tower")) return FakeRunner.Ok("""{ "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "linux" } }""");
+            if (call.RemoteCommand.Contains("run wake-tower")) return FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "ran", "outcome": "succeeded" }""");
+            return FakeRunner.Ok(Status("wol"));
+        });
+        var models = Models(tracker, runner, config);
+        foreach (var model in models.Values) await model.RefreshAsync();
+
+        var plan = WakePlanner.Plan(config, "tower", SitePresence.Decide(config, Bindings.Empty, Array.Empty<string>()), States(models), Array.Empty<WakeHold>());
+        var report = await Walk(tracker).RunAsync(models["tower"], plan, models);
+        Assert.True(report.Confirmed);
+        Assert.Contains("answering", report.Sentence);
+        // pi ran it and tower answered: nas was never asked.
+        Assert.DoesNotContain(runner.Calls, call => To(call, "nas") && call.RemoteCommand.Contains("run wake-tower"));
+    }
+
+    [Fact]
+    public async Task AnUnreadHelperIsReadOnceJustBeforeItsStep()
+    {
+        using var home = new TempHome();
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var config = Config();
+        var runner = new FakeRunner(call =>
+        {
+            if (To(call, "tower") || To(call, "pi")) return Unreachable(To(call, "pi") ? "pi.example" : "tower.example");
+            if (call.RemoteCommand.Contains("run wake-tower")) return FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "ran", "outcome": "succeeded" }""");
+            return FakeRunner.Ok(Status("command"));
+        });
+        var models = Models(tracker, runner, config);
+        var plan = WakePlanner.Plan(config, "tower", SitePresence.Decide(config, Bindings.Empty, Array.Empty<string>()), States(models), Array.Empty<WakeHold>());
+        Assert.All(plan.Steps, step => Assert.True(((WakeStep.ViaHelper)step).ReadFirst));
+
+        var report = await Walk(tracker).RunAsync(models["tower"], plan, models);
+        // pi turned out to be asleep and was skipped at its step; nas was read and then asked.
+        Assert.Contains(report.Attempts, attempt => attempt.Contains("Pi is asleep or off"));
+        Assert.Single(runner.Calls, call => To(call, "nas") && call.RemoteCommand.Contains(" status"));
+        Assert.Single(runner.Calls, call => To(call, "nas") && call.RemoteCommand.Contains("run wake-tower"));
+        Assert.DoesNotContain(runner.Calls, call => To(call, "pi") && call.RemoteCommand.Contains("run"));
+    }
+
+    [Fact]
+    public async Task AHelperThatIsAsleepIsSkippedAndOfferedAsAManualStep()
+    {
+        using var home = new TempHome();
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var config = Config();
+        var models = Models(tracker, new FakeRunner(call => Unreachable("nas.example")), config);
+        await models["pi"].RefreshAsync();
+        await models["nas"].RefreshAsync();
+
+        var plan = WakePlanner.Plan(config, "tower", SitePresence.Decide(config, Bindings.Empty, Array.Empty<string>()), States(models), Array.Empty<WakeHold>());
+        Assert.Empty(plan.Steps);
+        Assert.Contains(plan.Obstacles, obstacle => obstacle.Contains("asleep or off"));
+        // The manual step is offered rather than taken, and only for a helper with a wake block of
+        // its own: waking a helper to wake something else is how a machine nobody wanted on ends up on.
+        Assert.Equal(new[] { "nas" }, plan.OfferToWakeFirst);
+        Assert.Contains("no way to wake", plan.Sentence("Tower"), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AHeldCommandIsNeverRunTwiceAndOnlyItsRecordReleasesIt()
+    {
+        // The scenario every client runs. pi's command to wake tower ends without a record; the
+        // app restarts; pi is unreachable; nas's command must not run, a declared wol on nas may;
+        // and once pi's record says it finished, the next press runs nas's command.
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var config = Config();
+        string? held = null;
+        var piAwake = true;
+        var piFinished = false;
+        var nasKind = "command";
+        var runner = new FakeRunner(call =>
+        {
+            if (To(call, "tower")) return Unreachable("tower.example");
+            if (To(call, "pi"))
+            {
+                if (!piAwake) return Unreachable("pi.example");
+                if (call.RemoteCommand.Contains("run wake-tower"))
+                {
+                    if (held is null)
+                    {
+                        held = call.RemoteCommand.Split("--op ")[1].Split(' ')[0];
+                        return FakeRunner.TimedOutResult();
+                    }
+                    return FakeRunner.Ok("""{ "ok": false, "contract": 3, "action": "failed", "reasonCode": "apply-failed", "outcome": "failed" }""");
+                }
+                if (call.RemoteCommand.Contains(" op ")) return FakeRunner.Ok(piFinished
+                    ? $$"""
+                      { "ok": true, "contract": 3, "op": { "id": "{{held}}", "kind": "run", "actionId": "wake-tower", "state": "finished",
+                        "result": { "ok": true, "action": "ran", "outcome": "succeeded" }, "outcome": "succeeded" } }
+                      """
+                    : $$"""{ "ok": true, "contract": 3, "op": { "id": "{{held}}", "kind": "run", "actionId": "wake-tower", "state": "running", "result": null, "outcome": "pending" } }""");
+                return FakeRunner.Ok(Status("command"));
+            }
+            if (call.RemoteCommand.Contains("run wake-tower")) return FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "ran", "outcome": "succeeded" }""");
+            return FakeRunner.Ok(Status(nasKind));
+        });
+        var presence = SitePresence.Decide(config, Bindings.Empty, Array.Empty<string>());
+
+        // First press: pi's run times out, and its record, read once more, still says running, so
+        // tower is held.
+        var tracker = new OperationTracker(path);
+        var models = Models(tracker, runner, config);
+        foreach (var model in models.Values) await model.RefreshAsync();
+        var first = await Walk(tracker).RunAsync(models["tower"],
+            WakePlanner.Plan(config, "tower", presence, States(models), Holds(tracker, "tower")), models);
+        Assert.False(first.Confirmed);
+        Assert.NotNull(held);
+        Assert.Equal(held, Assert.Single(tracker.WakeHoldsFor("tower")).Id);
+        Assert.DoesNotContain(runner.Calls, call => To(call, "nas") && call.RemoteCommand.Contains("run wake-tower"));
+
+        // The app restarts. The hold is on disk, and pi does not answer: that releases nothing.
+        piAwake = false;
+        tracker = new OperationTracker(path);
+        models = Models(tracker, runner, config);
+        foreach (var model in models.Values) await model.RefreshAsync();
+        Assert.Single(tracker.WakeHoldsFor("tower"));
+        var plan = WakePlanner.Plan(config, "tower", presence, States(models), Holds(tracker, "tower"));
+        Assert.Contains(plan.Skipped, skip => skip is { Machine: "nas", Reason: WakeSkip.Held });
+        Assert.True(plan.IsHeld);
+        await Walk(tracker).RunAsync(models["tower"], plan, models);
+        Assert.DoesNotContain(runner.Calls, call => To(call, "nas") && call.RemoteCommand.Contains("run wake-tower"));
+
+        // A declared wol is a pure send, and runs while the hold stands.
+        nasKind = "wol";
+        await models["nas"].RefreshAsync();
+        plan = WakePlanner.Plan(config, "tower", presence, States(models), Holds(tracker, "tower"));
+        await Walk(tracker).RunAsync(models["tower"], plan, models);
+        Assert.Single(runner.Calls, call => To(call, "nas") && call.RemoteCommand.Contains("run wake-tower"));
+        Assert.Single(tracker.WakeHoldsFor("tower"));
+
+        // pi is back and its record says the run finished. That releases the hold, and the next
+        // press runs nas's command after pi's new one fails.
+        nasKind = "command";
+        piAwake = true;
+        piFinished = true;
+        AMinuteLater(models["pi"]);
+        await models["pi"].RefreshAsync();
+        await models["nas"].RefreshAsync();
+        await models["pi"].ResolveAsync(held!);
+        Assert.Empty(tracker.WakeHoldsFor("tower"));
+        plan = WakePlanner.Plan(config, "tower", presence, States(models), Holds(tracker, "tower"));
+        Assert.False(plan.IsHeld);
+        await Walk(tracker).RunAsync(models["tower"], plan, models);
+        Assert.Equal(2, runner.Calls.Count(call => To(call, "nas") && call.RemoteCommand.Contains("run wake-tower")));
+    }
+
+    [Fact]
+    public async Task AHoldOnAHelperThatKeepsNoRecordsSurvivesARestartUntilTheTargetAnswers()
+    {
+        // A 2.x helper has no operation records to read, so only the target answering, the helper
+        // leaving the setup or a person releases its hold.
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var config = Config();
+        var towerAwake = false;
+        var runner = new FakeRunner(call =>
+        {
+            if (To(call, "tower")) return towerAwake
+                ? FakeRunner.Ok("""{ "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "linux" } }""")
+                : Unreachable("tower.example");
+            if (To(call, "pi") && call.RemoteCommand.Contains("run wake-tower")) return FakeRunner.TimedOutResult();
+            return FakeRunner.Ok(Status("command", To(call, "pi") ? 2 : 3));
+        });
+        var presence = SitePresence.Decide(config, Bindings.Empty, Array.Empty<string>());
+        var tracker = new OperationTracker(path);
+        var models = Models(tracker, runner, config);
+        foreach (var model in models.Values) await model.RefreshAsync();
+        await Walk(tracker).RunAsync(models["tower"], WakePlanner.Plan(config, "tower", presence, States(models), Holds(tracker, "tower")), models);
+        Assert.Single(tracker.WakeHoldsFor("tower"));
+
+        tracker = new OperationTracker(path);
+        models = Models(tracker, runner, config);
+        foreach (var model in models.Values) await model.RefreshAsync();
+        Assert.Single(tracker.WakeHoldsFor("tower"));
+        Assert.True(WakePlanner.Plan(config, "tower", presence, States(models), Holds(tracker, "tower")).IsHeld);
+
+        towerAwake = true;
+        AMinuteLater(models["tower"]);
+        await models["tower"].RefreshAsync();
+        Assert.Empty(tracker.WakeHoldsFor("tower"));
+        // Released, not forgotten: the run is still on the list, still not known.
+        Assert.Contains(tracker.All, operation => operation.MachineId == "pi" && !operation.IsResolved);
+    }
+
+    [Fact]
+    public async Task TryingTheOtherHelpersIsAPersonsDecisionAndReleasesTheHold()
+    {
+        using var home = new TempHome();
+        var config = Config();
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var (operation, _) = tracker.Begin("abcdefab-1234-4567-8901-abcdefabcdef", "pi", "linux", new OperationIntent("run", ActionId: "wake-tower"), "tower");
+        tracker.MarkUnknown(operation.Id, "the link went away");
+        Assert.Single(tracker.WakeHoldsFor("tower"));
+        // Time alone never does it.
+        tracker.ReleaseWakeHolds("tower", DateTimeOffset.UtcNow - TimeSpan.FromDays(1));
+        Assert.Single(tracker.WakeHoldsFor("tower"));
+        // A person choosing to try the others does.
+        tracker.ReleaseWakeHolds("tower", DateTimeOffset.MaxValue);
+        Assert.Empty(tracker.WakeHoldsFor("tower"));
+        Assert.False(tracker.Find(operation.Id)!.IsResolved);
+    }
+
+    /// A device applying [document], with its own state, driving [runner]. Its first start approves
+    /// the commands it applies, so every system in it is driven.
+    private static AppModel Device(TempHome home, string document, IProcessRunner runner)
+    {
+        File.WriteAllBytes(Path.Combine(home.Path, "config.json"), ControllerDocument.FromText(document).Bytes);
+        var store = new ConfigStore(Path.Combine(home.Path, "config.json"), Path.Combine(home.Path, "setup-state.json"),
+            new SetupLedger(Path.Combine(home.Path, "revisions")), "laptop", watch: false);
+        return new AppModel(store, runner, new OperationTracker(Path.Combine(home.Path, "operations.json")), DesktopSettings.Default,
+            new RecordingSink(), Bindings.Empty,
+            new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))),
+            new LaunchApprovals(Path.Combine(home.Path, "approved-launch.json")));
+    }
+
+    /// pi's command to wake tower never reports how it ended: its run times out and its record
+    /// still says running. nas's command fails, so no walk waits for tower to answer.
+    private static FakeRunner HeldOnPi() => new(call =>
+    {
+        if (To(call, "tower")) return Unreachable("tower.example");
+        if (To(call, "pi") && call.RemoteCommand.Contains("run wake-tower")) return FakeRunner.TimedOutResult();
+        if (To(call, "pi") && call.RemoteCommand.Contains(" op "))
+        {
+            var id = call.RemoteCommand.Split(" op ")[1].Split(' ')[0];
+            return FakeRunner.Ok($$"""{ "ok": true, "contract": 3, "op": { "id": "{{id}}", "kind": "run", "actionId": "wake-tower", "state": "running", "result": null, "outcome": "pending" } }""");
+        }
+        if (call.RemoteCommand.Contains("run wake-tower"))
+            return FakeRunner.Ok("""{ "ok": false, "contract": 3, "action": "failed", "reasonCode": "apply-failed", "outcome": "failed" }""");
+        return FakeRunner.Ok(Status("command"));
+    });
+
+    [Fact]
+    public async Task AHoldEndsWhenItsHelperLeavesTheSetup()
+    {
+        using var home = new TempHome();
+        using var app = Device(home, Fleet, HeldOnPi());
+        await app.WakeAsync(app.Machine("tower")!);
+        Assert.Single(app.Tracker.WakeHoldsFor("tower"));
+
+        // A setup that could not be read for a moment has lost nobody; one without pi has.
+        var withoutPi = JsonNode.Parse(Fleet)!.AsObject();
+        withoutPi["machines"]!.AsArray().RemoveAt(0);
+        withoutPi["machines"]![1]!["wake"]!["helpers"]!.AsArray().RemoveAt(0);
+        Assert.Null(app.Config.Apply(ControllerDocument.FromText(withoutPi.ToJsonString()), "pi left"));
+        Assert.Empty(app.Tracker.WakeHoldsFor("tower"));
+    }
+
+    [Fact]
+    public void AMagicPacketIsTheStandardHundredAndTwoBytes()
+    {
+        var packet = WakeOnLan.MagicPacket(new byte[] { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 });
+        Assert.Equal(102, packet.Length);
+        Assert.All(packet.Take(6), value => Assert.Equal(0xFF, value));
+        Assert.Equal(0x02, packet[6]);
+        Assert.Equal(0x01, packet[^1]);
+    }
+
+    [Fact]
+    public void AMachineWithNothingToSendToSaysSoRatherThanShowingADeadButton()
+    {
+        var config = ControllerConfig.From(Value.Parse("""
+            { "version": 1, "machines": [ { "id": "x", "name": "X" } ] }
+            """));
+        var plan = WakePlanner.Plan(config, "x", new SitePresence(), new Dictionary<string, HelperState>(), Array.Empty<WakeHold>());
+        Assert.True(plan.IsEmpty);
+        Assert.Equal(new[] { WakeSkip.NoMac, WakeSkip.None }, plan.Skipped.Select(skip => skip.Reason));
+        Assert.Contains("no hardware address", plan.Sentence("X"));
+    }
+}

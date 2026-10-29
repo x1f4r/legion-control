@@ -622,6 +622,9 @@ public sealed record AgentStatus
     public IReadOnlyList<string> Incomplete { get; init; } = Array.Empty<string>();
     /// Whether the reply named a services array at all. Decides whether `--service` may be sent.
     public bool ReportsServices { get; init; }
+    /// Whether the reply listed its actions at all. Only a list says a helper has no such action;
+    /// a status that names none says nothing either way.
+    public bool ReportsActions { get; init; }
     public bool ReportsPolicies { get; init; }
 
     public string? SystemId => Envelope.System?.Id ?? OsName;
@@ -677,6 +680,7 @@ public sealed record AgentStatus
             Partial = timing?.Partial ?? json["partial"].AsBool() ?? false,
             Incomplete = json["incomplete"].AsStringList(),
             ReportsServices = services.IsArray,
+            ReportsActions = json["actions"].IsArray,
             ReportsPolicies = policies.IsArray || decoded.Any(service => service.Updates is not null),
         };
     }

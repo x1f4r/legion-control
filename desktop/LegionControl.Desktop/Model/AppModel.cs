@@ -130,7 +130,23 @@ public sealed class AppModel : IDisposable
             _machines.Clear();
             _machines.AddRange(kept);
         }
+        // A hold on a helper that has left the setup holds nothing back any more. Only a setup
+        // that is applied says so: one that could not be read for a moment has lost nobody.
+        if (Effective is { } effective)
+        {
+            foreach (var hold in Tracker.All.Where(operation => operation.IsWakeHold && effective.Machine(operation.MachineId) is null))
+                Tracker.ReleaseWakeHold(hold.Id);
+        }
         Changed?.Invoke();
+    }
+
+    /// Works out where this device is from its addresses as they are now, for every machine. Done on
+    /// every poll and immediately before a wake is planned: a laptop that moved house since the
+    /// last reading is somewhere else.
+    private void RefreshPresence()
+    {
+        Presence = SitePresence.Decide(Config.Config, Bindings);
+        foreach (var machine in Machines) machine.Presence = Presence;
     }
 
     /// Evaluates the document against the record (contract section 9.9).
@@ -284,6 +300,7 @@ public sealed class AppModel : IDisposable
         Config.ReloadIfChanged();
         // The command line may have approved something since the last reading.
         if (Approvals.ReloadIfChanged()) Rebuild();
+        RefreshPresence();
         var before = SnapshotOutcomes();
         await Task.WhenAll(Machines.Select(machine => RefreshOneAsync(machine, cancellationToken)));
         AnnounceChanges(before);
@@ -328,24 +345,56 @@ public sealed class AppModel : IDisposable
 
     // MARK: waking
 
-    /// What could be tried to wake a machine, in order.
-    public WakePlan PlanWake(MachineModel target) => WakePlanner.Plan(
-        target.Machine,
-        Config.Config ?? new ControllerConfig(),
-        Presence,
-        Machines.ToDictionary(machine => machine.Id, machine => machine, StringComparer.Ordinal));
+    /// What could be tried to wake a machine, in order, from where this device is now, what each
+    /// helper's last reading said and the wake holds recorded for the machine (contract section 10.2).
+    public WakePlan PlanWake(MachineModel target)
+    {
+        RefreshPresence();
+        var machines = Machines;
+        // A model the window still draws in the moment after its machine left the setup is planned
+        // as the only machine there is, rather than not at all.
+        var config = Effective is { } effective && effective.Machine(target.Id) is not null
+            ? effective
+            : new ControllerConfig { Machines = new[] { target.Machine } };
+        return WakePlanner.Plan(
+            config,
+            target.Id,
+            Presence,
+            machines.ToDictionary(machine => machine.Id, HelperState.Of, StringComparer.Ordinal),
+            WakeHoldsFor(target));
+    }
+
+    /// The wake holds recorded for a machine, as the plan reads them.
+    public IReadOnlyList<WakeHold> WakeHoldsFor(MachineModel target) => Tracker.WakeHoldsFor(target.Id)
+        .Select(hold => new WakeHold(hold.MachineId, hold.Intent.ActionId ?? ""))
+        .ToList();
+
+    /// Reads, once, the record of each held helper action for [target] on a helper that speaks
+    /// contract 3 and was not last seen asleep. A record that has finished releases its hold, and
+    /// so does the helper saying it has no such operation. A helper that cannot be reached leaves
+    /// its hold exactly where it was.
+    public async Task ReleaseWakeHoldsAsync(MachineModel target, CancellationToken cancellationToken = default)
+    {
+        foreach (var hold in Tracker.WakeHoldsFor(target.Id))
+        {
+            if (Machine(hold.MachineId) is not { } helper) continue;
+            // Whether it speaks contract 3 is the reading's to say, so a helper this session has
+            // not read yet is read once first, as it would be at its step.
+            if (helper.Status is null && helper.Failure is null) await helper.RefreshAsync(cancellationToken);
+            if (!helper.Capabilities.SupportsOperationQuery || helper.Failure is { MeansAsleepOrOff: true }) continue;
+            await helper.ResolveAsync(hold.Id, cancellationToken, dialEveryRoute: true);
+        }
+    }
 
     /// Wakes a machine and, when the document asks for a particular system and the machine came up
     /// as another one, offers the ordinary boot request for it.
-    public async Task<WakeReport> WakeAsync(
-        MachineModel target, TimeSpan? patience = null, CancellationToken cancellationToken = default)
+    public async Task<WakeReport> WakeAsync(MachineModel target, CancellationToken cancellationToken = default)
     {
+        await ReleaseWakeHoldsAsync(target, cancellationToken);
         var plan = PlanWake(target);
-        var runner = new WakeRunner(_runner);
-        var report = await runner.RunAsync(
+        var report = await new WakeRunner(Tracker).RunAsync(
             target, plan,
             Machines.ToDictionary(machine => machine.Id, machine => machine, StringComparer.Ordinal),
-            patience ?? TimeSpan.FromMinutes(2),
             cancellationToken);
         Changed?.Invoke();
         return report;

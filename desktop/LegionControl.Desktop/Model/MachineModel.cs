@@ -94,12 +94,18 @@ public sealed class MachineModel
     /// the next has already come back from a live one. So every reading is numbered when it
     /// starts, and one that finishes after a later-started reading was applied is dropped, failure
     /// and success alike: a slow poll never puts an older picture over a newer one.
-    public async Task RefreshAsync(CancellationToken cancellationToken = default)
+    ///
+    /// An answer is this machine awake, so it releases every wake hold for it recorded before the
+    /// question was asked (contract section 10.2). [dialEveryRoute] is for a wake: the addresses
+    /// of a machine coming up are dialled even within the minute after one failed.
+    public async Task RefreshAsync(CancellationToken cancellationToken = default, bool dialEveryRoute = false)
     {
         var sequence = Interlocked.Increment(ref _readingsStarted);
+        var asked = DateTimeOffset.UtcNow;
         try
         {
-            var reply = await NewAgent().StatusAsync(Capabilities, PreferredSystem(), null, cancellationToken);
+            var reply = await NewAgent(dialEveryRoute).StatusAsync(Capabilities, PreferredSystem(), null, cancellationToken);
+            _tracker.ReleaseWakeHolds(Machine.Id, asked);
             lock (_readingGate)
             {
                 if (sequence < _readingApplied) return;
@@ -234,7 +240,7 @@ public sealed class MachineModel
         TrackedOperation tracked;
         try
         {
-            (tracked, _) = _tracker.Begin(operationId, Machine.Id, Routes.RememberedSystemId, request.Intent);
+            (tracked, _) = _tracker.Begin(operationId, Machine.Id, Routes.RememberedSystemId, request.Intent, request.WakeTarget);
         }
         catch (InvalidOperationException error)
         {
@@ -551,14 +557,18 @@ public sealed class MachineModel
             $"{request.Describe()} on {Name} is still running. The id is {operationId}.", operationId);
     }
 
-    /// Asks about an operation without waiting for it, for the rows that resolve themselves in the
-    /// background after a link came back.
-    public async Task<TrackedOperation?> ResolveAsync(string operationId, CancellationToken cancellationToken = default)
+    /// Asks about an operation once, for the rows that resolve themselves in the background after a
+    /// link came back. [waitSeconds] waits on the agent's side for a record that is still running,
+    /// which is how a wake reads a held helper action once more before it moves on. A wake also
+    /// passes [dialEveryRoute]: the one read a hold gets has to go out even over the address whose
+    /// run just timed out, or the hold would stand on a question nobody asked.
+    public async Task<TrackedOperation?> ResolveAsync(
+        string operationId, CancellationToken cancellationToken = default, int? waitSeconds = null, bool dialEveryRoute = false)
     {
         if (!Capabilities.SupportsOperationQuery) return _tracker.Find(operationId);
         try
         {
-            var reply = await NewAgent().OperationAsync(operationId, null, Capabilities, PreferredSystem(), null,
+            var reply = await NewAgent(dialEveryRoute).OperationAsync(operationId, waitSeconds, Capabilities, PreferredSystem(), null,
                 cancellationToken);
             if (reply.Value.NoRecord) NeverStarted(operationId, reply.Value.Envelope.ReasonCode);
             else if (reply.Value.Record is { } record) _tracker.Apply(operationId, record);
@@ -877,8 +887,9 @@ public sealed class MachineModel
     }
 
     /// The agent for this machine: spawned here when this device is the machine and a local agent
-    /// is bound, and over ssh otherwise.
-    public RemoteAgent NewAgent()
+    /// is bound, and over ssh otherwise. Addresses that failed within the last minute are left out
+    /// unless [dialEveryRoute] says a machine is expected to be coming up.
+    public RemoteAgent NewAgent(bool dialEveryRoute = false)
     {
         if (Bindings.CanRunLocally(Machine.Id))
         {
@@ -889,7 +900,7 @@ public sealed class MachineModel
             return new RemoteAgent(Machine, _runner, local: new LocalExecution(Bindings.LocalAgent, system));
         }
         var routes = Routes.Order(Bindings.RoutesFor(Machine), ExpectedSystemId(), Presence.IsOnNetworkOf(Machine))
-            .Where(route => !Routes.IsBackedOff(route.Id)).ToList();
+            .Where(route => dialEveryRoute || !Routes.IsBackedOff(route.Id)).ToList();
         return new RemoteAgent(Machine, _runner, routes)
         {
             KnownHostsFile = Bindings.KnownHosts,

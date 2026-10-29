@@ -69,6 +69,13 @@ public sealed record TrackedOperation
         || (Outcome == OperationOutcome.Unknown && State == OperationState.Finished);
     /// True when the link went away and nothing has resolved it since. The amber row.
     public bool OutcomeUnknown { get; init; }
+    /// The machine this helper action was run to wake, while it is a wake hold for it. Never
+    /// published: holds are this device's own.
+    public string? WakeTarget { get; init; }
+    /// A wake hold: an action run for [WakeTarget] whose terminal record has not been read. Only
+    /// that record, the agent saying it has no such operation, the target answering, the helper
+    /// leaving the setup or a person releases it; never time, a restart or the helper being away.
+    public bool IsWakeHold => WakeTarget is not null && State != OperationState.Finished;
 
     public TrackedOperation WithRecord(OperationRecord record) => this with
     {
@@ -127,7 +134,8 @@ public sealed class OperationTracker
     /// The conflict case is the point: an id whose stored intent is not the intent being asked for
     /// is refused here, before anything is sent, because the agent would answer about the other
     /// request and this client would draw the wrong thing.
-    public (TrackedOperation Operation, bool IsReplay) Begin(string id, string machineId, string? systemId, OperationIntent intent)
+    public (TrackedOperation Operation, bool IsReplay) Begin(
+        string id, string machineId, string? systemId, OperationIntent intent, string? wakeTarget = null)
     {
         lock (_gate)
         {
@@ -146,6 +154,7 @@ public sealed class OperationTracker
                 MachineId = machineId,
                 SystemId = systemId,
                 Intent = intent,
+                WakeTarget = wakeTarget,
             };
             _operations[id] = operation;
             Save();
@@ -220,6 +229,41 @@ public sealed class OperationTracker
         Changed?.Invoke();
     }
 
+    /// The wake holds recorded for [target], oldest first.
+    public IReadOnlyList<TrackedOperation> WakeHoldsFor(string target) =>
+        All.Where(operation => operation.IsWakeHold && operation.WakeTarget == target).Reverse().ToList();
+
+    /// Releases every hold for [target] recorded before [before]: the target answered an
+    /// authenticated status asked for after them, or a person chose to try the other helpers. The
+    /// operations stay, still asked about; they only stop holding anything back.
+    public void ReleaseWakeHolds(string target, DateTimeOffset before)
+    {
+        var released = false;
+        lock (_gate)
+        {
+            foreach (var operation in _operations.Values.Where(operation =>
+                         operation.IsWakeHold && operation.WakeTarget == target && operation.StartedAt < before).ToList())
+            {
+                _operations[operation.Id] = operation with { WakeTarget = null };
+                released = true;
+            }
+            if (released) Save();
+        }
+        if (released) Changed?.Invoke();
+    }
+
+    /// Releases one hold: its helper left the setup.
+    public void ReleaseWakeHold(string id)
+    {
+        lock (_gate)
+        {
+            if (!_operations.TryGetValue(id, out var operation) || operation.WakeTarget is null) return;
+            _operations[id] = operation with { WakeTarget = null };
+            Save();
+        }
+        Changed?.Invoke();
+    }
+
     public void Forget(string id)
     {
         lock (_gate)
@@ -236,15 +280,16 @@ public sealed class OperationTracker
     private void Prune()
     {
         var cutoff = DateTimeOffset.UtcNow - TimeSpan.FromDays(14);
+        // A hold is never pruned: only what releases it may end it.
         var stale = _operations.Values
-            .Where(operation => operation.IsResolved && operation.UpdatedAt < cutoff)
+            .Where(operation => operation.IsResolved && !operation.IsWakeHold && operation.UpdatedAt < cutoff)
             .Select(operation => operation.Id)
             .ToList();
         foreach (var id in stale) _operations.Remove(id);
 
         if (_operations.Count <= 400) return;
         foreach (var id in _operations.Values
-                     .Where(operation => operation.IsResolved)
+                     .Where(operation => operation.IsResolved && !operation.IsWakeHold)
                      .OrderBy(operation => operation.UpdatedAt)
                      .Take(_operations.Count - 400)
                      .Select(operation => operation.Id)
@@ -287,6 +332,7 @@ public sealed class OperationTracker
                     ReasonCode = entry["reasonCode"].AsText(),
                     ExpiresAt = entry["expiresAt"].AsInstant(),
                     OutcomeUnknown = entry["outcomeUnknown"].AsBool() ?? false,
+                    WakeTarget = entry["wakeTarget"].AsText(),
                 };
             }
         }
@@ -343,6 +389,7 @@ public sealed class OperationTracker
                     reasonCode = operation.ReasonCode,
                     expiresAt = operation.ExpiresAt?.ToString("o"),
                     outcomeUnknown = operation.OutcomeUnknown,
+                    wakeTarget = operation.WakeTarget,
                 }).ToList(),
             };
             AtomicWrite.Text(_path, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));

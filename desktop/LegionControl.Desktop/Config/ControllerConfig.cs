@@ -59,11 +59,19 @@ public sealed record ControllerConfig
 /// Where a group of machines physically is, and which addresses a device on that network has.
 public sealed record SiteConfig(string Id, string Name, IReadOnlyList<string> LanPrefixes, IReadOnlyList<string> Broadcast)
 {
+    /// The prefixes and broadcast addresses are the strings the lists hold, as the placement and the
+    /// wake plan of contract section 10 read them: a number or a blank entry is no prefix, rather
+    /// than one this reader made up out of it.
     public static SiteConfig From(Value json) => new(
         json["id"].AsText() ?? "",
         json["name"].AsText() ?? json["id"].AsText() ?? "",
-        json["lanPrefixes"].AsStringList(),
-        json["broadcast"].AsStringList());
+        Strings(json["lanPrefixes"]),
+        Strings(json["broadcast"]));
+
+    private static IReadOnlyList<string> Strings(Value list) => list.AsArray()
+        .Where(entry => entry.Raw.ValueKind == System.Text.Json.JsonValueKind.String)
+        .Select(entry => entry.Raw.GetString()!)
+        .ToList();
 }
 
 /// One physical box: one network card, one hardware address, one thing to wake.
@@ -271,61 +279,68 @@ public sealed record EndpointConfig
 }
 
 /// A machine that can send a magic packet on the target's own network, and the action on it that
-/// does so.
+/// does so. Both are read as the strings the document holds, the empty one included, exactly as
+/// the wake plan of contract section 10.2 reads them: an entry the plan would skip as missing is
+/// not dropped here first.
 public sealed record WakeHelper(string Machine, string Action)
 {
     public static WakeHelper? From(Value json)
     {
         if (!json.IsObject) return null;
-        var machine = json["machine"].AsText();
-        var action = json["action"].AsText();
+        var machine = json["machine"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["machine"].Raw.GetString() : null;
+        var action = json["action"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["action"].Raw.GetString() : null;
         return machine is null || action is null ? null : new WakeHelper(machine, action);
     }
 }
 
 /// Wake on LAN. A machine without this block simply has no wake action.
+///
+/// Read as the document says it and nothing more. Where the block names no broadcast address, no
+/// usable port or no helper, the wake plan decides what that means (contract section 10.2), not
+/// this reader: a default filled in here was how the site's own broadcast address never got used.
 public sealed record WakeConfig
 {
     /// The hardware address a magic packet carries, or null when the block names none. A block
     /// without one is still a wake block: nothing can wake the machine directly, and its helpers
     /// still can (contract section 9.7, `wake-no-mac`).
     public string? Mac { get; init; }
-    public IReadOnlyList<string> Broadcast { get; init; } = new[] { "255.255.255.255" };
-    public IReadOnlyList<int> Ports { get; init; } = new[] { 9, 7 };
-    public WakeProbe? Probe { get; init; }
-    /// Used only when the machine names no site. A prefix a device's own address starts with when
-    /// it is on this machine's network.
+    /// The strings of `wake.broadcast`. Only the dotted IPv4 ones are ever sent to.
+    public IReadOnlyList<string> Broadcast { get; init; } = Array.Empty<string>();
+    /// The whole numbers of `wake.ports`. Only those from 1 to 65535 are ever sent to.
+    public IReadOnlyList<long> Ports { get; init; } = Array.Empty<long>();
+    /// Used only when the machine names no site in sites[]: a prefix of section 10.1 that one of
+    /// this device's addresses is inside when it is on this machine's network.
     public string? LanPrefix { get; init; }
     /// The compatibility alias for the first helper, kept so a 1.2 client that only knows the
     /// singular key still has one.
     public WakeHelper? Helper { get; init; }
     /// Helpers in the order to try them.
     public IReadOnlyList<WakeHelper> Helpers { get; init; } = Array.Empty<WakeHelper>();
+    /// Whether `helpers` is a list with anything in it, readable entries or not. Only then does it
+    /// replace the singular alias.
+    public bool ListsHelpers { get; init; }
     /// Which system to boot into once the machine is awake, when the document asks for one.
     public string? BootTarget { get; init; }
 
     public static WakeConfig? From(Value json)
     {
         if (!json.IsObject) return null;
-        var mac = json["mac"].AsText();
-        var broadcast = json["broadcast"].AsStringList();
-        var ports = json["ports"].Map(port => port.AsInt()).Where(port => port is not null).Select(port => port!.Value).ToList();
         return new WakeConfig
         {
-            Mac = mac,
-            Broadcast = broadcast.Count > 0 ? broadcast : new[] { "255.255.255.255" },
-            Ports = ports.Count > 0 ? ports : new[] { 9, 7 },
-            Probe = WakeProbe.From(json["probe"]),
-            LanPrefix = json["lanPrefix"].AsText(),
+            Mac = Text(json["mac"]),
+            Broadcast = json["broadcast"].AsArray().Select(Text).Where(entry => entry is not null).Select(entry => entry!).ToList(),
+            Ports = json["ports"].AsArray().Select(Whole).Where(port => port is not null).Select(port => port!.Value).ToList(),
+            LanPrefix = Text(json["lanPrefix"]),
             Helper = WakeHelper.From(json["helper"]),
             Helpers = json["helpers"].Map(WakeHelper.From).Where(helper => helper is not null).Select(helper => helper!).ToList(),
+            ListsHelpers = json["helpers"].AsArray().Count > 0,
             BootTarget = json["bootTarget", "boot"].AsText(),
         };
     }
 
     /// The helpers to walk, in order: the list when there is one, and the singular alias otherwise.
     public IReadOnlyList<WakeHelper> EffectiveHelpers =>
-        Helpers.Count > 0 ? Helpers : (Helper is null ? Array.Empty<WakeHelper>() : new[] { Helper });
+        ListsHelpers ? Helpers : (Helper is null ? Array.Empty<WakeHelper>() : new[] { Helper });
 
     /// The six bytes of the hardware address, or null when there is none or it is not one.
     public byte[]? MacBytes
@@ -346,15 +361,17 @@ public sealed record WakeConfig
             return bytes;
         }
     }
-}
 
-public sealed record WakeProbe(string Host, int Port)
-{
-    public static WakeProbe? From(Value json)
+    /// A JSON string as itself, empty included; anything else is no string.
+    private static string? Text(Value value) =>
+        value.Raw.ValueKind == System.Text.Json.JsonValueKind.String ? value.Raw.GetString() : null;
+
+    /// A JSON number that is a whole number, as one. `9.0` is the port 9 to every reader; `9.5`
+    /// and the string "9" are no port at all.
+    private static long? Whole(Value value)
     {
-        if (!json.IsObject) return null;
-        var host = json["host"].AsText();
-        return host is null ? null : new WakeProbe(host, json["port"].AsInt() ?? 22);
+        if (value.Raw.ValueKind != System.Text.Json.JsonValueKind.Number || !value.Raw.TryGetDouble(out var number)) return null;
+        return Math.Floor(number) == number && Math.Abs(number) <= 1e15 ? (long)number : null;
     }
 }
 

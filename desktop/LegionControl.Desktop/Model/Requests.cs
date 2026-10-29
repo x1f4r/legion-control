@@ -30,6 +30,11 @@ public sealed record MachineRequest
     public bool DryRun { get; init; }
     /// Reuse this id rather than minting one. Set when retrying a request whose reply was lost.
     public string? OperationId { get; init; }
+    /// The machine a helper's wake action is run for, when that action is not a declared wol. The
+    /// operation is then a wake hold for that machine from before it is sent (contract section
+    /// 10.2): if its run ends without a terminal record, no other helper's command runs for the
+    /// same machine until one is read.
+    public string? WakeTarget { get; init; }
 
     public OperationIntent Intent => new(
         Kind switch
