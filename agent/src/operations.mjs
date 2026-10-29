@@ -920,17 +920,32 @@ export function deriveState(record, { systemId = null, bootId = bootIdentity(), 
 }
 
 /**
+ * When a run began, the clock recovery tells an older run from a later one by.
+ * A queued request is asked for well before it is taken up, so the time it was
+ * asked for cannot say which of two runs found what the other left on disk. A
+ * record that never started has only the time it was asked for.
+ */
+export function whenStarted(record) {
+  return String(record.startedAt ?? record.requestedAt ?? '');
+}
+
+/**
  * Services an interrupted operation may have left stopped, each with every
  * record that still owes it something, oldest first and with the phase each
  * reached, so the caller can decide what putting it back means. All of them,
  * not one: a restart interrupted before an update that was killed part way
  * through its install owes the service a start, the update owes it a look at
  * the version, and settling the first must not quietly settle the second.
- * `records` come newest first, as every listing does.
+ *
+ * `records` come newest first by when each was asked for, as every listing
+ * does, and oldest here means started first. An update queued before another
+ * and taken up after it installed on top of what the other left, and weighing
+ * it as the older of the two once rolled a finished install back.
  */
 export function servicesNeedingRecovery(records) {
   const needing = new Map();
-  for (const record of [...records].reverse()) {
+  const oldestFirst = [...records].reverse().sort((a, b) => whenStarted(a).localeCompare(whenStarted(b)));
+  for (const record of oldestFirst) {
     if (!record.service) continue;
     const phase = record.phase ?? '';
     if (!DISRUPTED_PHASES.has(phase)) continue;

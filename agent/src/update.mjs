@@ -43,7 +43,7 @@
 import { describeFailure } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
-import { appendLog, listOperations, recordPhase, updateOperation } from './operations.mjs';
+import { appendLog, listOperations, recordPhase, updateOperation, whenStarted } from './operations.mjs';
 import { runMutationArgv, unsettledWork } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
@@ -976,11 +976,11 @@ const INSTALL_BEGUN = new Set(['installing', 'verifying', 'starting', 'rolling-b
  * asked for can be taken up once it is over.
  */
 function versionSettledSince(record) {
-  const since = String(record.startedAt ?? record.requestedAt ?? '');
+  const since = whenStarted(record);
   return listOperations({ service: record.service, kind: 'update', state: 'finished', limit: 200 }).some(
     (later) =>
       later.id !== record.id &&
-      String(later.startedAt ?? later.requestedAt ?? '') > since &&
+      whenStarted(later) > since &&
       (['updated', 'rolled-back'].includes(later.result?.action) || later.result?.reasonCode === REASON.alreadyOnTarget),
   );
 }
@@ -1001,7 +1001,8 @@ function installedNow(service, record) {
 /**
  * What the version of a service owes the updates an interruption left behind
  * (contract section 5.5), judged from every record still owing it, oldest
- * first. Like a process reading, it is one of three states:
+ * first by when each started, the clock versionSettledSince tells a later run
+ * by. Like a process reading, it is one of three states:
  *
  *   none     nothing is to be rolled back;
  *   owed     the version installed is neither the `from` of the run that

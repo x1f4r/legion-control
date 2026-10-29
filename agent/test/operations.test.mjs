@@ -181,6 +181,19 @@ test('an operation interrupted before it touched anything needs no service recov
   });
 });
 
+test('the records owing a service its recovery are oldest first by when each started, not when each was asked for', async () => {
+  const ops = await fresh('operations.mjs');
+  const owing = (id, requestedAt, startedAt) => ({ id, ...base, phase: 'installing', requestedAt, startedAt });
+  // Newest asked for first, as a listing gives them. The queued one was asked
+  // for first and taken up last.
+  const listed = [
+    owing('direct', '2026-01-01T10:05:00.000Z', '2026-01-01T10:05:00.000Z'),
+    owing('queued', '2026-01-01T10:00:00.000Z', '2026-01-01T10:20:00.000Z'),
+    owing('older', '2026-01-01T09:00:00.000Z', null),
+  ];
+  assert.deepEqual(ops.servicesNeedingRecovery(listed)[0].records.map((record) => record.id), ['older', 'direct', 'queued']);
+});
+
 test('a reboot is only believed with both a new boot and the right system', async () => {
   await withHome(async () => {
     const ops = await fresh('operations.mjs');

@@ -277,6 +277,27 @@ test('an update queued before the interrupted one and taken up after it is the l
   });
 });
 
+test('an interrupted update queued before another interrupted one and taken up after it is the later of the two', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { running: 'off', installed: '3.0.0', 'rollback-to': '1.0.0' });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    const direct = 'interrupted-direct-004';
+    const queued = 'interrupted-queued-004';
+    leftInterrupted(direct, { from: '1.0.0', to: '2.0.0', requestedAt: '2026-01-01T10:05:00.000Z', startedAt: '2026-01-01T10:05:00.000Z' });
+    // Asked for first, taken up while the direct update still owed its
+    // recovery, and killed in its start after an install that worked. Its
+    // version command could not answer with the service down, so it noted no
+    // from. 3.0.0 is where it landed, not something the direct update left.
+    leftInterrupted(queued, { phase: 'starting', from: null, to: '3.0.0', requestedAt: '2026-01-01T10:00:00.000Z', startedAt: '2026-01-01T10:20:00.000Z' });
+    cli(['cycle'], { home });
+    assert.equal(readFixture(dir, 'rollback-runs'), '', 'a finished install is not undone');
+    assert.equal(readFixture(dir, 'installed'), '3.0.0');
+    assert.equal(readFixture(dir, 'start-runs'), '1');
+    assert.equal(readFixture(dir, 'running'), 'on');
+    for (const id of [direct, queued]) assert.equal(readOperation(id).recoveryPending, false);
+  });
+});
+
 test('a rollback that fails settles once the service is running again, rather than stop it every cycle', async () => {
   await withHome(async (home) => {
     const dir = fixtureData(home, { running: 'off', 'npm-install-fails': '1.0.0' });
