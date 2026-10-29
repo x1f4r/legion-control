@@ -768,6 +768,13 @@ final class ConfigStore {
     /// nil so the unrevisioned edit cannot be published to another machine.
     private(set) var hasPendingExternalEdit = false
 
+    /// True while there is a file at the path that is not a setup document: unreadable, refused by
+    /// section 12, or not a setup this app can read. The app goes on running on the one it read
+    /// before, but that one is no longer what storage holds. A half-saved edit is the person's all
+    /// the same, so `document` is nil until the file is a document again and nothing is adopted
+    /// over it (M16).
+    private(set) var hasBrokenFile = false
+
     let url: URL
     private let revisionsURL: URL
     private let appliedStateURL: URL
@@ -840,11 +847,13 @@ final class ConfigStore {
     /// Whether the window has anything at all to show besides the setup page.
     var hasAnything: Bool { !machines.isEmpty || local != nil }
 
-    /// What there is to share, or nil while nothing usable has been read. A file that was edited
-    /// into something broken leaves the previous document here, which is the same rule the machines
-    /// list follows: the last thing that made sense is what the app is running on.
+    /// What there is to share, and what an adoption is swapped against: nil while nothing usable has
+    /// been read, while a hand edit waits for its revision, and while the file is not a document at
+    /// all. A file that was edited into something broken leaves the previous config in force, the
+    /// last thing that made sense, but storage no longer holds that document, and section 9.5 has a
+    /// device holding only an unrevisioned hand edit decide nothing until it is one.
     var document: ControllerDocument? {
-        guard !hasPendingExternalEdit, let config, let bytes, let hash else { return nil }
+        guard !hasPendingExternalEdit, !hasBrokenFile, let config, let bytes, let hash else { return nil }
         return ControllerDocument(bytes: bytes, hash: hash, identity: config.identity, errors: errors)
     }
 
@@ -866,9 +875,11 @@ final class ConfigStore {
             isMissing = true
             // Not an error worth showing: no file is the state a fresh install is in, and the setup
             // page says what to do about it. An earlier config is kept, so a file that is being
-            // rewritten in place does not blank the window on its way past zero bytes.
+            // rewritten in place does not blank the window on its way past zero bytes. A file that
+            // is there and cannot be read is still somebody's, and nothing is written over it.
             problem = nil
-            if config != nil, FileManager.default.fileExists(atPath: path) { return }
+            hasBrokenFile = FileManager.default.fileExists(atPath: path)
+            if config != nil, hasBrokenFile { return }
             if config != nil {
                 config = nil
                 bytes = nil
@@ -883,6 +894,7 @@ final class ConfigStore {
         // Section 12 first: bytes it refuses are no document at all, and not even the document this
         // device applies is kept on them. The one read before stays in force.
         if let refusal = Canonical.rejection(data) {
+            hasBrokenFile = true
             problem = "The setup file is not a setup document: \(refusal.sentence) This app keeps using the one it read before."
             return
         }
@@ -894,6 +906,7 @@ final class ConfigStore {
             let canonical = try Canonical.bytes(data)
             let checked = try ControllerConfig.applied(canonical, errors: verdict.errors)
             problem = nil
+            hasBrokenFile = false
             // Before the equality check below: a file that was reformatted without changing anything
             // this app reads is still a different document to the machines, and they compare bytes.
             let document = ControllerDocument(bytes: canonical, hash: Canonical.sha256(canonical),
@@ -909,8 +922,10 @@ final class ConfigStore {
             updateAppliedState(for: document)
             if changed { onChange?() }
         } catch let error as DecodingError {
+            hasBrokenFile = true
             problem = "The setup file could not be read, so this app keeps using the one it read before. \(Self.describe(error))"
         } catch {
+            hasBrokenFile = true
             problem = "The setup file could not be read, so this app keeps using the one it read before. \(error.localizedDescription)"
         }
     }
@@ -1243,11 +1258,12 @@ final class ConfigStore {
     ///
     /// A compare-and-swap (section 9.5). The decision to adopt was made against the document
     /// applied then, `expectedHead`, nil when there was none; reading the bytes took a round trip,
-    /// and a person may have saved an edit meanwhile. So the file is read again first, and when the
-    /// applied hash is not the one expected, or a hand edit is waiting to be recorded, nothing is
-    /// written: the edit stays, and the next status decides from it (M16). Take theirs, Keep mine
-    /// and Merge come through here as well, expecting the document the divergence sheet was built
-    /// from.
+    /// and a person may have saved an edit meanwhile. So the file is read again first, and when what
+    /// it holds is not the document expected, a hand edit is waiting to be recorded, or it is no
+    /// setup document at all, nothing is written: the edit stays, and the next status decides from
+    /// it (M16). With nothing expected, a file that is not a document is refused outright rather
+    /// than replaced. Take theirs, Keep mine and Merge come through here as well, expecting the
+    /// document the divergence sheet was built from.
     ///
     /// The bytes are written exactly as they are, canonicalised and never re-serialised: this device
     /// is not their author, and writing them any other way would change the hash and turn a
@@ -1272,10 +1288,23 @@ final class ConfigStore {
     private func adopt(_ bytes: Data, describedAs description: String, replacing expectedHead: String?,
                        enrolling: Bool) -> AdoptOutcome {
         reloadIfChanged()
-        // A hand edit not yet recorded as a revision is an edit all the same, made after whatever
-        // the adoption was decided against.
-        let current = hasPendingExternalEdit ? hash : document?.hash
-        guard !hasPendingExternalEdit, current == expectedHead else { return .headMoved(current: current) }
+        // The swap is against what storage holds now, not against the last document read cleanly.
+        // A half-saved file is kept out of `config`, but it is the person's all the same, and a hand
+        // edit not yet recorded as a revision is an edit made after whatever the adoption was
+        // decided against. Neither is written over.
+        switch storedHead() {
+        case .file(hash: nil):
+            guard expectedHead != nil else {
+                return .refused("The file at \(path) is not a setup document, so nothing was written over it: it may be an edit somebody is in the middle of. Fix it in an editor or move it away first.")
+            }
+            return .headMoved(current: nil)
+        case .file(hash: let stored?):
+            guard !hasPendingExternalEdit, stored == expectedHead, document?.hash == expectedHead else {
+                return .headMoved(current: stored)
+            }
+        case .nothing:
+            guard expectedHead == nil else { return .headMoved(current: nil) }
+        }
         if let refusal = Canonical.rejection(bytes) {
             return .refused("That setup could not be adopted: \(refusal.sentence)")
         }
@@ -1297,6 +1326,23 @@ final class ConfigStore {
         } catch {
             return .refused("That setup could not be written to \(path). \(error.localizedDescription)")
         }
+    }
+
+    /// What the file at the path holds at this moment.
+    private enum StoredHead: Equatable {
+        case nothing
+        /// The canonical hash of its bytes, nil when they are no setup document.
+        case file(hash: String?)
+    }
+
+    /// Read the file again rather than trusting the last load: the signature the poll compares is
+    /// the modification time and the size, and a save can leave both as they were.
+    private func storedHead() -> StoredHead {
+        guard FileManager.default.fileExists(atPath: path) else { return .nothing }
+        guard !hasBrokenFile, let data = try? Data(contentsOf: url), Canonical.rejection(data) == nil else {
+            return .file(hash: nil)
+        }
+        return .file(hash: try? Canonical.hash(data))
     }
 
     /// The last change made from here, for the provenance line. Not persisted: it is about this run.

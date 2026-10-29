@@ -278,8 +278,7 @@ final class SetupPeerSync {
         let holder = channel.setupHolder
         switch admission {
         case .headMoved:
-            // An edit was saved while the read was out. It stays, and deciding again finds the branch.
-            decide(over: channel, remote: channel.status?.controller)
+            headMoved(over: channel)
         case .moved:
             // The machine changed between the decision and the read; the next status decides.
             break
@@ -301,12 +300,25 @@ final class SetupPeerSync {
             case .adopted:
                 channel.saySetup("Adopted the setup from \(holder): revision \(fetched.identity.revisionNumber).", isError: false, detail: nil)
             case .headMoved:
-                decide(over: channel, remote: channel.status?.controller)
+                headMoved(over: channel)
             case .refused(let problem):
                 state.failedAt[expected.localHash] = now()
                 channel.saySetup("The setup from \(holder) could not be adopted: \(problem)", isError: true, detail: nil)
             }
         }
+    }
+
+    /// The setup here is not the one the fetch was decided against, so nothing was written. An edit
+    /// saved while the read was out stays, and deciding again finds the branch. A file saved as
+    /// something that is not a setup document yet leaves this device nothing to decide from, so the
+    /// row has nothing to say until it is one; the line says why the newer setup was not taken.
+    private func headMoved(over channel: some SetupChannel) {
+        if channel.appliedSetup() == nil {
+            let holder = channel.setupHolder
+            channel.saySetup("The setup file here was saved while the setup on \(holder) was being read, and it is not a setup this device can share yet, so the one on \(holder) was not adopted over it.",
+                             isError: true, detail: nil)
+        }
+        decide(over: channel, remote: channel.status?.controller)
     }
 
     // MARK: - Reading the machine's document

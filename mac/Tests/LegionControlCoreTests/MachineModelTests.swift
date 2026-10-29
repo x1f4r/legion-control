@@ -1198,6 +1198,43 @@ struct MachineModelTests {
         #expect(!runner.sent.contains("config set"))
     }
 
+    @Test("a setup file saved half-way while a fetch was being read is not adopted over, and the line says why")
+    func adoptionKeepsAFileSavedBrokenDuringTheRead() async throws {
+        let (store, home) = try Self.setupStore()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let theirs = try Self.revision(of: store, renamingPiTo: "Kitchen Pi")
+        let runner = SetupRunner()
+        runner.answer("status", Self.setupStatus(holding: try Canonical.hash(theirs)), Self.setupStatus(holding: try Canonical.hash(theirs)))
+        runner.answer("config meta", try Self.setupMeta(theirs))
+        runner.answer("config", try Self.setupRead(theirs), try Self.setupRead(theirs))
+        runner.hold("config")
+        let model = try Self.setupModel("pi", runner: runner, store: store, logs: home)
+
+        await model.refresh(userInitiated: false)
+        await Self.eventually { runner.isHolding("config") }
+        #expect(runner.isHolding("config"))
+
+        // The person's editor saves the file half-way while the read is out. The app goes on running
+        // on the document before it, which is the head the fetch was decided against.
+        let unfinished = Data(try #require(store.rawBytes).dropLast(3)) + Data(",\n".utf8)
+        try unfinished.write(to: store.url)
+        runner.release("config")
+        await Self.eventually { !model.core.setup.isSharing }
+
+        // M16: nothing is written over it, and the line says why the newer setup was not taken.
+        #expect(try Data(contentsOf: store.url) == unfinished)
+        #expect(store.config?.machine(id: "pi")?.name == "Pi")
+        #expect(model.statusIsError)
+        #expect(model.statusLine.contains("not a setup this device can share yet"))
+
+        // A file that is not a document gives nothing to decide from, so the read is not sent again.
+        await model.refresh(userInitiated: false)
+        await Self.eventually { !model.core.setup.isSharing }
+        #expect(model.setupDecision.decision == .unknown)
+        #expect(runner.sent == ["status", "config meta", "config", "status"])
+        #expect(try Data(contentsOf: store.url) == unfinished)
+    }
+
     @Test("two reads out at once cannot both adopt: the second finds the head the first one wrote")
     func twoReadsCannotOverwriteANewHead() async throws {
         let (store, home) = try Self.setupStore()

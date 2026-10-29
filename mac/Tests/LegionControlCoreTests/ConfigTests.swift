@@ -481,6 +481,58 @@ struct ConfigTests {
         #expect(store.document?.hash == head)
     }
 
+    @Test("a half-saved file is a moved head, and nothing is adopted over it")
+    func adoptionKeepsAHalfSavedFile() throws {
+        let (store, home, child) = try Self.storeWithChild()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let head = try #require(store.document?.hash)
+        let raw = try #require(store.rawBytes)
+
+        // M16: the file fails to parse, so the app runs on the document before it, and that one is
+        // still the head the adoption was decided against. What storage holds is not.
+        for unfinished in [Data(raw.dropLast(3)) + Data(",\n".utf8), Data([0xEF, 0xBB, 0xBF, 0xEF, 0xBB, 0xBF]) + raw] {
+            Thread.sleep(forTimeInterval: 0.01)
+            try unfinished.write(to: store.url)
+            store.reloadIfChanged()
+            #expect(store.problem != nil)
+            #expect(store.config?.machine(id: "pi")?.name == "Pi")
+            #expect(store.document == nil)
+
+            #expect(store.adopt(child, describedAs: "adopted", replacing: head) == .headMoved(current: nil))
+            #expect(try Data(contentsOf: store.url) == unfinished)
+            // With nothing expected, which is how enrolment and giving a setup an identity come, the
+            // file is refused outright rather than replaced.
+            guard case .refused(let why) = store.enrol(child, describedAs: "enrolled") else {
+                Issue.record("a file that is not a document was enrolled over")
+                return
+            }
+            #expect(why.contains("not a setup document"))
+            #expect(try Data(contentsOf: store.url) == unfinished)
+        }
+
+        // Saved whole again, it is the head once more, and the adoption goes ahead.
+        Thread.sleep(forTimeInterval: 0.01)
+        try raw.write(to: store.url)
+        #expect(store.adopt(child, describedAs: "adopted", replacing: head) == .adopted(hash: try Canonical.hash(child)))
+        #expect(store.rawBytes == child)
+    }
+
+    @Test("a file section 12 accepts but that is no setup this app can read is not adopted over either")
+    func adoptionKeepsAFileThatIsNoSetup() throws {
+        let (store, home, child) = try Self.storeWithChild()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let head = try #require(store.document?.hash)
+        let unfinished = Data(#"{ "version": 1.5, "machines": [] }"#.utf8)
+        #expect(Canonical.rejection(unfinished) == nil)
+        Thread.sleep(forTimeInterval: 0.01)
+        try unfinished.write(to: store.url)
+
+        // Not reloaded first: the adoption reads the file itself.
+        #expect(store.adopt(child, describedAs: "adopted", replacing: head) == .headMoved(current: nil))
+        #expect(store.problem != nil)
+        #expect(try Data(contentsOf: store.url) == unfinished)
+    }
+
     @Test("setting helpers writes the compatibility alias too")
     func helpersWriteTheAlias() throws {
         let (store, home) = try Self.store(Self.twoMachines)
