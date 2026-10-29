@@ -411,6 +411,30 @@ struct AppUpdateModelTests {
         #expect(FileManager.default.fileExists(atPath: AppUpdates.launchMarkerURL(support: next.supportDirectory).path))
     }
 
+    @Test("a relocated run leaves the ordinary installation's swap alone, whichever build it is", arguments: ["3.0.0", "3.1.0"])
+    func isolatedRunLeavesSwap(version: String) async throws {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        prepareInstall(model, in: directory) { _, _, _, _, _ in }
+        await offerAndInstall(model, store: store)
+        let pending = try #require(model.loadPendingSwap())
+        let id = try #require(pending.operationId)
+
+        // Long after the handover, where the ordinary installation would settle it, and with no
+        // note, because the helper never writes into a relocated run's support folder.
+        let (relocated, history) = relaunch(after: model, preferences: preferences, store: store, as: version)
+        relocated.isIsolatedRun = true
+        relocated.supportDirectory = directory.appending(path: "relocated-state")
+        relocated.now = { Date().addingTimeInterval(AppUpdates.helperLifetime + 1) }
+        relocated.confirmLaunch()
+        #expect(relocated.failure == nil)
+        #expect(relocated.loadPendingSwap() == pending)
+        #expect(history.record(id: id)?.state == .unknown)
+        // Its own marker is still written, in its own support folder.
+        #expect(FileManager.default.fileExists(atPath: AppUpdates.launchMarkerURL(support: relocated.supportDirectory).path))
+    }
+
     /// What the helper writes down as it ends, as its `finish` spells it: the swap's id and the
     /// status it exits with, beside the marker. `AppUpdateTests` holds the real helper to this.
     static func helperEnds(_ status: Int32, swap id: String, marker: URL) throws {

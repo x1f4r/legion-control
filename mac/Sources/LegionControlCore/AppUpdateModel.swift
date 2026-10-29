@@ -464,7 +464,9 @@ final class AppUpdateModel {
     /// that release saying so, and the record is next read by a build that knows about it, maybe
     /// days later: by version alone, that looks exactly like the roll back failing.
     private func resolvePendingSwap() {
-        guard let pending = loadPendingSwap() else { return }
+        // A relocated run never hands a swap over, and its support folder is not where the helper
+        // writes, so whatever record it finds belongs to the ordinary installation, unread.
+        guard !isIsolatedRun, let pending = loadPendingSwap() else { return }
         let running = installedVersion
         let outcome = AppUpdates.swapOutcome(support: supportDirectory).flatMap { $0.id == pending.id ? $0.status : nil }
         // Neither the build it asked for nor a word from the helper, while the helper may still be
