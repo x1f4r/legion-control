@@ -65,19 +65,26 @@ enum SiteAwareness {
         var cursor: UnsafeMutablePointer<ifaddrs>? = first
         while let entry = cursor {
             defer { cursor = entry.pointee.ifa_next }
-            let flags = entry.pointee.ifa_flags
             guard let raw = entry.pointee.ifa_addr,
-                  raw.pointee.sa_family == UInt8(AF_INET),
-                  flags & UInt32(IFF_UP) != 0,
-                  flags & UInt32(IFF_BROADCAST) != 0,
-                  flags & UInt32(IFF_LOOPBACK) == 0,
-                  flags & UInt32(IFF_POINTOPOINT) == 0
+                  isCandidate(flags: entry.pointee.ifa_flags, family: raw.pointee.sa_family),
+                  let address = ipv4(raw)
             else { continue }
-            guard let address = ipv4(raw) else { continue }
             let length = entry.pointee.ifa_netmask.flatMap(ipv4).flatMap(LocalAddress.prefixLength(ofMask:))
             if let local = LocalAddress(address: address, prefixLength: length) { addresses.append(local) }
         }
         return addresses
+    }
+
+    /// Whether an interface's address can place this device: IPv4, on an interface that is up and
+    /// can broadcast, and neither loopback nor point-to-point. A VPN's `utun` is up and
+    /// point-to-point and cannot broadcast, so its address, however much it looks like the office's
+    /// network, never says this device is there.
+    static func isCandidate(flags: UInt32, family: sa_family_t) -> Bool {
+        family == sa_family_t(AF_INET)
+            && flags & UInt32(IFF_UP) != 0
+            && flags & UInt32(IFF_BROADCAST) != 0
+            && flags & UInt32(IFF_LOOPBACK) == 0
+            && flags & UInt32(IFF_POINTOPOINT) == 0
     }
 
     /// The IPv4 address a `sockaddr` holds, as a 32-bit number in host order.

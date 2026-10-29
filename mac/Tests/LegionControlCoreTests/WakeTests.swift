@@ -136,6 +136,25 @@ struct WakeTests {
         #expect(!SiteAwareness.localAddresses().contains { $0.address >> 24 == 127 })
     }
 
+    @Test("only an interface that is up and can broadcast places this device, never a tunnel")
+    func candidateInterfaces() {
+        // The flags `ifconfig` shows for each, as the kernel reports them.
+        let ethernet = UInt32(IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_SIMPLEX | IFF_MULTICAST)
+        let vpn = UInt32(IFF_UP | IFF_POINTOPOINT | IFF_RUNNING | IFF_MULTICAST)
+        let loopback = UInt32(IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_MULTICAST)
+        let unplugged = UInt32(IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST)
+        let inet = sa_family_t(AF_INET)
+        #expect(SiteAwareness.isCandidate(flags: ethernet, family: inet))
+        // A VPN's utun is up and point-to-point, and its address used to place a laptop on the
+        // train in the office it tunnels into (C8).
+        #expect(!SiteAwareness.isCandidate(flags: vpn, family: inet))
+        // Point-to-point is refused even where the interface also claims it can broadcast.
+        #expect(!SiteAwareness.isCandidate(flags: vpn | UInt32(IFF_BROADCAST), family: inet))
+        #expect(!SiteAwareness.isCandidate(flags: loopback, family: inet))
+        #expect(!SiteAwareness.isCandidate(flags: unplugged, family: inet))
+        #expect(!SiteAwareness.isCandidate(flags: ethernet, family: sa_family_t(AF_INET6)))
+    }
+
     // MARK: - The plan
 
     @Test("on the machine's own network the site's broadcast comes before the limited one")
