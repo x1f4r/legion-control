@@ -368,3 +368,28 @@ test('a forced cycle overrides the busy gate and nothing else', async () => {
     assert.equal(readFixture(dir, 'update-runs'), '1', 'the paused service was not updated as well');
   });
 });
+
+test('an update killed part way whose pid another process holds now is recovered, and its service put back', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { running: 'off' });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    const { spawn } = await import('node:child_process');
+    const other = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    await new Promise((resolve) => other.once('spawn', resolve));
+    try {
+      const id = 'killed-update-reused-pid';
+      beginOperation({ id, kind: 'update', service: 'demo', systemId: 'test' });
+      // Its own process started an hour ago and is gone; the id is somebody else's now.
+      updateOperation(id, { phase: 'stopping', pid: other.pid, ownerStartedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() });
+      const observed = cli(['op', id], { home }).payload;
+      assert.equal(observed.op.state, 'finished');
+      assert.equal(observed.op.result.action, 'interrupted');
+      const cycled = cli(['cycle'], { home }).payload;
+      assert.deepEqual(cycled.recovered.map((entry) => [entry.opId, entry.action]), [[id, 'interrupted']]);
+      assert.equal(readFixture(dir, 'running'), 'on', 'the service it had stopped is running again');
+      assert.equal(readOperation(id).recoveryPending, false);
+    } finally {
+      other.kill('SIGKILL');
+    }
+  });
+});

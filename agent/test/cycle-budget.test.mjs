@@ -10,7 +10,7 @@ import { beginOperation, queueOperation, readOperation, updateOperation } from '
 import { CYCLE_BUDGET_MS, cycleBudget, runCycle, SCHEDULER_LIMIT_MS } from '../src/scheduler.mjs';
 import { serviceState } from '../src/state.mjs';
 import { recoveryWorstCaseMs, restartWorstCaseMs, runUpdate, updateWorstCaseMs } from '../src/update.mjs';
-import { commandService, deadPid, fixtureConfig, fixtureData, readFixture, REPO, withHome, writeConfig } from './helpers.mjs';
+import { commandService, deadPid, fixtureConfig, fixtureData, npmService, readFixture, REPO, withHome, writeConfig } from './helpers.mjs';
 
 const minute = 60 * 1000;
 
@@ -41,6 +41,9 @@ test('the worst case of an update counts its drain, and fits in a cycle as confi
     }));
     const [plain, drained] = config.services;
     const plainMs = updateWorstCaseMs(plain);
+    const npm = configured(home, fixtureConfig(dir, { services: [npmService(dir, { pkg: 'demo-pkg', prefix: path.join(home, 'npm-prefix') })] })).services[0];
+    assert.ok(updateWorstCaseMs(npm) > 10 * minute, 'an npm install may run for ten minutes');
+    assert.ok(updateWorstCaseMs(npm) < CYCLE_BUDGET_MS, 'and still fits in a cycle that has just begun');
     assert.ok(plainMs > 10 * minute, 'the update command alone may run for ten minutes');
     assert.ok(plainMs < CYCLE_BUDGET_MS, 'or no scheduled update could ever start');
     assert.ok(updateWorstCaseMs(drained) >= plainMs + 10 * minute, 'a ten minute drain is ten minutes more');
