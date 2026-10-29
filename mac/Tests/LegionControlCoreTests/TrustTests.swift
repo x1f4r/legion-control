@@ -83,7 +83,7 @@ struct TrustTests {
 
     /// A signing key made here, so the verifier can be shown accepting a good signature as well as
     /// refusing a bad one. The shipping app has no way to reach this: the override is an environment
-    /// variable it never sets, and there is no path that turns verification off.
+    /// variable a release build does not read, and there is no path that turns verification off.
     static func signed(_ manifest: [String: Any]) throws -> (bytes: Data, signature: Data, key: Curve25519.Signing.PrivateKey) {
         let key = Curve25519.Signing.PrivateKey()
         let bytes = try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
@@ -125,6 +125,23 @@ struct TrustTests {
         // cross-language SPKI mismatch would show up.
         let parsed = try ReleaseTrust.publicKey(fromPEM: Self.pem(for: key))
         #expect(parsed.rawRepresentation == key.publicKey.rawRepresentation)
+    }
+
+    @Test("the test release key is read from the environment only in a debug build")
+    func testKeyOnlyInDebug() throws {
+        let pinned = try ReleaseTrust.publicKey(fromPEM: ReleaseTrust.publicKeyPEM)
+        let other = Curve25519.Signing.PrivateKey()
+        let environment = ["LEGION_CONTROL_TEST_RELEASE_KEY": Self.pem(for: other)]
+        #expect(try ReleaseTrust.verificationKey(environment: [:]).rawRepresentation == pinned.rawRepresentation)
+        #expect(try ReleaseTrust.verificationKey(environment: ["LEGION_CONTROL_TEST_RELEASE_KEY": ""])
+            .rawRepresentation == pinned.rawRepresentation)
+        // A release build cannot run these tests, so its half is checked on the binary: the variable's
+        // name is not in it at all (strings on a release build finds nothing).
+        #if DEBUG
+        #expect(try ReleaseTrust.verificationKey(environment: environment).rawRepresentation == other.publicKey.rawRepresentation)
+        #else
+        #expect(try ReleaseTrust.verificationKey(environment: environment).rawRepresentation == pinned.rawRepresentation)
+        #endif
     }
 
     @Test("a signature that is not 64 bytes is refused before anything else happens")
