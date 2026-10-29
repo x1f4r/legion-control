@@ -104,10 +104,13 @@ setup moved on since the text was read: start again from the setup as it is now.
 into a device that has none approves everything in it, after showing all of it. Nothing that arrives
 from another peer approves anything, and neither do merges.
 
+`--approve-launch` takes the hash the listing printed, and approves nothing once the setup is no
+longer that document, so a revision adopted in between is never approved unseen.
+
 ```
 legion-control --command setup                                   # what waits, beside what was approved
-legion-control --command setup --approve-launch 'machines[tower].systems[linux]'
-legion-control --command setup --approve-launch all
+legion-control --command setup --approve-launch 'machines[tower].systems[linux]' --hash HASH
+legion-control --command setup --approve-launch all --hash HASH
 legion-control --command setup --revert-launch 'machines[tower].systems[linux]'
 ```
 

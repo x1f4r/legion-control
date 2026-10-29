@@ -231,10 +231,18 @@ public sealed class SetupEditor : Window
             _report.Children.Add(Ui.Actions(Ui.Action("Start again from the current setup", StartAgain,
                 explanation: "Replaces the document below with the setup as it is now. Copy anything you typed that you want to keep first.")));
         }
+        // Approve here records the waiting value itself, which the document below may no longer
+        // show, so it is shown beside the button as the review shows it.
+        if (launch.Any(problem => problem.Waiting is not null))
+        {
+            _report.Children.Add(Ui.Note(LaunchGate.Provenance(_app.Config.Document?.Identity)));
+            _report.Children.Add(Ui.Note(LaunchReviewSheet.Consequence));
+        }
         foreach (var problem in launch)
         {
             _report.Children.Add(Ui.Note(problem.Sentence, Ui.Bad));
             if (problem.Waiting is not { } entry) continue;
+            _report.Children.Add(LaunchReviewSheet.Comparison(entry, _app.Config.Config));
             _report.Children.Add(Ui.Actions(
                 entry.Approvable ? Ui.Action("Approve", () => ApproveWaiting(entry)) : null,
                 entry.CanRevert ? Ui.Action("Revert", () => RevertWaiting(entry),

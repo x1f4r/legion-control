@@ -63,15 +63,13 @@ public sealed class LaunchReviewSheet : Window
         var focused = _notNow?.IsFocused ?? false;
         _body.Children.Clear();
         _body.Children.Add(Ui.Title(Title!));
-        var identity = _app.Config.Document?.Identity;
-        _body.Children.Add(Ui.Note(
-            $"Revision {identity?.RevisionNumber}, says it was written by {identity?.Device ?? "an unnamed device"} ({identity?.Source ?? "no source"}). Not verified."));
-        _body.Children.Add(Ui.Note("Approving lets this device run this command over ssh with its own key."));
+        _body.Children.Add(Ui.Note(LaunchGate.Provenance(_app.Config.Document?.Identity)));
+        _body.Children.Add(Ui.Note(Consequence));
 
         var config = _app.Config.Config;
         foreach (var group in entries.GroupBy(entry => entry.MachineId))
         {
-            _body.Children.Add(Ui.SectionHeading(group.Key is { } machine ? config?.Machine(machine)?.Name ?? machine : "This device"));
+            _body.Children.Add(Ui.SectionHeading(group.Key is { } machine ? LaunchGate.Show(config?.Machine(machine)?.Name ?? machine) : "This device"));
             foreach (var entry in group) _body.Children.Add(Row(entry));
         }
 
@@ -86,12 +84,33 @@ public sealed class LaunchReviewSheet : Window
 
     private Control Row(LaunchReviewEntry entry)
     {
+        var row = Comparison(entry, _app.Config.Config);
+        if (!entry.Approvable)
+        {
+            row.Children.Add(Ui.Note(
+                "This cannot be approved: it holds a character a person could not see, a shape this app cannot quote, or a repository that is not owner/name.",
+                Ui.Bad));
+        }
+        row.Children.Add(Ui.Actions(
+            entry.Approvable ? Ui.Action("Approve", () => Approve(new[] { entry })) : null,
+            entry.CanRevert ? Ui.Action("Revert", () => Revert(entry),
+                explanation: "Puts the approved value back into the shared setup, as an edit made here.") : null));
+        return row;
+    }
+
+    /// What approving does, said wherever something can be approved.
+    internal const string Consequence = "Approving lets this device run this command over ssh with its own key.";
+
+    /// One waiting value: what it is, then the value this device approved there beside the one on
+    /// offer. The setup editor shows the same above its own Approve, so a value is never approved
+    /// from a sentence that only names its place.
+    internal static StackPanel Comparison(LaunchReviewEntry entry, ControllerConfig? config)
+    {
         var row = Ui.Column(2);
         row.Margin = new Thickness(0, 4, 0, 8);
-        var config = _app.Config.Config;
         var label = entry.Scope switch
         {
-            LaunchScope.System => config?.Machine(entry.MachineId!)?.System(entry.SystemId!)?.Name ?? entry.SystemId!,
+            LaunchScope.System => LaunchGate.Show(config?.Machine(entry.MachineId!)?.System(entry.SystemId!)?.Name ?? entry.SystemId!),
             LaunchScope.IdentityFile => "Identity file",
             LaunchScope.Repo => "Where this app's updates come from",
             _ => "Local agent",
@@ -118,17 +137,6 @@ public sealed class LaunchReviewSheet : Window
         Side(0, "Approved", entry.Recorded ? Shown(entry.Scope, entry.Approved) : "nothing");
         Side(1, "Offered", Shown(entry.Scope, entry.Offered));
         row.Children.Add(sides);
-
-        if (!entry.Approvable)
-        {
-            row.Children.Add(Ui.Note(
-                "This cannot be approved: it holds a character a person could not see, a shape this app cannot quote, or a repository that is not owner/name.",
-                Ui.Bad));
-        }
-        row.Children.Add(Ui.Actions(
-            entry.Approvable ? Ui.Action("Approve", () => Approve(new[] { entry })) : null,
-            entry.CanRevert ? Ui.Action("Revert", () => Revert(entry),
-                explanation: "Puts the approved value back into the shared setup, as an edit made here.") : null));
         return row;
     }
 

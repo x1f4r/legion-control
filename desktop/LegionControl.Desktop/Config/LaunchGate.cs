@@ -281,9 +281,19 @@ public static class LaunchGate
     /// something they could not see.
     public static string Show(string text) => LaunchValues.IsLaunchText(text) ? text : Quote(text);
 
+    /// The line every review shows about who wrote the revision. `controller.device` and `source`
+    /// are whatever the revision says about itself, so they are marked as unverified, and escaped
+    /// like a launch value when they hold something a person could not see: a bidirectional
+    /// override in a device name would otherwise rewrite the rest of the line.
+    public static string Provenance(ControllerIdentity? identity) =>
+        $"Revision {identity?.RevisionNumber ?? 0}, says it was written by "
+        + $"{(identity?.Device is { } device ? Show(device) : "an unnamed device")} "
+        + $"({(identity?.Source is { } source ? Show(source) : "no source")}). Not verified.";
+
     /// Every launch value of a document, for the summary a person confirms before a device that
     /// applies no setup yet adopts one and approves all of them: each machine and system with its
-    /// argv and grammar, and any identity file, update repository and local agent.
+    /// argv and grammar, and any identity file, update repository and local agent. Names and ids
+    /// are the peer's too, and are escaped like the values beside them.
     public static IReadOnlyList<string> Summary(ControllerDocument document)
     {
         var projection = LaunchProjection.Of(document);
@@ -292,10 +302,10 @@ public static class LaunchGate
         foreach (var machine in projection.Machines)
         {
             var name = decoded.Machine(machine.Id)?.Name ?? machine.Id;
-            lines.Add($"{name} ({machine.Id})");
+            lines.Add($"{Show(name)} ({Show(machine.Id)})");
             foreach (var system in machine.Systems)
             {
-                var systemName = decoded.Machine(machine.Id)?.System(system.Id)?.Name ?? system.Id;
+                var systemName = Show(decoded.Machine(machine.Id)?.System(system.Id)?.Name ?? system.Id);
                 if (system.Tuple.IsInert)
                 {
                     lines.Add($"  {systemName}: no agent command, so it is not driven");

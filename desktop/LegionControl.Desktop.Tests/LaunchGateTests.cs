@@ -984,6 +984,29 @@ public class LaunchGateTests
         Assert.Empty(app.LaunchReview);
     }
 
+    [Fact]
+    public void WhoARevisionSaysWroteItIsShownWithNothingHidden()
+    {
+        var claimed = new ControllerIdentity { Revision = 4, Device = "laptop", Source = "desktop" };
+        Assert.Equal("Revision 4, says it was written by laptop (desktop). Not verified.", LaunchGate.Provenance(claimed));
+
+        // An override in the name would turn the rest of the line around; it is shown escaped.
+        var line = LaunchGate.Provenance(claimed with { Device = "laptop\u202E (verified", Source = "desk\u200Btop" });
+        Assert.DoesNotContain('\u202E', line);
+        Assert.DoesNotContain('\u200B', line);
+        Assert.Contains("\\u202E", line);
+        Assert.Contains("\\u200B", line);
+        Assert.EndsWith("). Not verified.", line);
+        Assert.Equal("Revision 0, says it was written by an unnamed device (no source). Not verified.", LaunchGate.Provenance(null));
+
+        // The enrolment summary holds names the peer chose beside the commands it approves.
+        var root = LaunchDocuments.Root();
+        LaunchDocuments.Machine(root, "tower")["name"] = "Tower\u202E";
+        var summary = string.Join("\n", LaunchGate.Summary(LaunchDocuments.Of(root)));
+        Assert.DoesNotContain('\u202E', summary);
+        Assert.Contains("\\u202E", summary);
+    }
+
     // MARK: the record itself
 
     [Fact]
@@ -1045,15 +1068,18 @@ public class LaunchGateTests
     public async Task TheCommandLineListsApprovesAndRevertsWhatWaits()
     {
         using var home = new TempHome();
+        var record = Path.Combine(home.Path, "approved-launch.json");
         var d0 = LaunchDocuments.Of(Unreachable(LaunchDocuments.Root()));
-        File.WriteAllText(Path.Combine(home.Path, "approved-launch.json"),
-            LaunchRecord.Seeded(LaunchProjection.Of(d0), d0.Hash).ToJson().ToJsonString());
-        var d1 = LaunchDocuments.Descendant(d0, root =>
+        File.WriteAllText(record, LaunchRecord.Seeded(LaunchProjection.Of(d0), d0.Hash).ToJson().ToJsonString());
+        var d1 = JsonNode.Parse(LaunchDocuments.Descendant(d0, root =>
         {
             LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "id");
             LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/srv/pi/bin/launcher.mjs");
-        });
-        File.WriteAllBytes(home.ConfigPath, d1.Bytes);
+        }).Text)!.AsObject();
+        d1["controller"]!["device"] = "a phone\u202E";
+        var listedDocument = LaunchDocuments.Of(d1);
+        File.WriteAllBytes(home.ConfigPath, listedDocument.Bytes);
+        var listedHash = listedDocument.Hash;
         Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, home.ConfigPath);
         try
         {
@@ -1062,23 +1088,43 @@ public class LaunchGateTests
             Assert.Contains("machines[tower].systems[linux]  changed", listed.ToString());
             Assert.Contains("[\"sh\", \"-c\", \"id\"] as posix", listed.ToString());
             Assert.Contains("machines[pi].systems[linux]", listed.ToString());
+            Assert.Contains($"--hash {listedHash}", listed.ToString());
+            Assert.Contains("written by \"a phone\\u202E\"", listed.ToString());
+            Assert.DoesNotContain('\u202E', listed.ToString());
 
             Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--reconcile-once" }, new StringWriter()));
 
+            // Without the hash of the listing that showed it, nothing is approved.
+            var unlisted = File.ReadAllText(record);
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(
+                new[] { "--command", "setup", "--approve-launch", "machines[pi].systems[linux]" }, new StringWriter()));
+            Assert.Equal(unlisted, File.ReadAllText(record));
+
             var approved = new StringWriter();
             Assert.Equal(Runner.Ok, await Runner.RunAsync(
-                new[] { "--command", "setup", "--approve-launch", "machines[pi].systems[linux]" }, approved));
+                new[] { "--command", "setup", "--approve-launch", "machines[pi].systems[linux]", "--hash", listedHash }, approved));
             Assert.Contains("approved  machines[pi].systems[linux]", approved.ToString());
+
+            // A peer's next revision lands after the listing: what it offers was never shown.
+            var d2 = LaunchDocuments.Descendant(listedDocument, root =>
+                LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "touch /tmp/x"));
+            File.WriteAllBytes(home.ConfigPath, d2.Bytes);
+            var beforeStale = File.ReadAllText(record);
+            var stale = new StringWriter();
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(
+                new[] { "--command", "setup", "--approve-launch", "all", "--hash", listedHash }, stale));
+            Assert.Contains("no longer the one that listing showed", stale.ToString());
+            Assert.Equal(beforeStale, File.ReadAllText(record));
 
             var reverted = new StringWriter();
             Assert.Equal(Runner.Ok, await Runner.RunAsync(
                 new[] { "--command", "setup", "--revert-launch", "machines[tower].systems[linux]" }, reverted));
-            Assert.Contains($"revision {d1.Identity.RevisionNumber + 1}", reverted.ToString());
+            Assert.Contains($"revision {d2.Identity.RevisionNumber + 1}", reverted.ToString());
 
-            Assert.Equal(Runner.Failed, await Runner.RunAsync(
-                new[] { "--command", "setup", "--approve-launch", "machines[tower].systems[linux]" }, new StringWriter()));
-            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--reconcile-once" }, new StringWriter()));
             var current = ControllerDocument.FromRaw(File.ReadAllBytes(home.ConfigPath));
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(
+                new[] { "--command", "setup", "--approve-launch", "machines[tower].systems[linux]", "--hash", current.Hash }, new StringWriter()));
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--reconcile-once" }, new StringWriter()));
             Assert.Equal(LaunchDocuments.Tower, LaunchProjection.Of(current).TupleAt("tower", "linux")!.Agent);
         }
         finally

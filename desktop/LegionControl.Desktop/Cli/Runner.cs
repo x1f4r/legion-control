@@ -32,7 +32,7 @@ public static class Runner
         "timeout", "out", "site", "pause", "windows", "automatic", "patience", "screenshot",
         "quit-after", "update-marker", "budget", "in", "self", "system", "local-agent",
         "identity", "device", "alias", "template", "command", "route", "trust-systems", "legacy-system", "base", "local-agent-json",
-        "approve-launch", "revert-launch",
+        "approve-launch", "revert-launch", "hash",
     };
 
     public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output)
@@ -293,7 +293,7 @@ public static class Runner
     private static async Task<int> SetupAsync(
         AppModel app, CommandLine line, TextWriter output, bool json, CancellationToken token)
     {
-        if (line.Value("approve-launch") is { } approve) return ApproveLaunch(app, approve, output);
+        if (line.Value("approve-launch") is { } approve) return ApproveLaunch(app, approve, line.Value("hash"), output);
         if (line.Value("revert-launch") is { } revert) return RevertLaunch(app, revert, output);
 
         var machine = line.Value("machine") is null ? null : Pick(app, line, output);
@@ -329,7 +329,9 @@ public static class Runner
         }
 
         output.WriteLine($"Setup     {document.Identity.Id}");
-        output.WriteLine($"Revision  {document.Identity.RevisionNumber} by {document.Identity.Device ?? "?"} ({document.Identity.Source ?? "?"})");
+        // Whatever the revision says about who wrote it, with nothing a person could not see: the
+        // waiting commands below are approved from this listing.
+        output.WriteLine($"Revision  {document.Identity.RevisionNumber} by {(document.Identity.Device is { } device ? LaunchGate.Show(device) : "?")} ({(document.Identity.Source is { } source ? LaunchGate.Show(source) : "?")})");
         output.WriteLine($"Hash      {document.Hash}");
         output.WriteLine($"Lineage   {(document.Identity.Lineage.Count == 0 ? "none" : string.Join(", ", document.Identity.Lineage.Select(hash => hash[..12])))}");
         output.WriteLine($"Kept      {app.Config.Ledger.Hashes().Count} earlier documents");
@@ -366,24 +368,38 @@ public static class Runner
     /// Each launch value this device has not approved, beside the one it did approve at that place.
     private static void WriteLaunchReview(AppModel app, TextWriter output)
     {
-        if (app.LaunchReview.Count == 0) return;
-        var identity = app.Config.Document?.Identity;
+        if (app.LaunchReview.Count == 0 || app.Config.Document is not { } document) return;
         output.WriteLine();
-        output.WriteLine($"Waiting for approval on this device. Revision {identity?.RevisionNumber} says it was written by {identity?.Device ?? "an unnamed device"} ({identity?.Source ?? "no source"}); that is not verified.");
+        output.WriteLine($"Waiting for approval on this device. {LaunchGate.Provenance(document.Identity)}");
         foreach (var entry in app.LaunchReview)
         {
             output.WriteLine($"  {entry.Path}  {entry.Kind}{(entry.Approvable ? "" : ", cannot be approved: it can only be reverted or left")}");
             output.WriteLine($"    approved  {(entry.Recorded ? LaunchGate.Describe(entry.Scope, entry.Approved) : "nothing")}");
             output.WriteLine($"    offered   {LaunchGate.Describe(entry.Scope, entry.Offered)}");
         }
-        output.WriteLine("Approving lets this device run the command over ssh with its own key: --approve-launch PATH, or all.");
+        output.WriteLine($"Approving lets this device run the command over ssh with its own key: --approve-launch PATH --hash {document.Hash}, or all in place of PATH.");
         output.WriteLine("--revert-launch PATH puts the approved value back into the shared setup as an edit.");
     }
 
     /// Approves what waits at one path, or everything that can be approved, and says exactly what
-    /// was recorded. The values are the ones this run read and printed, never a later document's.
-    private static int ApproveLaunch(AppModel app, string which, TextWriter output)
+    /// was recorded.
+    ///
+    /// [listed] is the hash the listing printed, and nothing is approved unless the setup is still
+    /// that document. What waits comes from the document, and one adopted between the listing and
+    /// this run, by the window's next reading for one, would have its values approved without
+    /// anybody having seen them.
+    private static int ApproveLaunch(AppModel app, string which, string? listed, TextWriter output)
     {
+        if (listed is null)
+        {
+            output.WriteLine("Nothing was approved. List what waits with --command setup, then approve with the hash it prints: --approve-launch PATH --hash HASH.");
+            return Failed;
+        }
+        if (app.Config.Document?.Hash != listed)
+        {
+            output.WriteLine("Nothing was approved: the setup is no longer the one that listing showed. List what waits again with --command setup.");
+            return Failed;
+        }
         var chosen = which == "all"
             ? app.LaunchReview
             : app.LaunchReview.Where(entry => entry.Path == which).ToList();
@@ -816,7 +832,7 @@ public static class Runner
             if (refused.Count > 0)
             {
                 foreach (var refusal in refused) output.WriteLine(refusal.Sentence);
-                output.WriteLine("Nothing was applied. Approve or revert a waiting value with --command setup --approve-launch PATH or --revert-launch PATH.");
+                output.WriteLine("Nothing was applied. Approve or revert a waiting value with --command setup --approve-launch PATH --hash HASH or --revert-launch PATH.");
                 return Failed;
             }
             if (document is null)
@@ -1170,8 +1186,9 @@ public static class Runner
 
         Commands from the shared setup run only once this device approved them:
           --command setup                     lists what waits, beside what this device approved
-          --command setup --approve-launch PATH | --approve-launch all
-                                              approves what waits there, and prints what it recorded
+          --command setup --approve-launch PATH --hash HASH | --approve-launch all --hash HASH
+                                              approves what the listing with that hash showed there,
+                                              and prints what it recorded
           --command setup --revert-launch PATH
                                               puts the approved value back, as an edit that replicates
 
