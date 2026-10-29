@@ -758,6 +758,27 @@ struct LaunchGateTests {
         #expect(RemoteAgent.attempts(machine: gated, preferredSystem: nil, preferredRoute: nil).count == 2)
     }
 
+    @Test("the machine section says which system waits, and names one the typed reading does not have")
+    func machineSectionLines() {
+        var changed = SystemConfig(id: "linux", name: "Linux", platform: .linux, agent: Self.launcher)
+        changed.launchState = .approvedWithChangeWaiting
+        var waiting = SystemConfig(id: "windows", name: "Windows 11", platform: .windows, agent: [])
+        waiting.launchState = .notDriven
+        let machine = Machine(id: "tower", name: "Tower",
+                              endpoints: [Endpoint(id: "lan", kind: "lan", host: "192.0.2.20", user: "me")],
+                              systems: [changed, waiting])
+        func line(_ location: LaunchLocation) -> String {
+            MachineSection.launchLine(LaunchReviewEntry(location: location, kind: .changed, approvable: true,
+                                                        approved: nil, offered: .text("~/.ssh/id_tower")),
+                                      on: machine)
+        }
+
+        #expect(line(.system(machine: "tower", system: "linux")) == "Linux: Runs the approved command. A changed one is waiting for approval.")
+        #expect(line(.system(machine: "tower", system: "windows")) == "Windows 11: Not driven from this device until its command is approved.")
+        #expect(line(.system(machine: "tower", system: "spare\u{202E}")) == "The command for spare\\u{202E} is waiting for approval. Nothing is sent to it from this device.")
+        #expect(line(.identityFile(machine: "tower")) == "Its identity file is waiting for approval. This device offers the one it approved, or none.")
+    }
+
     @Test("a system this device has not approved is never bootstrapped over a 2.x agent")
     func notDrivenIsNeverBootstrapped() async throws {
         let runner = MachineModelTests.FakeRunner()

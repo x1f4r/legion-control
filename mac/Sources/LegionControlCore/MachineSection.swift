@@ -97,7 +97,7 @@ struct MachineSection: View {
         if !waiting.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(waiting) { entry in
-                    StatusText(symbol: "exclamationmark.shield", text: launchLine(entry), tint: .orange)
+                    StatusText(symbol: "exclamationmark.shield", text: Self.launchLine(entry, on: model.machine), tint: .orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Button("Review…") { app.reviewLaunch() }
@@ -106,16 +106,29 @@ struct MachineSection: View {
         }
     }
 
-    private func launchLine(_ entry: LaunchReviewEntry) -> String {
-        guard case .system(_, let systemId) = entry.location, let system = model.machine.system(id: systemId) else {
+    /// The line for one of `machine`'s waiting values, which says what runs meanwhile. `machine` is
+    /// the gated one the section draws.
+    static func launchLine(_ entry: LaunchReviewEntry, on machine: Machine) -> String {
+        switch entry.location {
+        case .system(_, let systemId):
+            // The entry is read from the document's bytes and the machine from its typed reading.
+            // When the two disagree about a system, a repeated key say, the gate has nothing of that
+            // id to drive, so nothing is sent to it, and the line names it as the document does.
+            guard let system = machine.system(id: systemId) else {
+                return "The command for \(LaunchValues.visible(systemId)) is waiting for approval. Nothing is sent to it from this device."
+            }
+            let prefix = machine.systems.count > 1 ? "\(system.name): " : ""
+            switch system.launchState {
+            case .approvedWithChangeWaiting:
+                return prefix + "Runs the approved command. A changed one is waiting for approval."
+            case .approved, .notDriven:
+                return prefix + "Not driven from this device until its command is approved."
+            }
+        case .identityFile:
             return "Its identity file is waiting for approval. This device offers the one it approved, or none."
-        }
-        let prefix = model.machine.systems.count > 1 ? "\(system.name): " : ""
-        switch system.launchState {
-        case .approvedWithChangeWaiting:
-            return prefix + "Runs the approved command. A changed one is waiting for approval."
-        case .approved, .notDriven:
-            return prefix + "Not driven from this device until its command is approved."
+        case .repo, .local:
+            // Neither belongs to a machine, so the block never draws one; said plainly all the same.
+            return "A value from the shared setup is waiting for approval on this device."
         }
     }
 

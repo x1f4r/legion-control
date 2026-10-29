@@ -253,7 +253,10 @@ private struct MachineEditor: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Text(system.name).font(.headline)
-                        Text("\(system.platform.rawValue) · \(Self.grammarLabel(system))\(system.isRestricted ? " · restricted key" : "")")
+                        // The document's own field, because this is the document as it is written:
+                        // a restricted system the dispatcher could not take has no grammar, and the
+                        // hint is what says why it is not driven.
+                        Text("\(system.platform.rawValue) · \(Self.grammarLabel(system))\(system.restricted == true ? " · restricted key" : "")")
                             .font(.caption).foregroundStyle(.secondary)
                         Spacer(minLength: 8)
                         if machine.systems.count > 1 {
