@@ -13,7 +13,7 @@ struct ContractVectorTests {
 
     /// The families this suite runs. A family joins when this app has a port of its reference to
     /// run, and the contract has nine.
-    static let families = ["hash", "identifiers", "transport", "launch"]
+    static let families = ["hash", "identifiers", "transport", "setup-acceptance", "launch"]
 
     typealias Adapter = @Sendable (VectorJSON) throws -> VectorJSON
 
@@ -41,6 +41,11 @@ struct ContractVectorTests {
         .hostKeyChanged, .hostKeyUnknown, .timedOut(seconds: 0), .linkLost, .interpreterMissing, .agentMissing,
         .unreadableOutput, .agentFailed, .badRequest
     ].map { ($0.contractName, $0) })
+
+    /// The codes of a list of problems as the vectors list them: sorted, each once.
+    static func codes(_ problems: [DocumentAcceptance.Problem]) -> VectorJSON {
+        .array(Set(problems.map(\.code)).sorted().map(VectorJSON.string))
+    }
 
     static func document(_ text: String) throws -> Any {
         try JSONSerialization.jsonObject(with: Data(text.utf8))
@@ -189,6 +194,16 @@ struct ContractVectorTests {
                 "accepted": .bool(rejection == nil),
                 "reject": VectorJSON(rejection?.rawValue),
             ]
+        },
+
+        // Section 9.7.
+        "setup-acceptance/documents": { input in
+            guard let intake = DocumentAcceptance.Intake(rawValue: try string(input, "intake")) else {
+                throw BadInput(description: "unknown intake")
+            }
+            let verdict = DocumentAcceptance.check(Data(try string(input, "text").utf8), intake: intake)
+            return ["valid": .bool(verdict.valid), "errors": codes(verdict.errors), "warnings": codes(verdict.warnings),
+                    "assignsIdentity": .bool(verdict.assignsIdentity), "keep": .bool(verdict.keep)]
         },
 
         // Section 9.9.

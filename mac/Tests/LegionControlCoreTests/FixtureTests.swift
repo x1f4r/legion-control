@@ -119,25 +119,25 @@ struct FixtureTests {
         #expect(checked > 40, "only \(checked) fixtures were decoded")
     }
 
-    @Test("every shared controller document decodes, and the invalid ones are refused")
+    @Test("every shared controller document is accepted or refused exactly as the index expects")
     func controllerDocuments() throws {
         guard let index = Self.index() else { return }
+        var checked = 0
         for entry in index.fixtures where entry.file.hasPrefix("controller-document.") {
             let data = try Self.bytes(entry.file)
-            let decoded = try? JSONDecoder().decode(ControllerConfig.self, from: data)
-            guard let decoded else {
-                // A document that will not decode at all is only acceptable when the index says the
-                // fixture is meant to be invalid.
-                #expect(entry.expect == "invalid", "\(entry.file) did not decode")
-                continue
-            }
-            let validated = try? decoded.validated()
+            // Section 9.7 under peer intake, which is how a document read from a machine is taken.
+            // Android once refused the minimal document here while its own test decoded fixtures
+            // as something else and passed (C3).
+            let verdict = DocumentAcceptance.check(data, intake: .peer)
             if entry.expect == "invalid" {
-                #expect(validated == nil, "\(entry.file) should have been refused")
+                #expect(!verdict.valid, "\(entry.file) should have been refused")
             } else {
-                #expect(validated != nil, "\(entry.file) should have been accepted")
+                #expect(verdict.valid, "\(entry.file) should have been accepted: \(verdict.errors.map(\.message))")
+                #expect((try? JSONDecoder().decode(ControllerConfig.self, from: data)) != nil, "\(entry.file) did not decode")
             }
+            checked += 1
         }
+        #expect(checked >= 5)
     }
 
     // MARK: - What the app reads out of them

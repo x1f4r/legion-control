@@ -102,3 +102,88 @@ enum SiteAwareness {
         return addresses.contains { $0.hasPrefix(prefix) }
     }
 }
+
+/// A LAN prefix as section 10.1 of the contract reads one: a network and a length, never text.
+///
+/// Every client used to match a prefix with "starts with" on the address text, so `192.168.1`
+/// matched 192.168.10.7 and a device two subnets away believed it was at home (A9). A prefix is a
+/// dotted form of one to three octets with an optional trailing dot, `192.168.1` and `192.168.1.`
+/// being the same /24, or a CIDR network with no host bits set. Anything else, a full address
+/// without a length, IPv6, a wildcard, a space, is no prefix and never matches anything. This is the
+/// grammar of `contract/tools/wake-plan.mjs`; the setup's warnings are written on it.
+struct LanPrefix: Sendable, Equatable {
+    enum Form: Sendable, Equatable {
+        case dotted
+        case cidr
+    }
+
+    var network: UInt32
+    var length: Int
+    var form: Form
+
+    init?(_ text: String) {
+        guard !text.isEmpty else { return nil }
+        if let slash = text.firstIndex(of: "/") {
+            let lengthText = text[text.index(after: slash)...]
+            guard let network = Self.ipv4(String(text[..<slash])),
+                  lengthText.utf8.allSatisfy({ (0x30...0x39).contains($0) }),
+                  lengthText.count <= 2, lengthText.first != "0" || lengthText.count == 1,
+                  let length = Int(lengthText), (8...32).contains(length),
+                  network & ~Self.mask(length) == 0
+            else { return nil }
+            self.init(network: network, length: length, form: .cidr)
+            return
+        }
+        let body = text.hasSuffix(".") ? text.dropLast() : Substring(text)
+        let parts = body.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...3).contains(parts.count) else { return nil }
+        var network: UInt32 = 0
+        for part in parts {
+            guard let octet = Self.octet(part) else { return nil }
+            network = network << 8 | octet
+        }
+        self.init(network: network << (8 * (4 - parts.count)), length: 8 * parts.count, form: .dotted)
+    }
+
+    init(network: UInt32, length: Int, form: Form) {
+        self.network = network
+        self.length = length
+        self.form = form
+    }
+
+    /// Whether an address, as a 32-bit number, is inside this prefix.
+    func contains(_ address: UInt32) -> Bool {
+        address & Self.mask(length) == network & Self.mask(length)
+    }
+
+    /// Whether two prefixes share any address: the shorter one contains the other's network.
+    func overlaps(_ other: LanPrefix) -> Bool {
+        let mask = Self.mask(min(length, other.length))
+        return network & mask == other.network & mask
+    }
+
+    /// A dotted-quad IPv4 address as a 32-bit number, or nil. Exactly four decimal octets from 0 to
+    /// 255 without leading zeros: `192.168.01.1` is octal to some parsers and decimal to others, so
+    /// it is neither.
+    static func ipv4(_ text: String) -> UInt32? {
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        var value: UInt32 = 0
+        for part in parts {
+            guard let octet = octet(part) else { return nil }
+            value = value << 8 | octet
+        }
+        return value
+    }
+
+    private static func octet(_ text: Substring) -> UInt32? {
+        guard (1...3).contains(text.utf8.count), text.utf8.allSatisfy({ (0x30...0x39).contains($0) }),
+              text == "0" || text.first != "0", let value = UInt32(text), value <= 255
+        else { return nil }
+        return value
+    }
+
+    private static func mask(_ length: Int) -> UInt32 {
+        length == 0 ? 0 : UInt32.max << (32 - length)
+    }
+}
