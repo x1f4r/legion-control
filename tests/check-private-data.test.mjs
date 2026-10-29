@@ -46,21 +46,27 @@ test('a home directory is refused unless its user is a placeholder, in every way
       `$Base = 'D:\\Users\\${user}\\.legion-control'`,
       `{ "path": "C:\\\\Users\\\\${user}\\\\.legion-control" }`,
       `c:/users/${user}/AppData`,
+      // The same homes through a mount: WSL's view of a Windows drive, and an image-based Fedora.
+      `cp ${posixHome('mnt/c/Users')}/Downloads/x .`,
+      `IdentityFile ${posixHome('var/home')}/.ssh/id_ed25519`,
     ].join('\n'),
     'placeholders.txt': [
       '/home/me/legion-control and /Users/me/.ssh/id and C:\\Users\\me\\x and C:\\\\Users\\\\me and C:/Users/me/x.',
+      '/mnt/c/Users/me/Downloads, /mnt/d/users/Public/x and /var/home/me/.ssh.',
       'everything lives under /home/me.',
       '/home/runner/work, /Users/runner/work, C:\\Users\\runneradmin\\work, /Users/Shared/x, C:\\Users\\Public\\x',
       // Spelled so that they name nobody: a placeholder, a variable, an interpolation.
       'ssh <machine> bash ~/x; /home/<you>/x; /home/$USER/x; /Users/${name}/x; "/Users/\\(user)/x"; C:\\Users\\<you>\\x',
       // A path in a web address is not a home directory.
-      `https://example.com/home/${user} and https://api.github.com/users/${user}`,
+      `https://example.com/home/${user} and https://api.github.com/users/${user} and https://example.com/var/home/${user}`,
     ].join('\n'),
   });
   const result = check();
-  assert.deepEqual(where(result), ['refused.txt:1', 'refused.txt:2', 'refused.txt:3', 'refused.txt:4', 'refused.txt:5']);
+  assert.deepEqual(where(result), ['refused.txt:1', 'refused.txt:2', 'refused.txt:3', 'refused.txt:4', 'refused.txt:5', 'refused.txt:6', 'refused.txt:7']);
   assert.match(result.findings[0].message, new RegExp(`^/home/${user} is somebody's home directory; write it for the placeholder user me\\.$`));
   assert.match(result.findings[3].message, new RegExp(`^C:\\\\\\\\Users\\\\\\\\${user} is`));
+  assert.match(result.findings[5].message, new RegExp(`^/mnt/c/Users/${user} is`));
+  assert.match(result.findings[6].message, new RegExp(`^/var/home/${user} is`));
 });
 
 test('a private address is refused outside the placeholder ranges, a site prefix too', (t) => {

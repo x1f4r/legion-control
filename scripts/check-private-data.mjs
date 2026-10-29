@@ -9,8 +9,10 @@
 // file git tracks or would track is read, and the files' names as well, for three things:
 //
 // - A home directory whose user is not a placeholder: /home/<user>, /Users/<user>, or
-//   <drive>:\Users\<user> with \, \\ or / between the parts. The user the fixtures, vectors,
-//   examples and tests are written for is `me`; PLACEHOLDER_HOMES has the few others there are.
+//   <drive>:\Users\<user> with \, \\ or / between the parts, and the same homes reached through a
+//   mount, /mnt/<drive>/Users/<user> in WSL and /var/home/<user> on an image-based Fedora. The user
+//   the fixtures, vectors, examples and tests are written for is `me`; PLACEHOLDER_HOMES has the
+//   few others there are.
 // - A private IPv4 address outside the ranges the same files are written with, which are
 //   10.0.0.0/24 and the /24s of 192.168.1, 192.168.10 and 192.168.50. The rest of 10.0.0.0/8,
 //   172.16.0.0/12 and 192.168.0.0/16 is somebody's network, and so is a three-part 192.168 prefix,
@@ -54,8 +56,10 @@ export const TERMS_VARIABLE = 'LEGION_PRIVATE_TERMS';
 export const TERMS_FILE = '~/.legion-control/private/terms.txt';
 
 // A home directory: /home/ or /Users/ where a path starts, or a drive's \Users\. What follows is
-// read separately, so a placeholder such as <user>, $USER or ${user} names nobody.
-const HOME = /(?<![\w.-])(?:\/(?:home|Users)\/|[A-Za-z]:(\\\\|\\|\/)Users\1)/gi;
+// read separately, so a placeholder such as <user>, $USER or ${user} names nobody. The mounts are
+// spelled out, since the start of a path is what keeps a web address's /home/ or /users/ out, and
+// /mnt/c/Users/ is the way a Windows home comes back in a Linux test or doc.
+const HOME = /(?<![\w.-])(?:(?:\/var)?\/home\/|(?:\/mnt\/[A-Za-z])?\/Users\/|[A-Za-z]:(\\\\|\\|\/)Users\1)/gi;
 const USER = /[A-Za-z0-9_][\w.-]*/y;
 // A dotted IPv4 address, or three parts of one. Not inside a longer run of numbers and dots, which
 // is a version or a build number.
