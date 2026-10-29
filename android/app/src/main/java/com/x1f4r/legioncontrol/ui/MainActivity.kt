@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.ui
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -32,11 +33,25 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         val model = legion.model
         val updates = legion.updates
+        // A recreated activity is handed its first intent again, and a machine tapped open an hour
+        // ago is not where anybody wants to be put back.
+        if (savedInstanceState == null) open(intent)
         setContent {
             LegionTheme {
                 LegionApp(model, updates)
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        open(intent)
+    }
+
+    /** A tapped notification names the machine its change was on; the screen goes to it. */
+    private fun open(intent: Intent?) {
+        intent?.getStringExtra(AndroidOperationNotifier.EXTRA_MACHINE)?.let(legion.model::openMachine)
     }
 
     override fun onResume() {

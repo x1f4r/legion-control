@@ -128,4 +128,15 @@ class ChangesOnScreenTest {
 
         assertEquals(running, scope.coroutineContext.job.children.count())
     }
+
+    @Test
+    fun `a tapped notification finds the page of its machine`() {
+        val tower = model("tower")
+        val pi = model("pi")
+        val pages = listOf(Page.Divergence, Page.OneMachine(tower), Page.OneMachine(pi), Page.Device)
+
+        assertEquals(2, pages.indexOfMachine("pi"))
+        assertEquals(1, pages.indexOfMachine("tower"))
+        assertEquals("a machine the setup no longer has opens nothing", -1, pages.indexOfMachine("nas"))
+    }
 }

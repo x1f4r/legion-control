@@ -189,6 +189,16 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
         if (app.launchReviewRequests > 0 && index >= 0) pager.animateScrollToPage(index)
     }
 
+    // A tapped notification opens the page of the machine its change was on. Taken once, so the
+    // pages changing afterwards does not pull the screen back to it.
+    LaunchedEffect(app.requestedMachine, pages) {
+        val wanted = app.requestedMachine ?: return@LaunchedEffect
+        val index = pages.indexOfMachine(wanted)
+        if (index < 0) return@LaunchedEffect
+        pager.scrollToPage(index)
+        app.openedMachine()
+    }
+
     LaunchedEffect(pager, pages) {
         snapshotFlow { pager.currentPage }
             .distinctUntilChanged()
@@ -612,6 +622,10 @@ private fun ConfirmationDialog(
         },
     )
 }
+
+/** Where the page of the machine [machineId] is, or -1 when this setup has no such machine. */
+internal fun List<Page>.indexOfMachine(machineId: String): Int =
+    indexOfFirst { it is Page.OneMachine && it.model.machine.id == machineId }
 
 /** Reads a flow into composition without dragging a lifecycle dependency into every call site. */
 @Composable

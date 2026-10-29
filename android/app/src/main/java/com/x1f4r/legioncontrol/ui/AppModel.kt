@@ -88,7 +88,13 @@ class AppModel(
     private var clockJob: Job? = null
     private var polling = false
 
-    private val notifier = AndroidOperationNotifier(app) { notifications.enabled }
+    /**
+     * Whether the screen is in front of somebody: between the activity's resume and pause, which is
+     * also exactly when it polls. A change that ends now is told by the page, not by a notification.
+     */
+    val inFront: Boolean get() = polling
+
+    private val notifier = AndroidOperationNotifier(app, enabled = { notifications.enabled }, inFront = { inFront })
 
     /** Every change this app has asked for, across launches. */
     val operations = OperationCenter(services.operations, scope, notifier, keepAlive)
@@ -400,6 +406,22 @@ class AppModel(
         clockJob = null
     }
 
+    /**
+     * The machine a tapped notification asked to show, until the screen has moved to it. Only ever a
+     * machine this setup has: the id comes in on an intent, which anything on the phone can send.
+     */
+    var requestedMachine: String? by mutableStateOf(null)
+        private set
+
+    fun openMachine(machineId: String) {
+        if (machines.any { it.machine.id == machineId }) requestedMachine = machineId
+    }
+
+    /** The screen is on the requested machine's page now. */
+    fun openedMachine() {
+        requestedMachine = null
+    }
+
     fun refreshAll() {
         machines.forEach { it.refreshNow() }
     }
@@ -595,6 +617,12 @@ class AppModel(
         set(value) {
             notifications.enabled = value
         }
+
+    /**
+     * Whether Android lets this app post a notification now. Asked rather than remembered: the user
+     * can take it back in the system settings at any time, and the setting here is not told.
+     */
+    fun notificationsPermitted(): Boolean = notifier.permitted()
 
     val deviceBindings get() = bindings.bindings
 
