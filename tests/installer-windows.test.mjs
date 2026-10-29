@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { checkoutFiles } from '../scripts/checkout-files.mjs';
@@ -84,6 +84,7 @@ const removalCode = (text, start, end) => {
 };
 const windowsRemoval = () => removalCode(installer, "$RemoveAgentFiles = @'\n", "\n'@\n");
 const linuxRemoval = () => removalCode(linuxInstaller, `"$NODE_BIN" --input-type=module - "$BASE" "$1" <<'NODE'\n`, '\nNODE\n');
+const runRemoval = (base, scope) => spawnSync(process.execPath, ['--input-type=module', '-', base, scope], { input: windowsRemoval(), encoding: 'utf8' });
 
 test('both installers remove the agent\'s files with the same code', () => {
   assert.equal(windowsRemoval(), linuxRemoval());
@@ -95,7 +96,7 @@ test('uninstalling takes the agent\'s code, purging its records too, and nothing
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion removal '));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const base = path.join(root, "home with ' apostrophe", '.legion-control');
-  const run = (scope) => spawnSync(process.execPath, ['--input-type=module', '-', base, scope], { input: windowsRemoval(), encoding: 'utf8' });
+  const run = (scope) => runRemoval(base, scope);
   const code = ['bin', 'agent', 'agent.prev', 'agent.new', 'agent.install.new.1234', 'agent-swap.json', 'agent-baseline.json'];
   const records = ['config.json', 'config.last-good.json', 'controller.json', 'controller.meta.json', 'agent-floor.json', 'legionctl.log', 'legionctl.log.1', 'state', 'ops', 'incoming'];
   const theirs = ['private', 'release-signing.key', 'notes.txt'];
@@ -135,6 +136,70 @@ test('uninstalling takes the agent\'s code, purging its records too, and nothing
   const again = run('purge');
   assert.equal(again.status, 0, again.stderr);
   assert.equal(again.stdout, '');
+});
+
+// On Windows a folder a process works in cannot be moved, and elsewhere a folder that may not be
+// written to cannot be moved into another, whose way back it would have to rewrite. bin sorts last,
+// so every other entry has been moved aside by the time it stops the removal.
+test('an entry that cannot be moved aside stops uninstalling with everything of the agent\'s where it was', { skip: process.getuid?.() === 0 }, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion removal held '));
+  const base = path.join(root, '.legion-control');
+  const bin = path.join(base, 'bin');
+  const code = ['agent', 'agent.prev', 'agent-swap.json', 'bin'];
+  for (const name of code) {
+    if (name.endsWith('.json')) fs.writeFileSync(path.join(base, name), '{}\n');
+    else fs.mkdirSync(path.join(base, name, 'inside'), { recursive: true });
+  }
+  fs.writeFileSync(path.join(base, 'config.json'), '{"sentinel":"leave exactly alone"}\n');
+  let holder = null;
+  if (process.platform === 'win32') holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: bin, stdio: 'ignore' });
+  else fs.chmodSync(bin, 0o500);
+  t.after(async () => {
+    if (holder) await new Promise((resolve) => { holder.on('exit', resolve); holder.kill(); });
+    else fs.chmodSync(bin, 0o700);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const held = runRemoval(base, 'purge');
+  assert.equal(held.status, 1, held.stdout);
+  assert.match(held.stderr, /bin.*; nothing was removed\n$/);
+  assert.equal(held.stdout, '');
+  assert.deepEqual(fs.readdirSync(base).sort(), [...code, 'config.json', 'op.lock.sqlite'].sort());
+  for (const name of code.filter((each) => !each.endsWith('.json'))) assert.equal(fs.existsSync(path.join(base, name, 'inside')), true, name);
+  assert.equal(fs.readFileSync(path.join(base, 'config.json'), 'utf8'), '{"sentinel":"leave exactly alone"}\n');
+});
+
+// A file in a folder that may not be written to cannot be deleted. Windows has no such folder for
+// its owner, so this runs elsewhere.
+test('what cannot be deleted once it is aside is named, and the next uninstall takes it', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion removal left '));
+  const base = path.join(root, '.legion-control');
+  const locked = path.join(base, 'agent', 'locked');
+  fs.mkdirSync(locked, { recursive: true });
+  fs.writeFileSync(path.join(locked, 'index.mjs'), '\n');
+  fs.mkdirSync(path.join(base, 'bin'));
+  fs.chmodSync(locked, 0o500);
+  t.after(() => {
+    const folders = fs.existsSync(base) ? fs.readdirSync(base, { recursive: true }).map((name) => path.join(base, name)) : [];
+    for (const folder of folders) if (fs.lstatSync(folder).isDirectory()) fs.chmodSync(folder, 0o700);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const first = runRemoval(base, 'code');
+  assert.equal(first.status, 0, first.stderr);
+  const lines = first.stdout.trim().split('\n');
+  assert.deepEqual(lines.slice(0, 2), [`removed ${path.join(base, 'agent')}`, `removed ${path.join(base, 'bin')}`]);
+  assert.match(lines[2], /^could not delete all of .*agent\.removed\.[^ ]+ yet, and the next uninstall does: \S/);
+  assert.equal(lines.length, 3);
+  const aside = fs.readdirSync(base).filter((name) => name.startsWith('agent.removed.'));
+  assert.equal(aside.length, 1, fs.readdirSync(base).join(', '));
+  assert.equal(fs.existsSync(path.join(base, 'agent')), false);
+
+  fs.chmodSync(path.join(base, aside[0], 'agent', 'locked'), 0o700);
+  const second = runRemoval(base, 'purge');
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(second.stdout, `removed ${path.join(base, aside[0])}\nremoved ${base}\n`);
+  assert.equal(fs.existsSync(base), false);
 });
 
 // Windows PowerShell reads a script without a byte order mark in the ANSI code page, so anything

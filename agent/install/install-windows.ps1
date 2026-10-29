@@ -358,6 +358,32 @@ const CODE = /^(?:bin|agent|agent\..+|agent-swap\.json|agent-baseline\.json)$/;
 const DATA = /^(?:config\..+|controller\..+|agent-floor\.json.*|state|state\.json.*|ops|incoming|legionctl\.log.*|launchd\.log|update\.lock.*|op\.lock.*)$/;
 const say = (line) => process.stdout.write(`${line}\n`);
 
+// Moves all of `names` into one folder in the base, or none of them, and
+// returns that folder. On Windows a file in use, or a folder a process works
+// in, cannot be moved, and deleting one entry after another would stop there
+// with the job still running what is left. The folder is named like an agent
+// tree, so the next uninstall takes it if it outlives this one.
+function moveAside(names) {
+  const aside = path.join(base, `agent.removed.${process.pid}.${Date.now()}`);
+  fs.mkdirSync(aside);
+  const moved = [];
+  try {
+    for (const name of names) {
+      fs.renameSync(path.join(base, name), path.join(aside, name));
+      moved.push(name);
+    }
+  } catch (error) {
+    const stuck = moved.reverse().filter((name) => {
+      try { fs.renameSync(path.join(aside, name), path.join(base, name)); return false; }
+      catch { return true; }
+    });
+    if (stuck.length > 0) throw new Error(`${error.message}; ${stuck.join(', ')} could not be put back from ${aside}`);
+    fs.rmdirSync(aside);
+    throw new Error(`${error.message}; nothing was removed`);
+  }
+  return aside;
+}
+
 function remove() {
   if (!fs.existsSync(base)) return;
   const db = new DatabaseSync(path.join(base, 'op.lock.sqlite'));
@@ -368,10 +394,12 @@ function remove() {
       if (error?.errcode === 5) throw new Error('another operation is running; nothing was removed');
       throw error;
     }
-    const doomed = fs.readdirSync(base).filter((name) => CODE.test(name) || (scope === 'purge' && DATA.test(name))).sort();
-    for (const name of doomed.filter((each) => !each.startsWith('op.lock'))) {
-      fs.rmSync(path.join(base, name), { recursive: true, force: true });
-      say(`removed ${path.join(base, name)}`);
+    const doomed = fs.readdirSync(base).filter((name) => (CODE.test(name) || (scope === 'purge' && DATA.test(name))) && !name.startsWith('op.lock')).sort();
+    if (doomed.length > 0) {
+      const aside = moveAside(doomed);
+      for (const name of doomed) say(`removed ${path.join(base, name)}`);
+      try { fs.rmSync(aside, { recursive: true, force: true }); }
+      catch (error) { say(`could not delete all of ${aside} yet, and the next uninstall does: ${error.message}`); }
     }
   } finally {
     try { db.exec('ROLLBACK'); } catch { /* no transaction if acquisition failed */ }
@@ -379,14 +407,15 @@ function remove() {
   }
   if (scope !== 'purge') return;
   for (const name of fs.readdirSync(base).filter((each) => each.startsWith('op.lock'))) {
-    fs.rmSync(path.join(base, name), { recursive: true, force: true });
+    try { fs.rmSync(path.join(base, name), { recursive: true, force: true }); }
+    catch (error) { say(`could not remove ${path.join(base, name)}: ${error.message}`); }
   }
-  const kept = fs.readdirSync(base).sort();
-  if (kept.length === 0) {
+  const left = fs.readdirSync(base).sort();
+  if (left.length === 0) {
     fs.rmdirSync(base);
     say(`removed ${base}`);
   }
-  for (const name of kept) say(`kept ${path.join(base, name)}, which is not the agent's`);
+  for (const name of left.filter((each) => !CODE.test(each) && !DATA.test(each))) say(`kept ${path.join(base, name)}, which is not the agent's`);
 }
 
 try { remove(); }
