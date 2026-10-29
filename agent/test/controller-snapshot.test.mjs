@@ -11,7 +11,7 @@ import {
 import { SRC, cli, withHome, writeConfig } from './helpers.mjs';
 
 const document = (revision, lineage = []) => JSON.stringify({
-  version: 3, controller: { id: 'snapshot-test', revision, lineage, source: 'cli' },
+  version: 1, controller: { id: 'snapshot-test', revision, lineage, source: 'cli' },
   machines: [{ id: 'machine', name: `Revision ${revision}` }],
 });
 const journalPath = (home) => path.join(home, 'controller.commit.json');
@@ -185,7 +185,7 @@ test('concurrent publication and reads never return mixed documents, hashes, or 
   await withHome(async (home) => {
     storeController(document(1));
     const done = path.join(home, 'writer.done');
-    const source = `import fs from 'node:fs';import {storeController,readControllerMeta} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'controller.mjs')).href)};import {acquireOperationLock} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'lock.mjs')).href)};for(let revision=2;revision<=35;revision++){const held=acquireOperationLock({kind:'config',waitMs:5000});if(!held.ok)throw new Error(held.message);try{const meta=readControllerMeta();const raw=JSON.stringify({version:3,controller:{id:'snapshot-test',revision,lineage:[meta.hash,...meta.lineage].slice(0,32),source:'cli'},machines:[{id:'machine',name:'Revision '+revision}]});const result=storeController(raw);if(!result.ok)throw new Error(result.error);}finally{held.lock.release();}}fs.writeFileSync(${JSON.stringify(done)},'done');`;
+    const source = `import fs from 'node:fs';import {storeController,readControllerMeta} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'controller.mjs')).href)};import {acquireOperationLock} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'lock.mjs')).href)};for(let revision=2;revision<=35;revision++){const held=acquireOperationLock({kind:'config',waitMs:5000});if(!held.ok)throw new Error(held.message);try{const meta=readControllerMeta();const raw=JSON.stringify({version:1,controller:{id:'snapshot-test',revision,lineage:[meta.hash,...meta.lineage].slice(0,32),source:'cli'},machines:[{id:'machine',name:'Revision '+revision}]});const result=storeController(raw);if(!result.ok)throw new Error(result.error);}finally{held.lock.release();}}fs.writeFileSync(${JSON.stringify(done)},'done');`;
     const writer = spawn(process.execPath, ['--input-type=module', '-e', source], { env: { ...process.env, LEGIONCTL_HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] });
     let error = '';
     writer.stderr.on('data', (chunk) => { error += chunk; });

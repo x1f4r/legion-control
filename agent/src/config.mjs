@@ -30,7 +30,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CONTRACT_VERSION } from './contract.mjs';
+import { CLOCK_TIME_PATTERN, CONFIGURED_ID_PATTERN, CONTRACT_VERSION } from './contract.mjs';
 import { acquireFileLock, stateLockPath, writeJsonAtomic } from './state.mjs';
 
 /** The running agent's own tree: the directory above src/, holding package.json and, in a release, the signed manifest. */
@@ -652,7 +652,7 @@ function normalizeWindow(report, where, raw) {
   const time = (key, fallback) => {
     if (raw[key] === undefined || raw[key] === null) return fallback;
     const value = raw[key];
-    if (typeof value !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+    if (typeof value !== 'string' || !CLOCK_TIME_PATTERN.test(value)) {
       report.error(`${where}.${key}`, `expected a 24-hour local time like "02:30", got ${JSON.stringify(value)}`);
       return fallback;
     }
@@ -740,16 +740,13 @@ const KIND_KEYS = {
   command: ['installedVersion', 'latestVersion', 'update', 'verify', 'rollback', 'requireVersionMatch'],
 };
 
-/** Ids travel over ssh as bare tokens, so they are held to the token grammar. */
-const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-
 function normalizeService(report, raw, index, { platform, base }) {
   const where = `services[${index}]`;
   if (!isPlainObject(raw)) {
     return report.error(where, `expected an object describing a service, got ${JSON.stringify(raw)}`);
   }
   const id = reqStr(report, `${where}.id`, raw.id, `service-${index + 1}`);
-  if (id !== null && !ID_PATTERN.test(id)) {
+  if (id !== null && !CONFIGURED_ID_PATTERN.test(id)) {
     report.error(
       `${where}.id`,
       `the id ${JSON.stringify(id)} has characters that cannot be passed safely over SSH`,
@@ -940,7 +937,7 @@ const BOOT_METHODS = ['efi-bootnext', 'clear-bootsequence', 'bootsequence', 'gru
 function normalizeBootTarget(report, where, id, raw) {
   if (!isPlainObject(raw)) return report.error(where, `expected an object describing a boot target, got ${JSON.stringify(raw)}`);
   rejectUnknownKeys(report, where, raw, ['name', 'method', 'match', 'entry', 'arm', 'verify']);
-  if (!ID_PATTERN.test(id)) {
+  if (!CONFIGURED_ID_PATTERN.test(id)) {
     report.error(`${where}`, `the boot target id ${JSON.stringify(id)} cannot be passed safely over SSH`, 'use letters, digits, dot, dash and underscore only');
   }
   if (!BOOT_METHODS.includes(raw.method)) {
@@ -1125,7 +1122,7 @@ function normalizeActions(report, raw) {
       report.error(`${where}.id`, 'an action needs an id');
       return;
     }
-    if (!ID_PATTERN.test(id)) {
+    if (!CONFIGURED_ID_PATTERN.test(id)) {
       report.error(
         `${where}.id`,
         `the id ${JSON.stringify(id)} has characters that cannot be passed safely over SSH`,
@@ -1196,7 +1193,7 @@ function normalizeTelemetry(report, raw) {
     }
     rejectUnknownKeys(report, where, entry, ['id', 'name', 'unit', 'command', 'timeoutSeconds']);
     const id = reqStr(report, `${where}.id`, entry.id);
-    if (!id || !ID_PATTERN.test(id) || id.length > 64 || seen.has(id)) {
+    if (!id || !CONFIGURED_ID_PATTERN.test(id) || id.length > 64 || seen.has(id)) {
       report.error(`${where}.id`, 'expected a unique id of at most 64 letters, digits, dots, dashes or underscores');
       continue;
     }

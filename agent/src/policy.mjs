@@ -22,7 +22,7 @@
 // can say "paused until Tuesday" rather than "nothing happened".
 
 import { WEEKDAYS } from './config.mjs';
-import { REASON } from './contract.mjs';
+import { CLOCK_TIME_PATTERN, REASON } from './contract.mjs';
 import { serviceState } from './state.mjs';
 
 function minutesOfDay(hhmm) {
@@ -333,7 +333,7 @@ export function validatePolicyPatch(raw, { perService }) {
         if (unknown) errors.push({ path: `${where}.days`, message: `unknown day ${JSON.stringify(unknown)}; one of ${WEEKDAYS.join(', ')}` });
         for (const key of ['from', 'to']) {
           if (entry[key] === undefined || entry[key] === null) continue;
-          if (typeof entry[key] !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(entry[key])) {
+          if (typeof entry[key] !== 'string' || !CLOCK_TIME_PATTERN.test(entry[key])) {
             errors.push({ path: `${where}.${key}`, message: `expected a 24-hour local time like "02:30", got ${JSON.stringify(entry[key])}` });
           }
         }

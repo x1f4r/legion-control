@@ -172,11 +172,11 @@ function oneService(home, { initial = {}, service = {} } = {}) {
  * A setup document every client accepts (contract section 9.7), with its
  * lineage, and with `systems` when it should carry a launch value.
  */
-function setupText({ id = 'setup-conformance', revision, lineage = [], name = 'Beacon', systems = undefined }) {
+function setupText({ id = 'setup-conformance', revision, lineage = [], name = 'Beacon', systems = undefined, host = '192.0.2.40' }) {
   const document = {
     version: 1,
     controller: { id, revision, lineage, source: 'cli' },
-    machines: [{ id: 'pi', name, ...(systems ? { systems } : {}), endpoints: [{ id: 'lan', host: '192.0.2.40', user: 'me' }] }],
+    machines: [{ id: 'pi', name, ...(systems ? { systems } : {}), endpoints: [{ id: 'lan', host, user: 'me' }] }],
   };
   return `${JSON.stringify(document, null, 2)}\n`;
 }
@@ -586,14 +586,27 @@ test('config conforms through a whole lineage, and serves exactly the bytes it h
       assert.equal(locked.outcome, 'deferred');
     });
 
-    // These answer according to the document checks a restricted session and
-    // section 9.7 add; whichever way they go, the reply has to hold.
-    set('{"version": 1}\n');
-    set('{"version": 1, "version": 1, "machines": []}\n');
+    // The document checks of section 9.4: a member written twice is refused
+    // before anything else, a broken descendant before it is written, and
+    // what a client would only warn about is stored with notes.
+    const descendant = { id: 'setup-other', revision: 2, lineage: [canonicalHash(other)] };
+    assert.equal(set('{"version": 1}\n').reasonCode, 'controller-conflict');
+    const repeated = set('{"version": 1, "version": 1, "machines": []}\n');
+    assert.equal(repeated.reasonCode, 'config-invalid');
+    assert.deepEqual(repeated.problems.map((problem) => problem.path), ['version']);
+    const invalid = set(setupText({ ...descendant, host: 'victim.example,*' }));
+    assert.equal(invalid.reasonCode, 'config-invalid');
+    assert.equal(invalid.outcome, 'failed');
+    assert.deepEqual(invalid.problems.map((problem) => problem.path), ['machines[0].endpoints[0].host']);
+    const notedText = setupText({ ...descendant, systems: [{ id: 'linux', platform: 'linux' }] });
+    const noted = set(notedText);
+    assert.equal(noted.action, 'stored');
+    assert.match(noted.notes[0], /^machines\[0\]\.systems\[0\]: pi\/linux has no agent command/);
+
     const launcher = { id: 'linux', agent: ['/usr/bin/node', '/home/me/.legion-control/bin/launcher.mjs'] };
     invoke(home, ['config', 'set'], {
       restricted: true,
-      stdin: setupText({ id: 'setup-other', revision: 2, lineage: [canonicalHash(other)], name: 'Restricted', systems: [launcher] }),
+      stdin: setupText({ id: 'setup-other', revision: 3, lineage: [canonicalHash(notedText), canonicalHash(other)], name: 'Restricted', systems: [launcher] }),
     });
   });
 });

@@ -6,7 +6,7 @@ import test from 'node:test';
 import { canonicalHash, controllerMetaPath, controllerPath, readController, storeController } from '../src/controller.mjs';
 import { withHome } from './helpers.mjs';
 
-const document = (revision, lineage = []) => JSON.stringify({ version: 3,
+const document = (revision, lineage = []) => JSON.stringify({ version: 1,
   controller: { id: 'sharing-test', revision, lineage, source: 'cli' }, machines: [] });
 
 for (const phase of ['document', 'metadata', 'journal']) {

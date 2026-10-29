@@ -1100,6 +1100,8 @@ async function commandConfig(positional, flags, options) {
         // and only the second is a merge, so it always says which.
         ...(stored.reasonCode === REASON.controllerConflict ? { divergent: stored.divergent === true } : {}),
         ...(stored.current ? { current: stored.current } : {}),
+        // Why a document was refused, as paths a client can point at.
+        ...(stored.problems ? { problems: stored.problems } : {}),
         error: stored.error,
       });
     }
@@ -1121,6 +1123,8 @@ async function commandConfig(positional, flags, options) {
       revision: stored.meta.revision,
       source: stored.meta.source,
       ...(action === 'replaced' ? { replaced: true } : {}),
+      // Stored all the same: what a client can use but would say something about.
+      ...(stored.notes?.length > 0 ? { notes: stored.notes } : {}),
     });
   } finally {
     lock.lock.release();
@@ -1359,7 +1363,7 @@ async function commandVersion(flags, loaded) {
       'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
       'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs',
       'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'scheduler.mjs',
-      'selfupdate.mjs', 'service.mjs', 'state.mjs', 'status.mjs', 'trust.mjs', 'update.mjs',
+      'selfupdate.mjs', 'service.mjs', 'setup-document.mjs', 'state.mjs', 'status.mjs', 'trust.mjs', 'update.mjs',
     ];
     const failed = [];
     let loadedCount = 0;

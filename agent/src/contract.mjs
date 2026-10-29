@@ -239,6 +239,18 @@ export const OPERATION_ID_PATTERN = /^[a-z0-9-]{8,64}$/;
 /** Durations a client may write for an expiry or a pause: 30m, 4h, 2d. */
 export const DURATION_PATTERN = /^\d+(m|h|d)$/;
 
+/**
+ * Service, action and boot target ids, and the action a wake helper runs.
+ * They travel over ssh as bare tokens, so they are a narrower token.
+ */
+export const CONFIGURED_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** The shared setup's identity: one to 64 characters, and never a path. */
+export const SETUP_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+
+/** A local time of day in a maintenance window: 00:00 to 23:59. */
+export const CLOCK_TIME_PATTERN = /^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/;
+
 const DURATION_UNITS = { m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 };
 
 /** Milliseconds for a duration token, or null when it is not one. */
