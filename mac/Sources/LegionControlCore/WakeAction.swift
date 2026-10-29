@@ -42,12 +42,23 @@ enum WakeAction {
         /// The run may have been dispatched and no terminal record has been read. On a helper that
         /// keeps records, its record is read once, waiting up to twenty seconds for it to finish,
         /// and only a finished record or the helper having none ends the hold.
+        ///
+        /// Having none means what it says only for a run that may never have arrived. A helper that
+        /// answered the run — accepted it, replayed it, or said it could not tell how it went — had
+        /// it, and losing the record since is no evidence that the command never ran. Filed as
+        /// "never reached", a run the helper itself could not account for became a known failure.
         func ambiguous(_ failure: AgentFailure, running: Bool, summary said: String? = nil) async -> WakeActionOutcome {
             if dialect.supportsOperations,
                let reply = try? await read(try AgentRequest.operation(id: id, wait: OperationDriver.pollSeconds)) {
                 if let operation = reply.operation, operation.isFinished {
                     operations?.reconcile(id, with: operation)
                     return settled(OperationDriver.finalResult(from: operation, accepted: AgentActionResult()))
+                }
+                if reply.isUnknownOperation, failure.dispatch == .acknowledged {
+                    let summary = "\(action) may or may not have run: \(machineName) answered it, and has no record of it any more."
+                    operations?.resolveAsLost(id, summary: summary, detail: running ? nil : failure.detailText)
+                    return .init(sent: false, summary: summary, failure: nil,
+                                 isDeclaredWakePacket: declaredPacket, isAmbiguous: false)
                 }
                 if reply.isUnknownOperation {
                     operations?.resolveAsNeverStarted(id)

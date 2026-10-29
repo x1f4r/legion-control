@@ -418,6 +418,22 @@ final class OperationStore {
         }
     }
 
+    /// The far side answered this request and has no record of it now: the record was pruned, or
+    /// lost under it. Unlike an id it never heard of, that says nothing about whether the work ran,
+    /// so the outcome stays unknown. It is no longer owed, because there is nothing left to read,
+    /// and a wake hold on it ends, because nothing is still running under an id the helper does not
+    /// know (section 10.2).
+    func resolveAsLost(_ id: String, summary: String, detail: String? = nil) {
+        update(id) { record in
+            Self.release(&record, reason: "the helper has no record of it")
+            record.state = .unknown
+            record.needsReconciliation = false
+            record.summary = summary
+            record.detail = detail ?? record.detail
+            if record.finishedAt == nil { record.finishedAt = Date() }
+        }
+    }
+
     /// The user has read the unknown outcome and does not want to be asked again. A wake hold on it
     /// goes with it: a person has decided they are done with that command.
     func dismissReconciliation(_ id: String) {

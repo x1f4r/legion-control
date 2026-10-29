@@ -144,6 +144,48 @@ struct WakeActionTests {
         #expect(!outcome.sent)
         #expect(!outcome.isAmbiguous)
         #expect(store.wakeHolds(target: "tower").isEmpty)
+        // The helper accepted the run, so losing its record says nothing about whether the command
+        // ran. It was filed as a failure that never reached the helper.
+        let record = try #require(store.records.first)
+        #expect(record.state == .unknown)
+        #expect(!record.needsReconciliation)
+        #expect(record.summary == "wake-tower may or may not have run: Pi answered it, and has no record of it any more.")
+        #expect(outcome.summary == record.summary)
+    }
+
+    @Test("a helper that has no record of a run it answered ends the hold and leaves the run unknown")
+    func answeredThenLostIsUnknown() async throws {
+        // The helper said it could not tell how the run went, and then has no record of it. That
+        // ends the hold, but "never reached" would contradict the helper's own answer.
+        let internalError = try ContractCorpus.data("fixtures/error.internal.json")
+        let notFound = try ContractCorpus.data("fixtures/op.not-found.json")
+        let (store, directory) = Self.store()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outcome = await Self.run(store: store, send: { _ in
+            try JSONDecoder().decode(AgentActionResult.self, from: internalError)
+        }, read: { _ in
+            try JSONDecoder().decode(AgentOperationResult.self, from: notFound)
+        })
+        #expect(!outcome.sent)
+        #expect(!outcome.isAmbiguous)
+        #expect(store.wakeHolds(target: "tower").isEmpty)
+        let record = try #require(store.records.first)
+        #expect(record.state == .unknown)
+        #expect(!record.needsReconciliation)
+        #expect(record.summary == "wake-tower may or may not have run: Pi answered it, and has no record of it any more.")
+        #expect(record.detail?.contains("failed while writing the operation record") == true)
+        #expect(record.phases.contains { $0.name == "wake hold released" && $0.detail == "tower: the helper has no record of it" })
+
+        // A run that may never have arrived, with no record of it, never started.
+        let (lostStore, lostDirectory) = Self.store()
+        defer { try? FileManager.default.removeItem(at: lostDirectory) }
+        let lost = await Self.run(store: lostStore,
+                                  send: { _ in throw AgentFailure(.linkLost, dispatch: .unknown) },
+                                  read: { _ in try JSONDecoder().decode(AgentOperationResult.self, from: notFound) })
+        #expect(!lost.isAmbiguous)
+        #expect(lostStore.wakeHolds(target: "tower").isEmpty)
+        #expect(lostStore.records.first?.state == .failed)
+        #expect(lostStore.records.first?.summary.contains("never reached") == true)
     }
 
     @Test("a stated unknown that a finished record backs is final, and ends the hold at once")
