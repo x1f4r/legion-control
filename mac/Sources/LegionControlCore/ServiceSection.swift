@@ -120,14 +120,15 @@ struct ServiceSection: View {
     @ViewBuilder
     private func processVerdict(_ service: ServiceStatus) -> some View {
         if let process = service.process {
-            if process.running == true {
+            if process.isUnknown {
+                StatusText(symbol: "questionmark.circle", text: process.error?.isEmpty == false ? process.error! : "Not known",
+                           tint: .orange)
+            } else if process.running == true {
                 let started = ISO8601DateFormatter.lenient.date(from: process.startedAt)
                 StatusText(symbol: "checkmark.circle",
                            text: started.map { "Running since \($0.formatted(date: .abbreviated, time: .shortened))" }
                             ?? "Running",
                            tint: .green)
-            } else if let error = process.error, !error.isEmpty {
-                StatusText(symbol: "exclamationmark.triangle", text: error, tint: .orange)
             } else {
                 StatusText(symbol: "xmark.circle", text: process.state ?? "Not running", tint: .red)
             }

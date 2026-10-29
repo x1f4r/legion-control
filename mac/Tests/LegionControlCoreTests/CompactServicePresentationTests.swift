@@ -43,6 +43,17 @@ struct CompactServicePresentationTests {
     }
 }
 
+extension CompactServicePresentationTests {
+    @Test("a process probe that failed is not known, never stopped")
+    func failedProcessProbe() throws {
+        // The probe answers running false beside its error, and the row used to say Stopped (G13).
+        let status = try JSONDecoder().decode(AgentStatus.self, from: ContractCorpus.data("fixtures/status.process-unknown.json"))
+        let service = try #require(status.resolvedServices.first { $0.process?.error != nil })
+        #expect(service.process?.isUnknown == true)
+        #expect(CompactServicePresentation.state(for: service) != "Stopped")
+    }
+}
+
 @MainActor
 struct SheetActionRelayTests {
     @Test("sheet actions run once after dismissal and a plain dismissal runs nothing")

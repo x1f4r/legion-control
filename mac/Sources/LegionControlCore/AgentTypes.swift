@@ -581,6 +581,10 @@ struct AgentConfigResult: Decodable, Sendable {
     var divergent: Bool?
     /// What a `config-invalid` refusal found wrong with the document, at most fifty.
     var problems: [DocumentProblem]?
+    /// The launch values a restricted push carried that the machine does not hold, by path.
+    var launchChanges: [String]?
+    /// What became of a `config set`, as agent 3.1.0 states it (section 5.6).
+    var outcome: String?
     /// `stored`, `noop` or `replaced`.
     var action: String?
     /// How big the stored document is.

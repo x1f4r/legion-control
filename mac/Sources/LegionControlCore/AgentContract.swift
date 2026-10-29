@@ -471,6 +471,11 @@ struct AgentProcessInfo: Decodable, Sendable, Equatable {
     var state: String?
     var startedAt: String?
     var error: String?
+
+    /// Whether the probe failed, so nobody knows whether the process runs. A failed probe answers
+    /// `running: false` beside its error, and drawn from that flag it read as a service that had
+    /// stopped (G13): it is shown as unknown exactly when there is an error.
+    var isUnknown: Bool { error != nil }
 }
 
 struct AgentHealthInfo: Decodable, Sendable, Equatable {
@@ -662,6 +667,8 @@ struct AgentDoctorResult: Decodable, Sendable {
     var reasonCode: String?
     var notes: [String]?
     var checks: [AgentCheck]?
+    /// How many checks came out `ok`, `warn` and `fail`, as the agent counted them.
+    var counts: [String: Int]?
 }
 
 // MARK: - History, logs, policy, bundle
@@ -730,6 +737,8 @@ struct AgentPolicyResult: Decodable, Sendable {
     var autoUpdate: Bool?
     /// Which keys a `policy set` actually changed.
     var changed: [String]?
+    /// What became of a `policy set`, as agent 3.1.0 states it (section 5.6).
+    var outcome: String?
 
     struct ServicePolicy: Decodable, Sendable, Equatable, Identifiable {
         var id: String
@@ -828,6 +837,9 @@ struct AgentBusyResult: Decodable, Sendable {
     var reason: String?
     var monitoredServices: Int?
     var unmonitoredServices: Int?
+    /// The one-service shape, and a machine with none, put the busy record at the top level.
+    var monitored: Bool?
+    var evidence: String?
     var services: [Service]?
 
     struct Service: Decodable, Sendable, Equatable, Identifiable {

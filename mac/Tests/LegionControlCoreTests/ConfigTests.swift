@@ -892,6 +892,28 @@ struct ConfigTests {
         #expect(!text.contains("PRIVATE KEY"))
     }
 
+    @Test("a bindings file that asks for a shell is refused, and the settings from before it stay")
+    func bindingsWithAShellAreRefused() throws {
+        let home = try Self.temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let store = BindingsStore(url: home.appending(path: "bindings.json"))
+        #expect(store.update { $0.deviceName = "Desk tower"; $0.selfBinding = .init(machine: "tower") } == nil)
+
+        // A local agent is spawned as an argv; a shell beside it has nothing on its far side, and
+        // the decoder used to drop the key and run the argv as though it were not there.
+        try Data(#"{"deviceName":"Changed","self":{"machine":"tower"},"localAgent":{"argv":["node","/a.mjs"],"shell":"cmd"}}"#.utf8)
+            .write(to: store.url)
+        store.reloadIfChanged()
+        #expect(store.bindings.deviceName == "Desk tower")
+        #expect(store.problem?.contains("localAgent.shell is not a setting") == true)
+
+        #expect(Bindings.problems(in: Data(#"{"localAgent":{"argv":[]}}"#.utf8)).count == 1)
+        #expect(Bindings.problems(in: Data(#"{"self":{"system":"linux"}}"#.utf8)).count == 1)
+        #expect(Bindings.problems(in: Data("[]".utf8)).count == 1)
+        // Keys this build does not know are left alone, as they are everywhere else.
+        #expect(Bindings.problems(in: Data(#"{"knownHostsFile":"~/kh","machines":{"pi":{"sshAlias":"pi","port":2222}}}"#.utf8)).isEmpty)
+    }
+
     @Test("private bindings retire the deprecated shared local block on this device")
     func bindingsReplaceSharedLocal() throws {
         let home = try Self.temporaryHome()

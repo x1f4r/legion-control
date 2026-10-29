@@ -15,6 +15,8 @@ struct ServiceConfigReply: Decodable, Sendable {
     var errors: [Issue]?
     var reasonCode: String?
     var message: String?
+    /// What became of a `service-config set`, as agent 3.1.0 states it (section 5.6).
+    var outcome: String?
     struct Template: Decodable, Sendable, Identifiable {
         var id: String
         var name: String

@@ -148,4 +148,6 @@ extension VectorJSON: ExpressibleByStringLiteral, ExpressibleByBooleanLiteral, E
     init(_ value: String?) { self = value.map(VectorJSON.string) ?? .null }
     /// A number, or null when there is none.
     init(_ value: Int?) { self = value.map { .number(Double($0)) } ?? .null }
+    /// A boolean, or null when there is none.
+    init(_ value: Bool?) { self = value.map(VectorJSON.bool) ?? .null }
 }
