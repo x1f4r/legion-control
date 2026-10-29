@@ -17,6 +17,7 @@ import {
   basePath,
   configPath,
   detectPlatform,
+  lastGoodConfigPath,
   lastGoodInfo,
   operationsDir,
   readJsonDocument,
@@ -35,6 +36,7 @@ import { currentHolder } from './lock.mjs';
 import { checkServiceBusy } from './probes/busy.mjs';
 import { checkHealth } from './probes/health.mjs';
 import { listOperations } from './operations.mjs';
+import { redactConfig, redactReply, valueRedactor } from './redact.mjs';
 import { describeSystemUpdates, scheduledEligibility } from './policy.mjs';
 import { livenessOf, probeService } from './service.mjs';
 import { trustFingerprint } from './trust.mjs';
@@ -699,7 +701,9 @@ async function serviceChecks(config, service, { deep }) {
 export async function runDoctor(loaded, { service = null, deep = false } = {}) {
   const startedAt = Date.now();
   const raw = readJsonDocument(loaded.path ?? configPath());
-  const sanitize = diagnosticRedactor(loaded.config, raw.state === 'ok' ? raw.value : null);
+  // The last copy that loaded cleanly as well: a config.json that stopped
+  // parsing still has its old values quoted in records and log lines.
+  const sanitize = valueRedactor(loaded.config, raw.state === 'ok' ? raw.value : null, readJsonDocument(lastGoodConfigPath()).value);
   const checks = [...configChecks(loaded), ...environmentChecks(), ...agentChecks()];
 
   const config = loaded.config;
@@ -791,114 +795,12 @@ export async function runDoctor(loaded, { service = null, deep = false } = {}) {
   };
 }
 
-const REDACTED = '<redacted>';
-const sensitiveKey = (key) => /token|secret|password|passwd|apikey|authorization|credential|identityfile|privatekey|^auth$|^key$/i.test(key.replace(/[_-]/g, ''));
-
-/** Collect configured values only; this cannot identify arbitrary output secrets. */
-function diagnosticRedactor(...configs) {
-  const values = new Set();
-  const remember = (value) => {
-    if (typeof value === 'string' && value.length > 0) {
-      values.add(value);
-      // Both raw text and JSON-escaped echoes can occur in captured output.
-      values.add(JSON.stringify(value).slice(1, -1));
-    }
-  };
-  const collect = (value, sensitive = false) => {
-    if (typeof value === 'string') {
-      if (sensitive) remember(value);
-      try {
-        const url = new URL(value);
-        for (const credential of [url.username, url.password]) {
-          remember(credential);
-          try { remember(decodeURIComponent(credential)); } catch { /* retain encoded value */ }
-        }
-        for (const [key, inner] of url.searchParams) if (sensitiveKey(key)) remember(inner);
-        for (const pair of url.search.slice(1).split('&')) {
-          const separator = pair.indexOf('=');
-          if (separator < 0) continue;
-          try {
-            if (sensitiveKey(decodeURIComponent(pair.slice(0, separator).replace(/\+/g, ' ')))) remember(pair.slice(separator + 1));
-          } catch { /* malformed query encoding is retained as unknown text */ }
-        }
-      } catch { /* most config strings are not URLs */ }
-    } else if (Array.isArray(value)) {
-      const argv = value.every((item) => typeof item === 'string');
-      value.forEach((item, index) => {
-        collect(item, sensitive || (argv && index > 0));
-        if (argv && index > 0) {
-          const assignment = /^[^=\s]+=(.*)$/s.exec(item);
-          if (assignment) remember(assignment[1]);
-        }
-      });
-    } else if (value && typeof value === 'object') {
-      for (const [key, inner] of Object.entries(value)) collect(inner, sensitive || sensitiveKey(key));
-    }
-  };
-  configs.forEach((config) => collect(config));
-  const escaped = [...values].sort((a, b) => b.length - a.length).map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const pattern = escaped.length ? new RegExp(escaped.join('|'), 'g') : null;
-  const walk = (value) => {
-    if (typeof value === 'string') return pattern ? value.split(REDACTED).map((part) => part.replace(pattern, () => REDACTED)).join(REDACTED) : value;
-    if (Array.isArray(value)) return value.map(walk);
-    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, walk(inner)]));
-    return value;
-  };
-  return walk;
-}
-
-/**
- * Keys whose values a client decodes rather than reads: identifiers, enum
- * words, versions, timestamps, hashes and the names a reply is about. A
- * configured argument that happens to be a word like "restart" or "busy" is
- * still redacted wherever it appears in prose, but rewriting it inside these
- * turned an operation's kind into "re<redacted>" and a reason code into
- * something no schema allows, and the bundle into a reply no client decodes.
- */
-const VERBATIM_KEYS = new Set([
-  'agentVersion', 'system', 'reasonCode', 'deferredReason', 'action', 'outcome', 'state', 'phase', 'kind', 'mode', 'evidence', 'level', 'disposition',
-  'id', 'opId', 'service', 'target', 'actionId', 'systemId', 'hash', 'keyFingerprint', 'lineage', 'source', 'version', 'from', 'to',
-  'installed', 'latest', 'nightly', 'staged', 'channel', 'pendingVersion', 'replaced', 'floor', 'signed',
-  'requestedAt', 'startedAt', 'updatedAt', 'finishedAt', 'expiresAt', 'checkedAt', 'at', 'nextWindow', 'pauseUntil', 'generatedAt', 'days',
-  'controller', 'raw', 'meta', 'current', 'command', 'argument', 'accepts', 'name', 'os', 'node', 'unit', 'capabilities', 'launchChanges', 'path',
-]);
-
-/** Redact the free text of a reply with `redact`, leaving every value under VERBATIM_KEYS as it is. */
-export function redactReply(value, redact, key = null) {
-  if (key !== null && VERBATIM_KEYS.has(key)) return value;
-  if (Array.isArray(value)) return value.map((item) => redactReply(item, redact));
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([name, inner]) => [name, redactReply(inner, redact, name)]));
-  }
-  return redact(value);
-}
-
-/** Keep executable names for diagnosis; every subsequent argument is private. */
-export function redactConfig(config) {
-  if (!config) return null;
-  const walk = (value, key = '') => {
-    if (sensitiveKey(key)) return REDACTED;
-    if (Array.isArray(value)) {
-      if (value.every((item) => typeof item === 'string')) return value.map((item, index) => index === 0 ? item : REDACTED);
-      return value.map((item) => walk(item));
-    }
-    if (value && typeof value === 'object') {
-      const out = {};
-      for (const [name, inner] of Object.entries(value)) out[name] = walk(inner, name);
-      return out;
-    }
-    return value;
-  };
-
-  return diagnosticRedactor(config)(walk(config));
-}
-
 /** The diagnostic bundle: doctor, status, history, logs and a sanitized config. */
 export async function buildBundle({ doctor, status, history, logs, config, rawConfig = null }) {
   void AGENT_VERSION;
   void CONTRACT_VERSION;
   void os;
-  const sanitize = diagnosticRedactor(config, rawConfig);
+  const sanitize = valueRedactor(config, rawConfig, readJsonDocument(lastGoodConfigPath()).value);
   const evidence = redactReply({ doctor, status, history, logs }, sanitize);
   return {
     generatedAt: new Date().toISOString(),

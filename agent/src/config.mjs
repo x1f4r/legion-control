@@ -1398,7 +1398,118 @@ export function readJsonDocument(file) {
     const parsed = JSON.parse(raw);
     return { state: 'ok', value: parsed, error: null, raw };
   } catch (err) {
-    return { state: 'malformed', value: null, error: `${file} does not parse as JSON: ${err.message}`, raw };
+    return { state: 'malformed', value: null, error: `${file} does not parse as JSON: ${jsonParseProblem(err, raw)}`, raw };
+  }
+}
+
+/**
+ * Where JSON text stops parsing, said without quoting it: "line 3, column 8",
+ * "the JSON ends early", or "invalid JSON".
+ *
+ * V8's own message quotes the text around the fault, and the text is
+ * config.json, whose arguments a restricted key must not read (contract
+ * section 13). Its position is taken from the message when it gives one, and
+ * found here when it does not: V8 names no position for an unexpected token,
+ * which is the commonest hand edit there is, a trailing comma or a comment.
+ */
+export function jsonParseProblem(error, raw) {
+  const message = String(error?.message ?? '');
+  const reported = /\(line ([0-9]+) column ([0-9]+)\)/.exec(message);
+  if (reported) return `line ${reported[1]}, column ${reported[2]}`;
+  const text = typeof raw === 'string' ? raw : '';
+  const position = /at position ([0-9]+)/.exec(message);
+  const offset = position ? Number(position[1]) : jsonStopOffset(text);
+  if (offset !== null && offset < text.length) {
+    const before = text.slice(0, offset);
+    const line = before.split('\n').length;
+    return `line ${line}, column ${offset - before.lastIndexOf('\n')}`;
+  }
+  if (offset !== null || /Unexpected end of JSON input/.test(message)) return 'the JSON ends early';
+  return 'invalid JSON';
+}
+
+const JSON_NUMBER = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
+
+/**
+ * Where a strict JSON reader stops in `text`: the offset of the first
+ * character it cannot take, the length of the text when the text ends too
+ * early, or null when it is JSON after all.
+ */
+function jsonStopOffset(text) {
+  let at = 0;
+  const stop = () => { throw at; };
+  const space = () => { while (at < text.length && ' \t\n\r'.includes(text[at])) at += 1; };
+  const expect = (character) => {
+    if (text[at] !== character) stop();
+    at += 1;
+  };
+  const string = () => {
+    expect('"');
+    while (text[at] !== '"') {
+      if (at >= text.length || text.charCodeAt(at) < 0x20) stop();
+      if (text[at] !== '\\') {
+        at += 1;
+        continue;
+      }
+      at += 1;
+      if (text[at] === 'u') {
+        at += 1;
+        for (let digit = 0; digit < 4; digit += 1) {
+          if (!/[0-9A-Fa-f]/.test(text[at] ?? '')) stop();
+          at += 1;
+        }
+      } else if (at < text.length && '"\\/bfnrt'.includes(text[at])) {
+        at += 1;
+      } else {
+        stop();
+      }
+    }
+    at += 1;
+  };
+  const value = () => {
+    space();
+    if (text[at] === '{' || text[at] === '[') {
+      const close = text[at] === '{' ? '}' : ']';
+      at += 1;
+      space();
+      if (text[at] === close) {
+        at += 1;
+        return;
+      }
+      for (;;) {
+        if (close === '}') {
+          space();
+          string();
+          space();
+          expect(':');
+        }
+        value();
+        space();
+        if (text[at] !== ',') break;
+        at += 1;
+      }
+      expect(close);
+      return;
+    }
+    if (text[at] === '"') return string();
+    for (const literal of ['true', 'false', 'null']) {
+      if (text[at] === literal[0]) {
+        for (const character of literal) expect(character);
+        return;
+      }
+    }
+    JSON_NUMBER.lastIndex = at;
+    const number = JSON_NUMBER.exec(text);
+    if (number === null) stop();
+    at += number[0].length;
+  };
+  try {
+    value();
+    space();
+    return at < text.length ? at : null;
+  } catch (offset) {
+    // A document nested deeper than the stack is not one to locate by hand.
+    return typeof offset === 'number' ? offset : null;
   }
 }
 
@@ -1561,6 +1672,16 @@ function saveConfigLocked(patch) {
 // ---------------------------------------------------------------------------
 
 /**
+ * How a message names a command: by its executable, never its arguments.
+ * Arguments are configuration a person chose, a token or a private path among
+ * them, and every failure message used to carry the first 160 characters of
+ * the command line to whoever read the reply (contract section 13).
+ */
+export function commandLabel(file) {
+  return path.basename(String(file));
+}
+
+/**
  * Shared process runner. Always an argv array, never a shell string, so a
  * Windows npm prefix or "C:\Program Files\nodejs" cannot break quoting.
  */
@@ -1579,10 +1700,7 @@ export function runCommand(file, args = [], options = {}) {
   const stderr = typeof result.stderr === 'string' ? result.stderr : '';
   const timedOut = result.error?.code === 'ETIMEDOUT' || result.signal === 'SIGTERM';
 
-  // A PowerShell script passed as one argument is hundreds of characters long
-  // and would otherwise end up verbatim in every error message.
-  const full = [file, ...args].join(' ');
-  const command = full.length > 160 ? `${full.slice(0, 160)}...` : full;
+  const command = commandLabel(file);
 
   return {
     ok: result.status === 0,
@@ -1618,8 +1736,7 @@ export function runCommandAsync(file, args = [], options = {}) {
   return new Promise((resolve) => {
     const timeoutMs = options.timeoutMs ?? 30000;
     const maxBuffer = options.maxBuffer ?? 16 * 1024 * 1024;
-    const full = [file, ...args].join(' ');
-    const command = full.length > 160 ? `${full.slice(0, 160)}...` : full;
+    const command = commandLabel(file);
 
     let child;
     try {

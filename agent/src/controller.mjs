@@ -30,7 +30,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath } from './config.mjs';
+import { basePath, jsonParseProblem } from './config.mjs';
 import { REASON, SETUP_ID_PATTERN } from './contract.mjs';
 import { approvalsFrom, launchProjection, launchReview } from './launch.mjs';
 import { findRepeatedMember, validateSetupDocument } from './setup-document.mjs';
@@ -265,7 +265,7 @@ function documentSnapshot(bytes, meta, { requireMatch = false } = {}) {
     if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('not a JSON object');
   } catch (error) {
     return { document: null, raw, text: null, hash, meta: requireMatch ? legacyMeta() : meta, consistent: !requireMatch,
-      error: error.message === 'not a JSON object' ? 'controller.json is not a JSON object' : `controller.json does not parse: ${error.message}` };
+      error: error.message === 'not a JSON object' ? 'controller.json is not a JSON object' : `controller.json does not parse: ${jsonParseProblem(error, text)}` };
   }
   if (requireMatch) {
     const block = readControllerBlock(document);
@@ -645,7 +645,7 @@ export function storeController(input, { id = null, revision = null, source = nu
   try {
     parsed = JSON.parse(text);
   } catch (error) {
-    return failed(`the document does not parse: ${error.message}`);
+    return failed(`the document does not parse: ${jsonParseProblem(error, text)}`);
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return failed('the document is not a JSON object');
 

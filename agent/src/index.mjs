@@ -52,6 +52,7 @@ import { buildBundle, runDoctor } from './doctor.mjs';
 import { reportedFloor } from './floor.mjs';
 import { acquireOperationLock } from './lock.mjs';
 import { log, readLogLines } from './log.mjs';
+import { redactReply, restrictedRedactor } from './redact.mjs';
 import {
   beginOperation,
   cancelOperation,
@@ -156,9 +157,41 @@ const VALUE_OPTIONS = new Set([
 /** Options whose value is a path and therefore not held to the token grammar. */
 const PATH_OPTIONS = new Set(['from']);
 
+/**
+ * Write the one reply. A restricted key reads it redacted (contract section
+ * 13): the configured values of config.json and its last good copy are
+ * replaced wherever the reply quotes them in free text. Records and the log on
+ * disk keep everything, for the person who owns the machine.
+ *
+ * If redaction itself fails, the reply is replaced rather than sent as it
+ * was: a restricted key gets an internal error, and a mutation's outcome is
+ * unknown, so its client re-reads the operation instead of guessing.
+ */
 function emit(payload, exitCode) {
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
-  process.exitCode = exitCode;
+  let reply = payload;
+  let code = exitCode;
+  if (isRestrictedSession()) {
+    try {
+      reply = redactReply(payload, restrictedRedactor());
+    } catch (error) {
+      log(`a reply could not be redacted for a restricted session: ${error?.message ?? error}`, 'main');
+      const message = 'the reply could not be redacted for a restricted session';
+      reply = {
+        ok: false,
+        contract: CONTRACT_VERSION,
+        agentVersion: AGENT_VERSION,
+        system: systemIdentity ?? { id: platformName(), name: platformName() },
+        reasonCode: REASON.internal,
+        message,
+        ...(answeringMutation || 'outcome' in payload ? { outcome: 'unknown' } : {}),
+        command: null,
+        error: message,
+      };
+      code = 1;
+    }
+  }
+  process.stdout.write(`${JSON.stringify(reply)}\n`);
+  process.exitCode = code;
 }
 
 function parseArgs(argv) {
@@ -1363,7 +1396,7 @@ async function commandVersion(flags, loaded) {
       'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'launch.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
       'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
       'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs',
-      'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'scheduler.mjs',
+      'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'redact.mjs', 'scheduler.mjs',
       'selfupdate.mjs', 'service.mjs', 'setup-document.mjs', 'state.mjs', 'status.mjs', 'trust.mjs', 'update.mjs',
     ];
     const failed = [];
@@ -1607,6 +1640,9 @@ async function answer(command, positional, flags, options) {
  * the same execute() an ordinary session uses.
  */
 async function commandDispatch() {
+  // Only a restricted key arrives here, so its reply is redacted whether or
+  // not the forced command said so, a refusal included.
+  process.env.LEGIONCTL_RESTRICTED = '1';
   const line = process.env.SSH_ORIGINAL_COMMAND ?? '';
   const authorized = authorize(line);
   if (!authorized.ok) {
@@ -1626,7 +1662,6 @@ async function commandDispatch() {
     }
     return refused;
   }
-  process.env.LEGIONCTL_RESTRICTED = '1';
   return execute(authorized.argv);
 }
 

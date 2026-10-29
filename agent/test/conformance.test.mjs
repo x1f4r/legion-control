@@ -690,7 +690,14 @@ test('service-config, version and help conform', async () => {
 test('a restricted key gets the same shapes as an ordinary session', async () => {
   await withHome(async (home) => {
     const dir = fixtureData(home, { latest: '2.0.0' });
-    writeConfig(home, fixtureConfig(dir, { actions: [{ id: 'say', command: call(dir, 'action') }] }));
+    // Configured arguments are redacted from every reply a restricted key
+    // reads (contract section 13), and these collide with the enum words a
+    // client decodes: redaction has to leave those alone for the replies to hold.
+    const canaries = ['restart', 'busy', 'finished', 'deferred', 'update', 'running'];
+    writeConfig(home, fixtureConfig(dir, {
+      services: [commandService(dir, { latestVersion: [...call(dir, 'latest'), ...canaries] })],
+      actions: [{ id: 'say', command: [...call(dir, 'action'), ...canaries] }],
+    }));
     const ran = invoke(home, ['run', 'say'], { restricted: true });
     invoke(home, ['update'], { restricted: true });
     invoke(home, ['status'], { restricted: true });
