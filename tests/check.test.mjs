@@ -50,6 +50,8 @@ test('the agent check runs the contract tests after the validator and the genera
   assert.ok(at('node contract/validate.mjs') >= 0, green.calls.join('\n'));
   assert.ok(at('node contract/tools/generate.mjs --check') > at('node contract/validate.mjs'), green.calls.join('\n'));
   assert.ok(at('node --test contract/test/passing.test.mjs') > at('node contract/tools/generate.mjs --check'), green.calls.join('\n'));
+  // The checks of the whole checkout come before any test runs.
+  assert.ok(at('node scripts/check-syntax.mjs') >= 0 && at('node scripts/check-syntax.mjs') < at('npm --prefix agent test'), green.calls.join('\n'));
 
   // CI and the release preflight both run this leg, so one failing contract test stops both.
   write('contract/test/planted.test.mjs', FAILING);
