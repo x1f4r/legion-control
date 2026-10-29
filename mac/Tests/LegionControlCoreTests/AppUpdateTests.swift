@@ -189,6 +189,24 @@ struct AppUpdateTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
     }
 
+    @Test("an archive a single byte longer than its signed size is stopped and deleted")
+    func downloadStopsOneBytePastSignedSize() async throws {
+        let parent = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let archive = Self.randomBytes(200_000)
+        // The signed size is exactly the archive, and the server sends one byte more, on its own.
+        let served = try Self.serveRelease(archive: archive, declaredSize: Int64(archive.count),
+                                           archiveRoute: .init(chunks: Self.chunked(archive) + [Data([0x00])]))
+        defer { served.forget() }
+
+        await #expect {
+            try await AppUpdates.download(served.release, session: StubURLProtocol.session(), key: served.key, into: parent)
+        } throws: { error in
+            (error as? AppUpdates.InstallFailure)?.message.contains("ran past the 200000 bytes") == true
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
+    }
+
     @Test("an archive whose announced length is larger than its signed size is refused before it is read")
     func downloadRefusesAnnouncedOversize() async throws {
         let parent = try Self.temporaryDirectory()
@@ -198,10 +216,33 @@ struct AppUpdateTests {
             headers: ["Content-Length": "\(1 << 30)"], chunks: Self.chunked(archive)))
         defer { served.forget() }
 
-        await #expect(throws: AppUpdates.InstallFailure.self) {
+        // The body itself is exactly the signed size, so only the announced length can be what
+        // refused it.
+        await #expect {
             try await AppUpdates.download(served.release, session: StubURLProtocol.session(), key: served.key, into: parent)
+        } throws: { error in
+            (error as? AppUpdates.InstallFailure)?.message.contains("ran past the 1000 bytes") == true
         }
         #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
+    }
+
+    @Test("a reply announced larger than its ceiling is refused before a byte of it is written")
+    func receiveWritesNothingPastAnnouncedCeiling() async throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = URL(string: "https://stub.example/\(UUID().uuidString)/\(AppUpdates.assetName)")!
+        StubURLProtocol.serve(url, .init(headers: ["Content-Length": "\(1 << 30)"], chunks: Self.chunked(Self.randomBytes(1000))))
+        defer { StubURLProtocol.forget([url]) }
+        let archive = root.appending(path: AppUpdates.assetName)
+        #expect(FileManager.default.createFile(atPath: archive.path, contents: nil))
+        let file = try FileHandle(forWritingTo: archive)
+
+        await #expect(throws: AppUpdates.TooLarge.self) {
+            try await AppUpdates.receive(URLRequest(url: url), limit: 1000, session: StubURLProtocol.session(),
+                                         into: AppUpdates.Body(file: file))
+        }
+        try file.close()
+        #expect(try Data(contentsOf: archive).isEmpty)
     }
 
     @Test("a manifest over 256 KiB is refused, and nothing after it is asked for")
