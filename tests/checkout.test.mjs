@@ -31,3 +31,33 @@ test('every command of the Codex environments runs a script the checkout tracks 
   }
   assert.ok(commands > 0, 'no Codex environment runs anything');
 });
+
+test('scripts are written out with the line endings they run with, in every checkout', () => {
+  // `git ls-files --eol` gives, for each file, the endings the index holds, the ones the working
+  // tree has, and the attributes that decide what a checkout makes of them, whatever core.autocrlf
+  // says on the machine.
+  const files = new Map(git('ls-files', '--eol', '--', '*.sh', '*.ps1', '**/gradlew', '**/gradlew.bat').split('\n').filter(Boolean).map((line) => {
+    const [, index, attributes, file] = /^i\/(\S*)\s+w\/\S*\s+attr\/(.*?)\s*\t(.+)$/.exec(line);
+    return [file, { index, attributes }];
+  }));
+  for (const file of ['scripts/check.sh', 'agent/install/install-linux.sh', 'agent/install/install-windows.ps1', 'android/gradlew', 'android/gradlew.bat']) {
+    assert.ok(files.has(file), `${file} is not in the checkout`);
+  }
+  for (const [file, { index, attributes }] of files) {
+    if (file.endsWith('.bat')) {
+      assert.equal(attributes, '-text', `${file} is converted on checkout`);
+      assert.equal(index, 'crlf', `${file} is stored with ${index} line endings`);
+    } else {
+      assert.equal(attributes, 'text eol=lf', `${file} has no LF rule`);
+      assert.equal(index, 'lf', `${file} is stored with ${index} line endings`);
+    }
+  }
+  // And a script added later, anywhere, under the same rules.
+  const later = git('check-attr', 'text', 'eol', '--', 'somewhere/new.sh', 'somewhere/new.ps1', 'somewhere/gradlew', 'somewhere/gradlew.bat');
+  assert.equal(later, [
+    'somewhere/new.sh: text: set', 'somewhere/new.sh: eol: lf',
+    'somewhere/new.ps1: text: set', 'somewhere/new.ps1: eol: lf',
+    'somewhere/gradlew: text: set', 'somewhere/gradlew: eol: lf',
+    'somewhere/gradlew.bat: text: unset', 'somewhere/gradlew.bat: eol: unspecified',
+  ].join('\n') + '\n');
+});
