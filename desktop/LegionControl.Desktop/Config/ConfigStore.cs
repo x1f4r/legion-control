@@ -74,7 +74,8 @@ public sealed class ConfigStore : IDisposable
     /// before the document is applied and nobody is asked about what they just typed.
     ///
     /// Raised by [ApplyEdit] and [ApplyEditIfCurrent], by a hand edit of the file that keeps its
-    /// `controller` block, by a file with no identity that is given one here, and by
+    /// `controller` block, by a file with no identity that is given one here while no setup is
+    /// applied, and by
     /// [WriteExample]. Never by [Apply] or [ApplyIfCurrent], and never for a document either of
     /// those wrote, here or in another process on this device: what another peer wrote, a merge
     /// and a kept revision approve nothing.
@@ -164,11 +165,16 @@ public sealed class ConfigStore : IDisposable
         if (!document.Identity.HasIdentity)
         {
             var assigned = ControllerIdentity.NewSetup(decoded.Identity.Name, DeviceName);
-            // A file with no identity is the user's own: one written by hand, or the first one on
-            // this device. Whatever it changed from what was applied here is theirs. One that a
-            // process here adopted is stamped onto exactly itself, so nothing it carries counts as
-            // changed.
-            var editedFrom = WasAdopted(document) ? new EditedFrom(document.Bytes) : AppliedEditedFrom();
+            // A file with no identity becomes a setup of its own, so it is no edit of the one
+            // applied here: contract section 9.9 lets only a hand edit that keeps its controller
+            // block approve. On a device that applies none it is the person's first setup, and
+            // approves what it holds. Over one that is applied it approves nothing, and what it
+            // changed waits for review: an old copy with the block taken out would otherwise put
+            // back a command reverted since and approve it. One that a process here adopted is
+            // stamped onto exactly itself, so nothing it carries counts as changed.
+            var editedFrom = WasAdopted(document) ? new EditedFrom(document.Bytes)
+                : _applied.Hash is null ? new EditedFrom(null)
+                : null;
             if (StampIdentity(assigned, data, "assigned-setup-id", editedFrom) is { } stampProblem)
             {
                 Problem = stampProblem;
@@ -315,10 +321,11 @@ public sealed class ConfigStore : IDisposable
             // Kept before it is written, so that another process reading the file in the moment
             // before it is recorded as applied still knows it for an adoption (see [WasAdopted]).
             Ledger.Remember(document);
-            // The ledger never says why it could not keep a document. Without that copy, one that
-            // another process here would read as a hand edit of what is applied, one with no
-            // identity or a sibling branch with the same identity, would approve every launch value
-            // it changed, so it is not written at all.
+            // The ledger never says why it could not keep a document. Without that copy, another
+            // process here would take a sibling branch with the same identity for a hand edit of
+            // what is applied, and one with no identity for a person's first setup where none is
+            // applied, and either would approve every launch value it changed, so neither is
+            // written at all.
             ReloadApplied();
             if (!WasAdopted(document) && _applied.Hash != document.Hash
                 && (!document.Identity.HasIdentity || _applied.MatchesIdentityOf(document.Identity)))

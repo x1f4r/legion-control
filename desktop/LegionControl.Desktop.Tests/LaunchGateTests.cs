@@ -875,7 +875,7 @@ public class LaunchGateTests
         updateSuggestions: new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))));
 
     [Fact]
-    public void ADocumentWithNoIdentityApprovesOnlyWhenItIsThisDevicesOwn()
+    public void ADocumentWithNoIdentityApprovesOnlyAsTheFirstSetupHere()
     {
         using var home = new TempHome();
         var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
@@ -887,12 +887,57 @@ public class LaunchGateTests
         // Handed over by a machine: it is given an identity here, and approves nothing.
         Assert.Null(app.Config.Apply(LaunchDocuments.Of(anonymous), "took the setup from pi"));
         Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(app.LaunchReview).Path);
+        var approved = Record(home, "laptop").ToJsonString();
 
-        // Written into the file by a person: theirs.
+        // Written into the file by a person over the setup applied here: a setup of its own, and no
+        // edit of that one, so it approves nothing either.
         LaunchDocuments.System(anonymous, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/srv/mine/launcher.mjs");
         File.WriteAllBytes(app.Config.Path, LaunchDocuments.Of(anonymous).Bytes);
         app.Config.Load();
-        Assert.Equal(new[] { "node", "/srv/mine/launcher.mjs" }, Gated(app, "pi", "linux").Agent);
+        Assert.True(app.Config.Document!.Identity.HasIdentity);
+        Assert.Equal(approved, Record(home, "laptop").ToJsonString());
+        Assert.Equal(new[] { LaunchValues.SystemPath("tower", "linux"), LaunchValues.SystemPath("pi", "linux") },
+            app.LaunchReview.Select(entry => entry.Path));
+        Assert.Equal(LaunchDocuments.Pi, Gated(app, "pi", "linux").Agent);
+
+        // Written by a person on a device that applies no setup: their first one, and theirs.
+        using var desk = Device(home, "desk");
+        File.WriteAllBytes(desk.Config.Path, LaunchDocuments.Of(anonymous).Bytes);
+        desk.Config.Load();
+        Assert.Empty(desk.LaunchReview);
+        Assert.Equal(new[] { "node", "/srv/mine/launcher.mjs" }, Gated(desk, "pi", "linux").Agent);
+    }
+
+    /// A peer's command for tower is reverted here, and then the revision that carried it is copied
+    /// over the setup file with its controller block taken out, the way a file read out before the
+    /// revert comes back. Nothing in it says where it is from.
+    [Fact]
+    public void AnOldCopyWithItsControllerBlockTakenOutPutsBackNoRevertedCommand()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        using var app = Device(home, "laptop", applied: d0);
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "id"));
+        Assert.Null(app.Config.Apply(d1, "adopted from pi"));
+        Assert.Null(app.RevertLaunch(Assert.Single(app.LaunchReview)));
+        Assert.Empty(app.LaunchReview);
+        var reverted = app.Config.Document!;
+        var approved = Record(home, "laptop").ToJsonString();
+
+        var copy = JsonNode.Parse(d1.Text)!.AsObject();
+        copy.Remove("controller");
+        LaunchDocuments.Machine(copy, "pi")["name"] = "Pi upstairs";
+        File.WriteAllText(app.Config.Path, copy.ToJsonString());
+        app.Config.Load();
+
+        // It applies, as a setup of its own, and the peer's command waits again.
+        Assert.NotEqual(reverted.Identity.Id, app.Config.Document!.Identity.Id);
+        Assert.Equal("Pi upstairs", app.Machine("pi")!.Name);
+        Assert.Equal(approved, Record(home, "laptop").ToJsonString());
+        var waiting = Assert.Single(app.LaunchReview);
+        Assert.Equal(LaunchValues.SystemPath("tower", "linux"), waiting.Path);
+        Assert.Equal(LaunchDocuments.Tower, Gated(app, "tower", "linux").Agent);
     }
 
     [Fact]
@@ -903,6 +948,15 @@ public class LaunchGateTests
         Assert.Null(app.Config.WriteExample());
         Assert.Empty(app.LaunchReview);
         Assert.NotEmpty(Gated(app, "example", "linux").Agent);
+
+        // Also where a setup was applied and its file is gone: the example is written into empty
+        // space, and is this device's own whatever was applied before.
+        using var desk = Device(home, "desk", applied: LaunchDocuments.Of(LaunchDocuments.Root()));
+        File.Delete(desk.Config.Path);
+        desk.Config.Load();
+        Assert.Null(desk.Config.WriteExample());
+        Assert.Empty(desk.LaunchReview);
+        Assert.NotEmpty(Gated(desk, "example", "linux").Agent);
     }
 
     // MARK: approving and reverting

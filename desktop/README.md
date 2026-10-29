@@ -111,9 +111,11 @@ machine or on a new system, with or without a shell of its own. A file given to
 `--command edit --in` without its `controller` block also needs `--hash HASH`, the setup it was
 written against. A hand edit of the file that keeps its `controller` block is never refused, because
 it is already written when it is read: it applies, approves what it changed, and leaves a waiting
-command it changed or carried waiting. Importing a setup into a device that has none approves
-everything in it, after showing all of it. Nothing that arrives from another peer approves anything,
-and neither do merges.
+command it changed or carried waiting. A file put in place without its `controller` block becomes a
+setup of its own: on a device that applies none it is the first setup there and approves what it
+holds, and over a setup that is applied it approves nothing, so whatever it changed waits for review.
+Importing a setup into a device that has none approves everything in it, after showing all of it.
+Nothing that arrives from another peer approves anything, and neither do merges.
 
 `--approve-launch` takes the hash the listing printed, and approves nothing once the setup is no
 longer that document, so a revision adopted in between is never approved unseen.
