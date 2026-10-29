@@ -173,21 +173,27 @@ public static class LaunchGate
     /// One reason an editor will not save a document, and the waiting value it is about, if any.
     public sealed record EditProblem(string Sentence, LaunchReviewEntry? Waiting = null);
 
-    /// What an editor refuses about an edit of [current] into [editedText].
+    /// What an editor refuses about an edit of [current] into [editedText], given the record this
+    /// device holds.
     ///
     /// An edit made here approves the launch values it changes, so it must not change one that is
     /// waiting: an edit to the shell of a system whose command waits would otherwise approve a
     /// command nobody here chose, and the form editors make those inputs read-only for exactly that
     /// reason. The text editor cannot, so the save is refused instead and the value is offered for
-    /// Approve or Revert. Carrying a waiting value somewhere else, under a renamed machine for
-    /// instance, is refused the same way. And an editor never saves an empty agent or a value that
-    /// could not be approved: a 1.3 Mac refuses a document with an empty agent, and a value that
-    /// cannot be shown faithfully is not one to approve by typing it.
+    /// Approve or Revert. Carrying a waiting value somewhere else, under a renamed machine or on a
+    /// new system, with or without a shell of its own, is refused the same way (see [Carried]).
+    /// And an editor never saves an empty agent or a value that could not be approved: a 1.3 Mac
+    /// refuses a document with an empty agent, and a value that cannot be shown faithfully is not
+    /// one to approve by typing it.
+    ///
+    /// What waits is worked out here, for exactly [current], never taken from a review an earlier
+    /// document left behind.
     public static IReadOnlyList<EditProblem> EditProblems(
-        ControllerDocument? current, IReadOnlyList<LaunchReviewEntry> review, string editedText)
+        ControllerDocument? current, LaunchRecord record, string editedText)
     {
         var before = LaunchProjection.Of(current);
         var after = LaunchProjection.Of(editedText);
+        var review = LaunchValues.Review(record, before);
         var problems = new List<EditProblem>();
 
         foreach (var entry in review.Where(entry => entry.Scope == LaunchScope.System))
@@ -213,10 +219,10 @@ public static class LaunchGate
                 _ => LaunchValues.LocalPath,
             };
             if (problems.Any(problem => problem.Waiting?.Path == path)) continue;
-            if (review.FirstOrDefault(entry => entry.Scope == change.Scope && JsonNode.DeepEquals(entry.Offered, change.Value)) is { } moved)
+            if (Carried(change, before, record, review) is { } carried)
             {
                 problems.Add(new EditProblem(
-                    $"{path} would take the value waiting for approval at {moved.Path}. Approve or revert it there first.", moved));
+                    $"{path} would take the value waiting for approval at {carried.Path}. Approve or revert it there first.", carried));
                 continue;
             }
             if (Unapprovable(change) is { } reason) problems.Add(new EditProblem($"{path} {reason}"));
@@ -236,6 +242,38 @@ public static class LaunchGate
         }
         return problems;
     }
+
+    /// The waiting value that [change], made by an edit of the document [before] projects, would
+    /// approve though nobody here chose it, or null. [waiting] is what waited in that document.
+    ///
+    /// The editors refuse such an edit, and a hand edit of the file, which is already written by
+    /// the time it is read, leaves the value waiting. A change carries one when it holds the very
+    /// value at another place, under a renamed machine or on a new system, or changes the tuple of
+    /// a system whose own tuple waits, which is what an edit of the shell makes of a peer's
+    /// command. For a system it also carries one when it holds a waiting argv under any other
+    /// grammar, wherever that is: a rename or a copy and a shell edit at once. The argv is what
+    /// nobody here chose, and the grammar only says how its line is quoted.
+    ///
+    /// A tuple the record accepts carries nothing, and neither does a new grammar for the argv a
+    /// system already had: that system's tuple did not wait, so its argv is one this device
+    /// approved, and quoting it another way is the person's own edit of it.
+    internal static LaunchReviewEntry? Carried(
+        LaunchChange change, LaunchProjection before, LaunchRecord record, IReadOnlyList<LaunchReviewEntry> waiting)
+    {
+        var same = waiting.FirstOrDefault(entry => entry.Scope == change.Scope && JsonNode.DeepEquals(entry.Offered, change.Value));
+        if (change.Scope != LaunchScope.System) return same;
+        var tuple = LaunchTuple.From(change.Value)!;
+        if (LaunchValues.Accepts(record, tuple)) return null;
+        if (same is not null) return same;
+        var systems = waiting.Where(entry => entry.Scope == LaunchScope.System).ToList();
+        if (systems.FirstOrDefault(entry => entry.MachineId == change.MachineId && entry.SystemId == change.SystemId) is { } here)
+            return here;
+        if (before.TupleAt(change.MachineId!, change.SystemId!)?.Agent is { } previous && SameArgv(previous, tuple.Agent!)) return null;
+        return systems.FirstOrDefault(entry => SameArgv(entry.OfferedTuple!.Agent!, tuple.Agent!));
+    }
+
+    private static bool SameArgv(IReadOnlyList<string> one, IReadOnlyList<string> other) =>
+        one.SequenceEqual(other, StringComparer.Ordinal);
 
     private static string? Unapprovable(LaunchChange change)
     {

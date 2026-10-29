@@ -677,8 +677,8 @@ public class LaunchGateTests
     }
 
     /// A peer's command for tower waits. Then the file is edited by hand, keeping its controller
-    /// block: tower's shell changed, the waiting command copied onto a new system, and pi given a
-    /// launcher of the person's own.
+    /// block: tower's shell changed, the waiting command copied onto two new systems, one of them
+    /// with a shell of its own, and pi given a launcher of the person's own.
     [Fact]
     public void AHandEditApprovesNeitherAWaitingCommandItReshellsNorOneItCopies()
     {
@@ -690,21 +690,48 @@ public class LaunchGateTests
         Assert.Null(app.Config.Apply(d1, "adopted from pi"));
 
         var edited = JsonNode.Parse(d1.Text)!.AsObject();
-        LaunchDocuments.System(edited, "tower", "linux")["shell"] = "powershell";
         LaunchDocuments.Machine(edited, "tower")["systems"]!.AsArray().Add(new JsonObject
         {
             ["id"] = "spare", ["name"] = "Spare", ["platform"] = "linux", ["shell"] = "posix", ["agent"] = LaunchDocuments.Argv(offered),
         });
+        Carry(edited, "tower", "other", "powershell");
+        LaunchDocuments.System(edited, "tower", "linux")["shell"] = "powershell";
         LaunchDocuments.System(edited, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/srv/pi/bin/launcher.mjs");
         File.WriteAllText(app.Config.Path, edited.ToJsonString());
         app.Config.Load();
 
         Assert.Contains(d1.Hash, app.Config.Document!.Identity.Lineage);
-        Assert.Equal(new[] { LaunchValues.SystemPath("tower", "linux"), LaunchValues.SystemPath("tower", "spare") },
+        Assert.Equal(new[] { LaunchValues.SystemPath("tower", "linux"), LaunchValues.SystemPath("tower", "spare"), LaunchValues.SystemPath("tower", "other") },
             app.LaunchReview.Select(entry => entry.Path));
         Assert.Equal(LaunchDocuments.Tower, Gated(app, "tower", "linux").Agent);
         Assert.Equal(LaunchState.NotDriven, Gated(app, "tower", "spare").LaunchState);
+        Assert.Equal(LaunchState.NotDriven, Gated(app, "tower", "other").LaunchState);
         Assert.Equal(new[] { "node", "/srv/pi/bin/launcher.mjs" }, Gated(app, "pi", "linux").Agent);
+    }
+
+    /// The same peer's command, carried by hand to a renamed machine and given another shell there.
+    [Fact]
+    public void AHandEditApprovesNoWaitingCommandItMovesToARenamedMachineUnderAnotherShell()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        using var app = Device(home, "laptop", applied: d0);
+        var offered = new[] { "sh", "-c", "touch /tmp/x" };
+        var d1 = LaunchDocuments.Descendant(d0, root => LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv(offered));
+        Assert.Null(app.Config.Apply(d1, "adopted from pi"));
+        var approved = Record(home, "laptop").ToJsonString();
+
+        var edited = JsonNode.Parse(d1.Text)!.AsObject();
+        Carry(edited, "desk", "linux", "powershell");
+        File.WriteAllText(app.Config.Path, edited.ToJsonString());
+        app.Config.Load();
+
+        Assert.Contains(d1.Hash, app.Config.Document!.Identity.Lineage);
+        var waiting = Assert.Single(app.LaunchReview);
+        Assert.Equal((LaunchValues.SystemPath("desk", "linux"), "new"), (waiting.Path, waiting.Kind));
+        Assert.Equal(LaunchState.NotDriven, Gated(app, "desk", "linux").LaunchState);
+        Assert.Empty(Gated(app, "desk", "linux").Agent);
+        Assert.Equal(approved, Record(home, "laptop").ToJsonString());
     }
 
     [Fact]
@@ -926,26 +953,135 @@ public class LaunchGateTests
             return root.ToJsonString();
         }
 
-        var shell = LaunchGate.EditProblems(d1, review, Edit(root => LaunchDocuments.System(root, "tower", "linux")["shell"] = "powershell"));
+        var shell = LaunchGate.EditProblems(d1, record, Edit(root => LaunchDocuments.System(root, "tower", "linux")["shell"] = "powershell"));
         Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(shell).Waiting!.Path);
 
-        var moved = LaunchGate.EditProblems(d1, review, Edit(root => LaunchDocuments.Machine(root, "tower")["id"] = "desk"));
+        var moved = LaunchGate.EditProblems(d1, record, Edit(root => LaunchDocuments.Machine(root, "tower")["id"] = "desk"));
         Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(moved).Waiting!.Path);
 
-        var emptied = LaunchGate.EditProblems(d1, review, Edit(root => LaunchDocuments.System(root, "pi", "linux")["agent"] = new JsonArray()));
+        // Moved or copied and given a shell of its own on the way: still the peer's argv.
+        foreach (var (machine, system) in new[] { ("desk", "linux"), ("tower", "spare") })
+        {
+            var carried = LaunchGate.EditProblems(d1, record, Edit(root => Carry(root, machine, system, "powershell")));
+            var problem = Assert.Single(carried);
+            Assert.Equal(LaunchValues.SystemPath("tower", "linux"), problem.Waiting!.Path);
+            Assert.StartsWith(LaunchValues.SystemPath(machine, system), problem.Sentence);
+        }
+
+        var emptied = LaunchGate.EditProblems(d1, record, Edit(root => LaunchDocuments.System(root, "pi", "linux")["agent"] = new JsonArray()));
         Assert.Contains("needs an agent command", Assert.Single(emptied).Sentence);
 
-        var hidden = LaunchGate.EditProblems(d1, review, Edit(root =>
+        var hidden = LaunchGate.EditProblems(d1, record, Edit(root =>
             LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node\u200B", "/srv/pi/launcher.mjs")));
         Assert.Contains("invisible", Assert.Single(hidden).Sentence);
 
-        var refused = LaunchGate.EditProblems(d1, review, Edit(root =>
+        var refused = LaunchGate.EditProblems(d1, record, Edit(root =>
             LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/srv/pi/launcher.mjs", "--inspect")));
         Assert.Contains("restricted-agent-shape", Assert.Single(refused).Sentence);
 
-        Assert.Empty(LaunchGate.EditProblems(d1, review, Edit(root => LaunchDocuments.Machine(root, "tower")["name"] = "Desk tower")));
+        Assert.Empty(LaunchGate.EditProblems(d1, record, Edit(root => LaunchDocuments.Machine(root, "tower")["name"] = "Desk tower")));
         var (reverted, _) = LaunchGate.Reverted(d1, review[0]);
-        Assert.Empty(LaunchGate.EditProblems(d1, review, reverted!));
+        Assert.Empty(LaunchGate.EditProblems(d1, record, reverted!));
+    }
+
+    /// The pi's command waits because a peer took its restriction away. Carried to a renamed
+    /// machine with the restriction back, it is the tuple this device approved, and carries nothing.
+    /// And the tower's own approved argv may still be quoted another way while the same argv waits
+    /// on a system the peer added with a grammar of its own.
+    [Fact]
+    public void AnEditorStillSavesATupleThisDeviceApprovedWhereverItCameFrom()
+    {
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        var record = LaunchRecord.Seeded(LaunchProjection.Of(d0), d0.Hash);
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+        {
+            LaunchDocuments.System(root, "pi", "linux")["restricted"] = false;
+            LaunchDocuments.Machine(root, "tower")["systems"]!.AsArray().Add(new JsonObject
+            {
+                ["id"] = "spare", ["name"] = "Spare", ["platform"] = "linux", ["shell"] = "powershell", ["agent"] = LaunchDocuments.Argv(LaunchDocuments.Tower),
+            });
+        });
+        Assert.Equal(new[] { LaunchValues.SystemPath("tower", "spare"), LaunchValues.SystemPath("pi", "linux") },
+            LaunchValues.Review(record, LaunchProjection.Of(d1)).Select(entry => entry.Path));
+        string Edit(Action<JsonObject> change)
+        {
+            var root = JsonNode.Parse(d1.Text)!.AsObject();
+            change(root);
+            return root.ToJsonString();
+        }
+
+        Assert.Empty(LaunchGate.EditProblems(d1, record, Edit(root =>
+        {
+            LaunchDocuments.Machine(root, "pi")["id"] = "nas";
+            LaunchDocuments.System(root, "nas", "linux")["restricted"] = true;
+        })));
+        Assert.Empty(LaunchGate.EditProblems(d1, record, Edit(root => LaunchDocuments.System(root, "tower", "linux")["shell"] = "cmd")));
+        // Not where it was approved, though: on a new system the same argv, whatever its grammar,
+        // is the peer's spare system carried there.
+        var copied = Assert.Single(LaunchGate.EditProblems(d1, record, Edit(root => LaunchDocuments.Machine(root, "tower")["systems"]!.AsArray().Add(new JsonObject
+        {
+            ["id"] = "other", ["name"] = "Other", ["platform"] = "linux", ["shell"] = "cmd", ["agent"] = LaunchDocuments.Argv(LaunchDocuments.Tower),
+        }))));
+        Assert.Equal(LaunchValues.SystemPath("tower", "spare"), copied.Waiting!.Path);
+    }
+
+    /// The edit that puts the waiting tower command at [machine]'s [system] with [shell]: under a
+    /// renamed tower when [machine] is not "tower", and copied onto a new system of the tower
+    /// otherwise.
+    private static void Carry(JsonObject root, string machine, string system, string shell)
+    {
+        var tower = LaunchDocuments.Machine(root, "tower");
+        if (machine != "tower")
+        {
+            tower["id"] = machine;
+            LaunchDocuments.System(root, machine, system)["shell"] = shell;
+            return;
+        }
+        var waiting = LaunchDocuments.System(root, "tower", "linux");
+        tower["systems"]!.AsArray().Add(new JsonObject
+        {
+            ["id"] = system, ["name"] = "Spare", ["platform"] = "linux", ["shell"] = shell, ["agent"] = waiting["agent"]!.DeepClone(),
+        });
+    }
+
+    /// What the window's editor saves through: the peer's tower command, moved to a renamed machine
+    /// or copied to a new system and given another shell on the way, is never applied, so nothing
+    /// approves it; the tuple this device approved for the pi is applied wherever it is put.
+    [Fact]
+    public void AnEditNeverAppliesAWaitingCommandItMovedOrCopiedUnderAnotherShell()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        using var app = Device(home, "laptop", applied: d0);
+        var offered = new[] { "sh", "-c", "touch /tmp/x" };
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+        {
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv(offered);
+            LaunchDocuments.System(root, "pi", "linux")["restricted"] = false;
+        });
+        Assert.Null(app.Config.Apply(d1, "adopted from pi"));
+        var approved = Record(home, "laptop").ToJsonString();
+
+        foreach (var (machine, system) in new[] { ("desk", "linux"), ("tower", "spare") })
+        {
+            var edited = JsonNode.Parse(d1.Text)!.AsObject();
+            Carry(edited, machine, system, "powershell");
+            var (document, _, refused) = app.ApplyEdit(edited.ToJsonString(), d1.Hash, "edited here");
+
+            Assert.Null(document);
+            Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(refused).Waiting!.Path);
+            Assert.Equal(d1.Bytes, File.ReadAllBytes(app.Config.Path));
+            Assert.Equal(approved, Record(home, "laptop").ToJsonString());
+        }
+        Assert.DoesNotContain(app.EffectiveMachines().SelectMany(each => each.Systems), each => each.Agent.SequenceEqual(offered));
+
+        var restored = JsonNode.Parse(d1.Text)!.AsObject();
+        LaunchDocuments.Machine(restored, "pi")["id"] = "nas";
+        LaunchDocuments.System(restored, "nas", "linux")["restricted"] = true;
+        Assert.NotNull(app.ApplyEdit(restored.ToJsonString(), d1.Hash, "edited here").Document);
+        Assert.Equal(LaunchDocuments.Pi, Gated(app, "nas", "linux").Agent);
+        Assert.Equal(LaunchState.Approved, Gated(app, "nas", "linux").LaunchState);
+        Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(app.LaunchReview).Path);
     }
 
     /// The editor opens on a document whose tower command waits, so its text holds the peer's
@@ -1132,8 +1268,13 @@ public class LaunchGateTests
         }
     }
 
-    [Fact]
-    public async Task TheCommandLineEditRefusesToCarryAWaitingCommand()
+    /// The waiting tower command given another shell where it is, under a renamed machine, or on a
+    /// new system.
+    [Theory]
+    [InlineData("tower", "linux")]
+    [InlineData("desk", "linux")]
+    [InlineData("tower", "spare")]
+    public async Task TheCommandLineEditRefusesToCarryAWaitingCommand(string machine, string system)
     {
         using var home = new TempHome();
         var d0 = LaunchDocuments.Of(Unreachable(LaunchDocuments.Root()));
@@ -1143,7 +1284,8 @@ public class LaunchGateTests
             LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "id"));
         File.WriteAllBytes(home.ConfigPath, d1.Bytes);
         var edited = JsonNode.Parse(d1.Text)!.AsObject();
-        LaunchDocuments.System(edited, "tower", "linux")["shell"] = "powershell";
+        if ((machine, system) == ("tower", "linux")) LaunchDocuments.System(edited, "tower", "linux")["shell"] = "powershell";
+        else Carry(edited, machine, system, "powershell");
         var input = home.Write("edited.json", edited.ToJsonString());
         Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, home.ConfigPath);
         try

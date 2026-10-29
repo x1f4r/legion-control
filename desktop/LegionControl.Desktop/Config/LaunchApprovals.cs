@@ -109,22 +109,24 @@ public sealed class LaunchApprovals
             if (current.Missing && !_started)
                 return Apply(LaunchRecord.Seeded(previous ?? LaunchProjection.Empty, before is null ? "none" : Canonical.Hash(before)), changes);
             var record = current.Record ?? LaunchRecord.Empty();
-            var approved = previous is null ? changes : LeavingWaiting(changes, LaunchValues.Review(record, previous));
+            var approved = previous is null ? changes : LeavingWaiting(changes, previous, record);
             return approved.Count == 0 ? null : Apply(record, approved);
         }, setAside: true);
     }
 
-    /// The changes of a local edit less the two that would approve a value nobody here chose, given
-    /// what waited for review before it: a value that waits somewhere, carried to another place,
-    /// and a new tuple at a system whose own tuple waits, which is what an edit to the shell of a
-    /// peer's command makes of that command. The editors refuse both edits outright. A hand edit of
-    /// the file is already written by the time it is read, so it applies, and the values it carried
-    /// wait for review like any other.
-    private static IReadOnlyList<LaunchChange> LeavingWaiting(IReadOnlyList<LaunchChange> changes, IReadOnlyList<LaunchReviewEntry> waiting) =>
-        changes.Where(change => !waiting.Any(entry => entry.Scope == change.Scope
-            && (JsonNode.DeepEquals(entry.Offered, change.Value)
-                || (change.Scope == LaunchScope.System && entry.MachineId == change.MachineId && entry.SystemId == change.SystemId))))
-            .ToList();
+    /// The changes of a local edit less those that would approve a value nobody here chose, given
+    /// what waited for review in the document [before] it was made to: a waiting value carried to
+    /// another place, whatever shell it was given there, and a new tuple at a system whose own
+    /// tuple waits, which is what an edit to the shell of a peer's command makes of that command
+    /// (see [LaunchGate.Carried]). The editors refuse those edits outright. A hand edit of the file
+    /// is already written by the time it is read, so it applies, and the values it carried wait for
+    /// review like any other.
+    private static IReadOnlyList<LaunchChange> LeavingWaiting(
+        IReadOnlyList<LaunchChange> changes, LaunchProjection before, LaunchRecord record)
+    {
+        var waiting = LaunchValues.Review(record, before);
+        return changes.Where(change => LaunchGate.Carried(change, before, record, waiting) is null).ToList();
+    }
 
     /// Records exactly the values the entries showed, at their places. An entry that cannot be
     /// approved is skipped: a value that cannot be shown faithfully can only be reverted or left.

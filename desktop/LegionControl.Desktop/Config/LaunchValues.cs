@@ -571,6 +571,10 @@ public static class LaunchValues
         return changes;
     }
 
+    /// Whether [record] accepts [tuple] without asking: inert, equal to a tuple approved anywhere,
+    /// or the launcher migration of one.
+    public static bool Accepts(LaunchRecord record, LaunchTuple tuple) => new Approved(record).Accepts(tuple);
+
     /// Approving a review entry: exactly the value it showed, at its place.
     public static LaunchChange Change(this LaunchReviewEntry entry) =>
         new(entry.Scope, entry.MachineId, entry.SystemId, entry.Offered.DeepClone());

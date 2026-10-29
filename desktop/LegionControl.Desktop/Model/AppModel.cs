@@ -192,10 +192,7 @@ public sealed class AppModel : IDisposable
     {
         var document = Config.Document;
         if (document?.Hash != baseHash) return new[] { new LaunchGate.EditProblem(ConfigStore.MovedOn) };
-        // What waits is worked out for exactly the document the edit is checked against, never
-        // taken from a review an earlier one left behind.
-        var review = LaunchValues.Review(Approvals.Current, LaunchProjection.Of(document));
-        return LaunchGate.EditProblems(document, review, editedText);
+        return LaunchGate.EditProblems(document, Approvals.Current, editedText);
     }
 
     /// Applies an edit made on this device to the document [baseHash]: what the editor, the command
