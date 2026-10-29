@@ -20,9 +20,9 @@
 # by uninstalling it first, which throws away its ssh key.
 #
 # The toolchain is not negotiable and the failure modes are ugly, so this script pins all of it:
-# Gradle 9.5 through the wrapper checked into the repository, never the newer Gradle on PATH, because
-# AGP 8.13 calls into a Gradle internal that 9.6 removed. And JDK 21, never whichever java is on PATH,
-# because AGP refuses to run on a newer one. android/README.md has the long version.
+# Gradle 9.5 through the wrapper checked into the repository, never whichever Gradle is on PATH,
+# because AGP 8.13 calls into a Gradle internal that 9.6 removed. And JDK 21, never whichever java
+# is on PATH, because AGP refuses to run on a newer one. android/README.md has the long version.
 #
 set -euo pipefail
 
@@ -62,7 +62,7 @@ done
 # Toolchain
 # ---------------------------------------------------------------------------
 
-[ -x "$HERE/gradlew" ] || die "no Gradle wrapper at $HERE/gradlew. The wrapper is what pins Gradle 9.5; do not fall back to the gradle on PATH, it is too new for AGP 8.13."
+[ -x "$HERE/gradlew" ] || die "no Gradle wrapper at $HERE/gradlew. The wrapper is what pins Gradle 9.5; do not fall back to a gradle on PATH, AGP 8.13 fails on 9.6 and later."
 [ -f "$HERE/app/build.gradle.kts" ] || die "no app module at $HERE/app/build.gradle.kts."
 
 [ -d "$JAVA_HOME_PINNED" ] || die "no JDK 21 at $JAVA_HOME_PINNED. Install Temurin 21, or point LEGION_ANDROID_JAVA_HOME at your own copy; AGP 8.13 refuses a newer JDK."

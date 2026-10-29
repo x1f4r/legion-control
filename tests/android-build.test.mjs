@@ -43,11 +43,12 @@ cp "$1" "$out"
   return root;
 }
 
-function build(root, ...args) {
-  const env = { ...process.env, HOME: path.join(root, 'home'), LEGION_ANDROID_JAVA_HOME: path.join(root, 'jdk'), ANDROID_SDK_ROOT: path.join(root, 'sdk') };
+function buildWith(root, environment, ...args) {
+  const env = { ...process.env, HOME: path.join(root, 'home'), LEGION_ANDROID_JAVA_HOME: path.join(root, 'jdk'), ANDROID_SDK_ROOT: path.join(root, 'sdk'), ...environment };
   delete env.ANDROID_HOME;
   return spawnSync('bash', [path.join(root, 'android', 'build-apk.sh'), ...args], { encoding: 'utf8', env });
 }
+const build = (root, ...args) => buildWith(root, {}, ...args);
 const gradleArguments = (root) => fs.readFileSync(path.join(root, 'gradle-arguments'), 'utf8').trim().split('\n');
 
 test('the APK build bundles the agent agent/package.json names and tells Gradle which one', { skip: process.platform === 'win32' }, (t) => {
@@ -148,4 +149,18 @@ test('the APK build stops before Gradle unless it has a JDK 21, and says how to 
   assert.equal(nothing.status, 1);
   assert.equal(nothing.stderr.trim(), `ERROR: ${path.join(empty, 'jdk')} is Java unknown, not 21. AGP 8.13 needs 21.`);
   assert.equal(fs.existsSync(path.join(empty, 'gradle-arguments')), false);
+});
+
+test('the APK build stops without the Gradle wrapper and never runs a gradle from PATH instead', { skip: process.platform === 'win32' }, (t) => {
+  // The wrapper is what pins the Gradle AGP 8.13 runs on. Whatever gradle a machine has on PATH is
+  // not looked at, and the message says what the build needs without guessing which one that is.
+  const unwrapped = checkout(t);
+  fs.rmSync(path.join(unwrapped, 'android', 'gradlew'));
+  fs.mkdirSync(path.join(unwrapped, 'bin'));
+  fs.writeFileSync(path.join(unwrapped, 'bin', 'gradle'), `#!/bin/sh\nprintf '%s\\n' "$@" > "${path.join(unwrapped, 'gradle-arguments')}"\n`, { mode: 0o755 });
+  const result = buildWith(unwrapped, { PATH: `${path.join(unwrapped, 'bin')}${path.delimiter}${process.env.PATH}` });
+  assert.equal(result.status, 1);
+  // The script names its own folder as pwd -P has it, through any symlink above the scratch checkout.
+  assert.equal(result.stderr.trim(), `ERROR: no Gradle wrapper at ${path.join(fs.realpathSync(unwrapped), 'android', 'gradlew')}. The wrapper is what pins Gradle 9.5; do not fall back to a gradle on PATH, AGP 8.13 fails on 9.6 and later.`);
+  assert.equal(fs.existsSync(path.join(unwrapped, 'gradle-arguments')), false);
 });
