@@ -247,4 +247,61 @@ struct AppModelTests {
         #expect(SidebarItem.app.id == "app")
         #expect(SidebarItem(id: "app") == .app)
     }
+
+    @Test("every sidebar row carries its state, which VoiceOver reads as the row's value")
+    func sidebarRowsSayTheirState() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let bindings = BindingsStore(url: home.appending(path: "bindings.json"))
+        bindings.update {
+            $0.deviceName = "Desk"
+            $0.selfBinding = .init(machine: "tower", system: "mac")
+            $0.localAgent = .init(argv: ["/nowhere/at/all/node", "/agent.mjs"])
+        }
+        let app = try Self.app("""
+        { "version": 1, "machines": [
+          { "id": "pi", "name": "Pi",
+            "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.0.2.5", "user": "me" } ],
+            "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] },
+          { "id": "tower", "name": "Tower",
+            "systems": [ { "id": "mac", "platform": "mac", "agent": ["node", "/agent.mjs"] } ] } ] }
+        """, in: home, bindings: bindings)
+        let pi = try #require(app.machine(id: "pi"))
+        let mac = try #require(app.mac)
+
+        // The sidebar used to be handed these and draw only the name, so a sidebar read aloud was a
+        // list of names and nothing about any of them.
+        #expect(app.sidebarItems == [.machine("pi"), .local, .setup, .app])
+        #expect(app.sidebarItems.compactMap { app.sidebarRow(for: $0) } == [
+            SidebarRow(symbol: pi.symbolName, title: "Pi", summary: pi.sidebarSummary),
+            SidebarRow(symbol: "laptopcomputer", title: mac.name, summary: mac.sidebarSummary),
+            SidebarRow(symbol: "list.bullet.rectangle", title: "Setup", summary: "no identity yet"),
+            SidebarRow(symbol: "app", title: "Legion Control", summary: app.appUpdates.summary),
+        ])
+        #expect(app.sidebarItems.allSatisfy { app.sidebarRow(for: $0)?.summary.isEmpty == false })
+
+        // A row whose machine or service has gone draws nothing rather than a name with no state.
+        #expect(app.sidebarRow(for: .machine("gone")) == nil)
+        #expect(app.sidebarRow(for: .service(machine: "pi", service: "gone")) == nil)
+    }
+
+    @Test("the setup row says what waits to be settled before which revision this device is on")
+    func setupRowState() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let (app, _) = try Self.diverged(in: home)
+        #expect(app.sidebarRow(for: .setup)?.summary == "needs a decision")
+        app.divergence = nil
+        #expect(app.sidebarRow(for: .setup)?.summary == "revision 1")
+
+        // A record this device cannot read approves nothing, so every command waits for a person.
+        let other = try Self.home()
+        defer { try? FileManager.default.removeItem(at: other) }
+        let state = other.appending(path: "state")
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        try Data("not a record".utf8).write(to: state.appending(path: "approved-launch.json"))
+        let waiting = try Self.app(Self.twoMachines, in: other)
+        #expect(!waiting.launchReview.isEmpty)
+        #expect(waiting.sidebarRow(for: .setup)?.summary == "commands waiting for approval")
+    }
 }

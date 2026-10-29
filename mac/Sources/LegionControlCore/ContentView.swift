@@ -47,17 +47,7 @@ struct ContentView: View {
 
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
-    /// Every row there is, in the order they are drawn.
-    private var items: [SidebarItem] {
-        var items: [SidebarItem] = []
-        for machine in model.machines {
-            items.append(.machine(machine.id))
-        }
-        if model.mac != nil { items.append(.local) }
-        items.append(.setup)
-        items.append(.app)
-        return items
-    }
+    private var items: [SidebarItem] { model.sidebarItems }
 
     /// The stored row when it still exists, and the first one otherwise. A machine that has gone
     /// from the config, or a service that has gone from a status, must not leave the detail pane
@@ -247,6 +237,60 @@ struct ContentView: View {
 
 // MARK: - Sidebar
 
+/// What one sidebar row says: its symbol, its name, and the state a glance at it is for.
+struct SidebarRow: Equatable {
+    var symbol: String
+    var title: String
+    /// The row's state in a few words. Not drawn, which keeps the sidebar to one line a row, but it
+    /// is what the row is for, so VoiceOver reads it as the row's value: without it a sidebar read
+    /// aloud was a list of names, and every state behind them was missing.
+    var summary: String
+}
+
+extension AppModel {
+    /// Every row there is, in the order they are drawn.
+    var sidebarItems: [SidebarItem] {
+        var items: [SidebarItem] = []
+        for machine in machines {
+            items.append(.machine(machine.id))
+        }
+        if mac != nil { items.append(.local) }
+        items.append(.setup)
+        items.append(.app)
+        return items
+    }
+
+    /// The row for one sidebar item, or nil when what it points at has gone from the setup.
+    func sidebarRow(for item: SidebarItem) -> SidebarRow? {
+        switch item {
+        case .machine(let id):
+            guard let machine = machine(id: id) else { return nil }
+            return SidebarRow(symbol: machine.symbolName, title: machine.name, summary: machine.sidebarSummary)
+        case .service(let machineId, let serviceId):
+            guard let machine = machine(id: machineId), let service = machine.service(id: serviceId) else { return nil }
+            return SidebarRow(symbol: "curlybraces", title: service.displayName,
+                              summary: machine.sidebarSummary(for: service))
+        case .local:
+            guard let mac else { return nil }
+            return SidebarRow(symbol: "laptopcomputer", title: mac.name, summary: mac.sidebarSummary)
+        case .setup:
+            return SidebarRow(symbol: "list.bullet.rectangle", title: "Setup", summary: setupSummary)
+        case .app:
+            return SidebarRow(symbol: appUpdates.availableVersion == nil ? "app" : "app.badge",
+                              title: "Legion Control", summary: appUpdates.summary)
+        }
+    }
+
+    /// The state of the setup row: which revision this device is on, and whether anything is
+    /// waiting to be settled.
+    var setupSummary: String {
+        if divergence != nil { return "needs a decision" }
+        if !launchReview.isEmpty { return "commands waiting for approval" }
+        guard let identity = config.config?.identity, identity.id != nil else { return "no identity yet" }
+        return "revision \(identity.revisionNumber)"
+    }
+}
+
 /// Device navigation; service controls live beside their device.
 private struct Sidebar: View {
     let model: AppModel
@@ -256,58 +300,28 @@ private struct Sidebar: View {
     var body: some View {
         List(selection: $selection) {
             ForEach(items) { item in
-                row(item)
+                if let row = model.sidebarRow(for: item) {
+                    self.row(item, row)
+                }
             }
         }
         .listStyle(.sidebar)
     }
 
-    @ViewBuilder
-    private func row(_ item: SidebarItem) -> some View {
-        switch item {
-        case .machine(let id):
-            if let machine = model.machine(id: id) {
-                row(item, symbol: machine.symbolName, title: machine.name, summary: machine.sidebarSummary)
-            }
-        case .service(let machineId, let serviceId):
-            if let machine = model.machine(id: machineId), let service = machine.service(id: serviceId) {
-                row(item,
-                    symbol: "curlybraces",
-                    title: service.displayName,
-                    summary: machine.sidebarSummary(for: service))
-            }
-        case .local:
-            if let mac = model.mac {
-                row(item, symbol: "laptopcomputer", title: mac.name, summary: mac.sidebarSummary)
-            }
-        case .setup:
-            row(item, symbol: "list.bullet.rectangle", title: "Setup", summary: setupSummary)
-        case .app:
-            row(item, symbol: model.appUpdates.availableVersion == nil ? "app" : "app.badge",
-                title: "Legion Control", summary: model.appUpdates.summary)
-        }
-    }
-
-    /// The second line of the setup row: which revision this device is on, and whether anything is
-    /// waiting to be settled.
-    private var setupSummary: String {
-        if model.divergence != nil { return "needs a decision" }
-        if !model.launchReview.isEmpty { return "commands waiting for approval" }
-        guard let identity = model.config.config?.identity, identity.id != nil else { return "no identity yet" }
-        return "revision \(identity.revisionNumber)"
-    }
-
-    private func row(_ item: SidebarItem, symbol: String, title: String, summary: String) -> some View {
+    private func row(_ item: SidebarItem, _ row: SidebarRow) -> some View {
         HStack(alignment: .center, spacing: 10) {
-            Image(systemName: symbol)
+            Image(systemName: row.symbol)
                 .imageScale(.medium)
                 .frame(width: 18)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-            }
+            Text(row.title)
             Spacer(minLength: 0)
         }
         .padding(.vertical, 4)
+        // One element with the name as its label and the state as its value, rather than the
+        // symbol's own name read out ahead of the title and the state nowhere.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(row.title)
+        .accessibilityValue(row.summary)
         .tag(item)
     }
 }
