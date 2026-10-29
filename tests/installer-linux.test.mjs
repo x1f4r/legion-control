@@ -298,6 +298,18 @@ test('linux installer refuses a reference service port that is not a number', { 
   assert.equal(fs.existsSync(path.join(home, '.legion-control')), false);
 });
 
+// A user manager has units of its own and none of the system manager's, so ordering on
+// network-online.target, or on any other unit only the system manager has, does nothing at all.
+test('the user units order on no unit that only the system manager has', () => {
+  for (const name of ['legion-control-update.service', 'legion-control-update.timer', 't3-code.service']) {
+    const unit = fs.readFileSync(path.join(repository, 'agent', 'install', name), 'utf8');
+    const named = settings(unit)
+      .filter(([key]) => /^(?:After|Before|Wants|Requires|Requisite|BindsTo|PartOf|Upholds)$/.test(key))
+      .flatMap(([, value]) => value.trim().split(/\s+/));
+    assert.deepEqual(named.filter((each) => /^(?:network|network-online|network-pre|nss-lookup|time-sync|remote-fs)\.target$/.test(each)), [], name);
+  }
+});
+
 // --- File modes ------------------------------------------------------------------
 
 /** Every entry under `directory` that its group or anybody else may read, write or enter, with its mode. */

@@ -16,8 +16,9 @@
 
 [Unit]
 Description=Legion Control: run one update cycle
-After=network-online.target
-Wants=network-online.target
+# Nothing here orders on network-online.target. That is a unit of the system
+# manager, and a user manager has none of that name, so After= and Wants= on it
+# did nothing at all. The timer waits five minutes after boot instead.
 
 [Service]
 Type=oneshot
