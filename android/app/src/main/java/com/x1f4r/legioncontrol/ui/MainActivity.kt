@@ -1,12 +1,9 @@
 package com.x1f4r.legioncontrol.ui
 
 import android.os.Bundle
-import kotlinx.coroutines.flow.map
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import com.x1f4r.legioncontrol.data.BindingsStore
-import com.x1f4r.legioncontrol.net.UpdateSource
 import com.x1f4r.legioncontrol.ui.theme.LegionTheme
 
 /**
@@ -14,45 +11,26 @@ import com.x1f4r.legioncontrol.ui.theme.LegionTheme
  *
  * Polling is driven from resume and pause here rather than from inside a composable, because the
  * rule is not "poll while something is drawn" but "poll while the screen is in front of you". No
- * service, no worker, no alarm: when this activity stops, every question this app asks a machine
- * stops with it.
+ * worker and no alarm: when this activity stops, every question this app asks a machine stops with
+ * it.
  *
  * What does not stop is a change somebody asked for. An update takes minutes and locking the phone
  * is not withdrawing the request, so those run on the model's own scope and are reconciled by their
  * operation id when the app comes back.
  *
- * The model is held by the activity, which the manifest keeps alive across rotation and a light or
- * dark switch, so turning the phone sideways does not throw away a reading and start another ssh
- * connection to get the same answer back.
+ * The models belong to the process, in [LegionApplication], so this activity can be recreated for
+ * any reason at all without a change in flight noticing. The manifest still keeps it alive across
+ * rotation, a light or dark switch, a new font size, density or language, for the composition's
+ * sake: what is half typed into a field is kept by the screen, not the model.
  */
 class MainActivity : ComponentActivity() {
-    private lateinit var model: AppModel
-    private lateinit var updates: AppUpdateModel
+    private val legion: LegionApplication get() = application as LegionApplication
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val services = createControlServices(applicationContext)
-        model = AppModel(
-            context = applicationContext,
-            services = services,
-            remembered = RememberedSettings(applicationContext),
-            bindings = BindingsStore(applicationContext),
-            notifications = NotificationSettings(applicationContext),
-        )
-        // Held here for the same reason the model is, plus one of its own: the page that draws it
-        // is a page of a pager and is disposed the moment it is swiped away from. State kept inside
-        // it would ask GitHub for the release list again on every swipe back.
-        // The repository this device approved, never the one the shared setup merely names: where
-        // this app's own updates come from is a launch value (contract section 9.9), and one waiting
-        // for approval leaves the approved or the built-in source in place. It is held to GitHub's
-        // grammar again on the way into a URL.
-        updates = AppUpdateModel(applicationContext) {
-            UpdateSource.of(services.launch.value.config?.appUpdates?.githubRepo)
-        }
-        updates.observeRepositories(services.launch.map { gated ->
-            UpdateSource.of(gated.config?.appUpdates?.githubRepo)
-        })
+        val model = legion.model
+        val updates = legion.updates
         setContent {
             LegionTheme {
                 LegionApp(model, updates)
@@ -62,19 +40,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        model.startPolling()
-        updates.start()
+        legion.model.startPolling()
+        legion.updates.start()
     }
 
     override fun onPause() {
         super.onPause()
-        model.stopPolling()
-        updates.stop()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        model.close()
-        updates.close()
+        legion.model.stopPolling()
+        legion.updates.stop()
     }
 }

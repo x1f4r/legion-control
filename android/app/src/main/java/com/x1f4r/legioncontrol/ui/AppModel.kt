@@ -41,7 +41,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -77,9 +76,10 @@ class AppModel(
     /**
      * The scope changes run on.
      *
-     * Deliberately not tied to the screen. Polling stops when the app is put away; an update that
-     * was asked for does not, because locking the phone is not withdrawing the request. A failure
-     * nothing caught is logged rather than allowed to end the process.
+     * Deliberately not tied to the screen, and never cancelled: this model belongs to the process.
+     * Polling stops when the app is put away; an update that was asked for does not, because locking
+     * the phone is not withdrawing the request. A failure nothing caught is logged rather than
+     * allowed to end the process.
      */
     private val scope =
         CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler("AppModel"))
@@ -396,11 +396,6 @@ class AppModel(
         machines.forEach { it.stopPolling() }
         clockJob?.cancel()
         clockJob = null
-    }
-
-    fun close() {
-        stopPolling()
-        scope.cancel()
     }
 
     fun refreshAll() {

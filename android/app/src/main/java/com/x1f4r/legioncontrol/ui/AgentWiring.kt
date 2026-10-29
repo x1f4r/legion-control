@@ -1,6 +1,5 @@
 package com.x1f4r.legioncontrol.ui
 
-import android.content.Context
 import android.net.Network
 import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentActionResult
@@ -51,7 +50,7 @@ import kotlinx.serialization.json.JsonObject
  * and the screen wants to know how to name it. Both differences are settled here, in one file, so
  * that neither side has to be written around the other.
  */
-fun createControlServices(context: Context): ControlServices = WiredServices(LegionControl(context))
+fun createControlServices(control: LegionControl): ControlServices = WiredServices(control)
 
 private class WiredServices(private val control: LegionControl) : ControlServices {
 

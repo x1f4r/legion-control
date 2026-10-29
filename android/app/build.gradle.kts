@@ -189,4 +189,8 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
         include("fixtures/*.json", "vectors/*.json", "schemas/*.json", "hash-vectors.json", "release-public-key.pem", "bootstrap/*.cjs")
     })
     inputs.files(rootProject.fileTree("../tests/fixtures/trust") { include("*") })
+    // The manifest is a test input too: the configuration changes the activity absorbs and what it
+    // declares for the service that keeps a change running are rules, and are held to tests.
+    systemProperty("legion.manifest", file("src/main/AndroidManifest.xml").absolutePath)
+    inputs.file("src/main/AndroidManifest.xml")
 }

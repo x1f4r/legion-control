@@ -4,7 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
-import com.x1f4r.legioncontrol.agent.LegionControl
+import com.x1f4r.legioncontrol.ui.LegionApplication
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -23,17 +23,20 @@ import kotlinx.coroutines.launch
  * shell holds that privileged permission and an ordinary installed app cannot request it.
  *
  * No test key, host or address is compiled into any build. Everything comes in as an extra.
+ *
+ * It works on the process's own wiring, not a copy of it: a setup applied through a second store
+ * would be on disk without the open screen ever hearing of it.
  */
 class TestBridgeReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        val app = context.applicationContext
+        val control = (context.applicationContext as LegionApplication).control
         when (intent.action) {
             ACTION_SHOW_KEY -> {
                 val pending = goAsync()
                 CoroutineScope(Dispatchers.IO).launch {
                     try {
-                        val identity = LegionControl(app).identity.identity()
+                        val identity = control.identity.identity()
                         Log.i(TAG, "authorized_keys line: ${identity.authorizedKeysLine}")
                         Log.i(TAG, "fingerprint: ${identity.fingerprint}")
                     } catch (failure: Exception) {
@@ -50,7 +53,6 @@ class TestBridgeReceiver : BroadcastReceiver() {
                     Log.e(TAG, "no --es config given, nothing applied")
                     return
                 }
-                val control = LegionControl(app)
                 val failure = control.config.applyPasted(document, control.deviceName())
                 if (failure == null) {
                     val provenance = control.config.provenance.value
@@ -65,7 +67,6 @@ class TestBridgeReceiver : BroadcastReceiver() {
             }
 
             ACTION_SHOW_SETUP -> {
-                val control = LegionControl(app)
                 val provenance = control.config.provenance.value
                 Log.i(
                     TAG,

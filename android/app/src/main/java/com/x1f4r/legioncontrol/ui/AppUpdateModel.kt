@@ -17,17 +17,17 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.io.File
 
 /**
  * Updating the app itself.
  *
- * This lives beside the activity rather than inside the composable that draws it, and that is not
+ * This lives with the process rather than inside the composable that draws it, and that is not
  * tidiness. The three sections are pages of a pager now, so the one that owns this is thrown away
  * and rebuilt every time the user swipes past it. State held in the composable would mean a fresh
- * request to GitHub on every swipe, and a download losing its progress by being scrolled away from.
+ * request to GitHub on every swipe, and a download losing its progress by being scrolled away from;
+ * state held by the activity lost it to a recreation instead.
  *
  * There is no credential here and nothing to ask the user for. The releases this reads are public,
  * a repository that will not show them anonymously has nothing to offer this app, and a token kept
@@ -184,12 +184,6 @@ class AppUpdateModel(
 
     fun reportInstallProblem(message: String) {
         failure = message
-    }
-
-    fun close() {
-        stop()
-        downloadJob?.cancel()
-        scope.cancel()
     }
 
     private suspend fun runCheck() {
