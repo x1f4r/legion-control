@@ -25,7 +25,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { AGENT_VERSION, operationsDir, runArgv } from './config.mjs';
 import { CONTRACT_VERSION, DISRUPTED_PHASES, OPERATION_ID_PATTERN, outcomeOf, PHASES, producedOutcome, REASON } from './contract.mjs';
-import { probeOperationLock } from './lock.mjs';
+import { holdsOperationLock, probeOperationLock } from './lock.mjs';
 import { log } from './log.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
 import { ownStartTime, processIsAlive, writeJsonAtomic } from './state.mjs';
@@ -886,13 +886,15 @@ export function pendingPowerOperation({ excludeId = null } = {}) {
  *
  *   The machine lock. An owner that took it holds it until it has finished
  *   the record, and the operating system takes it away the moment the owner
- *   dies. A record that names the operation holding the lock for it is alive
- *   while the sidecar says that operation, in that process, holds the lock,
- *   and gone once the lock is free or another operation has it.
+ *   dies. So a record whose owner took it is gone once the lock is free, and
+ *   gone while this process holds it, as a cycle's recovery does: no other
+ *   process can then. It is alive while the sidecar says the operation it
+ *   names holds the lock in its process. A sidecar naming something else
+ *   says nothing either way, because its holder may have failed to write it.
  *
  *   The start time. Beside its pid the record keeps when that process
  *   started, and a process holding the pid now that started after that is not
- *   its owner (processIsAlive).
+ *   its owner (processIsAlive). This process knows its own exactly.
  *
  * Only where neither can say is a live pid taken at its word, as before:
  * judging a live operation dead would start a service under an install that
@@ -901,13 +903,14 @@ export function pendingPowerOperation({ excludeId = null } = {}) {
  */
 function ownerAlive(record) {
   if (!Number.isInteger(record.pid)) return false;
-  if (record.lockOwner) {
+  const startedAt = record.ownerStartedAt ?? null;
+  if (record.pid !== process.pid && record.lockOwner) {
+    if (holdsOperationLock()) return false;
     const { state, sidecar } = probeOperationLock();
     if (state === 'free') return false;
     if (state === 'held' && sidecar?.op === record.lockOwner && sidecar.pid === record.pid) return true;
-    if (state === 'held' && sidecar?.op && sidecar.op !== record.lockOwner) return false;
   }
-  return processIsAlive(record.pid, { startedAt: record.ownerStartedAt ?? null });
+  return processIsAlive(record.pid, { startedAt });
 }
 
 /**

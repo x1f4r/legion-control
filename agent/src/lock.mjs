@@ -200,6 +200,18 @@ export function acquireServiceLock(file, target) {
   };
 }
 
+/** How many holds on the machine lock this process has, which is never more than one at a time. */
+let heldHere = 0;
+
+/**
+ * Whether this process holds the machine lock. The kernel lets one process
+ * hold it at a time, so while this one does, no other can: what recovery
+ * knows, from inside the cycle that holds it, about every other process.
+ */
+export function holdsOperationLock() {
+  return heldHere > 0;
+}
+
 /**
  * Take the machine-wide operation lock.
  *
@@ -278,6 +290,7 @@ export function acquireOperationLock({
   }
 
   let released = false;
+  heldHere += 1;
   return {
     ok: true,
     conflict: false,
@@ -310,6 +323,7 @@ export function acquireOperationLock({
         } catch {
           /* the sidecar carries no authority; a leftover is harmless */
         }
+        heldHere -= 1;
         taken.release();
       },
     },

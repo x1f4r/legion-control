@@ -262,6 +262,7 @@ test('this process is not the owner of a record an earlier process with its pid 
 test('a record that took the machine lock lives exactly as long as that hold', async () => {
   await withHome(async (home) => {
     const ops = await fresh('operations.mjs');
+    const { acquireOperationLock } = await import('../src/lock.mjs');
     const id = '17171717-1111-4111-8111-111111111111';
     const holder = await liveProcess(home, { lock: id });
     const bystander = await liveProcess(home);
@@ -270,18 +271,37 @@ test('a record that took the machine lock lives exactly as long as that hold', a
       ops.updateOperation(id, { pid: holder.pid, ownerStartedAt: new Date().toISOString(), lockOwner: id });
       assert.equal(ops.deriveState(ops.readOperation(id)).state, 'running', 'the lock is held for it, by its own process');
 
-      // A live pid whose process holds no lock for the record is not its
-      // owner, whatever its start time says: the owner would still hold it.
+      // A live pid whose process says it took the lock, while another
+      // operation's sidecar is all there is to read: that sidecar may be one
+      // its holder failed to replace, so the pid is taken at its word.
       const orphan = '18181818-1111-4111-8111-111111111111';
       ops.beginOperation({ id: orphan, ...base });
       ops.updateOperation(orphan, { pid: bystander.pid, ownerStartedAt: new Date().toISOString(), lockOwner: orphan });
-      assert.equal(ops.deriveState(ops.readOperation(orphan)).state, 'finished', 'another operation holds the lock it would hold');
+      assert.equal(ops.deriveState(ops.readOperation(orphan)).state, 'running');
 
+      // Free, the lock says its owner is gone whatever its pid says now.
       await holder.stop();
       assert.equal(ops.deriveState(ops.readOperation(orphan)).state, 'finished', 'the lock is free');
       ops.updateOperation(id, { pid: bystander.pid });
       assert.equal(ops.deriveState(ops.readOperation(id)).state, 'finished', 'its hold ended with its process');
-      assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id).sort(), [id, orphan]);
+
+      // And held by this process, as a cycle's recovery holds it, no other
+      // process can be holding it for a record of its own.
+      const held = acquireOperationLock({ kind: 'cycle', opId: '19191919-2222-4222-8222-222222222222' });
+      assert.equal(held.ok, true);
+      try {
+        const elsewhere = '1b1b1b1b-1111-4111-8111-111111111111';
+        ops.beginOperation({ id: elsewhere, ...base });
+        ops.updateOperation(elsewhere, { pid: bystander.pid, ownerStartedAt: new Date().toISOString(), lockOwner: elsewhere });
+        assert.equal(ops.deriveState(ops.readOperation(elsewhere)).state, 'finished', 'its live pid is not holding the lock this process holds');
+        const mine = '1a1a1a1a-1111-4111-8111-111111111111';
+        ops.beginOperation({ id: mine, ...base });
+        ops.updateOperation(mine, { lockOwner: '19191919-2222-4222-8222-222222222222' });
+        assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id).sort(), [id, orphan, elsewhere].sort());
+        assert.equal(ops.readOperation(mine).state, 'running', 'a record of this process is its own to finish');
+      } finally {
+        held.lock.release();
+      }
     } finally {
       await holder.stop();
       await bystander.stop();
