@@ -44,6 +44,7 @@ import { reportedFloor } from './floor.mjs';
 import { checkHealth, healthPort } from './probes/health.mjs';
 import { probeProcessAsync } from './probes/process.mjs';
 import { collectTelemetry } from './probes/telemetry.mjs';
+import { isRestrictedSession } from './dispatch.mjs';
 import { deriveState, listOperations, summarize } from './operations.mjs';
 import { describeServiceUpdates, describeSystemUpdates } from './policy.mjs';
 import { canDrain, canRestart } from './service.mjs';
@@ -250,7 +251,7 @@ export async function buildStatus(loaded, { budgetMs = DEFAULT_STATUS_BUDGET_MS 
     contract: CONTRACT_VERSION,
     base: basePath(),
     node: process.versions.node,
-    restrictedSession: process.env.LEGIONCTL_RESTRICTED === '1',
+    restrictedSession: isRestrictedSession(),
     capabilities: ['setup-lineage', 'wol-action', 'configured-telemetry', 'service-config-admin'],
     // The oldest agent this machine may be replaced by, and whether the tree
     // answering is a signed release at all (contract section 13). A client

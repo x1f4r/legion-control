@@ -5,7 +5,10 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import test from 'node:test';
+import { checkReply } from '../../contract/validate.mjs';
+import { canonicalHash } from '../src/controller.mjs';
 import { authorize, parseCommandLine, ownEntry, RESTRICTED_COMMANDS } from '../src/dispatch.mjs';
+import { cli, withHome } from './helpers.mjs';
 
 const quote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
 const NODE = quote(process.execPath);
@@ -146,4 +149,28 @@ test('the allow list is the one published to the clients', () => {
   }
   assert.equal(RESTRICTED_COMMANDS.has('dispatch'), false);
   assert.equal(RESTRICTED_COMMANDS.has('op-run'), false);
+});
+
+test('a restricted key that pushes a new launcher through the dispatcher is refused, in the contract\'s shape', async () => {
+  await withHome(async (home) => {
+    const document = (revision, lineage, agent) => `${JSON.stringify({
+      version: 1,
+      controller: { id: 'setup-dispatch', revision, lineage, source: 'cli' },
+      machines: [{ id: 'tower', endpoints: [{ host: 'desk-tower.local', user: 'me' }], systems: [{ id: 'linux', agent }] }],
+    }, null, 2)}\n`;
+    const d0 = document(1, [], ['/usr/bin/node', '/home/me/.legion-control/bin/launcher.mjs']);
+    assert.equal(cli(['config', 'set'], { home, stdin: d0 }).payload.action, 'stored');
+    const d1 = document(2, [canonicalHash(d0)], ['sh', '-c', 'id']);
+    const run = cli(['dispatch'], {
+      home,
+      stdin: d1,
+      env: { LEGIONCTL_RESTRICTED: '1', SSH_ORIGINAL_COMMAND: `node ${ENTRY} config set --controller-id setup-dispatch --revision 2` },
+    });
+    assert.equal(run.exitCode, 1);
+    assert.equal(run.payload.reasonCode, 'restricted');
+    assert.deepEqual(run.payload.launchChanges, ['machines[tower].systems[linux]']);
+    assert.equal(run.payload.current.hash, canonicalHash(d0));
+    assert.deepEqual(checkReply('config-set.schema.json', run.payload, { where: 'restricted config set' }), []);
+    assert.equal(fs.readFileSync(path.join(home, 'controller.json'), 'utf8'), d0);
+  });
 });

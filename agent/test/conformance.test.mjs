@@ -603,11 +603,16 @@ test('config conforms through a whole lineage, and serves exactly the bytes it h
     assert.equal(noted.action, 'stored');
     assert.match(noted.notes[0], /^machines\[0\]\.systems\[0\]: pi\/linux has no agent command/);
 
+    // A restricted key may not bring a command the machine does not hold
+    // (section 9.9); the refusal names the path and what is still held.
     const launcher = { id: 'linux', agent: ['/usr/bin/node', '/home/me/.legion-control/bin/launcher.mjs'] };
-    invoke(home, ['config', 'set'], {
+    const restricted = invoke(home, ['config', 'set'], {
       restricted: true,
       stdin: setupText({ id: 'setup-other', revision: 3, lineage: [canonicalHash(notedText), canonicalHash(other)], name: 'Restricted', systems: [launcher] }),
     });
+    assert.equal(restricted.reasonCode, 'restricted');
+    assert.deepEqual(restricted.launchChanges, ['machines[pi].systems[linux]']);
+    assert.equal(restricted.current.hash, canonicalHash(notedText));
   });
 });
 

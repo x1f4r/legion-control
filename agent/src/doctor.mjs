@@ -28,6 +28,7 @@ import { CONTRACT_VERSION } from './contract.mjs';
 import { carriesSignedManifest } from './archive.mjs';
 import { selectSleepCommand } from './boot.mjs';
 import { readController } from './controller.mjs';
+import { isRestrictedSession } from './dispatch.mjs';
 import { checkEndpoint } from './endpoint.mjs';
 import { effectiveFloor, floorPath, isOlder } from './floor.mjs';
 import { currentHolder } from './lock.mjs';
@@ -248,7 +249,7 @@ function environmentChecks() {
     check(
       'session.restricted',
       'ok',
-      process.env.LEGIONCTL_RESTRICTED === '1' ? 'this is a restricted session' : 'this is an ordinary session',
+      isRestrictedSession() ? 'this is a restricted session' : 'this is an ordinary session',
       [
         process.env.LEGIONCTL_CLIENT ? `client: ${process.env.LEGIONCTL_CLIENT}` : null,
         `signed bundles are verified against release key ${trustFingerprint().slice(0, 8)} and nothing else`,

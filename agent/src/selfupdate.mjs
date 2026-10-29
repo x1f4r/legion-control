@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AGENT_VERSION, basePath, incomingDir, runCommand } from './config.mjs';
 import { CONTRACT_VERSION, REASON } from './contract.mjs';
+import { isRestrictedSession } from './dispatch.mjs';
 import { stageFiles, verifyAgentArchive, verifyAgentTree, MAX_ARCHIVE_BYTES } from './archive.mjs';
 import { commitInstallSwap, commitRollbackSwap, recoverAgentSwap, swapPaths } from './agent-swap.mjs';
 import { effectiveFloor, judgeAgentTransition, lowerFloor, raiseFloor, restoreFloor, treeDeclaration } from './floor.mjs';
@@ -167,7 +168,7 @@ function judgeTransition(mode, verified, base, allowDowngrade) {
     live: floor.live,
     floor: floor.version,
     floorUnreadable: floor.unreadable,
-    restricted: process.env.LEGIONCTL_RESTRICTED === '1',
+    restricted: isRestrictedSession(),
     allowDowngrade: allowDowngrade === true,
   });
 }

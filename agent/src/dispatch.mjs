@@ -133,6 +133,15 @@ function stableEntryAlias(entry) {
 }
 
 /**
+ * Whether this process answers a restricted key. The forced command sets it,
+ * and `dispatch` sets it again before running what it authorized, so every
+ * module asks here rather than reading the environment its own way.
+ */
+export function isRestrictedSession() {
+  return process.env.LEGIONCTL_RESTRICTED === '1';
+}
+
+/**
  * Commands a restricted key may run.
  *
  * `self-update --stdin` is here because it is the ONLY way a restricted session
@@ -144,6 +153,10 @@ function stableEntryAlias(entry) {
  * whose provenance is a path this same session chose. So is `--allow-downgrade`:
  * a restricted key only ever moves the agent forward, or back to a signed agent
  * at or above the version floor (contract section 13).
+ *
+ * `config set` is further limited in controller.mjs: a restricted session
+ * cannot publish a launch value the machine does not hold, or replace a copy
+ * it cannot read. The dispatcher never sees stdin.
  */
 export const RESTRICTED_COMMANDS = new Set([
   'status',

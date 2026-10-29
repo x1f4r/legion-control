@@ -4,7 +4,8 @@
 // every agent keeps a copy at <base>/controller.json and serves it to whoever
 // asks. It stores and returns the bytes it was given, and the clients do all
 // the interpreting: the agent checks the document's structure on `config set`
-// (contract section 9.4) and never acts on what is in it.
+// (contract section 9.4) and, in a restricted session, its launch values
+// (section 9.9). It never merges and never picks a winner.
 //
 // TWO THINGS MAKE THIS WORK, and both were broken before.
 //
@@ -31,6 +32,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { basePath } from './config.mjs';
 import { REASON, SETUP_ID_PATTERN } from './contract.mjs';
+import { approvalsFrom, launchProjection, launchReview } from './launch.mjs';
 import { findRepeatedMember, validateSetupDocument } from './setup-document.mjs';
 
 /** Room for far more machines than anyone has, and small enough to refuse a mistake. */
@@ -545,6 +547,44 @@ export function judgeIncoming(held, incoming) {
   return { ok: true, action: 'replaced' };
 }
 
+/** The most launch paths a restricted refusal lists, and names in its message. */
+const MAX_LAUNCH_CHANGES = 100;
+const NAMED_LAUNCH_CHANGES = 5;
+
+/**
+ * Why a restricted session may not store `parsed` over `current`, or null when
+ * it may (contract section 9.4).
+ *
+ * A restricted key may publish the setup, and a client runs only launch
+ * values it approved itself, so this is defence in depth: the values this
+ * machine already holds count as approved, and a push carrying any other is
+ * refused. A key that can rename and reroute but never introduce a command
+ * cannot make a client's review the only thing standing between a stolen
+ * phone and every machine. A held copy that cannot be read is refused too: its
+ * launch values are unknown, so nothing can be shown to be one of them. With
+ * nothing held the ordinary rules apply.
+ *
+ * The message names paths and never values: what a system runs is not for a
+ * restricted key to read back out of an error.
+ */
+function restrictedRefusal(current, parsed) {
+  // A copy that is not UTF-8 has no hash and is held all the same.
+  const holdsCopy = current.hash !== null || Boolean(current.error);
+  if (!holdsCopy) return null;
+  if (current.document === null) {
+    return {
+      error: 'this machine holds a setup copy it cannot read, so a restricted key cannot replace it; publish from a device whose key is not restricted',
+    };
+  }
+  const paths = launchReview(approvalsFrom(current.document), launchProjection(parsed)).map((entry) => entry.path);
+  if (paths.length === 0) return null;
+  const named = paths.slice(0, NAMED_LAUNCH_CHANGES).join(', ') + (paths.length > NAMED_LAUNCH_CHANGES ? ', …' : '');
+  return {
+    launchChanges: paths.slice(0, MAX_LAUNCH_CHANGES),
+    error: `this key is restricted, and the document carries a launch value this machine does not hold (${named}); publish it from a device whose key is not restricted`,
+  };
+}
+
 /**
  * Store a controller config.
  *
@@ -571,7 +611,7 @@ export function judgeIncoming(held, incoming) {
  * away anyway is answered by why it is turned away, and a byte-identical retry
  * is a noop whatever an older agent let through.
  */
-export function storeController(input, { id = null, revision = null, source = null, replace = false } = {}) {
+export function storeController(input, { id = null, revision = null, source = null, replace = false, restricted = false } = {}) {
   const failed = (error, reasonCode = REASON.badArgument, extra = {}) => ({
     ok: false,
     hash: null,
@@ -702,6 +742,11 @@ export function storeController(input, { id = null, revision = null, source = nu
     );
   }
   const notes = checked.warnings.slice(0, MAX_PROBLEMS).map(({ path, message }) => `${path}: ${message}`);
+
+  if (restricted) {
+    const refusal = restrictedRefusal(current, parsed);
+    if (refusal !== null) return { ok: false, hash: null, bytes: 0, reasonCode: REASON.restricted, current: held, ...refusal };
+  }
 
   const meta = {
     id: effectiveId,

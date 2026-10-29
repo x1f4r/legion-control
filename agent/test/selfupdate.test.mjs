@@ -140,7 +140,7 @@ test('version --check fails when an imported module is missing', () => {
   try {
     copyAgentSource(root);
     const entry = path.join(root, 'src', 'index.mjs');
-    fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace("'http.mjs', 'lock.mjs'", "'missing-check-module.mjs', 'lock.mjs'"));
+    fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace("'launch.mjs', 'lock.mjs'", "'missing-check-module.mjs', 'lock.mjs'"));
     const result = spawnSync(process.execPath, [path.join(root, 'src', 'index.mjs'), 'version', '--check'], {
       encoding: 'utf8', env: { ...process.env, LEGIONCTL_HOME: path.join(root, 'data') }, timeout: 5_000,
     });

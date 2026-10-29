@@ -76,7 +76,7 @@ import { buildStatus, DEFAULT_STATUS_BUDGET_MS } from './status.mjs';
 import { serviceState } from './state.mjs';
 import { checkBundle, resolveBootstrapLayout, runBootstrapInstall, runRollback, runSelfUpdate } from './selfupdate.mjs';
 import { runRestart, runUpdate } from './update.mjs';
-import { authorize, parseCommandLine } from './dispatch.mjs';
+import { authorize, isRestrictedSession, parseCommandLine } from './dispatch.mjs';
 
 /**
  * The command table. `flags` stand alone, `options` take a value, `positional`
@@ -1088,7 +1088,7 @@ async function commandConfig(positional, flags, options) {
   }
 
   try {
-    const stored = storeController(bytes, { id, revision, replace: flags.has('replace') });
+    const stored = storeController(bytes, { id, revision, replace: flags.has('replace'), restricted: isRestrictedSession() });
     if (!stored.ok) {
       log(`config set refused: ${stored.error}`, 'config');
       return refuse(stored.reasonCode ?? REASON.badArgument, stored.error, {
@@ -1102,6 +1102,7 @@ async function commandConfig(positional, flags, options) {
         ...(stored.current ? { current: stored.current } : {}),
         // Why a document was refused, as paths a client can point at.
         ...(stored.problems ? { problems: stored.problems } : {}),
+        ...(stored.launchChanges ? { launchChanges: stored.launchChanges } : {}),
         error: stored.error,
       });
     }
@@ -1172,7 +1173,7 @@ async function commandSelfUpdate(config, flags, options) {
   // Going below the installed agent or the version floor is a decision only an
   // unrestricted session makes (contract section 13). The dispatcher already
   // refuses the flag; this holds however else a restricted session got here.
-  if (flags.has('allow-downgrade') && process.env.LEGIONCTL_RESTRICTED === '1') {
+  if (flags.has('allow-downgrade') && isRestrictedSession()) {
     const message = 'self-update --allow-downgrade takes the agent below the installed one or the version floor, which a restricted key may not do';
     return refuse(REASON.restricted, message, { command: 'self-update', argument: '--allow-downgrade', error: message });
   }
@@ -1359,7 +1360,7 @@ async function commandVersion(flags, loaded) {
     // before swapping anything.
     const modules = [
       'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'boot.mjs', 'config.mjs', 'contract.mjs', 'controller.mjs',
-      'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
+      'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'launch.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
       'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
       'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs',
       'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'scheduler.mjs',
