@@ -39,7 +39,7 @@
         <activity
             android:name="com.x1f4r.legioncontrol.ui.MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density|fontScale|locale|layoutDirection"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|fontWeightAdjustment|locale|layoutDirection"
             android:label="@string/app_name"
             android:theme="@style/Theme.LegionControl"
             android:windowSoftInputMode="adjustResize">

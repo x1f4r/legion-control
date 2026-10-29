@@ -52,6 +52,8 @@ class ManifestTest {
         val wanted = setOf(
             "orientation", "screenSize", "smallestScreenSize", "screenLayout", "keyboardHidden", "uiMode",
             "density", "fontScale", "locale", "layoutDirection",
+            // A hardware keyboard attached, and Bold text turned on.
+            "keyboard", "navigation", "fontWeightAdjustment",
         )
         assertTrue("missing ${wanted - absorbed}", absorbed.containsAll(wanted))
     }
