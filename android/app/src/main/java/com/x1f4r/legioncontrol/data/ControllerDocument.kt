@@ -8,7 +8,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.longOrNull
 import java.util.Locale
 import java.util.UUID
 
@@ -74,11 +73,14 @@ class ControllerDocument private constructor(
         val baseIdentity = base.identity
         val id = baseIdentity?.id?.takeIf { it.isNotBlank() } ?: newSetupId()
         val lineage = (listOf(base.hash) + base.lineage).distinct().take(MAX_LINEAGE)
+        // At the largest Long, which is as far as a revision is read, it stays there rather than
+        // wrapping round to a negative one.
+        val higher = maxOf(base.revision, revision)
         return withIdentity(
             DocumentIdentity(
                 id = id,
                 name = baseIdentity?.name ?: identity?.name,
-                revision = maxOf(base.revision, revision) + 1L,
+                revision = if (higher == Long.MAX_VALUE) higher else higher + 1L,
                 updatedAt = now,
                 source = CLIENT_KIND,
                 device = deviceName,
@@ -269,7 +271,9 @@ data class DocumentIdentity(
             return DocumentIdentity(
                 id = id,
                 name = block.text("name"),
-                revision = block.long("revision") ?: 0L,
+                // The revision the agent reads, however it is spelled: a document that says 7.0 is
+                // pushed as revision 7, which is the only one the agent takes for it.
+                revision = wholeNumberOf(block["revision"]?.let(SetupJson::of)) ?: 0L,
                 updatedAt = block.text("updatedAt"),
                 source = block.text("source"),
                 device = block.text("device"),
@@ -284,10 +288,6 @@ data class DocumentIdentity(
 
 internal fun JsonObject.text(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.contentOrNull?.takeIf { it.isNotBlank() }
-
-internal fun JsonObject.long(key: String): Long? = (this[key] as? JsonPrimitive)?.let {
-    it.longOrNull ?: it.contentOrNull?.toLongOrNull()
-}
 
 internal fun JsonArray?.orEmpty(): List<JsonElement> = this ?: emptyList()
 

@@ -359,20 +359,24 @@ private fun <T> part(element: JsonElement?, serializer: KSerializer<T>): T? =
 private fun forDecoding(node: SetupJson): JsonElement = when (node) {
     is SetupJson.Object -> JsonObject(node.members.associateTo(LinkedHashMap()) { (name, value) -> name to forDecoding(value) })
     is SetupJson.Array -> JsonArray(node.items.map(::forDecoding))
-    is SetupJson.Number -> {
-        val value = node.lexeme.toDoubleOrNull()
-        if (value != null && value.isFinite() && value == Math.floor(value) && Math.abs(value) <= MAX_EXACT_INTEGER) {
-            JsonPrimitive(value.toLong())
-        } else {
-            node.toElement()
-        }
-    }
-
+    is SetupJson.Number -> wholeNumberOf(node)?.let(::JsonPrimitive) ?: node.toElement()
     else -> node.toElement()
 }
 
-/** The largest integer a double holds exactly, which is every integer `Number.isInteger` can mean. */
-private const val MAX_EXACT_INTEGER = 9_007_199_254_740_992.0
+/**
+ * The whole number [node] is to `JSON.parse` and `Number.isInteger`, which is how section 9.7 and
+ * the agent read one, or null when it is not one: `7`, `7.0` and `0.7e1` are all 7.
+ *
+ * Only a revision has no upper bound in the schema, and one past the range of a Long reads as the
+ * largest Long rather than as a document this app cannot read. Nothing is lost by it: the agent
+ * holds a revision as a double, which stops telling one whole number from the next long before a
+ * Long runs out, so no fleet can count that far anyway.
+ */
+internal fun wholeNumberOf(node: SetupJson?): Long? {
+    val value = (node as? SetupJson.Number)?.lexeme?.toDoubleOrNull() ?: return null
+    // Past the range of a Long, toLong() gives the largest one.
+    return if (value.isFinite() && value == Math.floor(value)) value.toLong() else null
+}
 
 /**
  * What is worth saying beside a field that section 9.7 does not say already, and is never a reason

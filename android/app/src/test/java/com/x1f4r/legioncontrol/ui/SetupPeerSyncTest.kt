@@ -80,6 +80,9 @@ class SetupPeerSyncTest {
     private inner class FakeMachine(id: String) : MachineClient by unusable<MachineClient>("setup sync") {
         override val machine = Machine(id = id, name = id.replaceFirstChar { it.uppercase() }, endpoints = emptyList(), systems = emptyList(), wake = null)
         val calls = mutableListOf<String>()
+
+        /** The `--revision` of every push, in order. */
+        val revisions = mutableListOf<Long>()
         var meta: suspend () -> Result<ConfigMetaReply> = { error("no config meta was expected") }
         var fetch: suspend () -> Result<ControllerFetch> = { error("no config read was expected") }
         var set: suspend (String) -> Result<ConfigSetReply> = { error("no config set was expected") }
@@ -88,6 +91,7 @@ class SetupPeerSyncTest {
         override suspend fun fetchSetup(): Result<ControllerFetch> = fetch().also { calls += "config" }
         override suspend fun configSet(canonicalDocument: String, setupId: String, revision: Long, replace: Boolean): Result<ConfigSetReply> {
             assertTrue("an automatic push never replaces", !replace)
+            revisions += revision
             return set(canonicalDocument).also { calls += "set" }
         }
 
@@ -443,6 +447,27 @@ class SetupPeerSyncTest {
         assertEquals("Setup updated from Pi.", machine.poll(status(null)))
         assertEquals(listOf("set", "config"), machine.calls)
         assertEquals(document.hash, store.appliedHash())
+    }
+
+    /**
+     * The agent takes `--revision` only when it is the revision it reads in the document, so a
+     * document that writes 7 as 7.0 is pushed as 7. Read with the spelling's own rules it was 0,
+     * every push was refused, and it was tried again every minute without ever replicating.
+     */
+    @Test
+    fun `a revision written with a fraction is pushed as the whole number the agent reads`() = runBlocking {
+        val spelled = LaunchDocuments.store(MemoryPreferences()).also {
+            assertNull(it.applyEnrolment(LaunchDocuments.HELD.replace("\"revision\": 7,", "\"revision\": 7.0,"), "Test phone"))
+        }
+        val spelledSync = SetupPeerSync(servicesOver(spelled)) { now }
+        val machine = FakeMachine("pi")
+        machine.set = { canonical -> Result.success(stored(hashOf(canonical))) }
+
+        assertTrue(spelledSync.reconcile(machine, status(null), false, spelledSync.state("pi"))!!.startsWith("The setup was sent to Pi."))
+        val first = spelled.appliedHash()
+        assertNull(spelled.applyEdit(spelled.document.value!!.editMachine("tower") { it.withText("name", "Edited here") }, "Test phone"))
+        assertTrue(spelledSync.reconcile(machine, status(first), false, spelledSync.state("pi"))!!.startsWith("The setup was sent to Pi."))
+        assertEquals(listOf(7L, 8L), machine.revisions)
     }
 
     @Test

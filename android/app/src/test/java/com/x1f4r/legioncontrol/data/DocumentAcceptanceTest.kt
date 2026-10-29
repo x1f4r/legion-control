@@ -80,6 +80,34 @@ class DocumentAcceptanceTest {
         val config = readControllerConfig(text).getOrThrow()
         assertEquals(22, config.machines.single().endpoints.single().port)
         assertEquals(10L, config.controller?.revision)
+
+        // The identity a push and an edit are made from reads it the same way. A push of this
+        // document is revision 10, the one the agent finds in it, and an edit of it is revision 11.
+        val document = ControllerDocument.parse(text).getOrThrow()
+        assertEquals(10L, document.identity!!.revision)
+        assertEquals(11L, document.asEditOf(document, "Test phone", "2026-09-05T14:00:00.000Z").identity!!.revision)
+    }
+
+    /**
+     * Section 9.7 sets no upper bound on a revision, and one past the range of a Long is still a
+     * document the contract accepts. It is read as the largest Long, and an edit of it stays there
+     * rather than wrapping round to a revision no machine takes.
+     */
+    @Test
+    fun `a revision past the range of a Long is accepted, and never wraps round`() {
+        val text = """{"version":1,"controller":{"id":"setup-a","revision":1e20},"machines":[]}"""
+        assertTrue(DocumentAcceptance.check(text, Intake.PEER).valid)
+        assertEquals(Long.MAX_VALUE, readControllerConfig(text).getOrThrow().controller?.revision)
+
+        val document = ControllerDocument.parse(text).getOrThrow()
+        assertEquals(Long.MAX_VALUE, document.identity!!.revision)
+        val edited = document.asEditOf(document, "Test phone", "2026-09-05T14:00:00.000Z")
+        assertEquals(Long.MAX_VALUE, edited.identity!!.revision)
+        assertTrue(DocumentAcceptance.check(edited.canonicalText, Intake.PEER).valid)
+
+        val store = LaunchDocuments.store()
+        assertTrue(store.adoptFromMachine(text, CanonicalSetup.hashOf(text), null, "Pi") is SetupOutcome.Applied)
+        assertEquals(CanonicalSetup.canonicalText(text), store.text.value)
     }
 
     /**
