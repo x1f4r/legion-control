@@ -69,7 +69,7 @@ public sealed class ServiceEditor : Window
             ShowProfile(); body.Children.Add(Ui.Actions(profileChoice, add)); body.Children.Add(profileNote);
         }
         byte[]? approved = null;
-        var save = Ui.Action("Save validated changes", async () =>
+        var save = Ui.Action("Save validated changes", () => Ui.Run(this, "Saving the service setup", async () =>
         {
             if (approved is null) { notes.Text = "Validate this exact document first."; return; }
             try
@@ -81,7 +81,7 @@ public sealed class ServiceEditor : Window
                 await machine.RefreshAsync();
             }
             catch (AgentFailure failure) { approved = null; notes.Text = failure.Sentence(machine.Name); }
-        });
+        }));
         save.IsEnabled = false;
         editor.TextChanged += (_, _) => { approved = null; save.IsEnabled = false; };
         body.Children.Add(Ui.Actions(selected, Ui.Action("Insert service template", () =>
@@ -99,7 +99,7 @@ public sealed class ServiceEditor : Window
             catch (Exception error) { notes.Text = error.Message; }
         })));
         body.Children.Add(editor); body.Children.Add(notes);
-        body.Children.Add(Ui.Actions(Ui.Action("Close", Close), Ui.Action("Validate and preview", async () =>
+        body.Children.Add(Ui.Actions(Ui.Action("Close", Close), Ui.Action("Validate and preview", () => Ui.Run(this, "Validating the service setup", async () =>
         {
             approved = null; save.IsEnabled = false;
             try
@@ -118,7 +118,7 @@ public sealed class ServiceEditor : Window
                 approved = payload; save.IsEnabled = true;
             }
             catch (Exception error) { notes.Text = error.Message; }
-        }), save));
+        })), save));
         Content = new ScrollViewer { Content = body };
     }
 }

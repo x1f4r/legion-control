@@ -4,6 +4,7 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
+using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Model;
 using LegionControl.Desktop.Updates;
 using LegionControl.Desktop.Views;
@@ -16,11 +17,25 @@ public partial class App : Application
     private MainWindow? _window;
     private TrayIcon? _tray;
     private Action? _trayChanged;
+    private DateTimeOffset _failureShown = DateTimeOffset.MinValue;
 
     public override void Initialize() => AvaloniaXamlLoader.Load(this);
 
     public override void OnFrameworkInitializationCompleted()
     {
+        // The last line of defence for the window: whatever a handler threw that nothing caught is
+        // written down and shown, and the window stays open. Everything a button starts already
+        // goes through [Ui.Run], which can say what was being done; this is for the rest.
+        // One that repeats, as a layout that throws does on every pass, is shown once a minute and
+        // logged every time.
+        Dispatcher.UIThread.UnhandledException += (_, unhandled) =>
+        {
+            AppLog.Write("the window", unhandled.Exception);
+            unhandled.Handled = true;
+            if (_window is not { IsVisible: true } window || DateTimeOffset.UtcNow - _failureShown < TimeSpan.FromMinutes(1)) return;
+            _failureShown = DateTimeOffset.UtcNow;
+            Ui.Failed(window, "Something went wrong", unhandled.Exception);
+        };
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             _model = new AppModel();
@@ -86,7 +101,10 @@ public partial class App : Application
         static NativeMenuItem Item(string label, Action action)
         { var item = new NativeMenuItem(label); item.Click += (_, _) => action(); return item; }
         var menu = new NativeMenu();
-        menu.Add(Item("Refresh", () => { if (_model is not null) _ = _model.RefreshAllAsync(); }));
+        menu.Add(Item("Refresh", () =>
+        {
+            if (_model is { } model && _window is { } window) Ui.Run(window, "Refreshing", () => model.RefreshAllAsync());
+        }));
         foreach (var machine in _model?.Machines ?? Array.Empty<MachineModel>())
         {
             var details = new NativeMenu();

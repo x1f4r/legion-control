@@ -1,5 +1,6 @@
 using Avalonia;
 using LegionControl.Desktop.Cli;
+using LegionControl.Desktop.Config;
 
 namespace LegionControl.Desktop;
 
@@ -17,6 +18,16 @@ internal static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        // Whatever escapes everything else is at least written down. The process may still end,
+        // but not without a line saying why.
+        AppDomain.CurrentDomain.UnhandledException += (_, unhandled) =>
+            AppLog.Write("unhandled", unhandled.ExceptionObject as Exception);
+        TaskScheduler.UnobservedTaskException += (_, unobserved) =>
+        {
+            AppLog.Write("a background task nobody waited for", unobserved.Exception);
+            unobserved.SetObserved();
+        };
+
         // A bare verb is part of the documented CLI too. Treat an unknown bare verb as a CLI
         // error rather than quietly opening a window and ignoring it.
         if (args.Any(argument => HeadlessFlags.Contains(argument))

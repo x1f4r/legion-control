@@ -66,7 +66,7 @@ public sealed class MainWindow : Window
             Ui.MenuAction("Check for app updates", CheckForUpdate),
             Ui.MenuAction("About", () => Sheets.Text(this, "Legion Control", $"Version {AgentContract.ClientVersion}")),
         }, "Application menu");
-        var toolbarActions = Ui.Actions(Ui.Action("Refresh", () => { _ = _app.RefreshAllAsync(); }), appMenu);
+        var toolbarActions = Ui.Actions(Ui.Action("Refresh", () => Run("Refreshing", () => _app.RefreshAllAsync())), appMenu);
         toolbarActions.Margin = new Thickness(8, 0, 0, 0);
         Grid.SetColumn(toolbarActions, 2); toolbar.Children.Add(toolbarActions);
         DockPanel.SetDock(toolbar, Dock.Top); root.Children.Add(toolbar);
@@ -649,7 +649,11 @@ public sealed class MainWindow : Window
 
     // MARK: the things the buttons do
 
-    private async void Request(MachineModel machine, MachineRequest request)
+    /// Every one of them that awaits anything runs through [Ui.Run], so an error none of them
+    /// planned for is shown and logged rather than taking the window down.
+    private void Run(string what, Func<Task> task, bool quiet = false) => Ui.Run(this, what, task, quiet);
+
+    private void Request(MachineModel machine, MachineRequest request) => Run("Sending the request", async () =>
     {
         var confirmation = Confirmation.For(request, machine.Status, machine.Name, machine.IsSelf);
         var answer = await Sheets.ConfirmAsync(this, request, confirmation);
@@ -657,36 +661,36 @@ public sealed class MainWindow : Window
         var outcome = await machine.RequestAsync(answer);
         if (outcome.IsKnownSuccess) return;
         Sheets.Text(this, answer.Describe(), outcome.Sentence_);
-    }
+    });
 
-    private async void EditPolicy(MachineModel machine, string? service)
+    private void EditPolicy(MachineModel machine, string? service) => Run("Reading the update policy", async () =>
     {
         var (reply, problem) = await machine.ReadPolicyAsync(service);
         if (reply is null) { Sheets.Text(this, "Policy", problem ?? "Policy unavailable."); return; }
         await new PolicyEditor(machine, service, reply).ShowDialog(this);
-    }
+    });
 
-    private async void Policy(MachineModel machine, string? service, PolicyPatch patch)
+    private void Policy(MachineModel machine, string? service, PolicyPatch patch) => Run("Changing the update policy", async () =>
     {
         var (_, problem) = await machine.WritePolicyAsync(service, patch);
         if (problem is not null) Sheets.Text(this, "The policy was not changed", problem);
         await machine.RefreshAsync();
-    }
+    });
 
-    private async void Cancel(MachineModel machine, string id)
+    private void Cancel(MachineModel machine, string id) => Run("Cancelling the operation", async () =>
     {
         var outcome = await machine.CancelAsync(id);
         if (outcome is not CommandOutcome.Done) Sheets.Text(this, "Cancel", outcome.Sentence_);
-    }
+    });
 
-    private async void History(MachineModel machine)
+    private void History(MachineModel machine) => Run("Reading the operation history", async () =>
     {
         var (history, problem) = await machine.HistoryAsync();
         Sheets.Text(this, "Operation history", problem is not null ? problem :
             string.Join("\n", history.Select(op => $"{op.Id}: {op.Describe()} — {op.Message ?? op.OutcomeText}")));
-    }
+    });
 
-    private async void Doctor(MachineModel machine, bool deep = false)
+    private void Doctor(MachineModel machine, bool deep = false) => Run("Checking the agent", async () =>
     {
         var (report, problem) = await machine.DoctorAsync(deep: deep);
         if (report is null)
@@ -698,15 +702,15 @@ public sealed class MainWindow : Window
             $"{check.Verdict.ToString().ToLowerInvariant(),-8} {check.DisplayName,-28} {check.Summary}"
             + (check.Fix is { } fix ? $"\n         fix: {fix}" : "")));
         Sheets.Text(this, $"Doctor — {machine.Name}", text);
-    }
+    });
 
-    private async void Logs(MachineModel machine)
+    private void Logs(MachineModel machine) => Run("Reading the agent log", async () =>
     {
         var (lines, problem) = await machine.LogsAsync();
         Sheets.Text(this, $"Log — {machine.Name}", problem ?? string.Join("\n", lines));
-    }
+    });
 
-    private async void Bundle(MachineModel machine)
+    private void Bundle(MachineModel machine) => Run("Exporting diagnostics", async () =>
     {
         var (text, problem) = await machine.BundleAsync();
         if (text is null)
@@ -726,11 +730,11 @@ public sealed class MainWindow : Window
         {
             Sheets.Text(this, "Bundle", $"Could not write {path}: {error.Message}");
         }
-    }
+    });
 
     /// Runs the other helpers' commands while one run for this machine may still be going, after a
     /// question that says so. Nothing else ever lifts a hold on a person's behalf.
-    private async void TryOtherHelpers(MachineModel machine)
+    private void TryOtherHelpers(MachineModel machine) => Run($"Waking {machine.Name}", async () =>
     {
         var confirmed = await Sheets.AskAsync(this, $"Try the other helpers for {machine.Name}?",
             $"A helper command run earlier to wake {machine.Name} has not reported how it ended, so it may still be running. Trying the other helpers runs their commands, and does not run that one again.",
@@ -738,21 +742,21 @@ public sealed class MainWindow : Window
         if (!confirmed) return;
         var report = await _app.WakeAsync(machine, HoldChoice.OtherHelpers);
         Sheets.Text(this, $"Wake — {machine.Name}", string.Join("\n", report.Attempts.Append(report.Sentence)));
-    }
+    });
 
     /// Runs a held helper command again when no other helper could be asked, after a question that
     /// says the first run may still be going and this can make it two. Without it, a hold on a
     /// helper that keeps no records would last until the machine answered.
-    private async void RunHeldAgain(MachineModel machine, WakePlan again)
+    private void RunHeldAgain(MachineModel machine, WakePlan again) => Run($"Waking {machine.Name}", async () =>
     {
         var confirmed = await Sheets.AskAsync(this, $"{WakePlanner.RunAgainLabel(again)} for {machine.Name}?",
             WakePlanner.RunAgainWarning(again, machine.Name), "Run it again");
         if (!confirmed) return;
         var report = await _app.WakeAsync(machine, HoldChoice.RunAgain);
         Sheets.Text(this, $"Wake — {machine.Name}", string.Join("\n", report.Attempts.Append(report.Sentence)));
-    }
+    });
 
-    private async void Wake(MachineModel machine, string? desiredSystem = null)
+    private void Wake(MachineModel machine, string? desiredSystem = null) => Run($"Waking {machine.Name}", async () =>
     {
         var report = await _app.WakeAsync(machine);
         if (report.Confirmed && desiredSystem is not null && report.SystemId != desiredSystem)
@@ -762,9 +766,9 @@ public sealed class MainWindow : Window
         }
         Sheets.Text(this, $"Wake — {machine.Name}",
             string.Join("\n", report.Attempts.Append(report.Sentence)));
-    }
+    });
 
-    private async void TrustAsync(MachineModel machine)
+    private void TrustAsync(MachineModel machine) => Run("Checking the host key", async () =>
     {
         var route = TrustRoute(machine);
         if (route is null) return;
@@ -792,7 +796,7 @@ public sealed class MainWindow : Window
                 Sheets.Text(this, "Trust", $"{conflict.Sentence}\n\n{conflict.Fix}");
                 return;
         }
-    }
+    });
 
     private MachineRoute? TrustRoute(MachineModel machine)
     {
@@ -802,7 +806,7 @@ public sealed class MainWindow : Window
             : routes.FirstOrDefault();
     }
 
-    private async void OperationDetails(MachineModel machine, string id)
+    private void OperationDetails(MachineModel machine, string id) => Run("Reading the operation", async () =>
     {
         var tracked = machine.Operations.FirstOrDefault(operation => operation.Id == id);
         if (tracked?.Output is { } output)
@@ -816,9 +820,9 @@ public sealed class MainWindow : Window
                 : reply.Value.NoRecord ? $"{machine.Name} has no operation {id}." : reply.Value.Envelope.Sentence() ?? "No operation record returned.");
         }
         catch (AgentFailure failure) { Sheets.Text(this, "Operation details", failure.Sentence(machine.Name)); }
-    }
+    });
 
-    private async void EditServices(MachineModel machine)
+    private void EditServices(MachineModel machine) => Run("Opening the service setup", async () =>
     {
         try
         {
@@ -828,12 +832,12 @@ public sealed class MainWindow : Window
             await new ServiceEditor(machine, reply.Value).ShowDialog(this);
         }
         catch (AgentFailure failure) { Sheets.Text(this, "Service setup", failure.Sentence(machine.Name)); }
-    }
+    });
 
     /// Installs the bundled agent where it is older than the one running, or below the version
     /// floor: only after a person answered a question that says so, and then with the agent told
     /// in as many words.
-    private async void GoBackToAgent(MachineModel machine, string version, string goesBack)
+    private void GoBackToAgent(MachineModel machine, string version, string goesBack) => Run("Going back to an older agent", async () =>
     {
         var floor = AgentVersions.IsOlder(version, machine.Capabilities.Floor)
             ? $" and lowers the machine's version floor to it, so the machine accepts agents from {version} up until a newer one raises the floor again"
@@ -845,9 +849,9 @@ public sealed class MainWindow : Window
         var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, allowDowngrade: true);
         Sheets.Text(this, "Agent", outcome.Report);
         await machine.RefreshAsync();
-    }
+    });
 
-    private async void InstallAgent(MachineModel machine)
+    private void InstallAgent(MachineModel machine) => Run("Installing the agent", async () =>
     {
         await machine.RefreshAsync();
         if (machine.Status is null || machine.Failure is not null)
@@ -880,9 +884,9 @@ public sealed class MainWindow : Window
             return;
         }
         if (problem is not null) Sheets.Text(this, "Launcher path", problem);
-    }
+    });
 
-    private async void Diverged(MachineModel machine, ReconcileOutcome outcome)
+    private void Diverged(MachineModel machine, ReconcileOutcome outcome) => Run("Settling the setup", async () =>
     {
         if (outcome is not ReconcileOutcome.NeedsDecision decision) return;
         // The screen is built from what the machine sent; every answer but Replace needs its
@@ -907,15 +911,15 @@ public sealed class MainWindow : Window
         };
         if (result is not null) Sheets.Text(this, "The setup", result);
         await _app.RefreshAllAsync();
-    }
+    });
 
-    private async void TryAgain(MachineModel machine)
+    private void TryAgain(MachineModel machine) => Run("Trying again", async () =>
     {
         await _app.Reconciler.TryAgainAsync(machine);
         Rebuild();
-    }
+    });
 
-    private async void CheckForUpdate()
+    private void CheckForUpdate() => Run("Checking for an update", async () =>
     {
         if (_reviewingUpdate) return;
         _reviewingUpdate = true;
@@ -928,21 +932,21 @@ public sealed class MainWindow : Window
             await ReviewUpdateAsync(ready);
         }
         finally { _reviewingUpdate = false; }
-    }
+    });
 
-    private async void SuggestAppUpdate()
+    private void SuggestAppUpdate() => Run("Checking for an update", async () =>
     {
         if (!_app.Settings.CheckForAppUpdates || _updateLifetime.IsCancellationRequested) return;
         await _app.CheckForAppUpdateAsync(_updateLifetime.Token, force: false);
-    }
+    }, quiet: true);
 
-    private async void ReviewAvailableUpdate(UpdateAvailability.Ready ready)
+    private void ReviewAvailableUpdate(UpdateAvailability.Ready ready) => Run("Installing the update", async () =>
     {
         if (_reviewingUpdate) return;
         _reviewingUpdate = true;
         try { await ReviewUpdateAsync(ready); }
         finally { _reviewingUpdate = false; }
-    }
+    });
 
     private async Task ReviewUpdateAsync(UpdateAvailability.Ready ready)
     {

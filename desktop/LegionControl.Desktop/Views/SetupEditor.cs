@@ -87,7 +87,7 @@ public sealed class SetupEditor : Window
     ///
     /// The fields are asked for rather than guessed: a machine id and an ssh host are the two things
     /// nobody else can know, and a template with a hole left in it is not inserted at all.
-    private async void Insert(SetupTemplate template)
+    private void Insert(SetupTemplate template) => Ui.Run(this, $"Inserting {template.Name}", async () =>
     {
         var values = await AskFor(template);
         if (values is null) return;
@@ -115,7 +115,7 @@ public sealed class SetupEditor : Window
         }
         _text.Text = plan.Text;
         Report(plan.Problems, plan.Preview.Lines().ToList());
-    }
+    });
 
     /// One small sheet per template, with a field for each thing it needs.
     private async Task<Dictionary<string, string>?> AskFor(SetupTemplate template)
@@ -193,12 +193,12 @@ public sealed class SetupEditor : Window
         });
     }
 
-    private async void Import()
+    private void Import() => Ui.Run(this, "Importing a setup", async () =>
     {
         await new ImportSetup(_app).ShowDialog(this);
         if (_app.Config.Document is { } document) ReadFrom(document);
         Check();
-    }
+    });
 
     /// Puts the setup as it is now in the editor, in place of whatever was typed.
     private void StartAgain()

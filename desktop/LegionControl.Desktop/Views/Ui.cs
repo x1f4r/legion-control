@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
+using LegionControl.Desktop.Config;
 
 namespace LegionControl.Desktop.Views;
 
@@ -138,6 +139,33 @@ public static class Ui
         return button;
     }
 
+    /// Runs one thing a person started, to its end, from the window's thread.
+    ///
+    /// Every button and menu item that awaits anything goes through here. Whatever it throws is
+    /// written to the log and shown in a sheet that says what was being done, rather than ending
+    /// the process, which is what an exception out of an `async void` handler does, or vanishing.
+    /// [quiet] is for what runs without anybody having asked, like the update check on activation:
+    /// that is logged and not shown.
+    public static void Run(Window owner, string what, Func<Task> task, bool quiet = false) =>
+        _ = UiTask.RunAsync(what, task, error =>
+        {
+            if (!quiet) Failed(owner, what, error);
+        });
+
+    /// The sheet for something that stopped on an error nobody planned for.
+    public static void Failed(Window owner, string what, Exception error)
+    {
+        try
+        {
+            Sheets.Text(owner, what, UiTask.Sentence(what, error));
+        }
+        catch (Exception shown)
+        {
+            // A window that has closed has nowhere to show it. The log has it either way.
+            AppLog.Write($"{what}, while saying so", shown);
+        }
+    }
+
     public static void ShowDetails(Window owner, string title, Control content)
     {
         content.Margin = new Thickness(16);
@@ -151,4 +179,33 @@ public static class Ui
         };
         window.Show(owner);
     }
+}
+
+/// What [Ui.Run] does, apart from the window, so that it can be checked without one.
+public static class UiTask
+{
+    /// Runs [task] and hands whatever it throws to [report], after writing it to the log. Never
+    /// throws itself, so the task this returns never faults and nothing awaits it in vain.
+    public static async Task RunAsync(string what, Func<Task> task, Action<Exception> report)
+    {
+        try
+        {
+            await task();
+        }
+        catch (Exception error)
+        {
+            AppLog.Write(what, error);
+            try
+            {
+                report(error);
+            }
+            catch (Exception shown)
+            {
+                AppLog.Write($"{what}, while saying so", shown);
+            }
+        }
+    }
+
+    public static string Sentence(string what, Exception error) =>
+        $"{what} stopped on an error this app did not expect: {error.Message}\n\nThe details are in {AppLog.Path}.";
 }

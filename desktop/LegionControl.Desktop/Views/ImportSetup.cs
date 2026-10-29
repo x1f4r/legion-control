@@ -68,7 +68,7 @@ public sealed class ImportSetup : Window
                 IdentityFile = string.IsNullOrWhiteSpace(identity.Text) ? app.Bindings.IdentityFile : identity.Text,
             });
         }
-        body.Children.Add(Ui.Actions(Ui.Action("Inspect / approve host identity", async () =>
+        body.Children.Add(Ui.Actions(Ui.Action("Inspect / approve host identity", () => Ui.Run(this, "Checking the host key", async () =>
         {
             try
             {
@@ -85,7 +85,7 @@ public sealed class ImportSetup : Window
                 };
             }
             catch (Exception error) { problem.Text = error.Message; }
-        }), Ui.Action("Fetch and preview", async () =>
+        })), Ui.Action("Fetch and preview", () => Ui.Run(this, "Fetching the setup", async () =>
         {
             try
             {
@@ -98,9 +98,9 @@ public sealed class ImportSetup : Window
                 problem.Text = string.Join("\n", SetupConflictPreview.Between(app.Config.Config, document.Decoded).Lines());
             }
             catch (Exception error) { problem.Text = error.Message; }
-        })));
+        }))));
         body.Children.Add(preview); body.Children.Add(problem);
-        body.Children.Add(Ui.Actions(Ui.Action("Cancel", Close), Ui.Action("Adopt this exact setup here", async () =>
+        body.Children.Add(Ui.Actions(Ui.Action("Cancel", Close), Ui.Action("Adopt this exact setup here", () => Ui.Run(this, "Adopting the setup", async () =>
         {
             if (fetched is null) { problem.Text = "Fetch and review a setup first."; return; }
             try
@@ -116,7 +116,7 @@ public sealed class ImportSetup : Window
                 Close();
             }
             catch (Exception error) { problem.Text = error.Message; }
-        })));
+        }))));
         Content = new ScrollViewer { Content = body };
     }
 

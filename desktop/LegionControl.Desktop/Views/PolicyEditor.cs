@@ -35,7 +35,7 @@ public sealed class PolicyEditor : Window
         var windows = Choice("Maintenance windows", service is null ? new[] { "Unchanged", "Custom", "Clear" } : new[] { "Unchanged", "Custom", "Clear", "Inherit" });
         var schedule = new TextBox { Watermark = "mon,tue:02:00-06:00;fri:23:00-05:00" }; body.Children.Add(schedule);
         var problem = new TextBlock { Foreground = Ui.Bad, TextWrapping = Avalonia.Media.TextWrapping.Wrap }; body.Children.Add(problem);
-        var save = Ui.Action("Apply and read back", async () =>
+        var save = Ui.Action("Apply and read back", () => Ui.Run(this, "Changing the update policy", async () =>
         {
             DateTimeOffset? pauseUntil = null;
             if (pause.SelectedIndex == 1 && !DateTimeOffset.TryParse(until.Text, out var parsed))
@@ -63,7 +63,7 @@ public sealed class PolicyEditor : Window
             if (readback is null) { problem.Text = readProblem ?? "Written, but the effective policy could not be read back."; return; }
             ShowEffective(readback); problem.Text = "Saved and read back.";
             await machine.RefreshAsync();
-        });
+        }));
         body.Children.Add(Ui.Actions(Ui.Action("Close", Close), save));
         Content = new ScrollViewer { Content = body };
     }
