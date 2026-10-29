@@ -1010,7 +1010,7 @@ public class LaunchGateTests
     // MARK: the record itself
 
     [Fact]
-    public void TheRecordKeepsWhatItDoesNotKnowAndWaitsForTheLock()
+    public async Task TheRecordKeepsWhatItDoesNotKnowAndWaitsForTheLock()
     {
         using var home = new TempHome();
         var path = Path.Combine(home.Path, "approved-launch.json");
@@ -1024,10 +1024,9 @@ public class LaunchGateTests
         {
             // The command line holds the lock: the window's write waits for it rather than racing.
             writer = Task.Run(() => approvals.Approve(new[] { entry }));
-            Assert.False(writer.Wait(300));
+            Assert.NotSame(writer, await Task.WhenAny(writer, Task.Delay(300)));
         }
-        Assert.True(writer.Wait(TimeSpan.FromSeconds(5)));
-        Assert.Null(writer.Result);
+        Assert.Null(await writer.WaitAsync(TimeSpan.FromSeconds(5)));
 
         var written = JsonNode.Parse(File.ReadAllText(path))!;
         Assert.True(written["later"]!["kept"]!.GetValue<bool>());
