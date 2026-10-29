@@ -2,73 +2,12 @@ import Foundation
 import Testing
 @testable import LegionControlCore
 
-/// The canonical form of a controller document, checked against the vectors the whole fleet agrees
-/// on.
+/// The canonical form of a controller document.
 ///
 /// This is the one place where being one byte out means every device disagrees about every document
-/// forever, so it is checked against `contract/hash-vectors.json` rather than against this app's own
-/// idea of the rule.
+/// forever. The shared `hash` vectors check it case by case (ContractVectorTests); these name the
+/// rules a person would get wrong.
 struct CanonicalTests {
-
-    struct Vectors: Decodable {
-        var vectors: [Vector]
-
-        struct Vector: Decodable {
-            var name: String
-            var purpose: String
-            var inputBase64: String
-            var canonicalBase64: String?
-            var sha256: String?
-            var accepted: Bool?
-            var reject: String?
-        }
-    }
-
-    static func loadVectors() throws -> Vectors? {
-        let url = repositoryRoot.appending(path: "contract/hash-vectors.json")
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try JSONDecoder().decode(Vectors.self, from: data)
-    }
-
-    /// The repository this test is running out of, found by walking up from the source file.
-    static var repositoryRoot: URL {
-        var url = URL(fileURLWithPath: #filePath)
-        // .../mac/Tests/LegionControlCoreTests/CanonicalTests.swift
-        for _ in 0..<4 { url = url.deletingLastPathComponent() }
-        return url
-    }
-
-    @Test("every shared hash vector produces the same canonical bytes and hash")
-    func sharedVectors() throws {
-        guard let vectors = try Self.loadVectors() else {
-            // This shared file may be absent from a source archive. A silently skipped check would
-            // be worse than either outcome, so the suite says so.
-            Issue.record("contract/hash-vectors.json is missing, so the shared canonicalisation was not checked")
-            return
-        }
-        #expect(!vectors.vectors.isEmpty)
-
-        for vector in vectors.vectors {
-            let input = try #require(Data(base64Encoded: vector.inputBase64), "\(vector.name): bad base64")
-
-            guard let expectedHash = vector.sha256 else {
-                // A vector with no hash is one that has no canonical form: invalid UTF-8. It has to
-                // be refused rather than hashed, because a stable hash for something nobody can read
-                // would make two sides agree forever about rubbish.
-                #expect(throws: Canonical.NotUTF8.self, "\(vector.name) should have no canonical form") {
-                    _ = try Canonical.bytes(input)
-                }
-                continue
-            }
-
-            let bytes = try Canonical.bytes(input)
-            if let expectedCanonical = vector.canonicalBase64 {
-                let expected = try #require(Data(base64Encoded: expectedCanonical))
-                #expect(bytes == expected, "\(vector.name): \(vector.purpose)")
-            }
-            #expect(Canonical.sha256(bytes) == expectedHash, "\(vector.name): \(vector.purpose)")
-        }
-    }
 
     @Test("the rule is the fixed ASCII set, not the language's own trim")
     func trimsOnlyTheFixedSet() throws {
@@ -117,5 +56,29 @@ struct CanonicalTests {
         let hash = try Canonical.hash(without)
         #expect(try Canonical.hash(with) == hash)
         #expect(try Canonical.hash(many) == hash)
+    }
+
+    @Test("two byte order marks: one is stripped, the second is content, and the document is refused")
+    func doubleByteOrderMark() throws {
+        // C13: Foundation's UTF-8 decoder drops a leading mark without saying so, and so does
+        // JSONSerialization, so a document behind two of them lost one in each and was accepted here
+        // while every other implementation refuses it.
+        let bom: [UInt8] = [0xEF, 0xBB, 0xBF]
+        let document = Data(#"{"version":1,"machines":[]}"#.utf8)
+        let twice = Data(bom + bom) + document
+        #expect(try Canonical.bytes(twice) == Data(bom) + document + Data("\n".utf8))
+        #expect(Canonical.rejection(twice) == .notAJSONObject)
+        #expect(Canonical.rejection(Data(bom) + document) == nil)
+    }
+
+    @Test("what section 12 refuses, in its order")
+    func rejectionOrder() {
+        #expect(Canonical.rejection(Data(repeating: 0x20, count: Canonical.maxDocumentBytes + 1)) == .tooLarge)
+        #expect(Canonical.rejection(Data([0x7B, 0xFF, 0x7D])) == .invalidUTF8)
+        #expect(Canonical.rejection(Data(" \r\n\t".utf8)) == .empty)
+        #expect(Canonical.rejection(Data("[1]".utf8)) == .notAJSONObject)
+        #expect(Canonical.rejection(Data(#"{"version":"1","machines":[]}"#.utf8)) == .notAJSONObject)
+        // A repeated name is section 9.7's to refuse, not section 12's.
+        #expect(Canonical.rejection(Data(#"{"version":1,"version":1,"machines":[]}"#.utf8)) == nil)
     }
 }

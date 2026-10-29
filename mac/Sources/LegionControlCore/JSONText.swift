@@ -83,7 +83,7 @@ enum JSONText {
 
     /// Numbers as JavaScript writes them: an integer with no decimal point, a double with the
     /// shortest representation that round-trips, and a bool as a bool.
-    private static func format(_ number: NSNumber) -> String {
+    static func format(_ number: NSNumber) -> String {
         // CFNumber does not distinguish a Bool from a 0 or 1 by type alone.
         if CFGetTypeID(number) == CFBooleanGetTypeID() {
             return number.boolValue ? "true" : "false"

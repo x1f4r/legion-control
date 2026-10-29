@@ -13,7 +13,7 @@ struct ContractVectorTests {
 
     /// The families this suite runs. A family joins when this app has a port of its reference to
     /// run, and the contract has nine.
-    static let families = ["identifiers", "transport", "launch"]
+    static let families = ["hash", "identifiers", "transport", "launch"]
 
     typealias Adapter = @Sendable (VectorJSON) throws -> VectorJSON
 
@@ -178,6 +178,19 @@ struct ContractVectorTests {
             ["valid": .bool(input["value"]?.int.map(Addresses.isPort) ?? false)]
         },
 
+        // Section 12: canonical bytes, their hash, and what the agent refuses to store.
+        "hash/vectors": { input in
+            guard let bytes = Data(base64Encoded: try string(input, "inputBase64")) else { throw BadInput(description: "bad base64") }
+            let canonical = try? Canonical.bytes(bytes)
+            let rejection = Canonical.rejection(bytes)
+            return [
+                "canonicalBase64": VectorJSON(canonical?.base64EncodedString()),
+                "sha256": VectorJSON(canonical.map(Canonical.sha256)),
+                "accepted": .bool(rejection == nil),
+                "reject": VectorJSON(rejection?.rawValue),
+            ]
+        },
+
         // Section 9.9.
         "launch/review": launchReview,
         "launch/migration": { input in
@@ -197,12 +210,16 @@ struct ContractVectorTests {
             guard let expected = group.consumers[Self.consumer] else { continue }
             let key = "\(name)/\(group.group)"
             let adapter = try #require(Self.adapters[key], "no adapter for \(key)")
-            let cases = try #require(file["groups"]?[group.group]?.array, "\(key) has no cases in its file")
+            // The hash file keeps the flat layout it always had: every vector is for every
+            // consumer, is its own input, and carries the four fields to reproduce beside it.
+            let flat = entry.layout == "flat"
+            let cases = try #require(flat ? file["vectors"]?.array : file["groups"]?[group.group]?.array,
+                                     "\(key) has no cases in its file")
             var ran = 0
-            for vector in cases where vector["consumers"]?.array?.contains(.string(Self.consumer)) == true {
+            for vector in cases where flat || vector["consumers"]?.array?.contains(.string(Self.consumer)) == true {
                 let label = "\(key)/\(vector["name"]?.string ?? "?")"
-                let input = try #require(vector["input"], "\(label) has no input")
-                let expect = try #require(vector["expect"], "\(label) has no expect")
+                let input = try #require(flat ? vector : vector["input"], "\(label) has no input")
+                let expect = try #require(flat ? Self.flatExpect(vector) : vector["expect"], "\(label) has no expect")
                 do {
                     let differences = expect.differences(from: try adapter(input))
                     #expect(differences.isEmpty, "\(label): \(differences.joined(separator: "; "))")
@@ -213,6 +230,13 @@ struct ContractVectorTests {
             }
             #expect(ran == expected, "\(key): ran \(ran) cases, the index gives the Mac \(expected)")
         }
+    }
+
+    /// What a flat vector expects: the four fields the reference reproduces.
+    static func flatExpect(_ vector: VectorJSON) -> VectorJSON? {
+        let keys = ["canonicalBase64", "sha256", "accepted", "reject"]
+        guard keys.allSatisfy({ vector[$0] != nil }) else { return nil }
+        return .object(Dictionary(uniqueKeysWithValues: keys.map { ($0, vector[$0]!) }))
     }
 
     @Test("every group the Mac consumes in these families has exactly one adapter")
