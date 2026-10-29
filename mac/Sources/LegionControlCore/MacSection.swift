@@ -512,7 +512,7 @@ struct MacSection: View {
             if !model.sites.isEmpty {
                 Picker("", selection: Binding(
                     get: { model.bindings.bindings.currentSite ?? "" },
-                    set: { model.confirmSite($0.isEmpty ? nil : $0) }
+                    set: { editProblem = model.confirmSite($0.isEmpty ? nil : $0) }
                 )) {
                     Text("Work it out from the addresses").tag("")
                     ForEach(model.sites) { site in

@@ -172,6 +172,22 @@ struct AppModelTests {
         #expect(outcome.text.contains("did not happen"))
     }
 
+    @Test("picking a site over a private settings file this device refuses says why nothing changed")
+    func refusedSiteIsSaid() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let url = home.appending(path: "bindings.json")
+        let refused = Data(#"{"self":{"machine":"tower"},"localAgent":{"argv":["node","/a.mjs"],"shell":"cmd"}}"#.utf8)
+        try refused.write(to: url)
+        let app = try Self.app(Self.twoMachines, in: home, bindings: BindingsStore(url: url))
+
+        // The file is never written over, and the picker used to snap back without a word.
+        let problem = app.confirmSite("home")
+        #expect(problem?.contains("Nothing was saved") == true)
+        #expect(app.bindings.bindings.currentSite == nil)
+        #expect(try Data(contentsOf: url) == refused)
+    }
+
     @Test("opening the setup or the private settings goes through the one opener, which a test replaces")
     func editorOpenerIsInjected() throws {
         let home = try Self.home()

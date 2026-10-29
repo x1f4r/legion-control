@@ -582,6 +582,37 @@ struct LaunchGateTests {
         #expect(Self.file(app.config.approvalsURL) == record)
     }
 
+    @Test("a migration nothing could save says why on the line it was asked from")
+    func refusedMigrationIsSaid() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let url = home.appending(path: "bindings.json")
+        let bindings = BindingsStore(url: url)
+        bindings.update {
+            $0.selfBinding = .init(machine: "tower", system: "linux")
+            $0.localAgent = .init(argv: ["/usr/bin/node", "/Users/me/.legion-control/agent/src/index.mjs"])
+        }
+        let app = try Self.app(try Self.held(), in: home, bindings: bindings)
+        let mac = try #require(app.mac)
+
+        // The private settings were edited by hand into a file this build refuses, which is never
+        // written over. Answering "Update command" used to do nothing, without a word.
+        let refused = Data(#"{"self":{"machine":"tower","system":"linux"},"localAgent":{"argv":["/usr/bin/node","/a.mjs"],"shell":"cmd"}}"#.utf8)
+        try refused.write(to: url)
+        mac.migrateAgentCommand?(["/usr/bin/node", "/Users/me/.legion-control/bin/launcher.mjs"])
+        #expect(mac.noteIsError)
+        #expect(mac.note?.contains("Nothing was saved") == true)
+        #expect(Self.file(url) == refused)
+
+        // A machine's command lives in the shared setup, and an edit it cannot take is said there too.
+        let pi = try #require(app.machine(id: "pi"))
+        let setup = Self.file(home.appending(path: "config.json"))
+        pi.migrateAgentCommand?("linux", ["/usr/bin/node", "/home/me/bin/\u{7}launcher.mjs"])
+        #expect(pi.statusIsError)
+        #expect(pi.statusLine.contains("needs an agent command"))
+        #expect(Self.file(home.appending(path: "config.json")) == setup)
+    }
+
     @Test("an edit here approves only what it changed, and never a command that was waiting")
     func localEdits() throws {
         let home = try Self.home()

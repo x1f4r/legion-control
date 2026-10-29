@@ -126,10 +126,15 @@ final class AppModel {
 
     /// Say outright which site this device is at, because prefixes cannot tell two identical private
     /// networks apart and guessing wrong means broadcasting into the wrong house.
-    func confirmSite(_ id: String?) {
-        bindings.update { $0.currentSite = id }
+    ///
+    /// Returns why nothing was saved, when it was not: a private settings file this device refuses
+    /// is never written over, and the picker otherwise just snapped back without a word.
+    @discardableResult
+    func confirmSite(_ id: String?) -> String? {
+        let problem = bindings.update { $0.currentSite = id }
         refreshPlacement()
         onStateChange?()
+        return problem
     }
 
     // MARK: - Following the setup
@@ -268,8 +273,10 @@ final class AppModel {
                                 isError: true)
                 return
             }
-            _ = self.editSetup("updated the agent launcher on \(model.name)") { root in
+            if let problem = self.editSetup("updated the agent launcher on \(model.name)", { root in
                 try ControllerEditor.upsertSystem(["id": system, "agent": argv], onMachine: model.id, in: &root)
+            }) {
+                model.setStatus(problem, isError: true)
             }
         }
         model.placement = { [weak self] in self?.placement ?? .nowhere }
@@ -329,8 +336,12 @@ final class AppModel {
     private func wireLocal(_ model: MacModel) {
         wireDevice(model)
         model.migrateAgentCommand = { [weak self, weak model] argv in
-            guard let self, model?.boundMachineId != nil else { return }
-            _ = self.bindings.update { $0.localAgent = .init(argv: argv) }
+            guard let self, let model, model.boundMachineId != nil else { return }
+            // Said on this device's line, where the change was asked for. A private settings file
+            // this device refuses is left exactly as it is, and saying nothing made it look done.
+            if let problem = self.bindings.update({ $0.localAgent = .init(argv: argv) }) {
+                model.setStatus(problem, isError: true)
+            }
         }
     }
 
