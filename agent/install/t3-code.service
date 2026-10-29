@@ -30,9 +30,11 @@ Type=simple
 # Spell it out. This is not decoration: the launcher npm drops in the global bin
 # starts with "#!/usr/bin/env node", so without /usr/bin on PATH the unit fails
 # at exec with a bare "no such file or directory" that points at nothing useful.
-Environment=PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin
+# Both paths are quoted: the npm prefix is in the home directory, and a space
+# there would split them.
+Environment="PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin"
 
-ExecStart=@NPM_BIN@/t3 start --mode web --host 127.0.0.1 --port @PORT@ --no-browser
+ExecStart="@NPM_BIN@/t3" start --mode web --host 127.0.0.1 --port @PORT@ --no-browser
 
 # Bind to loopback only. Anything outside the box reaches the server through a
 # VPN or a relay, never by listening on the LAN.

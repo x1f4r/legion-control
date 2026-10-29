@@ -24,8 +24,9 @@ Type=oneshot
 
 # A login shell is never sourced by systemd, so nothing about PATH can be
 # assumed here. Spell it out, including the npm bin directory, so a service
-# installed with npm can be found and driven.
-Environment=PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin
+# installed with npm can be found and driven. Quoted, because that directory is
+# in the home directory, and a space there would end the assignment.
+Environment="PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin"
 
 # The update cycle drives services with "systemctl --user stop/start", which
 # needs a session bus to talk to. When a unit is started by the timer there is

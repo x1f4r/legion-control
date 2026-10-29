@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import http from 'node:http';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -112,4 +113,185 @@ test('installer promotion refuses a held operation mutex and preserves the activ
   assert.equal(next.status, 0, next.stderr);
   assert.equal(JSON.parse(fs.readFileSync(path.join(base, 'agent', 'package.json'))).version, '3.0.1');
   assert.equal(JSON.parse(fs.readFileSync(path.join(base, 'agent.prev', 'package.json'))).version, '3.0.0');
+});
+
+// --- The systemd units ----------------------------------------------------------
+
+/**
+ * The words systemd reads out of a setting's value (systemd.syntax(7)): % starts a specifier and
+ * %% is a percent sign, quotes group, a backslash escapes, and on an Exec line $ starts a variable
+ * and $$ is a dollar sign. Anything the installer never means to write, a specifier, a variable or
+ * an escape other than \\ and \", fails the test rather than being read one way or another.
+ */
+function systemdWords(value, { exec = false } = {}) {
+  assert.doesNotMatch(value.replaceAll('%%', ''), /%/, `a specifier in ${value}`);
+  const text = value.replaceAll('%%', '%');
+  const words = [];
+  let word = null;
+  let quote = null;
+  for (let at = 0; at < text.length; at += 1) {
+    const character = text[at];
+    if (character === '\\' && quote !== "'") {
+      assert.match(text[at + 1] ?? '', /^[\\"]$/, `an escape systemd reads differently in ${value}`);
+      word = (word ?? '') + text[at + 1];
+      at += 1;
+    } else if (quote !== null) {
+      if (character === quote) quote = null;
+      else word += character;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+      word ??= '';
+    } else if (/\s/.test(character)) {
+      if (word !== null) words.push(word);
+      word = null;
+    } else {
+      word = (word ?? '') + character;
+    }
+  }
+  assert.equal(quote, null, `an unterminated quote in ${value}`);
+  if (word !== null) words.push(word);
+  if (!exec) return words;
+  return words.map((each) => {
+    assert.doesNotMatch(each.replaceAll('$$', ''), /\$/, `a variable in ${value}`);
+    return each.replaceAll('$$', '$');
+  });
+}
+
+/** Each setting of a unit file in order, as [key, value], comments left out. */
+const settings = (text) => text.split('\n').filter((line) => /^[A-Za-z]+=/.test(line)).map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]);
+const values = (unit, key, options) => settings(unit).filter(([name]) => name === key).map(([, value]) => systemdWords(value, options));
+
+// A systemctl that only notes what it is asked. The units are rendered and written for real, on a
+// machine that may have no user manager, or one this test must not touch.
+function fakeCommands(root) {
+  const bin = path.join(root, 'fake-bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'systemctl'), `#!/bin/sh
+printf '%s\\n' "$*" >> "$LEGION_TEST_SYSTEMCTL"
+case "$*" in
+  *' cat '*) exit 1 ;;
+  *is-enabled*) echo enabled ;;
+  *is-active*) echo inactive ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  return bin;
+}
+
+// Every character a unit or a sed replacement reads as syntax, in the home directory the units are
+// written for, which holds the npm prefix and the launcher. All but the backslash, which the
+// launcher's wrapper cannot run from; the npm prefix of the second test has one.
+const AWKWARD_HOME = `home with space, $HOME \${HOME}, 100% & | "quotes" and ' apostrophe`;
+
+function unitInstall(root, home, env = {}) {
+  const calls = path.join(root, 'systemctl-calls');
+  const options = {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${fakeCommands(root)}${path.delimiter}${process.env.PATH}`, HOME: home, LEGIONCTL_HOME: path.join(home, '.legion-control'), LEGION_NODE_BIN: process.execPath, LEGION_TEST_SYSTEMCTL: calls, ...env },
+  };
+  return { options, calls: () => fs.readFileSync(calls, 'utf8').trim().split('\n') };
+}
+
+const unitSkip = process.platform === 'win32' || process.getuid?.() === 0;
+
+test('linux installer writes units that systemd reads back as the paths it meant, for a home with a space in it', { skip: unitSkip }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion units '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, AWKWARD_HOME);
+  const units = path.join(home, '.config', 'systemd', 'user');
+  fs.mkdirSync(units, { recursive: true });
+  // A unit left from when the update pair was named after the one service it drove.
+  fs.writeFileSync(path.join(units, 'legion-t3-update.timer'), '[Timer]\n');
+  const source = sourceFixture(root);
+  const { options, calls } = unitInstall(root, home);
+
+  const result = spawnSync('bash', [path.join(source, 'install', 'install-linux.sh')], options);
+  assert.equal(result.status, 0, result.stderr);
+
+  const service = fs.readFileSync(path.join(units, 'legion-control-update.service'), 'utf8');
+  const uid = process.getuid();
+  assert.deepEqual(values(service, 'Environment').flat(), [
+    `PATH=${path.join(home, '.npm-global', 'bin')}:/usr/local/bin:/usr/bin:/bin`,
+    `XDG_RUNTIME_DIR=/run/user/${uid}`,
+    `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus`,
+  ]);
+  const execStart = values(service, 'ExecStart', { exec: true });
+  assert.deepEqual(execStart, [[path.join(home, '.legion-control', 'bin', 'legionctl'), 'cycle']]);
+  // And that is the launcher, which runs.
+  const launched = spawnSync(execStart[0][0], ['status'], { encoding: 'utf8' });
+  assert.equal(launched.status, 0, launched.stderr);
+  assert.equal(fs.readFileSync(path.join(units, 'legion-control-update.timer'), 'utf8'), fs.readFileSync(path.join(repository, 'agent', 'install', 'legion-control-update.timer'), 'utf8'));
+  assert.equal(fs.existsSync(path.join(units, 't3-code.service')), false);
+
+  // The timer pulls the oneshot service in, so the timer is the only unit enabled, and the unit of
+  // the old name is retired.
+  const asked = calls();
+  assert.ok(asked.includes('--user show-environment'), asked.join('\n'));
+  assert.ok(asked.includes('--user daemon-reload'), asked.join('\n'));
+  assert.ok(asked.includes('--user disable --now legion-t3-update.timer'), asked.join('\n'));
+  assert.deepEqual(asked.filter((call) => call.startsWith('--user enable')), ['--user enable --now legion-control-update.timer']);
+  assert.equal(fs.existsSync(path.join(units, 'legion-t3-update.timer')), false);
+
+  // Rendering again changes nothing.
+  const again = spawnSync('bash', [path.join(source, 'install', 'install-linux.sh')], options);
+  assert.equal(again.status, 0, again.stderr);
+  assert.match(again.stderr, /legion-control-update\.service unchanged/);
+});
+
+test('linux installer quotes and escapes the npm prefix in both units it writes for the reference service', { skip: unitSkip }, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion units t3 '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, AWKWARD_HOME);
+  const prefix = path.join(root, 'npm prefix with a back\\slash, & | % $PATH "quotes"');
+  // T3 already installed, so the installer leaves npm alone; this npm is only there to be found.
+  const npmBin = path.join(prefix, 'bin');
+  fs.mkdirSync(path.join(prefix, 'lib', 'node_modules', 't3'), { recursive: true });
+  fs.writeFileSync(path.join(prefix, 'lib', 'node_modules', 't3', 'package.json'), '{"version":"0.0.1"}\n');
+  fs.mkdirSync(npmBin, { recursive: true });
+  fs.writeFileSync(path.join(npmBin, 't3'), '#!/bin/sh\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(fakeCommands(root), 'npm'), '#!/bin/sh\necho 11.0.0\n', { mode: 0o755 });
+  // The installer waits for the service to answer on its port before it says it is done.
+  const server = http.createServer((request, response) => response.end('ok'));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const port = server.address().port;
+  const source = sourceFixture(root);
+  const { options } = unitInstall(root, home, { LEGION_T3_PORT: String(port), LEGION_NPM_PREFIX: prefix });
+
+  // Asynchronously, so the server above can answer the installer's health check.
+  const result = await new Promise((resolve) => {
+    const child = spawn('bash', [path.join(source, 'install', 'install-linux.sh'), '--with-t3'], options);
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.stdout.resume();
+    child.on('close', (status) => resolve({ status, stderr }));
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, new RegExp(`http://127\\.0\\.0\\.1:${port}/ answered 200`));
+
+  const unitPath = `PATH=${npmBin}:/usr/local/bin:/usr/bin:/bin`;
+  const update = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 'legion-control-update.service'), 'utf8');
+  assert.equal(values(update, 'Environment')[0][0], unitPath);
+  const unit = fs.readFileSync(path.join(home, '.config', 'systemd', 'user', 't3-code.service'), 'utf8');
+  assert.deepEqual(values(unit, 'Environment'), [[unitPath]]);
+  assert.deepEqual(values(unit, 'ExecStart', { exec: true }), [
+    [path.join(npmBin, 't3'), 'start', '--mode', 'web', '--host', '127.0.0.1', '--port', String(port), '--no-browser'],
+  ]);
+});
+
+test('linux installer refuses a reference service port that is not a number', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion units port '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  // An npm that fails, so an installer that let the port through stops here and goes nowhere near
+  // the network.
+  const bin = fakeCommands(root);
+  fs.writeFileSync(path.join(bin, 'npm'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const result = spawnSync('bash', [path.join(sourceFixture(root), 'install', 'install-linux.sh'), '--with-t3', '--skip-scheduler'], {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, HOME: home, LEGIONCTL_HOME: path.join(home, '.legion-control'), LEGION_T3_PORT: '3773 --host 0.0.0.0' },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /LEGION_T3_PORT must be a port number, got '3773 --host 0\.0\.0\.0'\./);
+  assert.equal(fs.existsSync(path.join(home, '.legion-control')), false);
 });

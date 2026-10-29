@@ -94,6 +94,12 @@ esac
 case "$BASE$NPM_PREFIX$UNIT_DIR" in
   *$'\n'*|*$'\r'*) die "install paths containing a line break are unsupported." ;;
 esac
+# The units take the port as a bare word, which is only safe for a number.
+if [ "$WITH_T3" -eq 1 ]; then
+  case "$PORT" in
+    ''|*[!0-9]*) die "LEGION_T3_PORT must be a port number, got '$PORT'." ;;
+  esac
+fi
 
 # Pin the explicitly selected Node, or the executable available in this setup
 # session. The scheduler later uses that absolute path without searching PATH.
@@ -296,17 +302,29 @@ render_unit() {
 
   [ -f "$src" ] || die "missing unit template $src."
 
-  local launcher_unit
-  launcher_unit="$("$NODE_BIN" -e 'process.stdout.write(process.argv[1].replace(/\\/g,"\\\\").replace(/"/g,"\\\"").replace(/%/g,"%%"))' "$LAUNCHER")"
-  sed \
-    -e "s|@NPM_BIN@|$NPM_BIN|g" \
-    -e "s|@LAUNCHER@|$(printf '%s' "$launcher_unit" | sed 's/[&|]/\\&/g')|g" \
-    -e "s|@PORT@|$PORT|g" \
-    -e "s|@UID@|$(id -u)|g" \
-    "$src" > "$tmp"
+  # Node fills the placeholders in, not sed: a home directory can hold any
+  # character, and a sed replacement reads & | and \ as its own syntax. Every
+  # path in the templates is written inside double quotes, where systemd reads \
+  # and " as escapes and % as the start of a specifier, and on an Exec line it
+  # expands $ as well (systemd.syntax(7), systemd.service(5)). Each value is
+  # escaped for exactly that. The port and the uid are digits and need nothing.
+  "$NODE_BIN" --input-type=module - "$src" "$tmp" "$NPM_BIN" "$LAUNCHER" "$PORT" "$(id -u)" <<'NODE' || die "could not render $name."
+import fs from 'node:fs';
+const [source, output, npmBin, launcher, port, uid] = process.argv.slice(2);
+const values = { NPM_BIN: npmBin, LAUNCHER: launcher, PORT: port, UID: uid };
+const escape = (value, exec) => {
+  const quoted = value.replace(/[\\"]/g, (character) => `\\${character}`).replace(/%/g, () => '%%');
+  return exec ? quoted.replace(/\$/g, () => '$$') : quoted;
+};
+const lines = fs.readFileSync(source, 'utf8').split('\n').map((line) => {
+  const exec = /^\s*Exec[A-Za-z]*=/.test(line);
+  return line.replace(/@([A-Z_]+)@/g, (token, name) => (Object.hasOwn(values, name) ? escape(values[name], exec) : token));
+});
+fs.writeFileSync(output, lines.join('\n'));
+NODE
 
-  # Catch a placeholder that was added to a template but never added to the sed
-  # list above, which would otherwise install a unit with a literal token in it.
+  # Catch a placeholder that was added to a template but not to the values
+  # above, which would otherwise install a unit with a literal token in it.
   # Comment lines are skipped: the templates talk about placeholders in prose.
   if grep -v '^[[:space:]]*#' "$tmp" | grep -Eq '@[A-Z_]+@'; then
     rm -f "$tmp"
