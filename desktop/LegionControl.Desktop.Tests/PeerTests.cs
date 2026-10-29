@@ -650,8 +650,59 @@ public class ReconcilerTests
         var (session, _) = await reconciler.PrepareMergeAsync(model);
 
         Assert.False(session!.CanReplace);
-        Assert.NotNull(await reconciler.ReplaceTheirsAsync(model, session));
+        Assert.Contains("holds a copy of this setup", await reconciler.ReplaceTheirsAsync(model, session));
         Assert.False(fake.SawReplace);
+        Assert.Empty(fake.Pushes);
+    }
+
+    [Fact]
+    public async Task ASetupWithAnErrorReplacesNothing()
+    {
+        // Section 9.5: a device whose setup has an error pushes nothing until it is fixed, and a
+        // replacement least of all. This machine stores whatever it is sent, the way an agent
+        // before 3.1.0 does.
+        using var home = new TempHome();
+        var broken = ControllerDocument.FromText(Documents.Make("setup-a", 3, Array.Empty<string>()).Text
+            .Replace("\"source\": \"desktop\"", "\"source\": \"android\""));
+        var (store, model, fake) = Build(home, broken);
+        Assert.False(store.Acceptance!.Valid);
+        fake.Held = Documents.Make("setup-b", 9, Array.Empty<string>(), "somebody else's");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+
+        var (session, problem) = await reconciler.PrepareMergeAsync(model);
+        Assert.Null(problem);
+        Assert.True(session!.DifferentSetup);
+        Assert.True(session.CanTakeTheirs);
+        Assert.False(session.CanReplace);
+        Assert.Contains("has errors", session.ReplaceProblem);
+        Assert.Equal(session.ReplaceProblem, await reconciler.ReplaceTheirsAsync(model, session));
+        // A screen that was not told is refused the same: the setup here is asked again before
+        // anything is sent.
+        Assert.Equal(session.ReplaceProblem, await reconciler.ReplaceTheirsAsync(model, session with { ReplaceProblem = null }));
+        Assert.False(fake.SawReplace);
+        Assert.Empty(fake.Pushes);
+    }
+
+    [Fact]
+    public async Task ADeviceWithNoSetupIsToldItHasNothingToSend()
+    {
+        // A device with no setup gets a screen for whatever a machine holds, and can only take it.
+        // Asked to replace it, it says what is missing, not that the machine holds a copy of a
+        // setup it does not have.
+        using var home = new TempHome();
+        var (_, model, fake) = Build(home, Documents.Make("setup-a", 2, Array.Empty<string>()));
+        fake.Held = Documents.Make("setup-b", 9, Array.Empty<string>(), "somebody else's");
+        File.Delete(home.ConfigPath);
+        var reconciler = new Reconciler(Store(home), Bindings.Empty);
+        await model.RefreshAsync();
+
+        var (session, problem) = await reconciler.PrepareMergeAsync(model);
+        Assert.Null(problem);
+        Assert.Null(session!.Mine);
+        Assert.True(session.CanTakeTheirs);
+        Assert.False(session.CanReplace);
+        Assert.Equal("this device has no setup to send", await reconciler.ReplaceTheirsAsync(model, session));
         Assert.Empty(fake.Pushes);
     }
 

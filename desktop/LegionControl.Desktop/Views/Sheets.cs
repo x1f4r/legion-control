@@ -220,9 +220,7 @@ public static class Sheets
         body.Children.Add(Ui.DetailRow("Here", Revision(session.Mine?.Identity)));
         body.Children.Add(Ui.DetailRow(machineName, Revision(session.Theirs.Identity)));
         body.Children.Add(Ui.Note(differentSetup
-            ? session.CanTakeTheirs
-                ? "Adopt the machine's setup here or explicitly replace its copy with this device's setup. Review the differences first."
-                : $"{session.TakeProblem} Its copy can still be replaced with this device's setup. Review the differences first."
+            ? DifferentSetupNote(session)
             : session.MergeProblem ?? "Merging keeps both sides: every entry only one side changed is taken from that side. The entries below were changed on both, or nothing says which side changed them, so they need an answer."));
 
         body.Children.Add(Ui.SectionHeading("What differs"));
@@ -293,6 +291,16 @@ public static class Sheets
         await dialog.ShowDialog(owner);
         return answer;
     }
+
+    /// What a different setup leaves to do, said for the buttons below it: adopt it, replace it,
+    /// either, or why neither can be done from here.
+    private static string DifferentSetupNote(MergeSession session) => (session.CanTakeTheirs, session.CanReplace) switch
+    {
+        (true, true) => "Adopt the machine's setup here or explicitly replace its copy with this device's setup. Review the differences first.",
+        (true, false) => $"{session.ReplaceProblem} The machine's setup can be adopted here. Review the differences first.".TrimStart(),
+        (false, true) => $"{session.TakeProblem} Its copy can still be replaced with this device's setup. Review the differences first.",
+        _ => $"{session.TakeProblem} {session.ReplaceProblem}".TrimEnd(),
+    };
 
     /// One revision and who wrote it, in one line, with nothing a peer wrote hidden in it.
     private static string Revision(ControllerIdentity? identity) => identity is null

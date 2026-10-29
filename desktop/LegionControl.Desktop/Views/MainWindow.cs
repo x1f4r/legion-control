@@ -813,8 +813,9 @@ public sealed class MainWindow : Window
     private async void Diverged(MachineModel machine, ReconcileOutcome outcome)
     {
         if (outcome is not ReconcileOutcome.NeedsDecision decision) return;
-        // The screen is built from the machine's verified document, and every answer acts on
-        // exactly what it showed, only while the setup here is still the one it was built from.
+        // The screen is built from what the machine sent; every answer but Replace needs its
+        // verified bytes, and every answer acts on exactly what the screen showed, only while the
+        // setup here is still the one it was built from.
         var (session, problem) = await _app.Reconciler.PrepareMergeAsync(machine);
         if (session is null)
         {

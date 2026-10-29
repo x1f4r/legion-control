@@ -50,7 +50,8 @@ public abstract record ReconcileOutcome
 /// [Theirs] is what the machine sent and [TheirsHash] what it says it holds. When [TakeProblem]
 /// says those bytes are not the ones the hash covers, or that this device does not accept them,
 /// only a different setup has a session at all, and the one answer to it is replacing it: that
-/// needs nothing of its bytes but the preview of what it overwrites.
+/// needs nothing of its bytes but the preview of what it overwrites. [ReplaceProblem] says why the
+/// setup here cannot be sent over it either.
 public sealed record MergeSession(
     ControllerDocument? Mine,
     ControllerDocument Theirs,
@@ -60,7 +61,8 @@ public sealed record MergeSession(
     SetupConflictPreview Preview,
     bool DifferentSetup,
     string? MergeProblem,
-    string? TakeProblem = null)
+    string? TakeProblem = null,
+    string? ReplaceProblem = null)
 {
     /// Whether Merge and Keep mine can be offered.
     public bool CanMerge => !DifferentSetup && Mine is not null && MergeProblem is null && TakeProblem is null;
@@ -69,8 +71,8 @@ public sealed record MergeSession(
     public bool CanTakeTheirs => TakeProblem is null;
 
     /// Whether this device's setup can be sent over the machine's with `--replace`: only over a
-    /// different setup, never over a copy of this one.
-    public bool CanReplace => DifferentSetup && Mine is not null;
+    /// different setup, never over a copy of this one, and only from a setup here without errors.
+    public bool CanReplace => DifferentSetup && Mine is not null && ReplaceProblem is null;
 }
 
 /// Keeps every machine's copy of the setup in step with this device's, without ever losing an edit.
@@ -102,6 +104,12 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
     /// How many times one status may lead to deciding again: after a meta read, a push refusal
     /// that says what the machine holds, or a head that moved during a read.
     private const int Rounds = 4;
+
+    /// Why a device whose applied document has a section 9.7 error sends nothing: it still reads,
+    /// fetches and merges, and pushes nothing until the error is fixed.
+    private const string ErrorsHere = "the setup here has errors, so it is not published until they are fixed";
+
+    private const string NoSetupToSend = "this device has no setup to send";
 
     /// What each machine's copy is doing, for the setup section. A snapshot: it never changes after
     /// it is read.
@@ -325,7 +333,7 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
         {
             "in-flight" => new ReconcileOutcome.Held("a setup request to this machine is still running"),
             "backoff" => new ReconcileOutcome.Held("waiting before trying again"),
-            "local-invalid" => new ReconcileOutcome.Held("the setup here has errors, so it is not published until they are fixed"),
+            "local-invalid" => new ReconcileOutcome.Held(ErrorsHere),
             "held" => Withheld(machine, state, localHash),
             "operation-running" => new ReconcileOutcome.Held("an operation is running there"),
             "settled" => new ReconcileOutcome.Failed(
@@ -381,7 +389,7 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
             var preview = SetupConflictPreview.Between(_config.Config, theirs.Decoded);
             if (different || mine is null)
                 return (new MergeSession(mine, theirs, theirsHash, null, Array.Empty<SetupDifference>(), preview,
-                    DifferentSetup: true, MergeProblem: null, takeProblem), null);
+                    DifferentSetup: true, MergeProblem: null, takeProblem, WhyNotReplace(machine)), null);
 
             var baseHash = SetupSync.CommonBase(mine.Hash, theirs.Hash, mine.Identity.Lineage, theirs.Identity.Lineage,
                 hash => _config.Ledger.Read(hash)?.Text);
@@ -455,17 +463,21 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
 
     /// Sends this device's document with `--replace`, which is the one command that overwrites a
     /// different setup. Only ever called from a control a person pressed after reading the preview,
-    /// only while the setup here is still the one they read it against, and only while the
-    /// machine's latest reading still names the document the preview was built from: `--replace`
-    /// itself takes whatever the machine holds by then.
+    /// only while the setup here is still the one they read it against and has no errors, and only
+    /// while the machine's latest reading still names the document the preview was built from:
+    /// `--replace` itself takes whatever the machine holds by then.
     public async Task<string?> ReplaceTheirsAsync(MachineModel machine, MergeSession session, CancellationToken cancellationToken = default)
     {
-        if (!session.CanReplace) return $"{machine.Name} holds a copy of this setup, which is merged, kept or taken, never replaced.";
+        if (session.Mine is null) return NoSetupToSend;
+        if (!session.DifferentSetup) return $"{machine.Name} holds a copy of this setup, which is merged, kept or taken, never replaced.";
+        if (session.ReplaceProblem is { } replaceProblem) return replaceProblem;
         await _reconcileGate.WaitAsync(cancellationToken);
         try
         {
-            if (_config.Document is not { } mine) return "this device has no setup to send";
-            if (_config.IsPendingEdit || mine.Hash != session.Mine?.Hash) return ConfigStore.HeadMovedSentence;
+            if (_config.Document is not { } mine) return NoSetupToSend;
+            if (_config.IsPendingEdit || mine.Hash != session.Mine.Hash) return ConfigStore.HeadMovedSentence;
+            // Asked of the setup as it is now, not only of the one the screen was built over.
+            if (WhyNotReplace(machine) is { } errors) return errors;
             if (machine.Status?.Controller?.Hash is { } holds && holds != session.TheirsHash)
                 return $"{machine.Name} holds another document now, not the one shown. Nothing was sent; read it again first.";
             var state = StateOf(machine.Id);
@@ -483,4 +495,10 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
         }
         finally { _reconcileGate.Release(); }
     }
+
+    /// Why the setup here cannot be sent over a machine's different one, or null when it can. One
+    /// with a section 9.7 error publishes nothing, and a replacement least of all: an agent before
+    /// 3.1.0 stores whatever it is sent without checking it.
+    private string? WhyNotReplace(MachineModel machine) =>
+        _config.Acceptance is { Valid: false } ? $"{machine.Name}'s copy cannot be replaced: {ErrorsHere}." : null;
 }
