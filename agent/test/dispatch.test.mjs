@@ -4,11 +4,12 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { checkReply } from '../../contract/validate.mjs';
 import { canonicalHash } from '../src/controller.mjs';
 import { authorize, parseCommandLine, ownEntry, RESTRICTED_COMMANDS } from '../src/dispatch.mjs';
-import { cli, withHome } from './helpers.mjs';
+import { REPO, cli, withHome } from './helpers.mjs';
 
 const quote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
 const NODE = quote(process.execPath);
@@ -208,4 +209,127 @@ test('a restricted key that pushes a new launcher through the dispatcher is refu
     assert.deepEqual(checkReply('config-set.schema.json', run.payload, { where: 'restricted config set' }), []);
     assert.equal(fs.readFileSync(path.join(home, 'controller.json'), 'utf8'), d0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The environment the agent starts with (T10)
+// ---------------------------------------------------------------------------
+
+const INSTALL = path.join(REPO, 'agent', 'install');
+
+/** A script that writes what it was started with (its argv and environment) as JSON to `out`. */
+function recorder(dir, out) {
+  const file = path.join(dir, 'record.mjs');
+  fs.writeFileSync(file, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(out)}, JSON.stringify({ argv: process.argv.slice(2), env: process.env }));\n`);
+  return file;
+}
+
+/** A session environment carrying what sshd's AcceptEnv could let a client send. */
+const hostile = (extra = {}) => ({
+  PATH: process.env.PATH,
+  HOME: os.homedir(),
+  LANG: 'C.UTF-8',
+  NODE_OPTIONS: '--no-warnings',
+  NODE_PATH: '/tmp/elsewhere',
+  NODE_EXTRA_CANARY: '1',
+  LEGIONCTL_HOME: '/tmp/not-the-base',
+  UNLISTED_CANARY: 'should not arrive',
+  ...extra,
+});
+
+const shells = ['/bin/sh', '/bin/dash', '/bin/bash', '/bin/zsh', '/bin/ksh'].filter((shell) => fs.existsSync(shell));
+
+test('the restricted forced command starts the agent with only the variables it lists', { skip: process.platform === 'win32' && 'POSIX shells only' }, () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "dispatch env's "));
+  try {
+    const out = path.join(bin, 'seen.json');
+    fs.copyFileSync(path.join(INSTALL, 'dispatch.sh'), path.join(bin, 'dispatch.sh'));
+    // The recorder is the launcher itself, so no shell of its own adds variables after env -i.
+    fs.writeFileSync(path.join(bin, 'legionctl'), `#!${process.execPath}\n${fs.readFileSync(recorder(bin, out), 'utf8')}`, { mode: 0o755 });
+    // Everything a client may put in the command arrives as it was sent.
+    const line = `node /x/index.mjs run 'a b' "$(id)" \`id\` ; * $HOME ~ \\ '\\''`;
+    for (const shell of shells) {
+      fs.rmSync(out, { force: true });
+      const run = spawnSync(shell, [path.join(bin, 'dispatch.sh')], { env: hostile({ SSH_ORIGINAL_COMMAND: line, SSH_CONNECTION: '192.0.2.5 50000 192.0.2.40 22' }), encoding: 'utf8' });
+      assert.equal(run.status, 0, `${shell}: ${run.stderr}`);
+      const seen = JSON.parse(fs.readFileSync(out, 'utf8'));
+      assert.deepEqual(seen.argv, ['dispatch'], shell);
+      assert.equal(seen.env.SSH_ORIGINAL_COMMAND, line, `${shell} passes the command as one unexpanded value`);
+      assert.equal(seen.env.SSH_CONNECTION, '192.0.2.5 50000 192.0.2.40 22');
+      assert.equal(seen.env.LEGIONCTL_RESTRICTED, '1');
+      assert.equal(seen.env.LEGIONCTL_CLIENT, 'restricted-ssh');
+      for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'NODE_EXTRA_CANARY', 'UNLISTED_CANARY', 'LEGIONCTL_HOME']) {
+        assert.equal(name in seen.env, false, `${shell} let ${name} through`);
+      }
+      const listed = new Set(['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES', 'TZ', 'TMPDIR',
+        'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_ORIGINAL_COMMAND', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'LEGIONCTL_RESTRICTED', 'LEGIONCTL_CLIENT']);
+      // A shell exports a few of its own (PWD, SHLVL), and env -i stops those
+      // too. macOS gives every process its text encoding.
+      if (process.platform === 'darwin') listed.add('__CF_USER_TEXT_ENCODING');
+      assert.deepEqual(Object.keys(seen.env).filter((name) => !listed.has(name)), [], shell);
+    }
+  } finally { fs.rmSync(bin, { recursive: true, force: true }); }
+});
+
+test('the stable launcher drops NODE_OPTIONS and NODE_PATH before Node starts, and every NODE_* before the agent does', { skip: process.platform === 'win32' && 'POSIX shell wrapper' }, () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher env '));
+  try {
+    const bin = path.join(base, 'bin');
+    fs.mkdirSync(bin);
+    const out = path.join(base, 'seen.json');
+    // The shell wrapper, rendered the way install-linux.sh renders it, in front of a recorder.
+    fs.writeFileSync(path.join(bin, 'legionctl'), fs.readFileSync(path.join(INSTALL, 'launcher.sh'), 'utf8').replace('@NODE_SHELL@', quote(process.execPath)), { mode: 0o755 });
+    fs.copyFileSync(recorder(base, out), path.join(bin, 'launcher.mjs'));
+    const wrapped = spawnSync('/bin/sh', [path.join(bin, 'legionctl'), 'status'], { env: hostile(), encoding: 'utf8' });
+    assert.equal(wrapped.status, 0, wrapped.stderr);
+    const seen = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.deepEqual(seen.argv, ['status']);
+    assert.equal('NODE_OPTIONS' in seen.env, false);
+    assert.equal('NODE_PATH' in seen.env, false);
+    assert.equal(seen.env.LEGIONCTL_HOME, fs.realpathSync(base));
+
+    // The launcher itself, in front of an agent that records what it got.
+    fs.copyFileSync(path.join(INSTALL, 'launcher.mjs'), path.join(bin, 'launcher.mjs'));
+    fs.mkdirSync(path.join(base, 'agent', 'src'), { recursive: true });
+    fs.copyFileSync(recorder(base, out), path.join(base, 'agent', 'src', 'index.mjs'));
+    fs.writeFileSync(path.join(base, 'agent', 'package.json'), JSON.stringify({ type: 'module', version: '3.1.0' }));
+    fs.rmSync(out);
+    const launched = spawnSync(process.execPath, [path.join(bin, 'launcher.mjs'), 'status'], { env: { ...hostile(), KEPT_CANARY: 'kept' }, encoding: 'utf8' });
+    assert.equal(launched.status, 0, launched.stderr);
+    const agent = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.deepEqual(agent.argv, ['status']);
+    assert.deepEqual(Object.keys(agent.env).filter((name) => name.toUpperCase().startsWith('NODE_')), []);
+    assert.equal(agent.env.KEPT_CANARY, 'kept', 'everything else is the agent\'s as before');
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+const powershell = process.platform === 'win32'
+  ? ['powershell.exe', 'pwsh.exe'].find((name) => spawnSync(name, ['-NoProfile', '-Command', 'exit 0']).status === 0)
+  : undefined;
+
+test('the Windows forced command starts the agent with only the variables it lists', { skip: !powershell && 'PowerShell on Windows only' }, () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'dispatch env '));
+  try {
+    const out = path.join(bin, 'seen.json');
+    fs.copyFileSync(path.join(INSTALL, 'dispatch.ps1'), path.join(bin, 'dispatch.ps1'));
+    // legionctl.ps1 records what it was started with, as the rendered launcher would pass it on.
+    fs.writeFileSync(path.join(bin, 'legionctl.ps1'), [
+      '$names = @([Environment]::GetEnvironmentVariables(\'Process\').Keys | ForEach-Object { ([string] $_).ToUpperInvariant() })',
+      '$seen = @{ names = $names; command = $env:SSH_ORIGINAL_COMMAND; restricted = $env:LEGIONCTL_RESTRICTED; arguments = @($args) }',
+      `[IO.File]::WriteAllText(${JSON.stringify(out).replaceAll('"', "'")}, ($seen | ConvertTo-Json -Compress))`,
+      'exit 0',
+    ].join('\r\n'));
+    const line = `node C:\\x\\index.mjs run 'a b' $(whoami) \`$env:PATH ; & | > %PATH%`;
+    const run = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(bin, 'dispatch.ps1')], {
+      env: { ...process.env, NODE_OPTIONS: '--no-warnings', NODE_PATH: 'C:\\elsewhere', UNLISTED_CANARY: 'x', SSH_ORIGINAL_COMMAND: line },
+      encoding: 'utf8',
+    });
+    assert.equal(run.status, 0, run.stdout + run.stderr);
+    const seen = JSON.parse(fs.readFileSync(out, 'utf8').replace(/^\uFEFF/, ''));
+    assert.equal(seen.command, line);
+    assert.equal(seen.restricted, '1');
+    assert.deepEqual([].concat(seen.arguments), ['dispatch']);
+    for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'UNLISTED_CANARY']) assert.equal(seen.names.includes(name), false, name);
+    assert.ok(seen.names.includes('SYSTEMROOT'));
+  } finally { fs.rmSync(bin, { recursive: true, force: true }); }
 });

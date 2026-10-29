@@ -261,6 +261,17 @@ export function verifyInstalledTree(directory) {
   }
 }
 
+/**
+ * The environment the agent starts with: this one without NODE_OPTIONS and
+ * every other NODE_* variable. Node reads those before the agent's first line,
+ * and NODE_OPTIONS can name code to run (--import, --require), so a variable a
+ * session was handed would run before anything the agent checks. The agent
+ * itself needs none of them.
+ */
+export function agentEnvironment(environment = process.env) {
+  return Object.fromEntries(Object.entries(environment).filter(([name]) => !name.toUpperCase().startsWith('NODE_')));
+}
+
 export function main(argv = process.argv.slice(2)) {
   process.env.LEGIONCTL_HOME = base;
   const recovery = recoverSwapGap();
@@ -281,7 +292,7 @@ export function main(argv = process.argv.slice(2)) {
     }
   }
 
-  const result = spawnSync(process.execPath, [entry(live), ...argv], { cwd: base, env: process.env, stdio: 'inherit' });
+  const result = spawnSync(process.execPath, [entry(live), ...argv], { cwd: base, env: agentEnvironment(), stdio: 'inherit' });
   if (result.error) throw result.error;
   if (result.signal) {
     process.kill(process.pid, result.signal);
