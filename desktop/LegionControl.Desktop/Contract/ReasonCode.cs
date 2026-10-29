@@ -90,6 +90,10 @@ public static class ReasonCode
         };
     }
 
+    /// Whether this build knows the code. Every code of the contract's closed enum is known; one a
+    /// later 3.x adds is not, and its message stands in for it.
+    public static bool IsKnown(string? code) => Describe(code) is not null;
+
     /// Whether a code says "the machine deliberately did nothing", which is the family the force
     /// sheet is offered for. Only busy is ever bypassed by force: a policy is bypassed by asking
     /// directly, and an unknown outcome is never bypassed at all.

@@ -33,7 +33,9 @@ public sealed record AgentEnvelope
         ContractVersion = json["contract", "contractVersion"].AsInt(),
         AgentVersion = json["agentVersion", "version"].AsText(),
         System = SystemInfo.From(json["system"]),
-        ReasonCode = json["reasonCode", "reason"].AsText(),
+        // Only `reasonCode`. A busy reply's `reason` is a sentence for a person ("1 turn running"),
+        // and read as a code it gave every busy answer a reason code no agent ever sent.
+        ReasonCode = json["reasonCode"].AsText(),
         Message = json["message"].AsText(),
         Error = json["error"].AsText(),
         Notes = json["notes"].AsStringList(),
@@ -1263,6 +1265,9 @@ public sealed record ConfigReply
     public bool Divergent { get; init; }
     /// On a refusal: what the machine holds instead.
     public ControllerMark? Current { get; init; }
+    /// On a `restricted` refusal from agent 3.1.0: the paths of the launch values the machine
+    /// would not take from a restricted key, in document order, and never the values themselves.
+    public IReadOnlyList<string> LaunchChanges { get; init; } = Array.Empty<string>();
 
     public static ConfigReply From(Value json)
     {
@@ -1294,6 +1299,7 @@ public sealed record ConfigReply
             Action = json["action"].AsText(),
             Divergent = json["divergent"].AsBool() ?? false,
             Current = ControllerMark.From(json["current"]),
+            LaunchChanges = json["launchChanges"].AsStringList(),
             Problems = json["problems"].Map(ConfigProblem.From),
         };
     }
