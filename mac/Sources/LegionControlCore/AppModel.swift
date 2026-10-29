@@ -383,9 +383,7 @@ final class AppModel {
     @discardableResult
     func resolveDivergence(_ divergence: SetupDivergence,
                            choices: [String: SetupMerge.Choice]) -> String? {
-        if let blocker = divergence.mergeBlocker {
-            return "This device's setup has to be fixed in the editor before it can be merged: \(blocker)"
-        }
+        if let blocker = divergence.mergeBlocker { return blocker }
         do {
             let outcome = try SetupMerge.merge(
                 base: divergence.baseBytes,

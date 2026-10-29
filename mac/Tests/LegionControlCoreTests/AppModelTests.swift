@@ -84,6 +84,20 @@ struct AppModelTests {
         }
     }
 
+    @Test("Merge and Keep mine give the reason the sheet showed for waiting, and write nothing")
+    func blockedMergeSaysWhy() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let (app, diverged) = try Self.diverged(in: home)
+        var divergence = diverged
+        divergence.mergeBlocker = "The common ancestor kept on this device breaks a rule, so it cannot be used: a helper is missing."
+        let applied = try #require(app.config.document?.hash)
+
+        #expect(app.resolveDivergence(divergence, choices: [:]) == divergence.mergeBlocker)
+        #expect(app.keepMine(divergence) == divergence.mergeBlocker)
+        #expect(app.config.document?.hash == applied)
+    }
+
     @Test("a merge over the document the sheet was built from is written, descending from both")
     func mergeLands() throws {
         let home = try Self.home()

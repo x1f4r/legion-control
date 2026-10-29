@@ -1235,6 +1235,67 @@ struct MachineModelTests {
         #expect(try Data(contentsOf: store.url) == unfinished)
     }
 
+    @Test("a kept base that peer intake refuses is said on the divergence sheet, not drawn as nothing to merge")
+    func divergenceSheetSaysTheBaseCannotBeUsed() async throws {
+        let home = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-setup-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        // The document both sides were made from wakes the Pi through a machine that does not exist,
+        // which peer intake refuses: a base an older client could push through a 3.0 agent. Each side
+        // has fixed it since, and the other one renamed the Pi as well.
+        let file = home.appending(path: "config.json")
+        try Data("""
+        { "version": 1,
+          "controller": { "id": "\(Self.setupId)", "name": "Home", "revision": 1, "lineage": [] },
+          "machines": [
+            { "id": "pi", "name": "Pi", "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.5", "user": "me" } ],
+              "wake": { "helper": { "machine": "ghost", "action": "wake-pi" },
+                        "helpers": [ { "machine": "ghost", "action": "wake-pi" } ] },
+              "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] },
+            { "id": "nas", "name": "NAS", "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.6", "user": "me" } ],
+              "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] } ] }
+        """.utf8).write(to: file)
+        let store = ConfigStore(url: file)
+        let base = try #require(store.document)
+        #expect(DocumentAcceptance.check(base.bytes, intake: .peer).errors.first?.code == "helper-unknown")
+        let fix = { (root: inout [String: Any]) throws in
+            try ControllerEditor.setWakeHelpers([WakeHelper(machine: "nas", action: "wake-pi")], onMachine: "pi", in: &root)
+        }
+        let theirs = try ControllerEditor.apply(to: base.bytes, parentHash: base.hash, parentIdentity: base.identity,
+                                                deviceName: "Pixel") { root in
+            try fix(&root)
+            try ControllerEditor.upsertMachine(["id": "pi", "name": "Kitchen Pi"], in: &root)
+        }.bytes
+        #expect(store.applyEdit(describedAs: "fixed the helper", deviceName: "MacBook", change: fix) == nil)
+
+        let runner = SetupRunner()
+        runner.answer("status", Self.setupStatus(holding: try Canonical.hash(theirs)))
+        runner.answer("config meta", try Self.setupMeta(theirs))
+        runner.answer("config", try Self.setupRead(theirs))
+        let model = try Self.setupModel("pi", runner: runner, store: store, logs: home)
+        model.setupBase = { mineHash, mineLineage, theirsHash, theirsLineage in
+            store.commonAncestor(mineHash: mineHash, mineLineage: mineLineage, theirsHash: theirsHash, theirsLineage: theirsLineage)
+        }
+        var raised: SetupDivergence?
+        model.onSetupDiverged = { raised = $0 }
+
+        await model.refresh(userInitiated: false)
+        await Self.eventually { !model.core.setup.isSharing && runner.sent.contains("config meta") }
+        #expect(model.setupDecision.decision == .diverged)
+        model.openSetupDivergence()
+        await Self.eventually { raised != nil }
+
+        // The base is found and kept, but nothing can be built on it: the sheet says so, and Merge and
+        // Keep mine wait with that reason rather than failing on it after the sheet said the two
+        // differ only in how they are written.
+        let divergence = try #require(raised)
+        #expect(divergence.baseBytes == base.bytes)
+        #expect(divergence.differences.isEmpty)
+        let blocker = try #require(divergence.mergeBlocker)
+        #expect(blocker.contains("common ancestor"))
+        #expect(blocker.contains("ghost"))
+    }
+
     @Test("two reads out at once cannot both adopt: the second finds the head the first one wrote")
     func twoReadsCannotOverwriteANewHead() async throws {
         let (store, home) = try Self.setupStore()

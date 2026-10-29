@@ -28,8 +28,9 @@ struct SetupDivergence: Sendable, Identifiable {
     var differences: [SetupMerge.Difference]
     /// True when the two are different setups rather than two branches of one.
     var isDifferentSetup: Bool
-    /// Why Merge and Keep mine wait until this device's document is fixed in the editor, when they
-    /// do (section 9.8). Take theirs never waits.
+    /// Why Merge and Keep mine cannot be used, as the sentence to show, when they cannot: this
+    /// device's document has to be fixed in the editor first (section 9.8), or the two could not be
+    /// compared at all. Take theirs never waits.
     var mergeBlocker: String?
 
     var id: String { machineId }
@@ -105,10 +106,22 @@ extension AgentDevice {
             let verdict = self.core.setup.decideAgain(after: theirs, over: self)
             guard [.diverged, .differentSetup].contains(verdict.decision) else { return }
             let base = self.setupBase?(local.hash, local.identity.ancestors, theirs.hash, theirs.identity.ancestors)
-            let blocker = verdict.decision == .diverged ? SetupMerge.blocker(mine: local.bytes) : nil
-            let differences = blocker == nil
-                ? (try? SetupMerge.differences(base: base, mine: local.bytes, theirs: theirs.bytes)) ?? []
-                : []
+            // Two documents that could not be compared are said to be that, never drawn as two that
+            // differ in nothing: a kept base that peer intake refuses, for one, stops the merge just
+            // as it stops the comparison.
+            var blocker: String?
+            var differences: [SetupMerge.Difference] = []
+            if verdict.decision == .diverged, let problem = SetupMerge.blocker(mine: local.bytes) {
+                blocker = "This device's setup has to be fixed in the editor before it can be merged or kept: \(problem)"
+            } else {
+                do {
+                    differences = try SetupMerge.differences(base: base, mine: local.bytes, theirs: theirs.bytes)
+                } catch let failure as SetupMerge.MergeFailure {
+                    blocker = failure.message
+                } catch {
+                    blocker = "The two setups could not be compared: \(error.localizedDescription)"
+                }
+            }
             self.onSetupDiverged?(SetupDivergence(
                 machineId: self.historyMachineId,
                 machineName: self.name,

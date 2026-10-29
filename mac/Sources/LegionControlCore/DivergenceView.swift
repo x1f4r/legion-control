@@ -49,7 +49,7 @@ struct DivergenceView: View {
 
             if let blocker = divergence.mergeBlocker {
                 SectionHeading(title: "Differences")
-                Text("This device's setup has to be fixed in the editor before it can be merged or kept: \(blocker)")
+                Text(blocker)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else if divergence.differences.isEmpty {
