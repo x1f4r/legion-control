@@ -31,7 +31,67 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
+      # contract/test/transport-shells.test.mjs runs command lines through every shell an ssh
+      # session can end in, and skips a shell that is not installed. The runner has sh and bash;
+      # these are the other shells a Linux login can be.
+      - name: Install dash, zsh and fish
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends dash zsh fish
+      # On Windows this also runs agent/install/install-windows.ps1 for real, with the scheduler
+      # left alone, and checks what it installed (tests/installer-windows.test.mjs). On Linux and
+      # macOS it renders the systemd units against a systemctl that only takes notes.
       - run: bash scripts/check.sh agent
+
+  private-data:
+    name: Private data
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      # The agent legs run this too, without the private terms. Here they come from a repository
+      # secret, which a pull request from a fork does not get; the check then says it had none and
+      # still looks for home directories and addresses. It never prints a term.
+      - run: node scripts/check-private-data.mjs
+        env:
+          LEGION_PRIVATE_TERMS: ${{ secrets.LEGION_PRIVATE_TERMS }}
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Every shell script in the repository; android/gradlew, which Gradle writes, has no .sh.
+      - run: |
+          shellcheck --version
+          git ls-files -z -- '*.sh' | xargs -0 shellcheck -S warning
+
+  powershell:
+    name: PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned like the actions: a new release of the analyser brings new rules, and those should
+      # arrive in a change of their own rather than fail an unrelated one.
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+      - shell: pwsh
+        run: |
+          Import-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0
+          ./scripts/check-powershell.ps1
 
   mac:
     name: macOS
@@ -92,12 +152,81 @@ jobs:
           key: nuget-${{ runner.os }}-${{ hashFiles('desktop/**/*.csproj') }}
           restore-keys: nuget-${{ runner.os }}-
       - run: bash scripts/check.sh desktop
-      - name: Publish Linux
-        if: runner.os == 'Linux'
-        run: dotnet publish desktop/LegionControl.Desktop -c Release -r linux-x64 --self-contained true -o desktop/artifacts/linux-x64
+      # The release dry run publishes all three archives the way a release does. This is the
+      # Windows build published on Windows, which a release never does.
       - name: Publish Windows
         if: runner.os == 'Windows'
         run: dotnet publish desktop/LegionControl.Desktop -c Release -r win-x64 --self-contained true -o desktop/artifacts/win-x64
-      - name: Publish Linux ARM64
-        if: runner.os == 'Linux'
-        run: dotnet publish desktop/LegionControl.Desktop -c Release -r linux-arm64 --self-contained true -o desktop/artifacts/linux-arm64
+
+  # What release.sh builds, built the same way, short of the release keys: the APK and its release
+  # lint, signed with a key made for the run; the three desktop archives, checked the way release.sh
+  # checks them; and the Mac bundle, ad hoc signed and not installed. Nothing here reads a secret,
+  # and no build carries the signed agent bundle, which only the release key can make. A change
+  # that would break a release fails here, on the pull request that made it.
+  release-android:
+    name: Release dry run (Android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: |
+            android/*.gradle.kts
+            android/app/*.gradle.kts
+            android/gradle/libs.versions.toml
+            android/gradle/wrapper/gradle-wrapper.properties
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: platform-tools
+      - name: Build and lint the release APK, unsigned
+        working-directory: android
+        run: |
+          ./gradlew :app:assembleRelease :app:lintRelease --console=plain
+          test -s app/build/outputs/apk/release/app-release-unsigned.apk
+      # android/build-apk.sh, which release.sh runs, aligns and signs that APK. With no key in
+      # ~/.legion-control it makes one, which this runner throws away with everything else.
+      - name: Sign it the way a release does
+        run: LEGION_ANDROID_JAVA_HOME="$JAVA_HOME" bash android/build-apk.sh
+
+  release-desktop:
+    name: Release dry run (desktop)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('desktop/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Build the desktop archives and check them
+        run: |
+          bash desktop/build.sh all
+          version="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' desktop/LegionControl.Desktop/LegionControl.Desktop.csproj | head -1)"
+          node scripts/verify-desktop-artifacts.mjs "$version" dist
+
+  release-mac:
+    name: Release dry run (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the Mac app without installing it
+        run: bash mac/build.sh --no-install

@@ -47,7 +47,7 @@ test('every action is pinned to the full commit of the release named beside it',
 });
 
 test('every job has a time limit, and every checkout leaves no credentials behind', () => {
-  assert.ok(all.size >= 4, [...all.keys()].join(', '));
+  assert.ok(all.size >= 10, [...all.keys()].join(', '));
   for (const [id, lines] of all) {
     assert.ok(lines.some(line => /^ {4}timeout-minutes: \d+$/.test(line)), `${id} has no timeout-minutes`);
     lines.forEach((line, at) => {
@@ -63,17 +63,55 @@ test('a newer push cancels the older run of a pull request, and a push to main i
   assert.match(concurrency, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
 });
 
+test('the agent legs install the shells the transport tests run lines through, on Linux', () => {
+  const agent = job('agent');
+  const install = agent.indexOf('sudo apt-get install -y -q --no-install-recommends dash zsh fish');
+  assert.ok(install >= 0, 'the agent job installs no shells');
+  assert.match(agent.slice(agent.lastIndexOf('- name:', install), install), /if: runner\.os == 'Linux'/);
+  assert.ok(agent.indexOf('bash scripts/check.sh agent') > install);
+  assert.match(agent, /os: \[ubuntu-latest, windows-latest, macos-latest\]/);
+});
+
+test('the release dry run builds what release.sh builds, and reads no secret', () => {
+  const android = job('release-android');
+  assert.match(android, /\.\/gradlew :app:assembleRelease :app:lintRelease/);
+  assert.match(android, /test -s app\/build\/outputs\/apk\/release\/app-release-unsigned\.apk/);
+  assert.match(android, /bash android\/build-apk\.sh/);
+  const desktop = job('release-desktop');
+  assert.match(desktop, /bash desktop\/build\.sh all/);
+  assert.match(desktop, /node scripts\/verify-desktop-artifacts\.mjs "\$version" dist/);
+  assert.match(job('release-mac'), /bash mac\/build\.sh --no-install/);
+  // The release keys never reach CI; the one secret the workflow reads is the private terms list,
+  // and only the job that looks for them.
+  for (const [id, lines] of all) {
+    if (id !== 'private-data') assert.doesNotMatch(lines.join('\n'), /secrets\./, `${id} reads a secret`);
+  }
+  assert.deepEqual([...checks.matchAll(/secrets\.([A-Z_]+)/g)].map(match => match[1]), ['LEGION_PRIVATE_TERMS']);
+  assert.match(job('private-data'), /run: node scripts\/check-private-data\.mjs\n\s+env:\n\s+LEGION_PRIVATE_TERMS: \$\{\{ secrets\.LEGION_PRIVATE_TERMS \}\}/);
+});
+
 test('the Gradle wrapper is validated before Gradle runs, and Gradle and NuGet are cached', () => {
-  for (const id of ['android']) {
+  for (const id of ['android', 'release-android']) {
     const lines = job(id);
     const validated = lines.indexOf('gradle/actions/wrapper-validation@');
     assert.ok(validated >= 0, `${id} does not validate the Gradle wrapper`);
     assert.ok(validated < lines.indexOf('actions/setup-java@'), `${id} sets Java up before it validates the wrapper`);
     assert.match(lines, /cache: gradle\n\s+cache-dependency-path: \|\n(?:\s+android\/.+\n){4}/);
   }
-  for (const id of ['desktop']) {
+  for (const id of ['desktop', 'release-desktop']) {
     assert.match(job(id), /uses: actions\/cache@[0-9a-f]{40} # v[\d.]+\n\s+with:\n\s+path: ~\/\.nuget\/packages\n\s+key: nuget-\$\{\{ runner\.os \}\}-\$\{\{ hashFiles\('desktop\/\*\*\/\*\.csproj'\) \}\}/);
   }
+});
+
+test('every shell script goes through ShellCheck, and every PowerShell script through a pinned PSScriptAnalyzer', () => {
+  assert.match(job('shellcheck'), /git ls-files -z -- '\*\.sh' \| xargs -0 shellcheck -S warning/);
+  const powershell = job('powershell');
+  const versions = [...powershell.matchAll(/PSScriptAnalyzer -RequiredVersion (\S+)/g)].map(match => match[1]);
+  assert.equal(versions.length, 2, 'installed and imported at a version named both times');
+  assert.equal(versions[0], versions[1]);
+  assert.match(versions[0], /^\d+\.\d+\.\d+$/);
+  assert.match(powershell, /\.\/scripts\/check-powershell\.ps1/);
+  assert.ok(fs.existsSync(path.join(repository, 'scripts', 'check-powershell.ps1')));
 });
 
 test('Dependabot proposes updates for the actions, the Android build and every desktop project', () => {
