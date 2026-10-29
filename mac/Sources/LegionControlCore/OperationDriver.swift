@@ -20,6 +20,11 @@ struct OperationDriver {
     /// How the driver waits before asking again after a poll that did not get through. The tests
     /// hand in one that returns at once.
     var pause: @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+    /// Called just before a poll is tried again. A machine lets its addresses be dialled again here:
+    /// one that did not answer is otherwise left alone for a minute, so the second and third tries
+    /// failed at once without leaving this device, and the driver stopped watching ten seconds
+    /// after the link dropped rather than after three real attempts.
+    var beforeRetry: @MainActor () -> Void = {}
 
     /// What the whole thing came to.
     struct Conclusion: Sendable {
@@ -60,7 +65,8 @@ struct OperationDriver {
     /// the caller as the failure of the whole request, and a read that never left this device reads
     /// as "never sent", so one dropped poll turned an update that was running perfectly well over
     /// there into a failed one here. The last state the agent reported stands, the poll is tried
-    /// again, and when the link stays down the app stops watching with the work still pending.
+    /// again, really dialled each time, and when the link stays down the app stops watching with
+    /// the work still pending.
     func perform(_ request: AgentRequest, operationId: String?, dialect: AgentDialect) async throws -> Conclusion {
         let reply = try await send(request)
         let replayed = reply.replayed == true
@@ -84,6 +90,7 @@ struct OperationDriver {
             if Task.isCancelled {
                 return Conclusion(result: reply, operation: lastSeen, replayed: replayed, stillRunning: true)
             }
+            if failedPolls > 0 { beforeRetry() }
             let answer: AgentOperationResult
             do {
                 answer = try await readOperation(poll)

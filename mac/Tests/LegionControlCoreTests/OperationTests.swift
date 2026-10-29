@@ -296,6 +296,23 @@ struct OperationTests {
         #expect(polls == OperationDriver.pollTries)
     }
 
+    @Test("every poll tried again is told first, so the address it failed on is dialled again")
+    func retriedPollsRedial() async throws {
+        // A machine holds an address that did not answer back for a minute, so the second and
+        // third polls, five seconds apart, failed at once without dialling anything.
+        var events: [String] = []
+        var driver = OperationDriver(send: { _ in try Self.reply(Self.accepted) }, readOperation: { _ in
+            events.append("poll")
+            throw AgentFailure(.hostUnreachable, dispatch: .never)
+        })
+        driver.pause = { _ in events.append("pause") }
+        driver.beforeRetry = { events.append("redial") }
+        let request = try AgentRequest.update(service: "demo", intent: .init(detach: true, operationId: Self.opId), dialect: .v3)
+        let conclusion = try await driver.perform(request, operationId: Self.opId, dialect: .v3)
+        #expect(conclusion.stillRunning)
+        #expect(events == ["poll", "pause", "redial", "poll", "pause", "redial", "poll"])
+    }
+
     @Test("a finished record with no result is read by its own reduction, never by the accepted reply's ok")
     func finishedWithoutAResultIsUnknown() async throws {
         // A record from before 3.1.0 that finished and kept no result. Reduced on its own it is

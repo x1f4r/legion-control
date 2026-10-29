@@ -171,6 +171,9 @@ final class MacModel: AgentDevice {
         await refresh(duringAction: duringAction)
     }
 
+    /// The local agent is a process on this Mac, with no address to hold back.
+    func allowRedial() {}
+
     func describe(_ failure: AgentFailure) -> String {
         failure.localMessage
     }

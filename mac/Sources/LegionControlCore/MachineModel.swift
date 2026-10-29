@@ -222,6 +222,12 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         await refresh(userInitiated: false, duringAction: duringAction)
     }
 
+    /// An address that did not answer is otherwise left alone for a minute, which is right for a
+    /// machine that is asleep and wrong for one that is expected back any moment.
+    func allowRedial() {
+        for route in machine.routes(bindings: agent.bindings) { agent.backoff.clear(route.target) }
+    }
+
     func describe(_ failure: AgentFailure) -> String {
         failure.message(machine: machine.name)
     }
@@ -801,7 +807,7 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
             let wait = sent.addingTimeInterval(Double(start) / 1000).timeIntervalSince(wakeClock.now())
             if wait > 0 { await wakeClock.sleep(wait) }
             if Task.isCancelled { return false }
-            for route in machine.routes(bindings: agent.bindings) { agent.backoff.clear(route.target) }
+            allowRedial()
             await refresh(userInitiated: false, duringAction: true)
             if isAwake { return true }
         }

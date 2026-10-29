@@ -13,7 +13,8 @@ enum WakeAction {
     static func run(action: String, target: String, targetId: String, machineId: String, machineName: String,
                     declaredPacket: Bool, dialect: AgentDialect, operations: OperationStore?,
                     send: @escaping @MainActor (AgentRequest) async throws -> AgentActionResult,
-                    read: @escaping @MainActor (AgentRequest) async throws -> AgentOperationResult) async -> WakeActionOutcome {
+                    read: @escaping @MainActor (AgentRequest) async throws -> AgentOperationResult,
+                    redial: @escaping @MainActor () -> Void = {}) async -> WakeActionOutcome {
         let id = AgentToken.newOperationId()
         operations?.begin(OperationRecord(id: id, machineId: machineId, machineName: machineName,
                                           kind: .action, subject: action,
@@ -60,7 +61,9 @@ enum WakeAction {
 
         do {
             let request = try AgentRequest.run(action: action, intent: .init(operationId: id), dialect: dialect)
-            let conclusion = try await OperationDriver(send: send, readOperation: read).perform(request, operationId: id, dialect: dialect)
+            var driver = OperationDriver(send: send, readOperation: read)
+            driver.beforeRetry = redial
+            let conclusion = try await driver.perform(request, operationId: id, dialect: dialect)
             if conclusion.stillRunning || Outcome.of(conclusion.result) == .pending {
                 let summary = "\(action) is still running on \(machineName)."
                 return await ambiguous(AgentFailure(.agentFailed, detail: summary, dispatch: .acknowledged), running: true)

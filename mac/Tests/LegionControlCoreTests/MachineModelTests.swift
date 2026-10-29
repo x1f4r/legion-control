@@ -638,8 +638,10 @@ struct MachineModelTests {
         #expect(record.state == .running)
         #expect(record.needsReconciliation)
         #expect(model.statusLine.contains("still running"))
-        // Asked about by its id, and never sent again.
-        #expect(runner.sentCommands.contains { $0.contains(" op ") })
+        // Asked about by its id, and never sent again. Every try really went out: the address that
+        // did not answer the first poll is otherwise left alone for a minute, and the other two
+        // failed without leaving this Mac.
+        #expect(runner.sentCommands.filter { $0.contains(" op ") }.count == OperationDriver.pollTries)
         #expect(runner.sentCommands.filter { $0.contains(" update") }.count == 1)
     }
 

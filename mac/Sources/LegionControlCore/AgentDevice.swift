@@ -39,6 +39,10 @@ protocol AgentDevice: SetupChannel {
     func send<Value: Decodable & Sendable>(_ request: AgentRequest, decoding: Value.Type) async throws -> Value
     /// Read the status again, as the poll would.
     func refreshStatus(duringAction: Bool) async
+    /// Let the next call dial this device again at once, though the last one did not get through.
+    /// For a call that is expected to find the device answering again, such as the next poll of an
+    /// operation it took.
+    func allowRedial()
     /// A transport failure in this device's own words: a machine names itself and talks about ssh,
     /// this Mac has no connection to blame.
     func describe(_ failure: AgentFailure) -> String
@@ -619,7 +623,8 @@ extension AgentDevice {
         return await WakeAction.run(action: actionId, target: target, targetId: targetId, machineId: historyMachineId,
                                     machineName: name, declaredPacket: declared, dialect: dialect, operations: operations,
                                     send: { try await self.send($0, decoding: AgentActionResult.self) },
-                                    read: { try await self.send($0, decoding: AgentOperationResult.self) })
+                                    read: { try await self.send($0, decoding: AgentOperationResult.self) },
+                                    redial: { self.allowRedial() })
     }
 
     // MARK: - Policy
@@ -927,6 +932,7 @@ extension AgentDevice {
                 }
             )
             driver.pause = core.pollPause
+            driver.beforeRetry = { [weak self] in self?.allowRedial() }
 
             core.watchedOperation = operation
             defer { core.watchedOperation = nil }
