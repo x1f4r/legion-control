@@ -15,8 +15,9 @@ import com.x1f4r.legioncontrol.ui.theme.LegionTheme
  * it.
  *
  * What does not stop is a change somebody asked for. An update takes minutes and locking the phone
- * is not withdrawing the request, so those run on the model's own scope and are reconciled by their
- * operation id when the app comes back.
+ * is not withdrawing the request, so those run on the model's own scope, held in the foreground by
+ * [ChangeService] until they settle, and are reconciled by their operation id when the app comes
+ * back if Android ended the process anyway.
  *
  * The models belong to the process, in [LegionApplication], so this activity can be recreated for
  * any reason at all without a change in flight noticing. The manifest still keeps it alive across

@@ -70,6 +70,8 @@ class AppModel(
     private val remembered: RememberedSettings,
     private val bindings: com.x1f4r.legioncontrol.data.BindingsStore,
     private val notifications: NotificationSettings,
+    /** Held by every change while it is sent or followed, which keeps the process running. */
+    keepAlive: KeepAlive,
 ) {
     private val app = context.applicationContext
 
@@ -89,7 +91,7 @@ class AppModel(
     private val notifier = AndroidOperationNotifier(app) { notifications.enabled }
 
     /** Every change this app has asked for, across launches. */
-    val operations = OperationCenter(services.operations, scope, notifier)
+    val operations = OperationCenter(services.operations, scope, notifier, keepAlive)
 
     var machines: List<MachineModel> by mutableStateOf(emptyList())
         private set

@@ -6,7 +6,8 @@ import com.x1f4r.legioncontrol.net.UpdateSource
 import kotlinx.coroutines.flow.map
 
 /**
- * What there is one of in this process: the wiring below the UI and the models above it.
+ * What there is one of in this process: the wiring below the UI, the models above it, and the hold
+ * that keeps changes running.
  *
  * Held here rather than by the activity. An activity is recreated by Android for reasons nobody
  * chose, a font size changed or a language, and on older versions it is finished outright by Back;
@@ -21,6 +22,9 @@ class LegionApplication : Application() {
     /** Everything below the UI. The one copy of every store, so a write through one is seen by all. */
     val control: LegionControl by lazy { LegionControl(this) }
 
+    /** Held by every change while it is sent or followed; the first hold starts [ChangeService]. */
+    val keepAlive = KeepAlive { ChangeService.start(this) }
+
     private val services: ControlServices by lazy { createControlServices(control) }
 
     val model: AppModel by lazy {
@@ -32,6 +36,7 @@ class LegionApplication : Application() {
             // be the name the next revision this device writes carries.
             bindings = control.bindings,
             notifications = NotificationSettings(this),
+            keepAlive = keepAlive,
         )
     }
 

@@ -18,10 +18,12 @@ import com.x1f4r.legioncontrol.agent.SystemInfo
 import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.contract.ContractCorpus
 import com.x1f4r.legioncontrol.data.OperationStore
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -43,7 +45,11 @@ class OperationCenterTest {
     private val directory: File = Files.createTempDirectory("operations").toFile()
     private val store = OperationStore(File(directory, "operations.json"))
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
-    private val center = OperationCenter(store, scope, SilentNotifier)
+
+    /** How many times the service that keeps a change running was asked for. */
+    private var keptAlive = 0
+    private val keepAlive = KeepAlive { keptAlive++ }
+    private val center = OperationCenter(store, scope, SilentNotifier, keepAlive)
 
     @After
     fun tearDown() {
@@ -54,11 +60,11 @@ class OperationCenterTest {
     /** A machine whose agent keeps records, answering `op` and `status` as the test says, counted. */
     private inner class Agent : MachineClient by unusable<MachineClient>("following a change") {
         override val machine = Machine(id = "tower", name = "Tower", endpoints = emptyList(), systems = emptyList(), wake = null)
-        override val abilities = AgentAbilities(contract = 3)
+        override var abilities = AgentAbilities(contract = 3)
         val reads = mutableListOf<String>()
-        var op: (String) -> Result<OpRecord> = { error("no op read was expected") }
+        var op: suspend (String) -> Result<OpRecord> = { error("no op read was expected") }
         var reading: () -> Result<AgentStatus> = { error("no status was expected") }
-        var cancelling: (String) -> Result<AgentActionResult> = { error("no cancel was expected") }
+        var cancelling: suspend (String) -> Result<AgentActionResult> = { error("no cancel was expected") }
 
         override suspend fun operation(operationId: String, waitSeconds: Int?): Result<OpRecord> {
             reads += operationId
@@ -203,5 +209,99 @@ class OperationCenterTest {
         assertEquals(OpAction.CANCELLED, stored.opAction)
         assertEquals("the record's outcome, not the reply's succeeded", Outcome.DEFERRED, stored.outcome)
         assertTrue("nothing ran, so it can be asked for again", stored.canTryAgain)
+    }
+
+    // MARK: - Keeping the process running while a change is in flight (A1)
+
+    private fun ambiguous(): Result<AgentActionResult> =
+        Result.failure(AgentFailure.Unreachable("Tower", "reset", stage = DispatchStage.AMBIGUOUS))
+
+    @Test
+    fun `a change is held from the press until its reply is on the record`() {
+        val reply = CompletableDeferred<Result<AgentActionResult>>()
+        val record = center.start(
+            client = agent,
+            intent = OperationIntent(kind = OpKind.RESTART, service = "demo"),
+            subjectName = "Demo",
+            initiator = "this phone",
+        ) { reply.await() }
+
+        assertEquals("held while the reply is on its way", 1, keepAlive.holds.value)
+        assertEquals(1, keptAlive)
+
+        reply.complete(Result.success(AgentActionResult(ok = true, contract = 3, op = finished(record.id, "restarted"))))
+
+        assertEquals(true, store.get(record.id)!!.succeeded)
+        assertEquals("settled: nothing keeps the process running", 0, keepAlive.holds.value)
+    }
+
+    @Test
+    fun `a lost reply is held through the watch that settles it, with no gap between`() {
+        val answer = CompletableDeferred<Result<OpRecord>>()
+        agent.op = { answer.await() }
+        val record = press { ambiguous() }
+
+        assertEquals("the watch holds once the send has let go", 1, keepAlive.holds.value)
+        assertEquals(listOf(record.id), agent.reads)
+
+        answer.complete(Result.success(finished(record.id, "restarted")))
+
+        assertEquals(TrackedState.FINISHED, store.get(record.id)!!.state)
+        assertEquals(0, keepAlive.holds.value)
+        // Asked for again would mean the count touched nothing between the send and the watch, and
+        // the service could have stopped while the reply was still unknown.
+        assertEquals("asked for once, for the send and the watch together", 1, keptAlive)
+    }
+
+    @Test
+    fun `a watch that can learn nothing is not held`() {
+        // An agent that keeps no records and a restart, which leaves nothing on the machine to see:
+        // still watched, as before, but not worth keeping the phone awake for.
+        agent.abilities = AgentAbilities(contract = 2)
+        val record = press { ambiguous() }
+
+        assertTrue("still followed", store.get(record.id)!!.isPending)
+        assertEquals(0, keepAlive.holds.value)
+    }
+
+    @Test
+    fun `a cancel is held until its reply is on the record`() {
+        val reply = CompletableDeferred<Result<AgentActionResult>>()
+        agent.cancelling = { reply.await() }
+        val record = queued()
+
+        center.cancel(agent, record)
+        assertEquals(1, keepAlive.holds.value)
+
+        reply.complete(fixture("cancel.cancelled.json"))
+        assertEquals(OpAction.CANCELLED, store.get(record.id)!!.opAction)
+        assertEquals(0, keepAlive.holds.value)
+    }
+
+    @Test
+    fun `a change sent and read by the wake walk is held while it runs`() {
+        val reply = CompletableDeferred<Result<AgentActionResult>>()
+        val answer = CompletableDeferred<Result<OpRecord>>()
+        agent.op = { answer.await() }
+        val record = center.record(agent, OperationIntent(kind = OpKind.RUN, actionId = "wake-tower"), "wake-tower", "this phone")
+
+        scope.launch {
+            center.send(agent, record.id) { reply.await() }
+            center.readOnce(agent, record.id)
+        }
+        assertEquals("held while sending", 1, keepAlive.holds.value)
+        reply.complete(ambiguous())
+        assertEquals("held while reading", 1, keepAlive.holds.value)
+        answer.complete(Result.success(finished(record.id, "ran")))
+
+        assertEquals(TrackedState.FINISHED, store.get(record.id)!!.state)
+        assertEquals(0, keepAlive.holds.value)
+    }
+
+    @Test
+    fun `a change started on a scope that is gone gives its hold back`() {
+        scope.cancel()
+        press { error("never sent: the scope is gone") }
+        assertEquals(0, keepAlive.holds.value)
     }
 }

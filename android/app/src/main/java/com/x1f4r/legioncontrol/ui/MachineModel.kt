@@ -44,14 +44,15 @@ import kotlinx.coroutines.launch
 /**
  * One machine, as the screen knows it, and the only thing that talks to that machine's agent.
  *
- * It polls while the screen is on and not one moment longer. A phone is not a desk: there is no
- * service, no worker, no alarm and nothing left running in the background. When the app is put away
- * these stop dead, which is why [startPolling] and [stopPolling] are driven straight from the
- * activity's resume and pause rather than from a composable that might outlive the visible screen.
+ * It polls while the screen is on and not one moment longer. A phone is not a desk: nothing polls,
+ * no worker and no alarm, once the app is put away. Polling stops dead then, which is why
+ * [startPolling] and [stopPolling] are driven straight from the activity's resume and pause rather
+ * than from a composable that might outlive the visible screen.
  *
  * Changes are the exception, and deliberately so: an update the user asked for runs on the
- * application scope through [OperationCenter], because locking the phone is not withdrawing the
- * request. What stops is the asking, not the doing.
+ * application scope through [OperationCenter], held in the foreground by [ChangeService] until it
+ * settles, because locking the phone is not withdrawing the request. What stops is the asking, not
+ * the doing.
  */
 @Stable
 class MachineModel(
@@ -670,16 +671,21 @@ class MachineModel(
         wakeTarget = target
         wakeableHelper = null
         runTask(Task.WAKE, "Waking ${machine.name}") {
-            val ending = WakeWalk(
-                target = client,
-                fleet = fleet,
-                operations = operations,
-                poll = {
-                    refreshQuietly()
-                    isAwake
-                },
-                progress = { statusLine = it },
-            ).run()
+            // Held for the whole walk rather than step by step: a phone locked between a packet and
+            // the readiness polls after it would come back to a walk that stopped halfway, and then
+            // carry on asking the next helper long after anybody wanted the machine up.
+            val ending = operations.held {
+                WakeWalk(
+                    target = client,
+                    fleet = fleet,
+                    operations = operations,
+                    poll = {
+                        refreshQuietly()
+                        isAwake
+                    },
+                    progress = { statusLine = it },
+                ).run()
+            }
             if (ending.answered) {
                 awoke()
             } else {

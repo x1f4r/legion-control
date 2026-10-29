@@ -32,11 +32,12 @@ import java.util.concurrent.ConcurrentHashMap
  * an update that takes nine minutes outlives the screen it was started from; and a phone that gets
  * put in a pocket takes its whole process with it.
  *
- * Three things fix that, and this file is where they meet. Every change gets a `--op` id before
+ * Four things fix that, and this file is where they meet. Every change gets a `--op` id before
  * anything is sent, so it can be asked about instead of repeated. The record is written to disk at
- * every transition, so a phone that comes back finds out what happened. And the work runs on a scope
+ * every transition, so a phone that comes back finds out what happened. The work runs on a scope
  * that outlives the screen, because a user who presses Update and locks the phone has not changed
- * their mind about updating.
+ * their mind about updating. And all of it runs held by [keepAlive], because a scope that outlives
+ * the screen is no use in a process Android has frozen.
  *
  * The one rule that everything else serves: a change whose outcome is unknown is never sent again.
  */
@@ -51,6 +52,11 @@ class OperationCenter(
      */
     private val scope: CoroutineScope,
     private val notifier: OperationNotifier,
+    /**
+     * Held for as long as a change is being sent or followed, so the phone locking does not freeze
+     * the process halfway through either.
+     */
+    private val keepAlive: KeepAlive = KeepAlive(),
 ) {
     val records: StateFlow<List<OperationRecord>> get() = store.records
 
@@ -138,16 +144,33 @@ class OperationCenter(
         // Claimed before the launch, so a poll that lands in between cannot start following a change
         // that has not been sent yet and leave it never sent at all.
         if (!inFlight.add(record.id)) return
-        scope.launch {
+        launchHeld {
             try {
                 dispatchClaimed(client, record.id, dispatch)
             } finally {
                 inFlight.remove(record.id)
             }
-            // Whatever it ended in, anything still open is now watched rather than assumed.
+            // Whatever it ended in, anything still open is now watched rather than assumed. The watch
+            // takes its own hold before this one is released, so the process is never let go between.
             follow(client, record.id)
         }
     }
+
+    /**
+     * Launches [work] on the scope, held from this moment until it ends.
+     *
+     * Held here rather than inside the coroutine: the press is the one moment this app is certainly
+     * in front, which is when Android allows the service to start, and a launch onto a scope that
+     * has been cancelled never runs its body at all, so only the completion handler is sure to
+     * release what was taken.
+     */
+    private fun launchHeld(work: suspend CoroutineScope.() -> Unit) {
+        keepAlive.hold()
+        scope.launch(block = work).invokeOnCompletion { keepAlive.release() }
+    }
+
+    /** Runs [work] held, for a caller that walks several changes in a row: a wake. */
+    internal suspend fun <T> held(work: suspend () -> T): T = keepAlive.whileHeld(work)
 
     /**
      * Sends a recorded change once, here and now, and returns once the reply or the failure is on
@@ -159,10 +182,12 @@ class OperationCenter(
         dispatch: suspend (operationId: String) -> Result<AgentActionResult>,
     ): Boolean {
         if (!inFlight.add(id)) return false
-        try {
-            dispatchClaimed(client, id, dispatch)
-        } finally {
-            inFlight.remove(id)
+        keepAlive.whileHeld {
+            try {
+                dispatchClaimed(client, id, dispatch)
+            } finally {
+                inFlight.remove(id)
+            }
         }
         return true
     }
@@ -201,10 +226,12 @@ class OperationCenter(
     internal suspend fun readOnce(client: MachineClient, id: String, waitSeconds: Int? = OP_WAIT_SECONDS) {
         val record = store.get(id) ?: return
         if (record.isOver || !record.trackable) return
-        client.operation(id, waitSeconds = waitSeconds).fold(
-            onSuccess = { apply(id, OperationEvent.Observed(it, System.currentTimeMillis())) },
-            onFailure = { failure -> noteReadFailure(id, failure) },
-        )
+        keepAlive.whileHeld {
+            client.operation(id, waitSeconds = waitSeconds).fold(
+                onSuccess = { apply(id, OperationEvent.Observed(it, System.currentTimeMillis())) },
+                onFailure = { failure -> noteReadFailure(id, failure) },
+            )
+        }
     }
 
     /**
@@ -215,6 +242,11 @@ class OperationCenter(
      * answer is authoritative. Where the agent keeps no records, the machine itself is watched for
      * the one kind of evidence that means anything, which is being observably in the state that was
      * asked for.
+     *
+     * Held while watching can find something out: the agent keeps records, or the change is a boot
+     * or an update, which leave evidence on the machine. Any other change on an agent that keeps no
+     * records is still watched as it always was, but keeping the phone awake for half an hour to
+     * learn nothing would be a cost with nothing on the other side of it.
      */
     fun follow(client: MachineClient, id: String) {
         val record = store.get(id) ?: return
@@ -223,7 +255,7 @@ class OperationCenter(
             return
         }
         if (!inFlight.add(id)) return
-        scope.launch {
+        val work: suspend CoroutineScope.() -> Unit = {
             try {
                 watch(client, id)
             } finally {
@@ -231,6 +263,7 @@ class OperationCenter(
             }
             store.get(id)?.takeIf { it.isOver && it.isNoteworthyEnding }?.let(notifier::finished)
         }
+        if (record.trackable || record.kind.leavesEvidence) launchHeld(work) else scope.launch(block = work)
     }
 
     private suspend fun watch(client: MachineClient, id: String) {
@@ -384,7 +417,7 @@ class OperationCenter(
      */
     fun cancel(client: MachineClient, record: OperationRecord) {
         if (!record.isCancellable) return
-        scope.launch {
+        launchHeld {
             client.cancel(record.id).fold(
                 onSuccess = { result ->
                     val now = System.currentTimeMillis()
@@ -439,6 +472,9 @@ class OperationCenter(
     internal fun apply(id: String, event: OperationEvent) {
         store.update(id) { it.reduce(event) }
     }
+
+    /** The kinds [observe] can settle by looking at the machine, whatever its agent keeps. */
+    private val OpKind.leavesEvidence: Boolean get() = this == OpKind.BOOT || this == OpKind.UPDATE
 
     private companion object {
         /** How long `op ID --wait` holds the connection. Long enough to be cheap, short enough to cancel. */

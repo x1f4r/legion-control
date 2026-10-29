@@ -15,6 +15,11 @@
          the setting is turned on, because a permission prompt for a feature nobody asked for is how
          people learn to refuse everything. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Keeping the app running while a change somebody asked for is still being sent or watched,
+         so locking the phone does not freeze it halfway. Both are granted at install: there is
+         nothing to ask. The second is the one Android 14 and later require for the dataSync type. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
         android:name="com.x1f4r.legioncontrol.ui.LegionApplication"
@@ -40,6 +45,13 @@
             </intent-filter>
         </activity>
     
+        <!-- Does no work of its own. It runs only while a change is in flight, says so in a quiet
+             notification, and stops itself when the last one settles. -->
+        <service
+            android:name="com.x1f4r.legioncontrol.ui.ChangeService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- The installer and explicit diagnostic sharing can read only their dedicated cache
              directories; application keys and private configuration are never exposed. -->
         <provider

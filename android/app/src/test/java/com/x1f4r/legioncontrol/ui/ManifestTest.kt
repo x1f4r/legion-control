@@ -8,11 +8,13 @@ import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
 
 /**
- * What the manifest promises about the app's lifecycle, held to the code that depends on it (A6).
+ * What the manifest promises about the app's lifecycle, held to the code that depends on it (A1, A6).
  *
  * None of this fails at build time when it is wrong. A configuration change the activity does not
- * absorb recreates it and throws away what is half typed; an application class nobody names is
- * never built, and the one copy of every store with it.
+ * absorb recreates it and throws away what is half typed; a foreground service whose type has no
+ * permission behind it is refused on Android 14 and later, and the change it was keeping alive goes
+ * back to being frozen with the phone; an application class nobody names is never built, and the
+ * one copy of every store with it.
  */
 class ManifestTest {
 
@@ -36,6 +38,9 @@ class ManifestTest {
     private fun component(tag: String, name: String): Element =
         elements(tag).singleOrNull { it.android("name") == name } ?: error("the manifest declares no $tag $name")
 
+    private val permissions: Set<String>
+        get() = elements("uses-permission").map { it.android("name") }.toSet()
+
     @Test
     fun `the models belong to an application the manifest names`() {
         assertEquals(LegionApplication::class.java.name, elements("application").single().android("name"))
@@ -49,6 +54,19 @@ class ManifestTest {
             "density", "fontScale", "locale", "layoutDirection",
         )
         assertTrue("missing ${wanted - absorbed}", absorbed.containsAll(wanted))
+    }
+
+    @Test
+    fun `the service that keeps a change running is private and declared for what it does`() {
+        val service = component("service", ChangeService::class.java.name)
+        assertEquals("false", service.android("exported"))
+        assertEquals("dataSync", service.android("foregroundServiceType"))
+        assertTrue(
+            "Android 14 and later refuse the type without its permission",
+            permissions.containsAll(
+                setOf("android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_DATA_SYNC"),
+            ),
+        )
     }
 
     private companion object {
