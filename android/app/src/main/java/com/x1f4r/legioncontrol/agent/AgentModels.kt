@@ -903,12 +903,17 @@ data class HistoryReply(
     val entries: List<OpSummary> get() = operations ?: history ?: items ?: emptyList()
 }
 
-/** One line of the agent's log. */
+/**
+ * One line of the agent's log.
+ *
+ * The text is under `line`, as the contract has always named it. This read `text`, which no agent
+ * ever sent, so every log this app asked for came back empty.
+ */
 @Serializable
 data class LogLine(
     val at: String? = null,
     val command: String? = null,
-    val text: String? = null,
+    val line: String? = null,
 )
 
 /** One `logs` reply. Same open question as [HistoryReply]; see question A3. */

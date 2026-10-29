@@ -1155,8 +1155,8 @@ class MachineModel(
         scope.launch {
             client.logs(lines = 100, operationId = null).fold(
                 onSuccess = { reply ->
-                    recentLog = reply.entries.mapNotNull { line ->
-                        line.text?.takeIf { it.isNotBlank() }
+                    recentLog = reply.entries.mapNotNull { entry ->
+                        entry.line?.takeIf { it.isNotBlank() }
                     }
                     if (recentLog.isEmpty()) statusLine = "The agent's log is empty."
                 },
