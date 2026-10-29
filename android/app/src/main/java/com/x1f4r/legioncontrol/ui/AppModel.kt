@@ -736,17 +736,7 @@ class AppModel(
      * file and update source in it, and only [confirmEnrolment] puts it in force.
      */
     private fun applyFetched(fetched: ControllerFetch, source: SetupSource): String = when (fetched) {
-        is ControllerFetch.Document -> EnrolmentPreview.of(
-            text = fetched.text,
-            host = source.host,
-            approves = services.document.value == null,
-        ).fold(
-            onSuccess = { preview ->
-                enrolment = preview
-                "Check what the setup from ${source.host} runs before using it."
-            },
-            onFailure = { "The setup from ${source.host} was refused. ${it.message}" },
-        )
+        is ControllerFetch.Document -> enrolment.offer(fetched.text, source.host)
 
         ControllerFetch.NothingStored ->
             "That machine has no setup stored yet. Paste one here, or fetch from a machine that has one."
@@ -761,27 +751,16 @@ class AppModel(
     // MARK: - Enrolment and the commands this device runs (contract section 9.9)
 
     /** A fetched setup waiting to be confirmed or cancelled. Nothing of it is applied until then. */
-    var enrolment: EnrolmentPreview? by mutableStateOf(null)
-        private set
+    val enrolment = SetupEnrolment(services)
 
-    /**
-     * Puts the previewed setup in force. On a device with no setup yet this approves every launch
-     * value the summary showed; on one that had a setup, the values it did not approve wait.
-     */
+    /** Confirm on the summary of a fetched setup. See [SetupEnrolment.confirm]. */
     fun confirmEnrolment() {
-        val preview = enrolment ?: return
-        enrolment = null
-        val failure = services.applyEnrolment(preview.text, services.deviceName())
-        val found = services.config.value?.machines?.size ?: 0
-        fetchOutcome = failure?.let { "The setup from ${preview.host} was refused. $it" }
-            ?: "The setup came from ${preview.host}: $found machine${if (found == 1) "" else "s"}."
+        enrolment.confirm()?.let { fetchOutcome = it }
     }
 
-    /** Drops the previewed setup. Nothing was applied, and nothing is. */
+    /** Cancel on the summary of a fetched setup, which leaves this device as it was. */
     fun cancelEnrolment() {
-        val preview = enrolment ?: return
-        enrolment = null
-        fetchOutcome = "Nothing from ${preview.host} was applied."
+        enrolment.cancel()?.let { fetchOutcome = it }
     }
 
     /** Each launch value of the setup in force that waits for this device's approval. */

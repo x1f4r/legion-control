@@ -1,8 +1,6 @@
 package com.x1f4r.legioncontrol.ui
 
-import com.x1f4r.legioncontrol.agent.LaunchGate
 import com.x1f4r.legioncontrol.data.ConfigStore
-import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.LaunchDocuments
 import com.x1f4r.legioncontrol.data.LaunchDocuments.HELD
 import com.x1f4r.legioncontrol.data.LaunchDocuments.LINUX
@@ -10,33 +8,18 @@ import com.x1f4r.legioncontrol.data.LaunchDocuments.descendant
 import com.x1f4r.legioncontrol.data.LaunchDocuments.tuple
 import com.x1f4r.legioncontrol.data.offered
 import com.x1f4r.legioncontrol.data.withSystemValue
-import kotlinx.coroutines.flow.StateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.lang.reflect.Proxy
 
 /**
  * The editor never writes a command that could not run, and never lets an edit approve one that
  * nobody approved (contract section 9.9).
  */
 class SetupEditorLaunchTest {
-
-    /** The services the editor reads and writes, backed by a real store; nothing else is reachable. */
-    private fun servicesOver(store: ConfigStore): ControlServices {
-        val unused = Proxy.newProxyInstance(ControlServices::class.java.classLoader, arrayOf(ControlServices::class.java)) { _, method, _ ->
-            throw UnsupportedOperationException("${method.name} is not part of editing")
-        } as ControlServices
-        return object : ControlServices by unused {
-            override val document: StateFlow<ControllerDocument?> get() = store.document
-            override val launch: StateFlow<LaunchGate.Effective> get() = store.launch
-            override fun deviceName(): String = "Test phone"
-            override fun applyEdit(document: ControllerDocument, deviceName: String?): String? = store.applyEdit(document, deviceName)
-        }
-    }
 
     private fun editor(store: ConfigStore) = SetupEditorModel(servicesOver(store)).apply { startFresh() }
 

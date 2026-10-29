@@ -154,7 +154,7 @@ private fun TupleLines(tuple: LaunchTuple) {
  */
 @Composable
 fun EnrolmentSummary(app: AppModel) {
-    val preview = app.enrolment ?: return
+    val preview = app.enrolment.preview ?: return
     Spacer(Modifier.height(10.dp))
     SectionHeading("What the setup from ${preview.host} runs", showsRule = false)
     ExplanationText(
