@@ -22,6 +22,11 @@
 #
 set -euo pipefail
 
+# Everything written from here on is this user's alone. The base holds every
+# command the agent was configured with, the setup and the record of every
+# operation, and the units and launchers say where all of that lives.
+umask 077
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -191,6 +196,9 @@ fi
 step "Agent"
 
 mkdir -p "$BASE" "$BIN_DIR"
+# Closed before anything goes in, also when an older installer left it open:
+# the umask covers only what is created from now on.
+chmod 700 "$BASE"
 
 verify_tree() {
   LEGIONCTL_HOME="$BASE" LEGIONCTL_LAUNCHER_LIBRARY=1 "$NODE_BIN" --input-type=module - "$SCRIPT_DIR/launcher.mjs" "$1" <<'NODE'
@@ -230,10 +238,10 @@ const [template, output, node] = process.argv.slice(2);
 const literal = "'" + node.replace(/'/g, "'\\''") + "'";
 fs.writeFileSync(output, fs.readFileSync(template, 'utf8').replace('@NODE_SHELL@', () => literal));
 NODE
-chmod 755 "$LAUNCHER.new.$$"
+chmod 700 "$LAUNCHER.new.$$"
 mv "$LAUNCHER.new.$$" "$LAUNCHER"
 cp -p "$SCRIPT_DIR/dispatch.sh" "$BIN_DIR/dispatch.sh.new.$$"
-chmod 755 "$BIN_DIR/dispatch.sh.new.$$"
+chmod 700 "$BIN_DIR/dispatch.sh.new.$$"
 mv "$BIN_DIR/dispatch.sh.new.$$" "$BIN_DIR/dispatch.sh"
 
 
@@ -269,6 +277,13 @@ if ! "$LAUNCHER" version --check >/dev/null; then
   die "installed agent failed its final self-check; the current tree and previous backup are retained for inspection."
 fi
 note "stable launcher installed at $LAUNCHER and passed version --check"
+
+# Nothing in the base is anyone else's. The copies above keep the modes of the
+# source, and the agent narrows a file an older version wrote only when it next
+# writes it, so everything is narrowed here once.
+if ! chmod -R go-rwx "$BASE" 2>/dev/null; then
+  note "WARNING: some files under $BASE could not be made private. Another user owns them: find $(printf '%q' "$BASE") ! -user $(id -un)"
+fi
 
 # config.json and state.json are deliberately NOT written here. The agent falls
 # back to its own defaults when they are absent, and an installer that stamped a

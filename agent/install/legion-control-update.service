@@ -37,6 +37,12 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
 
 ExecStart="@LAUNCHER@" cycle
 
+# What the cycle writes is this user's alone: the agent's configuration, the
+# setup, the operation records and the log. The agent asks for that itself,
+# and this is the floor under it. It holds for what the cycle runs as well, so
+# a package a service update installs is this user's alone too.
+UMask=0077
+
 # Worst case is several services, each with a cold package cache plus the 120 s
 # health wait plus a rollback, so leave real headroom. A run killed here leaves
 # operation records whose process is gone; the next cycle finds them, marks them

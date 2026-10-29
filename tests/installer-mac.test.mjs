@@ -25,6 +25,9 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
   const result = spawnSync('bash', args, { encoding: 'utf8', env });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.readFileSync(path.join(base, 'config.json'), 'utf8'), config);
+  // Only this user may enter the base, and the config in it is this user's alone.
+  assert.equal(fs.statSync(base).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(base, 'config.json')).mode & 0o077, 0);
   assert.equal(fs.existsSync(path.join(home, 'Library', 'LaunchAgents')), false);
   const version = spawnSync(path.join(base, 'bin', 'legionctl'), ['version', '--check'], { encoding: 'utf8', env });
   assert.equal(version.status, 0, version.stderr);
@@ -49,6 +52,8 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
   const plist = fs.readFileSync(path.join(repository, 'mac', 'install', 'com.x1f4r.legion-control.update.plist'), 'utf8');
   assert.match(plist, /<string>@LAUNCHER@<\/string>/);
   assert.doesNotMatch(plist, /src\/index\.mjs/);
+  // What a cycle writes is this user's alone, as the Linux unit's UMask=0077 has it: 63 is 0o77.
+  assert.match(plist, /<key>Umask<\/key>\s*<integer>63<\/integer>/);
 
   if (process.platform === 'darwin') {
     // Render and parse the real plist while every launchctl command goes only
@@ -63,6 +68,9 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
     const extracted = spawnSync('/usr/bin/plutil', ['-extract', 'ProgramArguments', 'json', '-o', '-', renderedPath], { encoding: 'utf8' });
     assert.equal(extracted.status, 0, extracted.stderr);
     assert.deepEqual(JSON.parse(extracted.stdout), [process.execPath, path.join(base, 'bin', 'launcher.mjs'), 'cycle']);
+    const umask = spawnSync('/usr/bin/plutil', ['-extract', 'Umask', 'raw', '-o', '-', renderedPath], { encoding: 'utf8' });
+    assert.equal(umask.status, 0, umask.stderr);
+    assert.equal(Number(umask.stdout.trim()), 0o77);
   }
 });
 

@@ -217,6 +217,8 @@ test('linux installer writes units that systemd reads back as the paths it meant
   ]);
   const execStart = values(service, 'ExecStart', { exec: true });
   assert.deepEqual(execStart, [[path.join(home, '.legion-control', 'bin', 'legionctl'), 'cycle']]);
+  // What the cycle writes, and what it runs writes, is this user's alone.
+  assert.deepEqual(values(service, 'UMask'), [['0077']]);
   // And that is the launcher, which runs.
   const launched = spawnSync(execStart[0][0], ['status'], { encoding: 'utf8' });
   assert.equal(launched.status, 0, launched.stderr);
@@ -294,4 +296,39 @@ test('linux installer refuses a reference service port that is not a number', { 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /LEGION_T3_PORT must be a port number, got '3773 --host 0\.0\.0\.0'\./);
   assert.equal(fs.existsSync(path.join(home, '.legion-control')), false);
+});
+
+// --- File modes ------------------------------------------------------------------
+
+/** Every entry under `directory` that its group or anybody else may read, write or enter, with its mode. */
+function openToOthers(directory) {
+  const open = [];
+  const walk = (entry) => {
+    const stat = fs.lstatSync(entry);
+    if ((stat.mode & 0o077) !== 0 && !stat.isSymbolicLink()) open.push(`${path.relative(directory, entry) || '.'} ${(stat.mode & 0o777).toString(8)}`);
+    if (stat.isDirectory()) for (const name of fs.readdirSync(entry)) walk(path.join(entry, name));
+  };
+  walk(directory);
+  return open;
+}
+
+test('linux installer leaves nothing in the base that another user can read, also in a base an older installer left open', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion installer modes '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home with space');
+  const base = path.join(home, '.legion-control');
+  // What an older installer and agent left behind under a umask of 022.
+  fs.mkdirSync(path.join(base, 'state'), { recursive: true });
+  fs.writeFileSync(path.join(base, 'config.json'), '{"sentinel":"leave exactly alone"}\n');
+  fs.writeFileSync(path.join(base, 'state', 'tower.json'), '{}\n');
+  for (const [entry, mode] of [['', 0o755], ['state', 0o755], ['config.json', 0o644], [path.join('state', 'tower.json'), 0o644]]) fs.chmodSync(path.join(base, entry), mode);
+
+  const result = install(sourceFixture(root), base, home, { LEGION_NODE_BIN: process.execPath });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.statSync(base).mode & 0o777, 0o700);
+  assert.deepEqual(openToOthers(base), []);
+  assert.equal(fs.readFileSync(path.join(base, 'config.json'), 'utf8'), '{"sentinel":"leave exactly alone"}\n');
+  // Private, and still the launcher its user runs.
+  const launched = spawnSync(path.join(base, 'bin', 'legionctl'), ['status'], { encoding: 'utf8' });
+  assert.equal(launched.status, 0, launched.stderr);
 });

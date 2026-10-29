@@ -27,6 +27,11 @@
 #
 set -euo pipefail
 
+# Everything written from here on is this user's alone, as on Linux: the job's
+# plist says where the agent lives, and the base holds every command it was
+# configured with, the setup and the record of every operation.
+umask 077
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
