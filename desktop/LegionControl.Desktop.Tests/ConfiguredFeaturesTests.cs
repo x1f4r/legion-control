@@ -34,15 +34,16 @@ public class ConfiguredFeaturesTests
     }
 
     [Theory]
-    [InlineData("ran", OperationOutcome.Succeeded)]
-    [InlineData("cancelled", OperationOutcome.Cancelled)]
-    [InlineData("failed", OperationOutcome.Failed)]
-    [InlineData("future-result", OperationOutcome.Unresolved)]
-    public void ServerHistorySummariesDecodeFlattenedOutcomes(string action, OperationOutcome expected)
+    [InlineData("ran", null, OperationOutcome.Succeeded)]
+    [InlineData("cancelled", "cancelled", OperationOutcome.Deferred)]
+    [InlineData("failed", "apply-failed", OperationOutcome.Failed)]
+    [InlineData("future-result", null, OperationOutcome.Unknown)]
+    public void ServerHistorySummariesDecodeFlattenedOutcomes(string action, string? reasonCode, OperationOutcome expected)
     {
+        var code = reasonCode is null ? "null" : $"\"{reasonCode}\"";
         var summary = OperationSummary.From(Value.Parse($$"""
             {"id":"peer-operation","kind":"run","actionId":"count","state":"finished",
-             "finishedAt":"2026-09-05T12:00:00Z","action":"{{action}}","message":"Server history result"}
+             "finishedAt":"2026-09-05T12:00:00Z","action":"{{action}}","reasonCode":{{code}},"message":"Server history result"}
             """));
         Assert.Equal(expected, summary!.Outcome);
         Assert.Equal(action, summary.Action);

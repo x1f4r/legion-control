@@ -216,7 +216,7 @@ public abstract record CommandOutcome
 
     /// Whether the thing asked for is known to have happened. Deliberately false for everything
     /// ambiguous: nothing in this app turns a lost connection into a success.
-    public bool IsKnownSuccess => this is Done { Outcome: OperationOutcome.Succeeded or OperationOutcome.Noop };
+    public bool IsKnownSuccess => this is Done { Outcome: OperationOutcome.Succeeded };
 }
 
 /// What a machine looks like after a reboot or a sleep was acknowledged.

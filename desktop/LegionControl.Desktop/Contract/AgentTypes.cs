@@ -748,31 +748,6 @@ public enum OperationState
     Finished,
 }
 
-/// What became of an operation. Deliberately not a boolean: "we do not know" is a state the whole
-/// design exists to be able to say, and it must never collapse into either of the other two.
-public enum OperationOutcome
-{
-    /// Still going, or waiting.
-    Pending,
-    Succeeded,
-    /// The agent said it failed.
-    Failed,
-    /// The agent deliberately did nothing and said why.
-    Deferred,
-    Queued,
-    Cancelled,
-    Expired,
-    /// Cut off mid-flight. Whatever it left behind is on the machine.
-    Interrupted,
-    /// Nothing needed doing.
-    Noop,
-    /// Refused because something else holds the machine.
-    Conflict,
-    /// The record is finished and does not say how it went, or the reply never arrived. Never
-    /// rendered as either of the two that matter.
-    Unresolved,
-}
-
 public sealed record OperationProgress(int? Step, int? Of, string? Note)
 {
     public static OperationProgress? From(Value json)
@@ -881,6 +856,8 @@ public sealed record OperationRecord
     /// Set when a queued request of the same shape was displaced by this one.
     public string? Replaced { get; init; }
     public OperationConflict? Conflict { get; init; }
+    /// What became of it, as the record states it or as section 5.6 reduces it.
+    public OperationOutcome Outcome { get; init; } = OperationOutcome.Unknown;
 
     public static OperationRecord? From(Value json)
     {
@@ -922,6 +899,9 @@ public sealed record OperationRecord
             Replayed = json["replayed"].AsBool() ?? false,
             Replaced = json["replaced"].AsText(),
             Conflict = OperationConflict.From(json["conflict"]),
+            // A record carries `result`, null until it finishes; a summary carries the result's
+            // fields flattened beside its own and is reduced from those.
+            Outcome = json.Has("result") ? Outcomes.OfRecord(json) : Outcomes.Of(json),
         };
     }
 
@@ -978,52 +958,6 @@ public sealed record OperationRecord
     };
 
     public bool IsFinished => State == OperationState.Finished;
-
-    /// What became of it. The rule that matters: a finished record whose outcome cannot be read is
-    /// [OperationOutcome.Unresolved], never success. Nothing in this client turns an absent
-    /// postcondition into a good result, whatever was forced.
-    public OperationOutcome Outcome
-    {
-        get
-        {
-            var word = (Result?.Action ?? RawState)?.Trim().ToLowerInvariant();
-            switch (word)
-            {
-                case "updated" or "restarted" or "ran" or "rebooted" or "slept" or "cycled" or "succeeded" or "success" or "armed":
-                    return OperationOutcome.Succeeded;
-                case "noop" or "current" or "skipped" or "already-on-target":
-                    return OperationOutcome.Noop;
-                case "failed" or "rolled-back":
-                    return OperationOutcome.Failed;
-                case "deferred":
-                    return OperationOutcome.Deferred;
-                case "queued":
-                    return OperationOutcome.Queued;
-                case "cancelled" or "canceled":
-                    return OperationOutcome.Cancelled;
-                case "expired":
-                    return OperationOutcome.Expired;
-                case "interrupted":
-                    return OperationOutcome.Interrupted;
-                case "conflict":
-                    return OperationOutcome.Conflict;
-                case "rebooting" or "sleeping" or "accepted" or "running" or "started" or "already-running":
-                    return OperationOutcome.Pending;
-                case "installed":
-                    return OperationOutcome.Succeeded;
-            }
-            if (State is OperationState.Running or OperationState.Queued) return OperationOutcome.Pending;
-            if (State == OperationState.Finished)
-            {
-                // A finished record with an explicit ok is readable; one with neither an action nor
-                // an ok is not, and saying so is the whole point of this branch.
-                if (Result?.Ok == true) return OperationOutcome.Succeeded;
-                if (Result?.Ok == false) return OperationOutcome.Failed;
-                return OperationOutcome.Unresolved;
-            }
-            return OperationOutcome.Unresolved;
-        }
-    }
 
     public OperationSummary ToSummary() => new()
     {
@@ -1091,7 +1025,7 @@ public sealed record OperationSummary
     public DateTimeOffset? RequestedAt { get; init; }
     public DateTimeOffset? UpdatedAt { get; init; }
     public DateTimeOffset? ExpiresAt { get; init; }
-    public OperationOutcome Outcome { get; init; } = OperationOutcome.Unresolved;
+    public OperationOutcome Outcome { get; init; } = OperationOutcome.Unknown;
 
     public static OperationSummary? From(Value json)
     {
@@ -1116,19 +1050,20 @@ public sealed record OperationSummary
         _ => kind,
     };
 
+    /// The outcome in a few words, with the action saying which kind of each it was.
     public string OutcomeText => Outcome switch
     {
-        OperationOutcome.Succeeded => Action ?? "done",
-        OperationOutcome.Noop => "nothing to do",
+        OperationOutcome.Pending => State == OperationState.Queued ? "queued" : Phase ?? "running",
+        OperationOutcome.Succeeded => Action == "noop" ? "nothing to do" : Action ?? "done",
         OperationOutcome.Failed => "failed",
-        OperationOutcome.Deferred => "deferred",
-        OperationOutcome.Queued => "queued",
-        OperationOutcome.Cancelled => "cancelled",
-        OperationOutcome.Expired => "expired",
-        OperationOutcome.Interrupted => "interrupted",
-        OperationOutcome.Conflict => "refused, something else was running",
-        OperationOutcome.Pending => Phase ?? "running",
-        _ => "outcome not known",
+        OperationOutcome.Deferred => Action switch
+        {
+            "conflict" => "refused, something else was running",
+            "cancelled" => "cancelled",
+            "expired" => "expired",
+            _ => "deferred",
+        },
+        _ => Action == "interrupted" ? "interrupted, outcome not known" : "outcome not known",
     };
 }
 
@@ -1178,68 +1113,28 @@ public sealed record ActionResult
             Replayed = (json["replayed"].AsBool() ?? false) || (operation?.Replayed ?? false),
             Operation = operation,
             Conflict = OperationConflict.From(json["conflict"]) ?? operation?.Conflict,
+            Outcome = Outcomes.Of(json),
         };
     }
 
-    /// Whether the agent took the work away and left this client to poll for it.
-    public bool IsAccepted => string.Equals(Action, "accepted", StringComparison.OrdinalIgnoreCase);
+    /// Whether the agent took the work away and left this client to poll for it. A replay of a
+    /// request that is still running says `already-running` rather than `accepted`, and is followed
+    /// exactly the same way (contract section 5.5).
+    public bool IsAccepted => Action is "accepted" or "already-running";
 
-    public bool IsCommandRefusal => Envelope.Ok == false && Operation is null
+    /// The agent refused the command itself before anything was started: a restricted key, or an
+    /// argument it does not take.
+    public bool IsCommandRefusal => Outcome == OperationOutcome.Failed && Envelope.Ok == false && Operation is null
         && Envelope.ReasonCode is ReasonCode.Restricted or ReasonCode.BadArgument;
 
-    public bool IsQueued => string.Equals(Action, "queued", StringComparison.OrdinalIgnoreCase);
+    public bool IsQueued => Action == "queued";
 
-    public bool IsConflict => string.Equals(Action, "conflict", StringComparison.OrdinalIgnoreCase)
-        || Envelope.ReasonCode == Contract.ReasonCode.OperationInProgress;
+    public bool IsConflict => Action == "conflict" || Envelope.ReasonCode == Contract.ReasonCode.OperationInProgress;
 
-    /// What this reply says happened, read through the same rules as an operation record so that a
-    /// synchronous agent and a detaching one produce the same outcome above this line.
-    public OperationOutcome Outcome
-    {
-        get
-        {
-            if (IsCommandRefusal) return OperationOutcome.Failed;
-            if (IsAccepted) return OperationOutcome.Pending;
-            if (IsQueued) return OperationOutcome.Queued;
-            if (IsConflict) return OperationOutcome.Conflict;
-            if (Operation is { } operation && operation.IsFinished) return operation.Outcome;
-            var word = Action?.Trim().ToLowerInvariant();
-            switch (word)
-            {
-                case "updated" or "restarted" or "ran" or "cycled" or "armed":
-                    return OperationOutcome.Succeeded;
-                case "noop" or "current" or "skipped" or "already-on-target":
-                    return OperationOutcome.Noop;
-                case "failed" or "rolled-back":
-                    return OperationOutcome.Failed;
-                case "deferred":
-                    return OperationOutcome.Deferred;
-                case "cancelled" or "canceled":
-                    return OperationOutcome.Cancelled;
-                case "expired":
-                    return OperationOutcome.Expired;
-                case "interrupted":
-                    return OperationOutcome.Interrupted;
-                // A machine that is going down has acknowledged and not yet arrived. It is pending
-                // until something observes the other side of the transition, and never before.
-                case "rebooting" or "sleeping":
-                    return OperationOutcome.Pending;
-                case "rebooted" or "slept" or "installed" or "rolled-back-agent":
-                    return OperationOutcome.Succeeded;
-                // The agent found the id already running and started nothing twice. What happened
-                // is whatever that operation does, which is not known yet.
-                case "already-running":
-                    return OperationOutcome.Pending;
-            }
-            // A reply that carries a reason code is by definition not the happy path, so an action
-            // word this build has never heard of must not be read as one. Saying "we do not know"
-            // about a word nobody wrote a case for is the only honest answer.
-            if (Envelope.ReasonCode is not null) return OperationOutcome.Unresolved;
-            if (Envelope.Ok == true && word is not null) return OperationOutcome.Succeeded;
-            if (Envelope.Ok == false) return OperationOutcome.Failed;
-            return OperationOutcome.Unresolved;
-        }
-    }
+    /// What this reply says happened: the agent's own `outcome`, or section 5.6's reduction of the
+    /// reply when an agent before 3.1.0 sent none. The reply's own fields decide, never the record
+    /// beside it: a replay carries the first request's record, and a conflict someone else's.
+    public OperationOutcome Outcome { get; init; } = OperationOutcome.Unknown;
 
     /// Whether this reply, on its own, says the machine is on its way down. Only an acknowledged
     /// reply ever does; a dropped link never does, wherever it dropped.

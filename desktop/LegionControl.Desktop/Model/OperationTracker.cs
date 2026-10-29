@@ -62,8 +62,11 @@ public sealed record TrackedOperation
     public string? Output { get; init; }
     public string? ReasonCode { get; init; }
     public DateTimeOffset? ExpiresAt { get; init; }
-    /// True once the outcome is something other than "we are still waiting to find out".
-    public bool IsResolved => Outcome is not (OperationOutcome.Pending or OperationOutcome.Unresolved);
+    /// True once asking again can tell nothing new: a terminal outcome, or a record the agent
+    /// finished without saying how it went. Pending work is followed, and an unknown outcome with
+    /// no finished record behind it is read again by the same id, never sent again.
+    public bool IsResolved => Outcome is OperationOutcome.Succeeded or OperationOutcome.Failed or OperationOutcome.Deferred
+        || (Outcome == OperationOutcome.Unknown && State == OperationState.Finished);
     /// True when the link went away and nothing has resolved it since. The amber row.
     public bool OutcomeUnknown { get; init; }
 
@@ -174,10 +177,13 @@ public sealed class OperationTracker
             if (!_operations.TryGetValue(id, out var existing)) return null;
             if (!existing.Intent.Matches(record))
             {
+                // This request is not that record, and an agent refuses an id that already names
+                // another request: whatever this app asked for under it is not in effect there.
                 var conflicted = existing with
                 {
                     UpdatedAt = DateTimeOffset.UtcNow,
-                    Outcome = OperationOutcome.Conflict,
+                    State = OperationState.Finished,
+                    Outcome = OperationOutcome.Failed,
                     Message = $"The machine has an operation {id} that is a {record.Describe()}, not the {existing.Intent.Describe()} this app asked for.",
                     OutcomeUnknown = false,
                 };
@@ -275,9 +281,7 @@ public sealed class OperationTracker
                     UpdatedAt = entry["updatedAt"].AsInstant() ?? DateTimeOffset.UtcNow,
                     State = OperationRecord.ReadState(entry["state"].AsText(), null, entry["finishedAt"].AsInstant()),
                     Phase = entry["phase"].AsText(),
-                    Outcome = Enum.TryParse<OperationOutcome>(entry["outcome"].AsText(), out var outcome)
-                        ? outcome
-                        : OperationOutcome.Pending,
+                    Outcome = ReadOutcome(entry["outcome"].AsText()),
                     Message = entry["message"].AsText(),
                     Output = entry["output"].AsText(),
                     ReasonCode = entry["reasonCode"].AsText(),
@@ -293,6 +297,20 @@ public sealed class OperationTracker
             // on the next status anyway.
         }
     }
+
+    /// An outcome as this list stores it. Builds before contract 3.1 wrote eleven words where the
+    /// contract has five, and each of the others is read as the one section 5.6 gives that ending:
+    /// nothing to do succeeded, a conflict, a cancelled or an expired request was deferred, an
+    /// interruption is unknown, and a queued request is still pending. A word nobody wrote is
+    /// pending, which is asked about again rather than believed.
+    internal static OperationOutcome ReadOutcome(string? stored) => stored switch
+    {
+        "Succeeded" or "Noop" => OperationOutcome.Succeeded,
+        "Failed" => OperationOutcome.Failed,
+        "Deferred" or "Conflict" or "Cancelled" or "Expired" => OperationOutcome.Deferred,
+        "Unknown" or "Unresolved" or "Interrupted" => OperationOutcome.Unknown,
+        _ => OperationOutcome.Pending,
+    };
 
     private void Save()
     {

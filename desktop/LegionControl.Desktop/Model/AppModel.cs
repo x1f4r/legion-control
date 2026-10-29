@@ -367,8 +367,8 @@ public sealed class AppModel : IDisposable
             var machine = Machine(operation.MachineId)?.Name ?? operation.MachineId;
             Notifications.Announce(new Announcement(
                 $"{operation.Intent.Describe()} on {machine}",
-                operation.Message ?? operation.Outcome.ToString().ToLowerInvariant(),
-                operation.Outcome is OperationOutcome.Failed or OperationOutcome.Interrupted));
+                operation.Message ?? operation.Outcome.Wire(),
+                operation.Outcome is OperationOutcome.Failed or OperationOutcome.Unknown));
         }
     }
 

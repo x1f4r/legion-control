@@ -340,19 +340,24 @@ public sealed class MachineModel
         }
         if (result.Operation is { } record) tracked = _tracker.Apply(tracked.Id, record) ?? tracked;
 
-        if (result.IsConflict)
+        // The outcome decides what happens next (contract section 5.6), and the action only says
+        // which kind of it this is: a request held until idle, a machine on its way down, or work
+        // the agent took away to finish on its own.
+        var outcome = result.Outcome;
+        if (outcome == OperationOutcome.Deferred && result.IsConflict)
         {
             var conflict = result.Conflict;
             var sentence = conflict is null
                 ? $"{Name} is already busy with another operation, so nothing was started."
                 : $"{Name} is already running {OperationSummary.Describe(conflict.Kind, conflict.Service, null, null)}"
                   + (conflict.Phase is { } phase ? $" ({phase})" : "") + ", so nothing was started.";
-            _tracker.Update(tracked with { Outcome = OperationOutcome.Conflict, Message = sentence });
+            _tracker.Update(tracked with { State = OperationState.Finished, Outcome = OperationOutcome.Deferred, Message = sentence,
+                ReasonCode = result.Envelope.ReasonCode });
             Changed?.Invoke();
             return new CommandOutcome.Conflicted(conflict, sentence);
         }
 
-        if (result.IsQueued)
+        if (outcome == OperationOutcome.Pending && result.IsQueued)
         {
             var expires = result.ExpiresAt;
             var sentence = $"Held until {Name} is idle"
@@ -360,7 +365,7 @@ public sealed class MachineModel
                 + (result.Replaced is { } replaced ? $" It replaced an earlier queued request ({replaced})." : "");
             var queued = tracked with
             {
-                Outcome = OperationOutcome.Queued,
+                Outcome = OperationOutcome.Pending,
                 State = OperationState.Queued,
                 ExpiresAt = expires,
                 Message = sentence,
@@ -370,7 +375,7 @@ public sealed class MachineModel
             return new CommandOutcome.Queued(queued, expires, sentence);
         }
 
-        if (result.AcknowledgedTransition)
+        if (outcome == OperationOutcome.Pending && result.AcknowledgedTransition)
         {
             Transition = new TransitionWatch
             {
@@ -385,7 +390,9 @@ public sealed class MachineModel
             return new CommandOutcome.Done(result, OperationOutcome.Pending, sentence);
         }
 
-        if (result.IsAccepted)
+        // Anything else the agent still owns is followed by its id: an accepted request, a replay
+        // of one still running, or a reply that simply says pending.
+        if (outcome == OperationOutcome.Pending)
         {
             // The id to poll is the one this app sent, never the one the reply happens to carry. An
             // agent that echoes a different id is answering about something else, and following it
@@ -411,12 +418,13 @@ public sealed class MachineModel
             return new CommandOutcome.Following(tracked, sentence);
         }
 
-        var outcome = result.Outcome;
         var reason = result.Envelope.ReasonCode;
         var text = result.Envelope.Sentence(request.Service) ?? DescribeOutcome(request, outcome, result);
         _tracker.Update(tracked with
         {
-            State = OperationState.Finished,
+            // An unknown outcome is finished only when a record says so. Without one, the id is
+            // still worth reading again; with one, there is nothing more to learn by asking.
+            State = outcome == OperationOutcome.Unknown ? result.Operation?.State ?? OperationState.Unknown : OperationState.Finished,
             Outcome = outcome,
             Message = text,
             Output = result.Output,
@@ -424,20 +432,14 @@ public sealed class MachineModel
         });
         Changed?.Invoke();
 
-        if (outcome == OperationOutcome.Deferred)
+        return outcome switch
         {
-            return new CommandOutcome.Refused(text, ReasonCode.IsForceable(reason), reason);
-        }
-        if (outcome == OperationOutcome.Failed)
-        {
-            return new CommandOutcome.Failed(text, result.Output);
-        }
-        if (outcome == OperationOutcome.Unresolved)
-        {
-            return new CommandOutcome.NotKnown(
-                $"{Name} answered without saying what became of {request.Describe()}. {text}".Trim(), tracked.Id);
-        }
-        return new CommandOutcome.Done(result, outcome, text);
+            OperationOutcome.Deferred => new CommandOutcome.Refused(text, ReasonCode.IsForceable(reason), reason),
+            OperationOutcome.Failed => new CommandOutcome.Failed(text, result.Output),
+            OperationOutcome.Unknown => new CommandOutcome.NotKnown(
+                $"{Name} answered without saying what became of {request.Describe()}. {text}".Trim(), tracked.Id),
+            _ => new CommandOutcome.Done(result, outcome, text),
+        };
     }
 
     /// Polls one operation until it finishes or the caller gives up.
@@ -479,18 +481,19 @@ public sealed class MachineModel
                     var missing = $"{Name} has no record of {operationId}. Nothing with that id ran there.";
                     if (tracked is not null)
                     {
-                        _tracker.Update(tracked with { Outcome = OperationOutcome.Unresolved, Message = missing });
+                        _tracker.Update(tracked with { Outcome = OperationOutcome.Unknown, Message = missing });
                     }
                     Changed?.Invoke();
                     return new CommandOutcome.NotKnown(missing, operationId);
                 }
                 tracked = _tracker.Apply(operationId, record) ?? tracked;
                 Changed?.Invoke();
-                if (tracked?.Outcome == OperationOutcome.Conflict)
+                if (tracked is not null && !tracked.Intent.Matches(record))
                 {
                     return new CommandOutcome.Conflicted(null, tracked.Message ?? "That id belongs to a different operation.");
                 }
-                if (record.IsFinished)
+                // Followed until the record is no longer pending. A finished record never is.
+                if (record.Outcome != OperationOutcome.Pending)
                 {
                     var sentence = record.Result?.Message
                         ?? ReasonCode.Describe(record.Result?.ReasonCode, record.Service)
@@ -500,9 +503,10 @@ public sealed class MachineModel
                         OperationOutcome.Failed => new CommandOutcome.Failed(sentence, record.Result?.Output),
                         OperationOutcome.Deferred => new CommandOutcome.Refused(
                             sentence, ReasonCode.IsForceable(record.Result?.ReasonCode), record.Result?.ReasonCode),
-                        OperationOutcome.Unresolved => new CommandOutcome.NotKnown(sentence, operationId),
+                        OperationOutcome.Unknown => new CommandOutcome.NotKnown(sentence, operationId),
                         _ => new CommandOutcome.Done(
-                            new ActionResult { Operation = record, Action = record.Result?.Action, Output = record.Result?.Output }, record.Outcome, sentence),
+                            new ActionResult { Operation = record, Action = record.Result?.Action, Output = record.Result?.Output, Outcome = record.Outcome },
+                            record.Outcome, sentence),
                     };
                 }
             }
@@ -551,8 +555,7 @@ public sealed class MachineModel
             if (Transition is { OperationId: var pending } watch && pending == operationId && updated?.IsResolved == true)
                 Transition = watch with
                 {
-                    State = updated.Outcome is OperationOutcome.Succeeded or OperationOutcome.Noop
-                        ? TransitionState.Observed : TransitionState.Contradicted,
+                    State = updated.Outcome == OperationOutcome.Succeeded ? TransitionState.Observed : TransitionState.Contradicted,
                     Note = updated.Message,
                 };
             Changed?.Invoke();
@@ -577,14 +580,15 @@ public sealed class MachineModel
             var reply = await NewAgent().MutateAsync(argv, TimeSpan.FromSeconds(40), PreferredSystem(), null,
                 cancellationToken: cancellationToken);
             var result = reply.Value;
-            if (result.Outcome == OperationOutcome.Cancelled)
+            // The cancel succeeded; the request it cancelled is deferred, finished without acting.
+            if (result.Outcome == OperationOutcome.Succeeded && result.Action == "cancelled")
             {
                 if (_tracker.Find(operationId) is { } tracked)
                 {
-                    _tracker.Update(tracked with { Outcome = OperationOutcome.Cancelled, Message = "Cancelled." });
+                    _tracker.Update(tracked with { State = OperationState.Finished, Outcome = OperationOutcome.Deferred, Message = "Cancelled." });
                 }
                 Changed?.Invoke();
-                return new CommandOutcome.Done(result, OperationOutcome.Cancelled, "Cancelled.");
+                return new CommandOutcome.Done(result, OperationOutcome.Succeeded, "Cancelled.");
             }
             var sentence = result.Envelope.Sentence() ?? "The agent did not cancel it.";
             // A running operation is not killable, and the agent says so rather than pretending.
@@ -881,18 +885,18 @@ public sealed class MachineModel
         _ => TimeSpan.FromMinutes(2),
     };
 
-    private static string DescribeOutcome(MachineRequest request, OperationOutcome outcome, ActionResult result) => outcome switch
+    private static string DescribeOutcome(MachineRequest request, OperationOutcome outcome, ActionResult result) => (outcome, result.Action) switch
     {
-        OperationOutcome.Succeeded when request.Kind == RequestKind.Update && result.To is { } to =>
+        (OperationOutcome.Succeeded, "noop") => "There was nothing to do.",
+        (OperationOutcome.Succeeded, _) when request.Kind == RequestKind.Update && result.To is { } to =>
             $"Updated {request.Service ?? "the service"} to {to}.",
-        OperationOutcome.Succeeded => $"{request.Describe()} done.",
-        OperationOutcome.Noop => "There was nothing to do.",
-        OperationOutcome.Failed => $"{request.Describe()} failed.",
-        OperationOutcome.Deferred => $"{request.Describe()} was deferred.",
-        OperationOutcome.Cancelled => "Cancelled.",
-        OperationOutcome.Expired => "The request expired before the machine was idle.",
-        OperationOutcome.Interrupted => $"{request.Describe()} was cut off before it finished.",
-        OperationOutcome.Conflict => "Something else holds the machine.",
+        (OperationOutcome.Succeeded, _) => $"{request.Describe()} done.",
+        (OperationOutcome.Failed, _) => $"{request.Describe()} failed.",
+        (OperationOutcome.Deferred, "cancelled") => "Cancelled.",
+        (OperationOutcome.Deferred, "expired") => "The request expired before the machine was idle.",
+        (OperationOutcome.Deferred, "conflict") => "Something else holds the machine.",
+        (OperationOutcome.Deferred, _) => $"{request.Describe()} was deferred.",
+        (OperationOutcome.Unknown, "interrupted") => $"{request.Describe()} was cut off before it finished.",
         _ => $"{request.Describe()}: the machine did not say what happened.",
     };
 }

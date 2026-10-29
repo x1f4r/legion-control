@@ -204,7 +204,7 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
 
             var gate = SetupSync.Gate(decision.Kind, local!.Hash, mark!.Hash, status.AgentVersion, at, state.View(
                 localInvalid: _config.Acceptance is { Valid: false },
-                localMutation: machine.Operations.Any(operation => operation.Outcome == OperationOutcome.Pending),
+                localMutation: machine.Operations.Any(operation => operation.Outcome == OperationOutcome.Pending && operation.State != OperationState.Queued),
                 runningOperations: status.Operations.Running.Count,
                 statusAt: statusAt));
             if (gate.Action == GateAction.Hold) return Held(machine, state, local.Hash, mark.Hash, status.AgentVersion, gate.Reason);

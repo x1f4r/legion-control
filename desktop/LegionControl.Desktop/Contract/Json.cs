@@ -77,6 +77,10 @@ public readonly struct Value
         }
     }
 
+    /// Whether the object names this property at all, null included. `"op": null` is an answer
+    /// ("there is no such operation"), and a reply with no `op` key at all is not one.
+    public bool Has(string name) => IsObject && _element.TryGetProperty(name, out _);
+
     /// Every property of an object, in document order. Used where the agent keys by service id.
     public IEnumerable<KeyValuePair<string, Value>> Properties()
     {

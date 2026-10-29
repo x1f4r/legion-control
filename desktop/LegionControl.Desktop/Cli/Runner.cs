@@ -566,15 +566,15 @@ public static class Runner
             output.WriteLine($"This device has no record of {id}, and the machine was not asked about an id it never got from here.");
             return NotKnown;
         }
-        output.WriteLine($"{tracked.Intent.Describe()}  {tracked.Outcome.ToString().ToLowerInvariant()}");
+        output.WriteLine($"{tracked.Intent.Describe()}  {tracked.Outcome.Wire()}");
         if (tracked.Phase is { } phase) output.WriteLine($"phase   {phase}");
         if (tracked.Message is { } message) output.WriteLine($"message {message}");
         if (!json && tracked.Output is { } commandOutput) output.WriteLine(commandOutput);
         if (json) output.WriteLine(JsonSerializer.Serialize(tracked, Indented));
         return tracked.Outcome switch
         {
-            OperationOutcome.Succeeded or OperationOutcome.Noop or OperationOutcome.Cancelled => Ok,
-            OperationOutcome.Failed or OperationOutcome.Expired or OperationOutcome.Conflict => Failed,
+            OperationOutcome.Succeeded => Ok,
+            OperationOutcome.Failed or OperationOutcome.Deferred => Failed,
             _ => NotKnown,
         };
     }
@@ -1072,8 +1072,8 @@ public static class Runner
     {
         CommandOutcome.Done done => done.Outcome switch
         {
-            OperationOutcome.Succeeded or OperationOutcome.Noop or OperationOutcome.Cancelled => Ok,
-            OperationOutcome.Pending or OperationOutcome.Unresolved => NotKnown,
+            OperationOutcome.Succeeded => Ok,
+            OperationOutcome.Pending or OperationOutcome.Unknown => NotKnown,
             _ => Failed,
         },
         CommandOutcome.Queued or CommandOutcome.Following => Ok,

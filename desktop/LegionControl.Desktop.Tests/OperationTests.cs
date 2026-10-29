@@ -70,7 +70,9 @@ public class OperationTrackerTests
             """));
         var applied = tracker.Apply("op-00000002", record!);
         Assert.NotNull(applied);
-        Assert.Equal(OperationOutcome.Conflict, applied!.Outcome);
+        // Not this request's outcome: what this app asked for under the id is not in effect.
+        Assert.Equal(OperationOutcome.Failed, applied!.Outcome);
+        Assert.True(applied.IsResolved);
         Assert.Contains("not the", applied.Message);
     }
 
@@ -106,6 +108,38 @@ public class OperationTrackerTests
         Assert.False(operation.IsResolved);
         Assert.Equal("update", operation.Intent.Kind);
         Assert.Equal("t3", operation.Intent.Service);
+    }
+
+    [Fact]
+    public void AnOutcomeAnEarlierBuildStoredIsReadAsTheOneSectionFivePointSixGivesIt()
+    {
+        // Builds before contract 3.1 kept eleven words. Each comes back as the outcome the contract
+        // gives that ending, so a row resolved then stays resolved and a queued one is followed.
+        using var home = new TempHome();
+        var path = home.Write("operations.json", """
+            { "version": 1, "operations": [
+              { "id": "op-noop-0001", "machineId": "pi", "intent": { "kind": "update" }, "state": "finished", "outcome": "Noop" },
+              { "id": "op-conflict-01", "machineId": "pi", "intent": { "kind": "update" }, "state": "finished", "outcome": "Conflict" },
+              { "id": "op-cancel-001", "machineId": "pi", "intent": { "kind": "boot" }, "state": "finished", "outcome": "Cancelled" },
+              { "id": "op-interrupt-1", "machineId": "pi", "intent": { "kind": "update" }, "state": "finished", "outcome": "Interrupted" },
+              { "id": "op-queued-001", "machineId": "pi", "intent": { "kind": "restart" }, "state": "queued", "outcome": "Queued" },
+              { "id": "op-unseen-001", "machineId": "pi", "intent": { "kind": "restart" }, "state": "unknown", "outcome": "Unresolved" } ] }
+            """);
+        var tracker = new OperationTracker(path);
+        Assert.Equal(OperationOutcome.Succeeded, tracker.Find("op-noop-0001")!.Outcome);
+        Assert.Equal(OperationOutcome.Deferred, tracker.Find("op-conflict-01")!.Outcome);
+        Assert.Equal(OperationOutcome.Deferred, tracker.Find("op-cancel-001")!.Outcome);
+        var interrupted = tracker.Find("op-interrupt-1")!;
+        Assert.Equal(OperationOutcome.Unknown, interrupted.Outcome);
+        // A finished record that does not say how it went has nothing more to tell.
+        Assert.True(interrupted.IsResolved);
+        var queued = tracker.Find("op-queued-001")!;
+        Assert.Equal(OperationOutcome.Pending, queued.Outcome);
+        Assert.Equal(OperationState.Queued, queued.State);
+        var unseen = tracker.Find("op-unseen-001")!;
+        Assert.Equal(OperationOutcome.Unknown, unseen.Outcome);
+        Assert.False(unseen.IsResolved);
+        Assert.Equal(new[] { "op-queued-001", "op-unseen-001" }, tracker.Unfinished.Select(operation => operation.Id).Order(StringComparer.Ordinal));
     }
 
     [Fact]
@@ -425,6 +459,85 @@ public class MachineRequestTests
             new MachineRequest { Kind = RequestKind.Update, Service = "t3" }, limit: TimeSpan.FromSeconds(5));
         var notKnown = Assert.IsType<CommandOutcome.NotKnown>(outcome);
         Assert.Contains("no record", notKnown.Sentence);
+    }
+
+    [Fact]
+    public async Task AnActionThisBuildNeverHeardOfIsNotASuccessAndIsNotSentAgain()
+    {
+        // ok is true, and the action is a word nobody wrote a case for. That is no evidence the
+        // update happened, and an outcome nobody knows is read again by its id, never resent.
+        using var home = new TempHome();
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains("status")
+            ? FakeRunner.Ok(V3Status)
+            : FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "teleported", "reasonCode": null }"""));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+        var outcome = await model.RequestAsync(new MachineRequest { Kind = RequestKind.Update, Service = "t3" });
+        var notKnown = Assert.IsType<CommandOutcome.NotKnown>(outcome);
+        Assert.NotNull(notKnown.OperationId);
+        Assert.False(outcome.IsKnownSuccess);
+        var tracked = Assert.Single(model.Operations);
+        Assert.Equal(OperationOutcome.Unknown, tracked.Outcome);
+        Assert.False(tracked.IsResolved);
+        Assert.Single(runner.Calls, call => call.RemoteCommand.Contains(" update"));
+    }
+
+    [Fact]
+    public async Task ARefusalThatNamesItsReasonIsAFailureWithThatReason()
+    {
+        // ok is false with a code and no action: the agent said no and why, which is a known
+        // failure rather than a mystery.
+        using var home = new TempHome();
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains("status")
+            ? FakeRunner.Ok(V3Status)
+            : FakeRunner.Ok("""{ "ok": false, "contract": 3, "reasonCode": "unknown-service", "message": "no service called t4" }"""));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+        var failed = Assert.IsType<CommandOutcome.Failed>(await model.RequestAsync(new MachineRequest { Kind = RequestKind.Update, Service = "t3" }));
+        Assert.Contains("no service called t4", failed.Sentence);
+        var tracked = Assert.Single(model.Operations);
+        Assert.Equal(OperationOutcome.Failed, tracked.Outcome);
+        Assert.True(tracked.IsResolved);
+    }
+
+    [Fact]
+    public async Task TheStatedOutcomeDecidesOverTheActionBesideIt()
+    {
+        // Agent 3.1.0 says what a client decides on. A producer that knows a failed install may
+        // have changed the machine reports unknown, whatever its action word says.
+        using var home = new TempHome();
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains("status")
+            ? FakeRunner.Ok(V3Status)
+            : FakeRunner.Ok("""{ "ok": false, "contract": 3, "action": "failed", "reasonCode": "apply-failed", "outcome": "unknown" }"""));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+        Assert.IsType<CommandOutcome.NotKnown>(await model.RequestAsync(new MachineRequest { Kind = RequestKind.Update, Service = "t3" }));
+        Assert.Equal(OperationOutcome.Unknown, Assert.Single(model.Operations).Outcome);
+    }
+
+    [Fact]
+    public async Task AReplayOfARequestStillRunningIsFollowedLikeAnAcceptedOne()
+    {
+        using var home = new TempHome();
+        const string id = "abcdefab-1234-4567-8901-abcdefabcdef";
+        var runner = new FakeRunner(call =>
+        {
+            var command = call.RemoteCommand;
+            if (command.Contains(" status")) return FakeRunner.Ok(V3Status);
+            if (command.Contains(" op ")) return FakeRunner.Ok($$"""
+                { "ok": true, "contract": 3, "op": { "id": "{{id}}", "kind": "update", "service": "t3", "state": "finished",
+                  "result": { "ok": true, "action": "updated", "to": "1.2.3" } } }
+                """);
+            return FakeRunner.Ok($$"""
+                { "ok": true, "contract": 3, "action": "already-running", "reasonCode": "already-running", "replayed": true,
+                  "op": { "id": "{{id}}", "kind": "update", "service": "t3", "state": "running", "result": null } }
+                """);
+        });
+        var model = NewModel(home, runner, DesktopSettings.Default);
+        await model.RefreshAsync();
+        var outcome = await model.RequestAsync(new MachineRequest { Kind = RequestKind.Update, Service = "t3", OperationId = id });
+        Assert.Equal(OperationOutcome.Succeeded, Assert.IsType<CommandOutcome.Done>(outcome).Outcome);
+        Assert.Contains(runner.Calls, call => call.RemoteCommand.Contains($"op {id}"));
     }
 
     [Fact]

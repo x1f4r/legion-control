@@ -22,7 +22,7 @@ public class VectorTests
     /// The families this client runs. A family joins this list when its port lands here, and from
     /// then on the accounting test holds it to the index exactly.
     private static readonly string[] Families =
-        { "hash", "identifiers", "transport", "launch", "setup-acceptance", "setup-reconcile", "setup-merge" };
+        { "hash", "identifiers", "outcome", "transport", "launch", "setup-acceptance", "setup-reconcile", "setup-merge" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -34,6 +34,15 @@ public class VectorTests
             ["identifiers/duration"] = input => Valid(CommandSurface.IsValidDuration(Text(input["value"]))),
             ["identifiers/clockTime"] = input => Valid(CommandSurface.IsValidClockTime(Text(input["value"]))),
             ["identifiers/sha256"] = input => Valid(ControllerIdentity.IsHash(Text(input["value"]))),
+
+            // A reply is reduced by the decoder every reply goes through; a record and a summary by
+            // the ones the operation list and the history use.
+            ["outcome/reduce"] = input => Outcome(ActionResult.From(Value.Parse(input.ToJsonString())).Outcome),
+            ["outcome/records"] = input =>
+            {
+                var value = Value.Parse(input["value"]!.ToJsonString());
+                return Outcome(Text(input["kind"]) == "record" ? OperationRecord.From(value)!.Outcome : OperationSummary.From(value)!.Outcome);
+            },
 
             ["transport/grammars"] = input =>
             {
@@ -308,6 +317,8 @@ public class VectorTests
     private static string? Text(JsonNode? node) => node?.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() : null;
 
     private static JsonNode Valid(bool valid) => new JsonObject { ["valid"] = valid };
+
+    private static JsonNode Outcome(OperationOutcome outcome) => new JsonObject { ["outcome"] = outcome.Wire() };
 
     /// Whether this app dials an address that is good in every field but [field], read out of a
     /// document the way the app reads one: as an endpoint, and as the deprecated `ssh` block. The

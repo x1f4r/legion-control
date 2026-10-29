@@ -197,7 +197,7 @@ public class FixtureTests
     {
         var record = OperationRecord.From(Value.Parse(Repo.ReadFixture("op.finished-interrupted.json"))["op"]);
         Assert.NotNull(record);
-        Assert.Equal(OperationOutcome.Interrupted, record!.Outcome);
+        Assert.Equal(OperationOutcome.Unknown, record!.Outcome);
         Assert.True(record.IsFinished);
     }
 

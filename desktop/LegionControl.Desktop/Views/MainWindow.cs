@@ -471,14 +471,17 @@ public sealed class MainWindow : Window
             Add(operation.Id, operation.Describe(), operation.Phase ?? "In progress", false);
         foreach (var operation in machine.Status?.Operations.Queued ?? Array.Empty<OperationSummary>())
             Add(operation.Id, operation.Describe(), "Waiting until idle", true);
-        foreach (var operation in machine.Operations.Where(operation => operation.Outcome is OperationOutcome.Pending or OperationOutcome.Queued or OperationOutcome.Unresolved))
-            Add(operation.Id, operation.Intent.Describe(), operation.OutcomeUnknown ? "Outcome unknown" : operation.Outcome.ToString(), operation.Outcome == OperationOutcome.Queued);
+        foreach (var operation in machine.Operations.Where(operation => !operation.IsResolved))
+            Add(operation.Id, operation.Intent.Describe(),
+                operation.OutcomeUnknown || operation.Outcome == OperationOutcome.Unknown ? "Outcome unknown"
+                    : operation.State == OperationState.Queued ? "Waiting until idle" : "In progress",
+                operation.State == OperationState.Queued);
         if (rows.Children.Count > 0) target.Children.Add(rows);
         if (!includeRecent) return;
         target.Children.Add(Ui.SectionHeading("Recent changes"));
         rows = Ui.Column(2);
-        foreach (var operation in machine.Operations.Where(operation => operation.Outcome is not (OperationOutcome.Pending or OperationOutcome.Queued or OperationOutcome.Unresolved)).Take(20))
-            Add(operation.Id, operation.Intent.Describe(), operation.Message ?? operation.Outcome.ToString(), false);
+        foreach (var operation in machine.Operations.Where(operation => operation.IsResolved).Take(20))
+            Add(operation.Id, operation.Intent.Describe(), operation.Message ?? operation.Outcome.Wire(), false);
         foreach (var operation in machine.Status?.Operations.Recent ?? Array.Empty<OperationSummary>())
             Add(operation.Id, operation.Describe(), operation.Message ?? operation.OutcomeText, false);
         if (!target.Children.Contains(rows)) target.Children.Add(rows);
@@ -625,7 +628,7 @@ public sealed class MainWindow : Window
         var answer = await Sheets.ConfirmAsync(this, request, confirmation);
         if (answer is null) return;
         var outcome = await machine.RequestAsync(answer);
-        if (outcome is CommandOutcome.Done { Outcome: OperationOutcome.Succeeded or OperationOutcome.Noop }) return;
+        if (outcome.IsKnownSuccess) return;
         Sheets.Text(this, answer.Describe(), outcome.Sentence_);
     }
 
@@ -653,7 +656,7 @@ public sealed class MainWindow : Window
     {
         var (history, problem) = await machine.HistoryAsync();
         Sheets.Text(this, "Operation history", problem is not null ? problem :
-            string.Join("\n", history.Select(op => $"{op.Id}: {op.Describe()} — {op.Message ?? op.Action ?? op.Outcome.ToString()}")));
+            string.Join("\n", history.Select(op => $"{op.Id}: {op.Describe()} — {op.Message ?? op.OutcomeText}")));
     }
 
     private async void Doctor(MachineModel machine, bool deep = false)
