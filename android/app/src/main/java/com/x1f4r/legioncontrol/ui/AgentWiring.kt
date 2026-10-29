@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.ui
 
 import android.content.Context
+import android.net.Network
 import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentActionResult
 import com.x1f4r.legioncontrol.agent.AgentDeploymentPath
@@ -36,11 +37,10 @@ import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.SetupSource
+import com.x1f4r.legioncontrol.net.LocalAddress
+import com.x1f4r.legioncontrol.net.WakeSend
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 
@@ -87,7 +87,7 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override val identityClash: StateFlow<SetupIdentityClash?> get() = control.config.identityClash
 
-    override fun networkAddresses(): Flow<List<String>> = control.homeNetwork.observeAddresses()
+    override fun networkAddresses(): Flow<List<LocalAddress>> = control.homeNetwork.observeAddresses()
 
     override fun deviceName(): String = control.deviceName()
 
@@ -190,11 +190,6 @@ private class WiredMachineClient(
     override val machine: Machine get() = wiring.machine
 
     override val abilities: AgentAbilities get() = wiring.agent.abilities
-
-    override fun wakeReadiness(): Flow<WakeReadiness> =
-        control.homeNetwork.observe(machine.wake?.lanPrefix).map { state ->
-            WakeReadiness(possible = state.onHomeNetwork, explanation = state.explanation)
-        }
 
     @Volatile
     private var lastRoute: Route? = null
@@ -300,38 +295,9 @@ private class WiredMachineClient(
     override suspend fun fetchSetup(): Result<ControllerFetch> =
         attempt { wiring.agent.config() }.map { readControllerReply(it, source = machine.name) }
 
-    override suspend fun sendWakePacket(broadcasts: List<String>, prefixes: List<String>): String? {
-        val wake = wiring.wake ?: return "This machine has no wake configuration."
-        // The machine's own network, not whatever the default route happens to be. With a tunnel up
-        // the default is the tunnel, and a broadcast put on that reaches nothing.
-        return wake.send(
-            via = control.homeNetwork.networkForPrefixes(prefixes),
-            broadcasts = broadcasts,
-        )
-    }
-
-    override suspend fun waitForWake(): Boolean = withTimeoutOrNull(WAKE_WAIT_MILLIS) {
-        while (true) {
-            delay(WAKE_POLL_MILLIS)
-            val status = runCatching { wiring.agent.status() }.getOrNull()?.value
-            if (status?.ok != false && status?.systemId != null) return@withTimeoutOrNull true
-        }
-        @Suppress("UNREACHABLE_CODE")
-        false
-    } ?: false
-
-    override val wakeProbeAddress: String? get() = wiring.wake?.probeAddress
-
-    override suspend fun wakeProxyFor(
-        machineId: String,
-        operationId: String?,
-    ): Result<AgentActionResult> = attempt { wiring.agent.wakeProxy(machineId, operationId) }
-
-    override suspend fun hasWakeProxy(): Boolean = try {
-        wiring.agent.readVerbs()
-        wiring.agent.abilities.hasWakeProxy
-    } catch (_: AgentFailure) {
-        false
+    override suspend fun sendWakePacket(broadcasts: List<String>, ports: List<Int>, via: Network?): WakeSend {
+        val wake = wiring.wake ?: return WakeSend(0, "This machine has no wake configuration.")
+        return wake.send(via, broadcasts, ports)
     }
 
     /**
@@ -381,10 +347,6 @@ private class WiredMachineClient(
         Result.failure(failure)
     }
 
-    private companion object {
-        const val WAKE_POLL_MILLIS = 3_000L
-        const val WAKE_WAIT_MILLIS = 45_000L
-    }
 }
 
 private val Pretty = Json {

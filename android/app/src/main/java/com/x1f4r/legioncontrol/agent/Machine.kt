@@ -84,14 +84,20 @@ enum class LaunchState {
     NOT_DRIVEN,
 }
 
-/** Everything a magic packet needs, and how to tell when the machine is back. */
+/**
+ * Everything a magic packet needs, as the document says it.
+ *
+ * Kept as written, and decided only by the wake plan (contract section 10.2): which broadcast
+ * entries are addresses, which ports are ports, and what to send to when there are none. Whether the
+ * machine is back is an authenticated status poll, never a probe of a port.
+ */
 data class WakeTarget(
     val mac: String,
+    /** `wake.broadcast` as written. Only the dotted IPv4 entries are ever sent to. */
     val broadcasts: List<String>,
+    /** `wake.ports` as written. Only 1 to 65535 count; with none of those, 9 and 7. */
     val ports: List<Int>,
-    val probeHost: String,
-    val probePort: Int,
-    /** The phone counts as at home when one of its addresses starts with this. */
+    /** The deprecated `wake.lanPrefix`, which places the machine only when it names no site. */
     val lanPrefix: String?,
     /** The site this machine's network is, when the document names sites. */
     val siteId: String?,
@@ -154,7 +160,11 @@ data class Machine(
  */
 fun LaunchGate.Effective.toMachines(): List<Machine> = config?.machines.orEmpty().map { it.toMachine() }
 
-private fun MachineConfig.toMachine(): Machine {
+/**
+ * One machine of a configuration. Its systems run only what the gate wrote into them, so one read
+ * straight from a document runs nothing; its wake block is the document's.
+ */
+internal fun MachineConfig.toMachine(): Machine {
     val systems = systems.map { system ->
         val driven = system.launchState != LaunchState.NOT_DRIVEN && system.grammar != null
         MachineSystem(
@@ -182,11 +192,6 @@ private fun MachineConfig.toMachine(): Machine {
             label = endpoint.label?.takeIf { it.isNotBlank() } ?: endpoint.host,
         )
     }
-    // The address the wake waits on. The config's own probe if it named one, otherwise the LAN
-    // address the packet is going to reach the machine on anyway: a machine that has just come out
-    // of sleep answers sshd well before a tunnel has re-registered, so waiting on a remote address
-    // would report a failure for a machine that is already up.
-    val fallbackProbe = endpoints.firstOrNull { it.kind == RouteKind.LAN } ?: endpoints.firstOrNull()
     return Machine(
         id = id,
         name = name?.takeIf { it.isNotBlank() } ?: id,
@@ -198,13 +203,9 @@ private fun MachineConfig.toMachine(): Machine {
         wake = wake?.let { wake ->
             WakeTarget(
                 mac = wake.mac,
-                broadcasts = wake.broadcast.filter { it.isNotBlank() },
-                ports = wake.ports.filter { it in 1..65535 }.ifEmpty { listOf(9, 7) },
-                probeHost = wake.probe?.host?.takeIf { it.isNotBlank() }
-                    ?: fallbackProbe?.host.orEmpty(),
-                probePort = wake.probe?.port?.takeIf { it in 1..65535 }
-                    ?: fallbackProbe?.port ?: 22,
-                lanPrefix = wake.lanPrefix?.takeIf { it.isNotBlank() },
+                broadcasts = wake.broadcast,
+                ports = wake.ports,
+                lanPrefix = wake.lanPrefix,
                 siteId = site?.takeIf { it.isNotBlank() },
                 helpers = wake.effectiveHelpers.mapNotNull { helper ->
                     val machineId = helper.machine.takeIf { it.isNotBlank() } ?: return@mapNotNull null

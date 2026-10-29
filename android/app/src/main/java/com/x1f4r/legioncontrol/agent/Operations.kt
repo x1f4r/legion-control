@@ -167,6 +167,17 @@ data class OperationRecord(
      * that predates outcomes.
      */
     val outcome: Outcome? = null,
+    /**
+     * The machine this helper action was run to wake, for an action the helper does not declare
+     * `wol` (contract section 10.2). While such a record is unresolved it is a wake hold: no other
+     * command helper is run for that machine, so an ambiguous script never runs on two helpers.
+     */
+    val wakeTarget: String? = null,
+    /**
+     * Set when the hold was released without the record being resolved: the target answered, or a
+     * person chose to try the other helpers. The record is still followed; it just holds nothing.
+     */
+    val wakeReleased: Boolean = false,
 ) {
     val isOver: Boolean get() = state.isOver
     val isPending: Boolean get() = state.isPending
@@ -175,6 +186,12 @@ data class OperationRecord(
 
     val opAction: OpAction? get() = OpAction.fromWire(action)
     val reason: ReasonCode? get() = ReasonCode.fromWire(reasonCode)
+
+    /**
+     * Whether this is a wake hold on [wakeTarget]: a non-`wol` helper action whose record has not
+     * been read finished, and that nobody has released. It is never released by time.
+     */
+    val holdsWake: Boolean get() = wakeTarget != null && !isOver && !wakeReleased
 
     /** The reason in words: the known sentence, or the agent's own code opened out. */
     val reasonSentence: String? get() = ReasonCode.describe(reasonCode)

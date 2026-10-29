@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.ui
 
+import android.net.Network
 import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentActionResult
 import com.x1f4r.legioncontrol.agent.AgentFailure
@@ -31,7 +32,9 @@ import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.SetupSource
+import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.net.RouteKind
+import com.x1f4r.legioncontrol.net.WakeSend
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -42,7 +45,7 @@ import kotlinx.coroutines.flow.StateFlow
  * layer that parses it and the layer that draws it. A second copy over here would only be a second
  * thing to keep in step, and the first field that drifted would be invisible until it was wrong on
  * screen. What this file does add is the handful of ideas that only exist for the sake of the
- * screen: what the link looks like, which address answered, and whether waking is possible at all.
+ * screen: what the link looks like and which address answered.
  */
 
 /** Which address answered. The user is told, because it changes what the app can do. */
@@ -112,12 +115,6 @@ sealed interface LinkState {
     data class PhoneKeyUnavailable(val reason: String) : LinkState
 }
 
-/** Whether a wake packet can reach a machine right now, and in one sentence why not. */
-data class WakeReadiness(
-    val possible: Boolean,
-    val explanation: String,
-)
-
 /**
  * One machine's transport, as the screen sees it.
  *
@@ -127,11 +124,8 @@ data class WakeReadiness(
 interface MachineClient {
     val machine: Machine
 
-    /** What the last reply said the far side is: which contract, which version, which verbs. */
+    /** What the last reply said the far side is: which contract and which version. */
     val abilities: AgentAbilities
-
-    /** Follows the network, so the wake action can be enabled and disabled while the app is open. */
-    fun wakeReadiness(): Flow<WakeReadiness>
 
     /** Which address answered last. Null until one has. */
     val route: Route?
@@ -233,20 +227,12 @@ interface MachineClient {
      */
     suspend fun fetchSetup(): Result<ControllerFetch>
 
-    /** Sends the magic packet from this phone through the selected site interface. */
-    suspend fun sendWakePacket(broadcasts: List<String>, prefixes: List<String>): String?
-
-    /** Waits for an authenticated agent status. False when the machine never provided one. */
-    suspend fun waitForWake(): Boolean
-
-    /** Where the wait is watching, so a failure can name the address that never answered. */
-    val wakeProbeAddress: String?
-
-    /** Asks this machine to send a magic packet at another one on its own network. */
-    suspend fun wakeProxyFor(machineId: String, operationId: String?): Result<AgentActionResult>
-
-    /** Whether this machine's agent actually offers the wake verb. Reads `help` once. */
-    suspend fun hasWakeProxy(): Boolean
+    /**
+     * Sends this machine's magic packets from this phone, as a direct wake step says: to every one of
+     * [broadcasts] on every one of [ports], bound to [via], the network of the address that placed
+     * the machine on this device's network.
+     */
+    suspend fun sendWakePacket(broadcasts: List<String>, ports: List<Int>, via: Network?): WakeSend
 
     /** Puts a signed agent bundle on the machine and installs it. */
     suspend fun installAgent(tarball: SignedTarball, operationId: String?): Result<AgentActionResult>
@@ -310,8 +296,11 @@ interface ControlServices {
     /** A machine carrying an entirely different setup. */
     val identityClash: StateFlow<SetupIdentityClash?>
 
-    /** Every IPv4 address this device holds, so the site can be worked out. */
-    fun networkAddresses(): Flow<List<String>>
+    /**
+     * Every address this device could send a wake packet from, each with its network, so the site
+     * can be worked out and a packet bound to the right network.
+     */
+    fun networkAddresses(): Flow<List<LocalAddress>>
 
     /** What to call this device in a revision it writes. */
     fun deviceName(): String

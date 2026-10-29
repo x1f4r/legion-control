@@ -71,6 +71,7 @@ fun MachineSection(model: MachineModel, app: AppModel) {
         PlainAction("Details", true) { sheet = "Device details" }
     }
     model.wakeableHelper?.let { PlainAction("Wake helper first", !model.isWorking) { model.requestWakeHelper() } }
+    WakeHoldLine(model, app)
     LaunchStateLines(model, app)
 
     OperationsBlock(model, showHistory = false)
@@ -371,34 +372,63 @@ private fun OperationRow(model: MachineModel, record: OperationRecord) {
 /**
  * Why waking is or is not on offer, from where this device is standing.
  *
- * The sentence is worked out from the site rules rather than written here, because whether a
- * broadcast can reach a machine depends on which network this phone is on and on whether that
- * question can even be answered: two houses on the same router defaults look identical from here.
+ * The sentence is read off the plan a press would follow now, from this device's real addresses,
+ * rather than written here: whether a broadcast can reach a machine depends on which network this
+ * phone is on and on whether that question can even be answered, since two houses on the same
+ * router defaults look identical from here.
  */
 @Composable
 private fun WakeExplanation(model: MachineModel, app: AppModel) {
     if (!model.canWake || model.isAwake) return
-    val plan = com.x1f4r.legioncontrol.agent.planWake(
-        target = model.machine,
-        sites = app.sites,
-        siteMatch = app.siteMatch,
-        machines = app.machines.map { it.machine },
-        localAddresses = emptyList(),
-    )
-    val sentence = when (plan) {
-        is com.x1f4r.legioncontrol.agent.WakePlan.Direct -> plan.why
-        is com.x1f4r.legioncontrol.agent.WakePlan.ViaHelpers -> plan.why
-        is com.x1f4r.legioncontrol.agent.WakePlan.Impossible -> plan.reasons.joinToString(" ")
-        com.x1f4r.legioncontrol.agent.WakePlan.NotConfigured -> null
+    val plan = model.wakePlan ?: return
+    val direct = plan.steps.firstOrNull { it is com.x1f4r.legioncontrol.agent.WakeStep.Direct }
+    val helpers = plan.steps.count { it is com.x1f4r.legioncontrol.agent.WakeStep.Helper }
+    val where = plan.effective?.let { id -> app.sites.firstOrNull { it.id == id }?.displayName }
+    val sentence = when {
+        direct != null -> listOfNotNull(
+            where?.let { "This device is on $it, so it sends the wake packet itself." }
+                ?: "This device is on ${model.machine.name}'s network, so it sends the wake packet itself.",
+            if (helpers > 0) "Then ${helpers.helpersAsked()}." else null,
+        ).joinToString(" ")
+
+        helpers > 0 -> "This device is not on ${model.machine.name}'s network, so ${helpers.helpersAsked()}."
+        plan.skipped.any { it.reason == com.x1f4r.legioncontrol.agent.WakeSkip.Reason.AMBIGUOUS } ->
+            app.siteMatch.explain()
+
+        else -> "Nothing can wake ${model.machine.name} from here: this device is not on its network and " +
+            "no helper can be asked."
     }
-    sentence?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
+    QuietText(sentence, Modifier.padding(top = 2.dp))
 
     model.wakeableHelper?.let { helper ->
-        val name = app.machines.firstOrNull { it.machine.id == helper.machineId }?.machine?.name
-            ?: helper.machineId
+        val name = app.machines.firstOrNull { it.machine.id == helper }?.machine?.name ?: helper
         Actions {
             PlainAction("Wake $name first", enabled = !model.isWorking) { model.requestWakeHelper() }
         }
+    }
+}
+
+private fun Int.helpersAsked(): String = if (this == 1) "one helper is asked" else "$this helpers are asked in turn"
+
+/**
+ * A wake hold on this machine, while there is one (contract section 10.2): a helper's command may
+ * still be running, and no other command helper is asked until its record is read finished.
+ * Releasing it is a person's decision and nothing else's.
+ */
+@Composable
+private fun WakeHoldLine(model: MachineModel, app: AppModel) {
+    val holds = model.wakeHolds
+    if (holds.isEmpty()) return
+    val helpers = holds.map { hold ->
+        app.machines.firstOrNull { it.machine.id == hold.machineId }?.machine?.name ?: hold.machineName
+    }.distinct()
+    StatusLine(
+        Mark.Attention,
+        "A wake command on ${helpers.joinToString(" and ")} may still be running. Other command helpers " +
+            "wait until it is known.",
+    )
+    Actions {
+        PlainAction("Try the other helpers anyway", enabled = !model.isWorking) { model.requestTryOtherHelpers() }
     }
 }
 

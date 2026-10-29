@@ -362,6 +362,7 @@ private fun perform(model: MachineModel, dialog: MachineModel.Dialog, whenIdle: 
 
         is MachineModel.Dialog.ConfirmAgentInstall -> model.installAgent()
         is MachineModel.Dialog.ConfirmWakeHelper -> model.wakeHelper()
+        is MachineModel.Dialog.ConfirmTryOtherHelpers -> model.tryOtherHelpers()
     }
 }
 

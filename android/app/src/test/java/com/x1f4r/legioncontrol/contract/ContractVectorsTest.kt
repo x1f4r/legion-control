@@ -28,6 +28,12 @@ import com.x1f4r.legioncontrol.agent.Outcome
 import com.x1f4r.legioncontrol.agent.RemoteShell
 import com.x1f4r.legioncontrol.agent.buildRemoteCommand
 import com.x1f4r.legioncontrol.agent.grammarFor
+import com.x1f4r.legioncontrol.agent.HelperState
+import com.x1f4r.legioncontrol.agent.WakeHold
+import com.x1f4r.legioncontrol.agent.WakeStep
+import com.x1f4r.legioncontrol.agent.planWake
+import com.x1f4r.legioncontrol.agent.readinessSchedule
+import com.x1f4r.legioncontrol.agent.toMachine
 import com.x1f4r.legioncontrol.agent.statusBudget
 import com.x1f4r.legioncontrol.data.CanonicalSetup
 import com.x1f4r.legioncontrol.data.DocumentAcceptance
@@ -37,6 +43,9 @@ import com.x1f4r.legioncontrol.data.JsonEquality
 import com.x1f4r.legioncontrol.data.LaunchTuple
 import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.data.SetupMerge
+import com.x1f4r.legioncontrol.data.readControllerConfig
+import com.x1f4r.legioncontrol.net.LanPrefix
+import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.contract.VectorJson.boolean
 import com.x1f4r.legioncontrol.contract.VectorJson.long
 import com.x1f4r.legioncontrol.contract.VectorJson.string
@@ -89,26 +98,23 @@ class ContractVectorsTest {
     @Test
     fun `outcomes of replies, records and summaries match the contract`() = runFamily("outcome")
 
+    @Test
+    fun `prefixes, broadcasts, wake plans and readiness match the contract`() = runFamily("wake")
+
     /**
-     * Every adapter is for a group this client consumes, and every consumed family is either adapted
-     * in full or still listed as pending.
+     * Every adapter is for a group this client consumes, and every group it consumes has one: all
+     * nine families, with nothing left pending.
      */
     @Test
     fun `every consumed group has exactly one adapter`() {
         val consumed = VectorJson.consumedGroups()
         assertEquals("adapters for groups this client does not consume", emptySet<String>(), adapters.keys - consumed)
-
-        val families = consumed.map { it.substringBefore('/') }.toSet()
-        for (family in families) {
-            val groups = consumed.filter { it.startsWith("$family/") }.toSet()
-            val adapted = groups.filter { it in adapters }.toSet()
-            if (family in PENDING_FAMILIES) {
-                assertTrue("$family is adapted and still listed as pending", adapted.isEmpty())
-            } else {
-                assertEquals("$family groups without an adapter", emptySet<String>(), groups - adapted)
-            }
-        }
-        assertEquals("pending families the index does not list", emptySet<String>(), PENDING_FAMILIES - families)
+        assertEquals("groups without an adapter", emptySet<String>(), consumed - adapters.keys)
+        assertEquals(
+            "families this client consumes",
+            setOf("hash", "identifiers", "outcome", "transport", "setup-acceptance", "launch", "setup-reconcile", "setup-merge", "wake"),
+            consumed.map { it.substringBefore('/') }.toSet(),
+        )
     }
 
     private fun runFamily(family: String) {
@@ -454,7 +460,103 @@ class ContractVectorsTest {
         "setup-merge/numbers" to { input ->
             buildJsonObject { put("equal", JsonEquality.sameNumber(input.string("a")!!, input.string("b")!!)) }
         },
+
+        // Through the matcher every placement uses: a prefix that does not parse contains nothing.
+        "wake/prefixes" to { input ->
+            val prefix = LanPrefix.parse(input.string("prefix"))
+            buildJsonObject {
+                put("valid", prefix != null)
+                put(
+                    "contains",
+                    JsonArray(
+                        input.strings("addresses").map { text ->
+                            val address = LanPrefix.parseIPv4(text)
+                            JsonPrimitive(prefix != null && address != null && prefix.contains(address))
+                        },
+                    ),
+                )
+            }
+        },
+
+        "wake/broadcasts" to { input ->
+            buildJsonObject { put("valid", LanPrefix.parseIPv4(input.string("text")) != null) }
+        },
+
+        // The document goes through the reader every document goes through, and its machines through
+        // the model this app wakes them from.
+        "wake/plans" to { input ->
+            val config = readControllerConfig(input.string("documentText")!!).getOrThrow()
+            val machines = config.machines.map { it.toMachine() }
+            val here = input["here"] as JsonObject
+            val helpers = (input["helpers"] as JsonObject).mapValues { (_, read) ->
+                read as JsonObject
+                HelperState(
+                    HelperState.Kind.entries.single { it.wire == read.string("state") },
+                    (read["actions"] as? JsonObject)?.mapValues { (_, kind) -> (kind as JsonPrimitive).content },
+                )
+            }
+            val holds = (input["holds"] as JsonArray).map { it as JsonObject }.map { WakeHold(it.string("helper")!!, it.string("action")!!) }
+            val plan = planWake(
+                target = machines.single { it.id == input.string("target") },
+                machines = machines,
+                sites = config.sites,
+                addresses = here.strings("addresses").mapNotNull(LocalAddress::parse),
+                currentSite = here.string("currentSite"),
+                helpers = helpers,
+                holds = holds,
+            )
+            buildJsonObject {
+                put("matching", JsonArray(plan.matching.map(::JsonPrimitive)))
+                put("effective", text(plan.effective))
+                put("steps", JsonArray(plan.steps.map(::step)))
+                put(
+                    "skipped",
+                    JsonArray(
+                        plan.skipped.map { skip ->
+                            buildJsonObject {
+                                put("kind", skip.kind.wire)
+                                put("machine", text(skip.machine))
+                                put("action", text(skip.action))
+                                put("reason", skip.reason.wire)
+                            }
+                        },
+                    ),
+                )
+                put("offerWakeFirst", JsonArray(plan.offerWakeFirst.map(::JsonPrimitive)))
+            }
+        },
+
+        "wake/readiness" to { input ->
+            buildJsonObject {
+                put("pollStartsMs", JsonArray(readinessSchedule(input.boolean("sentAnything")!!).map(::JsonPrimitive)))
+            }
+        },
     )
+
+    /** A step as the plans group writes one: every key present, null where it does not apply. */
+    private fun step(step: WakeStep): JsonObject = buildJsonObject {
+        when (step) {
+            is WakeStep.Direct -> {
+                put("kind", "direct")
+                put("machine", JsonNull)
+                put("action", JsonNull)
+                put("readFirst", JsonNull)
+                put("broadcast", JsonArray(step.broadcast.map(::JsonPrimitive)))
+                put("ports", JsonArray(step.ports.map(::JsonPrimitive)))
+                put("repeats", step.repeats)
+            }
+
+            is WakeStep.Helper -> {
+                put("kind", "helper")
+                put("machine", step.machine)
+                put("action", step.action)
+                put("readFirst", step.readFirst)
+                put("broadcast", JsonNull)
+                put("ports", JsonNull)
+                put("repeats", JsonNull)
+            }
+        }
+    }
 
     /** The codes of [problems], each once, sorted, as the acceptance vectors list them. */
     private fun codes(problems: List<DocumentProblem>): JsonArray =
@@ -471,14 +573,4 @@ class ContractVectorsTest {
         put("routeLevel", reading.routeLevel)
     }
 
-    private companion object {
-        /**
-         * Families this client consumes whose adapters arrive with the work that implements them.
-         *
-         * A debt, listed so it cannot be forgotten: the accounting test fails when a family here is
-         * adapted, or when the index stops listing it, and the list is empty once the Android port
-         * of every reference has landed.
-         */
-        val PENDING_FAMILIES = setOf("wake")
-    }
 }

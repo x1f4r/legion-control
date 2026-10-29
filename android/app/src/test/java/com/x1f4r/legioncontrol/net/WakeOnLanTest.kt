@@ -4,8 +4,15 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.SocketTimeoutException
 
-/** A magic packet is six 0xFF bytes and then the hardware address sixteen times over, or nothing. */
+/**
+ * A magic packet is six 0xFF bytes and then the hardware address sixteen times over, or nothing, and
+ * it goes three times to every address and port the wake plan names (contract section 10.2).
+ */
 class WakeOnLanTest {
 
     @Test
@@ -31,6 +38,48 @@ class WakeOnLanTest {
         assertNotNull(magicPacket("AA-BB-CC-DD-EE-FF"))
         assertNotNull(magicPacket("0:1:2:3:4:5"))
         assertEquals(0x01.toByte(), parseMacAddress("0:1:2:3:4:5")!![1])
+    }
+
+    @Test
+    fun `three packets go to every address and port, and a name is never looked up`() {
+        // Two loopback listeners stand in for two broadcast addresses' ports. The name in the list
+        // is skipped rather than resolved, because a broadcast entry is an address or nothing.
+        DatagramSocket(0, InetAddress.getByName("127.0.0.1")).use { first ->
+            DatagramSocket(0, InetAddress.getByName("127.0.0.1")).use { second ->
+                first.soTimeout = 2_000
+                second.soTimeout = 2_000
+                val payload = magicPacket("02:00:00:00:00:01")!!
+                val send = sendPackets(payload, listOf("127.0.0.1", "tower.local"), listOf(first.localPort, second.localPort))
+
+                assertEquals(WakeSend(sent = 6, problem = null), send)
+                assertEquals(3, received(first))
+                assertEquals(3, received(second))
+            }
+        }
+    }
+
+    @Test
+    fun `with nothing to send to nothing is sent`() {
+        val payload = magicPacket("02:00:00:00:00:01")!!
+        assertEquals(0, sendPackets(payload, listOf("tower.local"), listOf(9)).sent)
+        assertEquals(0, sendPackets(payload, listOf("127.0.0.1"), emptyList()).sent)
+    }
+
+    /** How many magic packets arrived on [socket] before it fell quiet. */
+    private fun received(socket: DatagramSocket): Int {
+        var count = 0
+        val buffer = ByteArray(256)
+        while (true) {
+            val packet = DatagramPacket(buffer, buffer.size)
+            try {
+                socket.receive(packet)
+            } catch (_: SocketTimeoutException) {
+                return count
+            }
+            assertEquals(102, packet.length)
+            count++
+            socket.soTimeout = 300
+        }
     }
 
     @Test

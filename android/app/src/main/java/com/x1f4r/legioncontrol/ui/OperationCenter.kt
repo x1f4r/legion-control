@@ -84,14 +84,16 @@ class OperationCenter(
     /**
      * Writes down a change about to be sent, under a new id, without sending it.
      *
-     * For the one caller that has to wait for its own reply before deciding what comes next, which
-     * sends with [send] and reads the outcome itself.
+     * For the one caller that has to wait for its own reply before deciding what comes next: the
+     * wake walk, which sends with [send] and reads the outcome itself. [wakeTarget] marks a helper
+     * action that is not a declared `wol`, which is what makes an ambiguous result a wake hold.
      */
     fun record(
         client: MachineClient,
         intent: OperationIntent,
         subjectName: String,
         initiator: String,
+        wakeTarget: String? = null,
     ): OperationRecord {
         val now = System.currentTimeMillis()
         return store.put(
@@ -106,6 +108,7 @@ class OperationCenter(
                 updatedAt = now,
                 state = TrackedState.REQUESTED,
                 summary = "${intent.kind.label} on $subjectName was asked for.",
+                wakeTarget = wakeTarget,
             ),
         )
     }
@@ -170,6 +173,20 @@ class OperationCenter(
                     ),
                 )
             },
+        )
+    }
+
+    /**
+     * Reads a recorded change once, for a caller that cannot wait for [follow]: the wake walk, which
+     * reads a helper's ambiguous action once with `--wait` before moving on, and reads each held
+     * helper's once before planning (contract section 10.2).
+     */
+    internal suspend fun readOnce(client: MachineClient, id: String, waitSeconds: Int? = OP_WAIT_SECONDS) {
+        val record = store.get(id) ?: return
+        if (record.isOver || !record.trackable) return
+        client.operation(id, waitSeconds = waitSeconds).fold(
+            onSuccess = { apply(id, OperationEvent.Observed(it, System.currentTimeMillis())) },
+            onFailure = { failure -> noteReadFailure(id, failure) },
         )
     }
 
@@ -364,6 +381,17 @@ class OperationCenter(
     fun clearHistory() = store.clearHistory()
 
     fun exportText(): String = store.exportText()
+
+    /** Every unresolved wake hold for [target], oldest first (contract section 10.2). */
+    fun wakeHolds(target: String): List<OperationRecord> = store.wakeHolds(target)
+
+    /**
+     * Releases every hold for [target] recorded before [before]: the target answered an
+     * authenticated status sent after them, or a person chose to try the other helpers. The records
+     * are still followed; they just hold nothing back any more.
+     */
+    fun releaseWakeHolds(target: String, before: Long, reason: String) =
+        store.releaseWakeHolds(target, before, reason)
 
     internal fun apply(id: String, event: OperationEvent) {
         store.update(id) { it.reduce(event) }

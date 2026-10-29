@@ -138,10 +138,12 @@ data class EndpointConfig(
 data class WakeConfig(
     val mac: String = "",
     val broadcast: List<String> = emptyList(),
-    val ports: List<Int> = listOf(9, 7),
+    /** As written; none means 9 and 7, which the wake plan decides (contract section 10.2). */
+    val ports: List<Int> = emptyList(),
+    /** Not used by any 1.4 client: readiness is an authenticated status poll. Kept for 1.2. */
     val probe: WakeProbeConfig? = null,
     /**
-     * This phone counts as at home when one of its addresses starts with this.
+     * The network this machine is on, as a prefix of section 10.1.
      *
      * The pre-sites way of saying where a machine is. Still read, and used for a machine that names
      * no site, so a 1.2 document keeps working unchanged.

@@ -8,7 +8,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentBundle
 import com.x1f4r.legioncontrol.agent.SignedTarball
-import com.x1f4r.legioncontrol.agent.AgentAction
+import com.x1f4r.legioncontrol.agent.HelperState
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.AgentStatus
@@ -33,6 +33,7 @@ import com.x1f4r.legioncontrol.data.sameMachine
 import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.data.advisories
 import com.x1f4r.legioncontrol.data.SiteConfig
+import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.net.SiteMatch
 import com.x1f4r.legioncontrol.net.matchSite
 import kotlinx.coroutines.CancellationException
@@ -114,7 +115,14 @@ class AppModel(
     /** Where this device is standing, and how sure that is. */
     var siteMatch: SiteMatch by mutableStateOf(SiteMatch.NoSites)
         private set
-    private var addresses: List<String> = emptyList()
+
+    /**
+     * This device's candidate addresses, each with its network (contract section 10.1). Read by
+     * every placement: the site line, route order and the wake plan, which is worked out again from
+     * these immediately before every wake.
+     */
+    var addresses: List<LocalAddress> by mutableStateOf(emptyList())
+        private set
 
     /** The signed agent bundle this build carries, once it has been checked. */
     var agentBundle: SignedTarball? by mutableStateOf(null)
@@ -213,8 +221,8 @@ class AppModel(
     private val fleet = object : FleetContext {
         override val machines: List<Machine> get() = clients.map { it.machine }
         override val sites: List<SiteConfig> get() = this@AppModel.sites
-        override val siteMatch: SiteMatch get() = this@AppModel.siteMatch
-        override val localAddresses: List<String> get() = addresses
+        override val localAddresses: List<LocalAddress> get() = addresses
+        override val currentSite: String? get() = bindings.bindings.value.currentSite
         override val deviceName: String get() = services.deviceName()
         override val agentBundle: SignedTarball? get() = this@AppModel.agentBundle
         override val agentBundleProblem: String? get() = this@AppModel.agentBundleProblem
@@ -222,14 +230,11 @@ class AppModel(
         override fun client(machineId: String): MachineClient? =
             clients.firstOrNull { it.machine.id == machineId }
 
-        override fun helperAwake(machineId: String): Boolean? =
-            this@AppModel.machines.firstOrNull { it.machine.id == machineId }?.let { model ->
-                model.isAwake.takeIf { model.lastChecked != null }
-            }
+        override fun helperState(machineId: String): HelperState =
+            this@AppModel.machines.firstOrNull { it.machine.id == machineId }?.helperState ?: HelperState.UNKNOWN
 
-        override fun action(machineId: String, actionId: String): AgentAction? =
-            this@AppModel.machines.firstOrNull { it.machine.id == machineId }
-                ?.actions?.firstOrNull { it.id == actionId }
+        override suspend fun readHelper(machineId: String): HelperState =
+            this@AppModel.machines.firstOrNull { it.machine.id == machineId }?.readForWake() ?: HelperState.UNKNOWN
 
         override fun forgetRoute(machineId: String) = services.forgetRoute(machineId)
 

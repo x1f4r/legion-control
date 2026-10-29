@@ -1,5 +1,7 @@
 package com.x1f4r.legioncontrol.net
 
+import android.net.Network
+
 /**
  * What a LAN prefix is, what it contains, and what a broadcast address is (contract section 10.1).
  *
@@ -81,6 +83,18 @@ data class LanPrefix(
             return LanPrefix(network shl (8 * (4 - parts.size)), 8 * parts.size, Form.DOTTED)
         }
 
+        /** An address as [parseIPv4] gives it, as dotted-quad text. */
+        fun formatIPv4(address: Long): String = listOf(24, 16, 8, 0).joinToString(".") { shift ->
+            ((address shr shift) and 0xFF).toString()
+        }
+
+        /**
+         * The directed broadcast of [address] on a network of [length] bits: every host bit set.
+         * Null for a /31 or /32, which has no broadcast address of its own.
+         */
+        fun directedBroadcast(address: Long, length: Int): Long? =
+            if (length in 0..30) (address or maskOf(length).inv()) and ALL_BITS else null
+
         private fun octet(text: String): Long? {
             if (!OCTET.matches(text)) return null
             return text.toLong().takeIf { it <= 255 }
@@ -90,5 +104,45 @@ data class LanPrefix(
 
         /** The mask of the first [length] bits. */
         private fun maskOf(length: Int): Long = if (length == 0) 0L else (ALL_BITS shl (32 - length)) and ALL_BITS
+    }
+}
+
+/**
+ * One of this device's own IPv4 addresses, with the length of the network it is on when the
+ * interface said, and the network that holds it (contract section 10.1).
+ *
+ * [network] is what a magic packet is bound to when this address places the machine being woken:
+ * with a tunnel up the default route is the tunnel, and a broadcast put on that reaches nothing. It
+ * is null where there is no such thing to bind to, which is every test.
+ */
+data class LocalAddress(
+    val address: String,
+    val prefixLength: Int?,
+    val network: Network? = null,
+) {
+    /** The address as a number, or null when it is not a dotted-quad IPv4 address. */
+    val value: Long? get() = LanPrefix.parseIPv4(address)
+
+    companion object {
+        private val LOOPBACK = LanPrefix.parse("127.0.0.0/8")!!
+
+        /** A prefix length of one of this device's addresses, 0 to 32. */
+        private val LENGTH = Regex("^(?:[0-9]|[12][0-9]|3[0-2])$")
+
+        /**
+         * `a.b.c.d` or `a.b.c.d/length`, as the vectors and an interface write one; null for
+         * anything else and for loopback, which is on no site's network however its prefixes read.
+         * A port of `parseLocalAddress` in `contract/tools/wake-plan.mjs`.
+         */
+        fun parse(text: String?): LocalAddress? {
+            val raw = text ?: return null
+            val slash = raw.indexOf('/')
+            val address = if (slash < 0) raw else raw.substring(0, slash)
+            val value = LanPrefix.parseIPv4(address) ?: return null
+            if (LOOPBACK.contains(value)) return null
+            if (slash < 0) return LocalAddress(address, null)
+            val length = raw.substring(slash + 1).takeIf { LENGTH.matches(it) } ?: return null
+            return LocalAddress(address, length.toInt())
+        }
     }
 }

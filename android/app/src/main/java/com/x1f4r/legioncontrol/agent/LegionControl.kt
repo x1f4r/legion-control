@@ -72,7 +72,7 @@ class LegionControl(context: Context) {
     /** Every change this app has asked for, kept across launches. */
     val operations: OperationStore = OperationStore(appContext)
 
-    /** Whether wake-on-LAN is possible right now, so the UI can be honest about it. */
+    /** The addresses this device could send a wake packet from, and the networks that hold them. */
     val homeNetwork: HomeNetwork = HomeNetwork(appContext)
 
     /**

@@ -128,7 +128,7 @@ class AgentClient(
         CommandSafety.READ,
         budgeted = true,
     ).also { reply ->
-        abilities = AgentAbilities.of(reply.value).copy(verbs = abilities.verbs)
+        abilities = AgentAbilities.of(reply.value)
         lastStatus = reply.value
         restrictedRoutes[reply.route.id] = reply.value.agent?.restrictedSession == true
     }
@@ -138,24 +138,7 @@ class AgentClient(
 
     suspend fun version(): AgentReply<AgentVersion> =
         call(listOf("version"), SHORT_TIMEOUT_MILLIS, AgentVersion.serializer(), CommandSafety.READ)
-            .also { abilities = AgentAbilities.of(it.value).copy(verbs = abilities.verbs) }
-
-    /**
-     * The verb list, read once per session and only because of one optional command.
-     *
-     * The wake proxy is an optional verb rather than part of contract 3 proper, so this app finds
-     * out whether it exists instead of assuming either way.
-     */
-    suspend fun readVerbs(): Set<String> {
-        if (abilities.verbs.isNotEmpty()) return abilities.verbs
-        val reply = call(listOf("help"), SHORT_TIMEOUT_MILLIS, HelpReply.serializer(), CommandSafety.READ)
-        val verbs = reply.value.verbs
-        abilities = abilities.copy(
-            contract = reply.value.contract ?: abilities.contract,
-            verbs = verbs,
-        )
-        return verbs
-    }
+            .also { abilities = AgentAbilities.of(it.value) }
 
     /** The agent's own preflight. `--deep` adds the network checks and costs seconds. */
     suspend fun doctor(serviceId: String? = null, deep: Boolean = false): AgentReply<DoctorReport> = call(
@@ -630,30 +613,6 @@ class AgentClient(
     }
 
     /**
-     * Asks this machine to send a magic packet at another one on its own network.
-     *
-     * A proposed contract addition, and used only when `help` actually listed the verb. See
-     * the app's fallback is an ordinary configured action on the helper machine, which needs
-     * nothing new at all.
-     */
-    suspend fun wakeProxy(
-        targetMachineId: String,
-        operationId: String? = null,
-    ): AgentReply<AgentActionResult> {
-        Contract.requireToken(targetMachineId, "machine id")
-        return call(
-            buildList {
-                add("wake")
-                add(targetMachineId)
-                addOperationId(operationId)
-            },
-            WAKE_PROXY_TIMEOUT_MILLIS,
-            AgentActionResult.serializer(),
-            CommandSafety.MUTATION,
-        )
-    }
-
-    /**
      * One authenticated request against exactly one address, and what it did.
      *
      * The diagnostics page runs these on demand and nothing else does. It is the authenticated
@@ -1090,7 +1049,6 @@ class AgentClient(
         const val BOOT_TIMEOUT_MILLIS = 60_000L
         const val SLEEP_TIMEOUT_MILLIS = 60_000L
         const val RESTART_TIMEOUT_MILLIS = 240_000L
-        const val WAKE_PROXY_TIMEOUT_MILLIS = 90_000L
         const val SELF_UPDATE_TIMEOUT_MILLIS = 300_000L
 
         /** A configured action is somebody else's script, and the agent gives it its own timeout. */

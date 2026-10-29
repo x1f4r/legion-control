@@ -1,132 +1,90 @@
 package com.x1f4r.legioncontrol.net
 
 import android.net.Network
+import com.x1f4r.legioncontrol.agent.WAKE_REPEATS
 import com.x1f4r.legioncontrol.agent.WakeTarget
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import kotlin.time.Duration
-import kotlin.time.Duration.Companion.seconds
-import kotlin.time.TimeSource
+
+/** What one send did: how many magic packets left this device, and why none did when none did. */
+data class WakeSend(val sent: Int, val problem: String?)
 
 /**
  * Wake-on-LAN for one machine's network card.
  *
  * This is LAN only and there is no way around that: a magic packet is a link local broadcast, and a
- * tunnel is a point to point link with no broadcast domain to put one on. The app is expected to
- * check [HomeNetwork] first and disable the action with a reason when the phone is elsewhere, rather
- * than offering a button that sends packets into nothing.
+ * tunnel is a point to point link with no broadcast domain to put one on. Whether this device is on
+ * the machine's network, and which addresses and ports to send to, is the wake plan's to decide
+ * (contract section 10.2); this only sends what it is given.
  */
 class WakeOnLan(private val target: WakeTarget) {
 
     /**
-     * Sends the magic packets. Returns null when at least one went out, or a sentence if none did.
+     * Sends [WAKE_REPEATS] magic packets to every one of [broadcasts] on every one of [ports].
      *
-     * [via] is the network the packet has to leave by, from [HomeNetwork.homeNetwork]. Binding to it
-     * matters whenever the default route is not the home network, which is any time a tunnel is up:
-     * an unbound broadcast would go into the tunnel, be dropped there, and the app would sit waiting
-     * for a machine that was never asked to wake.
+     * [via] is the network that holds the address that placed the machine on this device's network.
+     * Binding to it matters whenever the default route is not that network, which is any time a
+     * tunnel is up: an unbound broadcast would go into the tunnel, be dropped there, and the app
+     * would sit waiting for a machine that was never asked to wake.
      *
-     * Every configured broadcast address is used. The all ones address is deliberately not assumed
-     * on the machine's behalf: Android drops it on some interfaces, and the directed form is what
-     * actually reaches a switch port, so which addresses to send to is the configuration's business.
+     * Every entry is a dotted IPv4 address by the time it gets here, and it is turned into one
+     * without a lookup: a broadcast entry is never resolved as a name.
      */
-    suspend fun send(
-        via: Network? = null,
-        broadcasts: List<String> = target.broadcasts,
-    ): String? = withContext(Dispatchers.IO) {
+    suspend fun send(via: Network?, broadcasts: List<String>, ports: List<Int>): WakeSend = withContext(Dispatchers.IO) {
         val payload = magicPacket(target.mac)
-            ?: return@withContext "${target.mac} is not a valid hardware address."
-        if (broadcasts.isEmpty()) {
-            return@withContext "No broadcast address is configured for this machine."
-        }
+            ?: return@withContext WakeSend(0, "${target.mac} is not a valid hardware address.")
+        sendPackets(payload, broadcasts, ports) { socket -> via?.bindSocket(socket) }
+    }
+}
 
-        try {
-            DatagramSocket().use { socket ->
-                // Best effort: an always-on VPN set to block other traffic can refuse this, and then
-                // the default route is the only thing left to try.
-                via?.let { runCatching { it.bindSocket(socket) } }
-                socket.broadcast = true
-                var delivered = 0
-                var lastFailure: String? = null
-                for (address in broadcasts) {
-                    val destination = try {
-                        InetAddress.getByName(address)
-                    } catch (failure: Exception) {
-                        lastFailure = "$address: ${failure.message ?: failure::class.java.simpleName}"
-                        continue
-                    }
-                    for (port in target.ports) {
-                        // Wi-Fi drops UDP without telling anyone, and the packet is 102 bytes, so
-                        // repeat it.
-                        repeat(REPEATS) {
-                            try {
-                                socket.send(DatagramPacket(payload, payload.size, destination, port))
-                                delivered++
-                            } catch (failure: Exception) {
-                                lastFailure = "$address port $port: " +
-                                    (failure.message ?: failure::class.java.simpleName)
-                            }
+/**
+ * Sends [payload] [WAKE_REPEATS] times to every address and port, from one socket with
+ * `SO_BROADCAST` that [bind] may first tie to a network.
+ */
+internal fun sendPackets(
+    payload: ByteArray,
+    broadcasts: List<String>,
+    ports: List<Int>,
+    bind: (DatagramSocket) -> Unit = {},
+): WakeSend {
+    val destinations = broadcasts.mapNotNull { address -> LanPrefix.parseIPv4(address)?.let { address to it } }
+    if (destinations.isEmpty() || ports.isEmpty()) return WakeSend(0, "There is no address to send a wake packet to.")
+    return try {
+        DatagramSocket().use { socket ->
+            // Best effort: an always-on VPN set to block other traffic can refuse this, and then
+            // the default route is the only thing left to try.
+            runCatching { bind(socket) }
+            socket.broadcast = true
+            var sent = 0
+            var lastFailure: String? = null
+            for ((text, address) in destinations) {
+                val destination = InetAddress.getByAddress(addressBytes(address))
+                for (port in ports) {
+                    // Wi-Fi drops UDP without telling anyone, and the packet is 102 bytes, so
+                    // repeat it.
+                    repeat(WAKE_REPEATS) {
+                        try {
+                            socket.send(DatagramPacket(payload, payload.size, destination, port))
+                            sent++
+                        } catch (failure: Exception) {
+                            lastFailure = "$text port $port: " + (failure.message ?: failure::class.java.simpleName)
                         }
                     }
                 }
-                if (delivered > 0) null else lastFailure ?: "No magic packet could be sent."
             }
-        } catch (failure: Exception) {
-            "Could not open a UDP socket: ${failure.message ?: failure::class.java.simpleName}."
+            WakeSend(sent, if (sent > 0) null else lastFailure ?: "No magic packet could be sent.")
         }
-    }
-
-    /**
-     * Polls the configured probe address until the machine answers or [timeout] runs out.
-     *
-     * The LAN address rather than a tunnel address, and not by accident: a machine that has just come
-     * out of sleep answers sshd well before a tunnel daemon has re-registered, so watching a remote
-     * address would report a failure for a machine that is already up.
-     */
-    suspend fun waitForSsh(timeout: Duration = 45.seconds): Boolean {
-        if (target.probeHost.isBlank()) return true
-        val started = TimeSource.Monotonic.markNow()
-        var wait = FIRST_WAIT
-        var probes = 0
-        while (started.elapsedNow() < timeout && currentCoroutineContext().isActive) {
-            // The first wait comes before the first probe on purpose. sshd is not listening one
-            // millisecond after a magic packet under any circumstances, and a connection that
-            // arrives before it is up is one more unauthenticated attempt against a source that
-            // OpenSSH counts.
-            delay(wait)
-            if (!currentCoroutineContext().isActive) return false
-            if (TcpProbe.reachable(target.probeHost, target.probePort, POLL_TIMEOUT_MILLIS)) return true
-            probes += 1
-            if (probes >= MAX_PROBES) return false
-            // Backing off rather than polling every second. A machine takes tens of seconds to come
-            // out of sleep and the answer does not arrive sooner for being asked more often.
-            wait = (wait * BACKOFF_FACTOR).coerceAtMost(MAX_WAIT)
-        }
-        return false
-    }
-
-    /** Where the wait is watching, so a failure can say which address never answered. */
-    val probeAddress: String get() = "${target.probeHost}:${target.probePort}"
-
-    private companion object {
-        const val REPEATS = 3
-        const val POLL_TIMEOUT_MILLIS = 2_000
-
-        /** Nothing is listening before this, so probing earlier only costs the machine an entry. */
-        val FIRST_WAIT: Duration = 3.seconds
-        val MAX_WAIT: Duration = 8.seconds
-        const val BACKOFF_FACTOR = 1.6
-
-        /** A cap in probes as well as in time, so a long timeout cannot become a long knock. */
-        const val MAX_PROBES = 12
+    } catch (failure: Exception) {
+        WakeSend(0, "Could not open a UDP socket: ${failure.message ?: failure::class.java.simpleName}.")
     }
 }
+
+/** An address as [LanPrefix.parseIPv4] gives it, as the four bytes a socket takes. */
+private fun addressBytes(address: Long): ByteArray =
+    byteArrayOf((address shr 24).toByte(), (address shr 16).toByte(), (address shr 8).toByte(), address.toByte())
 
 /**
  * Six 0xFF bytes then the hardware address sixteen times over, or null when that is not a hardware
