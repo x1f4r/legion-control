@@ -34,9 +34,9 @@
 
     <!--
         An absolute node path, resolved at install time and baked in rather than
-        assumed. There is no /usr/bin/node on this Mac at all, node comes from
-        Homebrew, and a launchd agent starts with a minimal PATH that does not
-        include /opt/homebrew/bin, so "node" alone would simply not be found.
+        assumed. macOS ships no /usr/bin/node, node usually comes from Homebrew,
+        and a launchd agent starts with a minimal PATH that does not include
+        /opt/homebrew/bin, so "node" alone would simply not be found.
     -->
     <key>ProgramArguments</key>
     <array>

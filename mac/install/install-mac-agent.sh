@@ -204,9 +204,9 @@ SRC_AGENT="$(cd -- "$SRC_AGENT" 2>/dev/null && pwd -P)" \
   || die "no agent source at ${LEGION_CONTROL_AGENT_SRC:-$SCRIPT_DIR/../../agent}."
 [ -f "$SRC_AGENT/src/index.mjs" ] || die "no agent entry point at $SRC_AGENT/src/index.mjs."
 
-# Node, found rather than assumed. /usr/bin/node does not exist on this machine,
-# node is Homebrew's, and a launchd job does not get the Homebrew prefix on PATH,
-# so the plist needs a real absolute path written into it at install time.
+# Node, found rather than assumed. macOS ships no /usr/bin/node, node usually
+# comes from Homebrew, and a launchd job does not get the Homebrew prefix on
+# PATH, so the plist needs a real absolute path written into it at install time.
 #
 # The Homebrew symlink is preferred over its target on purpose. /opt/homebrew/bin/node
 # points into /opt/homebrew/Cellar/node/<version>/bin/node, and baking that
