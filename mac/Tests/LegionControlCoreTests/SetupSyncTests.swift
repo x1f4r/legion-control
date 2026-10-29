@@ -12,11 +12,9 @@ struct SetupSyncTests {
     // MARK: - Building documents
 
     static func document(_ body: String, identity: ControllerIdentity) throws -> ControllerDocument {
-        var root = (try JSONSerialization.jsonObject(with: Data(body.utf8))) as! [String: Any]
-        root["controller"] = SetupMerge.encode(identity)
-        let bytes = try JSONSerialization.data(withJSONObject: root,
-                                               options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        return try ControllerDocument(raw: bytes, identity: identity)
+        var root = try SetupJSON.parse(body)
+        root.stamp(identity)
+        return try ControllerDocument(raw: root.documentData, identity: identity)
     }
 
     static let minimal = """
@@ -152,12 +150,9 @@ struct SetupSyncTests {
 
     @Test("a merge descends from both sides, so both machines accept it")
     func mergeLineage() {
-        let mine = ControllerIdentity(id: "setup-1", revision: 6, lineage: ["base", "older"])
-        let theirs = ControllerIdentity(id: "setup-1", revision: 7, lineage: ["base"])
-        let merged = mine.merged(with: theirs, mineHash: "mine", theirsHash: "theirs", device: "Mac")
-        #expect(merged.revisionNumber == 8)
-        #expect(merged.ancestors.prefix(2) == ["mine", "theirs"])
-        #expect(merged.ancestors.contains("base"))
+        let merged = SetupMerge.mergedLineage(mineHash: "mine", theirsHash: "theirs",
+                                              mineLineage: ["base", "older"], theirsLineage: ["base"])
+        #expect(merged == ["mine", "theirs", "base", "older"])
     }
 
     @Test("a lineage of the wrong shape is refused rather than half-trusted")

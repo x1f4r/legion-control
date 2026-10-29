@@ -47,9 +47,14 @@ struct DivergenceView: View {
                 }
             }
 
-            if divergence.differences.isEmpty {
+            if let blocker = divergence.mergeBlocker {
                 SectionHeading(title: "Differences")
-                Text("The two documents differ but no entry this app compares has changed. That usually means only formatting or an unknown key moved.")
+                Text("This device's setup has to be fixed in the editor before it can be merged or kept: \(blocker)")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if divergence.differences.isEmpty {
+                SectionHeading(title: "Differences")
+                Text("The two documents differ only in how they are written: member order, spacing or the spelling of a number. Merging keeps this device's.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
@@ -65,7 +70,9 @@ struct DivergenceView: View {
                 } else {
                     Button("Merge") { apply(choices) }
                         .buttonStyle(.borderedProminent)
+                        .disabled(divergence.mergeBlocker != nil)
                     Button("Keep mine") { problem = model.keepMine(divergence) }
+                        .disabled(divergence.mergeBlocker != nil)
                 }
                 Button("Take theirs") { problem = model.takeTheirs(divergence) }
                 Button("Not now") { model.divergence = nil }
@@ -167,12 +174,12 @@ struct DivergenceView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func kindDescription(_ kind: SetupMerge.Difference.Kind) -> String {
+    private func kindDescription(_ kind: SetupMerge.Kind) -> String {
         switch kind {
-        case .onlyMineChanged: "changed here"
-        case .onlyTheirsChanged: "changed on \(divergence.machineName)"
-        case .bothChanged: "changed on both"
-        case .unknownBase: "no common ancestor to compare against"
+        case .mine: "changed here"
+        case .theirs: "changed on \(divergence.machineName)"
+        case .both: "changed on both"
+        case .noBase: "no common ancestor to compare against"
         }
     }
 

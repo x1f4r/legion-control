@@ -24,16 +24,22 @@ enum SetupTaking: Sendable, Equatable {
 }
 
 /// Everything the divergence sheet needs.
+///
+/// Built only from bytes that hash to what the agent reports.
 struct SetupDivergence: Sendable, Identifiable {
     var machineId: String
     var machineName: String
     var mine: ControllerDocument
     var theirsBytes: Data
+    var theirsHash: String
     var theirsIdentity: ControllerIdentity
     var baseBytes: Data?
     var differences: [SetupMerge.Difference]
     /// True when the two are different setups rather than two branches of one.
     var isDifferentSetup: Bool
+    /// Why Merge and Keep mine wait until this device's document is fixed in the editor, when they
+    /// do (section 9.8). Take theirs never waits.
+    var mergeBlocker: String?
 
     var id: String { machineId }
 }
@@ -239,17 +245,23 @@ extension AgentDevice {
                 self.onStateChange?()
                 return
             }
-            let base = self.setupBase?(local.identity, fetched.identity)
-            let differences = (try? SetupMerge.differences(mine: local.bytes, theirs: fetched.bytes, base: base)) ?? []
+            let theirsHash = Canonical.sha256(fetched.bytes)
+            let base = self.setupBase?(local.hash, local.identity.ancestors, theirsHash, fetched.identity.ancestors)
+            let blocker = isDifferent ? nil : SetupMerge.blocker(mine: local.bytes)
+            let differences = blocker == nil
+                ? (try? SetupMerge.differences(base: base, mine: local.bytes, theirs: fetched.bytes)) ?? []
+                : []
             self.onSetupDiverged?(SetupDivergence(
                 machineId: self.historyMachineId,
                 machineName: self.name,
                 mine: local,
                 theirsBytes: fetched.bytes,
+                theirsHash: theirsHash,
                 theirsIdentity: fetched.identity,
                 baseBytes: base,
                 differences: differences,
-                isDifferentSetup: isDifferent
+                isDifferentSetup: isDifferent,
+                mergeBlocker: blocker
             ))
         }
     }

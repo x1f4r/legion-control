@@ -232,8 +232,9 @@ final class AppModel {
         device.takeSetup = { [weak self] bytes, identity, holder in
             self?.takeSetup(bytes, identity: identity, from: holder) ?? .refused("Legion Control is closing.")
         }
-        device.setupBase = { [weak self] mine, theirs in
-            self?.config.commonAncestor(mine: mine, theirs: theirs)
+        device.setupBase = { [weak self] mineHash, mineLineage, theirsHash, theirsLineage in
+            self?.config.commonAncestor(mineHash: mineHash, mineLineage: mineLineage,
+                                        theirsHash: theirsHash, theirsLineage: theirsLineage)
         }
         device.onSetupDiverged = { [weak self] divergence in self?.divergence = divergence }
     }
@@ -377,21 +378,27 @@ final class AppModel {
     @discardableResult
     func resolveDivergence(_ divergence: SetupDivergence,
                            choices: [String: SetupMerge.Choice]) -> String? {
+        if let blocker = divergence.mergeBlocker {
+            return "This device's setup has to be fixed in the editor before it can be merged: \(blocker)"
+        }
         do {
-            let identity = divergence.mine.identity.merged(
-                with: divergence.theirsIdentity,
-                mineHash: divergence.mine.hash,
-                theirsHash: Canonical.sha256(divergence.theirsBytes),
-                device: bindings.bindings.effectiveDeviceName
-            )
-            let merged = try SetupMerge.merge(
+            let outcome = try SetupMerge.merge(
+                base: divergence.baseBytes,
                 mine: divergence.mine.bytes,
                 theirs: divergence.theirsBytes,
-                base: divergence.baseBytes,
-                differences: divergence.differences,
-                choices: choices,
-                identity: identity
+                mineHash: divergence.mine.hash,
+                theirsHash: divergence.theirsHash,
+                writer: SetupMerge.Writer(source: ControllerIdentity.sourceKind,
+                                          device: bindings.bindings.effectiveDeviceName,
+                                          now: ISO8601DateFormatter.lenient.string(from: Date())),
+                choices: choices
             )
+            guard let merged = outcome.result else {
+                // Nothing is written. The rule the choices broke, or that this device's setup broke
+                // already and the choices kept, is what the person needs to know.
+                let rule = outcome.error ?? "a rule"
+                return "That merge would break the rule \(rule) every device holds a setup to, so nothing was written. Choose the other side for the entry it comes from."
+            }
             // Both branches are kept, so whichever machine is holding either of them accepts the
             // merge as a fast-forward.
             config.keepRevision(divergence.mine.bytes)
@@ -402,9 +409,6 @@ final class AppModel {
             return problem
         } catch let failure as SetupMerge.MergeFailure {
             return failure.message
-        } catch let failure as Canonical.NotUTF8 {
-            _ = failure
-            return "The merged document is not valid UTF-8, so nothing was written."
         } catch {
             return error.localizedDescription
         }

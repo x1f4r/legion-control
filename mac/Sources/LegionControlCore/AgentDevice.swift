@@ -111,10 +111,10 @@ final class DeviceCore {
     /// that is enrolment: every launch value in it is shown, and nothing is written until the
     /// person confirms. With one applied it is adopting a different setup, which approves nothing.
     var takeSetup: (@MainActor (Data, ControllerIdentity, String) -> SetupTaking)?
-    /// The bytes of the newest document both lineages remember, when this device kept them. Without
-    /// it a merge can still be done, but every difference needs a decision instead of only the ones
-    /// both sides touched.
-    var setupBase: (@MainActor (ControllerIdentity, ControllerIdentity) -> Data?)?
+    /// The bytes of the base a merge of the two documents needs (section 9.8), when this device
+    /// kept them: mine's hash and lineage, then theirs'. Without it a merge can still be done, but
+    /// every difference needs a decision instead of only the ones both sides touched.
+    var setupBase: (@MainActor (String, [String], String, [String]) -> Data?)?
     /// Raise the divergence sheet.
     var onSetupDiverged: (@MainActor (SetupDivergence) -> Void)?
 
@@ -296,7 +296,7 @@ extension AgentDevice {
         set { core.takeSetup = newValue }
     }
 
-    var setupBase: (@MainActor (ControllerIdentity, ControllerIdentity) -> Data?)? {
+    var setupBase: (@MainActor (String, [String], String, [String]) -> Data?)? {
         get { core.setupBase }
         set { core.setupBase = newValue }
     }

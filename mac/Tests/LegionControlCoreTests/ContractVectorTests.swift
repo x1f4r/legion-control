@@ -13,7 +13,7 @@ struct ContractVectorTests {
 
     /// The families this suite runs. A family joins when this app has a port of its reference to
     /// run, and the contract has nine.
-    static let families = ["hash", "identifiers", "transport", "setup-acceptance", "launch"]
+    static let families = ["hash", "identifiers", "transport", "setup-acceptance", "launch", "setup-merge"]
 
     typealias Adapter = @Sendable (VectorJSON) throws -> VectorJSON
 
@@ -41,6 +41,14 @@ struct ContractVectorTests {
         .hostKeyChanged, .hostKeyUnknown, .timedOut(seconds: 0), .linkLost, .interpreterMissing, .agentMissing,
         .unreadableOutput, .agentFailed, .badRequest
     ].map { ($0.contractName, $0) })
+
+    static func strings(_ input: VectorJSON?, _ key: String) throws -> [String] {
+        guard let items = input?[key]?.array else { throw BadInput(description: "\(key) is not an array") }
+        return try items.map { item in
+            guard let value = item.string else { throw BadInput(description: "\(key) holds a non-string") }
+            return value
+        }
+    }
 
     /// The codes of a list of problems as the vectors list them: sorted, each once.
     static func codes(_ problems: [DocumentAcceptance.Problem]) -> VectorJSON {
@@ -206,6 +214,44 @@ struct ContractVectorTests {
                     "assignsIdentity": .bool(verdict.assignsIdentity), "keep": .bool(verdict.keep)]
         },
 
+        // Section 9.8.
+        "setup-merge/merges": { input in
+            let writer = try #require(input["writer"])
+            var choices: [String: SetupMerge.Choice] = [:]
+            for (entry, side) in input["choices"]?.object ?? [:] {
+                guard let choice = side.string.flatMap(SetupMerge.Choice.init(rawValue:)) else { throw BadInput(description: "bad choice") }
+                choices[entry] = choice
+            }
+            let outcome = try SetupMerge.merge(
+                base: input["baseText"]?.string.map { Data($0.utf8) },
+                mine: Data(try string(input, "mineText").utf8),
+                theirs: Data(try string(input, "theirsText").utf8),
+                mineHash: try string(input, "mineHash"),
+                theirsHash: try string(input, "theirsHash"),
+                writer: SetupMerge.Writer(source: try string(writer, "source"), device: try string(writer, "device"),
+                                          now: try string(writer, "now")),
+                choices: choices
+            )
+            return [
+                "differences": .array(outcome.differences.map { ["entry": .string($0.entry), "kind": .string($0.kind.rawValue)] }),
+                "resultText": VectorJSON(outcome.result.map { String(decoding: $0, as: UTF8.self) }),
+                "error": VectorJSON(outcome.error),
+            ]
+        },
+        "setup-merge/bases": { input in
+            let kept = (input["kept"]?.object ?? [:]).compactMapValues { $0.string.map { Data($0.utf8) } }
+            let base = SetupMerge.commonBase(mineHash: try string(input, "mineHash"), theirsHash: try string(input, "theirsHash"),
+                                             mineLineage: try strings(input, "mineLineage"),
+                                             theirsLineage: try strings(input, "theirsLineage")) { kept[$0] }
+            return ["base": VectorJSON(base)]
+        },
+        "setup-merge/numbers": { input in
+            let a = SetupJSON.decimalKey(try string(input, "a"))
+            let b = SetupJSON.decimalKey(try string(input, "b"))
+            guard a != nil, b != nil else { throw BadInput(description: "not a number lexeme") }
+            return ["equal": .bool(a == b)]
+        },
+
         // Section 9.9.
         "launch/review": launchReview,
         "launch/migration": { input in
@@ -268,6 +314,8 @@ struct ContractVectorTests {
     func comparison() {
         let expected: VectorJSON = ["a": 1, "b": ["x", nil, true], "docText": #"{"p":1,"q":[2]}"#]
         #expect(expected.differences(from: ["b": ["x", nil, true], "a": 1, "docText": #"{"q":[2],"p":1}"#]).isEmpty)
+        // In a document, a number's spelling is part of what is compared: `22.0` is not `22` there.
+        #expect(!VectorJSON.object(["docText": #"{"p":22.0}"#]).differences(from: ["docText": #"{"p":22}"#]).isEmpty)
         // A composed and a decomposed é are one string to Swift and two to the contract.
         #expect(!VectorJSON.string("\u{E9}").differences(from: .string("e\u{301}")).isEmpty)
         #expect(!expected.differences(from: ["a": 1, "b": ["x", nil, false], "docText": #"{"p":1,"q":[2]}"#]).isEmpty)

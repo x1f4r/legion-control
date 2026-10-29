@@ -660,10 +660,11 @@ struct LaunchGateTests {
         func divergence(theirs: Data) throws -> SetupDivergence {
             let mine = try #require(app.config.document)
             return SetupDivergence(machineId: "tower", machineName: "Tower", mine: mine, theirsBytes: theirs,
+                                   theirsHash: try Canonical.hash(theirs),
                                    theirsIdentity: try JSONDecoder().decode(ControllerConfig.self, from: theirs).identity,
                                    baseBytes: mine.bytes,
-                                   differences: try SetupMerge.differences(mine: mine.bytes, theirs: theirs, base: mine.bytes),
-                                   isDifferentSetup: false)
+                                   differences: try SetupMerge.differences(base: mine.bytes, mine: mine.bytes, theirs: theirs),
+                                   isDifferentSetup: false, mergeBlocker: nil)
         }
 
         // Restore a kept revision that names a command nobody here approved.

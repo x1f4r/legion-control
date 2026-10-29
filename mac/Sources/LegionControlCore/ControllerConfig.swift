@@ -653,33 +653,6 @@ struct ControllerIdentity: Codable, Sendable, Equatable {
         )
     }
 
-    /// The identity for a merge of two branches.
-    func merged(with other: ControllerIdentity, mineHash: String, theirsHash: String,
-                device: String, now: Date = Date()) -> ControllerIdentity {
-        // Both parents first, then the two histories interleaved so neither branch is dropped
-        // wholesale when the cap bites.
-        var chain = [mineHash, theirsHash]
-        var mine = ancestors.makeIterator()
-        var theirs = other.ancestors.makeIterator()
-        while chain.count < Self.lineageLimit {
-            let a = mine.next()
-            let b = theirs.next()
-            if a == nil, b == nil { break }
-            if let a, !chain.contains(a) { chain.append(a) }
-            if chain.count >= Self.lineageLimit { break }
-            if let b, !chain.contains(b) { chain.append(b) }
-        }
-        return ControllerIdentity(
-            id: id ?? other.id,
-            name: name ?? other.name,
-            revision: max(revisionNumber, other.revisionNumber) + 1,
-            updatedAt: ISO8601DateFormatter.lenient.string(from: now),
-            source: Self.sourceKind,
-            device: device,
-            lineage: Array(chain.prefix(Self.lineageLimit))
-        )
-    }
-
     /// Who wrote it, in words, for the divergence sheet.
     var authorDescription: String {
         let who = [device, source].compactMap { $0 }.first ?? "an unknown device"
@@ -1198,13 +1171,13 @@ final class ConfigStore {
         try? Data(contentsOf: revisionsDirectory.appending(path: "\(hash).json"))
     }
 
-    /// The newest document both lineages remember, which is the base a merge needs.
-    func commonAncestor(mine: ControllerIdentity, theirs: ControllerIdentity) -> Data? {
-        let theirSet = Set(theirs.ancestors)
-        for hash in mine.ancestors where theirSet.contains(hash) {
-            if let bytes = revisionBytes(hash: hash) { return bytes }
-        }
-        return nil
+    /// The base a merge needs (section 9.8): the newest document both lineages remember whose kept
+    /// bytes still hash to the name they are kept under. A revision file that was changed on disk is
+    /// not the document it is named after, and a merge built on it would take the wrong side.
+    func commonAncestor(mineHash: String, mineLineage: [String], theirsHash: String, theirsLineage: [String]) -> Data? {
+        let base = SetupMerge.commonBase(mineHash: mineHash, theirsHash: theirsHash, mineLineage: mineLineage,
+                                         theirsLineage: theirsLineage, kept: revisionBytes(hash:))
+        return base.flatMap(revisionBytes(hash:))
     }
 
     /// Keep a copy of a document under its own hash.

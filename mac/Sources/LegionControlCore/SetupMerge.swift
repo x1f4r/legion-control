@@ -1,59 +1,32 @@
 import Foundation
 
-/// Putting two diverged setups back together.
+/// Putting two diverged setups back together: section 9.8 of the contract.
 ///
 /// When both sides changed the document since they last agreed, neither may simply overwrite the
-/// other. What this does is compare them entry by entry — one machine, one site, one endpoint, one
-/// system, the app update settings — and, where a common ancestor is available, work out which side
-/// actually changed each entry. Entries only one side touched are taken from that side without
-/// asking. Entries both sides touched are the only ones a person has to decide about, and they are
-/// shown with both versions.
+/// other. This compares them entry by entry — one machine, one site, one endpoint, one system, a
+/// wake block, an unknown key — and, where a common ancestor is available, works out which side
+/// changed each entry. Entries only one side touched are taken from that side without asking.
+/// Entries both sides touched, a deletion against an edit included, are the ones a person decides,
+/// and without an ancestor every difference is.
 ///
-/// Everything works on the raw JSON rather than on the typed model, and that is deliberate: a
-/// document may legitimately carry keys this build has never heard of — a newer client wrote them,
-/// or only the phone reads them — and round-tripping through `ControllerConfig` would silently
-/// delete every one of them.
+/// The three clients used to merge three ways, and each lost something different: a deletion beat
+/// an edit without a question, endpoints without an id vanished, unknown keys were dropped, merged
+/// entries moved to the end of their arrays and `22.0` became `22` (C6). This is a port of
+/// `contract/tools/setup-sync.mjs`, held to `contract/vectors/setup-merge.json`, and it works on
+/// `SetupJSON`, which keeps member order and number spelling, so what a merge does not replace it
+/// writes back exactly as it found it.
 enum SetupMerge {
 
-    /// One thing the two documents disagree about.
-    struct Difference: Sendable, Equatable, Identifiable {
-        /// Where it is, as a path a person can read: `machines.legion.wake`, `sites.home-a`.
-        var path: [String]
-        var kind: Kind
-        /// What is on this device, as pretty JSON, or nil when this side does not have it.
-        var mine: String?
-        /// What the other side has, or nil when it does not have it.
-        var theirs: String?
-        /// What the common ancestor had, when there is one.
-        var base: String?
-
-        var id: String { path.joined(separator: ".") }
-        var label: String { path.joined(separator: " › ") }
-
-        enum Kind: Sendable, Equatable {
-            /// Only this device changed it. Taken from here, no question asked.
-            case onlyMineChanged
-            /// Only the other side changed it. Taken from there, no question asked.
-            case onlyTheirsChanged
-            /// Both changed it, differently. The one case a person has to settle.
-            case bothChanged
-            /// No common ancestor was available, so which side changed it cannot be worked out.
-            case unknownBase
-        }
-
-        /// What a merge does with it unless the user says otherwise.
-        var defaultChoice: Choice {
-            switch kind {
-            case .onlyMineChanged: .mine
-            case .onlyTheirsChanged: .theirs
-            // With no evidence about who moved, the copy the machines are already carrying wins.
-            // Taking "mine" by default would quietly undo an edit made on another device.
-            case .bothChanged, .unknownBase: .theirs
-            }
-        }
-
-        /// Whether it needs a person. Everything else is settled by the evidence.
-        var needsDecision: Bool { kind == .bothChanged || kind == .unknownBase }
+    /// Which side changed an entry, as far as the evidence says.
+    enum Kind: String, Sendable, Equatable {
+        /// Only this device changed it. Taken from here, no question asked.
+        case mine
+        /// Only the other side changed it. Taken from there, no question asked.
+        case theirs
+        /// Both changed it, differently, or one deleted what the other edited.
+        case both
+        /// No common ancestor was available, so which side changed it cannot be worked out.
+        case noBase
     }
 
     enum Choice: String, Sendable, Equatable, CaseIterable {
@@ -61,253 +34,410 @@ enum SetupMerge {
         case theirs
     }
 
+    /// One entry the two documents disagree about.
+    struct Difference: Sendable, Equatable, Identifiable {
+        /// The entry's key in the contract's spelling: `machines[pi].fields`, `sites[home]`.
+        var entry: String
+        var kind: Kind
+        /// What is on this device, written out, or nil when this side does not have it.
+        var mine: String?
+        /// What the other side has, or nil when it does not have it.
+        var theirs: String?
+        /// What the common ancestor had, when there is one and it had the entry.
+        var base: String?
+
+        var id: String { entry }
+
+        /// The key as a person reads it: `machines[pi] › fields`.
+        var label: String {
+            entry.hasPrefix("\"") ? entry : entry
+                .replacingOccurrences(of: "].", with: "] › ")
+                .replacingOccurrences(of: "controller.", with: "controller › ")
+        }
+
+        /// What a merge does with it unless the person says otherwise. With no evidence about who
+        /// moved, the copy the machines are already carrying wins: taking this device's by default
+        /// would quietly undo an edit made on another one.
+        var defaultChoice: Choice { kind == .mine ? .mine : .theirs }
+
+        /// Whether it needs a person. Everything else is settled by the evidence.
+        var needsDecision: Bool { kind == .both || kind == .noBase }
+    }
+
+    /// Who writes the merged revision.
+    struct Writer: Sendable, Equatable {
+        var source: String
+        var device: String
+        /// The ISO 8601 time it is written.
+        var now: String
+    }
+
+    struct Outcome: Sendable, Equatable {
+        var differences: [Difference]
+        /// The merged document, or nil when section 9.7 refuses it.
+        var result: Data?
+        /// The first error code the refused result breaks, in code point order.
+        var error: String?
+    }
+
+    /// A side that cannot be merged at all, saying why.
     struct MergeFailure: Error, Sendable, Equatable {
         var message: String
         init(_ message: String) { self.message = message }
     }
 
-    /// Compare two documents, with the common ancestor when one is to hand.
-    static func differences(mine: Data, theirs: Data, base: Data?) throws -> [Difference] {
-        let a = try object(mine, what: "this device's setup")
-        let b = try object(theirs, what: "the machine's setup")
-        let c = base.flatMap { try? object($0, what: "the common ancestor") }
+    // MARK: - Merging
 
-        var out: [Difference] = []
-        for path in entryPaths(a: a, b: b, base: c) {
-            let mineValue = value(at: path, in: a)
-            let theirsValue = value(at: path, in: b)
-            if equal(mineValue, theirsValue) { continue }
-            let baseValue = c.flatMap { value(at: path, in: $0) }
+    /// The entries where the two documents differ, in code point order of their keys.
+    static func differences(base: Data?, mine: Data, theirs: Data) throws -> [Difference] {
+        let (mineTree, theirsTree, baseTree) = try sides(base: base, mine: mine, theirs: theirs)
+        return differing(mine: mineTree, theirs: theirsTree, base: baseTree).map(\.difference)
+    }
 
-            let kind: Difference.Kind
-            if c == nil {
-                kind = .unknownBase
-            } else if equal(baseValue, mineValue) {
-                kind = .onlyTheirsChanged
-            } else if equal(baseValue, theirsValue) {
-                kind = .onlyMineChanged
-            } else {
-                kind = .bothChanged
+    /// Merge two documents.
+    ///
+    /// `choices` maps an entry key to a side. An entry it does not name takes the side its kind says:
+    /// mine for a `mine` difference and theirs for every other, so `both` and `noBase` are preselected
+    /// theirs. Keep mine is every entry answered mine.
+    ///
+    /// The result starts from mine. Every entry taken from theirs is removed where theirs lacks it and
+    /// replaced in place where both have it; then theirs' arrays are walked to insert what theirs
+    /// adds, each after its predecessor in theirs. Member order is mine's with new members appended,
+    /// and nothing that is not replaced is written differently. The identity is mine's id, one more
+    /// than the higher revision, both heads and both histories in the lineage, and the writer's
+    /// `updatedAt`, `source` and `device`; every other `controller` key is an entry like any other.
+    ///
+    /// The result is held to section 9.7 under peer intake, and one it refuses is not returned: the
+    /// person is told the rule instead, the one their choices broke or the one mine broke already
+    /// and the choices kept.
+    static func merge(base: Data?, mine: Data, theirs: Data, mineHash: String, theirsHash: String,
+                      writer: Writer, choices: [String: Choice] = [:]) throws -> Outcome {
+        let (mineTree, theirsTree, baseTree) = try sides(base: base, mine: mine, theirs: theirs)
+        guard mineTree["controller"]?["id"]?.stringValue != nil else {
+            throw MergeFailure("This device's setup has no identity yet, so it cannot be merged. Give it one first.")
+        }
+
+        let found = differing(mine: mineTree, theirs: theirsTree, base: baseTree)
+        let taken = Set(found.filter { (choices[$0.key] ?? $0.difference.defaultChoice) == .theirs }.map(\.key))
+
+        var result = mineTree
+        for entry in found where taken.contains(entry.key) { takeTheirs(entry, into: &result) }
+
+        walkTheirs(&result, "sites", theirsTree["sites"], taken: taken) { "sites[\($0 ?? "null")]" }
+        walkTheirs(&result, "machines", theirsTree["machines"], taken: taken) { "machines[\($0 ?? "null")]" }
+        let paired = pairedMachines(mineTree, theirsTree)
+        for machine in theirsTree["machines"]?.objects ?? [] {
+            guard let id = machine.id, paired.contains(id) else { continue }
+            let at = "machines[\(id)]"
+            result.modifyItem(in: "machines", id: id) { holder in
+                walkTheirs(&holder, "systems", machine["systems"], taken: taken) { "\(at).systems[\($0 ?? "null")]" }
+                walkTheirs(&holder, "endpoints", machine["endpoints"], taken: taken) { id in
+                    id.map { "\(at).endpoints[\($0)]" } ?? "\(at).endpoints[]"
+                }
             }
-
-            out.append(Difference(
-                path: path,
-                kind: kind,
-                mine: mineValue.map(pretty),
-                theirs: theirsValue.map(pretty),
-                base: baseValue.map(pretty)
-            ))
         }
-        return out.sorted { $0.id < $1.id }
+
+        // The identity. Mine's id stays where it is; the rest is written in place, or appended in
+        // this order when mine's block lacks it.
+        func revision(_ tree: SetupJSON) -> Int { tree["controller"]?["revision"]?.integerValue ?? 0 }
+        let lineage = mergedLineage(mineHash: mineHash, theirsHash: theirsHash,
+                                    mineLineage: lineageOf(mineTree), theirsLineage: lineageOf(theirsTree))
+        if var block = result["controller"] {
+            block["revision"] = .number(String(max(revision(mineTree), revision(theirsTree)) + 1))
+            block["updatedAt"] = .string(writer.now)
+            block["source"] = .string(writer.source)
+            block["device"] = .string(writer.device)
+            block["lineage"] = .array(lineage.map(SetupJSON.string))
+            result["controller"] = block
+        }
+
+        let text = result.documentData
+        let verdict = DocumentAcceptance.check(text, intake: .peer)
+        let codes = Set(verdict.errors.map(\.code)).sorted(by: SetupJSON.precedes)
+        return Outcome(differences: found.map(\.difference), result: verdict.valid ? text : nil,
+                       error: verdict.valid ? nil : codes.first)
     }
 
-    /// Build the merged document.
+    /// Why this device's document cannot be merged, or nil when it can.
     ///
-    /// `choices` is keyed by difference id and only has to cover the ones that need a decision;
-    /// anything missing takes the default, which is the side that changed it.
-    static func merge(
-        mine: Data,
-        theirs: Data,
-        base: Data?,
-        differences: [Difference],
-        choices: [String: Choice],
-        identity: ControllerIdentity
-    ) throws -> Data {
-        var result = try object(mine, what: "this device's setup")
-        let other = try object(theirs, what: "the machine's setup")
-
-        for difference in differences {
-            let choice = choices[difference.id] ?? difference.defaultChoice
-            guard choice == .theirs else { continue }
-            let theirsValue = value(at: difference.path, in: other)
-            result = setting(difference.path, to: theirsValue, in: result)
-        }
-
-        // The identity is always this device's own: it descends from both sides, so both machines
-        // accept it as a fast-forward and neither branch is lost.
-        result["controller"] = encode(identity)
-
-        // Written the way every device writes a document, so the merge has the same bytes and the
-        // same hash wherever it was made.
-        return try JSONText.canonicalDocument(result)
+    /// Mine is the applied document, which applied intake keeps with its errors. One that breaks only
+    /// how its parts refer to each other still merges: the result is checked like any other, and
+    /// taking theirs' side of the entry at fault repairs it. Any other error leaves no single answer
+    /// to what its entries are, so Merge and Keep mine wait until it is fixed in the editor. Take
+    /// theirs does not.
+    static func blocker(mine: Data) -> String? {
+        let verdict = DocumentAcceptance.check(mine, intake: .applied)
+        return verdict.errors.first { !DocumentAcceptance.mergeableErrors.contains($0.code) }?.message
     }
 
-    /// The identity block as a plain dictionary, so unknown keys elsewhere in the document survive.
-    static func encode(_ identity: ControllerIdentity) -> [String: Any] {
-        var block: [String: Any] = [:]
-        if let id = identity.id { block["id"] = id }
-        if let name = identity.name { block["name"] = name }
-        block["revision"] = identity.revisionNumber
-        if let updatedAt = identity.updatedAt { block["updatedAt"] = updatedAt }
-        if let source = identity.source { block["source"] = source }
-        if let device = identity.device { block["device"] = device }
-        block["lineage"] = identity.ancestors
-        return block
+    // MARK: - Bases and lineage
+
+    /// The base of a merge: the first hash of mine's lineage, newest first, that is also in theirs'
+    /// lineage and whose kept bytes still hash to it, or nil. A head is never a base: a head is not
+    /// in its own lineage, and a merge whose base was one side would only ever take the other side.
+    static func commonBase(mineHash: String, theirsHash: String, mineLineage: [String], theirsLineage: [String],
+                           kept: (String) -> Data?) -> String? {
+        for hash in mineLineage where hash != mineHash && hash != theirsHash && theirsLineage.contains(hash) {
+            if let bytes = kept(hash), (try? Canonical.hash(bytes)) == hash { return hash }
+        }
+        return nil
     }
 
-    // MARK: - Walking the document
-
-    /// The paths a merge works at.
-    ///
-    /// Not every key and not the whole document: one machine, one site, one endpoint, one system,
-    /// the wake block, the app update settings. Fine enough that renaming a machine on one device
-    /// and adding an endpoint to another one elsewhere merges without a question, coarse enough that
-    /// a person is never asked about a port number in isolation.
-    static func entryPaths(a: [String: Any], b: [String: Any], base: [String: Any]?) -> [[String]] {
-        var paths: [[String]] = []
-
-        for key in union(a, b, base, at: "sites").sorted() {
-            paths.append(["sites", key])
+    /// The lineage of a merge: mine's hash, theirs' hash, then the two lineages interleaved, mine
+    /// first, each hash once, cut at 32. Both heads are in it, so both branches fast-forward onto
+    /// the result.
+    static func mergedLineage(mineHash: String, theirsHash: String, mineLineage: [String], theirsLineage: [String]) -> [String] {
+        var lineage: [String] = []
+        func add(_ hash: String) { if !lineage.contains(hash) { lineage.append(hash) } }
+        add(mineHash)
+        add(theirsHash)
+        for index in 0..<max(mineLineage.count, theirsLineage.count) {
+            if index < mineLineage.count { add(mineLineage[index]) }
+            if index < theirsLineage.count { add(theirsLineage[index]) }
         }
+        return Array(lineage.prefix(ControllerIdentity.lineageLimit))
+    }
 
-        for machineId in union(a, b, base, at: "machines").sorted() {
-            let inA = element("machines", machineId, a)
-            let inB = element("machines", machineId, b)
-            let inBase = base.flatMap { element("machines", machineId, $0) }
-            // A machine that exists on only one side is one decision, not a dozen.
-            guard inA != nil, inB != nil else {
-                paths.append(["machines", machineId])
+    private static func lineageOf(_ tree: SetupJSON) -> [String] {
+        (tree["controller"]?["lineage"]?.items ?? []).compactMap(\.stringValue)
+    }
+
+    // MARK: - Entries
+
+    /// The controller keys that are identity, which a merge writes itself.
+    private static let identityKeys: Set<String> = ["id", "revision", "updatedAt", "source", "device", "lineage"]
+    /// The top-level keys whose contents are entries of their own.
+    private static let structureKeys: Set<String> = ["controller", "machines", "sites"]
+    /// The members of a machine that are entries of their own when both sides have the machine.
+    private static let machineParts: Set<String> = ["endpoints", "systems", "wake"]
+
+    /// The entry key of a top-level member: its name, or the name in double quotes, nothing escaped,
+    /// when it begins the way another entry's key does. Without the quotes, a member called
+    /// `sites[home]` beside a site `home` would give one key to two entries. Ids are tokens, which
+    /// hold no bracket, so the other keys never collide with each other.
+    static func topLevelKey(_ name: String) -> String {
+        ["\"", "controller.", "sites[", "machines["].contains(where: name.hasPrefix) ? "\"\(name)\"" : name
+    }
+
+    /// Where an entry lives in a document.
+    private enum Place: Sendable, Equatable {
+        case top(String)
+        case controller(String)
+        case site(String)
+        case machine(String)
+        case fields(machine: String)
+        case wake(machine: String)
+        case system(machine: String, id: String)
+        case endpoint(machine: String, id: String)
+        case idless(machine: String)
+    }
+
+    private struct Entry {
+        var key: String
+        var place: Place
+        var mine: SetupJSON?
+        var theirs: SetupJSON?
+        var base: SetupJSON?
+        var kind: Kind
+
+        var difference: Difference {
+            Difference(entry: key, kind: kind, mine: mine.map { $0.printed() }, theirs: theirs.map { $0.printed() },
+                       base: base.map { $0.printed() })
+        }
+    }
+
+    /// One document's entries by key. Keys are unique in every document a merge takes, because
+    /// section 9.7 refuses two parts with one id and topLevelKey keeps unknown names apart, so a
+    /// second entry under one key is a bug and stops the merge rather than lose one of the two.
+    private static func entryMap(_ document: SetupJSON, paired: Set<String>) throws -> [String: (place: Place, value: SetupJSON)] {
+        var map: [String: (place: Place, value: SetupJSON)] = [:]
+        func add(_ key: String, _ place: Place, _ value: SetupJSON) throws {
+            guard map[key] == nil else { throw MergeFailure("Two entries of one document are both called \(key).") }
+            map[key] = (place, value)
+        }
+        for member in document.members ?? [] where !structureKeys.contains(member.name) {
+            try add(topLevelKey(member.name), .top(member.name), member.value)
+        }
+        for member in document["controller"]?.members ?? [] where !identityKeys.contains(member.name) {
+            try add("controller.\(member.name)", .controller(member.name), member.value)
+        }
+        for site in document["sites"]?.objects ?? [] {
+            if let id = site.id { try add("sites[\(id)]", .site(id), site) }
+        }
+        for machine in document["machines"]?.objects ?? [] {
+            guard let id = machine.id else { continue }
+            let at = "machines[\(id)]"
+            guard paired.contains(id) else {
+                try add(at, .machine(id), machine)
                 continue
             }
-            // The machine's own scalar fields, minus the collections handled below.
-            paths.append(["machines", machineId, "identity"])
-            paths.append(["machines", machineId, "wake"])
-            for endpoint in union(inA, inB, inBase, at: "endpoints").sorted() {
-                paths.append(["machines", machineId, "endpoints", endpoint])
+            try add("\(at).fields", .fields(machine: id),
+                    .object((machine.members ?? []).filter { !machineParts.contains($0.name) }))
+            if let wake = machine["wake"] { try add("\(at).wake", .wake(machine: id), wake) }
+            for system in machine["systems"]?.objects ?? [] {
+                if let systemId = system.id { try add("\(at).systems[\(systemId)]", .system(machine: id, id: systemId), system) }
             }
-            for system in union(inA, inB, inBase, at: "systems").sorted() {
-                paths.append(["machines", machineId, "systems", system])
+            // Endpoints without an id cannot be told apart, so together, in order, they are one
+            // entry. None at all is absent.
+            var idless: [SetupJSON] = []
+            for endpoint in machine["endpoints"]?.objects ?? [] {
+                if let endpointId = endpoint.id {
+                    try add("\(at).endpoints[\(endpointId)]", .endpoint(machine: id, id: endpointId), endpoint)
+                } else {
+                    idless.append(endpoint)
+                }
+            }
+            if !idless.isEmpty { try add("\(at).endpoints[]", .idless(machine: id), .array(idless)) }
+        }
+        return map
+    }
+
+    private static func machineIds(_ document: SetupJSON) -> Set<String> {
+        Set((document["machines"]?.objects ?? []).compactMap(\.id))
+    }
+
+    /// The ids of the machines both documents have, which merge part by part.
+    private static func pairedMachines(_ mine: SetupJSON, _ theirs: SetupJSON) -> Set<String> {
+        machineIds(mine).intersection(machineIds(theirs))
+    }
+
+    /// Every entry where mine and theirs differ, in code point order of the key, with its kind.
+    private static func differing(mine: SetupJSON, theirs: SetupJSON, base: SetupJSON?) -> [Entry] {
+        let paired = pairedMachines(mine, theirs)
+        // entryMap only throws for a document section 9.7 refuses, and sides() never lets one in.
+        let ofMine = (try? entryMap(mine, paired: paired)) ?? [:]
+        let ofTheirs = (try? entryMap(theirs, paired: paired)) ?? [:]
+        let ofBase = base.flatMap { try? entryMap($0, paired: paired) } ?? [:]
+        let keys = Set(ofMine.keys).union(ofTheirs.keys).sorted(by: SetupJSON.precedes)
+        return keys.compactMap { key in
+            let mineValue = ofMine[key]?.value
+            let theirsValue = ofTheirs[key]?.value
+            guard !SetupJSON.equal(mineValue, theirsValue), let place = (ofMine[key] ?? ofTheirs[key])?.place else { return nil }
+            let baseValue = ofBase[key]?.value
+            let kind: Kind
+            if base == nil {
+                kind = .noBase
+            } else if SetupJSON.equal(theirsValue, baseValue) {
+                kind = .mine
+            } else if SetupJSON.equal(mineValue, baseValue) {
+                kind = .theirs
+            } else {
+                kind = .both
+            }
+            return Entry(key: key, place: place, mine: mineValue, theirs: theirsValue, base: baseValue, kind: kind)
+        }
+    }
+
+    /// Parse the three sides, each held to the intake section 9.7 gives it: theirs and the base to
+    /// peer intake, as everything read from a machine or kept is, and mine to applied intake with
+    /// only the errors a merge can carry.
+    private static func sides(base: Data?, mine: Data, theirs: Data) throws -> (SetupJSON, SetupJSON, SetupJSON?) {
+        if let problem = blocker(mine: mine) {
+            throw MergeFailure("This device's setup has to be fixed in the editor before it can be merged: \(problem)")
+        }
+        let theirsVerdict = DocumentAcceptance.check(theirs, intake: .peer)
+        if let problem = theirsVerdict.errors.first {
+            throw MergeFailure("The other setup breaks a rule every device holds a setup to, so it cannot be merged: \(problem.message)")
+        }
+        if let base, let problem = DocumentAcceptance.check(base, intake: .peer).errors.first {
+            throw MergeFailure("The common ancestor kept on this device breaks a rule, so it cannot be used: \(problem.message)")
+        }
+        func tree(_ data: Data) throws -> SetupJSON { try SetupJSON.parse(try Canonical.bytes(data)) }
+        return (try tree(mine), try tree(theirs), try base.map(tree))
+    }
+
+    // MARK: - Building the result
+
+    /// Take one entry from theirs: remove what theirs lacks, replace in place what both have.
+    /// Insertions come later, in walkTheirs.
+    private static func takeTheirs(_ entry: Entry, into result: inout SetupJSON) {
+        let theirs = entry.theirs
+        func replace(in name: String, id: String, of holder: inout SetupJSON) {
+            holder.modifyItems(of: name) { items in
+                guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+                if let theirs { items[index] = theirs } else { items.remove(at: index) }
             }
         }
-
-        paths.append(["appUpdates"])
-        return paths
-    }
-
-    /// The ids present in an array-of-objects field, across all three documents.
-    private static func union(_ a: [String: Any]?, _ b: [String: Any]?, _ base: [String: Any]?,
-                              at key: String) -> Set<String> {
-        var ids = Set<String>()
-        for document in [a, b, base] {
-            guard let list = document?[key] as? [[String: Any]] else { continue }
-            for entry in list {
-                if let id = entry["id"] as? String { ids.insert(id) }
+        switch entry.place {
+        case .top(let name):
+            result[name] = theirs
+        case .controller(let name):
+            if var block = result["controller"] {
+                block[name] = theirs
+                result["controller"] = block
+            }
+        case .site(let id):
+            replace(in: "sites", id: id, of: &result)
+        case .machine(let id):
+            replace(in: "machines", id: id, of: &result)
+        case .fields(let machineId):
+            // The machine's own members, other than its parts, become theirs: each where mine has
+            // it, gone where theirs lacks it, appended where it is new.
+            result.modifyItem(in: "machines", id: machineId) { machine in
+                guard let members = machine.members else { return }
+                var kept: [SetupJSON.Member] = []
+                for member in members {
+                    if machineParts.contains(member.name) {
+                        kept.append(member)
+                    } else if let value = theirs?[member.name] {
+                        kept.append(SetupJSON.Member(name: member.name, value: value))
+                    }
+                }
+                for member in theirs?.members ?? [] where !kept.contains(where: { SetupJSON.same($0.name, member.name) }) {
+                    kept.append(member)
+                }
+                machine = .object(kept)
+            }
+        case .wake(let machineId):
+            result.modifyItem(in: "machines", id: machineId) { $0["wake"] = theirs }
+        case .system(let machineId, let id):
+            result.modifyItem(in: "machines", id: machineId) { replace(in: "systems", id: id, of: &$0) }
+        case .endpoint(let machineId, let id):
+            result.modifyItem(in: "machines", id: machineId) { replace(in: "endpoints", id: id, of: &$0) }
+        case .idless(let machineId):
+            result.modifyItem(in: "machines", id: machineId) { machine in
+                machine.modifyItems(of: "endpoints") { $0.removeAll { $0.id == nil } }
             }
         }
-        return ids
     }
 
-    private static func element(_ key: String, _ id: String, _ document: [String: Any]) -> [String: Any]? {
-        (document[key] as? [[String: Any]])?.first { $0["id"] as? String == id }
-    }
-
-    /// What is at a path, or nil when nothing is.
-    static func value(at path: [String], in document: [String: Any]) -> Any? {
-        switch path.count {
-        case 1:
-            return document[path[0]]
-        case 2:
-            return element(path[0], path[1], document)
-        case 3 where path[2] == "identity":
-            // Everything about the machine except the collections, which have their own paths.
-            guard var machine = element(path[0], path[1], document) else { return nil }
-            for key in ["endpoints", "systems", "wake"] { machine.removeValue(forKey: key) }
-            return machine
-        case 3:
-            return element(path[0], path[1], document)?[path[2]]
-        case 4:
-            guard let machine = element(path[0], path[1], document) else { return nil }
-            return (machine[path[2]] as? [[String: Any]])?.first { $0["id"] as? String == path[3] }
-        default:
-            return nil
-        }
-    }
-
-    /// The document with one path replaced. Removing is what a nil value means.
-    static func setting(_ path: [String], to newValue: Any?, in document: [String: Any]) -> [String: Any] {
-        var result = document
-        switch path.count {
-        case 1:
-            if let newValue { result[path[0]] = newValue } else { result.removeValue(forKey: path[0]) }
-        case 2:
-            var list = (result[path[0]] as? [[String: Any]]) ?? []
-            list.removeAll { $0["id"] as? String == path[1] }
-            if let entry = newValue as? [String: Any] { list.append(entry) }
-            result[path[0]] = list
-        case 3 where path[2] == "identity":
-            var list = (result[path[0]] as? [[String: Any]]) ?? []
-            guard let index = list.firstIndex(where: { $0["id"] as? String == path[1] }) else { return result }
-            let keep = list[index]
-            var merged = (newValue as? [String: Any]) ?? [:]
-            for key in ["endpoints", "systems", "wake"] where keep[key] != nil { merged[key] = keep[key] }
-            list[index] = merged
-            result[path[0]] = list
-        case 3:
-            var list = (result[path[0]] as? [[String: Any]]) ?? []
-            guard let index = list.firstIndex(where: { $0["id"] as? String == path[1] }) else { return result }
-            var machine = list[index]
-            if let newValue { machine[path[2]] = newValue } else { machine.removeValue(forKey: path[2]) }
-            list[index] = machine
-            result[path[0]] = list
-        case 4:
-            var list = (result[path[0]] as? [[String: Any]]) ?? []
-            guard let index = list.firstIndex(where: { $0["id"] as? String == path[1] }) else { return result }
-            var machine = list[index]
-            var inner = (machine[path[2]] as? [[String: Any]]) ?? []
-            inner.removeAll { $0["id"] as? String == path[3] }
-            if let entry = newValue as? [String: Any] { inner.append(entry) }
-            machine[path[2]] = inner
-            list[index] = machine
-            result[path[0]] = list
-        default:
-            break
-        }
-        return result
-    }
-
-    // MARK: - Comparing and printing
-
-    /// Two JSON values, compared by their canonical serialisation. Key order and number formatting
-    /// therefore cannot make two identical entries look different.
-    static func equal(_ a: Any?, _ b: Any?) -> Bool {
-        switch (a, b) {
-        case (nil, nil): return true
-        case (nil, _), (_, nil): return false
-        default: return canonicalString(a!) == canonicalString(b!)
-        }
-    }
-
-    private static func canonicalString(_ value: Any) -> String {
-        let wrapped = ["v": value]
-        guard let data = try? JSONSerialization.data(withJSONObject: wrapped, options: [.sortedKeys]) else {
-            return String(describing: value)
-        }
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    static func pretty(_ value: Any) -> String {
-        let wrapped = ["v": value]
-        guard let data = try? JSONSerialization.data(withJSONObject: wrapped,
-                                                     options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
-              let text = String(data: data, encoding: .utf8)
-        else { return String(describing: value) }
-        // Unwrap the one-key object the serialiser needed to accept a bare value.
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        guard lines.count > 2 else { return text }
-        return lines.dropFirst().dropLast()
-            .map { line -> String in
-                var trimmed = String(line)
-                if trimmed.hasPrefix("  ") { trimmed.removeFirst(2) }
-                return trimmed
+    /// Walk one of theirs' arrays in order with a cursor. An element whose key is in the result moves
+    /// the cursor to it; an element taken from theirs that is not in the result is inserted after the
+    /// cursor, first when there is none, and becomes the cursor. Anything else is passed over. So an
+    /// element theirs added lands after its predecessor in theirs, and everything else keeps mine's
+    /// order: a reorder alone is never a difference.
+    ///
+    /// An endpoint without an id has no key of its own. When the id-less entry is taken from theirs,
+    /// mine's id-less endpoints are already gone and each of theirs' is inserted; otherwise theirs'
+    /// n-th id-less endpoint stands for the result's n-th and only moves the cursor.
+    private static func walkTheirs(_ holder: inout SetupJSON, _ name: String, _ theirsArray: SetupJSON?,
+                                   taken: Set<String>, entry: (String?) -> String) {
+        var cursor = -1
+        var idless = 0
+        for element in theirsArray?.objects ?? [] {
+            let id = element.id
+            let key = entry(id)
+            let items = holder[name]?.items ?? []
+            let index: Int?
+            if let id {
+                index = items.firstIndex { $0.id == id }
+            } else if taken.contains(key) {
+                index = nil
+            } else {
+                let positions = items.indices.filter { items[$0].isObject && items[$0].id == nil }
+                index = idless < positions.count ? positions[idless] : nil
+                idless += 1
             }
-            .joined(separator: "\n")
-            .replacingOccurrences(of: "\"v\" : ", with: "")
-    }
-
-    private static func object(_ data: Data, what: String) throws -> [String: Any] {
-        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            throw MergeFailure("\(what) is not a JSON object, so the two cannot be compared.")
+            if let index {
+                cursor = index
+                continue
+            }
+            guard taken.contains(key) else { continue }
+            // An array mine never had is made only for something that goes in it.
+            if holder[name]?.items == nil { holder[name] = .array([]) }
+            cursor += 1
+            let at = cursor
+            holder.modifyItems(of: name) { $0.insert(element, at: at) }
         }
-        return object
     }
 }
