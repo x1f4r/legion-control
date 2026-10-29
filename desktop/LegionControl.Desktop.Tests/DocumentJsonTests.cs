@@ -61,9 +61,13 @@ public class DocumentJsonTests
         // store, the editor and a merge each check a document more than once.
         var text = Names(115_000);
         Assert.True(Encoding.UTF8.GetByteCount(text) <= Canonical.MaxDocumentBytes);
+        // Only a bound, and a loose one: a few hundredths of a second here, half a minute as a
+        // square, and a slow runner sits between. Four times the names is no check of growth at
+        // this size either, since caches and the collector alone make it up to eight times as
+        // slow on a fast machine.
         var watch = Stopwatch.StartNew();
         var verdict = DocumentAcceptance.Check(text, Intake.Peer);
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"one check took {watch.Elapsed}");
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10), $"one check took {watch.Elapsed}");
         Assert.True(verdict.Valid, verdict.Sentence);
 
         // The repeat is still found, and reported where it is, however far into the text.

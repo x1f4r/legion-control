@@ -753,21 +753,41 @@ public class SetupMergeTests
         // Every unknown top-level key is an entry of its own: looked up on three sides, compared,
         // and taken one by one. Taking one looked through every member of the merged document
         // before, so taking them all cost the square of their number.
+        //
+        // A wall-clock bound alone is either loose enough to pass a square on a fast machine or
+        // tight enough to fail a slow runner that did nothing wrong, so the growth is checked too:
+        // four times the names may take less than ten times as long, where linear is four and a
+        // square sixteen. Each size counts its faster of two runs, the one least disturbed by
+        // whatever else the machine was doing, and the smaller runs first, which warms the code up
+        // as well.
         const int count = 100_000;
-        var mine = DocumentJsonTests.Names(count).Replace("\"machines\":[]",
-            "\"controller\":{\"id\":\"setup-a\",\"revision\":1,\"lineage\":[]},\"machines\":[]");
-        var root = (DocumentObject)DocumentJson.Parse(mine);
-        for (var index = 0; index < count; index += 1)
+        SetupMerge.Result? result = null;
+        TimeSpan Fastest(int size)
         {
-            if (index % 2 == 0) root.Remove(DocumentJsonTests.Name(index));
-            else root.Set(DocumentJsonTests.Name(index), new DocumentNumber("1"));
+            var mine = DocumentJsonTests.Names(size).Replace("\"machines\":[]",
+                "\"controller\":{\"id\":\"setup-a\",\"revision\":1,\"lineage\":[]},\"machines\":[]");
+            var root = (DocumentObject)DocumentJson.Parse(mine);
+            for (var index = 0; index < size; index += 1)
+            {
+                if (index % 2 == 0) root.Remove(DocumentJsonTests.Name(index));
+                else root.Set(DocumentJsonTests.Name(index), new DocumentNumber("1"));
+            }
+            var theirs = DocumentJson.Print(root);
+            var fastest = TimeSpan.MaxValue;
+            for (var run = 0; run < 2; run += 1)
+            {
+                var watch = Stopwatch.StartNew();
+                result = Merge(mine, theirs, baseText: mine);
+                if (watch.Elapsed < fastest) fastest = watch.Elapsed;
+            }
+            return fastest;
         }
-        var theirs = DocumentJson.Print(root);
 
-        var watch = Stopwatch.StartNew();
-        var result = Merge(mine, theirs, baseText: mine);
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5), $"the merge took {watch.Elapsed}");
-        Assert.Equal(count, result.Differences.Count);
+        var quarter = Fastest(count / 4);
+        var whole = Fastest(count);
+        Assert.True(whole < TimeSpan.FromSeconds(30), $"the merge took {whole}");
+        Assert.True(whole < quarter * 10, $"the merge took {whole}, and {quarter} for a quarter of the names");
+        Assert.Equal(count, result!.Differences.Count);
         Assert.All(result.Differences, difference => Assert.Equal(SetupChange.Theirs, difference.Kind));
         var merged = (DocumentObject)DocumentJson.Parse(result.Text!);
         Assert.False(merged.Has(DocumentJsonTests.Name(0)));
