@@ -598,20 +598,21 @@ final class AppModel {
         config.writeExample()
     }
 
-    /// Opens the config in whatever the user edits text with. `open -t` is the system's own answer to
-    /// that question, so the app does not have to have an opinion.
-    func openConfigInEditor() {
-        let path = config.path
+    /// Opens a file in whatever the user edits text with. `open -t` is the system's own answer to
+    /// that question, so the app does not have to have an opinion. Replaced in tests, which have no
+    /// business opening anything in front of the person running them.
+    @ObservationIgnored var openInEditor: @MainActor (String) -> Void = { path in
         Task.detached {
             _ = await Shell.run(executable: "/usr/bin/open", arguments: ["-t", path], timeout: 20)
         }
     }
 
+    func openConfigInEditor() {
+        openInEditor(config.path)
+    }
+
     func openBindingsInEditor() {
-        let path = bindings.path
-        Task.detached {
-            _ = await Shell.run(executable: "/usr/bin/open", arguments: ["-t", path], timeout: 20)
-        }
+        openInEditor(bindings.path)
     }
 
     func movePrivateSettingsOut() -> String? {

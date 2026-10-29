@@ -428,6 +428,15 @@ enum AppUpdates {
 
     // MARK: - The swap
 
+    /// What the helper starts a bundle with: LaunchServices, as a new instance, so it never brings an
+    /// already running copy forward in place of the one it has just put there.
+    ///
+    /// A parameter of the helper rather than a word written into it, so a test can hand it a command
+    /// that only writes down what it would have started. The real one, pointed at the fake bundles a
+    /// test makes, has macOS report each of them as an app that quit unexpectedly and offer to move it
+    /// to the Bin, in front of whoever is running the tests.
+    static let launcher = ["/usr/bin/open", "-n"]
+
     /// The helper script that does the dangerous part from outside this process.
     ///
     /// It cannot be done from inside. The swap moves the bundle this executable is running out of,
@@ -438,6 +447,8 @@ enum AppUpdates {
     /// one into place, launch it, and wait for it to say it came up. If it does not, put the old
     /// bundle back and launch that instead. Every path ends with exactly one bundle at the real
     /// path, and it is always one of the two whole bundles rather than a mixture.
+    ///
+    /// `launcher` is the argv every path starts a bundle with, the bundle's path appended.
     static func swapScript(
         current: URL,
         staged: URL,
@@ -445,7 +456,8 @@ enum AppUpdates {
         marker: URL,
         pid: Int32,
         exitTimeout: Int = 10,
-        launchTimeout: Int = 45
+        launchTimeout: Int = 45,
+        launcher: [String] = launcher
     ) -> String {
         func quoted(_ url: URL) -> String { CommandGrammar.posixQuoted(url.path(percentEncoded: false)) }
         return """
@@ -456,6 +468,11 @@ enum AppUpdates {
         PREVIOUS=\(quoted(previous))
         MARKER=\(quoted(marker))
         PID=\(pid)
+
+        # Every path below starts a bundle through this one function.
+        launch() {
+            \(launcher.map(CommandGrammar.posixQuoted).joined(separator: " ")) "$1" 2>/dev/null || true
+        }
 
         # Wait for the app to actually be gone. Moving a bundle out from under a running process is
         # survivable on macOS but leaves the old code running against the new resources.
@@ -477,18 +494,18 @@ enum AppUpdates {
 
         if ! mv "$CURRENT" "$PREVIOUS"; then
             # Nothing has moved, so the running build is still exactly where it was.
-            open -n "$CURRENT" 2>/dev/null || true
+            launch "$CURRENT"
             exit 1
         fi
 
         if ! mv "$STAGED" "$CURRENT"; then
             # The only window in which the real path holds nothing. Put it back and stop.
             mv "$PREVIOUS" "$CURRENT"
-            open -n "$CURRENT" 2>/dev/null || true
+            launch "$CURRENT"
             exit 1
         fi
 
-        open -n "$CURRENT" 2>/dev/null || true
+        launch "$CURRENT"
 
         # The new build writes the marker as soon as it has finished launching. No marker means it
         # crashed on the way up, or refused to start at all, and the old one goes back.
@@ -505,7 +522,7 @@ enum AppUpdates {
         # that turns out to be about something else is still diagnosable.
         rm -rf "$STAGED"
         if mv "$CURRENT" "$STAGED" && mv "$PREVIOUS" "$CURRENT"; then
-            open -n "$CURRENT" 2>/dev/null || true
+            launch "$CURRENT"
         fi
         exit 2
         """
@@ -517,13 +534,27 @@ enum AppUpdates {
     }
 
     /// Write the swap helper and start it detached, then it is out of this process's hands.
-    static func startSwap(staged: Staged, current: URL, marker: URL) throws {
+    ///
+    /// Only ever for the bundle this process runs from: the helper waits for this process to exit
+    /// and then moves `current`, so any other bundle would be swapped under a process that is not
+    /// running out of it. The same check is what stops a test that forgot to replace this from
+    /// starting a helper over its fake bundles.
+    static func startSwap(
+        staged: Staged, current: URL, marker: URL,
+        launcher: [String] = launcher,
+        runningFrom running: URL = Bundle.main.bundleURL
+    ) throws {
+        guard current.standardizedFileURL.path(percentEncoded: false)
+                == running.standardizedFileURL.path(percentEncoded: false) else {
+            throw InstallFailure("\(current.lastPathComponent) is not the bundle Legion Control is running from, so the update helper was not started.")
+        }
         let script = swapScript(
             current: current,
             staged: staged.bundle,
             previous: staged.previous,
             marker: marker,
-            pid: ProcessInfo.processInfo.processIdentifier
+            pid: ProcessInfo.processInfo.processIdentifier,
+            launcher: launcher
         )
         let helper = URL(fileURLWithPath: NSTemporaryDirectory())
             .appending(path: "legion-control-swap-\(UUID().uuidString).sh")

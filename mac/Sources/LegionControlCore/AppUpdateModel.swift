@@ -327,7 +327,9 @@ final class AppUpdateModel {
         failure = nil
         let marker = AppUpdates.launchMarkerURL(support: supportDirectory)
         do {
-            try AppUpdates.rollBack(to: previous, current: bundleURL, marker: marker)
+            // Through the same seam as an install, so nothing here can start the real helper unless
+            // the app itself asked for it.
+            try AppUpdates.rollBack(to: previous, current: bundleURL, marker: marker, start: performSwap)
             quit()
         } catch let problem as AppUpdates.InstallFailure {
             failure = problem.message

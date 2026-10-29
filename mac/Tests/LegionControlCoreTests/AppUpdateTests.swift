@@ -154,6 +154,31 @@ struct AppUpdateTests {
     }
 
     // MARK: - The swap
+    //
+    // None of these lets the helper near LaunchServices. Every one hands it a launcher that writes
+    // down what it was asked to start, because the real `open -n` pointed at these fake bundles has
+    // macOS report each one as an app that quit unexpectedly, in front of whoever runs the tests.
+
+    /// A stand-in for `open -n`: it writes each bundle it is asked to start to a log, then runs
+    /// `then` with the bundle as `$1` and the log as `$LOG`.
+    static func recordingLauncher(in root: URL, then script: String = "") throws -> (argv: [String], log: URL) {
+        let log = root.appending(path: "launched.log")
+        let launcher = root.appending(path: "launch.sh")
+        let text = "LOG=\(CommandGrammar.posixQuoted(log.path))\nprintf '%s\\n' \"$1\" >> \"$LOG\"\n" + script
+        try Data(text.utf8).write(to: launcher)
+        return (["/bin/sh", launcher.path], log)
+    }
+
+    /// What the recording launcher was asked to start, in order.
+    static func launched(_ log: URL) -> [String] {
+        ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+
+    static func runHelper(_ script: String, in root: URL) async throws -> CommandResult {
+        let scriptURL = root.appending(path: "swap.sh")
+        try Data(script.utf8).write(to: scriptURL)
+        return await Shell.run(executable: "/bin/sh", arguments: [scriptURL.path], timeout: 30)
+    }
 
     @Test("the swap helper leaves exactly one whole bundle at the real path, whatever happens")
     func swapHelperSucceeds() async throws {
@@ -166,23 +191,24 @@ struct AppUpdateTests {
         try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
         try Self.makeBundle(at: staged, identifier: "id", executable: "LegionControl", version: "1.4.0")
 
-        // The marker is written straight away, standing in for a new build that came up.
+        // The old build's own proof is there before the swap, and the helper has to clear it: a
+        // marker left over from the last launch must never read as the new build coming up.
         try Data("ok".utf8).write(to: marker)
-        let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 2)
-        // The marker is removed by the helper before it launches, so it has to be recreated by
-        // something. A background writer stands in for the new build's own launch.
-        let scriptURL = root.appending(path: "swap.sh")
-        try Data(script.utf8).write(to: scriptURL)
+        // The launch stands in for the new build coming up and writing its marker. It can only
+        // happen after the helper has cleared the old one, so nothing races the helper's own rm.
+        let marked = CommandGrammar.posixQuoted(marker.path)
+        let launch = try Self.recordingLauncher(in: root, then: """
+            [ -f \(marked) ] && echo stale-marker >> "$LOG"
+            printf ok > \(marked)
 
-        let writer = Task.detached {
-            try? await Task.sleep(for: .milliseconds(300))
-            try? Data("ok".utf8).write(to: marker)
-        }
-        let run = await Shell.run(executable: "/bin/sh", arguments: [scriptURL.path], timeout: 30)
-        _ = await writer.result
+            """)
+        let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 2,
+                                           launcher: launch.argv)
+        let run = try await Self.runHelper(script, in: root)
 
         #expect(run.exitCode == 0)
+        #expect(Self.launched(launch.log) == [current.path(percentEncoded: false)])
         // The new build is at the real path and the old one is kept beside it.
         #expect(AppUpdates.version(ofBundleAt: current) == "1.4.0")
         #expect(AppUpdates.version(ofBundleAt: previous) == "1.3.0")
@@ -201,13 +227,14 @@ struct AppUpdateTests {
         try Self.makeBundle(at: staged, identifier: "id", executable: "LegionControl", version: "1.4.0")
 
         // Nothing ever writes the marker: the new build crashed on the way up.
+        let launch = try Self.recordingLauncher(in: root)
         let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1)
-        let scriptURL = root.appending(path: "swap.sh")
-        try Data(script.utf8).write(to: scriptURL)
-
-        let run = await Shell.run(executable: "/bin/sh", arguments: [scriptURL.path], timeout: 30)
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1,
+                                           launcher: launch.argv)
+        let run = try await Self.runHelper(script, in: root)
         #expect(run.exitCode == 2)
+        // The new build was started once, and then the old one, back at the same path.
+        #expect(Self.launched(launch.log) == [current.path(percentEncoded: false), current.path(percentEncoded: false)])
         // The build that worked is back at the real path, and the one that did not is kept for
         // diagnosis rather than deleted.
         #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
@@ -225,16 +252,16 @@ struct AppUpdateTests {
         let marker = root.appending(path: "launched-ok")
         try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
 
+        let launch = try Self.recordingLauncher(in: root)
         let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1)
-        let scriptURL = root.appending(path: "swap.sh")
-        try Data(script.utf8).write(to: scriptURL)
-
-        let run = await Shell.run(executable: "/bin/sh", arguments: [scriptURL.path], timeout: 30)
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1,
+                                           launcher: launch.argv)
+        let run = try await Self.runHelper(script, in: root)
         #expect(run.exitCode == 1)
         // The one window where the real path could hold nothing is closed by putting the old bundle
-        // straight back.
+        // straight back, and that is the one launch.
         #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
+        #expect(Self.launched(launch.log) == [current.path(percentEncoded: false)])
     }
 
     @Test("a live old app aborts the helper without changing bundles, backups, marker or launching")
@@ -249,6 +276,10 @@ struct AppUpdateTests {
             try Self.makeBundle(at: bundle, identifier: "id", executable: "LegionControl", version: version)
         }
         try Data("existing launch proof".utf8).write(to: marker)
+        // The launcher lives outside the tree being compared, so writing it changes nothing there.
+        let tools = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tools) }
+        let launch = try Self.recordingLauncher(in: tools)
         let snapshot = try Self.fileSnapshot(root)
 
         let oldApp = Process()
@@ -259,20 +290,43 @@ struct AppUpdateTests {
         }
         try oldApp.run()
         defer { if oldApp.isRunning { oldApp.terminate() } }
-        let launched = root.appending(path: "unexpected-launch")
-        // A shell function captures every attempted launch without opening any real application.
-        let intercept = "open() { printf launched > " + CommandGrammar.posixQuoted(launched.path) + "; }\n"
-        let script = intercept + AppUpdates.swapScript(
+        let script = AppUpdates.swapScript(
             current: current, staged: staged, previous: previous, marker: marker,
-            pid: oldApp.processIdentifier, exitTimeout: 1, launchTimeout: 1
+            pid: oldApp.processIdentifier, exitTimeout: 1, launchTimeout: 1, launcher: launch.argv
         )
         let run = await Shell.run(executable: "/bin/sh", arguments: ["-c", script], timeout: 10)
         #expect(run.exitCode == 3)
         #expect(oldApp.isRunning)
-        #expect(!FileManager.default.fileExists(atPath: launched.path))
+        #expect(Self.launched(launch.log).isEmpty)
         #expect(try Self.fileSnapshot(root) == snapshot)
         oldApp.terminate()
         for await _ in exited { break }
+    }
+
+    @Test("the helper is never started for a bundle this process is not running from")
+    func startSwapRefusesAnotherBundle() throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let current = root.appending(path: "Legion Control.app")
+        let staged = root.appending(path: "Legion Control.new.app")
+        let marker = root.appending(path: "launched-ok")
+        try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
+        try Self.makeBundle(at: staged, identifier: "id", executable: "LegionControl", version: "1.4.0")
+        let tools = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tools) }
+        let launch = try Self.recordingLauncher(in: tools)
+        let snapshot = try Self.fileSnapshot(root)
+
+        // This process is the test runner, not anything in that directory, so the helper that would
+        // wait for it to exit and then move those bundles is refused before it is even written.
+        #expect(throws: AppUpdates.InstallFailure.self) {
+            try AppUpdates.startSwap(
+                staged: .init(bundle: staged, previous: root.appending(path: "Legion Control.previous.app"), version: "1.4.0"),
+                current: current, marker: marker, launcher: launch.argv
+            )
+        }
+        #expect(try Self.fileSnapshot(root) == snapshot)
+        #expect(Self.launched(launch.log).isEmpty)
     }
 
     @Test("rollback hands reversed bundles to the helper without deleting existing staging or launch proof")

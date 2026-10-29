@@ -103,4 +103,18 @@ struct AppModelTests {
         #expect(outcome.isError)
         #expect(outcome.text.contains("did not happen"))
     }
+
+    @Test("opening the setup or the private settings goes through the one opener, which a test replaces")
+    func editorOpenerIsInjected() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try Self.app(Self.twoMachines, in: home)
+        // Nothing reaches /usr/bin/open: the paths are only written down.
+        var opened: [String] = []
+        app.openInEditor = { opened.append($0) }
+
+        app.openConfigInEditor()
+        app.openBindingsInEditor()
+        #expect(opened == [app.config.path, app.bindings.path])
+    }
 }
