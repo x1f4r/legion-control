@@ -16,7 +16,7 @@
       }
     },
     {
-      "id": "wake-attic-box",
+      "id": "wake-laptop",
       "name": "Wake the attic laptop",
       "wol": {
         "mac": "02:00:00:00:00:02",

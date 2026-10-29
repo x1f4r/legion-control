@@ -12,7 +12,7 @@
   "identityFile": "~/.ssh/legion-control_ed25519",
 
   "machines": {
-    "attic-box": { "identityFile": "~/.ssh/id_attic", "sshAlias": "attic-box-lan" },
-    "router-flat": { "identityFile": "~/.ssh/id_router" }
+    "laptop": { "identityFile": "~/.ssh/id_attic", "sshAlias": "laptop-lan" },
+    "nas": { "identityFile": "~/.ssh/id_nas" }
   }
 }

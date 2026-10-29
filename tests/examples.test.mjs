@@ -33,7 +33,7 @@ const AGENT_CONFIGS = {
 };
 const BASES = { linux: '/home/me/.legion-control', mac: '/Users/me/.legion-control', windows: 'C:\\Users\\me\\.legion-control' };
 // The machine of the shared setup each agent config is the config of, where it is one.
-const CONFIG_OF = { 'pi-flat': 'agent-config-helper.json' };
+const CONFIG_OF = { pi: 'agent-config-helper.json' };
 
 const setup = json('controller-config.json');
 const bindings = json('bindings.json');
@@ -46,6 +46,13 @@ function absolute(platform, value) {
   return shape.test(value) && !value.split(/[\\/]/).includes('..') && !/[~$%]/.test(value);
 }
 const launcher = (platform, value) => absolute(platform, value) && (platform === 'windows' ? /\\bin\\launcher\.mjs$/ : /\/bin\/launcher\.mjs$/).test(value);
+
+// The placeholders the contract's newer fixtures and vectors are written with, for the values
+// scripts/check-private-data.mjs cannot tell from real ones: a machine's name, an ssh user and a
+// MAC address. 02: is the locally administered prefix, which no network card ships with.
+const PLACEHOLDER_MACHINES = new Set(['tower', 'pi', 'nas', 'laptop', 'old-box', 'studio', 'shed', 'tv']);
+const PLACEHOLDER_USER = 'me';
+const PLACEHOLDER_MAC = /^02:00:00:00:00:0\d$/;
 
 test('every example is one the tests here check', () => {
   const names = fs.readdirSync(examples).filter(name => name.endsWith('.json')).sort();
@@ -127,4 +134,27 @@ test('an agent config example of a helper holds every wake action the shared set
     }
     assert.ok(asked > 0, `nothing in the setup asks ${helperId} to wake anything`);
   }
+});
+
+test('the examples name only placeholder machines, users and MAC addresses', () => {
+  // A helper, bindings.self and bindings.machines may only name a machine of the setup, which the
+  // tests above hold them to, so the setup's own machines are the ones to check.
+  for (const { id } of setup.machines) assert.ok(PLACEHOLDER_MACHINES.has(id), `controller-config.json has the machine ${id}, which is not a placeholder name`);
+  let seen = 0;
+  const visit = (name, where, value) => {
+    if (Array.isArray(value)) value.forEach((each, index) => visit(name, `${where}[${index}]`, each));
+    else if (value && typeof value === 'object') {
+      for (const [key, each] of Object.entries(value)) {
+        if (key === 'user' && typeof each === 'string') {
+          seen += 1;
+          assert.equal(each, PLACEHOLDER_USER, `${name}: ${where}.user is ${each}`);
+        } else if (key === 'mac' && typeof each === 'string') {
+          seen += 1;
+          assert.match(each, PLACEHOLDER_MAC, `${name}: ${where}.mac is ${each}`);
+        } else visit(name, `${where}.${key}`, each);
+      }
+    }
+  };
+  for (const name of fs.readdirSync(examples).filter(each => each.endsWith('.json'))) visit(name, '$', json(name));
+  assert.ok(seen > 0, 'no example names a user or a MAC address');
 });
