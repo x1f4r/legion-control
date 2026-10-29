@@ -82,8 +82,13 @@ test('Mac uninstaller names what else removing the agent home would delete', { s
 
   const agentOnly = uninstall();
   assert.equal(agentOnly.status, 0, agentOnly.stderr);
-  assert.match(agentOnly.stdout, /Remove those too, if that is what you want:\n {4}rm -rf .+\n\n {2}Put the job back:\n/);
+  const hint = /Remove those too, if that is what you want:\n {4}(rm -rf .+)\n\n {2}Put the job back:\n/.exec(agentOnly.stdout);
+  assert.ok(hint, agentOnly.stdout);
   assert.doesNotMatch(agentOnly.stdout, /not the agent's/);
+  // Pasted into a shell, the hint removes the agent home and nothing else, spaces and all. The
+  // shell only splits it into words here; nothing runs it.
+  const words = spawnSync('bash', ['-c', `set -- ${hint[1]}; printf '%s\\0' "$@"`], { encoding: 'utf8' });
+  assert.deepEqual(words.stdout.split('\0').slice(0, -1), ['rm', '-rf', base]);
 
   // A Mac releases are cut on: its keys and the private terms live in the same directory.
   fs.writeFileSync(path.join(base, 'release-signing.key'), 'key\n');

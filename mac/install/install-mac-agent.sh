@@ -162,7 +162,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
   printf '\n  The agent tree and its state were left in place, the Mac app still uses them:\n'
   printf '    %s\n' "$BASE"
   printf '\n  Remove those too, if that is what you want:\n'
-  printf '    rm -rf %s\n' "$BASE"
+  # Quoted for the shell it is pasted into. Unquoted, a home with a space in it
+  # turns the line into one that deletes two other paths.
+  printf '    rm -rf %q\n' "$BASE"
   # The Mac releases are cut on keeps its signing keys in the same directory,
   # and the private terms the private-data check reads. None of them is the
   # agent's and a reinstall brings none of them back, so they are named before
