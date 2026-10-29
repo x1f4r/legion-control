@@ -454,7 +454,8 @@ struct AppUpdateTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let tools = try Self.temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: tools) }
-        let current = root.appending(path: "Legion Control.app")
+        // A directory URL, with the trailing slash the running app's own bundle URL carries.
+        let current = root.appending(path: "Legion Control.app", directoryHint: .isDirectory)
         let staged = root.appending(path: "Legion Control.new.app")
         let previous = root.appending(path: "Legion Control.previous.app")
         let marker = root.appending(path: "launched-ok")
@@ -467,9 +468,11 @@ struct AppUpdateTests {
         try FileManager.default.createSymbolicLink(at: staged.appending(path: "Contents/MacOS/hang"),
                                                    withDestinationURL: URL(fileURLWithPath: "/bin/sleep"))
         let started = CommandGrammar.posixQuoted(starting.path)
+        // Started by its canonical path, as LaunchServices starts an app, whatever the helper wrote.
         let launch = try Self.recordingLauncher(in: tools, then: """
-            if [ -e "$1/Contents/MacOS/hang" ]; then
-                "$1/Contents/MacOS/hang" 30 </dev/null >/dev/null 2>&1 &
+            bundle="${1%/}"
+            if [ -e "$bundle/Contents/MacOS/hang" ]; then
+                "$bundle/Contents/MacOS/hang" 30 </dev/null >/dev/null 2>&1 &
                 printf '%s\\n' "$!" > \(started)
             elif kill -0 "$(cat \(started))" 2>/dev/null; then
                 echo new-build-still-running >> "$LOG"
@@ -486,7 +489,8 @@ struct AppUpdateTests {
 
         #expect(run.exitCode == 2)
         // The old build was started only once the new one had been stopped.
-        #expect(Self.launched(launch.log) == [current.path(percentEncoded: false), current.path(percentEncoded: false)])
+        #expect(current.path(percentEncoded: false).hasSuffix("/"))
+        #expect(Self.launched(launch.log) == [AppUpdates.bundlePath(current), AppUpdates.bundlePath(current)])
         #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
         #expect(AppUpdates.version(ofBundleAt: staged) == "1.4.0")
         #expect(kill(hung, 0) != 0)

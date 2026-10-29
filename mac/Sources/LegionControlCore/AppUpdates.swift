@@ -624,7 +624,7 @@ enum AppUpdates {
         launchTimeout: Int = 45,
         launcher: [String] = launcher
     ) -> String {
-        func quoted(_ url: URL) -> String { CommandGrammar.posixQuoted(url.path(percentEncoded: false)) }
+        func quoted(_ url: URL) -> String { CommandGrammar.posixQuoted(bundlePath(url)) }
         return """
         #!/bin/sh
         set -u
@@ -724,6 +724,15 @@ enum AppUpdates {
         """
     }
 
+    /// A bundle's path as the helper and `ps` spell it: without the trailing slash a directory URL
+    /// carries. The running app's own bundle URL has one, and `"$CURRENT"/*` written with it would
+    /// never match the executable path inside it.
+    static func bundlePath(_ url: URL) -> String {
+        let path = url.standardizedFileURL.path(percentEncoded: false)
+        guard path.count > 1, path.hasSuffix("/") else { return path }
+        return String(path.dropLast())
+    }
+
     /// Where the new build says "I came up".
     static func launchMarkerURL(support: URL) -> URL {
         support.appending(path: "launched-ok")
@@ -750,8 +759,7 @@ enum AppUpdates {
         runningFrom running: URL = Bundle.main.bundleURL,
         onExit: (@Sendable (Int32) -> Void)? = nil
     ) throws {
-        guard current.standardizedFileURL.path(percentEncoded: false)
-                == running.standardizedFileURL.path(percentEncoded: false) else {
+        guard bundlePath(current) == bundlePath(running) else {
             throw InstallFailure("\(current.lastPathComponent) is not the bundle Legion Control is running from, so the update helper was not started.")
         }
         let script = swapScript(
