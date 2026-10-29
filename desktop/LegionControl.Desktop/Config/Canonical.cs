@@ -79,6 +79,37 @@ public static class Canonical
 
     public static string Hash(byte[] raw) => Sha256Hex(Bytes(raw));
 
+    /// The most a setup document may be, counted on the bytes as given.
+    public const int MaxDocumentBytes = 1048576;
+
+    /// Why a document is refused before anything is stored, sent or adopted, or null when it is not
+    /// (contract section 12): `too-large`, `invalid-utf8`, `empty` or `not-a-json-object`, the first
+    /// that applies.
+    ///
+    /// Size is judged on the bytes as given, because that is what was read off the wire; the rest
+    /// on the canonical bytes, so a byte order mark or a blank line around the document never makes
+    /// it unreadable. A second byte order mark is content, not decoration: one is stripped, the
+    /// text then starts with U+FEFF, and no JSON reader takes that for whitespace.
+    public static string? Rejection(byte[] raw)
+    {
+        if (raw.Length > MaxDocumentBytes) return "too-large";
+        if (!IsValidUtf8(raw)) return "invalid-utf8";
+        var canonical = Bytes(raw);
+        if (canonical.Length == 1) return "empty";
+        DocumentValue parsed;
+        try
+        {
+            parsed = DocumentJson.Read(Encoding.UTF8.GetString(canonical), out _);
+        }
+        catch (DocumentJson.Malformed)
+        {
+            return "not-a-json-object";
+        }
+        return parsed is DocumentObject root && root["version"] is DocumentNumber && root["machines"] is DocumentArray
+            ? null
+            : "not-a-json-object";
+    }
+
     public static string Sha256Hex(byte[] bytes) =>
         Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 }

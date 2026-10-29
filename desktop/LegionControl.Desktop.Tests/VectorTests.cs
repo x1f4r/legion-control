@@ -19,7 +19,7 @@ public class VectorTests
 
     /// The families this client runs. A family joins this list when its port lands here, and from
     /// then on the accounting test holds it to the index exactly.
-    private static readonly string[] Families = { "identifiers", "transport", "launch" };
+    private static readonly string[] Families = { "hash", "identifiers", "transport", "launch" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -87,6 +87,20 @@ public class VectorTests
             ["transport/users"] = input => Valid(Dialled("user", input["value"])),
             ["transport/ports"] = input => Valid(Dialled("port", input["value"])),
 
+            ["hash/vectors"] = input =>
+            {
+                var bytes = Convert.FromBase64String(Text(input["inputBase64"])!);
+                var valid = Canonical.IsValidUtf8(bytes);
+                var reject = Canonical.Rejection(bytes);
+                return new JsonObject
+                {
+                    ["canonicalBase64"] = valid ? Convert.ToBase64String(Canonical.Bytes(bytes)) : null,
+                    ["sha256"] = valid ? Canonical.Hash(bytes) : null,
+                    ["accepted"] = reject is null,
+                    ["reject"] = reject,
+                };
+            },
+
             ["launch/review"] = Launch,
             ["launch/migration"] = input => new JsonObject
             {
@@ -107,10 +121,7 @@ public class VectorTests
     {
         var (family, group, count) = Consumed().Single(entry => $"{entry.Family}/{entry.Group}" == key);
         var adapter = Adapters[key];
-        var file = JsonNode.Parse(Repo.ReadContract(FileOf(family)))!;
-        var cases = file["groups"]![group]!.AsArray()
-            .Where(entry => entry!["consumers"]!.AsArray().Any(consumer => consumer!.GetValue<string>() == Consumer))
-            .ToList();
+        var cases = Cases(family, group);
 
         var failures = new List<string>();
         foreach (var entry in cases)
@@ -160,11 +171,32 @@ public class VectorTests
         }
     }
 
-    private static string FileOf(string family)
+    /// The cases of one group that name this client, as `{name, input, expect}`. A family in the
+    /// flat layout (`hash`) is one list in which each vector is its own input and carries its own
+    /// expectation, and every consumer runs every vector.
+    private static List<JsonNode?> Cases(string family, string group)
     {
         var index = JsonNode.Parse(Repo.ReadContract("vectors/index.json"))!;
-        return index["families"]!.AsArray().Single(entry => entry!["family"]!.GetValue<string>() == family)!["file"]!
-            .GetValue<string>();
+        var entry = index["families"]!.AsArray().Single(entry => entry!["family"]!.GetValue<string>() == family)!;
+        var file = JsonNode.Parse(Repo.ReadContract(entry["file"]!.GetValue<string>()))!;
+        if (entry["layout"]!.GetValue<string>() == "flat")
+        {
+            return file[group]!.AsArray().Select(vector => (JsonNode?)new JsonObject
+            {
+                ["name"] = vector!["name"]!.DeepClone(),
+                ["input"] = vector.DeepClone(),
+                ["expect"] = new JsonObject
+                {
+                    ["canonicalBase64"] = vector["canonicalBase64"]?.DeepClone(),
+                    ["sha256"] = vector["sha256"]?.DeepClone(),
+                    ["accepted"] = vector["accepted"]!.DeepClone(),
+                    ["reject"] = vector["reject"]?.DeepClone(),
+                },
+            }).ToList();
+        }
+        return file["groups"]![group]!.AsArray()
+            .Where(entry => entry!["consumers"]!.AsArray().Any(consumer => consumer!.GetValue<string>() == Consumer))
+            .ToList();
     }
 
     private static string? Text(JsonNode? node) => node?.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() : null;

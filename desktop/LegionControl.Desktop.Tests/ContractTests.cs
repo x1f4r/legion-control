@@ -5,65 +5,10 @@ using Xunit;
 
 namespace LegionControl.Desktop.Tests;
 
-/// The canonical form, against the vectors the four implementations share.
-///
-/// This is the test that catches a whole class of silent disagreement: a document that hashes one
-/// way here and another way on the machine means this app pushes the same setup forever without
-/// ever agreeing with anybody, and nothing else would notice.
+/// The canonical form: the facts the shared hash vectors do not spell out on their own. The
+/// vectors themselves run in [VectorTests], through the same adapter as every other family.
 public class CanonicalTests
 {
-    public static TheoryData<string, string, string> Vectors()
-    {
-        var data = new TheoryData<string, string, string>();
-        var json = Value.Parse(File.ReadAllText(Repo.HashVectors));
-        foreach (var vector in json["vectors"].AsArray())
-        {
-            var name = vector["name"].AsText() ?? "?";
-            var input = vector["inputBase64"].AsText();
-            var hash = vector["sha256"].AsText();
-            if (input is null) continue;
-            data.Add(name, input, hash ?? "");
-        }
-        return data;
-    }
-
-    [Theory]
-    [MemberData(nameof(Vectors))]
-    public void MatchesTheSharedVectors(string name, string inputBase64, string expected)
-    {
-        var input = Convert.FromBase64String(inputBase64);
-        if (expected.Length == 0)
-        {
-            // A vector with no hash is one the shared file says has none: bytes that are not UTF-8.
-            // This side has to refuse them rather than hash replacement characters, or two
-            // implementations would agree forever about something nobody can read.
-            Assert.False(Canonical.IsValidUtf8(input), $"{name} should not be valid UTF-8");
-            Assert.Throws<Canonical.NotUtf8>(() => Canonical.Bytes(input));
-            return;
-        }
-        Assert.True(Canonical.IsValidUtf8(input), $"{name} should be valid UTF-8");
-        Assert.Equal(expected, Canonical.Hash(input));
-    }
-
-    [Theory]
-    [MemberData(nameof(Vectors))]
-    public void ProducesTheSharedCanonicalBytes(string name, string inputBase64, string expected)
-    {
-        var json = Value.Parse(File.ReadAllText(Repo.HashVectors));
-        var vector = json["vectors"].AsArray().First(entry => entry["name"].AsText() == name);
-        var canonical = vector["canonicalBase64"].AsText();
-        if (canonical is null || expected.Length == 0) return;
-        Assert.Equal(canonical, Convert.ToBase64String(Canonical.Bytes(Convert.FromBase64String(inputBase64))));
-    }
-
-    [Fact]
-    public void EveryVectorIsCovered()
-    {
-        var json = Value.Parse(File.ReadAllText(Repo.HashVectors));
-        Assert.True(json["vectors"].AsArray().Count >= 10,
-            "the shared hash vectors should not have shrunk to nothing");
-    }
-
     [Fact]
     public void TrimsOnlyTheSixAsciiCodePoints()
     {
