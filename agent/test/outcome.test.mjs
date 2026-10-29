@@ -13,7 +13,6 @@ import test from 'node:test';
 import { MUTATING_PHASES, OUTCOMES, producedOutcome } from '../src/contract.mjs';
 import { cli, commandService, fixtureConfig, fixtureData, fresh, withHome, writeConfig } from './helpers.mjs';
 
-
 test('a producer may lower failed to unknown, and nothing else', () => {
   const failed = { ok: false, action: 'failed', reasonCode: 'internal' };
   assert.equal(producedOutcome(failed), 'failed');
