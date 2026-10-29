@@ -50,10 +50,13 @@ class WakeWalkTest {
         directory.deleteRecursively()
     }
 
-    /** An operation center over [file], as a fresh process would build one. */
+    /**
+     * An operation center over [file], as a fresh process would build one. On a clock that stands
+     * still, because the phone's uptime clock is not there off a device.
+     */
     private fun center(): OperationCenter {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined).also { scopes += it }
-        return OperationCenter(OperationStore(file), scope, SilentNotifier)
+        return OperationCenter(OperationStore(file), scope, SilentNotifier, clock = { 0L })
     }
 
     private val home = SiteConfig(id = "home", name = "Home", lanPrefixes = listOf("192.168.1."), broadcast = listOf("192.168.1.255"))

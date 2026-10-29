@@ -50,7 +50,10 @@ class OperationCenterTest {
     /** How many times the service that keeps a change running was asked for. */
     private var keptAlive = 0
     private val keepAlive = KeepAlive { keptAlive++ }
-    private val center = OperationCenter(store, scope, SilentNotifier, keepAlive)
+
+    /** Milliseconds on the clock the wall clock cannot move. Still, unless a test moves it. */
+    private var monotonic = 0L
+    private val center = OperationCenter(store, scope, SilentNotifier, keepAlive, clock = { monotonic })
 
     @After
     fun tearDown() {
@@ -255,11 +258,15 @@ class OperationCenterTest {
     }
 
     /** A restart left pending by an earlier run, asked for [age] milliseconds ago. */
-    private fun leftPending(age: Long, state: TrackedState = TrackedState.OUTCOME_UNKNOWN): OperationRecord {
+    private fun leftPending(
+        age: Long,
+        state: TrackedState = TrackedState.OUTCOME_UNKNOWN,
+        id: String = "3f6b2a9e-0c41-4d7e-b8a5-9e2c1f7d4b60",
+    ): OperationRecord {
         val at = System.currentTimeMillis() - age
         return store.put(
             OperationRecord(
-                id = "3f6b2a9e-0c41-4d7e-b8a5-9e2c1f7d4b60",
+                id = id,
                 machineId = agent.machine.id,
                 machineName = agent.machine.name,
                 intent = OperationIntent(kind = OpKind.RESTART, service = "demo"),
@@ -278,14 +285,66 @@ class OperationCenterTest {
     fun `a change whose watch gave up is followed again without being held`() {
         // Sent hours ago to a machine that has not answered since. Every return to the app follows
         // it again; held, each would keep the phone awake for another half hour asking for nothing.
-        val record = leftPending(age = 3 * 60 * 60_000L, state = TrackedState.DISPATCHED)
-        center.apply(record.id, OperationEvent.GaveUp("Tower never settled it.", System.currentTimeMillis()))
-        assertEquals(TrackedState.OUTCOME_UNKNOWN, store.get(record.id)!!.state)
+        val old = leftPending(age = 3 * 60 * 60_000L, state = TrackedState.DISPATCHED)
+        // And one whose press reads as an hour from now, because the clock was set back since. It is
+        // no younger for that: counted as young, it would be held again on every return until the
+        // clock caught up with it.
+        val ahead = leftPending(
+            age = -60 * 60_000L,
+            state = TrackedState.DISPATCHED,
+            id = "9b1c7e40-5d2a-4f86-a3e9-0c6d8b2f1a57",
+        )
+        for (record in listOf(old, ahead)) {
+            center.apply(record.id, OperationEvent.GaveUp("Tower never settled it.", System.currentTimeMillis()))
+            assertEquals(TrackedState.OUTCOME_UNKNOWN, store.get(record.id)!!.state)
+        }
         agent.op = { CompletableDeferred<Result<OpRecord>>().await() }
 
         center.resume(listOf(agent))
 
-        assertEquals("still followed: the machine may yet say how it ended", listOf(record.id), agent.reads)
+        assertEquals(
+            "still followed: the machine may yet say how they ended",
+            setOf(old.id, ahead.id),
+            agent.reads.toSet(),
+        )
+        assertEquals(0, keepAlive.holds.value)
+        assertEquals("the service is never asked for", 0, keptAlive)
+    }
+
+    @Test
+    fun `a change sent here is held through its watch however the clock is set while it is sent`() {
+        val answer = CompletableDeferred<Result<OpRecord>>()
+        agent.op = { answer.await() }
+        val record = press {
+            // The network sets the clock back an hour while the reply is on its way, so the press
+            // reads as an hour from now. The change is no less under way for that.
+            store.records.value.single().let { store.put(it.copy(startedAt = it.startedAt + 60 * 60_000L)) }
+            ambiguous()
+        }
+
+        assertEquals(listOf(record.id), agent.reads)
+        assertEquals("timed from the press on a clock nothing sets", 1, keepAlive.holds.value)
+
+        answer.complete(Result.success(finished(record.id, "restarted")))
+        assertEquals(true, store.get(record.id)!!.succeeded)
+        assertEquals(0, keepAlive.holds.value)
+    }
+
+    @Test
+    fun `a change asked for here and given up on is not held again after the clock is set back`() {
+        // Asked for in this process three hours ago, sent, and its watch gave up. The clock has
+        // since been set back to read five minutes after the press, which would make the change
+        // young again if the time on its record were all there was to go on.
+        val record = center.record(agent, OperationIntent(kind = OpKind.RESTART, service = "demo"), "Demo", "this phone")
+        center.apply(record.id, OperationEvent.Dispatched(trackable = true, at = record.startedAt))
+        center.apply(record.id, OperationEvent.GaveUp("Tower never settled it.", record.startedAt))
+        monotonic += 3 * 60 * 60_000L
+        store.get(record.id)!!.let { store.put(it.copy(startedAt = System.currentTimeMillis() - 5 * 60_000L)) }
+        agent.op = { CompletableDeferred<Result<OpRecord>>().await() }
+
+        center.resume(listOf(agent))
+
+        assertEquals("still followed", listOf(record.id), agent.reads)
         assertEquals(0, keepAlive.holds.value)
         assertEquals("the service is never asked for", 0, keptAlive)
     }

@@ -34,7 +34,9 @@ class ChangesOnScreenTest {
     private val directory: File = Files.createTempDirectory("screen").toFile()
     private val store = OperationStore(File(directory, "operations.json"))
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
-    private val center = OperationCenter(store, scope, SilentNotifier)
+    // The phone's uptime clock is not there off a device, so one that stands still: every change
+    // pressed here is as young as a change gets.
+    private val center = OperationCenter(store, scope, SilentNotifier, clock = { 0L })
 
     @After
     fun tearDown() {

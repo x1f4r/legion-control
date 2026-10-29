@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.ui
 
+import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -57,6 +58,13 @@ class OperationCenter(
      * the process halfway through either.
      */
     private val keepAlive: KeepAlive = KeepAlive(),
+    /**
+     * Milliseconds, for how long ago a change asked for in this process was asked for. One that
+     * counts up whatever the wall clock does, so a clock set by hand or by the network cannot make
+     * an old change look young or a young one old; and one that counts the time the phone slept,
+     * which is most of the time between a watch giving up and the next return to the app.
+     */
+    private val clock: () -> Long = SystemClock::elapsedRealtime,
 ) {
     val records: StateFlow<List<OperationRecord>> get() = store.records
 
@@ -73,6 +81,9 @@ class OperationCenter(
 
     /** The ids currently being worked on here, so nothing is dispatched or reconciled twice. */
     private val inFlight = ConcurrentHashMap.newKeySet<String>()
+
+    /** When each change asked for in this process was written down, on [clock], by id. */
+    private val askedAt = ConcurrentHashMap<String, Long>()
 
     init {
         scope.launch { store.records.collect { observed = it } }
@@ -119,9 +130,11 @@ class OperationCenter(
         wakeTarget: String? = null,
     ): OperationRecord {
         val now = System.currentTimeMillis()
+        val id = Contract.newOpId()
+        askedAt[id] = clock()
         return store.put(
             OperationRecord(
-                id = Contract.newOpId(),
+                id = id,
                 machineId = client.machine.id,
                 machineName = client.machine.name,
                 intent = intent,
@@ -280,10 +293,18 @@ class OperationCenter(
 
     /**
      * Whether the change was asked for recently enough to be still under way: within one watch's
-     * length of the press. The wall clock, because the press may have been in an earlier process.
+     * length of the press.
+     *
+     * Timed on [clock] when the press was in this process, which is nearly always. One left by an
+     * earlier process has only the wall-clock time on its record, and there a press that reads as
+     * later than now says the clock was set back since, not that the change is young: counted as
+     * young, it would be held again on every return to the app until the clock caught up with it.
      */
     private val OperationRecord.mayBeInFlight: Boolean
-        get() = System.currentTimeMillis() - startedAt < WATCH_BUDGET_MS
+        get() {
+            val age = askedAt[id]?.let { clock() - it } ?: (System.currentTimeMillis() - startedAt)
+            return age in 0 until WATCH_BUDGET_MS
+        }
 
     private suspend fun watch(client: MachineClient, id: String) {
         val deadline = System.currentTimeMillis() + WATCH_BUDGET_MS
