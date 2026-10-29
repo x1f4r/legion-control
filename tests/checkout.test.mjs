@@ -61,3 +61,24 @@ test('scripts are written out with the line endings they run with, in every chec
     'somewhere/gradlew.bat: text: unset', 'somewhere/gradlew.bat: eol: unspecified',
   ].join('\n') + '\n');
 });
+
+test('every file the agent tarball carries is written out with LF endings, in every checkout', () => {
+  // scripts/package-agent.mjs packs these as the checkout has them, and its signed manifest lists
+  // each one's digest. A file a Windows checkout gave CRLF endings would change the tarball and the
+  // digests with it, so a bundle built there would not be the bundle built anywhere else. The list
+  // is read from the packager itself, so a folder it starts to pack is held to the same rule.
+  const packager = fs.readFileSync(path.join(repository, 'scripts', 'package-agent.mjs'), 'utf8');
+  const [, list] = /for \(const relative of \[([^\]]*)\]\) await copy\(relative\)/.exec(packager) ?? [];
+  assert.ok(list, 'scripts/package-agent.mjs no longer says which parts of agent/ it packs');
+  const packed = [...list.matchAll(/'([^']+)'/g)].map(([, part]) => `agent/${part}`);
+  assert.deepEqual(packed, ['agent/src', 'agent/install', 'agent/package.json']);
+  const files = git('ls-files', '--eol', '--', ...packed).split('\n').filter(Boolean);
+  for (const file of ['agent/install/legion-control-update.service', 'agent/install/legion-control-update.timer', 'agent/install/t3-code.service', 'agent/package.json', 'agent/src/index.mjs']) {
+    assert.ok(files.some(line => line.endsWith(`\t${file}`)), `${file} is not in the checkout`);
+  }
+  for (const line of files) {
+    const [, index, attributes, file] = /^i\/(\S*)\s+w\/\S*\s+attr\/(.*?)\s*\t(.+)$/.exec(line);
+    assert.equal(attributes, 'text eol=lf', `${file} goes into the agent tarball with no LF rule`);
+    assert.equal(index, 'lf', `${file} is stored with ${index} line endings`);
+  }
+});
