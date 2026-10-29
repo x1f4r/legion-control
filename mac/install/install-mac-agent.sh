@@ -163,6 +163,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
   printf '    %s\n' "$BASE"
   printf '\n  Remove those too, if that is what you want:\n'
   printf '    rm -rf %s\n' "$BASE"
+  # The Mac releases are cut on keeps its signing keys in the same directory,
+  # and the private terms the private-data check reads. None of them is the
+  # agent's and a reinstall brings none of them back, so they are named before
+  # anyone runs that line.
+  KEPT=()
+  for kept in release-signing.key android-release.jks android-release.pw private; do
+    if [ -e "$BASE/$kept" ]; then KEPT+=("$BASE/$kept"); fi
+  done
+  if [ "${#KEPT[@]}" -gt 0 ]; then
+    printf '\n  %s\n' "That also deletes these, which are not the agent's. Move them out first:"
+    for kept in "${KEPT[@]}"; do printf '    %s\n' "$kept"; done
+  fi
   printf '\n  Put the job back:\n'
   printf '    %s\n\n' "$SCRIPT_DIR/install-mac-agent.sh"
   exit 0

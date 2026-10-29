@@ -65,3 +65,39 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
     assert.deepEqual(JSON.parse(extracted.stdout), [process.execPath, path.join(base, 'bin', 'launcher.mjs'), 'cycle']);
   }
 });
+
+test('Mac uninstaller names what else removing the agent home would delete', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion mac uninstall '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const base = path.join(home, '.legion-control');
+  fs.mkdirSync(path.join(base, 'agent'), { recursive: true });
+  // Every launchctl command goes to a stub that has nothing loaded, so no launchd job on the test
+  // machine is asked about or unloaded.
+  const commands = path.join(root, 'commands');
+  fs.mkdirSync(commands);
+  fs.writeFileSync(path.join(commands, 'launchctl'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const env = { ...process.env, HOME: home, LEGIONCTL_HOME: base, PATH: `${commands}:${process.env.PATH}` };
+  const uninstall = () => spawnSync('bash', [path.join(repository, 'mac', 'install', 'install-mac-agent.sh'), '--uninstall'], { encoding: 'utf8', env });
+
+  const agentOnly = uninstall();
+  assert.equal(agentOnly.status, 0, agentOnly.stderr);
+  assert.match(agentOnly.stdout, /Remove those too, if that is what you want:\n {4}rm -rf .+\n\n {2}Put the job back:\n/);
+  assert.doesNotMatch(agentOnly.stdout, /not the agent's/);
+
+  // A Mac releases are cut on: its keys and the private terms live in the same directory.
+  fs.writeFileSync(path.join(base, 'release-signing.key'), 'key\n');
+  fs.writeFileSync(path.join(base, 'android-release.jks'), 'keystore\n');
+  fs.mkdirSync(path.join(base, 'private'));
+  fs.writeFileSync(path.join(base, 'private', 'terms.txt'), 'terms\n');
+  const releasing = uninstall();
+  assert.equal(releasing.status, 0, releasing.stderr);
+  const named = /rm -rf .+\n\n {2}That also deletes these, which are not the agent's\. Move them out first:\n((?: {4}.+\n)+)/.exec(releasing.stdout);
+  assert.ok(named, releasing.stdout);
+  assert.deepEqual(named[1].trimEnd().split('\n').map(line => line.trim()), [
+    path.join(base, 'release-signing.key'),
+    path.join(base, 'android-release.jks'),
+    path.join(base, 'private'),
+  ]);
+  assert.equal(fs.readFileSync(path.join(base, 'private', 'terms.txt'), 'utf8'), 'terms\n');
+});
