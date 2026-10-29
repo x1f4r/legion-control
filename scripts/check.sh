@@ -28,7 +28,17 @@ if [[ "$component" == all || "$component" == android ]]; then
   if [[ -n "${LEGION_ANDROID_JAVA_HOME:-}" ]]; then
     export JAVA_HOME="$LEGION_ANDROID_JAVA_HOME"
   elif [[ "$(uname -s)" == Darwin ]]; then
-    export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
+    # Assigned apart from the export, which would hide a java_home that found no JDK at all.
+    JAVA_HOME="$(/usr/libexec/java_home -v 21)"
+    export JAVA_HOME
+  fi
+  # And then the JDK is asked, because java_home answers a version it does not have with the newest
+  # JDK it does, and AGP refuses anything but 21 with an error that does not say so.
+  java="${JAVA_HOME:+$JAVA_HOME/bin/}java"
+  java_version="$("$java" -XshowSettings:properties -version 2>&1 | sed -n 's/.*java\.specification\.version = //p' | head -1 || true)"
+  if [[ "$java_version" != 21 ]]; then
+    echo "The Android checks need JDK 21, and ${JAVA_HOME:-the java on PATH} is ${java_version:+Java }${java_version:-no JDK that runs}. Point LEGION_ANDROID_JAVA_HOME at a JDK 21." >&2
+    exit 1
   fi
   (cd android && ./gradlew :app:testDebugUnitTest :app:testReleaseUnitTest :app:lintDebug --console=plain)
 fi

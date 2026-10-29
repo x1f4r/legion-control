@@ -60,3 +60,40 @@ test('the agent check runs the contract tests after the validator and the genera
   assert.notEqual(all.status, 0, all.stdout);
   assert.equal(all.calls.some((call) => call.startsWith('gradlew')), false, 'nothing after the failing leg runs');
 });
+
+// A JDK that answers the property query the way a real one does, on stderr, for one version.
+function jdk(write, name, version) {
+  write(`${name}/bin/java`, `#!/bin/sh\nprintf 'Property settings:\\n    java.specification.version = ${version}\\n    java.version = ${version}.0.1\\n\\nopenjdk version "${version}.0.1"\\n' >&2\n`, 0o755);
+}
+
+test('the Android check stops before Gradle unless the JDK it runs on is 21', { skip: process.platform === 'win32' }, (t) => {
+  const { root, write, run } = scratch(t);
+  jdk(write, 'jdk-17', '17');
+  jdk(write, 'jdk-21', '21');
+
+  const old = run('android', { LEGION_ANDROID_JAVA_HOME: path.join(root, 'jdk-17') });
+  assert.equal(old.status, 1);
+  assert.equal(old.stderr, `The Android checks need JDK 21, and ${path.join(root, 'jdk-17')} is Java 17. Point LEGION_ANDROID_JAVA_HOME at a JDK 21.\n`);
+  assert.deepEqual(old.calls, []);
+
+  const missing = run('android', { LEGION_ANDROID_JAVA_HOME: path.join(root, 'no-jdk') });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /no-jdk is no JDK that runs\./);
+  assert.deepEqual(missing.calls, []);
+
+  const right = run('android', { LEGION_ANDROID_JAVA_HOME: path.join(root, 'jdk-21') });
+  assert.equal(right.status, 0, right.stderr);
+  assert.deepEqual(right.calls, ['gradlew :app:testDebugUnitTest :app:testReleaseUnitTest :app:lintDebug --console=plain', `JAVA_HOME=${path.join(root, 'jdk-21')}`]);
+});
+
+// Off a Mac nothing picks a JDK: the JAVA_HOME the job set up is the one checked. uname says Linux
+// here wherever the test runs.
+test('the Android check off a Mac checks the JAVA_HOME it was given', { skip: process.platform === 'win32' }, (t) => {
+  const { root, write, run } = scratch(t);
+  write('bin/uname', '#!/bin/sh\necho Linux\n', 0o755);
+  jdk(write, 'jdk-26', '26');
+  const result = run('android', { LEGION_ANDROID_JAVA_HOME: '', JAVA_HOME: path.join(root, 'jdk-26') });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /jdk-26 is Java 26\./);
+  assert.deepEqual(result.calls, []);
+});
