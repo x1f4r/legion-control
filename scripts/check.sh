@@ -21,6 +21,9 @@ if [[ "$component" == all || "$component" == agent ]]; then
   node contract/validate.mjs
   node contract/tools/generate.mjs --check
   node --test contract/test/*.test.mjs
+  # Last, so a private value found never hides what the tests above would have said. CI runs it
+  # once more on its own, with the private terms from the repository's secret.
+  node scripts/check-private-data.mjs
 fi
 if [[ "$component" == all || "$component" == mac ]]; then
   swift test --package-path mac
