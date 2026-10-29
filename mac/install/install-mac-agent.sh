@@ -102,6 +102,17 @@ if [ "$(id -u)" -eq 0 ] && [ "$SKIP_SCHEDULER" -ne 1 ]; then
   die "run this as your own user without sudo. It installs a launchd USER agent and writes into \$HOME."
 fi
 
+# The base is a folder of the agent's own, as install-linux.sh insists before it
+# makes everything in it this user's alone; uninstalling here would otherwise
+# suggest an rm -rf of the home directory.
+if [ -d "$BASE" ]; then
+  REAL_BASE="$(cd -- "$BASE" && pwd -P)"
+  REAL_HOME="$(cd -- "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
+  case "$REAL_HOME/" in
+    "${REAL_BASE%/}/"*) die "LEGIONCTL_HOME is $BASE, which is not a folder of the agent's own but holds the home directory. Point it at one, such as \$HOME/.legion-control. Nothing was changed." ;;
+  esac
+fi
+
 # ---------------------------------------------------------------------------
 # Is the job running right now
 # ---------------------------------------------------------------------------

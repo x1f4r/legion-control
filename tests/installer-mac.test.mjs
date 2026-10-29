@@ -114,3 +114,25 @@ test('Mac uninstaller names what else removing the agent home would delete', { s
   ]);
   assert.equal(fs.readFileSync(path.join(base, 'private', 'terms.txt'), 'utf8'), 'terms\n');
 });
+
+// Uninstalling would otherwise suggest an rm -rf of the home directory, and installing would make it
+// this user's alone.
+test('Mac installer refuses a base that holds the home directory', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion mac home base '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
+  const commands = path.join(root, 'commands');
+  fs.mkdirSync(commands);
+  fs.writeFileSync(path.join(commands, 'launchctl'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  for (const args of [['--skip-scheduler'], ['--uninstall']]) {
+    const result = spawnSync('bash', [path.join(repository, 'mac', 'install', 'install-mac-agent.sh'), ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home, LEGIONCTL_HOME: home, LEGION_NODE_BIN: process.execPath, PATH: `${commands}:${process.env.PATH}` },
+    });
+    assert.equal(result.status, 1, `${args.join(' ')}\n${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /which is not a folder of the agent's own but holds the home directory\. .* Nothing was changed\./);
+    assert.doesNotMatch(result.stdout, /rm -rf/);
+  }
+  assert.deepEqual(fs.readdirSync(home), ['bin']);
+});

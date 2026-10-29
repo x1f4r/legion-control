@@ -122,6 +122,17 @@ esac
 case "$BASE$NPM_PREFIX$UNIT_DIR" in
   *$'\n'*|*$'\r'*) die "install paths containing a line break are unsupported." ;;
 esac
+# The base is a folder of the agent's own. Installing makes it and everything
+# in it this user's alone, and uninstalling takes out what it knows by name, so
+# the home directory, or a folder that holds it, would lose its bin and every
+# other account's access to it. Refused before either.
+if [ -d "$BASE" ]; then
+  REAL_BASE="$(cd -- "$BASE" && pwd -P)"
+  REAL_HOME="$(cd -- "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
+  case "$REAL_HOME/" in
+    "${REAL_BASE%/}/"*) die "LEGIONCTL_HOME is $BASE, which is not a folder of the agent's own but holds the home directory. Point it at one, such as \$HOME/.legion-control. Nothing was changed." ;;
+  esac
+fi
 # The units take the port as a bare word, which is only safe for a number.
 if [ "$WITH_T3" -eq 1 ]; then
   case "$PORT" in

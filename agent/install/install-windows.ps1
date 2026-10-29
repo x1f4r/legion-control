@@ -309,7 +309,19 @@ if ($Purge -and -not $Uninstall) {
     throw '-Purge only goes with -Uninstall.'
 }
 
-$nodeCmd = Get-Command 'node.exe' -ErrorAction SilentlyContinue
+# The base is a folder of the agent's own. Installing gives it and everything
+# in it to one account alone, and uninstalling takes out what it knows by name,
+# so a drive, a profile, a folder profiles are kept in or one Windows and
+# programs keep their own files in would lose every other account's access, or
+# its bin folder. Refused before either.
+$sharedFolders = @(Get-ProfileRoot) + @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:APPDATA, $env:LOCALAPPDATA)
+if ($Base -eq [IO.Path]::GetPathRoot($Base + '\').TrimEnd('\') -or
+    @($sharedFolders | Where-Object { $_ -and (Test-Inside $_ @($Base)) }).Count -gt 0) {
+    throw ("LEGIONCTL_HOME is $Base, which is not a folder of the agent's own. Point it at one, such as " +
+        (Join-Path $UserProfile '.legion-control') + ", and run this again. Nothing was changed.")
+}
+
+$nodeCmd =Get-Command 'node.exe' -ErrorAction SilentlyContinue
 if (-not $nodeCmd) {
     $nodeCmd = Get-Command 'node' -ErrorAction SilentlyContinue
 }

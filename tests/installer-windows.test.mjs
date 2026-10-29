@@ -367,6 +367,26 @@ test('the Windows uninstaller removes the launchers and the agent, and keeps its
   assert.equal(taskExists(name), false);
 });
 
+// Given to one account alone, a profile would lose every other account's access, SYSTEM's too, and
+// uninstalling from it would take its bin folder.
+test('the Windows installer refuses a base that is a profile, installing or uninstalling', { skip: process.platform !== 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows profile base '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'bin', 'tool.cmd'), '@echo mine\r\n');
+  const before = accessOf(home);
+  const source = agentSource(root);
+  for (const args of [['-SkipScheduler'], ['-Uninstall'], ['-Uninstall', '-Purge']]) {
+    const refused = runScript(source, home, home, ['-TaskName', taskName(), ...args]);
+    assert.equal(refused.status, 1, `${args.join(' ')}\n${refused.stdout}\n${refused.stderr}`);
+    assert.match(`${refused.stdout}\n${refused.stderr}`, /LEGIONCTL_HOME is .*, which is not a folder of the agent's own\. .* Nothing was changed\./);
+  }
+  assert.deepEqual(accessOf(home), before);
+  assert.deepEqual(fs.readdirSync(home), ['bin']);
+  assert.equal(fs.readFileSync(path.join(home, 'bin', 'tool.cmd'), 'utf8'), '@echo mine\r\n');
+});
+
 // --- The scheduler, on CI's Windows only ---------------------------------------------
 
 // These register real tasks, one of them as SYSTEM, and so run only on a throwaway runner, which is

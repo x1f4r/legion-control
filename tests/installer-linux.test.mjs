@@ -436,6 +436,30 @@ test('linux uninstall changes nothing while a cycle runs or an operation holds t
   } finally { db.exec('ROLLBACK'); db.close(); }
 });
 
+// Made this user's alone, the home directory would shut out everybody else, and uninstalling from
+// it would take its bin folder. So would a folder that holds it.
+test('linux installer refuses a base that holds the home directory, installing or uninstalling', { skip: unitSkip }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion home base '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'bin', 'tool'), 'mine\n');
+  fs.chmodSync(home, 0o755);
+  const script = path.join(sourceFixture(root), 'install', 'install-linux.sh');
+  const { options } = unitInstall(root, home);
+  for (const base of [home, `${home}/`, root]) {
+    for (const args of [['--skip-scheduler'], [], ['--uninstall'], ['--uninstall', '--purge']]) {
+      const result = spawnSync('bash', [script, ...args], { ...options, env: { ...options.env, LEGIONCTL_HOME: base } });
+      assert.equal(result.status, 1, `${base} ${args.join(' ')}\n${result.stderr}`);
+      assert.match(result.stderr, /LEGIONCTL_HOME is .*, which is not a folder of the agent's own but holds the home directory\. .* Nothing was changed\./);
+    }
+  }
+  assert.equal(fs.statSync(home).mode & 0o777, 0o755);
+  assert.deepEqual(fs.readdirSync(home), ['bin']);
+  assert.equal(fs.readFileSync(path.join(home, 'bin', 'tool'), 'utf8'), 'mine\n');
+  assert.equal(fs.existsSync(path.join(root, 'systemctl-calls')), false);
+});
+
 test('linux installer takes --purge only with --uninstall, and --uninstall only with --purge', { skip: process.platform === 'win32' }, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion uninstall arguments '));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
