@@ -304,11 +304,16 @@ test('the stable launcher drops NODE_OPTIONS and NODE_PATH before Node starts, a
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
-const powershell = process.platform === 'win32'
+// Every Windows the agent runs on ships Windows PowerShell, so on Windows the
+// two tests below run or fail. Skipping there for want of a shell would leave
+// dispatch.ps1 untested on the only systems that run it, and say nothing.
+const windows = process.platform === 'win32';
+const powershell = windows
   ? ['powershell.exe', 'pwsh.exe'].find((name) => spawnSync(name, ['-NoProfile', '-Command', 'exit 0']).status === 0)
   : undefined;
 
-test('the Windows forced command starts the agent with only the variables it lists', { skip: !powershell && 'PowerShell on Windows only' }, () => {
+test('the Windows forced command starts the agent with only the variables it lists', { skip: !windows && 'PowerShell on Windows only' }, () => {
+  assert.ok(powershell, 'neither powershell.exe nor pwsh.exe answered');
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'dispatch env '));
   try {
     const out = path.join(bin, 'seen.json');
@@ -394,7 +399,8 @@ test('a restricted status and doctor run through the installed forced command, l
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
-test('a restricted status and doctor run through the installed Windows forced command, launcher and agent', { skip: !powershell && 'PowerShell on Windows only' }, () => {
+test('a restricted status and doctor run through the installed Windows forced command, launcher and agent', { skip: !windows && 'PowerShell on Windows only' }, () => {
+  assert.ok(powershell, 'neither powershell.exe nor pwsh.exe answered');
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'restricted chain '));
   try {
     const { bin, marker, options } = installedBase(base);
