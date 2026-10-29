@@ -363,6 +363,70 @@ struct ConfigTests {
         #expect(block.members?.map(\.name) == ["id", "revision", "policy", "lineage", "updatedAt", "source", "device"])
     }
 
+    @Test("an edit elsewhere keeps numbers no double holds exactly as they were written")
+    func editKeepsNumbersADoubleCannotHold() throws {
+        // Every number went through a double and was written out again from it, so an edit anywhere
+        // turned 12345678901234567890 into 1.2345678901234567e+19 and 0.10000000000000000001 into
+        // 0.1, values nobody changed, and a document holding 1e400 could not be edited at all.
+        let json = """
+        {
+          "version": 1,
+          "futureTopLevel": { "big": 12345678901234567890, "fine": 0.10000000000000000001, "huge": 1e400 },
+          "machines": [
+            { "id": "pi", "name": "Pi", "futureMachineKey": [1e400, 0.10000000000000000001, 12345678901234567890],
+              "endpoints": [{"id":"e","host":"h"}],
+              "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] },
+            { "id": "tower", "name": "Tower", "endpoints": [{"id":"e","host":"h2"}],
+              "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] }
+          ]
+        }
+        """
+        let (store, home) = try Self.store(json)
+        defer { try? FileManager.default.removeItem(at: home) }
+        func occurrences(_ lexeme: String) throws -> Int {
+            String(decoding: try #require(store.rawBytes), as: UTF8.self).components(separatedBy: lexeme).count - 1
+        }
+
+        // An edit to another machine, and one to the machine that holds some of them.
+        #expect(store.applyEdit(describedAs: "renamed", deviceName: "MacBook") { root in
+            try ControllerEditor.upsertMachine(["id": "tower", "name": "Big Tower"], in: &root)
+        } == nil)
+        #expect(store.applyEdit(describedAs: "renamed", deviceName: "MacBook") { root in
+            try ControllerEditor.upsertMachine(["id": "pi", "name": "Kitchen Pi"], in: &root)
+        } == nil)
+        #expect(store.config?.machine(id: "pi")?.name == "Kitchen Pi")
+        for lexeme in ["12345678901234567890", "0.10000000000000000001", "1e400"] {
+            #expect(try occurrences(lexeme) == 2, "\(lexeme) was not written back as it was")
+        }
+        let tree = try SetupJSON.parse(try #require(store.rawBytes))
+        #expect(tree["futureTopLevel"]?["huge"] == .number("1e400"))
+        #expect(tree["machines"]?.items?.first?["futureMachineKey"]?.items
+                == [.number("1e400"), .number("0.10000000000000000001"), .number("12345678901234567890")])
+
+        // A hand edit is recorded as a revision through the same path, and keeps them as well.
+        let text = String(decoding: try #require(store.rawBytes), as: UTF8.self)
+        Thread.sleep(forTimeInterval: 0.01)
+        try Data(text.replacingOccurrences(of: "\"Big Tower\"", with: "\"Hand Tower\"").utf8).write(to: store.url)
+        store.reloadIfChanged()
+        #expect(store.hasPendingExternalEdit)
+        #expect(store.reconcileExternalEdit(deviceName: "MacBook") == nil)
+        #expect(store.config?.machine(id: "tower")?.name == "Hand Tower")
+        for lexeme in ["12345678901234567890", "0.10000000000000000001", "1e400"] {
+            #expect(try occurrences(lexeme) == 2, "\(lexeme) was not kept by the hand edit")
+        }
+
+        // A number the change itself brings is written the way JavaScript writes it, and one no JSON
+        // can hold is still refused.
+        #expect(store.applyEdit(describedAs: "added", deviceName: "MacBook") { root in
+            root["futureAdded"] = 0.25
+        } == nil)
+        #expect(try SetupJSON.parse(try #require(store.rawBytes))["futureAdded"] == .number("0.25"))
+        #expect(store.applyEdit(describedAs: "added", deviceName: "MacBook") { root in
+            root["futureInfinite"] = Double.infinity
+        } != nil)
+        #expect(try occurrences("1e400") == 2)
+    }
+
     @Test("renaming the setup keeps the new name")
     func renameKeepsTheName() throws {
         let (store, home) = try Self.store(Self.twoMachines)

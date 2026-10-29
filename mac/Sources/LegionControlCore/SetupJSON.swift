@@ -272,9 +272,9 @@ indirect enum SetupJSON: Sendable, Equatable {
             return .null
         case let number as NSNumber:
             if CFGetTypeID(number) == CFBooleanGetTypeID() { return .bool(number.boolValue) }
+            if case .number(let written)? = original, carries(number, written) { return .number(written) }
             let lexeme = JSONText.format(number)
             guard decimalKey(lexeme) != nil else { throw Unrepresentable(message: "\(number) is not a JSON number.") }
-            if case .number(let written)? = original, decimalKey(written) == decimalKey(lexeme) { return .number(written) }
             return .number(lexeme)
         case let text as String:
             if case .string(let written)? = original, same(written, text) { return .string(written) }
@@ -284,10 +284,10 @@ indirect enum SetupJSON: Sendable, Equatable {
             var used = Set<Int>()
             var items: [SetupJSON] = []
             for (index, element) in array.enumerated() {
-                let candidate = try Self.rebased(element, onto: nil)
-                let match = before.indices.first { !used.contains($0) && candidate.id != nil && before[$0].id == candidate.id }
-                    ?? before.indices.first { !used.contains($0) && equal(before[$0], candidate) }
-                    ?? (index < before.count && !used.contains(index) && before[index].id == candidate.id ? index : nil)
+                let id = (element as? [String: Any])?["id"] as? String
+                let match = before.indices.first { !used.contains($0) && id != nil && before[$0].id == id }
+                    ?? before.indices.first { !used.contains($0) && holds(element, before[$0]) }
+                    ?? (index < before.count && !used.contains(index) && before[index].id == id ? index : nil)
                 if let match { used.insert(match) }
                 items.append(try Self.rebased(element, onto: match.map { before[$0] }))
             }
@@ -309,6 +309,42 @@ indirect enum SetupJSON: Sendable, Equatable {
             return rebuilt
         default:
             throw Unrepresentable(message: "\(type(of: value)) is not a JSON value.")
+        }
+    }
+
+    /// Whether a number an edit handed back is the one written as `lexeme`.
+    ///
+    /// An integer is compared exactly. Anything else is compared with the double `foundationValue`
+    /// read the lexeme as, which is all an edit ever had of it: 12345678901234567890 and
+    /// 0.10000000000000000001 are not doubles, and 1e400 is not even finite, so formatting the double
+    /// again would write another number, or none, and an edit anywhere else would change a value
+    /// nobody touched.
+    private static func carries(_ number: NSNumber, _ lexeme: String) -> Bool {
+        if CFNumberIsFloatType(number as CFNumber) { return Double(lexeme) == number.doubleValue }
+        return decimalKey(JSONText.format(number)) == decimalKey(lexeme)
+    }
+
+    /// Whether a Foundation value is this tree's value, numbers compared as `carries` compares them,
+    /// so that an array element nobody changed finds the original it came from. Asked of the value
+    /// itself rather than of a tree written from it, which a number no double holds would not survive.
+    private static func holds(_ value: Any, _ tree: SetupJSON) -> Bool {
+        switch (value, tree) {
+        case (is NSNull, .null):
+            return true
+        case (let number as NSNumber, _):
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return tree == .bool(number.boolValue) }
+            guard case .number(let written) = tree else { return false }
+            return carries(number, written)
+        case (let text as String, .string(let written)):
+            return same(written, text)
+        case (let array as [Any], .array(let items)):
+            return array.count == items.count && zip(array, items).allSatisfy { holds($0, $1) }
+        case (let object as [String: Any], .object(let members)):
+            return object.count == members.count && members.allSatisfy { member in
+                object.first { same($0.key, member.name) }.map { holds($0.value, member.value) } ?? false
+            }
+        default:
+            return false
         }
     }
 }
