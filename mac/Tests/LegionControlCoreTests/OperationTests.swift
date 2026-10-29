@@ -121,6 +121,57 @@ struct OperationTests {
         #expect(store.unresolved.isEmpty)
     }
 
+    @Test("a finished cycle is read again with its services, exactly as its reply was decided")
+    func cycleReconcilesWithItsServices() throws {
+        let (store, directory) = try Self.store()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        func cycle(_ children: [AgentOperation.Child], result: AgentOperation.Result) -> AgentOperation {
+            var operation = AgentOperation()
+            operation.kind = "cycle"
+            operation.state = "finished"
+            operation.phase = "done"
+            operation.result = result
+            operation.children = children
+            return operation
+        }
+        let cycled = AgentOperation.Result(ok: true, action: "cycled", reasonCode: nil, message: "0 updated, 1 left alone, 0 failed")
+
+        // Filed unknown for an interrupted service, and read again: the record says `cycled`, and
+        // that is no evidence about the service.
+        let interrupted = Self.record(kind: .updateAll)
+        store.begin(interrupted)
+        store.finish(interrupted.id, state: .unknown, summary: "Maintenance cycle on Pi: 1 may or may not have updated.")
+        store.reconcile(interrupted.id, with: cycle([.init(service: "edge", action: "interrupted")], result: cycled))
+        let unknown = try #require(store.record(id: interrupted.id))
+        #expect(unknown.state == .unknown)
+        #expect(unknown.summary == "Maintenance cycle on Pi: 1 may or may not have updated.")
+        #expect(unknown.detail == "edge: interrupted")
+        #expect(!unknown.needsReconciliation)
+
+        // One this app stopped watching, settled by its record: a failed service fails it, and a
+        // service that updated fine is counted beside it.
+        let watched = Self.record(kind: .updateAll)
+        store.begin(watched)
+        store.finish(watched.id, state: .running, summary: "still running", forceUnresolved: true)
+        store.reconcile(watched.id, with: cycle(
+            [.init(service: "t3", action: "updated"), .init(service: "demo", action: "failed", reasonCode: "apply-failed")],
+            result: .init(ok: false, action: "failed", reasonCode: "apply-failed", message: "1 updated, 0 left alone, 1 failed")))
+        let failed = try #require(store.record(id: watched.id))
+        #expect(failed.state == .failed)
+        #expect(failed.summary == "Maintenance cycle on Pi: 1 updated, 1 failed.")
+        #expect(store.unresolved.isEmpty)
+
+        // A cycle that failed of itself says why, in the agent's words.
+        let own = Self.record(kind: .updateAll)
+        store.begin(own)
+        store.finish(own.id, state: .running, summary: "still running", forceUnresolved: true)
+        store.reconcile(own.id, with: cycle([], result: .init(ok: false, action: "failed", reasonCode: "internal",
+                                                              message: "the lock file could not be read")))
+        #expect(store.record(id: own.id)?.state == .failed)
+        #expect(store.record(id: own.id)?.summary == "Maintenance cycle on Pi failed: the lock file could not be read")
+    }
+
     @Test("an agent with no record of the id means it never started")
     func neverStarted() throws {
         let (store, directory) = try Self.store()

@@ -189,3 +189,77 @@ enum OperationOutcome {
         }
     }
 }
+
+/// What a maintenance cycle came to, decided in one place for its reply and for its record read
+/// again by its id.
+///
+/// The verdict starts from the cycle's own outcome, the one the agent states or the reduction of
+/// it, and each service's part, read by its own outcome, can only make it less certain. Decided
+/// from the services alone, a cycle the agent failed before it reached any of them had no failed
+/// service in it and was filed as "nothing to do". Decided from the record alone, a cycle filed
+/// unknown for an interrupted service turned green the first time its finished record was read
+/// again, because that record says `cycled` whatever became of the services in it.
+///
+/// A service nobody can say the end of makes the whole cycle unknown, even one the agent calls
+/// failed: a failure says the machine is in a known state, and that service may be half updated.
+/// The agent reasons the same way about a cycle that throws once it has reached the services.
+struct CycleReport: Equatable {
+    var outcome: Outcome
+    var state: OperationState
+    var summary: String
+    /// Which service went which way and why, or the agent's own words when no service was reached.
+    var detail: String?
+
+    /// Nil when the cycle did not act: one held back, refused or still running has no services to
+    /// count, and is said the way any other request is.
+    init?(outcome own: Outcome, action: String?, reason: AgentReason?, message: String?,
+          children: [AgentOperation.Child], machine: String) {
+        guard own == .succeeded || own == .failed || own == .unknown else { return nil }
+        let outcomes = children.map { Outcome.of($0) }
+        let updated = zip(children, outcomes).filter { $1 == .succeeded && $0.action == "updated" }.count
+        let held = outcomes.filter { $0 == .deferred || $0 == .pending }.count
+        let failed = outcomes.filter { $0 == .failed }.count
+        let unknown = outcomes.filter { $0 == .unknown }.count
+        outcome = own == .unknown || unknown > 0 ? .unknown : own == .failed || failed > 0 ? .failed : .succeeded
+        state = OperationOutcome.state(outcome, action: action)
+
+        var parts: [String] = []
+        if updated > 0 { parts.append("\(updated) updated") }
+        if held > 0 { parts.append("\(held) held back") }
+        if failed > 0 { parts.append("\(failed) failed") }
+        if unknown > 0 { parts.append("\(unknown) may or may not have updated") }
+        if parts.isEmpty { parts.append("nothing to do") }
+        switch outcome {
+        case .failed where failed == 0:
+            // The cycle failed of itself, so no service's line says why; the agent's words do.
+            let why = reason?.sentence(subject: machine, message: message) ?? message
+            summary = "Maintenance cycle on \(machine) failed: \(why ?? "\(machine) gave no reason.")"
+        case .unknown where unknown == 0:
+            // The agent's own words first: a reason code's sentence was written for an ending that
+            // is known, and this one is not.
+            let said = message ?? reason?.sentence(subject: machine, message: nil)
+            summary = "Maintenance cycle on \(machine) may or may not have taken effect: \(said ?? "\(machine) could not say.")"
+        default:
+            summary = "Maintenance cycle on \(machine): \(parts.joined(separator: ", "))."
+        }
+        // The counts say how it went; the lines say which service it went that way for, and why,
+        // which is the part anyone acting on a failure needs.
+        let lines = children.map { child in
+            "\(child.service ?? "service"): \(child.action ?? "no result")\(child.reasonCode.map { " (\($0))" } ?? "")"
+        }.joined(separator: "\n")
+        detail = lines.isEmpty ? message : lines
+    }
+
+    /// A reply, or a finished record read back as one, with the services it names.
+    init?(_ result: AgentActionResult, children: [AgentOperation.Child], machine: String) {
+        self.init(outcome: Outcome.of(result), action: result.action, reason: result.reason,
+                  message: result.message, children: children, machine: machine)
+    }
+
+    /// A finished cycle record, read by its id. Only a whole record names its services; a summary
+    /// from `status` or `history` carries none of them and cannot decide a cycle.
+    init?(_ operation: AgentOperation, machine: String) {
+        self.init(outcome: Outcome.of(operation), action: operation.resolvedAction, reason: operation.resolvedReason,
+                  message: operation.resolvedMessage, children: operation.children ?? [], machine: machine)
+    }
+}

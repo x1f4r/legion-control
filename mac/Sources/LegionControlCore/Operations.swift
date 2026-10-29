@@ -331,12 +331,19 @@ final class OperationStore {
     /// The agent's record is authoritative and this app's guess is not, so a record written down as
     /// "outcome unknown" is corrected here even when that means turning a red row green. A finished
     /// record ends a wake hold on it, whatever its result: the command is no longer running.
+    ///
+    /// A finished cycle is decided exactly as it was when its reply came back, its services with
+    /// it. Decided from its own result alone, which says `cycled` whatever became of them, a cycle
+    /// filed unknown for an interrupted service turned green here, and reading the same record
+    /// again is no evidence about that service.
     func reconcile(_ id: String, with operation: AgentOperation) {
         update(id) { record in
             if operation.isFinished { Self.release(&record, reason: "the helper's record of it finished") }
+            let cycle = record.kind == .updateAll && operation.isFinished
+                ? CycleReport(operation, machine: record.machineName) : nil
             switch operation.state {
             case "finished":
-                record.state = OperationOutcome.state(
+                record.state = cycle?.state ?? OperationOutcome.state(
                     for: OperationDriver.finalResult(from: operation, accepted: AgentActionResult()),
                     stillRunning: false
                 )
@@ -349,7 +356,10 @@ final class OperationStore {
             }
             record.needsReconciliation = !operation.isFinished && record.state != .queued
 
-            if let message = operation.result?.message, !message.isEmpty {
+            if let cycle {
+                record.summary = cycle.summary
+                record.detail = cycle.detail ?? record.detail
+            } else if let message = operation.result?.message, !message.isEmpty {
                 record.summary = message
             } else if let reason = operation.resolvedReason {
                 record.summary = reason.sentence(subject: record.subject, message: nil)

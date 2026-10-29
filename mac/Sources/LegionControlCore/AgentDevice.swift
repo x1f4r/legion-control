@@ -373,8 +373,10 @@ extension AgentDevice {
         guard let next = owed.first else { return }
         core.lastReconcileAttempt = Date()
 
-        // The status the poll just read may already carry it, which costs nothing at all.
-        if let known = status?.operation(id: next.id) {
+        // The status the poll just read may already carry it, which costs nothing at all. Not for a
+        // finished cycle: a summary names none of its services, and a cycle is decided on them too.
+        if let known = status?.operation(id: next.id),
+           next.kind != .updateAll || !known.isFinished || known.children != nil {
             operations.reconcile(next.id, with: known)
             onStateChange?()
             return
@@ -539,35 +541,18 @@ extension AgentDevice {
                 build: { intent in try AgentRequest.cycle(intent: intent, dryRun: false, dialect: dialect) },
                 intent: .init(detach: dialect.supportsDetach, operationId: operation),
                 interpret: { result, conclusion in
+                    // The cycle's own outcome first, and each service's part folded into it, in the
+                    // one place its record read again is decided too, so the two cannot disagree.
                     let children = conclusion.operation?.children ?? result.children ?? []
-                    // Each service's part is read by its outcome, as the cycle's own is. Counted by
-                    // action word, an update that timed out half-way counted as a plain failure, and
-                    // an interrupted one was not counted at all, so a cycle that may have left a
-                    // service half-updated was filed as a success.
-                    let outcomes = children.map { Outcome.of($0) }
-                    let updated = zip(children, outcomes).filter { $1 == .succeeded && $0.action == "updated" }.count
-                    let held = outcomes.filter { $0 == .deferred || $0 == .pending }.count
-                    let failed = outcomes.filter { $0 == .failed }.count
-                    let unknown = outcomes.filter { $0 == .unknown }.count
-                    var parts: [String] = []
-                    if updated > 0 { parts.append("\(updated) updated") }
-                    if held > 0 { parts.append("\(held) held back") }
-                    if failed > 0 { parts.append("\(failed) failed") }
-                    if unknown > 0 { parts.append("\(unknown) may or may not have updated") }
-                    if parts.isEmpty { parts.append("nothing to do") }
-                    let sentence = "Maintenance cycle on \(self.name): \(parts.joined(separator: ", "))."
-                    // The counts say how it went; the lines say which service it went that way for,
-                    // and why, which is the part anyone acting on a failure needs.
-                    let detail = children.map { child in
-                        "\(child.service ?? "service"): \(child.action ?? "no result")\(child.reasonCode.map { " (\($0))" } ?? "")"
-                    }.joined(separator: "\n")
-                    // A service nobody can say the end of makes the whole cycle owed, never failed:
+                    guard let report = CycleReport(result, children: children, machine: self.name) else {
+                        // Held back by the lock or refused before any service was looked at.
+                        return self.otherOutcome(result, subject: self.name, verb: "The maintenance cycle")
+                    }
+                    // A service nobody can say the end of leaves the whole cycle owed, never failed:
                     // its record is read again by its id, and nothing is sent twice.
-                    let state: OperationState = unknown > 0 ? .unknown : failed > 0 ? .failed : .succeeded
-                    self.setStatus(sentence, isError: state.isProblem, detail: detail.isEmpty ? result.message : detail)
-                    return .init(state: state, summary: sentence,
-                                 detail: detail.isEmpty ? result.message : detail, refresh: true,
-                                 unresolved: state == .unknown)
+                    self.setStatus(report.summary, isError: report.state.isProblem, detail: report.detail)
+                    return .init(state: report.state, summary: report.summary, detail: report.detail,
+                                 refresh: true, unresolved: report.outcome == .unknown)
                 }
             )
         }

@@ -352,6 +352,89 @@ struct MacModelTests {
         #expect(second.summary == "Maintenance cycle on This Mac: 1 may or may not have updated.")
     }
 
+    @Test("a cycle starts from its own outcome, so one the agent failed or held back is never nothing to do")
+    func cycleOwnOutcomeFirst() async throws {
+        // Decided from its services alone, a cycle the agent failed before it reached any of them
+        // had no failed service in it, and each of these was filed as a green "nothing to do" (C5).
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        // The agent's own catch, when the cycle record cannot be written.
+        runner.answer("cycle", json: """
+        {"ok":false,"contract":3,"action":"failed","reasonCode":"internal","children":[],
+         "message":"the cycle record could not be written (EACCES), so no maintenance was attempted"}
+        """, exit: 1)
+        runner.answer("status", json: Self.status)
+        // A 3.1.0 refusal that states its outcome and names no action.
+        runner.answer("cycle", json: """
+        {"ok":false,"contract":3,"reasonCode":"bad-argument","outcome":"failed","children":[],
+         "message":"--op names a different cycle"}
+        """, exit: 1)
+        runner.answer("status", json: Self.status)
+        // Held back by the lock, which names no action either.
+        runner.answer("cycle", json: #"{"ok":false,"contract":3,"reasonCode":"lock-held","message":"an update holds the lock"}"#, exit: 1)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await model.refresh()
+
+        var records: [OperationRecord] = []
+        var errors: [Bool] = []
+        for _ in 0..<3 {
+            model.runCycle()
+            await Self.settle(model)
+            records.append(try #require(store.newestFirst.first { $0.kind == .updateAll }))
+            errors.append(model.noteIsError)
+        }
+        #expect(Set(records.map(\.id)).count == 3)
+        #expect(records.map(\.state) == [.failed, .failed, .deferred])
+        #expect(errors == [true, true, false])
+        #expect(records.allSatisfy { !$0.summary.contains("nothing to do") && !$0.needsReconciliation })
+        #expect(records[0].summary == "Maintenance cycle on This Mac failed: the cycle record could not be written (EACCES), so no maintenance was attempted")
+        #expect(records[1].summary == "Maintenance cycle on This Mac failed: The agent refused an argument this app sent. --op names a different cycle")
+        #expect(records[2].summary == "The maintenance lock is held by something else on that machine.")
+    }
+
+    @Test("a cycle left unknown by a service stays unknown when its finished record is read again")
+    func cycleVerdictSurvivesReconciliation() async throws {
+        // The record says `cycled` whatever became of its services, and read on its own it turned
+        // this cycle green within one pass, with the agent's "1 left alone" for an interrupted update.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await model.refresh()
+
+        model.runCycle()
+        let id = try #require(store.newestFirst.first { $0.kind == .updateAll }).id
+        runner.answer("cycle", json: """
+        { "ok": true, "contract": 3, "action": "cycled", "children": [ { "service": "edge", "action": "interrupted" } ] }
+        """)
+        // The status after it carries the cycle's summary, which names none of its services, so the
+        // record itself is read by its id.
+        runner.answer("status", json: Self.status.replacingOccurrences(of: #""actions":"#, with: """
+        "operations": { "recent": [ { "id": "\(id)", "kind": "cycle", "state": "finished", "phase": "done",
+                                      "action": "cycled", "reasonCode": null, "outcome": "succeeded" } ] },
+        "actions":
+        """))
+        runner.answer("op", json: """
+        {"ok":true,"contract":3,"op":{"id":"\(id)","kind":"cycle","state":"finished","phase":"done","outcome":"succeeded",
+         "result":{"ok":true,"action":"cycled","reasonCode":null,"message":"0 updated, 1 left alone, 0 failed","outcome":"succeeded"},
+         "children":[{"opId":null,"service":"edge","action":"interrupted","reasonCode":null}]}}
+        """)
+        await Self.settle(model)
+        let deadline = Date().addingTimeInterval(2)
+        while store.record(id: id)?.needsReconciliation == true, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        let record = try #require(store.record(id: id))
+        #expect(runner.sent.contains { $0.contains("op") && $0.contains(id) })
+        #expect(record.state == .unknown)
+        #expect(record.summary == "Maintenance cycle on This Mac: 1 may or may not have updated.")
+        // Read once: the same finished record has nothing more to say about that service.
+        #expect(!record.needsReconciliation)
+    }
+
     @Test("a policy change is decided on its outcome: held back by the lock, unknown, or refused")
     func policyByOutcome() async throws {
         // Read off `ok`, all three of these were one "not changed", and the one the agent failed
