@@ -248,8 +248,26 @@ struct AgentRequest: Sendable, Equatable {
     }
 
     /// Send the signed agent tarball in on stdin and let the far side verify and install it.
-    static func selfUpdateFromStdin(operation: String) throws -> AgentRequest {
-        AgentRequest(["self-update", "--stdin", "--op", try checkedOperation(operation)], timeout: 300, safety: .mutation)
+    ///
+    /// `allowDowngrade` is a person's explicit decision to put an older agent in, or one below the
+    /// machine's version floor, taken in front of a question that says so (section 13). Nothing in
+    /// this app sets it on its own initiative. It is refused here for an agent that reports no
+    /// floor, which has never heard of the flag, and over a restricted key, whose dispatcher
+    /// refuses it.
+    static func selfUpdateFromStdin(operation: String, allowDowngrade: Bool = false,
+                                    agent: AgentInfo? = nil) throws -> AgentRequest {
+        var arguments = ["self-update", "--stdin"]
+        if allowDowngrade {
+            guard agent?.reportsFloor == true else {
+                throw Invalid(message: "This agent predates the version floor, so it cannot be asked to go back to an older agent.")
+            }
+            guard agent?.restrictedSession != true else {
+                throw Invalid(message: "A restricted key can only move the agent forward.")
+            }
+            arguments.append("--allow-downgrade")
+        }
+        arguments += ["--op", try checkedOperation(operation)]
+        return AgentRequest(arguments, timeout: 300, safety: .mutation)
     }
 
     static func selfUpdate(from path: String) throws -> AgentRequest {

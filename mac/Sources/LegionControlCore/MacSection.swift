@@ -560,9 +560,19 @@ struct MacSection: View {
                 ServiceSetupButton(enabled: !mac.isWorking && mac.dialect.supportsDoctor,
                                    restricted: mac.status?.isRestrictedSession == true,
                                    send: { try await mac.serviceConfig($0) })
-                Button("Install agent\(AgentBundle.shared.map { " " + $0.version } ?? "")") { afterSheet { mac.installBundledAgent() } }
-                    .disabled(AgentBundle.shared == nil || mac.isWorking || mac.status?.ok != true || mac.status?.isRestrictedSession == true)
-                    .help(AgentBundle.shared == nil ? AgentBundle.unavailableReason : "Upgrade the authenticated local agent.")
+                if let goesBack = mac.bundledAgentGoesBack {
+                    // Never offered as an upgrade. Going back is its own question, and only where the
+                    // agent can be told it is meant.
+                    if mac.canGoBackToBundledAgent {
+                        Button("Go back to agent\(AgentBundle.shared.map { " " + $0.version } ?? "")…") { afterSheet { mac.requestBundledAgentDowngrade() } }
+                            .disabled(mac.isWorking || mac.status?.ok != true)
+                            .help(goesBack + ".")
+                    }
+                } else {
+                    Button("Install agent\(AgentBundle.shared.map { " " + $0.version } ?? "")") { afterSheet { mac.installBundledAgent() } }
+                        .disabled(AgentBundle.shared == nil || mac.isWorking || mac.status?.ok != true || mac.status?.isRestrictedSession == true)
+                        .help(AgentBundle.shared == nil ? AgentBundle.unavailableReason : "Upgrade the authenticated local agent.")
+                }
                 Button("Export operation history") { exportHistory() }
                 if !model.operations.records.isEmpty {
                     Button("Clear the history") { model.operations.clearHistory() }

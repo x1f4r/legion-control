@@ -187,6 +187,28 @@ struct WakeActionOutcome: Sendable {
     var isDeclaredWakePacket: Bool
 }
 
+/// Whether installing an agent takes a device back rather than forward (section 13).
+enum AgentDowngrade {
+    /// What makes installing `version` over the agent that sent `status` a way back, or nil when it
+    /// is not one: older than the agent running, or below its version floor.
+    static func reason(installing version: String, over status: AgentStatus) -> String? {
+        if let running = status.version, AgentVersion.isOlder(version, than: running) {
+            return "Agent \(version) is older than the \(running) running there"
+        }
+        if let floor = status.agent?.floor, AgentVersion.isOlder(version, than: floor) {
+            return "Agent \(version) is below the version floor \(floor) kept there"
+        }
+        return nil
+    }
+
+    /// Whether going back may be asked for at all: only of an agent that reports a floor, which
+    /// every agent that knows `--allow-downgrade` does, and never over a restricted key, whose
+    /// dispatcher refuses the flag. An agent from before the floor is never taken back from here.
+    static func isOffered(by status: AgentStatus) -> Bool {
+        status.agent?.reportsFloor == true && !status.isRestrictedSession
+    }
+}
+
 // MARK: - What every device reads the same way
 
 extension AgentDevice {
@@ -795,9 +817,43 @@ extension AgentDevice {
 
     // MARK: - Trusted agent deployment
 
+    /// Why installing the bundled agent would take this device back rather than forward, or nil
+    /// when it would not.
+    var bundledAgentGoesBack: String? {
+        guard let bundle = AgentBundle.shared, let status else { return nil }
+        return AgentDowngrade.reason(installing: bundle.version, over: status)
+    }
+
+    /// Whether going back to the bundled agent may be asked for here at all.
+    var canGoBackToBundledAgent: Bool {
+        bundledAgentGoesBack != nil && status.map(AgentDowngrade.isOffered) == true
+    }
+
+    /// Going back is a decision of its own, taken in front of a question that says what it does.
+    func requestBundledAgentDowngrade() {
+        guard let bundle = AgentBundle.shared, let reason = bundledAgentGoesBack, canGoBackToBundledAgent else { return }
+        let floor = status?.agent?.floor
+        let lowers = floor.map { AgentVersion.isOlder(bundle.version, than: $0) } == true
+            ? " It also lowers the version floor \(name) keeps to \(bundle.version)."
+            : ""
+        ask?(PendingDialog(
+            id: "agent-downgrade-\(historyMachineId)",
+            title: "Go back to agent \(bundle.version) on \(name)?",
+            message: "\(reason). Going back replaces the agent with this older one, signed by the same release key.\(lowers) Do this only to undo a release that broke something.",
+            confirmTitle: "Go back to \(bundle.version)",
+            perform: { [weak self] in self?.installBundledAgent(allowDowngrade: true) }
+        ))
+    }
+
     /// Install the agent this build was made with, after verifying its signature here.
-    func installBundledAgent() {
+    ///
+    /// Never as an upgrade when it is older than the agent running, or below the version floor: an
+    /// agent 3.1.0 refuses that without `--allow-downgrade`, and this app used to offer it all the
+    /// same. `allowDowngrade` comes only from the question above.
+    func installBundledAgent(allowDowngrade: Bool = false) {
         guard let bundle = AgentBundle.shared, let status, status.ok == true, isCommandable else { return }
+        let goesBack = AgentDowngrade.reason(installing: bundle.version, over: status) != nil
+        guard goesBack == allowDowngrade, !allowDowngrade || AgentDowngrade.isOffered(by: status) else { return }
         if let previous = unresolvedOperations.first(where: { $0.kind == .appUpdate && $0.subject == "control agent" }) {
             setStatus("Agent installation \(previous.id) still has an unknown outcome. Check its result before starting another installation.", isError: true)
             reconcileNow()
@@ -814,7 +870,10 @@ extension AgentDevice {
                     return await self.installOverLegacyAgent(payload, operation: operation, version: bundle.version)
                 }
                 return await self.dispatch(operation: operation, subject: "control agent", verb: "Installing the agent",
-                                           build: { _ in try AgentRequest.selfUpdateFromStdin(operation: operation).sending(payload) },
+                                           build: { _ in
+                                               try AgentRequest.selfUpdateFromStdin(operation: operation, allowDowngrade: allowDowngrade,
+                                                                                    agent: status.agent).sending(payload)
+                                           },
                                            intent: .init(operationId: operation)) { result, _ in
                     guard result.didInstallAgent else {
                         return self.otherOutcome(result, subject: "control agent", verb: "Installing the agent")

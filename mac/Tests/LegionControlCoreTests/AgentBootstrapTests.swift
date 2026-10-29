@@ -166,6 +166,77 @@ struct AgentBootstrapTests {
         }
     }
 
+    // MARK: - The version floor
+
+    static func status(_ json: String) throws -> AgentStatus {
+        try JSONDecoder().decode(AgentStatus.self, from: Data(json.utf8))
+    }
+
+    @Test("an older bundled agent is a way back and never an upgrade")
+    func olderBundleGoesBack() throws {
+        let running = try Self.status(#"{"ok":true,"contract":3,"agent":{"version":"3.2.0","contract":3,"floor":"3.1.0"}}"#)
+        #expect(AgentDowngrade.reason(installing: "3.1.0", over: running)?.contains("older than the 3.2.0") == true)
+        #expect(AgentDowngrade.reason(installing: "3.2.0", over: running) == nil)
+        #expect(AgentDowngrade.reason(installing: "3.10.0", over: running) == nil)
+        // Below the floor is a way back even where the running agent is older still.
+        let behind = try Self.status(#"{"ok":true,"contract":3,"agent":{"version":"3.0.1","contract":3,"floor":"3.1.0"}}"#)
+        #expect(AgentDowngrade.reason(installing: "3.0.9", over: behind)?.contains("below the version floor 3.1.0") == true)
+        // A version that cannot be read is not taken for an older one, and a 2.x agent is behind.
+        #expect(AgentDowngrade.reason(installing: "3.1.0", over: try Self.status(#"{"ok":true,"agentVersion":"nightly"}"#)) == nil)
+        #expect(AgentDowngrade.reason(installing: "3.1.0", over: try Self.status(#"{"ok":true,"agentVersion":"2.4.1"}"#)) == nil)
+    }
+
+    @Test("going back is offered only to an agent that reports a floor, and never over a restricted key")
+    func goingBackNeedsAFloor() throws {
+        let floored = try JSONDecoder().decode(AgentStatus.self, from: ContractCorpus.data("fixtures/status.full.json"))
+        #expect(floored.agent?.reportsFloor == true)
+        #expect(floored.agent?.floor == "3.1.0")
+        #expect(AgentDowngrade.isOffered(by: floored))
+
+        // A floor the agent could not read is still a floor it reports, as null.
+        let unreadable = try Self.status(#"{"ok":true,"contract":3,"agent":{"version":"3.1.0","contract":3,"floor":null}}"#)
+        #expect(unreadable.agent?.reportsFloor == true)
+        #expect(unreadable.agent?.floor == nil)
+        #expect(AgentDowngrade.isOffered(by: unreadable))
+
+        // An agent from before the floor has never heard of the flag, and a restricted dispatcher
+        // refuses it.
+        let unfloored = try Self.status(#"{"ok":true,"contract":3,"agent":{"version":"3.0.1","contract":3}}"#)
+        #expect(unfloored.agent?.reportsFloor == false)
+        #expect(!AgentDowngrade.isOffered(by: unfloored))
+        let restricted = try Self.status(#"{"ok":true,"contract":3,"agent":{"version":"3.1.0","contract":3,"floor":"3.1.0","restrictedSession":true}}"#)
+        #expect(!AgentDowngrade.isOffered(by: restricted))
+    }
+
+    @Test("--allow-downgrade is sent only when asked for, and only to an agent that can take it")
+    func allowDowngradeFlag() throws {
+        let id = "abcdefab-1234-4567-8901-abcdefabcdef"
+        let floored = try JSONDecoder().decode(AgentStatus.self, from: ContractCorpus.data("fixtures/status.full.json")).agent
+        #expect(try AgentRequest.selfUpdateFromStdin(operation: id).arguments == ["self-update", "--stdin", "--op", id])
+        #expect(try AgentRequest.selfUpdateFromStdin(operation: id, agent: floored).arguments == ["self-update", "--stdin", "--op", id])
+        #expect(try AgentRequest.selfUpdateFromStdin(operation: id, allowDowngrade: true, agent: floored).arguments
+                == ["self-update", "--stdin", "--allow-downgrade", "--op", id])
+        let unfloored = try Self.status(#"{"ok":true,"contract":3,"agent":{"version":"3.0.1","contract":3}}"#).agent
+        #expect(throws: AgentRequest.Invalid.self) { try AgentRequest.selfUpdateFromStdin(operation: id, allowDowngrade: true, agent: unfloored) }
+        var restricted = floored
+        restricted?.restrictedSession = true
+        #expect(throws: AgentRequest.Invalid.self) { try AgentRequest.selfUpdateFromStdin(operation: id, allowDowngrade: true, agent: restricted) }
+    }
+
+    @Test("agent versions compare numerically on their first three numbers")
+    func versionOrder() {
+        #expect(AgentVersion.compare("3.10.0", "3.9.0") == .orderedDescending)
+        #expect(AgentVersion.compare("3.1.0", "3.1.0") == .orderedSame)
+        #expect(AgentVersion.compare("3.1.0-beta.2", "3.1.0") == .orderedSame)
+        #expect(AgentVersion.compare("03.001.0", "3.1.0") == .orderedSame)
+        #expect(AgentVersion.compare("2.9.99", "3.0.0") == .orderedAscending)
+        #expect(AgentVersion.compare("99999999999999999999999999999999.0.0", "3.0.0") == .orderedDescending)
+        for notAVersion in [nil, "", "3.1", "v3.1.0", "\u{663}.1.0", "3..1"] as [String?] {
+            #expect(AgentVersion.compare(notAVersion, "3.1.0") == nil)
+            #expect(!AgentVersion.isOlder(notAVersion, than: "3.1.0"))
+        }
+    }
+
     @Test("bootstrap refuses archive symlinks before running any staged code")
     func unsafeArchive() async throws {
         let (dir, source, _) = try await fixture()

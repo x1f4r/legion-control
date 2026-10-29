@@ -514,6 +514,71 @@ struct AgentInfo: Decodable, Sendable, Equatable {
     var node: String?
     /// True when this app is talking through the restricted dispatcher rather than a full shell.
     var restrictedSession: Bool?
+    /// The version floor, from agent 3.1.0 on: the oldest agent this machine may be replaced by
+    /// (section 13). Null both when the agent could not read its floor file and when it predates the
+    /// idea; `reportsFloor` tells the two apart, because only an agent that reports a floor knows
+    /// `--allow-downgrade` at all.
+    var floor: String?
+    var reportsFloor = false
+
+    private enum CodingKeys: String, CodingKey {
+        case version, contract, base, node, restrictedSession, floor
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(String.self, forKey: .version)
+        contract = try container.decodeIfPresent(Int.self, forKey: .contract)
+        base = try container.decodeIfPresent(String.self, forKey: .base)
+        node = try container.decodeIfPresent(String.self, forKey: .node)
+        restrictedSession = try container.decodeIfPresent(Bool.self, forKey: .restrictedSession)
+        floor = try container.decodeIfPresent(String.self, forKey: .floor)
+        reportsFloor = container.contains(.floor)
+    }
+}
+
+/// Agent versions, compared the way the version floor compares them (section 13): the three
+/// leading numbers, numerically, and whatever follows them ignored. A version that does not start
+/// with three numbers compares with nothing, and is never taken for an older one.
+enum AgentVersion {
+    /// `.orderedAscending` when `left` is the older, nil when either is not a version.
+    static func compare(_ left: String?, _ right: String?) -> ComparisonResult? {
+        guard let a = leading(left), let b = leading(right) else { return nil }
+        for (x, y) in zip(a, b) where x != y {
+            // Digits without their leading zeros: the longer is the larger, and of two as long the
+            // first that differs decides, so no number is too long to compare.
+            if x.count != y.count { return x.count < y.count ? .orderedAscending : .orderedDescending }
+            return x < y ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
+    }
+
+    /// Whether `version` is known to be older than `other`. Not knowing is not older.
+    static func isOlder(_ version: String?, than other: String?) -> Bool {
+        compare(version, other) == .orderedAscending
+    }
+
+    /// The three leading numbers, each without its leading zeros, or nil.
+    private static func leading(_ version: String?) -> [String]? {
+        guard let version else { return nil }
+        var numbers: [String] = []
+        var digits = ""
+        for scalar in version.unicodeScalars {
+            if ("0"..."9").contains(scalar) {
+                digits.unicodeScalars.append(scalar)
+                continue
+            }
+            guard !digits.isEmpty, numbers.count < 2, scalar == "." else { break }
+            numbers.append(digits)
+            digits = ""
+        }
+        guard numbers.count == 2, !digits.isEmpty else { return nil }
+        numbers.append(digits)
+        return numbers.map { number in
+            let trimmed = number.drop { $0 == "0" }
+            return trimmed.isEmpty ? "0" : String(trimmed)
+        }
+    }
 }
 
 /// Whether the agent could read its own configuration. `ok: false` blocks every mutation on the far
