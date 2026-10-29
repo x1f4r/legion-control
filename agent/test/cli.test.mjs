@@ -405,6 +405,12 @@ test('an unknown service, action and boot target each say what does exist', asyn
 
     const target = cli(['boot', 'nope'], { home });
     assert.equal(target.payload.reasonCode, 'not-configured');
+
+    // Asked to wait for an idle machine, a missing action or target is refused
+    // in the same way, before anything is queued.
+    assert.equal(cli(['run', '--when-idle'], { home }).payload.reasonCode, 'unknown-action');
+    assert.equal(cli(['boot', '--when-idle'], { home }).payload.reasonCode, 'not-configured');
+    assert.equal(cli(['status'], { home }).payload.operations.queued.length, 0);
   });
 });
 

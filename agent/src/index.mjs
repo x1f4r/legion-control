@@ -573,10 +573,7 @@ async function commandBoot(config, positional, flags, options) {
     );
   }
 
-  if (flags.has('when-idle')) {
-    if (!target) return badArgument('boot --when-idle needs a target', { command: 'boot' });
-    return queueRequest({ kind: 'boot', target, flags, options, config });
-  }
+  if (flags.has('when-idle')) return queueRequest({ kind: 'boot', target, flags, options, config });
 
   const result = await runBoot(config, target, { ...operationOptions(flags, options), noReboot: flags.has('no-reboot') });
   return mutationReply(result, {
@@ -611,10 +608,7 @@ async function commandRun(config, positional, flags, options) {
       { command: 'run', argument: id ?? null, accepts: known, error: `unknown action: ${id ?? '(none given)'}` },
     );
   }
-  if (flags.has('when-idle')) {
-    if (!id) return badArgument('run --when-idle needs an action id', { command: 'run' });
-    return queueRequest({ kind: 'run', actionId: id, flags, options, config });
-  }
+  if (flags.has('when-idle')) return queueRequest({ kind: 'run', actionId: id, flags, options, config });
 
   const shared = operationOptions(flags, options);
   if (flags.has('detach')) return detachedRun(config, { kind: 'run', actionId: id, ...shared });
