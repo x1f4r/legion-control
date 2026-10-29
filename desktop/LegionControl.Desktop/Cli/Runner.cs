@@ -668,18 +668,23 @@ public static class Runner
     {
         var machine = Pick(app, line, output);
         if (machine is null) return Failed;
+        var others = line.Has("try-other-helpers");
         await app.ReleaseWakeHoldsAsync(machine, token);
         var plan = app.PlanWake(machine);
         output.WriteLine(plan.Sentence(machine.Name));
         foreach (var obstacle in plan.Obstacles) output.WriteLine($"  {obstacle}");
         foreach (var offer in plan.OfferToWakeFirst) output.WriteLine($"  \"{offer}\" could be woken first, as a separate step.");
-        if (plan.IsEmpty) return Failed;
+        if (plan.IsHeld && !others)
+        {
+            output.WriteLine("  A helper command run for it earlier may still be going. Add --try-other-helpers to run the other helpers' commands anyway.");
+        }
+        if (plan.IsEmpty && !(others && plan.IsHeld)) return Failed;
         if (!line.Has("yes"))
         {
             output.WriteLine("Add --yes to actually try it.");
             return Ok;
         }
-        var report = await app.WakeAsync(machine, token);
+        var report = await app.WakeAsync(machine, tryOtherHelpers: others, cancellationToken: token);
         foreach (var attempt in report.Attempts) output.WriteLine($"  {attempt}");
         output.WriteLine(report.Sentence);
         return report.Confirmed ? Ok : NotKnown;
@@ -1196,6 +1201,8 @@ public static class Runner
           --command bundle  [--machine ID] [--out FILE]
           --command op      --machine ID --op ID
           --command wake    --machine ID      what could wake it, in order; --yes to try
+                            [--try-other-helpers]  run the other helpers' commands while one may
+                                              still be running
           --command trust   --machine ID [--route ID]  show the host keys; --accept to pin them
           --command edit    [--out FILE]      print or save the setup document
           --command bindings                  this device's own settings, which are never shared

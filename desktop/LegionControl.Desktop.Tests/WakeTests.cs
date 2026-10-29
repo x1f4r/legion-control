@@ -555,6 +555,42 @@ public class WakeTests
         return FakeRunner.Ok(Status("command"));
     });
 
+    private static int Runs(FakeRunner runner, string host) =>
+        runner.Calls.Count(call => To(call, host) && call.RemoteCommand.Contains("run wake-tower"));
+
+    [Fact]
+    public async Task TryingTheOtherHelpersAsksOnlyTheOthers()
+    {
+        // Releasing the hold is what the person chose; running pi's command a second time while the
+        // first may still be going is not.
+        using var home = new TempHome();
+        var runner = HeldOnPi();
+        using var app = Device(home, Fleet, runner);
+        var tower = app.Machine("tower")!;
+
+        var first = await app.WakeAsync(tower);
+        Assert.False(first.Confirmed);
+        Assert.Equal((1, 0), (Runs(runner, "pi"), Runs(runner, "nas")));
+        Assert.True(app.PlanWake(tower).IsHeld);
+
+        // A press without the choice still holds, and reads pi's record first.
+        var reads = runner.Calls.Count(call => To(call, "pi") && call.RemoteCommand.Contains(" op "));
+        await app.WakeAsync(tower);
+        Assert.Equal((1, 0), (Runs(runner, "pi"), Runs(runner, "nas")));
+        Assert.Equal(reads + 1, runner.Calls.Count(call => To(call, "pi") && call.RemoteCommand.Contains(" op ")));
+
+        var others = await app.WakeAsync(tower, tryOtherHelpers: true);
+        Assert.Equal((1, 1), (Runs(runner, "pi"), Runs(runner, "nas")));
+        Assert.Contains(others.Attempts, attempt => attempt.Contains("only the other helpers are asked"));
+        Assert.Empty(app.Tracker.WakeHoldsFor("tower"));
+
+        // The hold is gone, so the next press asks every helper again, once pi's address that
+        // timed out is dialled again.
+        AMinuteLater(app.Machine("pi")!);
+        await app.WakeAsync(tower);
+        Assert.Equal(2, Runs(runner, "pi"));
+    }
+
     [Fact]
     public async Task AHoldEndsWhenItsHelperLeavesTheSetup()
     {

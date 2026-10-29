@@ -388,10 +388,18 @@ public sealed class AppModel : IDisposable
 
     /// Wakes a machine and, when the document asks for a particular system and the machine came up
     /// as another one, offers the ordinary boot request for it.
-    public async Task<WakeReport> WakeAsync(MachineModel target, CancellationToken cancellationToken = default)
+    ///
+    /// [tryOtherHelpers] is a person's explicit decision to run the other helpers' commands while
+    /// one may still be running: it releases the holds for the machine that are still standing once
+    /// their records were read, and nothing else ever does that on their behalf. The helpers those
+    /// holds were on are not asked in this walk; the others are.
+    public async Task<WakeReport> WakeAsync(
+        MachineModel target, bool tryOtherHelpers = false, CancellationToken cancellationToken = default)
     {
         await ReleaseWakeHoldsAsync(target, cancellationToken);
-        var plan = PlanWake(target);
+        var passed = tryOtherHelpers ? WakeHoldsFor(target) : Array.Empty<WakeHold>();
+        if (passed.Count > 0) Tracker.ReleaseWakeHolds(target.Id, DateTimeOffset.MaxValue);
+        var plan = WakePlanner.Without(PlanWake(target), passed, target.Name);
         var report = await new WakeRunner(Tracker).RunAsync(
             target, plan,
             Machines.ToDictionary(machine => machine.Id, machine => machine, StringComparer.Ordinal),

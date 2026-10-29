@@ -239,6 +239,21 @@ public static class WakePlanner
         return null;
     }
 
+    /// The plan without the helper steps of [passed]: the holds a person chose to go past by asking
+    /// for the other helpers. Those holds are released, so a later press asks every helper again,
+    /// but this walk asks only the others. Releasing a hold is not a reason to run its own command a
+    /// second time while the first run may still be going.
+    public static WakePlan Without(WakePlan plan, IReadOnlyList<WakeHold> passed, string targetName)
+    {
+        if (passed.Count == 0) return plan;
+        bool Passed(WakeStep step) => step is WakeStep.ViaHelper helper
+            && passed.Any(hold => hold.Helper == helper.Helper.Machine && hold.Action == helper.Helper.Action);
+        var skipped = plan.Skipped.Concat(plan.Steps.Where(Passed).Cast<WakeStep.ViaHelper>().Select(step =>
+            new WakeSkip("helper", step.Helper.Machine, step.Helper.Action, WakeSkip.Held,
+                $"{step.HelperName}'s {step.Helper.Action} was run for {targetName} earlier and may still be going, so only the other helpers are asked.")));
+        return plan with { Steps = plan.Steps.Where(step => !Passed(step)).ToList(), Skipped = skipped.ToList() };
+    }
+
     public static string SkipSentence(string reason, string targetName, WakeHelper entry, string helperName) => reason switch
     {
         WakeSkip.Missing => $"The helper \"{entry.Machine}\" is not a machine in this setup.",

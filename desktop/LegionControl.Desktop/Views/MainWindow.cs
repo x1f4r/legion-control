@@ -244,6 +244,7 @@ public sealed class MainWindow : Window
             : "Not checked yet";
         identity.Children.Add(Ui.Note(state, machine.Failure is null ? null : Ui.Unknown));
         foreach (var line in LaunchLines(machine)) identity.Children.Add(Ui.Note(line, Ui.Unknown));
+        if (HoldLine(machine) is { } hold) identity.Children.Add(Ui.Note(hold, Ui.Unknown));
         heading.Children.Add(identity);
         var controls = BuildMachineActions(machine);
         if (ContentWidth < 650) { Grid.SetRow(controls, 1); Grid.SetColumnSpan(controls, 2); }
@@ -255,6 +256,16 @@ public sealed class MainWindow : Window
             _content.Children.Add(Ui.Actions(Ui.Action("Details", () => ShowMachineDetails(machine))));
         BuildOperations(machine);
         BuildServices(machine);
+    }
+
+    /// The wake holds for this machine, in one line, while there are any.
+    private string? HoldLine(MachineModel machine)
+    {
+        var held = _app.Tracker.WakeHoldsFor(machine.Id)
+            .Select(hold => $"{_app.Machine(hold.MachineId)?.Name ?? hold.MachineId}'s {hold.Intent.ActionId}")
+            .Distinct().ToList();
+        return held.Count == 0 ? null
+            : $"Waking held: {string.Join(", ", held)} may still be running, so other helpers' commands wait until it is known how it ended.";
     }
 
     /// What this device runs on each system whose command is not simply the one the setup offers.
@@ -520,6 +531,8 @@ public sealed class MainWindow : Window
             foreach (var helperId in plan.OfferToWakeFirst)
                 if (_app.Machine(helperId) is { } helper)
                     wake.Add(Ui.MenuAction("Wake " + helper.Name + " first", () => Wake(helper)));
+            // Only a person lifts a hold: the command held may still be running on its helper.
+            if (plan.IsHeld) wake.Add(Ui.MenuAction("Try the other helpers", () => TryOtherHelpers(machine)));
             wake.Add(Ui.MenuAction("Wake details", () => Sheets.Text(this, "Wake", plan.Sentence(machine.Name) + "\n" + string.Join("\n", plan.Obstacles))));
             items.Add(new MenuItem { Header = "Wake options", ItemsSource = wake });
         }
@@ -708,6 +721,18 @@ public sealed class MainWindow : Window
         {
             Sheets.Text(this, "Bundle", $"Could not write {path}: {error.Message}");
         }
+    }
+
+    /// Runs the other helpers' commands while one run for this machine may still be going, after a
+    /// question that says so. Nothing else ever lifts a hold on a person's behalf.
+    private async void TryOtherHelpers(MachineModel machine)
+    {
+        var confirmed = await Sheets.AskAsync(this, $"Try the other helpers for {machine.Name}?",
+            $"A helper command run earlier to wake {machine.Name} has not reported how it ended, so it may still be running. Trying the other helpers runs their commands, and does not run that one again.",
+            "Try them");
+        if (!confirmed) return;
+        var report = await _app.WakeAsync(machine, tryOtherHelpers: true);
+        Sheets.Text(this, $"Wake — {machine.Name}", string.Join("\n", report.Attempts.Append(report.Sentence)));
     }
 
     private async void Wake(MachineModel machine, string? desiredSystem = null)
