@@ -653,6 +653,42 @@ public class LaunchGateTests
         Assert.Equal(LaunchDocuments.Tower, Gated(window, "tower", "linux").Agent);
     }
 
+    /// The kept copy is what tells the window that the command line adopted a document, before the
+    /// command line has recorded it as applied. Where the revisions cannot be written, a document
+    /// the window would otherwise read as a hand edit is not adopted at all; an edit, which has a
+    /// revision of its own, still is.
+    [Fact]
+    public void ADocumentThatCannotBeKeptIsNotAdoptedWhereItWouldReadAsAHandEdit()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        Directory.CreateDirectory(Path.Combine(home.Path, "laptop"));
+        File.WriteAllText(Path.Combine(home.Path, "laptop", "revisions"), "something that is not a directory");
+        using var window = Device(home, "laptop", applied: d0);
+        var mine = LaunchDocuments.Descendant(d0, root => LaunchDocuments.Machine(root, "tower")["name"] = "My tower");
+        Assert.Null(window.Config.Apply(mine, "adopted from pi"));
+        var approved = Record(home, "laptop").ToJsonString();
+
+        var theirs = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "touch /tmp/x"));
+        var anonymous = (JsonObject)JsonNode.Parse(theirs.Text)!;
+        anonymous.Remove("controller");
+        using (var line = Store(home, "laptop"))
+        {
+            Assert.Contains("Nothing was replaced", line.Apply(theirs, "took the setup from tower"));
+            Assert.Contains("Nothing was replaced", line.Apply(LaunchDocuments.Of(anonymous), "took the setup from tower"));
+        }
+        Assert.Equal(mine.Bytes, File.ReadAllBytes(window.Config.Path));
+        window.Config.Load();
+        Assert.Equal(mine.Hash, window.Config.Document!.Hash);
+        Assert.Equal(approved, Record(home, "laptop").ToJsonString());
+
+        var renamed = JsonNode.Parse(mine.Text)!.AsObject();
+        LaunchDocuments.Machine(renamed, "pi")["name"] = "Pi upstairs";
+        Assert.NotNull(window.ApplyEdit(renamed.ToJsonString(), mine.Hash, "edited here").Document);
+        Assert.Equal("Pi upstairs", window.Machine("pi")!.Name);
+    }
+
     [Fact]
     public void AHandEditOfWhatTheCommandLineTookApprovesOnlyWhatThePersonChanged()
     {

@@ -315,6 +315,16 @@ public sealed class ConfigStore : IDisposable
             // Kept before it is written, so that another process reading the file in the moment
             // before it is recorded as applied still knows it for an adoption (see [WasAdopted]).
             Ledger.Remember(document);
+            // The ledger never says why it could not keep a document. Without that copy, one that
+            // another process here would read as a hand edit of what is applied, one with no
+            // identity or a sibling branch with the same identity, would approve every launch value
+            // it changed, so it is not written at all.
+            ReloadApplied();
+            if (!WasAdopted(document) && _applied.Hash != document.Hash
+                && (!document.Identity.HasIdentity || _applied.MatchesIdentityOf(document.Identity)))
+            {
+                return $"Could not keep a copy of this setup in {Ledger.Directory}, which is how the window and the command line tell it from a hand edit. Nothing was replaced ({description}).";
+            }
             AtomicWrite.Bytes(Path, document.Bytes);
             RecordApplied(document);
             _lastSignature = null;
