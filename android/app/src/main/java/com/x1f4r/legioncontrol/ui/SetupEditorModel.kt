@@ -16,12 +16,15 @@ import com.x1f4r.legioncontrol.data.WakeHelperConfig
 import com.x1f4r.legioncontrol.data.withList
 import com.x1f4r.legioncontrol.data.withText
 import com.x1f4r.legioncontrol.data.text
+import com.x1f4r.legioncontrol.data.withStrings
 import com.x1f4r.legioncontrol.data.withWake
+import com.x1f4r.legioncontrol.net.LanPrefix
 import com.x1f4r.legioncontrol.data.AcceptedConfig
 import com.x1f4r.legioncontrol.data.acceptControllerConfig
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 
@@ -315,15 +318,7 @@ class SetupEditorModel(
 
     fun setWakeBroadcasts(machineId: String, addresses: List<String>) = change {
         it.editMachine(machineId) { machine ->
-            machine.withWake { wake ->
-                JsonObject(
-                    wake + (
-                        "broadcast" to buildJsonArray {
-                            addresses.filter { a -> a.isNotBlank() }.forEach { a -> add(JsonPrimitive(a)) }
-                        }
-                        ),
-                )
-            }
+            machine.withWake { wake -> wake.withStrings("broadcast", addresses.filter { a -> a.isNotBlank() }) }
         }
     }
 
@@ -384,27 +379,11 @@ class SetupEditorModel(
     fun removeSite(id: String) = change { it.removeSite(id) }
 
     fun setSitePrefixes(id: String, prefixes: List<String>) = change {
-        it.editSite(id) { site ->
-            JsonObject(
-                site + (
-                    "lanPrefixes" to buildJsonArray {
-                        prefixes.filter { p -> p.isNotBlank() }.forEach { p -> add(JsonPrimitive(p)) }
-                    }
-                    ),
-            )
-        }
+        it.editSite(id) { site -> site.withStrings("lanPrefixes", prefixes.filter { p -> p.isNotBlank() }) }
     }
 
     fun setSiteBroadcasts(id: String, addresses: List<String>) = change {
-        it.editSite(id) { site ->
-            JsonObject(
-                site + (
-                    "broadcast" to buildJsonArray {
-                        addresses.filter { a -> a.isNotBlank() }.forEach { a -> add(JsonPrimitive(a)) }
-                    }
-                    ),
-            )
-        }
+        it.editSite(id) { site -> site.withStrings("broadcast", addresses.filter { a -> a.isNotBlank() }) }
     }
 
     // MARK: - Applying
@@ -421,9 +400,13 @@ class SetupEditorModel(
      * the edit would approve it on this device.
      */
     fun apply(): Boolean {
-        val document = working ?: return false
+        val edited = working ?: return false
         commandProblem?.let { problem ->
             error = problem
+            return false
+        }
+        val document = normalisePrefixes(edited, base).getOrElse { problem ->
+            error = problem.message
             return false
         }
         val failure = services.applyEdit(document, services.deviceName())
@@ -449,6 +432,45 @@ class SetupEditorModel(
         val to = working?.root ?: return emptyList()
         return SetupMerge.changesBetween(before = from, after = to)
     }
+}
+
+/**
+ * [edited] with every network prefix the edit changed written as contract section 10.1 says an
+ * editor writes one, or the first that is not a prefix at all.
+ *
+ * Octet-aligned prefixes become dotted octets with the trailing dot, because a client that predates
+ * the section matches prefixes as text and is right only when one ends in a dot; any other length
+ * stays CIDR. A value that is neither, a full address without a length, host bits set, a wildcard,
+ * would never match anything, so it is refused here rather than saved. Only the prefixes the edit
+ * changed are looked at: one that came in from a peer is shown as a warning, and is the peer's to
+ * fix.
+ */
+internal fun normalisePrefixes(edited: ControllerDocument, before: ControllerDocument?): Result<ControllerDocument> {
+    fun normalised(text: String): String? = LanPrefix.parse(text)?.normalised
+    fun refusal(text: String) = IllegalArgumentException(
+        "\"$text\" is not a network prefix. Write one to three octets, like 192.168.1., or a network " +
+            "and its length, like 192.168.16.0/20.",
+    )
+
+    val beforeSites = (before?.root?.get("sites") as? JsonArray).orEmpty().filterIsInstance<JsonObject>()
+    val beforeMachines = (before?.root?.get("machines") as? JsonArray).orEmpty().filterIsInstance<JsonObject>()
+    var document = edited
+    for (site in (edited.root["sites"] as? JsonArray).orEmpty().filterIsInstance<JsonObject>()) {
+        val id = site.text("id") ?: continue
+        val prefixes = (site["lanPrefixes"] as? JsonArray)?.map { (it as? JsonPrimitive)?.contentOrNull } ?: continue
+        if (beforeSites.firstOrNull { it.text("id") == id }?.get("lanPrefixes") == site["lanPrefixes"]) continue
+        val written = prefixes.map { text -> text?.let(::normalised) ?: return Result.failure(refusal(text.orEmpty())) }
+        document = document.editSite(id) { it.withStrings("lanPrefixes", written) }
+    }
+    for (machine in (edited.root["machines"] as? JsonArray).orEmpty().filterIsInstance<JsonObject>()) {
+        val id = machine.text("id") ?: continue
+        val prefix = (machine["wake"] as? JsonObject)?.text("lanPrefix") ?: continue
+        val previous = (beforeMachines.firstOrNull { it.text("id") == id }?.get("wake") as? JsonObject)?.text("lanPrefix")
+        if (prefix == previous) continue
+        val written = normalised(prefix) ?: return Result.failure(refusal(prefix))
+        document = document.editMachine(id) { it.withWake { wake -> wake.withText("lanPrefix", written) } }
+    }
+    return Result.success(document)
 }
 
 /**

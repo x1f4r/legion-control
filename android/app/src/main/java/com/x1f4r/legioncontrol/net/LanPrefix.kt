@@ -35,6 +35,18 @@ data class LanPrefix(
         return network and mask == other.network and mask
     }
 
+    /**
+     * How an editor writes this prefix (contract section 10.1): an octet-aligned one as dotted
+     * octets with the trailing dot, because a client that predates the section compares text with
+     * "starts with" and is right only when the prefix ends in a dot; any other length as CIDR.
+     */
+    val normalised: String
+        get() = if (length % 8 == 0 && length <= 24) {
+            formatIPv4(network).split('.').take(length / 8).joinToString(".", postfix = ".")
+        } else {
+            "${formatIPv4(network)}/$length"
+        }
+
     companion object {
         private val OCTET = Regex("^(?:0|[1-9][0-9]{0,2})$")
 

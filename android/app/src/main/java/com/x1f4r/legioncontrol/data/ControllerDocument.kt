@@ -159,12 +159,15 @@ class ControllerDocument private constructor(
     fun removeMachine(id: String): ControllerDocument =
         withMachines(machinesArray().filterNot { it.text("id") == id })
 
+    /**
+     * A new site, with nothing but its id and name. An empty `lanPrefixes` or `broadcast` is never
+     * written: a site with no prefixes is one the person names as where they are, and writing an
+     * empty list says the same thing with one more way to read it.
+     */
     fun addSite(id: String, name: String): ControllerDocument = withSites(
         sitesArray() + buildJsonObject {
             put("id", JsonPrimitive(id))
             put("name", JsonPrimitive(name))
-            put("lanPrefixes", JsonArray(emptyList()))
-            put("broadcast", JsonArray(emptyList()))
         },
     )
 
@@ -305,6 +308,13 @@ internal fun JsonObject.withList(
     val existing = (this[key] as? JsonArray).orEmpty().filterIsInstance<JsonObject>()
     return JsonObject(this + (key to JsonArray(transform(existing))))
 }
+
+/**
+ * Sets a list of strings, or removes the key when there are none: an editor never writes an empty
+ * `lanPrefixes` or `broadcast` (contract section 10.1).
+ */
+internal fun JsonObject.withStrings(key: String, values: List<String>): JsonObject =
+    if (values.isEmpty()) JsonObject(this - key) else JsonObject(this + (key to JsonArray(values.map(::JsonPrimitive))))
 
 /** Edits the wake block, creating it if a machine did not have one. */
 internal fun JsonObject.withWake(transform: (JsonObject) -> JsonObject): JsonObject {
