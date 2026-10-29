@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { processStartTicks } from '../src/state.mjs';
 import { cli, fresh, SRC, withHome } from './helpers.mjs';
 
 const base = { kind: 'update', service: 'demo', systemId: 'linux' };
@@ -145,7 +146,7 @@ test('the wire record carries only what the contract names', async () => {
     const ops = await fresh('operations.mjs');
     const { record } = ops.beginOperation({ id: 'eeeeeeee-1111-4111-8111-111111111111', ...base });
     const wire = ops.wireRecord(ops.readOperation(record.id));
-    for (const internal of ['bootId', 'queueRequested', 'force', 'contract', 'workerClaimed', 'launchPendingUntil', 'ownerStartedAt', 'lockOwner']) {
+    for (const internal of ['bootId', 'queueRequested', 'force', 'contract', 'workerClaimed', 'launchPendingUntil', 'ownerStartedAt', 'ownerStartTicks', 'lockOwner']) {
       assert.equal(internal in wire, false, `${internal} is internal and must not reach a client`);
     }
     for (const required of ['id', 'kind', 'service', 'target', 'actionId', 'mode', 'initiator', 'state', 'phase', 'progress', 'requestedAt', 'startedAt', 'updatedAt', 'finishedAt', 'expiresAt', 'pid', 'detached', 'result', 'log', 'agentVersion', 'systemId']) {
@@ -218,21 +219,21 @@ test('a pid another process holds now does not keep a record running', async () 
       const reused = '12121212-1111-4111-8111-111111111111';
       ops.beginOperation({ id: reused, ...base });
       ops.recordPhase(reused, 'installing');
-      ops.updateOperation(reused, { pid: other.pid, ownerStartedAt: anHourAgo() });
+      ops.updateOperation(reused, { pid: other.pid, ownerStartedAt: anHourAgo(), ownerStartTicks: null });
       assert.equal(ops.deriveState(ops.readOperation(reused)).state, 'finished');
 
       // The same live pid, with an owner that started before it was written
       // down, is that owner still at work.
       const owned = '13131313-1111-4111-8111-111111111111';
       ops.beginOperation({ id: owned, ...base });
-      ops.updateOperation(owned, { pid: other.pid, ownerStartedAt: new Date().toISOString() });
+      ops.updateOperation(owned, { pid: other.pid, ownerStartedAt: new Date().toISOString(), ownerStartTicks: processStartTicks(other.pid) });
       assert.equal(ops.deriveState(ops.readOperation(owned)).state, 'running');
 
       // A record from before 3.1.0 names no start time, and a live pid is
       // taken at its word as it always was.
       const legacy = '14141414-1111-4111-8111-111111111111';
       ops.beginOperation({ id: legacy, ...base });
-      ops.updateOperation(legacy, { pid: other.pid, ownerStartedAt: undefined });
+      ops.updateOperation(legacy, { pid: other.pid, ownerStartedAt: undefined, ownerStartTicks: undefined });
       assert.equal(ops.deriveState(ops.readOperation(legacy)).state, 'running');
 
       const recovered = ops.recoverOperations({ systemId: 'linux' });
@@ -251,7 +252,7 @@ test('this process is not the owner of a record an earlier process with its pid 
     const ops = await fresh('operations.mjs');
     const left = '15151515-1111-4111-8111-111111111111';
     ops.beginOperation({ id: left, ...base });
-    ops.updateOperation(left, { pid: process.pid, ownerStartedAt: anHourAgo() });
+    ops.updateOperation(left, { pid: process.pid, ownerStartedAt: anHourAgo(), ownerStartTicks: null });
     const mine = '16161616-1111-4111-8111-111111111111';
     ops.beginOperation({ id: mine, ...base });
     assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id), [left]);
@@ -276,7 +277,7 @@ test('a record that took the machine lock lives exactly as long as that hold', a
       // its holder failed to replace, so the pid is taken at its word.
       const orphan = '18181818-1111-4111-8111-111111111111';
       ops.beginOperation({ id: orphan, ...base });
-      ops.updateOperation(orphan, { pid: bystander.pid, ownerStartedAt: new Date().toISOString(), lockOwner: orphan });
+      ops.updateOperation(orphan, { pid: bystander.pid, ownerStartedAt: new Date().toISOString(), ownerStartTicks: processStartTicks(bystander.pid), lockOwner: orphan });
       assert.equal(ops.deriveState(ops.readOperation(orphan)).state, 'running');
 
       // Free, the lock says its owner is gone whatever its pid says now.

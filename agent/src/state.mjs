@@ -72,9 +72,45 @@ export function parseProcessStart(text) {
   return new Date(year, month, day, hours, minutes, seconds).getTime();
 }
 
-/** When this process started, as a record keeps it beside the pid. */
+/**
+ * When this process started, as a record keeps it beside the pid. Worked out
+ * once: the clock can be set while the process runs, a Raspberry Pi with no
+ * clock of its own sets it from the network after it has booted, and a start
+ * time worked out again after that would no longer match the one written.
+ */
+const OWN_START = new Date(Date.now() - process.uptime() * 1000).toISOString();
+
 export function ownStartTime() {
-  return new Date(Date.now() - process.uptime() * 1000).toISOString();
+  return OWN_START;
+}
+
+/**
+ * On Linux, when a process started in clock ticks since the boot, from
+ * /proc/<pid>/stat, or null. Within a boot it names one process exactly, and
+ * unlike any time of day it does not move when the clock is set: ps works its
+ * start times out from the clock as it is now, so a process that started
+ * before the clock was set forward looks as if it started after.
+ */
+export function processStartTicks(pid) {
+  if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    return parseStartTicks(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The start ticks in a /proc/<pid>/stat line: its 22nd field, counted from the
+ * last parenthesis, since the command name before it may hold spaces and
+ * parentheses of its own. Null for anything else.
+ */
+export function parseStartTicks(text) {
+  const line = String(text ?? '');
+  const close = line.lastIndexOf(')');
+  if (close === -1) return null;
+  const ticks = line.slice(close + 2).split(' ')[19];
+  return /^[0-9]+$/.test(ticks ?? '') ? ticks : null;
 }
 
 /**
@@ -104,18 +140,22 @@ export function processStartTime(pid) {
  * handed out again, on Windows soon. So whoever wrote the pid down also writes
  * down when that process started, no later than which it must have, and a
  * process that holds the id now and started well after that is somebody else's:
- * the one that was named is gone. A start time that cannot be read cannot prove
- * that, and the pid is taken for running, as it always was. The locks do not
- * depend on any of this, the operating system holds those; the records of
- * operations, the command ledger and the Windows watchdog's lock file do.
+ * the one that was named is gone. On Linux the ticks it started at, where they
+ * were written down too, say it exactly (processStartTicks). A start time that
+ * cannot be read cannot prove anything, and the pid is taken for running, as it
+ * always was. The locks do not depend on any of this, the operating system
+ * holds those; the records of operations, the command ledger and the Windows
+ * watchdog's lock file do.
  */
-export function processIsAlive(pid, { startedAt = null } = {}) {
+export function processIsAlive(pid, { startedAt = null, startTicks = null } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
   } catch (err) {
     if (err.code !== 'EPERM') return false;
   }
+  const ticks = startTicks ? processStartTicks(pid) : null;
+  if (ticks !== null) return ticks === startTicks;
   const named = Date.parse(startedAt ?? '');
   if (Number.isNaN(named)) return true;
   const started = pid === process.pid ? Date.parse(ownStartTime()) : processStartTime(pid);

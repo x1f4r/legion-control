@@ -75,6 +75,7 @@ import { runBoot, runSleep } from './power.mjs';
 import { aggregateBusy, checkAllBusy } from './probes/busy.mjs';
 import { runCycle } from './scheduler.mjs';
 import { livenessOf, selectService } from './service.mjs';
+import { processStartTicks } from './state.mjs';
 import { buildStatus, DEFAULT_STATUS_BUDGET_MS } from './status.mjs';
 import { checkBundle, resolveBootstrapLayout, runBootstrapInstall, runRollback, runSelfUpdate } from './selfupdate.mjs';
 import { runRestart, runUpdate } from './update.mjs';
@@ -1295,7 +1296,7 @@ async function detachedRun(config, { kind, service = null, target = null, action
   // The worker started no later than now, which is what tells it from a later
   // process given its id should it die before it claims the record.
   updateOperation(id, (record) => record.state === 'running' && record.pid === process.pid
-    ? { pid: started.pid, ownerStartedAt: new Date().toISOString() }
+    ? { pid: started.pid, ownerStartedAt: new Date().toISOString(), ownerStartTicks: processStartTicks(started.pid) }
     : {});
   return mutationReply({ ok: true, action: 'accepted',
     message: `${kind} accepted as operation ${id}; ask "op ${id} --wait 20" for the result` }, {

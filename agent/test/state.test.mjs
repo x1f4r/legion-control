@@ -118,6 +118,44 @@ test('eight concurrent writers keep every one of their four hundred writes', asy
   });
 });
 
+test('a clock set forward does not make this process a stranger to the records it wrote', async () => {
+  const state = await import('../src/state.mjs');
+  const written = state.ownStartTime();
+  const now = Date.now;
+  try {
+    // As a machine with no clock of its own does once the network sets it.
+    Date.now = () => now() + 60 * 60 * 1000;
+    assert.equal(state.ownStartTime(), written);
+    assert.equal(state.processIsAlive(process.pid, { startedAt: written }), true);
+  } finally {
+    Date.now = now;
+  }
+});
+
+test('the start ticks are read past a command name with spaces and parentheses of its own', async () => {
+  const { parseStartTicks } = await import('../src/state.mjs');
+  const after = 'S 1 4242 4242 0 -1 4194560 1234 0 0 0 10 5 0 0 20 0 11 0 987654 123456789 4321';
+  assert.equal(parseStartTicks(`4242 (node) ${after}`), '987654');
+  assert.equal(parseStartTicks(`4242 (a (b) c) ${after}`), '987654');
+  for (const text of ['4242 node S 1', '4242 (node) S 1 2', '', null]) assert.equal(parseStartTicks(text), null, String(text));
+});
+
+test('on Linux a process is told from a later one with its id by its start ticks, whatever the clock says', { skip: process.platform !== 'linux' }, async () => {
+  const state = await import('../src/state.mjs');
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  await new Promise((resolve) => child.once('spawn', resolve));
+  try {
+    const ticks = state.processStartTicks(child.pid);
+    assert.match(ticks, /^[0-9]+$/);
+    const anHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    assert.equal(state.processIsAlive(child.pid, { startedAt: anHourAgo, startTicks: ticks }), true, 'the same ticks are the same process, a clock that moved since or not');
+    assert.equal(state.processIsAlive(child.pid, { startedAt: new Date().toISOString(), startTicks: String(Number(ticks) - 1) }), false);
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
+
 test('a rename Windows refuses for a moment is tried again, and nowhere else', async () => {
   const state = await fresh('state.mjs');
   const sharing = (times, code = 'EPERM') => {

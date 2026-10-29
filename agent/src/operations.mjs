@@ -28,7 +28,7 @@ import { CONTRACT_VERSION, DISRUPTED_PHASES, OPERATION_ID_PATTERN, outcomeOf, PH
 import { holdsOperationLock, probeOperationLock } from './lock.mjs';
 import { log } from './log.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
-import { ownStartTime, processIsAlive, writeJsonAtomic } from './state.mjs';
+import { ownStartTime, processIsAlive, processStartTicks, writeJsonAtomic } from './state.mjs';
 
 /**
  * How many finished records are kept whatever they say, how long one that
@@ -395,8 +395,9 @@ function baseRecord(input) {
     pid: input.state === 'queued' ? null : process.pid,
     // What tells this pid's process from a later one with the same id, and
     // the operation whose hold on the machine lock is this owner's evidence of
-    // life once it takes it (see stillOwned). Neither is on the wire.
+    // life once it takes it (see ownerAlive). None of them is on the wire.
     ownerStartedAt: input.state === 'queued' ? null : ownStartTime(),
+    ownerStartTicks: input.state === 'queued' ? null : processStartTicks(process.pid),
     lockOwner: null,
     detached: input.detached === true,
     workerClaimed: input.state !== 'queued' && input.detached !== true,
@@ -636,6 +637,7 @@ export function claimOperation(id, { pid = process.pid, parentPid = process.ppid
         updatedAt: nowIso(),
         pid,
         ownerStartedAt: pid === process.pid ? ownStartTime() : null,
+        ownerStartTicks: processStartTicks(pid),
         lockOwner: null,
         workerClaimed: true,
         launchPendingUntil: null,
@@ -851,7 +853,8 @@ export function deferQueuedOperation(id, result) {
       return finishOperationUnlocked(id, { ok: true, action: 'expired', reasonCode: REASON.expired, message: 'the queued request expired while waiting for an idle window' });
     }
     return updateOperationUnlocked(id, {
-      state: 'queued', phase: 'queued', pid: null, ownerStartedAt: null, lockOwner: null, startedAt: null, workerClaimed: false, result: null,
+      state: 'queued', phase: 'queued', pid: null, ownerStartedAt: null, ownerStartTicks: null, lockOwner: null,
+      startedAt: null, workerClaimed: false, result: null,
       log: appendLine(record.log, `waiting for idle: ${result.message ?? result.reasonCode ?? 'busy'}`),
     });
   });
@@ -903,14 +906,13 @@ export function pendingPowerOperation({ excludeId = null } = {}) {
  */
 function ownerAlive(record) {
   if (!Number.isInteger(record.pid)) return false;
-  const startedAt = record.ownerStartedAt ?? null;
   if (record.pid !== process.pid && record.lockOwner) {
     if (holdsOperationLock()) return false;
     const { state, sidecar } = probeOperationLock();
     if (state === 'free') return false;
     if (state === 'held' && sidecar?.op === record.lockOwner && sidecar.pid === record.pid) return true;
   }
-  return processIsAlive(record.pid, { startedAt });
+  return processIsAlive(record.pid, { startedAt: record.ownerStartedAt ?? null, startTicks: record.ownerStartTicks ?? null });
 }
 
 /**
