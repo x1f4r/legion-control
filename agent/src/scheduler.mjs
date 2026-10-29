@@ -53,7 +53,7 @@ import {
   summarize,
   updateOperation,
 } from './operations.mjs';
-import { stillAtWork } from './operate.mjs';
+import { finishUnrunnable, stillAtWork } from './operate.mjs';
 import { orderServices, scheduledEligibility } from './policy.mjs';
 import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
@@ -245,13 +245,13 @@ async function runQueued(config, record, { lock, budget }) {
 
   if (record.kind === 'restart' || record.kind === 'update') {
     if (!service) {
-      finishOperation(record.id, {
+      const ended = finishUnrunnable(record.id, {
         ok: false,
         action: 'failed',
         reasonCode: REASON.unknownService,
         message: `the queued ${record.kind} names ${record.service}, which this machine no longer has`,
       });
-      return { opId: record.id, kind: record.kind, ok: false, action: 'failed' };
+      return { ...ended, opId: record.id, kind: record.kind, service: record.service };
     }
     const result =
       record.kind === 'restart' ? await runRestart(config, service, shared) : await runUpdate(config, service, shared);
@@ -259,6 +259,15 @@ async function runQueued(config, record, { lock, budget }) {
   }
 
   if (record.kind === 'run') {
+    if (!findAction(config, record.actionId)) {
+      const ended = finishUnrunnable(record.id, {
+        ok: false,
+        action: 'failed',
+        reasonCode: REASON.unknownAction,
+        message: `the queued run names the action ${record.actionId}, which this machine no longer has`,
+      });
+      return { ...ended, opId: record.id, kind: record.kind };
+    }
     return { opId: record.id, kind: record.kind, ...(await runAction(config, record.actionId, shared)) };
   }
 
@@ -275,13 +284,13 @@ async function runQueued(config, record, { lock, budget }) {
     return { opId: record.id, kind: record.kind, target: record.target ?? null, ...result };
   }
 
-  finishOperation(record.id, {
+  const ended = finishUnrunnable(record.id, {
     ok: false,
     action: 'failed',
     reasonCode: REASON.badArgument,
     message: `this agent does not know how to run a queued ${record.kind}`,
   });
-  return { opId: record.id, kind: record.kind, ok: false, action: 'failed' };
+  return { ...ended, opId: record.id, kind: record.kind };
 }
 
 /** The longest a queued request can take once it is taken up, or 0 for one that only fails. */

@@ -53,6 +53,7 @@ import { reportedFloor } from './floor.mjs';
 import { acquireOperationLock } from './lock.mjs';
 import { log, readLogLines } from './log.mjs';
 import { redactReply, restrictedRedactor } from './redact.mjs';
+import { finishUnrunnable } from './operate.mjs';
 import {
   beginOperation,
   cancelOperation,
@@ -1319,10 +1320,25 @@ async function commandOpRun(config, positional) {
   let result;
   if (record.kind === 'update' || record.kind === 'restart') {
     const service = config.services.find((entry) => entry.id === record.service);
-    if (!service) return missingService(config, record.service);
-    result = record.kind === 'update' ? await runUpdate(config, service, shared) : await runRestart(config, service, shared);
+    // Removed since the request was made: the worker is the only one left to
+    // end the record, and a refusal of its own would leave it running.
+    result = service
+      ? record.kind === 'update' ? await runUpdate(config, service, shared) : await runRestart(config, service, shared)
+      : finishUnrunnable(id, {
+        ok: false,
+        action: 'failed',
+        reasonCode: REASON.unknownService,
+        message: `the ${record.kind} names ${record.service}, which this machine no longer has`,
+      });
   } else if (record.kind === 'run') {
-    result = await runAction(config, record.actionId, shared);
+    result = config.actions.some((action) => action.id === record.actionId)
+      ? await runAction(config, record.actionId, shared)
+      : finishUnrunnable(id, {
+        ok: false,
+        action: 'failed',
+        reasonCode: REASON.unknownAction,
+        message: `the run names the action ${record.actionId}, which this machine no longer has`,
+      });
   } else if (record.kind === 'boot') {
     result = await runBoot(config, record.target, shared);
   } else if (record.kind === 'sleep') {

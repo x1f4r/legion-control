@@ -317,3 +317,37 @@ test('a queued arm-only request keeps its intent through op-run and replays its 
     assert.equal(replay.op.state, 'finished');
   });
 });
+
+test('a detached worker finishes a record whose service or action was removed, rather than leaving it running', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home);
+    const config = fixtureConfig(dir, { actions: [{ id: 'hello', name: 'Hello', command: [process.execPath, '-e', ''] }] });
+    writeConfig(home, config);
+    // Opened as `--detach` opens them, and then the setup lost what they name.
+    for (const [id, input] of [['detached-gone-service', { kind: 'restart', service: 'gone' }], ['detached-gone-action', { kind: 'run', actionId: 'gone' }]]) {
+      beginOperation({ id, ...input, systemId: 'test', detached: true });
+      updateOperation(id, { launchPendingUntil: new Date(Date.now() + 30000).toISOString() });
+    }
+    const service = cli(['op-run', 'detached-gone-service'], { home }).payload;
+    assert.equal(service.action, 'failed');
+    assert.equal(service.reasonCode, 'unknown-service');
+    assert.equal(service.op.state, 'finished');
+    const action = cli(['op-run', 'detached-gone-action'], { home }).payload;
+    assert.equal(action.reasonCode, 'unknown-action');
+    for (const id of ['detached-gone-service', 'detached-gone-action']) {
+      const record = readOperation(id);
+      assert.equal(record.state, 'finished', id);
+      assert.equal(record.result.outcome, 'failed');
+      assert.equal(record.workerClaimed, true, 'taken up like any other, so a second worker would find it taken');
+    }
+    assert.equal(cli(['op-run', 'detached-gone-service'], { home }).payload.action, 'conflict');
+
+    // A queued run whose action went is finished by the cycle that finds it,
+    // not taken up and dropped every quarter of an hour until it expires.
+    assert.equal(cli(['run', 'hello', '--when-idle', '--op', 'queued-gone-action'], { home }).payload.action, 'queued');
+    writeConfig(home, { ...config, actions: [] });
+    const cycled = cli(['cycle'], { home }).payload;
+    assert.deepEqual(cycled.queued.map((entry) => [entry.opId, entry.action, entry.reasonCode]), [['queued-gone-action', 'failed', 'unknown-action']]);
+    assert.equal(readOperation('queued-gone-action').state, 'finished');
+  });
+});

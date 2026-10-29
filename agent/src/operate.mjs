@@ -68,6 +68,31 @@ export function stillAtWork(result, unsettled) {
 }
 
 /**
+ * Finish a record whose request can no longer be run at all, because the
+ * service or action it names was removed from the setup after it was asked
+ * for. Whoever takes it up, a cycle or a detached worker, finishes it with
+ * why; otherwise nobody ever would, and a client following it would wait for
+ * an ending that never comes. It is taken up the way withOperation takes up a
+ * record, so one another process already took is left to that process.
+ */
+export function finishUnrunnable(id, result) {
+  const claimed = claimOperation(id);
+  if (!claimed.ok) {
+    return {
+      ok: false,
+      action: 'conflict',
+      reasonCode: claimed.reasonCode ?? REASON.operationInProgress,
+      opId: id,
+      op: summarize(claimed.record ?? readOperation(id)),
+      replayed: true,
+      message: claimed.error,
+    };
+  }
+  const finished = finishOperation(id, result);
+  return { ...result, opId: id, op: summarize(finished) };
+}
+
+/**
  * Open a record, take the lock, run the body, close the record.
  *
  * The body returns `{ action, ok, reasonCode, message, ... }` — exactly what the
