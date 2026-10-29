@@ -727,16 +727,17 @@ enum AppUpdates {
         launch "$CURRENT"
 
         # The new build writes the marker as soon as it has finished launching. No marker means it
-        # crashed on the way up, or refused to start at all, and the old one goes back.
+        # crashed on the way up, or refused to start at all, and the old one goes back. Looked for
+        # once more after the last wait, so a build that came up during it is not stopped for that.
         i=0
-        while [ $i -lt \(launchTimeout * 10) ]; do
-            if [ -f "$MARKER" ]; then
-                finish 0
-                exit 0
-            fi
+        while [ $i -lt \(launchTimeout * 10) ] && [ ! -f "$MARKER" ]; do
             sleep 0.1
             i=$((i + 1))
         done
+        if [ -f "$MARKER" ]; then
+            finish 0
+            exit 0
+        fi
 
         # Recovery. The new build is put where the previous one was rather than deleted, so a failure
         # that turns out to be about something else is still diagnosable.

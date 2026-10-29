@@ -463,6 +463,31 @@ struct AppUpdateTests {
         #expect(AppUpdates.swapOutcome(support: root) == .init(id: "swap-1", status: AppUpdates.SwapOutcome.landed))
     }
 
+    @Test("a build that comes up during the helper's last wait is not stopped for being a poll late")
+    func swapHelperLooksOnceMoreAfterWaiting() async throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let current = root.appending(path: "Legion Control.app")
+        let staged = root.appending(path: "Legion Control.new.app")
+        let previous = root.appending(path: "Legion Control.previous.app")
+        let marker = root.appending(path: "launched-ok")
+        try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
+        try Self.makeBundle(at: staged, identifier: "id", executable: "LegionControl", version: "1.4.0")
+
+        // No wait at all, so the look after it is the only one there is, and the build being
+        // started has written its marker by then.
+        let launch = try Self.recordingLauncher(in: root, then: "printf ok > \(CommandGrammar.posixQuoted(marker.path))\n")
+        let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
+                                           marker: marker, pid: try Self.exitedProcessID(), swapID: "swap-1",
+                                           launchTimeout: 0, launcher: launch.argv)
+        let run = try await Self.runHelper(script, in: root)
+
+        #expect(run.exitCode == 0)
+        #expect(Self.launched(launch.log) == [current.path(percentEncoded: false)])
+        #expect(AppUpdates.version(ofBundleAt: current) == "1.4.0")
+        #expect(AppUpdates.swapOutcome(support: root) == .init(id: "swap-1", status: AppUpdates.SwapOutcome.landed))
+    }
+
     /// A launcher step that copies whatever outcome the helper has written so far to `seen`, so a
     /// test can tell what the build being started would have found.
     static func notingOutcome(support: URL, into seen: URL) -> String {

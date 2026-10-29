@@ -457,29 +457,50 @@ final class AppUpdateModel {
         resolvePendingSwap()
     }
 
-    /// The one place an install is recorded as done: the build running now is the one it installed.
+    /// How soon the build a swap put in place looks again for the helper's word, while it waits for
+    /// it. Injected so a test need not wait as long.
+    @ObservationIgnored var settleInterval: Duration = .milliseconds(250)
+    @ObservationIgnored private var settleTask: Task<Void, Never>?
+
+    /// The one place an install is recorded as done: the helper saw the build it put in place come
+    /// up, or that build is running and the helper is long gone.
     ///
-    /// Any other build settles the swap by what the helper wrote down about it, never by its own
-    /// version alone. A roll back into a release from before swaps were written down lands without
-    /// that release saying so, and the record is next read by a build that knows about it, maybe
-    /// days later: by version alone, that looks exactly like the roll back failing.
+    /// Not on the running version alone, even when it is the one asked for. The marker this build
+    /// has just written can reach the helper a poll after its wait ran out, and then the helper stops
+    /// this build and starts the previous one, which has to find the record still there to say the
+    /// update did not come up. The helper says "landed" within a poll of seeing the marker, so the
+    /// build it was waiting for looks again until it has.
+    ///
+    /// Any other build settles the swap by what the helper wrote down about it too. A roll back into
+    /// a release from before swaps were written down lands without that release saying so, and the
+    /// record is next read by a build that knows about it, maybe days later: by version alone, that
+    /// looks exactly like the roll back failing.
     private func resolvePendingSwap() {
         // A relocated run never hands a swap over, and its support folder is not where the helper
         // writes, so whatever record it finds belongs to the ordinary installation, unread.
         guard !isIsolatedRun, let pending = loadPendingSwap() else { return }
         let running = installedVersion
+        let isTarget = running == pending.version
         let outcome = AppUpdates.swapOutcome(support: supportDirectory).flatMap { $0.id == pending.id ? $0.status : nil }
-        // Neither the build it asked for nor a word from the helper, while the helper may still be
-        // at work: this is a copy started beside the swap, and the next launch settles it.
-        if running != pending.version, outcome == nil, let handedOverAt = pending.handedOverAt {
+        if let handedOverAt = pending.handedOverAt {
             let age = now().timeIntervalSince(handedOverAt)
-            if age >= 0 && age < AppUpdates.helperLifetime { return }
+            if age >= 0 && age < AppUpdates.helperLifetime {
+                // No word yet while the helper may still be at work. The build it put in place waits
+                // for it; any other is a copy started beside the swap, and the next launch settles it.
+                if outcome == nil {
+                    if isTarget { lookAgainShortly() }
+                    return
+                }
+                // The helper did not see this build come up and is stopping it to start the one
+                // before, which settles the swap as the helper says.
+                if isTarget && outcome != AppUpdates.SwapOutcome.landed { return }
+            }
         }
         forgetPendingSwap()
         AppUpdates.forgetSwapOutcome(support: supportDirectory)
 
-        if running == pending.version {
-            // A roll back that landed needs no word: the build it asked for is the one running.
+        if isTarget, outcome == nil || outcome == AppUpdates.SwapOutcome.landed {
+            // A roll back that landed needs nothing more: the build it asked for is the one running.
             if pending.kind == .update { updateCameUp(pending) }
         } else if outcome == AppUpdates.SwapOutcome.landed {
             // The helper saw the build it put in place come up, and something has replaced it since:
@@ -495,6 +516,16 @@ final class AppUpdateModel {
         onStateChange?()
     }
 
+    private func lookAgainShortly() {
+        guard settleTask == nil else { return }
+        let interval = settleInterval
+        settleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: interval)
+            self?.settleTask = nil
+            self?.resolvePendingSwap()
+        }
+    }
+
     private func updateCameUp(_ pending: PendingSwap) {
         let running = installedVersion
         if let id = pending.operationId {
@@ -504,8 +535,9 @@ final class AppUpdateModel {
         }
         // The check that offered this build found it the newest there was, and until the next
         // check that is still the answer, so the new build does not come up with none. Not when
-        // the setup has since named another repository: that one has not been asked.
-        if pending.repository == nil || pending.repository == repo() {
+        // the setup has since named another repository: that one has not been asked. Nor once this
+        // build has an answer of its own, which it can by the time the helper has had its say.
+        if check == nil, pending.repository == nil || pending.repository == repo() {
             let answer = AppUpdates.Check.upToDate(note: "Updated to \(running).")
             checkedRepo = repo()
             lastChecked = pending.checkedAt ?? now()

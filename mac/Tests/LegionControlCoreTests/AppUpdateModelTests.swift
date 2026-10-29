@@ -384,7 +384,13 @@ struct AppUpdateModelTests {
         }
     }
 
-    @Test("an install handed to the helper is only recorded as done by the launch of the new build")
+    /// Waits a little for something a model does on a timer of its own.
+    func eventually(_ condition: () -> Bool) async {
+        let deadline = Date().addingTimeInterval(2)
+        while !condition(), Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+    }
+
+    @Test("an install handed to the helper is only recorded as done once the helper has seen the new build come up")
     func installConfirmedByNextLaunch() async throws {
         let (model, preferences, directory) = fixture()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -403,12 +409,76 @@ struct AppUpdateModelTests {
         #expect(AppUpdateModel(preferences: preferences, installedVersion: "3.0.0").check == .available(Self.release))
 
         let (next, history) = relaunch(after: model, preferences: preferences, store: store, as: "3.1.0")
+        next.settleInterval = .milliseconds(5)
         next.confirmLaunch()
+        let marker = AppUpdates.launchMarkerURL(support: next.supportDirectory)
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+        // Running the build it asked for is not the helper's word yet: its wait may have run out a
+        // poll before that marker, and then it stops this build and starts the old one.
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(next.loadPendingSwap() == pending)
+        #expect(history.record(id: id)?.state == .unknown)
+        #expect(next.check == nil)
+        #expect(next.failure == nil)
+
+        // The helper sees the marker and says so.
+        try Self.helperEnds(AppUpdates.SwapOutcome.landed, swap: pending.id, marker: marker)
+        await eventually { history.record(id: id)?.state == .succeeded }
         #expect(history.record(id: id)?.state == .succeeded)
         #expect(next.check == .upToDate(note: "Updated to 3.1.0."))
         #expect(next.failure == nil)
         #expect(next.loadPendingSwap() == nil)
-        #expect(FileManager.default.fileExists(atPath: AppUpdates.launchMarkerURL(support: next.supportDirectory).path))
+        #expect(AppUpdates.swapOutcome(support: next.supportDirectory) == nil)
+    }
+
+    @Test("a new build the helper stops after all leaves the swap to the build put back, which reports it")
+    func lateNewBuildLeavesSwap() async throws {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        prepareInstall(model, in: directory) { _, _, _, _, _ in }
+        await offerAndInstall(model, store: store)
+        let pending = try #require(model.loadPendingSwap())
+        let id = try #require(pending.operationId)
+
+        // The new build's marker came a poll after the helper's wait ran out, so the helper says
+        // the old build goes back while the new one is still waiting to hear.
+        let (late, lateHistory) = relaunch(after: model, preferences: preferences, store: store, as: "3.1.0")
+        late.settleInterval = .milliseconds(5)
+        late.confirmLaunch()
+        let marker = AppUpdates.launchMarkerURL(support: late.supportDirectory)
+        try Self.helperEnds(AppUpdates.SwapOutcome.putBack, swap: pending.id, marker: marker)
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(late.loadPendingSwap() == pending)
+        #expect(lateHistory.record(id: id)?.state == .unknown)
+        #expect(late.failure == nil)
+
+        // The helper stops it and starts the old build, which finds the record and the reason.
+        let (old, oldHistory) = relaunch(after: model, preferences: preferences, store: store, as: "3.0.0")
+        old.confirmLaunch()
+        #expect(oldHistory.record(id: id)?.state == .failed)
+        #expect(old.failure?.contains("3.1.0 did not come up, so 3.0.0 is still the build that runs") == true)
+        #expect(old.check == .available(Self.release))
+        #expect(old.loadPendingSwap() == nil)
+    }
+
+    @Test("the new build settles by its own version only once the helper is long gone without a word")
+    func newBuildAfterHelperIsGone() async throws {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        prepareInstall(model, in: directory) { _, _, _, _, _ in }
+        await offerAndInstall(model, store: store)
+        let id = try #require(model.loadPendingSwap()?.operationId)
+
+        // The Mac went down mid-swap, say, and the new build was started at login: nothing is left
+        // to stop it, so it is what was installed.
+        let (next, history) = relaunch(after: model, preferences: preferences, store: store, as: "3.1.0")
+        next.now = { Date().addingTimeInterval(AppUpdates.helperLifetime + 1) }
+        next.confirmLaunch()
+        #expect(history.record(id: id)?.state == .succeeded)
+        #expect(next.loadPendingSwap() == nil)
+        #expect(next.failure == nil)
     }
 
     @Test("a relocated run leaves the ordinary installation's swap alone, whichever build it is", arguments: ["3.0.0", "3.1.0"])
@@ -578,12 +648,19 @@ struct AppUpdateModelTests {
         model.rollBack()
         #expect(handed.map(\.bundle) == [previous])
         #expect(quits == 1)
-        #expect(model.loadPendingSwap()?.version == "2.9.0")
+        let pending = try #require(model.loadPendingSwap())
+        #expect(pending.version == "2.9.0")
         // A released 2.9.0 would take this build's "up to date" as its own.
         #expect(preferences.data(forKey: "appUpdateLastCheck") == nil)
 
+        // The kept build coming up is not the helper's word either, and settles once there is one.
         let (back, _) = relaunch(after: model, preferences: preferences, store: store, as: "2.9.0")
+        back.settleInterval = .milliseconds(5)
         back.confirmLaunch()
+        #expect(back.loadPendingSwap() == pending)
+        try Self.helperEnds(AppUpdates.SwapOutcome.landed, swap: pending.id,
+                            marker: AppUpdates.launchMarkerURL(support: back.supportDirectory))
+        await eventually { back.loadPendingSwap() == nil }
         #expect(back.failure == nil)
         #expect(back.loadPendingSwap() == nil)
 
