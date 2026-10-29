@@ -640,6 +640,16 @@ enum AppUpdates {
             \(launcher.map(CommandGrammar.posixQuoted).joined(separator: " ")) "$1" 2>/dev/null || true
         }
 
+        # Whether a pid names a process running out of the bundle this helper put in place. Asked
+        # again before every signal: a pid that has since gone to something else, or a marker an
+        # older build wrote without one, is left alone.
+        runs_from_current() {
+            case "$(/bin/ps -p "$1" -o comm= 2>/dev/null)" in
+                "$CURRENT"/*) return 0 ;;
+            esac
+            return 1
+        }
+
         # The new build writes its pid to STARTING as it starts and to the marker once it is up. A
         # build that is still coming up when the wait runs out, slowly or never, is stopped here
         # before the old one is started, so the two never end up running side by side.
@@ -651,20 +661,16 @@ enum AppUpdates {
                 case "$found" in
                     ''|*[!0-9]*) continue ;;
                 esac
-                # Only a process running out of the bundle this helper put in place. A pid that has
-                # since gone to something else, or a marker an older build wrote without one, is
-                # left alone.
-                case "$(/bin/ps -p "$found" -o comm= 2>/dev/null)" in
-                    "$CURRENT"/*) ;;
-                    *) continue ;;
-                esac
+                runs_from_current "$found" || continue
                 kill -TERM "$found" 2>/dev/null
                 j=0
-                while [ $j -lt 50 ] && kill -0 "$found" 2>/dev/null; do
+                while [ $j -lt 50 ] && runs_from_current "$found"; do
                     sleep 0.1
                     j=$((j + 1))
                 done
-                kill -KILL "$found" 2>/dev/null
+                if runs_from_current "$found"; then
+                    kill -KILL "$found" 2>/dev/null
+                fi
             done
             return 0
         }

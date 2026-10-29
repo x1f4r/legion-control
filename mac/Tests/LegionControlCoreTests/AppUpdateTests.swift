@@ -528,6 +528,48 @@ struct AppUpdateTests {
         #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
     }
 
+    @Test("recovery sends the hard kill only while the pid still runs out of the new bundle")
+    func swapHelperKillsOnlyInsideBundle() async throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tools = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tools) }
+        let current = root.appending(path: "Legion Control.app")
+        let staged = root.appending(path: "Legion Control.new.app")
+        let previous = root.appending(path: "Legion Control.previous.app")
+        let marker = root.appending(path: "launched-ok")
+        let starting = AppUpdates.launchingURL(support: root)
+        try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
+        try Self.makeBundle(at: staged, identifier: "id", executable: "LegionControl", version: "1.4.0")
+        // A new build that, asked to stop, becomes something running from outside the bundle under
+        // the same pid: what a pid handed to another program between the two signals looks like to
+        // the helper. A shell linked into the bundle, so ps names it by its path there until it
+        // execs sleep.
+        try FileManager.default.createSymbolicLink(at: staged.appending(path: "Contents/MacOS/hang"),
+                                                   withDestinationURL: URL(fileURLWithPath: "/bin/bash"))
+        let started = CommandGrammar.posixQuoted(starting.path)
+        let launch = try Self.recordingLauncher(in: tools, then: """
+            bundle="${1%/}"
+            if [ -e "$bundle/Contents/MacOS/hang" ]; then
+                "$bundle/Contents/MacOS/hang" -c 'trap "exec /bin/sleep 30" TERM; while :; do /bin/sleep 0.1; done' </dev/null >/dev/null 2>&1 &
+                printf '%s\\n' "$!" > \(started)
+            fi
+
+            """)
+        let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
+                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1,
+                                           launcher: launch.argv)
+        let run = try await Self.runHelper(script, in: root)
+        let pid = try #require(Int32(String(contentsOf: starting, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        defer { kill(pid, SIGKILL) }
+
+        #expect(run.exitCode == 2)
+        #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
+        // Stopped being the new build after the first signal, so it never got the second.
+        #expect(kill(pid, 0) == 0)
+    }
+
     @Test("the helper puts everything back when the staged bundle cannot be moved into place")
     func swapHelperHandlesMissingStage() async throws {
         let root = try Self.temporaryDirectory()
