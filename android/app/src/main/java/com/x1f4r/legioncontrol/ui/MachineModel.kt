@@ -24,6 +24,7 @@ import com.x1f4r.legioncontrol.agent.OperationIntent
 import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.PolicyPatch
 import com.x1f4r.legioncontrol.agent.RetryRequest
+import com.x1f4r.legioncontrol.agent.ServiceNaming
 import com.x1f4r.legioncontrol.agent.ServiceStatus
 import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.UpdateRequest
@@ -1020,11 +1021,11 @@ class MachineModel(
      * came back refused for as long as anybody kept pressing. An outcome nobody knows is never
      * offered at all; it is only ever read again, with [checkAgain].
      *
-     * What is sent is [retryRequest]'s answer and nothing else, the same answer that decides whether
-     * the button is drawn, so a record the screen offers nothing for cannot be sent here either.
+     * What is sent is [tryAgainFor]'s answer and nothing else, the same answer that decides whether
+     * the button can be pressed, so a record the screen offers nothing for cannot be sent here either.
      */
     fun retry(record: OperationRecord) {
-        val again = record.retryRequest(detach = speaksV3, serviceArgument = ::serviceArgument) ?: return
+        val again = tryAgainFor(record, status, detach = speaksV3) ?: return
         val intent = record.intent
         val task = when (again) {
             is RetryRequest.Update -> Task.UPDATE
@@ -1049,6 +1050,10 @@ class MachineModel(
             }
         }
     }
+
+    /** Whether Try again on [record] can be pressed now: [tryAgainFor], from the reading on screen. */
+    fun canTryAgain(record: OperationRecord): Boolean =
+        !isWorking && tryAgainFor(record, status, detach = speaksV3) != null
 
     /**
      * Reads an unresolved change again by its own id, and sends nothing (contract section 5.6).
@@ -1512,6 +1517,19 @@ internal fun agentDeploymentFor(
     }
     return AgentDeploymentPath.decide(abilities, status, system, bundled)
 }
+
+/**
+ * What Try again sends for [record] from the reading on screen, [status], or null when it sends
+ * nothing now.
+ *
+ * The button is enabled from this and the press sends it, so neither goes further than the other,
+ * and neither goes further than the buttons the change was first asked for with. A service is named
+ * the way [status] says this agent takes one, and nothing that names a service is rebuilt while there
+ * is no reading that says, which is after any failed read and before the first: an update sent then
+ * without `--service` would stop and reinstall the first service instead.
+ */
+internal fun tryAgainFor(record: OperationRecord, status: AgentStatus?, detach: Boolean): RetryRequest? =
+    record.retryRequest(detach, ServiceNaming.of(status))
 
 /**
  * The actions an agent offered, as far as this app can send them back.

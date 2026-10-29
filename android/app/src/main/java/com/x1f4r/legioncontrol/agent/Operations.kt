@@ -231,10 +231,12 @@ data class OperationRecord(
     val isCancellable: Boolean get() = state == TrackedState.QUEUED
 
     /**
-     * Whether "Try again" is offered: exactly when [retryRequest] has a request to send, so the button
-     * on screen and the press behind it can never disagree.
+     * Whether "Try again" is drawn: exactly when [retryRequest] has a request to send to an agent that
+     * lists its services. Whether it can be pressed is the same question asked of the machine's last
+     * reading, which the screen asks with the same function, so the button and the press behind it
+     * can never disagree.
      */
-    val canTryAgain: Boolean get() = retryRequest(detach = false) != null
+    val canTryAgain: Boolean get() = retryRequest(detach = false, services = ServiceNaming.BY_NAME) != null
 
     /**
      * Whether it ended well. Null while it is not over, while the outcome is not known, and for a
@@ -278,6 +280,40 @@ sealed interface RetryRequest {
 }
 
 /**
+ * How a machine's agent is told which service an update or restart is for, by its last reading.
+ *
+ * Three answers and not two, because sending no `--service` means two different things. To the first
+ * agent, which lists no services and drives exactly one, it is the only way to name that one. To
+ * every later agent it means the first service in its configuration, which is another service
+ * whenever the change was for any other. So nothing that names a service is rebuilt until the
+ * machine has answered and said which of the two it is.
+ */
+enum class ServiceNaming {
+    /** The reading listed the services, so the agent takes `--service` and is always given one. */
+    BY_NAME,
+
+    /** The reading listed none: the first agent, which drives one service and takes no `--service`. */
+    NOT_TAKEN,
+
+    /**
+     * No reading to go on: none yet, the last one failed, or the agent answered `ok:false`, which
+     * is a refusal and not an account of what it runs, and usually lists no services at all.
+     */
+    UNKNOWN,
+    ;
+
+    companion object {
+        /** What [status] says, read as [AgentStatus.reportsServices] decides `--service` for the buttons. */
+        fun of(status: AgentStatus?): ServiceNaming =
+            when (status?.takeIf { it.ok != false }?.reportsServices) {
+                true -> BY_NAME
+                false -> NOT_TAKEN
+                null -> UNKNOWN
+            }
+    }
+}
+
+/**
  * What "Try again" sends for this change, or null when it offers nothing (contract section 5.6).
  *
  * Only for a change that is over, ended without anything a second request could double, and whose
@@ -285,23 +321,25 @@ sealed interface RetryRequest {
  * same force and queueing it was first asked for with, and naming the subject it named. A cycle, an
  * agent install, a policy write and anything written down without [OperationIntent.repeatable] are
  * never rebuilt here, because the fields kept for them would send something else. [detach] and
- * [serviceArgument] are what the machine's agent takes now, as the buttons decide them.
+ * [services] are what the machine's agent takes now, as its last reading says. An update or a restart
+ * goes without `--service` only to an agent that takes none, and is not rebuilt at all while nobody
+ * knows which kind of agent it is, because to every other agent that is the first service.
  */
 fun OperationRecord.retryRequest(
     detach: Boolean,
-    serviceArgument: (String) -> String? = { it },
+    services: ServiceNaming = ServiceNaming.BY_NAME,
 ): RetryRequest? {
     if (!isOver || !retryable || !intent.repeatable) return null
     val force = intent.force
     val whenIdle = intent.whenIdle
     val expires = intent.expires
     return when (intent.kind) {
-        OpKind.UPDATE -> intent.service?.takeIf { it.isNotBlank() }?.let { service ->
-            RetryRequest.Update(UpdateRequest(serviceArgument(service), force, whenIdle, expires, detach))
+        OpKind.UPDATE -> intent.serviceArgument(services)?.let { service ->
+            RetryRequest.Update(UpdateRequest(service.id, force, whenIdle, expires, detach))
         }
 
-        OpKind.RESTART -> intent.service?.takeIf { it.isNotBlank() }?.let { service ->
-            RetryRequest.Restart(serviceArgument(service), InterruptRequest(force, whenIdle, expires, detach))
+        OpKind.RESTART -> intent.serviceArgument(services)?.let { service ->
+            RetryRequest.Restart(service.id, InterruptRequest(force, whenIdle, expires, detach))
         }
 
         // The contract gives a boot and a sleep no `--detach`, so neither is ever sent with one.
@@ -316,6 +354,23 @@ fun OperationRecord.retryRequest(
         }
 
         OpKind.CYCLE, OpKind.SELF_UPDATE -> null
+    }
+}
+
+/** The `--service` a second update or restart carries: [id], or none to an agent that takes none. */
+private class ServiceArgument(val id: String?)
+
+/**
+ * The service this intent named, as [services] says the agent is to be told it, or null when it
+ * cannot be told it. An id the command line cannot carry is not dropped in its place, as the buttons
+ * drop it, because to an agent that takes `--service` a request without one is the first service.
+ */
+private fun OperationIntent.serviceArgument(services: ServiceNaming): ServiceArgument? {
+    val named = service?.takeIf { it.isNotBlank() } ?: return null
+    return when (services) {
+        ServiceNaming.BY_NAME -> named.takeIf { Contract.isToken(it) }?.let { ServiceArgument(it) }
+        ServiceNaming.NOT_TAKEN -> ServiceArgument(null)
+        ServiceNaming.UNKNOWN -> null
     }
 }
 

@@ -65,13 +65,91 @@ class RetryRequestTest {
 
     @Test
     fun `the service is named the way the buttons name it to that agent`() {
-        // An agent that lists no services takes no --service, and the buttons send none to it.
-        val withoutServices: (String) -> String? = { null }
         val update = neverArrived(OperationIntent(OpKind.UPDATE, service = "t3", repeatable = true))
         val restart = neverArrived(OperationIntent(OpKind.RESTART, service = "t3", repeatable = true))
 
-        assertEquals(RetryRequest.Update(UpdateRequest(serviceId = null)), update.retryRequest(false, withoutServices))
-        assertEquals(RetryRequest.Restart(null, InterruptRequest()), restart.retryRequest(false, withoutServices))
+        assertEquals(
+            RetryRequest.Update(UpdateRequest(serviceId = "t3")),
+            update.retryRequest(false, ServiceNaming.BY_NAME),
+        )
+        assertEquals(
+            RetryRequest.Restart("t3", InterruptRequest()),
+            restart.retryRequest(false, ServiceNaming.BY_NAME),
+        )
+        // An agent that lists no services takes no --service, and the buttons send none to it.
+        assertEquals(
+            RetryRequest.Update(UpdateRequest(serviceId = null)),
+            update.retryRequest(false, ServiceNaming.NOT_TAKEN),
+        )
+        assertEquals(
+            RetryRequest.Restart(null, InterruptRequest()),
+            restart.retryRequest(false, ServiceNaming.NOT_TAKEN),
+        )
+    }
+
+    @Test
+    fun `a named service is never asked for again without its name while the agent is unknown`() {
+        // Pressed Update on the second service while the machine was away, so it failed before
+        // anything arrived. Until the machine answers again, nobody knows whether this agent takes
+        // --service, and to one that does a request without it is the first service.
+        listOf(OpKind.UPDATE, OpKind.RESTART).forEach { kind ->
+            val record = neverArrived(OperationIntent(kind, service = "second", repeatable = true))
+            assertTrue(kind.name, record.retryable)
+            assertTrue("drawn, since a reading can still say how to name it", record.canTryAgain)
+            assertNull(kind.name, record.retryRequest(detach = true, services = ServiceNaming.UNKNOWN))
+        }
+    }
+
+    @Test
+    fun `a service id the command line cannot carry is not dropped in its place`() {
+        // The buttons leave such an id out, which to an agent that lists services is its first.
+        listOf(OpKind.UPDATE, OpKind.RESTART).forEach { kind ->
+            val record = neverArrived(OperationIntent(kind, service = "second service", repeatable = true))
+            assertFalse(kind.name, record.canTryAgain)
+            assertNull(kind.name, record.retryRequest(detach = true, services = ServiceNaming.BY_NAME))
+        }
+    }
+
+    @Test
+    fun `what names no service is asked for again whatever is known of the services`() {
+        val cases = listOf(
+            OperationIntent(OpKind.BOOT, target = "windows", repeatable = true) to
+                RetryRequest.Boot("windows", InterruptRequest()),
+            OperationIntent(OpKind.SLEEP, repeatable = true) to RetryRequest.Sleep(InterruptRequest()),
+            OperationIntent(OpKind.RUN, actionId = "count", repeatable = true) to
+                RetryRequest.Run("count", InterruptRequest()),
+        )
+        cases.forEach { (intent, expected) ->
+            ServiceNaming.entries.forEach { naming ->
+                assertEquals("${intent.kind} $naming", expected, neverArrived(intent).retryRequest(false, naming))
+            }
+        }
+    }
+
+    @Test
+    fun `how the services are named is read off the last good reading only`() {
+        fun status(json: String) = AgentJson.decodeFromString(AgentStatus.serializer(), json)
+
+        assertEquals(ServiceNaming.UNKNOWN, ServiceNaming.of(null))
+        // A refusal is not an account of what the agent runs, even one that lists services.
+        assertEquals(
+            ServiceNaming.UNKNOWN,
+            ServiceNaming.of(status("""{"ok":false,"contract":3,"error":"config-invalid","message":"broken"}""")),
+        )
+        assertEquals(
+            ServiceNaming.UNKNOWN,
+            ServiceNaming.of(status("""{"ok":false,"contract":3,"services":[{"id":"t3"}]}""")),
+        )
+        assertEquals(
+            ServiceNaming.BY_NAME,
+            ServiceNaming.of(status("""{"ok":true,"contract":3,"services":[{"id":"t3"},{"id":"second"}]}""")),
+        )
+        assertEquals(ServiceNaming.BY_NAME, ServiceNaming.of(status("""{"ok":true,"contract":3,"services":[]}""")))
+        // The first agent, which drives the one service it reports in a t3 block.
+        assertEquals(
+            ServiceNaming.NOT_TAKEN,
+            ServiceNaming.of(status("""{"ok":true,"agentVersion":"1.4.0","t3":{"installed":"0.0.36"}}""")),
+        )
     }
 
     @Test
