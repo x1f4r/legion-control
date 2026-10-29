@@ -772,7 +772,7 @@ struct MachineModelTests {
         // The setup as the app runs it, through the launch gate with all of it approved: a system
         // read straight from a document is not driven, so the hub would never be asked anything.
         let setup = LaunchGate.effective(
-            try JSONDecoder().decode(ControllerConfig.self, from: document).validated(), document: document,
+            try ControllerConfig.accepted(document), document: document,
             record: LaunchValues.approvals(from: try JSONSerialization.jsonObject(with: document), seededFrom: "none")
         ).config
         let pi = try #require(setup.machine(id: "pi"))

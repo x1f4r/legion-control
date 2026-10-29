@@ -109,12 +109,12 @@ struct ShellQuotingTests {
               "systems": [ { "id": "windows", "platform": "windows", \(shell) "agent": ["node", "C:\\\\a.mjs"] } ] } ] }
             """.utf8)
         }
-        let defaulted = try JSONDecoder().decode(ControllerConfig.self, from: document("")).validated()
+        let defaulted = try ControllerConfig.accepted(document(""))
         #expect(defaulted.machines[0].systems[0].grammar == .success(.cmd))
         // Decoding no longer fails on it, so the setup can be read and repaired; using it still fails.
         let unknown = try JSONDecoder().decode(ControllerConfig.self, from: document(#""shell": "pwsh","#))
         #expect(unknown.machines[0].systems[0].shell == "pwsh")
-        #expect(throws: ConfigProblem.self) { _ = try unknown.validated() }
+        #expect(DocumentAcceptance.check(document(#""shell": "pwsh","#), intake: .peer).errors.map(\.code) == ["schema"])
     }
 
     @Test("a restricted key gets the dispatcher's grammar whatever platform it is on")

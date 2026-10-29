@@ -302,7 +302,7 @@ struct MachineSection: View {
         if let route = model.lastRoute { parts.append(route.label) }
         else if let target = model.machine.sshTarget { parts.append(target.display) }
         if let site = model.machine.site.flatMap({ app.config.config?.site(id: $0) }) { parts.append(site.name) }
-        if let wake = model.machine.wake { parts.append(wake.mac) }
+        if let mac = model.machine.wake?.mac { parts.append(mac) }
         return parts.isEmpty ? "not known" : parts.joined(separator: ", ")
     }
 

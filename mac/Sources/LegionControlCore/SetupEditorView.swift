@@ -70,8 +70,31 @@ struct SetupEditorView: View {
                     .padding(.top, 14)
             }
 
+            if !model.setupErrors.isEmpty {
+                SetupErrorsNote(errors: model.setupErrors).padding(.top, 12)
+            }
             ForEach(model.setupWarnings, id: \.self) { warning in
                 QuietNote(text: warning).padding(.top, 12)
+            }
+        }
+    }
+}
+
+/// What the applied setup breaks, said once, with the reason it matters.
+struct SetupErrorsNote: View {
+    let errors: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            StatusText(symbol: "exclamationmark.triangle",
+                       text: "This setup breaks a rule every device holds it to, so it is not shared until it is fixed, and a machine with a problem is not driven.",
+                       tint: .orange)
+            ForEach(errors, id: \.self) { error in
+                Text(error)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

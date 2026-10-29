@@ -83,7 +83,15 @@ enum WakePlan {
             return SiteAwareness.matchesLANPrefix(wake.lanPrefix, addresses: addresses)
         }()
 
-        if onSite {
+        if wake.mac == nil {
+            // Only a wake block with a hardware address is woken directly (section 9.7); one without
+            // is a setup another peer may well have written, and its helpers can still wake it.
+            unavailable.append(Unavailable(
+                what: "Sending it from here",
+                reason: "the setup names no hardware address for \(machine.name), so no magic packet can be sent to it. Only its helpers can wake it.",
+                wakeableFirst: nil
+            ))
+        } else if onSite {
             var broadcasts = wake.broadcast
             if broadcasts == ["255.255.255.255"], let site, !site.broadcast.isEmpty {
                 broadcasts = site.broadcast

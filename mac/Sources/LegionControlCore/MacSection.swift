@@ -428,8 +428,10 @@ struct MacSection: View {
             }
 
             if let problem = model.config.problem {
-                QuietNote(text: "The setup file was edited into something that could not be read, so the machines above are the ones from before it. \(problem)")
-                    .padding(.top, 12)
+                QuietNote(text: problem).padding(.top, 12)
+            }
+            if !model.setupErrors.isEmpty {
+                SetupErrorsNote(errors: model.setupErrors).padding(.top, 12)
             }
             if let problem = model.bindings.problem {
                 QuietNote(text: problem).padding(.top, 12)

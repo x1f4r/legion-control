@@ -578,7 +578,11 @@ final class AppModel {
     }
 
     /// Warnings about the setup itself, which are not reasons to refuse it.
-    var setupWarnings: [String] { config.config?.warnings() ?? [] }
+    var setupWarnings: [String] { config.warnings.map(\.message) + (config.config?.commandWarnings() ?? []) }
+
+    /// What the applied setup breaks (section 9.7). It is applied all the same, without the machines
+    /// an error is inside, and not shared until these are fixed.
+    var setupErrors: [String] { config.errors.map(\.message) }
 
     /// The freshest reading anywhere, for the "checked N minutes ago" line.
     var lastChecked: Date? {
@@ -772,6 +776,7 @@ final class AppModel {
         if let problem = bindings.problem { lines.append("bindings problem: \(problem)") }
         if let problem = operations.persistenceProblem { lines.append("history problem: \(problem)") }
         if let problem = approvals.problem { lines.append("approvals problem: \(problem)") }
+        for error in setupErrors { lines.append("setup error: \(error)") }
         for warning in setupWarnings { lines.append("setup warning: \(warning)") }
         // Paths only, never the commands: a bug report is not where an argv from the shared setup
         // belongs.
@@ -812,7 +817,7 @@ final class AppModel {
     /// Writes the documented example config, but never over anything that is already there.
     @discardableResult
     func writeExampleConfig() -> String? {
-        config.writeExample()
+        config.writeExample(deviceName: bindings.bindings.effectiveDeviceName)
     }
 
     /// Opens a file in whatever the user edits text with. `open -t` is the system's own answer to

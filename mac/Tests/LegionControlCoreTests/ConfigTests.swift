@@ -66,33 +66,23 @@ struct ConfigTests {
         #expect(tower.wake?.orderedHelpers.map(\.action) == ["wake-tower"])
     }
 
-    // MARK: - Validation
+    // MARK: - Acceptance
+
+    /// The error codes section 9.7 gives a document under peer intake, sorted.
+    static func errorCodes(_ json: String) -> [String] {
+        Set(DocumentAcceptance.check(Data(json.utf8), intake: .peer).errors.map(\.code)).sorted()
+    }
 
     @Test("a helper that does not exist, is the machine itself, or forms a loop is refused")
     func helperValidation() throws {
-        func problem(_ json: String) -> String? {
-            guard let data = json.data(using: .utf8),
-                  let decoded = try? JSONDecoder().decode(ControllerConfig.self, from: data) else {
-                return "did not decode"
-            }
-            do {
-                _ = try decoded.validated()
-                return nil
-            } catch let failure as ConfigProblem {
-                return failure.message
-            } catch {
-                return error.localizedDescription
-            }
-        }
-
-        #expect(problem(Self.twoMachines) == nil)
+        #expect(Self.errorCodes(Self.twoMachines).isEmpty)
 
         let missing = Self.twoMachines.replacingOccurrences(of: "\"machine\": \"pi\"", with: "\"machine\": \"ghost\"")
-        #expect(problem(missing)?.contains("not a machine in this setup") == true)
+        #expect(Self.errorCodes(missing) == ["helper-unknown"])
 
         let itself = Self.twoMachines.replacingOccurrences(of: "\"machine\": \"pi\"", with: "\"machine\": \"tower\"")
         // A machine that is asleep cannot wake itself, so this is always a mistake.
-        #expect(problem(itself)?.contains("its own wake helper") == true)
+        #expect(Self.errorCodes(itself) == ["helper-self"])
 
         let cycle = """
         { "version": 1, "machines": [
@@ -104,22 +94,28 @@ struct ConfigTests {
             "wake": { "mac": "AA:BB:CC:DD:EE:00", "helpers": [{ "machine": "a", "action": "w" }] } }
         ] }
         """
-        #expect(problem(cycle)?.contains("loop") == true)
+        #expect(Self.errorCodes(cycle) == ["helper-cycle"])
 
-        // The compatibility key has to name the same machine as the first of the list: a document
-        // where they disagree wakes different things depending on which app is open.
+        // The compatibility key has to name the same machine and action as the first of the list: a
+        // document where they disagree wakes different things depending on which app is open.
         let mismatch = Self.twoMachines.replacingOccurrences(
             of: "\"helper\": { \"machine\": \"pi\", \"action\": \"wake-tower\" }",
-            with: "\"helper\": { \"machine\": \"ghost\", \"action\": \"wake-tower\" }")
-        #expect(problem(mismatch)?.contains("compatibility") == true)
+            with: "\"helper\": { \"machine\": \"pi\", \"action\": \"wake-other\" }")
+        #expect(Self.errorCodes(mismatch) == ["helper-alias"])
+
+        // A helper action is a configured id, which has no colon, as the agent's own grammar says.
+        let colon = Self.twoMachines.replacingOccurrences(of: "wake-tower", with: "wake:tower")
+        #expect(Self.errorCodes(colon) == ["schema"])
     }
 
-    @Test("a machine naming a site that does not exist is refused")
+    @Test("a site is only checked against a list that exists")
     func siteValidation() throws {
-        let json = Self.twoMachines.replacingOccurrences(of: "\"site\": \"home\"", with: "\"site\": \"nowhere\"")
-        let data = try #require(json.data(using: .utf8))
-        let decoded = try JSONDecoder().decode(ControllerConfig.self, from: data)
-        #expect(throws: ConfigProblem.self) { _ = try decoded.validated() }
+        let nowhere = Self.twoMachines.replacingOccurrences(of: "\"site\": \"home\"", with: "\"site\": \"nowhere\"")
+        #expect(Self.errorCodes(nowhere) == ["unknown-site"])
+        // A setup without sites places nobody, so naming one is not wrong yet.
+        let unplaced = nowhere.replacingOccurrences(
+            of: "\"sites\": [ { \"id\": \"home\", \"name\": \"Home\", \"lanPrefixes\": [\"10.0.0.\"], \"broadcast\": [\"10.0.0.255\"] } ],", with: "")
+        #expect(Self.errorCodes(unplaced).isEmpty)
     }
 
     @Test("a lineage of the wrong shape is refused rather than half-trusted")
@@ -129,23 +125,87 @@ struct ConfigTests {
           "machines": [ { "id": "a", "endpoints": [{"id":"e","host":"h"}],
             "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
         """
-        let decoded = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8))
-        #expect(throws: ConfigProblem.self) { _ = try decoded.validated() }
+        #expect(Self.errorCodes(json) == ["schema"])
 
         // Swift's own idea of a hex digit takes the fullwidth letters too; the contract's does not.
         let fullwidth = String(repeating: "a", count: 63) + "\u{FF41}"
-        let wide = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.replacingOccurrences(of: "short", with: fullwidth).utf8))
-        #expect(throws: ConfigProblem.self) { _ = try wide.validated() }
-        let plain = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.replacingOccurrences(of: "short", with: String(repeating: "a", count: 64)).utf8))
-        #expect(throws: Never.self) { _ = try plain.validated() }
+        #expect(Self.errorCodes(json.replacingOccurrences(of: "short", with: fullwidth)) == ["schema"])
+        #expect(Self.errorCodes(json.replacingOccurrences(of: "short", with: String(repeating: "a", count: 64))).isEmpty)
     }
 
-    @Test("a maintenance window end is HH:MM in ASCII digits, nothing that only parses like one")
-    func clockTimes() {
-        #expect(MaintenanceWindow(from: "02:00", to: "04:00").looksValid)
-        #expect(!MaintenanceWindow(from: "+1:00", to: "04:00").looksValid)
-        #expect(!MaintenanceWindow(from: "\u{0660}\u{0662}:00", to: "04:00").looksValid)
-        #expect(!MaintenanceWindow(from: "24:00", to: "04:00").looksValid)
+    @Test("what this app cannot use is accepted with a warning, and only a schema or rule break refuses")
+    func partialSetupsAreAccepted() throws {
+        // A machine with no systems yet, an endpoint with no id and no user, a wake block with no
+        // hardware address: every one of them is a document another peer may well have written.
+        let partial = """
+        { "version": 1, "machines": [
+          { "id": "new" },
+          { "id": "tower", "endpoints": [{"host":"192.0.2.10"}], "wake": { "helpers": [{ "machine": "new", "action": "w" }] },
+            "systems": [{"id":"l","platform":"linux"}] } ] }
+        """
+        let verdict = DocumentAcceptance.check(Data(partial.utf8), intake: .peer)
+        #expect(verdict.valid)
+        #expect(Set(verdict.warnings.map(\.code)) == ["machine-no-systems", "machine-no-endpoints", "system-no-agent",
+                                                     "endpoint-no-id", "endpoint-no-user", "wake-no-mac",
+                                                     "helper-not-always-on"])
+    }
+
+    @Test("a document typed here gets an identity before it is checked; one read from a machine does not")
+    func intakes() throws {
+        let anonymous = """
+        { "version": 1, "controller": { "name": "Home" }, "machines": [] }
+        """
+        let local = DocumentAcceptance.check(Data(anonymous.utf8), intake: .local)
+        #expect(local.valid && local.assignsIdentity)
+        let peer = DocumentAcceptance.check(Data(anonymous.utf8), intake: .peer)
+        #expect(!peer.valid && !peer.keep)
+        // The document this device already applies is never refused while section 12 accepts it.
+        let applied = DocumentAcceptance.check(Data(anonymous.utf8), intake: .applied)
+        #expect(!applied.valid && applied.keep)
+        #expect(!DocumentAcceptance.check(Data("{ not json".utf8), intake: .applied).keep)
+    }
+
+    @Test("a broken applied setup is kept, without the machine it breaks, and is not published")
+    func brokenAppliedSetupIsKept() throws {
+        let broken = Self.twoMachines.replacingOccurrences(of: "\"machine\": \"pi\"", with: "\"machine\": \"ghost\"")
+        let (store, home) = try Self.store(broken)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        // The file is applied: it is what this device runs on, errors and all.
+        #expect(store.problem == nil)
+        #expect(store.errors.map(\.code) == ["helper-unknown"])
+        // The machine the error is inside is not driven, and the other one still is.
+        #expect(store.config?.machines.map(\.id) == ["pi"])
+        // And it is still the document this device decides from, carrying its errors.
+        let document = try #require(store.document)
+        #expect(!document.errors.isEmpty)
+    }
+
+    @Test("a setup that already breaks a rule can still be edited, and fixed, but not broken further")
+    func editingABrokenSetup() throws {
+        let broken = Self.twoMachines.replacingOccurrences(of: "\"machine\": \"pi\"", with: "\"machine\": \"ghost\"")
+        let (store, home) = try Self.store(broken)
+        defer { try? FileManager.default.removeItem(at: home) }
+        #expect(store.errors.map(\.code) == ["helper-unknown"])
+
+        // Renaming the very machine the error is in, or moving the other one up the list, is not a
+        // new error.
+        #expect(store.applyEdit(describedAs: "renamed", deviceName: "MacBook") { root in
+            try ControllerEditor.upsertMachine(["id": "tower", "name": "Big Tower"], in: &root)
+        } == nil)
+        #expect(store.applyEdit(describedAs: "reordered", deviceName: "MacBook") { root in
+            root["machines"] = Array(((root["machines"] as? [[String: Any]]) ?? []).reversed())
+        } == nil)
+        // A second one is.
+        #expect(store.applyEdit(describedAs: "broke more", deviceName: "MacBook") { root in
+            try ControllerEditor.setSite("nowhere", onMachine: "pi", in: &root)
+        } != nil)
+        // And the edit that fixes it is saved, and the setup is shared again.
+        #expect(store.applyEdit(describedAs: "fixed", deviceName: "MacBook") { root in
+            try ControllerEditor.setWakeHelpers([WakeHelper(machine: "pi", action: "wake-tower")], onMachine: "tower", in: &root)
+        } == nil)
+        #expect(store.errors.isEmpty)
+        #expect(store.document?.errors.isEmpty == true)
     }
 
     @Test("a system no grammar can be written for is a warning that says why")
@@ -154,20 +214,21 @@ struct ConfigTests {
         { "version": 1, "machines": [ { "id": "tower", "endpoints": [{"id":"e","host":"192.0.2.10"}],
           "systems": [{"id":"l","platform":"linux","restricted":true,"agent":["/bin/sh","-c","legionctl"]}] } ] }
         """
-        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
-        #expect(config.warnings().contains { $0.contains("is never sent anything") && $0.contains("the interpreter and the agent's entry") })
+        let config = try ControllerConfig.accepted(Data(json.utf8))
+        #expect(config.commandWarnings().contains { $0.contains("is never sent anything") && $0.contains("the interpreter and the agent's entry") })
     }
 
     @Test("an address outside the dial grammar is a warning that names it")
     func undialableAddressIsAWarning() throws {
         let json = """
         { "version": 1, "machines": [ { "id": "tower", "name": "Tower",
-          "endpoints": [{"id":"lan","host":"desk-tower.local"}, {"id":"odd","host":"tower.example.","user":"me"}],
+          "endpoints": [{"id":"lan","host":"desk-tower.local","user":"me"}, {"id":"odd","host":"tower.example.","user":"me"}],
           "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
         """
-        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
-        let warnings = config.warnings().filter { $0.contains("never dials") }
-        #expect(warnings == ["Tower lists me@tower.example., which this app never dials, scans or pins: the host \"tower.example.\" is not one it accepts."])
+        let warnings = DocumentAcceptance.check(Data(json.utf8), intake: .peer).warnings
+        #expect(warnings.map(\.code) == ["endpoint-undialable"])
+        #expect(warnings.first?.path == "machines[0].endpoints[1].host")
+        #expect(warnings.first?.message == "Tower lists \"tower.example.\", which this app never dials, scans or pins: it is not a name or address it accepts.")
     }
 
     @Test("a wake path that cannot work is a warning, not a refusal")
@@ -186,14 +247,23 @@ struct ConfigTests {
               "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] }
           ] }
         """
-        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
-        let warnings = config.warnings()
+        let (store, home) = try Self.store(json)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let warnings = store.warnings.map(\.message)
         // A helper at another site is legitimate through a router, so it is said rather than refused.
         #expect(warnings.contains { $0.contains("different sites") })
         // And a machine nothing can reach is worth knowing about while you are editing, not the
         // first time you need it.
         #expect(warnings.contains { $0.contains("only be woken by a device that is already on its network") })
         #expect(warnings.contains { $0.contains("always on") })
+    }
+
+    @Test("a maintenance window end is HH:MM in ASCII digits, nothing that only parses like one")
+    func clockTimes() {
+        #expect(MaintenanceWindow(from: "02:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "+1:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "\u{0660}\u{0662}:00", to: "04:00").looksValid)
+        #expect(!MaintenanceWindow(from: "24:00", to: "04:00").looksValid)
     }
 
     // MARK: - Editing

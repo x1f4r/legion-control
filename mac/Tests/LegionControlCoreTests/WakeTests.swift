@@ -34,7 +34,7 @@ struct WakeTests {
     """
 
     static func config() throws -> ControllerConfig {
-        try JSONDecoder().decode(ControllerConfig.self, from: Data(setup.utf8)).validated()
+        try ControllerConfig.accepted(Data(setup.utf8))
     }
 
     static let awake = WakePlan.HelperState(isAwake: true, isCommandable: true, canBeWoken: false, lastCheckedAt: Date())
@@ -191,13 +191,31 @@ struct WakeTests {
           "wake": { "mac": "AA:BB:CC:DD:EE:FF" },
           "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
         """
-        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
+        let config = try ControllerConfig.accepted(Data(json.utf8))
         let machine = try #require(config.machine(id: "x"))
         let plan = WakePlan.plan(for: machine, in: config,
                                  placement: SiteAwareness.Placement(matching: [], confirmed: nil),
                                  addresses: ["100.64.0.3"], helperStates: [:])
         #expect(plan.isEmpty)
         #expect(!plan.nothingToTry.isEmpty)
+    }
+
+    @Test("a wake block without a hardware address is woken only through its helpers")
+    func noHardwareAddress() throws {
+        let json = """
+        { "version": 1, "machines": [ { "id": "x", "endpoints": [{"id":"e","host":"h","user":"me"}],
+          "wake": { "broadcast": ["10.0.0.255"], "lanPrefix": "10.0.0." },
+          "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
+        """
+        // The schema allows it, so it is accepted with a warning rather than refused.
+        #expect(DocumentAcceptance.check(Data(json.utf8), intake: .peer).warnings.map(\.code) == ["wake-no-mac"])
+        let config = try ControllerConfig.accepted(Data(json.utf8))
+        let machine = try #require(config.machine(id: "x"))
+        let plan = WakePlan.plan(for: machine, in: config,
+                                 placement: SiteAwareness.Placement(matching: [], confirmed: nil),
+                                 addresses: ["10.0.0.7"], helperStates: [:])
+        #expect(plan.steps.isEmpty)
+        #expect(plan.unavailable.first?.reason.contains("no hardware address") == true)
     }
 
     @Test("the old per-machine LAN prefix still works for a machine with no site")
@@ -207,7 +225,7 @@ struct WakeTests {
           "wake": { "mac": "AA:BB:CC:DD:EE:FF", "broadcast": ["10.0.0.255"], "lanPrefix": "10.0.0." },
           "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
         """
-        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(json.utf8)).validated()
+        let config = try ControllerConfig.accepted(Data(json.utf8))
         let machine = try #require(config.machine(id: "x"))
         let plan = WakePlan.plan(for: machine, in: config,
                                  placement: SiteAwareness.Placement(matching: [], confirmed: nil),
