@@ -37,6 +37,17 @@ data class OperationIntent(
     val whenIdle: Boolean = false,
     /** The `DUR` form, e.g. `4h`. Only meaningful with [whenIdle]. */
     val expires: String? = null,
+    /**
+     * Whether these fields are the whole request, so that "Try again" can send it once more, exactly,
+     * under a new id. Set by the update, restart, boot, sleep and action buttons and by nothing else.
+     *
+     * False by default, because a wrong true sends a change nobody asked for and a wrong false only
+     * costs a button. A write of the update policy is recorded as an update ([policyWrite]) and keeps
+     * no patch, so rebuilding one would stop and reinstall a service instead; a wake helper's action
+     * would run without the hold the wake walk keeps; and an intent written before this field was,
+     * by a build that recorded policy writes the same way, cannot be told apart from an update.
+     */
+    val repeatable: Boolean = false,
 ) {
     /** What this operation is about, for a heading. */
     val subject: String?
@@ -51,6 +62,16 @@ data class OperationIntent(
             force -> OpMode.FORCE
             else -> OpMode.MANUAL
         }
+
+    companion object {
+        /**
+         * A write of the update schedule, pause or policy for [service], or for the machine when null.
+         *
+         * Recorded under [OpKind.UPDATE], which is what it governs, and never [repeatable]: the switch,
+         * the pause or the patch it sent is not kept here, and the fields that are describe an update.
+         */
+        fun policyWrite(service: String?) = OperationIntent(kind = OpKind.UPDATE, service = service)
+    }
 }
 
 /**
@@ -153,9 +174,10 @@ data class OperationRecord(
     /** Whether the agent said it checked that the thing it set out to do actually happened. */
     val verified: Boolean? = null,
     /**
-     * True when asking for it again is offered: nothing reached the machine, or the agent finished
-     * it in a way that leaves nothing done twice by a second request. A second request always has an
-     * id of its own (contract section 5.6), so a stored refusal is never replayed back at it.
+     * True when asking for it again is safe: nothing reached the machine, or the agent finished it in
+     * a way that leaves nothing done twice by a second request. A second request always has an id of
+     * its own (contract section 5.6), so a stored refusal is never replayed back at it. Whether it is
+     * offered also depends on the intent being the whole request; see [canTryAgain].
      */
     val retryable: Boolean = false,
     /** True when the agent accepted `--op` and can therefore be asked what happened. */
@@ -209,6 +231,12 @@ data class OperationRecord(
     val isCancellable: Boolean get() = state == TrackedState.QUEUED
 
     /**
+     * Whether "Try again" is offered: exactly when [retryRequest] has a request to send, so the button
+     * on screen and the press behind it can never disagree.
+     */
+    val canTryAgain: Boolean get() = retryRequest(detach = false) != null
+
+    /**
      * Whether it ended well. Null while it is not over, while the outcome is not known, and for a
      * change the agent held back, which neither worked nor failed.
      */
@@ -238,6 +266,57 @@ data class OperationRecord(
             val total = progressOf?.takeIf { it > 0 } ?: return null
             return (step.toFloat() / total.toFloat()).coerceIn(0f, 1f)
         }
+}
+
+/** A second request for a change that is over, as "Try again" sends it under a new id. */
+sealed interface RetryRequest {
+    data class Update(val request: UpdateRequest) : RetryRequest
+    data class Restart(val service: String?, val request: InterruptRequest) : RetryRequest
+    data class Boot(val target: String, val request: InterruptRequest) : RetryRequest
+    data class Sleep(val request: InterruptRequest) : RetryRequest
+    data class Run(val actionId: String, val request: InterruptRequest) : RetryRequest
+}
+
+/**
+ * What "Try again" sends for this change, or null when it offers nothing (contract section 5.6).
+ *
+ * Only for a change that is over, ended without anything a second request could double, and whose
+ * intent is the whole request: an update, a restart, a boot, a sleep or an action, rebuilt with the
+ * same force and queueing it was first asked for with, and naming the subject it named. A cycle, an
+ * agent install, a policy write and anything written down without [OperationIntent.repeatable] are
+ * never rebuilt here, because the fields kept for them would send something else. [detach] and
+ * [serviceArgument] are what the machine's agent takes now, as the buttons decide them.
+ */
+fun OperationRecord.retryRequest(
+    detach: Boolean,
+    serviceArgument: (String) -> String? = { it },
+): RetryRequest? {
+    if (!isOver || !retryable || !intent.repeatable) return null
+    val force = intent.force
+    val whenIdle = intent.whenIdle
+    val expires = intent.expires
+    return when (intent.kind) {
+        OpKind.UPDATE -> intent.service?.takeIf { it.isNotBlank() }?.let { service ->
+            RetryRequest.Update(UpdateRequest(serviceArgument(service), force, whenIdle, expires, detach))
+        }
+
+        OpKind.RESTART -> intent.service?.takeIf { it.isNotBlank() }?.let { service ->
+            RetryRequest.Restart(serviceArgument(service), InterruptRequest(force, whenIdle, expires, detach))
+        }
+
+        // The contract gives a boot and a sleep no `--detach`, so neither is ever sent with one.
+        OpKind.BOOT -> intent.target?.takeIf { it.isNotBlank() }?.let { target ->
+            RetryRequest.Boot(target, InterruptRequest(force, whenIdle, expires))
+        }
+
+        OpKind.SLEEP -> RetryRequest.Sleep(InterruptRequest(force, whenIdle, expires))
+
+        OpKind.RUN -> intent.actionId?.takeIf { it.isNotBlank() }?.let { action ->
+            RetryRequest.Run(action, InterruptRequest(force, whenIdle, expires, detach))
+        }
+
+        OpKind.CYCLE, OpKind.SELF_UPDATE -> null
+    }
 }
 
 /** Everything that can move an operation along. */

@@ -23,12 +23,14 @@ import com.x1f4r.legioncontrol.agent.OpSummary
 import com.x1f4r.legioncontrol.agent.OperationIntent
 import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.PolicyPatch
+import com.x1f4r.legioncontrol.agent.RetryRequest
 import com.x1f4r.legioncontrol.agent.ServiceStatus
 import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.agent.WakeHold
 import com.x1f4r.legioncontrol.agent.WakePlan
 import com.x1f4r.legioncontrol.agent.resolveSystem
+import com.x1f4r.legioncontrol.agent.retryRequest
 import com.x1f4r.legioncontrol.data.SiteConfig
 import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.net.onNetwork
@@ -774,6 +776,7 @@ class MachineModel(
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
             subjectName = machine.name,
         ) { id ->
@@ -797,6 +800,7 @@ class MachineModel(
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
             subjectName = target.name,
             subjectId = target.id,
@@ -830,6 +834,7 @@ class MachineModel(
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
             subjectName = service.displayName,
             subjectId = service.id,
@@ -867,6 +872,7 @@ class MachineModel(
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
             subjectName = service.displayName,
             subjectId = service.id,
@@ -897,6 +903,7 @@ class MachineModel(
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
             subjectName = action.displayName,
             subjectId = id,
@@ -910,7 +917,7 @@ class MachineModel(
         change(
             task = Task.AUTO_UPDATE,
             label = "Saving the update schedule",
-            intent = OperationIntent(kind = OpKind.UPDATE, service = serviceId),
+            intent = OperationIntent.policyWrite(serviceId),
             subjectName = serviceId ?: on.name,
             subjectId = serviceId ?: on.id,
             track = false,
@@ -923,7 +930,7 @@ class MachineModel(
         change(
             task = Task.POLICY,
             label = "Pausing updates",
-            intent = OperationIntent(kind = OpKind.UPDATE, service = serviceId),
+            intent = OperationIntent.policyWrite(serviceId),
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
@@ -936,7 +943,7 @@ class MachineModel(
         change(
             task = Task.POLICY,
             label = "Resuming updates",
-            intent = OperationIntent(kind = OpKind.UPDATE, service = serviceId),
+            intent = OperationIntent.policyWrite(serviceId),
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
@@ -949,7 +956,7 @@ class MachineModel(
         change(
             task = Task.POLICY,
             label = "Saving the update policy",
-            intent = OperationIntent(kind = OpKind.UPDATE, service = serviceId),
+            intent = OperationIntent.policyWrite(serviceId),
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
@@ -1012,17 +1019,19 @@ class MachineModel(
      * answers a known id with what it stored for it, so a refused change re-sent under its own id
      * came back refused for as long as anybody kept pressing. An outcome nobody knows is never
      * offered at all; it is only ever read again, with [checkAgain].
+     *
+     * What is sent is [retryRequest]'s answer and nothing else, the same answer that decides whether
+     * the button is drawn, so a record the screen offers nothing for cannot be sent here either.
      */
     fun retry(record: OperationRecord) {
-        if (!record.isOver || !record.retryable) return
+        val again = record.retryRequest(detach = speaksV3, serviceArgument = ::serviceArgument) ?: return
         val intent = record.intent
-        val task = when (intent.kind) {
-            OpKind.UPDATE -> Task.UPDATE
-            OpKind.RESTART -> Task.RESTART
-            OpKind.BOOT -> Task.BOOT
-            OpKind.SLEEP -> Task.SLEEP
-            OpKind.RUN -> Task.RUN
-            else -> return
+        val task = when (again) {
+            is RetryRequest.Update -> Task.UPDATE
+            is RetryRequest.Restart -> Task.RESTART
+            is RetryRequest.Boot -> Task.BOOT
+            is RetryRequest.Sleep -> Task.SLEEP
+            is RetryRequest.Run -> Task.RUN
         }
         change(
             task = task,
@@ -1031,41 +1040,12 @@ class MachineModel(
             subjectName = record.subjectName,
             subjectId = intent.service ?: intent.target ?: intent.actionId,
         ) { id ->
-            when (intent.kind) {
-                OpKind.UPDATE -> client.update(
-                    UpdateRequest(
-                        serviceId = intent.service,
-                        force = intent.force,
-                        whenIdle = intent.whenIdle,
-                        expires = intent.expires,
-                        detach = speaksV3,
-                    ),
-                    id,
-                )
-
-                OpKind.RESTART -> client.restart(
-                    intent.service,
-                    InterruptRequest(intent.force, intent.whenIdle, intent.expires, speaksV3),
-                    id,
-                )
-
-                OpKind.BOOT -> client.boot(
-                    intent.target.orEmpty(),
-                    InterruptRequest(intent.force, intent.whenIdle, intent.expires),
-                    noReboot = false,
-                    operationId = id,
-                )
-
-                OpKind.SLEEP -> client.sleep(
-                    InterruptRequest(intent.force, intent.whenIdle, intent.expires),
-                    id,
-                )
-
-                else -> client.run(
-                    intent.actionId.orEmpty(),
-                    InterruptRequest(intent.force, intent.whenIdle, intent.expires, speaksV3),
-                    id,
-                )
+            when (again) {
+                is RetryRequest.Update -> client.update(again.request, id)
+                is RetryRequest.Restart -> client.restart(again.service, again.request, id)
+                is RetryRequest.Boot -> client.boot(again.target, again.request, noReboot = false, operationId = id)
+                is RetryRequest.Sleep -> client.sleep(again.request, id)
+                is RetryRequest.Run -> client.run(again.actionId, again.request, id)
             }
         }
     }

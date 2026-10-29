@@ -307,8 +307,8 @@ internal fun OperationsBlock(model: MachineModel, showHistory: Boolean = true) {
                 Actions {
                     PlainAction("Details", enabled = !model.isWorking) { model.showOperation(record.id) }
                     // A new request with a new id, for a change that ended without doing anything
-                    // a second request could double.
-                    if (record.retryable) {
+                    // a second request could double and that can be asked for again exactly.
+                    if (record.canTryAgain) {
                         PlainAction("Try again", enabled = !model.isWorking) { model.retry(record) }
                     }
                 }
