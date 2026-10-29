@@ -13,13 +13,18 @@ import com.x1f4r.legioncontrol.agent.RemoteShell
 import com.x1f4r.legioncontrol.agent.buildRemoteCommand
 import com.x1f4r.legioncontrol.agent.grammarFor
 import com.x1f4r.legioncontrol.agent.statusBudget
+import com.x1f4r.legioncontrol.data.CanonicalSetup
+import com.x1f4r.legioncontrol.data.LaunchTuple
+import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.contract.VectorJson.boolean
 import com.x1f4r.legioncontrol.contract.VectorJson.long
 import com.x1f4r.legioncontrol.contract.VectorJson.string
 import com.x1f4r.legioncontrol.contract.VectorJson.strings
 import com.x1f4r.legioncontrol.contract.VectorJson.number
 import com.x1f4r.legioncontrol.contract.VectorJson.text
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -43,6 +48,9 @@ class ContractVectorsTest {
 
     @Test
     fun `command lines, attempts, walks, budgets and addresses match the contract`() = runFamily("transport")
+
+    @Test
+    fun `launch values, their review and what runs match the contract`() = runFamily("launch")
 
     /**
      * Every adapter is for a group this client consumes, and every consumed family is either adapted
@@ -195,6 +203,54 @@ class ContractVectorsTest {
             val port = value?.takeIf { Regex("^-?[0-9]+$").matches(it) }?.toIntOrNull()
             buildJsonObject { put("valid", port != null && Addresses.isPort(port)) }
         },
+
+        // The record is the case's own when it gives one, and otherwise what a device seeds from the
+        // held document; restrictedRefused is the held document's own values, never the record's.
+        "launch/review" to { input ->
+            val heldText = input.string("heldText")
+            val held = heldText?.let { Json.parseToJsonElement(it) as JsonObject }
+            val record = (input["approvals"] as? JsonObject)
+                ?: held?.let { LaunchValues.approvalsFrom(it, seededFrom = CanonicalSetup.hashOf(heldText)) }
+                ?: LaunchValues.EMPTY_RECORD
+            val offered = LaunchValues.projection(Json.parseToJsonElement(input.string("offeredText")!!) as JsonObject)
+            buildJsonObject {
+                put(
+                    "review",
+                    JsonArray(
+                        LaunchValues.review(record, offered).map { entry ->
+                            buildJsonObject {
+                                put("path", entry.path)
+                                put("scope", entry.scope.wire)
+                                put("kind", entry.kind)
+                                put("approvable", entry.approvable)
+                            }
+                        },
+                    ),
+                )
+                put(
+                    "effective",
+                    JsonArray(
+                        LaunchValues.effective(record, offered).map { entry ->
+                            buildJsonObject {
+                                put("path", entry.path)
+                                put("scope", entry.scope.wire)
+                                put("state", entry.state.wire)
+                                put("agent", entry.tuple?.agent?.let { JsonArray(it.map(::JsonPrimitive)) } ?: JsonNull)
+                                put("grammar", text(entry.tuple?.grammar))
+                                put("text", text(entry.text))
+                            }
+                        },
+                    ),
+                )
+                put("restrictedRefused", held != null && LaunchValues.review(LaunchValues.approvalsFrom(held), offered).isNotEmpty())
+            }
+        },
+
+        "launch/migration" to { input ->
+            buildJsonObject {
+                put("migration", LaunchValues.isLauncherMigration(LaunchTuple.from(input["approved"]), LaunchTuple.from(input["offered"])))
+            }
+        },
     )
 
     private fun identifier(check: (String?) -> Boolean): (JsonObject) -> JsonObject = { input ->
@@ -217,7 +273,7 @@ class ContractVectorsTest {
          * of every reference has landed.
          */
         val PENDING_FAMILIES = setOf(
-            "hash", "outcome", "setup-acceptance", "launch", "setup-reconcile", "setup-merge", "wake",
+            "hash", "outcome", "setup-acceptance", "setup-reconcile", "setup-merge", "wake",
         )
     }
 }
