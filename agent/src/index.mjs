@@ -150,8 +150,15 @@ const COMMANDS = {
  * If redaction itself fails, the reply is replaced rather than sent as it
  * was: a restricted key gets an internal error, and a mutation's outcome is
  * unknown, so its client re-reads the operation instead of guessing.
+ *
+ * Only the first call writes anything. A failure that surfaces after the reply
+ * has gone, an exception in a stray callback or a promise nobody awaited, must
+ * not put a second object on stdout, which would make the first unreadable.
  */
+let emitted = false;
+
 function emit(payload, exitCode) {
+  if (emitted) return;
   let reply = payload;
   let code = exitCode;
   if (isRestrictedSession()) {
@@ -174,7 +181,11 @@ function emit(payload, exitCode) {
       code = 1;
     }
   }
-  process.stdout.write(`${JSON.stringify(reply)}\n`);
+  // Marked written only once there is something to write, so a reply that
+  // cannot be serialised still leaves room for the failure that says so.
+  const text = `${JSON.stringify(reply)}\n`;
+  emitted = true;
+  process.stdout.write(text);
   process.exitCode = code;
 }
 
@@ -1623,7 +1634,8 @@ async function main() {
   emit(payload, exitCode);
 }
 
-main().catch((error) => {
+/** The reply to a failure nothing else caught: internal, and unknown for a mutation. */
+function emitUnexpected(error) {
   const message = error?.stack ? String(error.stack).split('\n')[0] : String(error);
   log(`unhandled failure: ${message}`, 'main');
   emit(
@@ -1641,4 +1653,34 @@ main().catch((error) => {
     },
     1,
   );
-});
+}
+
+// stdout and stderr are pipes to an ssh session, and the other end can go at
+// any moment: a client that gave up, a phone that slept. Writing to a closed
+// pipe fails asynchronously with EPIPE, and an `error` event nobody listens for
+// ends the process there and then, which used to kill the agent half way
+// through a rollback for the sake of a progress line. The reply cannot reach a
+// reader who has gone, and the work is worth finishing anyway.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on('error', () => { /* the reader has gone; the log still has everything */ });
+}
+
+// Anything thrown where main() cannot catch it still gets its one reply. The
+// process then ends as soon as that reply is written: the state such a failure
+// leaves behind is unknown, and a mutation in progress is better left to
+// recovery than continued on it. process.exit() would drop whatever stdout has
+// not yet written to its pipe, so it waits for that first.
+function failUnexpectedly(error) {
+  emitUnexpected(error);
+  const exit = () => process.exit();
+  setTimeout(exit, 2000).unref();
+  try {
+    process.stdout.write('', exit);
+  } catch {
+    exit();
+  }
+}
+process.on('uncaughtException', failUnexpectedly);
+process.on('unhandledRejection', failUnexpectedly);
+
+main().catch(emitUnexpected);
