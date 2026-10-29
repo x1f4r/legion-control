@@ -8,12 +8,17 @@ import org.junit.Test
 
 /**
  * The configuration is the one thing in this app the user types by hand, so what it accepts and
- * what it says when it refuses are both part of the contract.
+ * what it says when it refuses are both part of the contract (section 9.7): a document is refused
+ * for a broken schema constraint or a relationship rule, and everything this app merely cannot use
+ * is a warning.
  */
 class ControllerConfigTest {
 
     private fun error(text: String): String =
         readControllerConfig(text).exceptionOrNull()?.message ?: "no failure"
+
+    private fun warnings(text: String): List<String> =
+        acceptControllerConfig(text).getOrThrow().verdict.warnings.map { it.code }
 
     @Test
     fun `the example is refused only for its placeholder hardware address`() {
@@ -22,7 +27,7 @@ class ControllerConfigTest {
         val message = error(EXAMPLE_CONTROLLER_CONFIG)
         assertTrue(message, message.contains("not a hardware address"))
 
-        val filled = EXAMPLE_CONTROLLER_CONFIG.replace("XX:XX:XX:XX:XX:XX", "aa:bb:cc:dd:ee:ff")
+        val filled = EXAMPLE_CONTROLLER_CONFIG.replace("XX:XX:XX:XX:XX:XX", "02:00:00:00:00:01")
         val config = readControllerConfig(filled).getOrNull()
         assertNotNull(config)
         assertEquals(1, config!!.machines.size)
@@ -62,6 +67,8 @@ class ControllerConfigTest {
     fun `a document that is not JSON says so rather than throwing`() {
         assertTrue(error("not json at all").startsWith("That is not a configuration"))
         assertTrue(error("   ").contains("nothing to apply"))
+        // JSON, and not a setup: a setup has a version and a list of machines.
+        assertTrue(error("""{ "machines": [] }""").startsWith("That is not a configuration"))
     }
 
     @Test
@@ -70,71 +77,57 @@ class ControllerConfigTest {
             { "id": "one", "endpoints": [{ "id": "lan", "kind": "lan", "host": "h", "user": "me" }],
               "systems": [{ "id": "linux", "agent": ["node", "a.mjs"] }] }
         """.trimIndent()
-        assertTrue(error("""{ "machines": [$machine, $machine] }""").contains("share the id"))
+        assertTrue(error("""{ "version": 1, "machines": [$machine, $machine] }""").contains("share the id"))
     }
 
     @Test
-    fun `a machine needs somewhere to dial and something to run`() {
-        assertTrue(error("""{ "machines": [] }""").contains("no machines"))
-        assertTrue(
-            error(
-                """{ "machines": [{ "id": "one", "systems": [{ "id": "l", "agent": ["n"] }] }] }""",
-            ).contains("no endpoints"),
+    fun `a machine that cannot be driven yet is accepted, and says why`() {
+        // C3: each of these used to refuse the whole setup, so a machine somebody was halfway
+        // through adding on another device stopped replication for everybody.
+        assertEquals(listOf("no-machines"), warnings("""{ "version": 1, "machines": [] }"""))
+        assertEquals(
+            listOf("machine-no-endpoints"),
+            warnings("""{ "version": 1, "machines": [{ "id": "one", "systems": [{ "id": "l", "agent": ["n"] }] }] }"""),
         )
-        assertTrue(
-            error(
-                """
-                { "machines": [{ "id": "one",
-                  "endpoints": [{ "id": "lan", "kind": "lan", "host": "h", "user": "me" }] }] }
-                """.trimIndent(),
-            ).contains("no systems"),
+        assertEquals(
+            listOf("machine-no-systems"),
+            warnings("""{ "version": 1, "machines": [{ "id": "one", "endpoints": [{ "id": "lan", "host": "h", "user": "me" }] }] }"""),
+        )
+        assertEquals(
+            listOf("system-no-agent"),
+            warnings(
+                """{ "version": 1, "machines": [{ "id": "one", "endpoints": [{ "id": "lan", "host": "h", "user": "me" }],
+                     "systems": [{ "id": "linux", "agent": [] }] }] }""",
+            ),
         )
     }
 
     @Test
-    fun `a system without an agent command cannot be reached and is refused`() {
-        val message = error(
-            """
-            { "machines": [{ "id": "one",
-              "endpoints": [{ "id": "lan", "kind": "lan", "host": "h", "user": "me" }],
-              "systems": [{ "id": "linux", "agent": [] }] }] }
-            """.trimIndent(),
-        )
-        assertTrue(message, message.contains("no agent command"))
-    }
-
-    @Test
-    fun `an endpoint needs a user, a known kind and a system that exists`() {
-        fun endpoint(fields: String) = error(
-            """
-            { "machines": [{ "id": "one",
+    fun `an endpoint with no user or a hint to nothing is a warning, and an unknown kind is refused`() {
+        fun endpoint(fields: String) = """
+            { "version": 1, "machines": [{ "id": "one",
               "endpoints": [$fields],
               "systems": [{ "id": "linux", "agent": ["node", "a.mjs"] }] }] }
-            """.trimIndent(),
+        """.trimIndent()
+        assertEquals(listOf("endpoint-no-user"), warnings(endpoint("""{ "id": "lan", "kind": "lan", "host": "h" }""")))
+        assertEquals(
+            listOf("endpoint-unknown-system"),
+            warnings(endpoint("""{ "id": "e", "kind": "remote", "host": "h", "user": "me", "system": "bsd" }""")),
         )
-        assertTrue(endpoint("""{ "id": "lan", "kind": "lan", "host": "h" }""").contains("no user"))
-        assertTrue(
-            endpoint("""{ "id": "lan", "kind": "tailnet", "host": "h", "user": "me" }""")
-                .contains("\"lan\" or \"remote\""),
-        )
-        assertTrue(
-            endpoint("""{ "id": "e", "kind": "remote", "host": "h", "user": "me", "system": "bsd" }""")
-                .contains("does not have"),
-        )
+        assertTrue(error(endpoint("""{ "id": "lan", "kind": "tailnet", "host": "h", "user": "me" }""")).contains("lan, remote"))
     }
 
     @Test
-    fun `wake is refused when the packet could not be built or sent`() {
-        fun wake(fields: String) = error(
-            """
-            { "machines": [{ "id": "one",
+    fun `wake is refused only for a hardware address no packet can carry`() {
+        fun wake(fields: String) = """
+            { "version": 1, "machines": [{ "id": "one",
               "endpoints": [{ "id": "lan", "kind": "lan", "host": "h", "user": "me" }],
               "wake": $fields,
               "systems": [{ "id": "linux", "agent": ["node", "a.mjs"] }] }] }
-            """.trimIndent(),
-        )
-        assertTrue(wake("""{ "mac": "nonsense", "broadcast": ["h"] }""").contains("not a hardware address"))
-        assertTrue(wake("""{ "mac": "aa:bb:cc:dd:ee:ff" }""").contains("no broadcast address"))
+        """.trimIndent()
+        assertTrue(error(wake("""{ "mac": "nonsense", "broadcast": ["192.0.2.255"] }""")).contains("not a hardware address"))
+        // No broadcast is a default, not a fault: direct wake falls back to the derived one (C8).
+        assertEquals(listOf("wake-broadcast-defaulted"), warnings(wake("""{ "mac": "02:00:00:00:00:01", "lanPrefix": "192.0.2." }""")))
     }
 
     @Test

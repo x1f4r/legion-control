@@ -131,6 +131,11 @@ data class Machine(
     val siteId: String? = null,
     /** A hint that this machine is always powered. Changes what a warning says, nothing else. */
     val alwaysOn: Boolean = false,
+    /**
+     * Why nothing is dialled or run on this machine: the first error of contract section 9.7 inside
+     * it, in the document in force. Null on every machine of a document without errors.
+     */
+    val problem: String? = null,
 ) {
     fun system(id: String?): MachineSystem? = systems.firstOrNull { it.id == id }
 
@@ -189,6 +194,7 @@ private fun MachineConfig.toMachine(): Machine {
         systems = systems,
         siteId = site?.takeIf { it.isNotBlank() },
         alwaysOn = alwaysOn,
+        problem = problem,
         wake = wake?.let { wake ->
             WakeTarget(
                 mac = wake.mac,

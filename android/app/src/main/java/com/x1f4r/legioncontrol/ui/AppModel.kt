@@ -20,6 +20,7 @@ import com.x1f4r.legioncontrol.agent.decideFromStatus
 import com.x1f4r.legioncontrol.agent.provenanceOf
 import com.x1f4r.legioncontrol.agent.shouldAskForMeta
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.DocumentProblem
 import com.x1f4r.legioncontrol.data.EXAMPLE_CONTROLLER_CONFIG
 import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.data.LaunchReviewEntry
@@ -192,9 +193,21 @@ class AppModel(
 
     val sites: List<SiteConfig> get() = services.config.value?.sites.orEmpty()
 
-    /** Warnings about the setup that are worth showing and are never a reason to refuse it. */
+    /**
+     * Warnings about the setup that are worth showing and are never a reason to refuse it: what
+     * contract section 9.7 says this app cannot use, and what this app says beside it.
+     */
     val advisories: List<String>
-        get() = services.config.value?.advisories().orEmpty()
+        get() = services.acceptance.value?.warnings.orEmpty().map { it.message } +
+            services.config.value?.advisories().orEmpty()
+
+    /**
+     * What is wrong with the document in force, when an earlier build stored one this one would
+     * refuse. It stays in force; nothing is published and no machine an error is inside is driven
+     * until it is fixed in the editor.
+     */
+    val setupErrors: List<DocumentProblem>
+        get() = services.acceptance.value?.errors.orEmpty()
 
     private val fleet = object : FleetContext {
         override val machines: List<Machine> get() = clients.map { it.machine }
@@ -506,11 +519,15 @@ class AppModel(
     }
 
     fun applyConfig() {
+        // Shown once, as section 9.5 asks: a document that named no setup is given an id here.
+        val named = ControllerDocument.parse(configDraft).getOrNull()?.setupId != null
         val failure = services.applyPasted(configDraft, services.deviceName())
         configError = failure
         configNote = if (failure == null) {
             draftMatchesApplied = true
-            "The setup is in force and will be sent to every machine that will take it."
+            val assigned = services.provenance.value?.authority?.takeUnless { named }
+            "The setup is in force and will be sent to every machine that will take it." +
+                (assigned?.let { " It was given the setup id $it." } ?: "")
         } else {
             null
         }

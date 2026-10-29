@@ -14,6 +14,9 @@ import com.x1f4r.legioncontrol.agent.buildRemoteCommand
 import com.x1f4r.legioncontrol.agent.grammarFor
 import com.x1f4r.legioncontrol.agent.statusBudget
 import com.x1f4r.legioncontrol.data.CanonicalSetup
+import com.x1f4r.legioncontrol.data.DocumentAcceptance
+import com.x1f4r.legioncontrol.data.DocumentProblem
+import com.x1f4r.legioncontrol.data.Intake
 import com.x1f4r.legioncontrol.data.LaunchTuple
 import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.contract.VectorJson.boolean
@@ -32,6 +35,7 @@ import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Base64
 
 /**
  * The shared conformance vectors, run through this app's own code.
@@ -51,6 +55,12 @@ class ContractVectorsTest {
 
     @Test
     fun `launch values, their review and what runs match the contract`() = runFamily("launch")
+
+    @Test
+    fun `canonical bytes, hashes and refusals match the contract`() = runFamily("hash")
+
+    @Test
+    fun `which setup documents are accepted matches the contract`() = runFamily("setup-acceptance")
 
     /**
      * Every adapter is for a group this client consumes, and every consumed family is either adapted
@@ -251,7 +261,36 @@ class ContractVectorsTest {
                 put("migration", LaunchValues.isLauncherMigration(LaunchTuple.from(input["approved"]), LaunchTuple.from(input["offered"])))
             }
         },
+
+        // A vector of the flat layout is its own input.
+        "hash/vectors" to { input ->
+            val bytes = Base64.getDecoder().decode(input.string("inputBase64")!!)
+            val valid = CanonicalSetup.canonicalTextOrNull(bytes) != null
+            val reject = CanonicalSetup.rejectionOf(bytes)
+            buildJsonObject {
+                put("canonicalBase64", text(if (valid) Base64.getEncoder().encodeToString(CanonicalSetup.canonicalBytes(bytes)) else null))
+                put("sha256", text(if (valid) CanonicalSetup.hashOf(bytes) else null))
+                put("accepted", reject == null)
+                put("reject", text(reject))
+            }
+        },
+
+        "setup-acceptance/documents" to { input ->
+            val intake = Intake.entries.single { it.wire == input.string("intake") }
+            val verdict = DocumentAcceptance.check(input.string("text")!!, intake)
+            buildJsonObject {
+                put("valid", verdict.valid)
+                put("errors", codes(verdict.errors))
+                put("warnings", codes(verdict.warnings))
+                put("assignsIdentity", verdict.assignsIdentity)
+                put("keep", verdict.keep)
+            }
+        },
     )
+
+    /** The codes of [problems], each once, sorted, as the acceptance vectors list them. */
+    private fun codes(problems: List<DocumentProblem>): JsonArray =
+        JsonArray(problems.map { it.code }.distinct().sorted().map(::JsonPrimitive))
 
     private fun identifier(check: (String?) -> Boolean): (JsonObject) -> JsonObject = { input ->
         buildJsonObject { put("valid", check(input.string("value"))) }
@@ -272,8 +311,6 @@ class ContractVectorsTest {
          * adapted, or when the index stops listing it, and the list is empty once the Android port
          * of every reference has landed.
          */
-        val PENDING_FAMILIES = setOf(
-            "hash", "outcome", "setup-acceptance", "setup-reconcile", "setup-merge", "wake",
-        )
+        val PENDING_FAMILIES = setOf("outcome", "setup-reconcile", "setup-merge", "wake")
     }
 }

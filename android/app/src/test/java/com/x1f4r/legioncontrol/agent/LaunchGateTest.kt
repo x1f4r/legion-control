@@ -129,8 +129,8 @@ class LaunchGateTest {
      * The vector adapter checks the port of the reference. This checks the wiring around it: that the
      * record the store seeds is the one the reference seeds, that adopting leaves what the reference
      * says to leave, and that the typed configuration the transports read carries exactly the
-     * effective tuples. A case whose offered document this build's own validation refuses is named
-     * below with the reason, rather than skipped silently, and every other case has to be adopted.
+     * effective tuples. Every case has to be adopted: its offered document is one contract section 9.7
+     * accepts, and so does this build.
      */
     @Test
     fun `the review vectors hold through the store, the gate and the machines built from it`() {
@@ -144,11 +144,6 @@ class LaunchGateTest {
 
             when (val outcome = store.adoptFromMachine(case.input.string("offeredText")!!, null, "Tower")) {
                 is SetupOutcome.Applied -> Unit
-                is SetupOutcome.Invalid -> {
-                    val expected = REFUSED_HERE[case.name]
-                    if (expected == null || expected !in outcome.reason) failures += "${case.name}: refused, ${outcome.reason}"
-                    continue
-                }
 
                 else -> {
                     failures += "${case.name}: $outcome"
@@ -425,16 +420,5 @@ class LaunchGateTest {
         const val V3_STATUS = """{"ok":true,"contract":3,"system":{"id":"linux"}}"""
         const val DISPATCH_STATUS = """{"ok":true,"contract":3,"system":{"id":"linux"},"agent":{"restrictedSession":true}}"""
 
-        /**
-         * The review cases whose offered document this build's validation refuses, and why. Stricter
-         * than contract section 9.7, which keeps a system with no agent and takes a wake block's
-         * broadcast from its site; the setup-acceptance port lifts both. A case listed here that is
-         * adopted is checked like any other.
-         */
-        val REFUSED_HERE = mapOf(
-            "agent-removed" to "has no agent command",
-            "agent-emptied" to "has no agent command",
-            "display-and-routing-only" to "no broadcast address",
-        )
     }
 }

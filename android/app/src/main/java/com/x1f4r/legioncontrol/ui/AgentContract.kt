@@ -24,6 +24,7 @@ import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.DocumentAcceptance
 import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.data.LaunchReviewEntry
 import com.x1f4r.legioncontrol.data.SetupDivergence
@@ -341,6 +342,12 @@ interface ControlServices {
 
     /** Records exactly the values [entries] showed as approved on this device. Returns null, or why not. */
     fun approveLaunch(entries: List<LaunchReviewEntry>): String?
+
+    /**
+     * What contract section 9.7 says of the document in force: its warnings and, when an earlier
+     * build stored it under other rules, its errors. While it has one, nothing is published.
+     */
+    val acceptance: StateFlow<DocumentAcceptance.Verdict?>
 
     /** Takes a copy off a machine. Only ever called when it descends from this device's copy. */
     fun adoptFromMachine(text: String, expectedHash: String?, machineName: String): SetupOutcome

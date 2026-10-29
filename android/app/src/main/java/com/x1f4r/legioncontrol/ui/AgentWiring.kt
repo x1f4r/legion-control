@@ -29,6 +29,7 @@ import com.x1f4r.legioncontrol.agent.resolveSystem
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.DocumentAcceptance
 import com.x1f4r.legioncontrol.data.KeyChange
 import com.x1f4r.legioncontrol.data.LaunchReviewEntry
 import com.x1f4r.legioncontrol.data.SetupDivergence
@@ -105,6 +106,8 @@ private class WiredServices(private val control: LegionControl) : ControlService
         control.config.applyEnrolment(text, deviceName)
 
     override fun approveLaunch(entries: List<LaunchReviewEntry>): String? = control.config.approveLaunch(entries)
+
+    override val acceptance: StateFlow<DocumentAcceptance.Verdict?> get() = control.config.acceptance
 
     override fun adoptFromMachine(
         text: String,

@@ -186,7 +186,7 @@ configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configu
 tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     systemProperty("legion.contract", rootProject.file("../contract").absolutePath)
     inputs.files(rootProject.fileTree("../contract") {
-        include("fixtures/*.json", "vectors/*.json", "hash-vectors.json", "release-public-key.pem", "bootstrap/*.cjs")
+        include("fixtures/*.json", "vectors/*.json", "schemas/*.json", "hash-vectors.json", "release-public-key.pem", "bootstrap/*.cjs")
     })
     inputs.files(rootProject.fileTree("../tests/fixtures/trust") { include("*") })
 }

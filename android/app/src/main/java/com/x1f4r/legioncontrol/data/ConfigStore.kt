@@ -85,17 +85,37 @@ class ConfigStore internal constructor(
     /** Exactly what is stored, so the field on screen starts as what was last applied. */
     val text: StateFlow<String> = _text.asStateFlow()
 
+    /**
+     * The document in force as it was left, under applied intake (contract section 9.7): never
+     * refused as long as section 12 accepts its bytes. A document an earlier build stored under rules
+     * that were wider in one place and narrower in another stays in force with its errors shown,
+     * rather than disappearing at the first start of this one.
+     */
+    private val loaded: AcceptedConfig? =
+        _text.value.takeIf { it.isNotBlank() }?.let { acceptControllerConfig(it, Intake.APPLIED).getOrNull() }
+
     private val _document = MutableStateFlow(
-        _text.value.takeIf { it.isNotBlank() }?.let { ControllerDocument.parse(it).getOrNull() },
+        loaded?.let { ControllerDocument.parse(_text.value).getOrNull() },
     )
 
     /** The applied document as a tree, which is what an edit works on. */
     val document: StateFlow<ControllerDocument?> = _document.asStateFlow()
 
-    private val _config = MutableStateFlow(readControllerConfig(_text.value).getOrNull())
+    private val _config = MutableStateFlow(loaded?.config)
 
     /** The configuration in force. Null means there is none, which is the first-run state. */
     val config: StateFlow<ControllerConfig?> = _config.asStateFlow()
+
+    private val _acceptance = MutableStateFlow(
+        loaded?.verdict ?: _text.value.takeIf { it.isNotBlank() }?.let { DocumentAcceptance.check(it, Intake.APPLIED) },
+    )
+
+    /**
+     * What section 9.7 says of the document in force: its warnings, and under applied intake its
+     * errors. While it has an error this device publishes nothing (section 9.5) and each machine one
+     * is inside is not driven; it still reads, fetches and merges.
+     */
+    val acceptance: StateFlow<DocumentAcceptance.Verdict?> = _acceptance.asStateFlow()
 
     // Seeded before anything evaluates the gate, so the first start of this build drives exactly
     // what the one before it did.
@@ -137,10 +157,12 @@ class ConfigStore internal constructor(
     /**
      * Puts a document typed or pasted in here into force.
      *
-     * A document that already names a setup keeps it and counts as an edit of whatever this device
-     * was holding, so pasting a colleague's export and then editing it stays in that setup's
-     * history. One that names no setup gets a fresh id, revision 1 and no ancestry, which is R3:
-     * the phone is a peer and the setup it creates belongs to the fleet rather than to the phone.
+     * Local intake (contract section 9.7): a document with no `controller` block, or a block with no
+     * id, gets a fresh setup id, revision 1 and no ancestry, keeping the block's other keys, and is
+     * then checked like any other. The phone is a peer and the setup it creates belongs to the fleet
+     * rather than to the phone. A document that already names a setup keeps it and counts as an edit
+     * of whatever this device was holding, so pasting a colleague's export and then editing it stays
+     * in that setup's history.
      *
      * Nothing is stored on a failure, on purpose: an app that is working against a good
      * configuration must not lose it because a half-finished edit was applied by accident.
@@ -162,10 +184,12 @@ class ConfigStore internal constructor(
         paste(text, deviceName, if (_document.value == null) Approving.EVERYTHING else Approving.NOTHING)
 
     private fun paste(text: String, deviceName: String?, approving: Approving): String? {
+        val verdict = DocumentAcceptance.check(text, Intake.LOCAL)
+        if (!verdict.valid) return verdict.errors.firstOrNull()?.message ?: "That configuration could not be read."
         val parsed = ControllerDocument.parse(text).getOrElse { return it.message }
         val applied = _document.value
         val document = when {
-            parsed.identity == null -> parsed.withFreshIdentity(deviceName, now())
+            verdict.assignsIdentity -> parsed.withFreshIdentity(deviceName, now())
             // Same setup, and this device already had a copy: an ordinary edit, so it descends from
             // what was here and every machine will fast-forward onto it.
             applied != null && applied.setupId == parsed.setupId ->
@@ -345,8 +369,9 @@ class ConfigStore internal constructor(
         approving: Approving = Approving.NOTHING,
     ): String? {
         val text = document.canonicalText
-        val typed = readControllerConfig(text)
-        typed.exceptionOrNull()?.let { return it.message ?: "That configuration could not be read." }
+        val accepted = acceptControllerConfig(text).getOrElse {
+            return it.message ?: "That configuration could not be read."
+        }
 
         val after = LaunchValues.projection(document.root)
         val changes = when (approving) {
@@ -389,7 +414,8 @@ class ConfigStore internal constructor(
         _provenance.value = provenance
         _text.value = text
         _document.value = document
-        _config.value = typed.getOrNull()
+        _config.value = accepted.config
+        _acceptance.value = accepted.verdict
         _divergence.value = null
         announce(record)
         return null

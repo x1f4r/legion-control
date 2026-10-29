@@ -17,8 +17,8 @@ import com.x1f4r.legioncontrol.data.withList
 import com.x1f4r.legioncontrol.data.withText
 import com.x1f4r.legioncontrol.data.text
 import com.x1f4r.legioncontrol.data.withWake
-import com.x1f4r.legioncontrol.data.advisories
-import com.x1f4r.legioncontrol.data.readControllerConfig
+import com.x1f4r.legioncontrol.data.AcceptedConfig
+import com.x1f4r.legioncontrol.data.acceptControllerConfig
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -65,9 +65,19 @@ class SetupEditorModel(
     val hasChanges: Boolean
         get() = working != null && working?.canonicalText != base?.canonicalText
 
-    /** Everything the validator says, so Apply can be refused with a reason rather than silently. */
-    val validation: Result<ControllerConfig>?
-        get() = working?.let { readControllerConfig(it.canonicalText) }
+    /** The last document checked and what was said of it, so a recomposition does not check it again. */
+    private var checked: Pair<ControllerDocument, Result<AcceptedConfig>>? = null
+
+    /**
+     * Everything contract section 9.7 says of the edit, so Apply can be refused with a reason rather
+     * than silently, and its warnings shown beside it.
+     */
+    val validation: Result<AcceptedConfig>?
+        get() {
+            val document = working ?: return null
+            checked?.takeIf { it.first === document }?.let { return it.second }
+            return acceptControllerConfig(document.canonicalText).also { checked = document to it }
+        }
 
     val isValid: Boolean get() = validation?.isSuccess == true && commandProblem == null
 
@@ -107,9 +117,9 @@ class SetupEditorModel(
 
     /** Warnings, which never block Apply. */
     val advisories: List<String>
-        get() = validation?.getOrNull()?.advisories().orEmpty()
+        get() = validation?.getOrNull()?.advisories.orEmpty()
 
-    val typed: ControllerConfig? get() = validation?.getOrNull()
+    val typed: ControllerConfig? get() = validation?.getOrNull()?.config
 
     fun reset(document: ControllerDocument?) {
         base = document
@@ -331,8 +341,10 @@ class SetupEditorModel(
         if (helperMachineId == machineId) {
             return "A machine cannot wake itself. One that is asleep cannot send its own packet."
         }
-        if (!Contract.isToken(actionId.trim())) {
-            return "A wake action id has to be a plain identifier."
+        // The configured-id grammar, which is what the helper's agent names its actions with: a
+        // token with a colon in it would be saved here and refused by every peer.
+        if (!Contract.isConfiguredId(actionId.trim())) {
+            return "A wake action id is letters, digits and . _ -, starting with a letter or a digit."
         }
         val existing = typed?.machines?.firstOrNull { it.id == machineId }
             ?.wake?.effectiveHelpers.orEmpty()

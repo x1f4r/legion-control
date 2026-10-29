@@ -1,6 +1,5 @@
 package com.x1f4r.legioncontrol.data
 
-import com.x1f4r.legioncontrol.agent.Contract
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -262,7 +261,10 @@ data class DocumentIdentity(
 
     companion object {
         fun from(block: JsonObject?): DocumentIdentity? {
-            val id = block?.text("id")?.takeIf { it.isNotBlank() && Contract.isToken(it) } ?: return null
+            // Any id the block holds is its id, valid or not: whether it is one a machine takes is
+            // section 9.7's to say, and a document whose id is wrong keeps it until somebody fixes
+            // it, rather than quietly becoming a document with no identity and getting a new one.
+            val id = block?.text("id") ?: return null
             return DocumentIdentity(
                 id = id,
                 name = block.text("name"),

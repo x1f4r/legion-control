@@ -64,7 +64,12 @@ object LaunchGate {
                     val agent = tuple?.agent
                     val grammar = RemoteShell.fromGrammar(tuple?.grammar)
                     val awaitsApproval = waiting[place]?.approvable == true
-                    if (agent == null || grammar == null) {
+                    // A machine with an error of section 9.7 inside it runs nothing, whatever this
+                    // device approved there: applied intake keeps the document in force and
+                    // disables the machine until the error is fixed.
+                    if (machine.problem != null) {
+                        system.copy(agent = emptyList(), grammar = null, launchState = LaunchState.NOT_DRIVEN, awaitsApproval = false)
+                    } else if (agent == null || grammar == null) {
                         system.copy(
                             agent = emptyList(),
                             grammar = null,

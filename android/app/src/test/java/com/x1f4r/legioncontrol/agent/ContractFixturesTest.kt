@@ -1,5 +1,8 @@
 package com.x1f4r.legioncontrol.agent
 
+import com.x1f4r.legioncontrol.contract.ContractCorpus
+import com.x1f4r.legioncontrol.data.DocumentAcceptance
+import com.x1f4r.legioncontrol.data.Intake
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -92,6 +95,14 @@ class ContractFixturesTest {
                     file.name.startsWith("bundle.") ->
                         AgentJson.decodeFromString(JsonObject.serializer(), text)
 
+                    // A setup document is not a reply: it is held to contract section 9.7 and has to
+                    // come out valid or invalid exactly as the fixture index says (C3).
+                    file.name.startsWith("controller-document.") -> {
+                        val verdict = DocumentAcceptance.check(file.readBytes(), Intake.PEER)
+                        val valid = documentExpectations()[file.name] == "valid"
+                        check(verdict.valid == valid) { "expected ${if (valid) "valid" else "invalid"}, got ${verdict.errors}" }
+                    }
+
                     // Everything else is a mutation reply or an error, which share one shape.
                     else -> AgentJson.decodeFromString(AgentActionResult.serializer(), text)
                 }
@@ -103,6 +114,13 @@ class ContractFixturesTest {
         assertTrue("failed to decode:\n${failures.joinToString("\n")}", failures.isEmpty())
         assertEquals("every fixture should have been decoded", files.size, decoded)
     }
+
+    /** What `fixtures/index.json` expects of each setup document fixture: `valid` or `invalid`. */
+    private fun documentExpectations(): Map<String, String> =
+        ((ContractCorpus.json("fixtures/index.json") as JsonObject)["fixtures"] as kotlinx.serialization.json.JsonArray)
+            .map { it as JsonObject }
+            .filter { (it["kind"] as kotlinx.serialization.json.JsonPrimitive).content == "document" }
+            .associate { (it["file"] as kotlinx.serialization.json.JsonPrimitive).content to (it["expect"] as kotlinx.serialization.json.JsonPrimitive).content }
 
     @Test
     fun `a full status carries everything the app draws from`() {

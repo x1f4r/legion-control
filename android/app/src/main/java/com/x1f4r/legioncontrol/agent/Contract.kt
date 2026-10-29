@@ -99,6 +99,22 @@ object Contract {
         return value
     }
 
+    /**
+     * The same check for a setup id, which has its own grammar: what `--controller-id` takes, at
+     * most 64 characters and no `@`, `/` or `\`. The generic token grammar is wider, and an id that
+     * passes it and not this one is one the agent refuses with `bad-argument` after it was sent.
+     */
+    fun requireSetupId(value: String): String {
+        if (!isSetupId(value)) {
+            throw AgentFailure.BadRequest(
+                "This app will not send that request.",
+                "The setup id \"$value\" is not a valid setup id. Letters, digits and . _ : - only, " +
+                    "starting with a letter or a digit, at most 64 characters.",
+            )
+        }
+        return value
+    }
+
     /** A duration in seconds as the `DUR` form the agent takes, rounded up to whole minutes. */
     fun durationOf(seconds: Long): String = when {
         seconds <= 0L -> "1m"

@@ -24,10 +24,29 @@ object VectorJson {
     /** One case of one group, as the family file has it. */
     data class Case(val name: String, val consumers: List<String>, val input: JsonObject, val expect: JsonObject)
 
+    /**
+     * The fields every implementation reproduces for a vector of a family in the flat layout, which
+     * is the `hash` family's: each vector is its own input, and these are its expect.
+     */
+    private val FLAT_EXPECT = listOf("canonicalBase64", "sha256", "accepted", "reject")
+
     /** Every case of [group] in [family] that names [consumer]. */
     fun cases(family: String, group: String, consumer: String = CONSUMER): List<Case> {
         val entry = familyEntry(family)
         val file = (entry["file"] as JsonPrimitive).content
+        if ((entry["layout"] as? JsonPrimitive)?.content == "flat") {
+            // Every consumer runs every vector of a flat file, which has no consumers of its own.
+            val vectors = (ContractCorpus.json(file) as JsonObject)[group] as? JsonArray
+                ?: throw AssertionError("$file has no $group")
+            return vectors.map { it as JsonObject }.map { vector ->
+                Case(
+                    name = (vector["name"] as JsonPrimitive).content,
+                    consumers = listOf(consumer),
+                    input = vector,
+                    expect = JsonObject(FLAT_EXPECT.associateWith { key -> vector[key] ?: throw AssertionError("$file vector has no $key") }),
+                )
+            }
+        }
         val groups = (ContractCorpus.json(file) as JsonObject)["groups"] as? JsonObject
             ?: throw AssertionError("$file has no groups")
         val cases = groups[group] as? JsonArray ?: throw AssertionError("$file has no group $group")

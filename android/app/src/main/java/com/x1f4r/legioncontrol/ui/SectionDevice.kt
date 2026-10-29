@@ -436,6 +436,12 @@ private fun SetupBlock(app: AppModel, onEdit: () -> Unit = app::openEditor) {
             "same way. Neither can quietly undo the other.",
     )
 
+    // The document in force stays in force with these, and is published nowhere until they are fixed.
+    app.setupErrors.firstOrNull()?.let { problem ->
+        Spacer(Modifier.height(8.dp))
+        StatusLine(Mark.Bad, "This setup has an error, so it is not sent to any machine until it is fixed")
+        QuietText(problem.message, Modifier.padding(top = 2.dp))
+    }
     app.advisories.forEach { QuietText(it, Modifier.padding(top = 4.dp)) }
 
     // The badge stays while anything waits, whether or not the review was put off for now.

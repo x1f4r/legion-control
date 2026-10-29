@@ -126,7 +126,10 @@ below.
 
 The same block lives under **This device → Setup**, next to the JSON field for pasting a
 document by hand (**Insert example** drops in a template whose hardware address is a
-placeholder). Either way the document is validated first and nothing is stored until it passes.
+placeholder). Either way the document is checked first and nothing is stored until it passes.
+What passes is exactly what contract section 9.7 accepts, the same on every client: a machine
+with no systems or addresses yet, an address with no id or no user and a wake block with no
+broadcast are warnings that say why something is not driven, never a reason to refuse the setup.
 The machines' endpoints are dialled directly by the app's own ssh client, in the order listed:
 a tunnel address first works from anywhere, a LAN address as the fallback works from home.
 
@@ -244,6 +247,9 @@ reach, and travels on the next poll of each one. Behind that:
   a difference per machine, address, system, wake block or site, defaulting to whichever side
   actually changed each one. Merging writes a revision descending from both, which every machine
   then accepts as an ordinary fast-forward, so nothing is replaced.
+- A document already in force that this build would refuse stays in force with its errors
+  shown: nothing is published from it, and a machine an error is inside is not driven until the
+  editor fixes it.
 - A machine carrying an entirely different setup cannot be merged with, and is the one place the
   app ever sends `--replace`, after an explicit decision.
 
@@ -267,8 +273,8 @@ both, and the next setup confirmed here counts as the first.
 The hash all of this turns on is the canonical form from `contract/hash-vectors.json`: strict
 UTF-8, one leading byte order mark stripped, CRLF and CR to LF, a fixed six-character whitespace
 set trimmed from both ends, exactly one trailing newline. `data/CanonicalSetup.kt` implements
-that rule and `CanonicalSetupTest` checks every shared vector, including the ones that must be
-refused.
+that rule and the `hash` family of `ContractVectorsTest` checks every shared vector, including
+the ones that must be refused.
 
 ## Testing on an emulator
 

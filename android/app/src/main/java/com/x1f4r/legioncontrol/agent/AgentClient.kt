@@ -271,7 +271,7 @@ class AgentClient(
         revision: Long,
         replace: Boolean = false,
     ): AgentReply<ConfigSetReply> {
-        Contract.requireToken(setupId, "setup id")
+        Contract.requireSetupId(setupId)
         if (revision < 0) refuse("A setup revision counts up from zero, and this one is $revision.")
         return call(
             buildList {
@@ -764,7 +764,9 @@ class AgentClient(
     ): AgentReply<T> {
         // Contract section 9.9: nothing is sent to a system this device does not drive, and with none
         // driven on the whole machine there is nothing to try on any route. Said as what would change
-        // that, so the machine is not drawn as one that is asleep.
+        // that, so the machine is not drawn as one that is asleep. A machine the document in force
+        // has an error inside (section 9.7) is not dialled at all, not even for the bootstrap.
+        if (machine.problem != null) throw notDriven()
         if (overrideArgv == null && machine.systems.isNotEmpty() && machine.systems.none { it.isDriven }) {
             throw notDriven()
         }
@@ -856,6 +858,7 @@ class AgentClient(
      */
     private fun notDriven(): AgentFailure.BadRequest {
         val nothing = "Nothing on ${machine.name} is driven from this device."
+        machine.problem?.let { return AgentFailure.BadRequest("Nothing is sent to ${machine.name} until the setup is fixed.", it) }
         if (machine.systems.any { it.awaitsApproval }) {
             return AgentFailure.BadRequest(nothing, "Not driven from this device until its command is approved.")
         }
