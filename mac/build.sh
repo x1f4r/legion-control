@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Builds "Legion Control.app" from the SwiftPM executable and installs it into /Applications so the
-# Raycast launcher finds it by name. Safe to run over and over, and never needs sudo: /Applications is
-# writable by admin users.
+# Builds "Legion Control.app" from the SwiftPM executable and installs it into /Applications, where
+# Spotlight and other launchers find it by name. Safe to run over and over, and never needs sudo:
+# /Applications is writable by admin users.
 #
 #   ./build.sh                 build, sign, install into /Applications
 #   ./build.sh --no-install    build and sign only, leave the bundle in mac/build
