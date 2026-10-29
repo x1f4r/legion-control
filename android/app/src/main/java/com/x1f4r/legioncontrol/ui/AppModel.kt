@@ -565,6 +565,7 @@ class AppModel(
             }
 
             is SetupOutcome.Invalid -> configError = outcome.reason
+            is SetupOutcome.NotSaved -> configError = outcome.reason
         }
     }
 

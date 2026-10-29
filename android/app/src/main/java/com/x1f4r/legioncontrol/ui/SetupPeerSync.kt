@@ -196,6 +196,13 @@ internal class SetupPeerSync(
                     state.settled += settledKey(head.hash, expect, status.version)
                     Step.Done("$name is carrying a setup this app cannot use. ${outcome.reason}")
                 }
+
+                // Nothing about the document: this device could not write it down. Tried again
+                // after the back-off, like any request that did not go through.
+                is SetupOutcome.NotSaved -> {
+                    state.failed(head.hash, clock())
+                    Step.Done(outcome.reason)
+                }
             }
         }
     }

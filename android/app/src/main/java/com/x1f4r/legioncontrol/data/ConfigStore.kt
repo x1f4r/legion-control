@@ -2,6 +2,7 @@ package com.x1f4r.legioncontrol.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.core.content.edit
 import com.x1f4r.legioncontrol.agent.LaunchGate
 import com.x1f4r.legioncontrol.agent.SetupProvenance
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -68,6 +69,12 @@ sealed interface SetupOutcome {
      */
     data object HeadMoved : SetupOutcome
     data class Invalid(val reason: String) : SetupOutcome
+
+    /**
+     * This device could not write the document down, so nothing changed. Nothing is wrong with the
+     * document: the same decision can be made again later.
+     */
+    data class NotSaved(val reason: String) : SetupOutcome
 }
 
 /**
@@ -247,8 +254,11 @@ class ConfigStore internal constructor(
         val changes = entries.filter { it.approvable }.map { it.change() }
         if (changes.isEmpty()) return "Nothing here can be approved. It can only be reverted or left."
         val record = synchronized(HEAD_LOCK) {
+            val before = prefs.all
             val editor = prefs.edit()
-            approvals.update(editor, _document.value?.root, changes).also { editor.commit() }
+            val record = approvals.update(editor, _document.value?.root, changes)
+            if (!committed(editor, before)) return "This device could not save the approval just now, so nothing was approved."
+            record
         }
         announce(record)
         return null
@@ -293,6 +303,7 @@ class ConfigStore internal constructor(
             Stored.Unchanged -> SetupOutcome.Unchanged
             Stored.HeadMoved -> SetupOutcome.HeadMoved
             is Stored.Refused -> SetupOutcome.Invalid(stored.reason)
+            is Stored.NotSaved -> SetupOutcome.NotSaved(stored.reason)
         }
     }
 
@@ -358,6 +369,7 @@ class ConfigStore internal constructor(
             Stored.Unchanged -> SetupOutcome.Unchanged
             Stored.HeadMoved -> SetupOutcome.HeadMoved
             is Stored.Refused -> SetupOutcome.Invalid(stored.reason)
+            is Stored.NotSaved -> SetupOutcome.NotSaved(stored.reason)
         }
     }
 
@@ -393,7 +405,15 @@ class ConfigStore internal constructor(
         data object HeadMoved : Stored
         data class Refused(val reason: String) : Stored
 
-        val failure: String? get() = (this as? Refused)?.reason
+        /** The disk would not take the write, and everything is as it was before it. */
+        data class NotSaved(val reason: String) : Stored
+
+        val failure: String?
+            get() = when (this) {
+                is Refused -> reason
+                is NotSaved -> reason
+                else -> null
+            }
     }
 
     /**
@@ -405,7 +425,8 @@ class ConfigStore internal constructor(
      * approve waits.
      *
      * The check of [head] and the write are one step under [HEAD_LOCK], and the write is a commit,
-     * so no other store in this process can come between reading the head and replacing it.
+     * so no other store in this process can come between reading the head and replacing it. A
+     * commit the disk refused is undone, and nothing is announced.
      */
     private fun store(
         document: ControllerDocument,
@@ -446,6 +467,7 @@ class ConfigStore internal constructor(
 
             // The approvals go into the same edit as the document they belong to, recorded before
             // anything can read the document back, so an edit made here never shows up for review.
+            val before = prefs.all
             val editor = prefs.edit()
                 .putString(KEY_TEXT, text)
                 .putString(KEY_HASH, provenance.hash)
@@ -457,7 +479,9 @@ class ConfigStore internal constructor(
                 .putString(KEY_DEVICE, provenance.device)
                 .putString(KEY_PROVENANCE_SOURCE, provenance.readFrom)
             val record = approvals.update(editor, document.root, changes)
-            editor.commit()
+            if (!committed(editor, before)) {
+                return Stored.NotSaved("This device could not save the setup just now, so nothing changed.")
+            }
 
             // Kept before it is announced, so a merge that needs this revision as a base can find
             // it even if the app is killed in the next moment.
@@ -477,6 +501,35 @@ class ConfigStore internal constructor(
 
     /** The hash in storage, which only [store] writes. Called under [HEAD_LOCK]. */
     private fun storedHash(): String? = prefs.getString(KEY_HASH, null)?.takeIf { it.isNotBlank() }
+
+    /**
+     * Writes [editor] to disk, or puts the preferences back to [before] and says it did not.
+     *
+     * A commit and not an apply, because what is announced is what gets published: a document sent
+     * to machines must still be the one in force here if the app is killed a moment later, and the
+     * next compare-and-swap must read the head the last write left. A commit that could not reach
+     * the disk has changed the preferences in memory all the same, which is where that head is read
+     * from, so it is undone there: a store left ahead of what it announced would refuse every
+     * adoption as a moved head and read the machine again on every status. Only text is written
+     * beside the document, so text is all there is to put back.
+     */
+    private fun committed(editor: SharedPreferences.Editor, before: Map<String, *>): Boolean {
+        if (editor.commit()) return true
+        val after = prefs.all
+        // An apply: memory is what has to be right at once. The disk still holds what it held
+        // before the refused write, and this brings it back to the same on its own time.
+        prefs.edit {
+            for (key in after.keys + before.keys) {
+                val was = before[key]
+                if (was == after[key]) continue
+                when (was) {
+                    null -> remove(key)
+                    is String -> putString(key, was)
+                }
+            }
+        }
+        return false
+    }
 
     /** What a document says about itself, for the divergence and different-setup screens. */
     private fun provenanceOf(document: ControllerDocument, machineName: String): SetupProvenance {

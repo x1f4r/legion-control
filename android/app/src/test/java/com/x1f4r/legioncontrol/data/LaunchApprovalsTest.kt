@@ -237,6 +237,26 @@ class LaunchApprovalsTest {
     }
 
     @Test
+    fun `an approval the disk refused approves nothing, and is said so`() {
+        val prefs = MemoryPreferences()
+        val store = store(prefs)
+        store.applyEnrolment(HELD, "Test phone")
+        store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("/usr/bin/node", "/opt/lc/bin/launcher.mjs")) })
+        val before = record(prefs)
+        val launch = store.launch.value
+        val shown = launch.review.single()
+
+        prefs.diskRefuses = true
+        assertNotNull(store.approveLaunch(listOf(shown)))
+        assertEquals(before, record(prefs))
+        assertEquals(launch, store.launch.value)
+
+        prefs.diskRefuses = false
+        assertNull(store.approveLaunch(listOf(shown)))
+        assertTrue(store.launch.value.review.isEmpty())
+    }
+
+    @Test
     fun `a value that cannot be shown faithfully is never approved`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)

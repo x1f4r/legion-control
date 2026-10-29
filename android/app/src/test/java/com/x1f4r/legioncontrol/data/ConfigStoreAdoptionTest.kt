@@ -85,6 +85,38 @@ class ConfigStoreAdoptionTest {
         assertTrue(store.applyMerge(newer(store.text.value, "Merged"), store.appliedHash()) is SetupOutcome.Applied)
     }
 
+    /**
+     * A commit the disk refused still changed the preferences in memory, which is where the head is
+     * read from. Left there, the store would be ahead of what it announced, and every adoption after
+     * it would be refused as a moved head.
+     */
+    @Test
+    fun `a write the disk refused leaves everything as it was, and is said so`() {
+        val prefs = MemoryPreferences()
+        val store = enrolled(prefs)
+        val head = store.appliedHash()!!
+        val text = store.text.value
+        val launch = store.launch.value
+        val saved = prefs.values.toMap()
+        val copy = newer(text, "Beacon two")
+
+        prefs.diskRefuses = true
+        assertNotNull(store.applyEdit(store.document.value!!.editMachine("tower") { it.withText("name", "Edited") }, "Test phone"))
+        val outcome = store.adoptFromMachine(copy, hashOf(copy), head, "Pi")
+        assertTrue("$outcome", outcome is SetupOutcome.NotSaved)
+
+        assertEquals(saved, prefs.values)
+        assertEquals(head, store.appliedHash())
+        assertEquals(text, store.text.value)
+        assertEquals(head, store.document.value!!.hash)
+        assertEquals(launch, store.launch.value)
+
+        // Nothing is stuck once the disk takes writes again: the same adoption goes through over the same head.
+        prefs.diskRefuses = false
+        assertTrue(store.adoptFromMachine(copy, hashOf(copy), head, "Pi") is SetupOutcome.Applied)
+        assertEquals(copy, store.text.value)
+    }
+
     @Test
     fun `the document in force is kept on load even when this build would refuse it`() {
         // A setup id the old token grammar allowed and the setup-id grammar does not (C10), stored

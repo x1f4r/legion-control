@@ -15,6 +15,12 @@ class MemoryPreferences : SharedPreferences {
     /** The keys of each write, in the order they were applied. */
     val writes = mutableListOf<Set<String>>()
 
+    /**
+     * While set, every commit fails the way it fails on Android when the disk will not take it: the
+     * map in memory has the new values all the same, and the commit returns false.
+     */
+    var diskRefuses = false
+
     override fun getAll(): MutableMap<String, *> = values.toMutableMap()
 
     override fun getString(key: String?, defValue: String?): String? =
@@ -77,7 +83,7 @@ class MemoryPreferences : SharedPreferences {
             removed.forEach { values.remove(it) }
             values.putAll(pending)
             writes += pending.keys + removed
-            return true
+            return !diskRefuses
         }
 
         override fun apply() {
