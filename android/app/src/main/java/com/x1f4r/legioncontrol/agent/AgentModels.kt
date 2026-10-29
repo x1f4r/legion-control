@@ -384,6 +384,11 @@ data class AgentSelf(
     val node: String? = null,
     /** True when this session came through the restricted dispatcher. */
     val restrictedSession: Boolean? = null,
+    /**
+     * v3.1: the oldest agent this one may be replaced by (contract section 13). Absent from older
+     * agents, and only an agent that reports it may ever be offered a deliberate downgrade.
+     */
+    val floor: String? = null,
 )
 
 @Serializable

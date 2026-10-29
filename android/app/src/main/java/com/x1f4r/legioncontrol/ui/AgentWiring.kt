@@ -349,7 +349,7 @@ private class WiredMachineClient(
     ): Result<AgentActionResult> {
         val status = wiring.agent.lastStatus
         val system = status?.let { machine.resolveSystem(it.systemId, it.systemName, it.osName) }
-        return when (val path = AgentDeploymentPath.decide(wiring.agent.abilities, status, system)) {
+        return when (val path = AgentDeploymentPath.decide(wiring.agent.abilities, status, system, tarball.version)) {
             AgentDeploymentPath.Stdin ->
                 attempt { wiring.agent.selfUpdateFromStdin(tarball.file, operationId) }
 

@@ -1251,7 +1251,7 @@ class MachineModel(
      * why when it cannot. The wiring decides again from its own last status before anything is sent.
      */
     val agentDeployment: AgentDeploymentPath
-        get() = agentDeploymentFor(machine, abilities, status, link)
+        get() = agentDeploymentFor(machine, abilities, status, link, fleet.agentBundle?.version)
 
     fun requestAgentInstall(version: String) {
         if (refuseAgentInstall()) return
@@ -1542,12 +1542,13 @@ internal fun agentDeploymentFor(
     abilities: AgentAbilities,
     status: AgentStatus?,
     link: LinkState,
+    bundled: String? = null,
 ): AgentDeploymentPath {
     val system = status?.let { machine.resolveSystem(it.systemId, it.systemName, it.osName) }
     if (system != null && link !is LinkState.Online) {
         return AgentDeploymentPath.Unavailable(AgentDeploymentPath.READ_STATUS_FIRST)
     }
-    return AgentDeploymentPath.decide(abilities, status, system)
+    return AgentDeploymentPath.decide(abilities, status, system, bundled)
 }
 
 /**
