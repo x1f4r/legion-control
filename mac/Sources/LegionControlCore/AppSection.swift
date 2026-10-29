@@ -146,10 +146,8 @@ struct AppSection: View {
     }
 
     private func exportDiagnostics() {
-        exportingDiagnostics = true
         Task { @MainActor in
-            exportProblem = await DiagnosticsExport.exportAll(model)
-            exportingDiagnostics = false
+            exportProblem = await DiagnosticsExport.exportAll(model) { exportingDiagnostics = $0 }
         }
     }
 }
@@ -160,9 +158,13 @@ enum DiagnosticsExport {
     /// Everything a bug report needs, written where the user chooses. The place is asked for first
     /// and the reading done after: the reading goes to every machine and can take a while, and a
     /// save panel that appears out of nowhere half a minute after the click is easy to mistake for
-    /// something else. Nil when it was written or the user cancelled, else the sentence to show.
-    static func exportAll(_ model: AppModel) async -> String? {
+    /// something else. `collecting` hears when that reading starts and stops, so nothing says it is
+    /// collecting behind the save panel or after a cancel. Nil when it was written or the user
+    /// cancelled, else the sentence to show.
+    static func exportAll(_ model: AppModel, collecting: (Bool) -> Void) async -> String? {
         guard let url = destination(suggestedName: "legion-control-diagnostics.txt") else { return nil }
+        collecting(true)
+        defer { collecting(false) }
         let text = await model.diagnosticsBundle()
         return write(text, to: url)
     }

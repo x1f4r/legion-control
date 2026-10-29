@@ -244,11 +244,9 @@ private struct AppRow: View {
     }
 
     private func exportDiagnostics() {
-        panel.isExportingDiagnostics = true
         panel.exportProblem = nil
         Task { @MainActor in
-            panel.exportProblem = await DiagnosticsExport.exportAll(model)
-            panel.isExportingDiagnostics = false
+            panel.exportProblem = await DiagnosticsExport.exportAll(model) { panel.isExportingDiagnostics = $0 }
         }
     }
 }
