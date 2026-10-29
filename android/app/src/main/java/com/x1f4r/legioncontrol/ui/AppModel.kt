@@ -27,6 +27,7 @@ import com.x1f4r.legioncontrol.data.LaunchReviewEntry
 import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.agent.SetupChangePreview
 import com.x1f4r.legioncontrol.data.SetupMerge
+import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.endpointCount
 import com.x1f4r.legioncontrol.data.machineIds
@@ -50,6 +51,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -557,11 +559,8 @@ class AppModel(
     /** Keeps this device's copy, as a revision that descends from both so every machine takes it. */
     fun keepMine() {
         val divergence = divergence ?: return
-        val failure = services.keepMineOver(divergence, services.deviceName())
-        configError = failure
-        if (failure == null) {
-            configNote = "Kept this device's setup. It will be sent to every machine."
-        }
+        val choices = divergenceDifferences().associate { it.entry to SetupMerge.Choice.MINE }
+        mergeAndApply(divergence, choices) { "Kept this device's setup. It will be sent to every machine." }
     }
 
     fun dismissDivergence() = services.clearDivergence()
@@ -572,48 +571,80 @@ class AppModel(
     val mergeChoices = mutableStateMapOf<String, SetupMerge.Choice>()
 
     /**
-     * What the two sides disagree about, at the granularity somebody can decide from.
+     * Why Merge and Keep mine cannot be offered for the divergence on screen, or null: this device's
+     * copy has an error that leaves its entries undefined, and is fixed in the editor first. Take
+     * theirs is always offered.
+     */
+    val mergeBlocked: String?
+        get() {
+            divergence ?: return null
+            val mine = services.document.value ?: return "There is no setup here to merge."
+            return SetupMerge.mineBlocks(mine.canonicalText)
+        }
+
+    /**
+     * What the two sides disagree about, at the granularity somebody can decide from (contract
+     * section 9.8).
      *
-     * The base is the newest revision both were made from, when this device still has a copy of it.
-     * With it, an entry only one side touched needs no answer at all; without it, every difference
-     * is a two-way choice, which is a worse afternoon rather than a wrong answer.
+     * The base is the newest revision both were made from, when this device still has a copy of it
+     * that hashes to it. With it, an entry only one side touched needs no answer at all; without it,
+     * every difference is a two-way choice, which is a worse afternoon rather than a wrong answer.
      */
     fun divergenceDifferences(): List<SetupMerge.Difference> {
         val divergence = divergence ?: return emptyList()
-        val mine = services.document.value?.root ?: return emptyList()
-        val theirs = ControllerDocument.parse(divergence.theirText).getOrNull()?.root
-            ?: return emptyList()
-        val base = divergence.baseHash
-            ?.let(services::revision)
-            ?.let { ControllerDocument.parse(it).getOrNull()?.root }
-        val differences = SetupMerge.differences(mine, theirs, base)
-        if (mergeChoices.isEmpty()) mergeChoices.putAll(SetupMerge.defaults(differences))
+        val mine = services.document.value ?: return emptyList()
+        val differences = try {
+            SetupMerge.differences(mine.canonicalText, divergence.theirText, baseOf(divergence))
+        } catch (refused: SetupMerge.Unmergeable) {
+            return emptyList()
+        }
+        if (mergeChoices.isEmpty()) differences.forEach { mergeChoices[it.entry] = it.defaultChoice }
         return differences
     }
 
-    fun chooseMerge(path: String, choice: SetupMerge.Choice) {
-        mergeChoices[path] = choice
+    fun chooseMerge(entry: String, choice: SetupMerge.Choice) {
+        mergeChoices[entry] = choice
     }
 
     /** Writes one revision made from both, which every machine takes as an ordinary fast-forward. */
     fun applyMerge() {
         val divergence = divergence ?: return
-        val mine = services.document.value?.root ?: return
-        val theirs = ControllerDocument.parse(divergence.theirText).getOrNull()?.root ?: return
         // Make sure the defaults exist even if the screen was never scrolled through.
         divergenceDifferences()
-        val merged = SetupMerge.merge(mine, theirs, mergeChoices.toMap())
-        val failure = services.applyMerge(
-            ControllerDocument.of(merged),
-            divergence.theirProvenance,
-            services.deviceName(),
-        )
+        mergeAndApply(divergence, mergeChoices.toMap()) { "Merged. The result is on its way to every machine." }
+    }
+
+    private fun mergeAndApply(divergence: SetupDivergence, choices: Map<String, SetupMerge.Choice>, done: () -> String) {
+        val mine = services.document.value ?: return
+        val outcome = try {
+            SetupMerge.merge(
+                baseText = baseOf(divergence),
+                mineText = mine.canonicalText,
+                theirsText = divergence.theirText,
+                mineHash = mine.hash,
+                theirsHash = divergence.theirProvenance.hash ?: return,
+                writer = SetupMerge.Writer(ControllerDocument.CLIENT_KIND, services.deviceName(), Instant.now().toString()),
+                choices = choices,
+            )
+        } catch (refused: SetupMerge.Unmergeable) {
+            configError = refused.message
+            return
+        }
+        val text = outcome.resultText ?: run {
+            configError = "Those choices would make a setup that breaks a rule every client holds it to " +
+                "(${outcome.error}), so nothing was written. Take the other side of the entry that names it."
+            return
+        }
+        val failure = services.applyMerge(text)
         configError = failure
         if (failure == null) {
             mergeChoices.clear()
-            configNote = "Merged. The result is on its way to every machine."
+            configNote = done()
         }
     }
+
+    /** The kept base of a divergence, which the store already checked hashes to it. */
+    private fun baseOf(divergence: SetupDivergence): String? = divergence.baseHash?.let(services::revision)
 
     /** What adopting the other setup would change, for the identity question. */
     fun clashPreview(): SetupChangePreview? {

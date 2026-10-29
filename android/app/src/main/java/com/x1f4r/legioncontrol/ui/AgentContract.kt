@@ -374,19 +374,12 @@ interface ControlServices {
     fun adoptDivergent(divergence: SetupDivergence): String?
 
     /**
-     * Keeps this device's copy, as a revision that descends from both sides.
+     * Puts the result of Merge or Keep mine in force.
      *
      * Not `--replace`: a revision whose ancestry contains the other machine's hash is one that every
      * machine on either branch accepts as an ordinary fast-forward, so nothing has to be overridden.
      */
-    fun keepMineOver(divergence: SetupDivergence, deviceName: String?): String?
-
-    /** Merges the two sides with a decision per differing entry. */
-    fun applyMerge(
-        merged: ControllerDocument,
-        theirProvenance: SetupProvenance,
-        deviceName: String?,
-    ): String?
+    fun applyMerge(mergedText: String): String?
 
     /** Drops this device's setup and follows the other one. */
     fun adoptOtherSetup(clash: SetupIdentityClash): String?

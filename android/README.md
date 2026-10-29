@@ -244,9 +244,11 @@ reach, and travels on the next poll of each one. Behind that:
   machine's descends from its own. Descent has a direction, so two devices can never take turns
   overwriting each other.
 - Anything else is a question. **Setup edited twice** shows both revisions, who wrote them, and
-  a difference per machine, address, system, wake block or site, defaulting to whichever side
-  actually changed each one. Merging writes a revision descending from both, which every machine
-  then accepts as an ordinary fast-forward, so nothing is replaced.
+  a difference per machine, address, system, wake block, site or unknown key, defaulting to
+  whichever side actually changed each one; a deletion against an edit is asked about. Merging
+  (section 9.8) starts from this phone's copy, keeps its order and every number as it was
+  written, and writes a revision descending from both, which every machine then accepts as an
+  ordinary fast-forward, so nothing is replaced.
 - A document already in force that this build would refuse stays in force with its errors
   shown: nothing is published from it, and a machine an error is inside is not driven until the
   editor fixes it.

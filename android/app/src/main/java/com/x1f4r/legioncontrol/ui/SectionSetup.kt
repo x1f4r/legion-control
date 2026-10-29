@@ -599,6 +599,7 @@ fun DivergenceSection(app: AppModel) {
             listOfNotNull(
                 divergence.mineProvenance?.revision?.let { "revision $it" },
                 divergence.mineProvenance?.describeAuthor(),
+                divergence.mineProvenance?.updatedAt?.let { localTime(it) },
             ).joinToString(", ").takeIf { it.isNotBlank() },
             "this device's copy",
         )
@@ -608,6 +609,7 @@ fun DivergenceSection(app: AppModel) {
             listOfNotNull(
                 divergence.theirProvenance.revision?.let { "revision $it" },
                 divergence.theirProvenance.describeAuthor(),
+                divergence.theirProvenance.updatedAt?.let { localTime(it) },
             ).joinToString(", ").takeIf { it.isNotBlank() },
             "the other copy",
         )
@@ -623,9 +625,12 @@ fun DivergenceSection(app: AppModel) {
         Modifier.padding(top = 4.dp),
     )
 
+    val blocked = app.mergeBlocked
+    blocked?.let { StatusLine(Mark.Bad, it) }
+
     SectionHeading("What differs", note = "${differences.size}")
     differences.forEach { difference ->
-        val choice = app.mergeChoices[difference.path]
+        val choice = app.mergeChoices[difference.entry]
         Column(Modifier.padding(vertical = 4.dp)) {
             Text(difference.label, style = MaterialTheme.typography.bodyMedium)
             QuietText(difference.summary, Modifier.padding(top = 2.dp))
@@ -634,21 +639,21 @@ fun DivergenceSection(app: AppModel) {
                     label = "Keep this device's",
                     enabled = choice != SetupMerge.Choice.MINE,
                     emphasis = choice == SetupMerge.Choice.MINE,
-                ) { app.chooseMerge(difference.path, SetupMerge.Choice.MINE) }
+                ) { app.chooseMerge(difference.entry, SetupMerge.Choice.MINE) }
                 PlainAction(
                     label = "Take ${divergence.machineName}'s",
                     enabled = choice != SetupMerge.Choice.THEIRS,
                     emphasis = choice == SetupMerge.Choice.THEIRS,
-                ) { app.chooseMerge(difference.path, SetupMerge.Choice.THEIRS) }
+                ) { app.chooseMerge(difference.entry, SetupMerge.Choice.THEIRS) }
             }
         }
     }
 
     SectionHeading("Settle it")
     Actions {
-        PlainAction("Merge", enabled = true, emphasis = true) { app.applyMerge() }
-        PlainAction("Keep this device's", enabled = true) { app.keepMine() }
-        PlainAction("Take ${divergence.machineName}'s", enabled = true) { app.takeTheirs() }
+        PlainAction("Merge", enabled = blocked == null, emphasis = blocked == null) { app.applyMerge() }
+        PlainAction("Keep this device's", enabled = blocked == null) { app.keepMine() }
+        PlainAction("Take ${divergence.machineName}'s", enabled = true, emphasis = blocked != null) { app.takeTheirs() }
     }
     QuietText(
         "Merging writes one revision made from both, so every machine takes it without anything " +

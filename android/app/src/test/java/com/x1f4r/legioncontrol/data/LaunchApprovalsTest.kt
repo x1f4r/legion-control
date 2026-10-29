@@ -36,6 +36,8 @@ import org.junit.Test
  */
 class LaunchApprovalsTest {
 
+    private val writer = SetupMerge.Writer("phone", "Test phone", "2026-09-05T14:00:00.000Z")
+
     private val tower = "tower"
 
     private fun record(prefs: MemoryPreferences): JsonObject = parse(prefs.values[LaunchApprovals.KEY] as String)
@@ -160,14 +162,17 @@ class LaunchApprovalsTest {
                 store.adoptAsFetched(store.divergence.value!!.theirText)
             },
             "merge" to { store, text ->
-                val theirs = ControllerDocument.parse(text).getOrThrow()
-                store.applyMerge(theirs, provenanceOf(theirs), "Test phone")
+                val mine = store.text.value
+                val merged = SetupMerge.merge(null, mine, text, CanonicalSetup.hashOf(mine), CanonicalSetup.hashOf(text), writer)
+                store.applyMerge(merged.resultText!!)
             },
             "keep mine" to { store, text ->
                 // Mine is the document a peer changed here, kept as a revision descending from both.
-                val mine = ControllerDocument.parse(text).getOrThrow()
+                val theirs = store.text.value
                 store.adoptAsFetched(text)
-                store.applyMerge(mine, provenanceOf(mine), "Test phone")
+                val choices = SetupMerge.differences(text, theirs, null).associate { it.entry to SetupMerge.Choice.MINE }
+                val kept = SetupMerge.merge(null, text, theirs, CanonicalSetup.hashOf(text), CanonicalSetup.hashOf(theirs), writer, choices)
+                store.applyMerge(kept.resultText!!)
             },
             "another setup" to { store, text ->
                 val other = ControllerDocument.of(

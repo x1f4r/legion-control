@@ -151,24 +151,7 @@ private class WiredServices(private val control: LegionControl) : ControlService
         }
     }
 
-    /**
-     * Keeping this device's copy, written as a revision that descends from both.
-     *
-     * The merge machinery with every entry chosen from this side. That is not the same as pushing
-     * what is already here: a revision whose ancestry contains the other machine's hash is one every
-     * machine on either branch accepts as an ordinary fast-forward, so nothing has to be replaced
-     * and no branch is left behind holding something the agent will refuse.
-     */
-    override fun keepMineOver(divergence: SetupDivergence, deviceName: String?): String? {
-        val mine = control.config.document.value ?: return "There is no setup here to keep."
-        return control.config.applyMerge(mine, divergence.theirProvenance, deviceName)
-    }
-
-    override fun applyMerge(
-        merged: ControllerDocument,
-        theirProvenance: SetupProvenance,
-        deviceName: String?,
-    ): String? = control.config.applyMerge(merged, theirProvenance, deviceName)
+    override fun applyMerge(mergedText: String): String? = control.config.applyMerge(mergedText)
 
     override fun adoptOtherSetup(clash: SetupIdentityClash): String? {
         val outcome = control.config.adoptFromMachine(

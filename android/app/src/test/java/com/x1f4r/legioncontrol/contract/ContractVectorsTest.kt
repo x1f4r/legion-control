@@ -17,8 +17,10 @@ import com.x1f4r.legioncontrol.data.CanonicalSetup
 import com.x1f4r.legioncontrol.data.DocumentAcceptance
 import com.x1f4r.legioncontrol.data.DocumentProblem
 import com.x1f4r.legioncontrol.data.Intake
+import com.x1f4r.legioncontrol.data.JsonEquality
 import com.x1f4r.legioncontrol.data.LaunchTuple
 import com.x1f4r.legioncontrol.data.LaunchValues
+import com.x1f4r.legioncontrol.data.SetupMerge
 import com.x1f4r.legioncontrol.contract.VectorJson.boolean
 import com.x1f4r.legioncontrol.contract.VectorJson.long
 import com.x1f4r.legioncontrol.contract.VectorJson.string
@@ -61,6 +63,9 @@ class ContractVectorsTest {
 
     @Test
     fun `which setup documents are accepted matches the contract`() = runFamily("setup-acceptance")
+
+    @Test
+    fun `merges, bases and number equality match the contract`() = runFamily("setup-merge")
 
     /**
      * Every adapter is for a group this client consumes, and every consumed family is either adapted
@@ -286,6 +291,53 @@ class ContractVectorsTest {
                 put("keep", verdict.keep)
             }
         },
+
+        "setup-merge/merges" to { input ->
+            val writer = input["writer"] as JsonObject
+            val choices = (input["choices"] as JsonObject).mapValues { (_, side) ->
+                if ((side as JsonPrimitive).content == "mine") SetupMerge.Choice.MINE else SetupMerge.Choice.THEIRS
+            }
+            val outcome = SetupMerge.merge(
+                baseText = input.string("baseText"),
+                mineText = input.string("mineText")!!,
+                theirsText = input.string("theirsText")!!,
+                mineHash = input.string("mineHash")!!,
+                theirsHash = input.string("theirsHash")!!,
+                writer = SetupMerge.Writer(writer.string("source")!!, writer.string("device")!!, writer.string("now")!!),
+                choices = choices,
+            )
+            buildJsonObject {
+                put(
+                    "differences",
+                    JsonArray(
+                        outcome.differences.map { difference ->
+                            buildJsonObject {
+                                put("entry", difference.entry)
+                                put("kind", difference.kind.wire)
+                            }
+                        },
+                    ),
+                )
+                put("resultText", text(outcome.resultText))
+                put("error", text(outcome.error))
+            }
+        },
+
+        "setup-merge/bases" to { input ->
+            val kept = (input["kept"] as JsonObject).mapValues { (_, text) -> (text as JsonPrimitive).content }
+            val base = SetupMerge.commonBase(
+                input.string("mineHash"),
+                input.string("theirsHash"),
+                input.strings("mineLineage"),
+                input.strings("theirsLineage"),
+                kept::get,
+            )
+            buildJsonObject { put("base", text(base)) }
+        },
+
+        "setup-merge/numbers" to { input ->
+            buildJsonObject { put("equal", JsonEquality.sameNumber(input.string("a")!!, input.string("b")!!)) }
+        },
     )
 
     /** The codes of [problems], each once, sorted, as the acceptance vectors list them. */
@@ -311,6 +363,6 @@ class ContractVectorsTest {
          * adapted, or when the index stops listing it, and the list is empty once the Android port
          * of every reference has landed.
          */
-        val PENDING_FAMILIES = setOf("outcome", "setup-reconcile", "setup-merge", "wake")
+        val PENDING_FAMILIES = setOf("outcome", "setup-reconcile", "wake")
     }
 }

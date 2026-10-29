@@ -273,17 +273,16 @@ class ConfigStore internal constructor(
         theirProvenance: SetupProvenance,
     ) {
         val mine = _provenance.value
-        val base = SetupMerge.commonBase(
-            myLineage = listOfNotNull(mine?.hash) + mine?.lineage.orEmpty(),
-            theirLineage = listOfNotNull(theirProvenance.hash) + theirProvenance.lineage,
-        )
+        // The newest ancestor both sides share whose kept copy still hashes to it (contract
+        // section 9.8); a copy that does not is no base at all.
+        val base = SetupMerge.commonBase(mine?.hash, theirProvenance.hash, mine?.lineage.orEmpty(), theirProvenance.lineage, revisions::get)
         _divergence.value = SetupDivergence(
             machineName = machineName,
             reason = reason,
             theirText = theirText,
             theirProvenance = theirProvenance,
             mineProvenance = mine,
-            baseHash = base?.takeIf { revisions.has(it) },
+            baseHash = base,
             at = System.currentTimeMillis(),
         )
     }
@@ -313,32 +312,15 @@ class ConfigStore internal constructor(
     }
 
     /**
-     * Puts a merged document into force, descending from both sides.
-     *
-     * The lineage carries both parents, which is what makes the result acceptable to every machine
-     * whichever branch it was on: each of them finds its own hash in the ancestry and fast-forwards.
+     * Puts a merged document into force: Merge, or Keep mine, which is Merge with every entry
+     * answered mine (contract section 9.8). The merge already wrote its identity, a lineage that
+     * carries both heads, so every machine on either branch takes it as an ordinary fast-forward.
      */
-    fun applyMerge(
-        merged: ControllerDocument,
-        theirProvenance: SetupProvenance,
-        deviceName: String?,
-    ): String? {
-        val mine = _document.value
-        val myHash = mine?.hash
-        val theirHash = theirProvenance.hash
-        val parents = (listOfNotNull(myHash, theirHash) + mine?.lineage.orEmpty() + theirProvenance.lineage)
-            .distinct()
-            .take(MAX_LINEAGE)
-        val identity = DocumentIdentity(
-            id = mine?.setupId ?: theirProvenance.authority ?: ControllerDocument.newSetupId(),
-            name = mine?.identity?.name,
-            revision = maxOf(mine?.revision ?: 0L, theirProvenance.revision ?: 0L) + 1L,
-            updatedAt = now(),
-            source = ControllerDocument.CLIENT_KIND,
-            device = deviceName,
-            lineage = parents,
-        )
-        val failure = store(merged.withIdentity(identity))
+    fun applyMerge(mergedText: String): String? {
+        val merged = ControllerDocument.parse(mergedText).getOrElse {
+            return it.message ?: "The merged setup could not be read."
+        }
+        val failure = store(merged)
         if (failure == null) clearDivergence()
         return failure
     }

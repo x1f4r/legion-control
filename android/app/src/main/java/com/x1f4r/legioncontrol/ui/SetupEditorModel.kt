@@ -447,7 +447,7 @@ class SetupEditorModel(
     fun changes(): List<SetupMerge.Difference> {
         val from = base?.root ?: return emptyList()
         val to = working?.root ?: return emptyList()
-        return SetupMerge.differences(mine = to, theirs = from, base = null)
+        return SetupMerge.changesBetween(before = from, after = to)
     }
 }
 
