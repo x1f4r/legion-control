@@ -831,9 +831,15 @@ public static class Runner
                         || readFrom.UpdatedAt != applied.Identity.UpdatedAt
                         || !readFrom.Lineage.SequenceEqual(applied.Identity.Lineage, StringComparer.Ordinal))))
             {
+                // The hash of the setup applied now is what lets a file with no controller block
+                // through, so it is never printed for one: a person who named the setup they read
+                // it out from would only rerun with it. A file that carries an identity is checked
+                // against that too, and the hash gets it nowhere.
                 output.WriteLine(applied is null
                     ? $"This device holds no setup for {input} to be an edit of. Nothing was applied."
-                    : $"{input} was not read out from the setup this device holds now (revision {applied.Identity.RevisionNumber}, hash {applied.Hash}). Nothing was applied.");
+                    : readFrom.HasIdentity
+                        ? $"{input} was not read out from the setup this device holds now (revision {applied.Identity.RevisionNumber}, hash {applied.Hash}). Nothing was applied."
+                        : $"{input} was not written against the setup this device holds now. Nothing was applied.");
                 output.WriteLine("Read it out again with --command edit --out PATH, make the change there, and apply that.");
                 return Failed;
             }

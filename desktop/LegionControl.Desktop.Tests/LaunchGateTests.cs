@@ -1430,7 +1430,8 @@ public class LaunchGateTests
             Assert.DoesNotContain(reverted.Hash, unnamed.ToString());
             var earlier = new StringWriter();
             Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "edit", "--in", exported, "--hash", d1.Hash }, earlier));
-            Assert.Contains("was not read out from the setup this device holds now", earlier.ToString());
+            Assert.Contains("was not written against the setup this device holds now", earlier.ToString());
+            Assert.DoesNotContain(reverted.Hash, earlier.ToString());
             Assert.Equal(reverted.Bytes, File.ReadAllBytes(home.ConfigPath));
             Assert.Equal(approved, File.ReadAllText(record));
 
