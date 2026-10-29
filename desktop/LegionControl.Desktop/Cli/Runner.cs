@@ -1096,7 +1096,9 @@ public static class Runner
         _ => NotKnown,
     };
 
-    private static int ExitFor(CommandOutcome outcome) => outcome switch
+    /// The exit code of a request's outcome. A request that turns out to have been cancelled, as a
+    /// replay of its id or a followed one can, exits 0 for the same reason as above.
+    public static int ExitFor(CommandOutcome outcome) => outcome switch
     {
         CommandOutcome.Done done => done.Outcome switch
         {
@@ -1104,6 +1106,7 @@ public static class Runner
             OperationOutcome.Pending or OperationOutcome.Unknown => NotKnown,
             _ => Failed,
         },
+        CommandOutcome.Refused { ReasonCode: ReasonCode.Cancelled } => Ok,
         CommandOutcome.Queued or CommandOutcome.Following => Ok,
         CommandOutcome.NotKnown => NotKnown,
         _ => Failed,

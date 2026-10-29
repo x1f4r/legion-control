@@ -310,6 +310,10 @@ public class MachineRequestTests
         Assert.Equal(Runner.Failed, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Failed }));
         Assert.Equal(Runner.NotKnown, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Unknown }));
         Assert.Equal(Runner.NotKnown, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Pending, ReasonCode = null }));
+
+        // A change whose id turns out to name a request somebody cancelled exits as the cancel did.
+        Assert.Equal(Runner.Ok, Runner.ExitFor(new CommandOutcome.Refused("Cancelled.", false, ReasonCode.Cancelled)));
+        Assert.Equal(Runner.Failed, Runner.ExitFor(new CommandOutcome.Refused("Busy.", true, ReasonCode.Busy)));
     }
 
     [Fact]
