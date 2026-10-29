@@ -11,6 +11,7 @@ import com.x1f4r.legioncontrol.agent.OpAction
 import com.x1f4r.legioncontrol.agent.OpKind
 import com.x1f4r.legioncontrol.agent.OpRecord
 import com.x1f4r.legioncontrol.agent.OpResult
+import com.x1f4r.legioncontrol.agent.OperationEvent
 import com.x1f4r.legioncontrol.agent.OperationIntent
 import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.Outcome
@@ -251,6 +252,59 @@ class OperationCenterTest {
         // Asked for again would mean the count touched nothing between the send and the watch, and
         // the service could have stopped while the reply was still unknown.
         assertEquals("asked for once, for the send and the watch together", 1, keptAlive)
+    }
+
+    /** A restart left pending by an earlier run, asked for [age] milliseconds ago. */
+    private fun leftPending(age: Long, state: TrackedState = TrackedState.OUTCOME_UNKNOWN): OperationRecord {
+        val at = System.currentTimeMillis() - age
+        return store.put(
+            OperationRecord(
+                id = "3f6b2a9e-0c41-4d7e-b8a5-9e2c1f7d4b60",
+                machineId = agent.machine.id,
+                machineName = agent.machine.name,
+                intent = OperationIntent(kind = OpKind.RESTART, service = "demo"),
+                subjectName = "Demo",
+                initiator = "this phone",
+                startedAt = at,
+                updatedAt = at,
+                state = state,
+                summary = "Restart on Demo was asked for.",
+                trackable = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `a change whose watch gave up is followed again without being held`() {
+        // Sent hours ago to a machine that has not answered since. Every return to the app follows
+        // it again; held, each would keep the phone awake for another half hour asking for nothing.
+        val record = leftPending(age = 3 * 60 * 60_000L, state = TrackedState.DISPATCHED)
+        center.apply(record.id, OperationEvent.GaveUp("Tower never settled it.", System.currentTimeMillis()))
+        assertEquals(TrackedState.OUTCOME_UNKNOWN, store.get(record.id)!!.state)
+        agent.op = { CompletableDeferred<Result<OpRecord>>().await() }
+
+        center.resume(listOf(agent))
+
+        assertEquals("still followed: the machine may yet say how it ended", listOf(record.id), agent.reads)
+        assertEquals(0, keepAlive.holds.value)
+        assertEquals("the service is never asked for", 0, keptAlive)
+    }
+
+    @Test
+    fun `a change a killed process left halfway is held through the watch that settles it`() {
+        val answer = CompletableDeferred<Result<OpRecord>>()
+        agent.op = { answer.await() }
+        val record = leftPending(age = 60_000L)
+
+        center.resume(listOf(agent))
+
+        assertEquals(listOf(record.id), agent.reads)
+        assertEquals("asked for a minute ago, so it may still be under way", 1, keepAlive.holds.value)
+        assertEquals(1, keptAlive)
+
+        answer.complete(Result.success(finished(record.id, "restarted")))
+        assertEquals(true, store.get(record.id)!!.succeeded)
+        assertEquals(0, keepAlive.holds.value)
     }
 
     @Test

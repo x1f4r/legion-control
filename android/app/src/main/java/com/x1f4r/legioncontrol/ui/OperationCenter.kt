@@ -247,6 +247,14 @@ class OperationCenter(
      * or an update, which leave evidence on the machine. Any other change on an agent that keeps no
      * records is still watched as it always was, but keeping the phone awake for half an hour to
      * learn nothing would be a cost with nothing on the other side of it.
+     *
+     * And held only while the change can still be in flight, which is one watch's length after it
+     * was asked for. A watch that gave up leaves the record pending, so every return to the app and
+     * every status reply follows it again; held, each of those would keep the phone awake for
+     * another half hour asking a machine that may be out of reach for days, and spend Android's
+     * daily allowance on a change long over before a new one needed it. An older record is still
+     * followed, and still settled if the machine answers; it just holds nothing. One left pending by
+     * a process that was killed halfway through is young, and is held as it was.
      */
     fun follow(client: MachineClient, id: String) {
         val record = store.get(id) ?: return
@@ -263,8 +271,19 @@ class OperationCenter(
             }
             store.get(id)?.takeIf { it.isOver && it.isNoteworthyEnding }?.let(notifier::finished)
         }
-        if (record.trackable || record.kind.leavesEvidence) launchHeld(work) else scope.launch(block = work)
+        if (record.mayBeInFlight && (record.trackable || record.kind.leavesEvidence)) {
+            launchHeld(work)
+        } else {
+            scope.launch(block = work)
+        }
     }
+
+    /**
+     * Whether the change was asked for recently enough to be still under way: within one watch's
+     * length of the press. The wall clock, because the press may have been in an earlier process.
+     */
+    private val OperationRecord.mayBeInFlight: Boolean
+        get() = System.currentTimeMillis() - startedAt < WATCH_BUDGET_MS
 
     private suspend fun watch(client: MachineClient, id: String) {
         val deadline = System.currentTimeMillis() + WATCH_BUDGET_MS
