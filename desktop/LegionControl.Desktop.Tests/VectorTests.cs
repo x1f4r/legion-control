@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
@@ -19,7 +20,7 @@ public class VectorTests
 
     /// The families this client runs. A family joins this list when its port lands here, and from
     /// then on the accounting test holds it to the index exactly.
-    private static readonly string[] Families = { "hash", "identifiers", "transport", "launch" };
+    private static readonly string[] Families = { "hash", "identifiers", "transport", "launch", "setup-acceptance" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -98,6 +99,20 @@ public class VectorTests
                     ["sha256"] = valid ? Canonical.Hash(bytes) : null,
                     ["accepted"] = reject is null,
                     ["reject"] = reject,
+                };
+            },
+
+            ["setup-acceptance/documents"] = input =>
+            {
+                var intake = Enum.Parse<Intake>(Text(input["intake"])!, ignoreCase: true);
+                var verdict = DocumentAcceptance.Check(Encoding.UTF8.GetBytes(Text(input["text"])!), intake);
+                return new JsonObject
+                {
+                    ["valid"] = verdict.Valid,
+                    ["errors"] = Codes(verdict.Errors),
+                    ["warnings"] = Codes(verdict.Warnings),
+                    ["assignsIdentity"] = verdict.AssignsIdentity,
+                    ["keep"] = verdict.Keep,
                 };
             },
 
@@ -198,6 +213,10 @@ public class VectorTests
             .Where(entry => entry!["consumers"]!.AsArray().Any(consumer => consumer!.GetValue<string>() == Consumer))
             .ToList();
     }
+
+    private static JsonArray Codes(IReadOnlyList<DocumentProblem> problems) => new(problems
+        .Select(problem => problem.Code).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)
+        .Select(code => (JsonNode)code).ToArray());
 
     private static string? Text(JsonNode? node) => node?.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() : null;
 

@@ -61,15 +61,18 @@ public static class WakePlanner
         {
             return new WakePlan(steps, new[] { $"{target.Name} has no wake configuration." }, offers);
         }
-        if (wake.MacBytes is null)
-        {
-            return new WakePlan(steps, new[] { $"\"{wake.Mac}\" is not a six byte hardware address." }, offers);
-        }
 
         // 1. From here, but only when being on that network is more than a guess. Two houses behind
         //    two stock routers share a subnet, and a packet sent into the wrong one is silence that
-        //    looks exactly like a packet sent into the right one.
-        if (presence.IsOnNetworkOf(target, localAddresses))
+        //    looks exactly like a packet sent into the right one. Without a hardware address there
+        //    is no packet to send, and only the helpers are left.
+        if (wake.MacBytes is null)
+        {
+            obstacles.Add(wake.Mac is null
+                ? $"{target.Name}'s wake block names no hardware address, so no packet can wake it directly."
+                : $"\"{wake.Mac}\" is not a six byte hardware address.");
+        }
+        else if (presence.IsOnNetworkOf(target, localAddresses))
         {
             var broadcast = wake.Broadcast.Count > 0
                 ? wake.Broadcast

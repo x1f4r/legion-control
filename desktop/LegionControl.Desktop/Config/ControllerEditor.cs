@@ -13,7 +13,8 @@ public sealed record EditPlan(
     string Description,
     string Text,
     IReadOnlyList<string> Problems,
-    SetupConflictPreview Preview)
+    SetupConflictPreview Preview,
+    IReadOnlyList<string>? Warnings = null)
 {
     public bool IsApplicable => Problems.Count == 0;
 }
@@ -54,9 +55,12 @@ public static class ControllerEditor
                 SetupConflictPreview.Between(current, new ControllerConfig()));
         }
 
+        // Held to section 9.7 as a document typed here is.
         var text = root.ToJsonString(Writing);
         var decoded = ControllerConfig.From(Value.Parse(text));
-        return new EditPlan(description, text, decoded.Problems(), SetupConflictPreview.Between(current, decoded));
+        var acceptance = DocumentAcceptance.Check(text, Intake.Local);
+        return new EditPlan(description, text, acceptance.Errors.Select(error => error.Message).ToList(),
+            SetupConflictPreview.Between(current, decoded), acceptance.Warnings.Select(warning => warning.Message).ToList());
     }
 
     /// Adds or replaces one machine.

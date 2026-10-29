@@ -160,20 +160,13 @@ public class LineageTests
     [Fact]
     public void ARubbishLineageIsRefusedRatherThanCarried()
     {
-        var identity = new ControllerIdentity { Id = "setup-a", Revision = 1, Lineage = new[] { "not-a-hash" } };
-        Assert.NotEmpty(identity.Problems());
-        var duplicated = new ControllerIdentity
-        {
-            Id = "setup-a",
-            Lineage = new[] { "a".PadLeft(64, 'a'), "a".PadLeft(64, 'a') },
-        };
-        Assert.Contains(duplicated.Problems(), problem => problem.Contains("repeats"));
-        var tooMany = new ControllerIdentity
-        {
-            Id = "setup-a",
-            Lineage = Enumerable.Range(0, 33).Select(index => index.ToString().PadLeft(64, '0')).ToList(),
-        };
-        Assert.Contains(tooMany.Problems(), problem => problem.Contains("at most"));
+        string With(string lineage) =>
+            $$"""{ "version": 1, "controller": { "id": "setup-a", "revision": 1, "lineage": {{lineage}} }, "machines": [] }""";
+        Assert.Contains(DocumentAcceptance.Check(With("[\"not-a-hash\"]"), Intake.Peer).Errors, error => error.Code == "schema");
+        var hash = "\"" + "a".PadLeft(64, 'a') + "\"";
+        Assert.Contains(DocumentAcceptance.Check(With($"[{hash}, {hash}]"), Intake.Peer).Errors, error => error.Message.Contains("twice"));
+        var tooMany = "[" + string.Join(", ", Enumerable.Range(0, 33).Select(index => "\"" + index.ToString().PadLeft(64, '0') + "\"")) + "]";
+        Assert.Contains(DocumentAcceptance.Check(With(tooMany), Intake.Peer).Errors, error => error.Message.Contains("at most"));
     }
 }
 
@@ -230,10 +223,18 @@ public class ConfigStoreTests
     [InlineData("{\"id\":\"setup-a\",\"revision\":\"3\"}")]
     [InlineData("{\"id\":\"setup-a\",\"revision\":3,\"lineage\":[42]}")]
     [InlineData("{\"revision\":3}")]
+    [InlineData("{\"id\":\"a@b\",\"revision\":3}")]
+    [InlineData("{\"id\":\"setup/a\",\"revision\":3}")]
     public void MalformedIdentityCannotBeAdoptedAsAnUnrevisionedSetup(string identity)
     {
-        var config = ControllerConfig.From(Value.Parse($"{{\"version\":1,\"machines\":[],\"controller\":{identity}}}"));
-        Assert.NotEmpty(config.Problems());
+        // A setup id is held to the agent's own grammar, not the wider token grammar, so an id the
+        // agent would refuse with bad-argument is refused here before anything is sent.
+        var text = $"{{\"version\":1,\"machines\":[],\"controller\":{identity}}}";
+        Assert.Contains(DocumentAcceptance.Check(text, Intake.Peer).Errors, error => error.Code == "schema");
+        using var home = new TempHome();
+        File.WriteAllBytes(home.ConfigPath, Documents.Make("setup-a", 2, Array.Empty<string>()).Bytes);
+        using var store = new ConfigStore(home.ConfigPath, watch: false);
+        Assert.NotNull(store.Apply(ControllerDocument.FromText(text)));
     }
     [Fact]
     public void RestampingKeepsUnknownControllerFields()
@@ -396,6 +397,53 @@ public class ConfigStoreTests
     }
 
     [Fact]
+    public void AnAppliedDocumentWithAnErrorIsKeptAndOnlyTheMachineItIsInsideIsLeftOut()
+    {
+        // Applied intake (contract section 9.7): the document this device runs on is never refused
+        // while its bytes are a document. The error is shown, and the one machine it is inside is
+        // neither dialled nor run; the rest of the setup still works.
+        using var home = new TempHome();
+        var root = JsonNode.Parse(Documents.Make("setup-a", 3, Array.Empty<string>()).Text)!.AsObject();
+        root["machines"]!.AsArray().Add(new JsonObject
+        {
+            ["id"] = "tower",
+            ["endpoints"] = new JsonArray(new JsonObject { ["id"] = "lan", ["host"] = "-oProxyCommand=x" }),
+        });
+        var text = root.ToJsonString();
+        File.WriteAllText(home.ConfigPath, text);
+        using var store = new ConfigStore(home.ConfigPath, watch: false);
+
+        Assert.Equal(ControllerDocument.FromText(text).Hash, store.Document!.Hash);
+        Assert.False(store.Acceptance!.Valid);
+        Assert.Equal(new[] { "pi" }, store.Config!.Machines.Select(machine => machine.Id));
+        Assert.Contains("machines[1].endpoints[0].host", store.Problem);
+        Assert.False(store.IsPendingEdit);
+    }
+
+    [Fact]
+    public void AnEditWithAMemberWrittenTwiceWaitsUnappliedUntilItIsFixed()
+    {
+        using var home = new TempHome();
+        var first = Documents.Make("setup-a", 4, Array.Empty<string>());
+        File.WriteAllBytes(home.ConfigPath, first.Bytes);
+        using var store = new ConfigStore(home.ConfigPath, watch: false);
+
+        // Which "name" is the edit is exactly what devices disagree about, so it gets no revision.
+        File.WriteAllText(home.ConfigPath, first.Text.Replace("\"name\": \"Beacon\"", "\"name\": \"Beacon\", \"name\": \"Other\""));
+        store.Load();
+        Assert.True(store.IsPendingEdit);
+        Assert.Equal(first.Hash, store.Document!.Hash);
+        Assert.Contains("written twice", store.Problem);
+
+        // Fixed, it is an ordinary hand edit of the setup before it.
+        File.WriteAllText(home.ConfigPath, first.Text.Replace("\"name\": \"Beacon\"", "\"name\": \"Other\""));
+        store.Load();
+        Assert.False(store.IsPendingEdit);
+        Assert.Equal(5, store.Document!.Identity.RevisionNumber);
+        Assert.Equal(first.Hash, store.Document.Identity.Lineage[0]);
+    }
+
+    [Fact]
     public void WritesTheExampleOnlyIntoEmptySpace()
     {
         using var home = new TempHome();
@@ -412,11 +460,32 @@ public class DocumentFixtureTests
     private static ControllerConfig Read(string name) =>
         ControllerConfig.From(Value.Parse(Repo.ReadFixture(name)));
 
+    private static Acceptance Judged(string name) => DocumentAcceptance.Check(Repo.ReadFixture(name), Intake.Peer);
+
+    /// Every document fixture, judged by section 9.7 under peer intake exactly as the index says:
+    /// valid ones accepted, invalid ones refused. A client that refuses a valid document stops
+    /// replicating it without anybody noticing.
+    [Fact]
+    public void EveryDocumentFixtureIsJudgedAsTheIndexSays()
+    {
+        var index = Value.Parse(Repo.ReadContract("fixtures/index.json"));
+        var documents = index["fixtures"].AsArray()
+            .Where(entry => entry["kind"].AsText() == "document" && entry["schema"].AsText() == "controller-document.schema.json")
+            .ToList();
+        Assert.True(documents.Count >= 10, "the document fixtures should not have shrunk to nothing");
+        Assert.All(documents, entry =>
+        {
+            var verdict = Judged(entry["file"].AsText()!);
+            Assert.True(verdict.Valid == (entry["expect"].AsText() == "valid"),
+                $"{entry["file"].AsText()}: expected {entry["expect"].AsText()}, got {string.Join(", ", verdict.Errors.Select(error => error.Code))}");
+        });
+    }
+
     [Fact]
     public void ReadsTheSitesAndHelpersDocument()
     {
         var config = Read("controller-document.sites-helpers.json");
-        Assert.Empty(config.Problems());
+        Assert.True(Judged("controller-document.sites-helpers.json").Valid);
         Assert.Equal(2, config.Sites.Count);
         var legion = config.Machine("legion")!;
         Assert.Equal("attic", legion.Site);
@@ -447,25 +516,54 @@ public class DocumentFixtureTests
     }
 
     [Fact]
-    public void RefusesTheInvalidDocuments()
+    public void RefusesTheInvalidDocumentsForTheRuleTheyBreak()
     {
-        Assert.Contains(Read("controller-document.invalid-helper-cycle.json").Problems(),
-            problem => problem.Contains("cycle"));
-        Assert.Contains(Read("controller-document.invalid-self-helper.json").Problems(),
-            problem => problem.Contains("itself"));
-        Assert.Contains(Read("controller-document.invalid-unknown-site.json").Problems(),
-            problem => problem.Contains("not in sites"));
-        Assert.Contains(Read("controller-document.invalid-helper-mismatch.json").Problems(),
-            problem => problem.Contains("have to agree"));
+        Assert.Contains(Judged("controller-document.invalid-helper-cycle.json").Errors, error => error.Code == "helper-cycle");
+        Assert.Contains(Judged("controller-document.invalid-self-helper.json").Errors, error => error.Code == "helper-self");
+        Assert.Contains(Judged("controller-document.invalid-unknown-site.json").Errors, error => error.Code == "unknown-site");
+        Assert.Contains(Judged("controller-document.invalid-helper-mismatch.json").Errors, error => error.Code == "helper-alias");
+        Assert.Contains(Judged("controller-document.invalid-host.json").Errors, error => error.Code == "schema");
     }
 
     [Fact]
     public void AHalfWrittenMachineIsAWarningRatherThanARefusal()
     {
         // The screen where the systems are added is the screen a refusal would take away.
-        var config = Read("controller-document.minimal.json");
-        Assert.Empty(config.Problems());
-        Assert.Contains(config.Warnings(), warning => warning.Contains("no systems"));
+        var verdict = Judged("controller-document.minimal.json");
+        Assert.True(verdict.Valid);
+        Assert.Contains(verdict.Warnings, warning => warning.Code == "machine-no-systems");
+    }
+
+    [Fact]
+    public void WhatTheOtherClientsWriteIsAcceptedHere()
+    {
+        // Each of these was refused here before section 9.7: a site named in a setup with no
+        // sites, two endpoints without an id, an endpoint without a user, and a wake block that
+        // names helpers but no hardware address. None is a reason to stop replicating.
+        var verdict = DocumentAcceptance.Check("""
+            { "version": 1,
+              "controller": { "id": "setup-a", "revision": 2, "lineage": [] },
+              "machines": [
+                { "id": "pi", "site": "attic", "alwaysOn": true,
+                  "endpoints": [ { "host": "pi.example" }, { "host": "pi.example" } ],
+                  "systems": [ { "id": "linux", "agent": [ "node", "/agent.mjs" ] } ] },
+                { "id": "tower", "site": "attic",
+                  "endpoints": [ { "id": "lan", "host": "tower.example", "user": "me" } ],
+                  "systems": [ { "id": "linux", "agent": [ "node", "/agent.mjs" ] } ],
+                  "wake": { "helpers": [ { "machine": "pi", "action": "wake-tower" } ] } } ] }
+            """, Intake.Peer);
+        Assert.True(verdict.Valid, string.Join(" ", verdict.Errors.Select(error => error.Message)));
+        Assert.Contains(verdict.Warnings, warning => warning.Code == "wake-no-mac");
+        Assert.Contains(verdict.Warnings, warning => warning.Code == "endpoint-no-id");
+
+        // And the helper still wakes the machine with no hardware address of its own.
+        var config = ControllerConfig.From(Value.Parse(DocumentJson.Print(DocumentJson.Parse("""
+            { "version": 1, "machines": [ { "id": "pi" },
+              { "id": "tower", "wake": { "helpers": [ { "machine": "pi", "action": "wake-tower" } ] } } ] }
+            """))));
+        var wake = config.Machine("tower")!.Wake!;
+        Assert.Null(wake.MacBytes);
+        Assert.Equal("pi", Assert.Single(wake.EffectiveHelpers).Machine);
     }
 
     [Fact]
@@ -589,6 +687,6 @@ public class SetupMergeTests
         var merged = SetupMerge.Merge(mine, mine.Hash, theirs, theirs.Hash, baseDocument, null, "device");
         Assert.Contains(mine.Hash, merged.Identity.Lineage);
         Assert.Contains(theirs.Hash, merged.Identity.Lineage);
-        Assert.Empty(merged.Decoded.Problems());
+        Assert.True(DocumentAcceptance.Check(merged.Bytes, Intake.Peer).Valid);
     }
 }

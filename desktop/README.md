@@ -83,6 +83,10 @@ answers, and none of them happens on its own. Merging keeps both sides: entries 
 changed are taken from that device, and entries both changed are the only ones anybody is asked
 about.
 
+A setup file with an error in it is still applied, with the error shown: nothing is published from
+here until it is fixed, and a machine the error is inside is neither reached nor run. A file that is
+no document at all, half saved for one, never replaces the setup before it.
+
 `--replace` is the one command that overwrites a different setup, and it is only ever sent after a
 person has answered that question in front of a preview of what changes.
 

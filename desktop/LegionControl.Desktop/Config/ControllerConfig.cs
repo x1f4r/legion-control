@@ -26,7 +26,6 @@ public sealed record ControllerConfig
     public LocalConfig? Local { get; init; }
     public ControllerIdentity Identity { get; init; } = new();
     public string? UpdateRepo { get; init; }
-    private IReadOnlyList<string> InputProblems { get; init; } = Array.Empty<string>();
 
     public const string DefaultUpdateRepo = "x1f4r/legion-control";
 
@@ -38,29 +37,7 @@ public sealed record ControllerConfig
         Local = LocalConfig.From(json["local"]),
         Identity = ControllerIdentity.From(json["controller"]),
         UpdateRepo = json["appUpdates"]["githubRepo"].AsText(),
-        InputProblems = ValidateInput(json),
     };
-
-    private static IReadOnlyList<string> ValidateInput(Value json)
-    {
-        var problems = new List<string>();
-        if (!json["machines"].IsArray) problems.Add("machines must be an array.");
-        if (json["sites"].Exists && !json["sites"].IsArray) problems.Add("sites must be an array.");
-        if (json.Properties().Any(p => p.Key == "controller"))
-        {
-            var identity = json["controller"];
-            if (!identity.IsObject || identity["id"].Raw.ValueKind != System.Text.Json.JsonValueKind.String
-                || !CommandSurface.IsValidToken(identity["id"].AsText()))
-                problems.Add("controller must contain a nonempty string id.");
-            if (identity["revision"].Raw.ValueKind != System.Text.Json.JsonValueKind.Number
-                || !identity["revision"].Raw.TryGetInt64(out var revision) || revision < 0)
-                problems.Add("controller.revision must be a nonnegative integer.");
-            if (identity.Properties().Any(p => p.Key == "lineage") && (!identity["lineage"].IsArray
-                || identity["lineage"].AsArray().Any(item => item.Raw.ValueKind != System.Text.Json.JsonValueKind.String)))
-                problems.Add("controller.lineage must be an array of hash strings.");
-        }
-        return problems;
-    }
 
     public string Repo => string.IsNullOrWhiteSpace(UpdateRepo) ? DefaultUpdateRepo : UpdateRepo!;
 
@@ -70,174 +47,13 @@ public sealed record ControllerConfig
 
     public bool IsEmpty => Machines.Count == 0;
 
-    /// What is wrong with the document, in the words of the thing that has to change.
-    ///
-    /// A document that fails this never replaces one that did: a machine with no systems, or an
-    /// unparseable hardware address, has no sensible default to fall back to.
-    public IReadOnlyList<string> Problems()
-    {
-        var problems = new List<string>(Identity.Problems());
-        problems.AddRange(InputProblems);
-        if (Version != 1) problems.Add("The shared setup must use document version 1.");
-        var seenSites = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var site in Sites)
-        {
-            if (!CommandSurface.IsValidToken(site.Id)) problems.Add("A site has an invalid id.");
-            else if (!seenSites.Add(site.Id)) problems.Add($"Two sites share the id \"{site.Id}\".");
-        }
-
-        var seenMachines = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var machine in Machines)
-        {
-            if (!CommandSurface.IsValidToken(machine.Id))
-            {
-                problems.Add("A machine has an empty id.");
-                continue;
-            }
-            if (!seenMachines.Add(machine.Id))
-            {
-                problems.Add($"Two machines share the id \"{machine.Id}\". Ids have to be unique.");
-            }
-            if (machine.Site is { } site && Site(site) is null)
-            {
-                problems.Add($"Machine \"{machine.Id}\" names the site \"{site}\", which is not in sites.");
-            }
-
-            var seenSystems = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var system in machine.Systems)
-            {
-                if (!CommandSurface.IsValidToken(system.Id))
-                {
-                    problems.Add($"A system on machine \"{machine.Id}\" has an empty id.");
-                    continue;
-                }
-                if (!seenSystems.Add(system.Id))
-                {
-                    problems.Add($"Machine \"{machine.Id}\" has two systems with the id \"{system.Id}\".");
-                }
-            }
-
-            var seenEndpoints = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var endpoint in machine.Endpoints)
-            {
-                if (!seenEndpoints.Add(endpoint.Id)) problems.Add($"Machine {machine.Id} has duplicate endpoint ids.");
-                if (endpoint.Host.Length == 0 || endpoint.Host.StartsWith('-') || endpoint.Host.Any(char.IsWhiteSpace))
-                    problems.Add($"Endpoint {endpoint.Id} needs a valid host or SSH alias.");
-                if (endpoint.Port is < 1 or > 65535) problems.Add($"Endpoint {endpoint.Id} has an invalid port.");
-            }
-
-            if (machine.Wake is { } wake)
-            {
-                if (wake.MacBytes is null)
-                {
-                    problems.Add($"The wake address \"{wake.Mac}\" on machine \"{machine.Id}\" is not a six byte hardware address.");
-                }
-                problems.AddRange(HelperProblems(machine));
-            }
-        }
-        return problems;
-    }
-
-    /// What is worth saying about the document without refusing it.
-    ///
-    /// The line between this and [Problems] is what a person can still do. A machine with no
-    /// systems yet is half-written, not broken, and refusing the whole document over it would take
-    /// away the very screen where the systems are added. A helper cycle, on the other hand, cannot
-    /// be acted on at all.
-    public IReadOnlyList<string> Warnings()
-    {
-        var warnings = new List<string>();
-        foreach (var machine in Machines)
-        {
-            if (machine.Systems.Count == 0)
-            {
-                warnings.Add($"Machine \"{machine.Id}\" lists no systems, so nothing can be run on it yet.");
-            }
-            if (machine.Routes.Count == 0)
-            {
-                warnings.Add($"Machine \"{machine.Id}\" has no address, so there is no way to reach it yet.");
-            }
-            foreach (var system in machine.Systems.Where(system => system.Agent.Count == 0))
-            {
-                warnings.Add($"System \"{system.Id}\" on machine \"{machine.Id}\" has no agent command, so it cannot be driven.");
-            }
-            if (machine.Wake is not { } wake) continue;
-            foreach (var helper in wake.EffectiveHelpers)
-            {
-                var helperMachine = Machine(helper.Machine);
-                if (helperMachine is null) continue;
-                if (helperMachine.Site is not null && machine.Site is not null && helperMachine.Site != machine.Site)
-                {
-                    warnings.Add(
-                        $"The helper \"{helper.Machine}\" for \"{machine.Id}\" is at another site. That only works if its action reaches the target's network another way, through a router or a VPN.");
-                }
-                if (helperMachine.AlwaysOn != true)
-                {
-                    warnings.Add(
-                        $"The helper \"{helper.Machine}\" for \"{machine.Id}\" is not marked as always on, so it may be asleep when it is needed.");
-                }
-            }
-            if (wake.EffectiveHelpers.Count == 0 && machine.Site is null && wake.LanPrefix is null)
-            {
-                warnings.Add(
-                    $"Machine \"{machine.Id}\" can only be woken by a device that is already on its network: it names no site, no lanPrefix and no helper.");
-            }
-        }
-        return warnings;
-    }
-
-    /// Helper rules that block the editor: the helper has to exist, must not be the machine itself,
-    /// and must not take part in a cycle of helpers.
-    private IEnumerable<string> HelperProblems(MachineConfig machine)
-    {
-        var wake = machine.Wake!;
-        // A client from before the ordered list reads only the singular key. Writing a different
-        // machine there than the list starts with would send those clients to a helper this
-        // document does not actually prefer, which is worse than having no list at all.
-        if (wake.Helpers.Count > 0 && wake.Helper is { } alias && alias != wake.Helpers[0])
-        {
-            yield return $"The wake helper alias on \"{machine.Id}\" names {alias.Machine}/{alias.Action}, but the ordered list starts with {wake.Helpers[0].Machine}/{wake.Helpers[0].Action}. They have to agree.";
-        }
-        foreach (var helper in machine.Wake!.EffectiveHelpers)
-        {
-            if (string.IsNullOrWhiteSpace(helper.Machine) || string.IsNullOrWhiteSpace(helper.Action))
-            {
-                yield return $"A wake helper on \"{machine.Id}\" is missing a machine or an action.";
-                continue;
-            }
-            if (!CommandSurface.IsValidToken(helper.Action))
-            {
-                yield return $"The wake action \"{helper.Action}\" on \"{machine.Id}\" is not a plain token.";
-            }
-            if (helper.Machine == machine.Id)
-            {
-                yield return $"Machine \"{machine.Id}\" lists itself as its own wake helper.";
-                continue;
-            }
-            if (Machine(helper.Machine) is null)
-            {
-                yield return $"The wake helper \"{helper.Machine}\" for \"{machine.Id}\" is not a machine in this document.";
-                continue;
-            }
-            if (HelperCycle(machine.Id, helper.Machine, new HashSet<string>(StringComparer.Ordinal) { machine.Id }))
-            {
-                yield return $"The wake helpers for \"{machine.Id}\" form a cycle through \"{helper.Machine}\".";
-            }
-        }
-    }
-
-    private bool HelperCycle(string origin, string current, HashSet<string> seen)
-    {
-        if (current == origin) return true;
-        if (!seen.Add(current)) return false;
-        var machine = Machine(current);
-        foreach (var helper in machine?.Wake?.EffectiveHelpers ?? Array.Empty<WakeHelper>())
-        {
-            if (helper.Machine == origin) return true;
-            if (HelperCycle(origin, helper.Machine, seen)) return true;
-        }
-        return false;
-    }
+    /// The configuration without the machines at [indexes] in the document's `machines`: the ones a
+    /// section 9.7 error is inside, which an applied document keeps but this device neither dials
+    /// nor runs (contract section 9.7, applied intake). What is wrong with a document is
+    /// [DocumentAcceptance]'s to say, never this model's: it reads leniently and cannot see a
+    /// member written twice or a number spelled as a string.
+    public ControllerConfig WithoutMachinesAt(IReadOnlySet<int> indexes) =>
+        indexes.Count == 0 ? this : this with { Machines = Machines.Where((_, index) => !indexes.Contains(index)).ToList() };
 }
 
 /// Where a group of machines physically is, and which addresses a device on that network has.
@@ -470,7 +286,10 @@ public sealed record WakeHelper(string Machine, string Action)
 /// Wake on LAN. A machine without this block simply has no wake action.
 public sealed record WakeConfig
 {
-    public string Mac { get; init; } = "";
+    /// The hardware address a magic packet carries, or null when the block names none. A block
+    /// without one is still a wake block: nothing can wake the machine directly, and its helpers
+    /// still can (contract section 9.7, `wake-no-mac`).
+    public string? Mac { get; init; }
     public IReadOnlyList<string> Broadcast { get; init; } = new[] { "255.255.255.255" };
     public IReadOnlyList<int> Ports { get; init; } = new[] { 9, 7 };
     public WakeProbe? Probe { get; init; }
@@ -489,7 +308,6 @@ public sealed record WakeConfig
     {
         if (!json.IsObject) return null;
         var mac = json["mac"].AsText();
-        if (mac is null) return null;
         var broadcast = json["broadcast"].AsStringList();
         var ports = json["ports"].Map(port => port.AsInt()).Where(port => port is not null).Select(port => port!.Value).ToList();
         return new WakeConfig
@@ -509,11 +327,12 @@ public sealed record WakeConfig
     public IReadOnlyList<WakeHelper> EffectiveHelpers =>
         Helpers.Count > 0 ? Helpers : (Helper is null ? Array.Empty<WakeHelper>() : new[] { Helper });
 
-    /// The six bytes of the hardware address, or null when it is not one.
+    /// The six bytes of the hardware address, or null when there is none or it is not one.
     public byte[]? MacBytes
     {
         get
         {
+            if (Mac is null) return null;
             var parts = Mac.Split(':', '-');
             if (parts.Length != 6) return null;
             var bytes = new byte[6];

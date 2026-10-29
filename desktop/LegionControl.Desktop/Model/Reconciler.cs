@@ -107,6 +107,11 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
 
             case Descent.TheyHaveNothing:
             case Descent.TheyAreBehind:
+                // A setup applied with an error in it is published by nobody until it is fixed.
+                if (_config.Acceptance is { Valid: false })
+                {
+                    return new ReconcileOutcome.Held("the setup here has errors, so it is not published until they are fixed");
+                }
                 // At most one automatic push per machine per document until a reply is read.
                 if (_pushedHash.TryGetValue(machine.Id, out var already) && already == mine.Hash)
                 {
@@ -139,6 +144,10 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
                 return new ReconcileOutcome.InSync();
 
             case Descent.TheyAreBehind:
+                if (_config.Acceptance is { Valid: false })
+                {
+                    return new ReconcileOutcome.Held("the setup here has errors, so it is not published until they are fixed");
+                }
                 _pushedHash[machine.Id] = mine.Hash;
                 return ReadPush(machine, await machine.PushSetupAsync(mine, replace: false, cancellationToken));
 

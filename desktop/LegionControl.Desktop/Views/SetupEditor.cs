@@ -166,8 +166,7 @@ public sealed class SetupEditor : Window
     private void Check()
     {
         var plan = ControllerEditor.Plan(_text.Text ?? "", _app.Config.Config, "check", _ => { });
-        var decoded = ControllerConfig.From(Contract.Value.Parse(plan.Text));
-        Report(plan.Problems, plan.Preview.Lines().Concat(decoded.Warnings()).ToList(), _app.LaunchEditProblems(_text.Text ?? "", _base));
+        Report(plan.Problems, plan.Preview.Lines().Concat(plan.Warnings ?? Array.Empty<string>()).ToList(), _app.LaunchEditProblems(_text.Text ?? "", _base));
     }
 
     private void Apply()

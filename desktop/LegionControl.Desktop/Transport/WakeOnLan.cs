@@ -45,7 +45,7 @@ public static class WakeOnLan
         if (mac is null)
         {
             return new WakeAttempt(0, Array.Empty<string>(),
-                new[] { $"\"{wake.Mac}\" is not a six byte hardware address." });
+                new[] { wake.Mac is null ? "The wake block names no hardware address." : $"\"{wake.Mac}\" is not a six byte hardware address." });
         }
 
         var packet = MagicPacket(mac);

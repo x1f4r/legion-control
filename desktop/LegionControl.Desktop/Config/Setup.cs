@@ -33,7 +33,6 @@ public sealed record ControllerIdentity
     public const string ThisSource = "desktop";
 
     private static readonly Regex HashGrammar = new(@"\A[0-9a-f]{64}\z", RegexOptions.Compiled);
-    private static readonly Regex IdGrammar = new(@"\A[A-Za-z0-9][A-Za-z0-9._:@/\\~=+-]*\z", RegexOptions.Compiled);
 
     /// Whether a value is a sha256 the way the contract writes one: 64 lower-case hex digits and
     /// nothing else, not even a final newline.
@@ -57,31 +56,6 @@ public sealed record ControllerIdentity
     public long RevisionNumber => Revision ?? 0;
 
     public bool HasIdentity => !string.IsNullOrWhiteSpace(Id);
-
-    /// What is wrong with this block, in the words of the thing that has to change. An empty list
-    /// means the editor may apply and publish.
-    public IReadOnlyList<string> Problems()
-    {
-        var problems = new List<string>();
-        if (Id is not null && !CommandSurface.Matches(IdGrammar, Id))
-        {
-            problems.Add($"The setup id \"{Id}\" is not a plain token. Use letters, digits and . _ : @ / ~ = + -");
-        }
-        if (Revision is { } revision && revision < 0) problems.Add("The setup revision cannot be negative.");
-        if (Lineage.Count > LineageLimit)
-        {
-            problems.Add($"The setup lineage carries {Lineage.Count} hashes; at most {LineageLimit} are allowed.");
-        }
-        foreach (var hash in Lineage)
-        {
-            if (!IsHash(hash)) problems.Add($"\"{hash}\" in the setup lineage is not a sha256 hash.");
-        }
-        if (Lineage.Distinct(StringComparer.Ordinal).Count() != Lineage.Count)
-        {
-            problems.Add("The setup lineage repeats a hash.");
-        }
-        return problems;
-    }
 
     /// A fresh setup, for a document that carries no identity: a hand written file, or the example.
     public static ControllerIdentity NewSetup(string? name, string? device) => new()

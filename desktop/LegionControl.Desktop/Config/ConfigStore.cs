@@ -7,11 +7,14 @@ namespace LegionControl.Desktop.Config;
 
 /// Holds whatever the setup document last said, and notices when it changes.
 ///
-/// Two rules everything above depends on. A document that does not parse never replaces one that
-/// did: a half-saved file is the normal state of a file being edited, and throwing the machines
-/// away every time an editor writes a partial document would make the app flicker through its own
-/// setup page. And every document this device applies is remembered by hash, because a merge needs
-/// the common ancestor and a person who adopted the wrong thing needs the previous one back.
+/// Two rules everything above depends on. A file that is no document at all (contract section 12)
+/// never replaces one that was: a half-saved file is the normal state of a file being edited, and
+/// throwing the machines away every time an editor writes a partial document would make the app
+/// flicker through its own setup page. A document that is one is applied even when section 9.7
+/// finds errors in it (applied intake): the errors are shown, nothing is published until they are
+/// fixed, and a machine an error is inside is left out of what this device dials and runs. And
+/// every document this device applies is remembered by hash, because a merge needs the common
+/// ancestor and a person who adopted the wrong thing needs the previous one back.
 ///
 /// There is no authority here. Every device is a peer: this one edits, publishes, and fast-forwards
 /// to what another peer wrote, all through the same lineage rule.
@@ -49,13 +52,23 @@ public sealed class ConfigStore : IDisposable
         if (watch) StartWatching();
     }
 
-    /// The last document that parsed and validated, or null when none ever has.
+    /// The machines of the applied document, without any that a section 9.7 error is inside, or
+    /// null when no document was ever applied.
     public ControllerConfig? Config { get; private set; }
-    /// Why the file on disk was refused, or null when it read cleanly.
+    /// Why the file on disk was not applied, or what is wrong with the document that was, or null
+    /// when it read cleanly.
     public string? Problem { get; private set; }
+    /// What section 9.7 said about the applied document. A document with errors is applied, and
+    /// publishes nothing until they are fixed.
+    public Acceptance? Acceptance { get; private set; }
     /// Worth saying without refusing the document: helpers that may be asleep, machines nothing can
     /// wake, a helper at another site.
     public IReadOnlyList<string> Warnings { get; private set; } = Array.Empty<string>();
+    /// Whether the file holds something other than the applied document that could not be applied
+    /// yet: a file half saved, or an edit that cannot be given a revision. Contract section 9.5
+    /// takes no part in reconciliation for such a device (rule 2), and a fetch decided before it
+    /// never lands over it.
+    public bool IsPendingEdit { get; private set; }
     /// True when there is simply nothing at the path.
     public bool IsMissing { get; private set; }
     /// The canonical bytes and their hash: what the machines are given and what they compare.
@@ -121,6 +134,8 @@ public sealed class ConfigStore : IDisposable
             {
                 Config = null;
                 Document = null;
+                Acceptance = null;
+                IsPendingEdit = false;
                 RawBytes = null;
                 Changed?.Invoke();
             }
@@ -128,41 +143,43 @@ public sealed class ConfigStore : IDisposable
         }
 
         IsMissing = false;
-        ControllerDocument document;
-        try
+        // Section 12 first: bytes that are no document at all are not applied, and the document
+        // before them stays. Anything section 12 accepts is applied, errors and all.
+        var acceptance = DocumentAcceptance.Check(data, Intake.Applied);
+        if (!acceptance.Keep)
         {
-            document = ControllerDocument.FromRaw(data);
-        }
-        catch (Canonical.NotUtf8)
-        {
-            Problem = "The setup file is not valid UTF-8, so it has no canonical form and no hash.";
+            Problem = !Canonical.IsValidUtf8(data)
+                ? "The setup file is not valid UTF-8, so it has no canonical form and no hash."
+                : Document is null
+                    ? $"The setup file is not a setup document. {acceptance.Sentence}"
+                    : $"The setup file is not a setup document yet, so the one before it stays applied. {acceptance.Sentence}";
+            IsPendingEdit = Document is not null;
             return;
         }
-
-        var json = Value.Parse(document.Text);
-        if (!json.IsObject)
-        {
-            Problem = "The setup file is not a JSON object.";
-            return;
-        }
-
-        var decoded = ControllerConfig.From(json);
-        var problems = decoded.Problems();
-        if (problems.Count > 0)
-        {
-            Problem = string.Join(" ", problems);
-            return;
-        }
+        var document = ControllerDocument.FromRaw(data);
+        var decoded = ControllerConfig.From(Value.Parse(document.Text));
+        var tree = DocumentJson.Read(document.Text, out var repeated);
 
         // The window and the command line both adopt documents into this file. What the other one
         // applied counts as applied here too, or its Take theirs would read as an edit of the
         // revision it replaced.
         ReloadApplied();
 
+        // A document with a member written twice cannot be given a revision: which copy is the
+        // edit is exactly what devices disagree about. One a process here adopted, or the one
+        // applied, is what it was; anything else is an edit that waits, unapplied, until the name
+        // is written once.
+        if (repeated is not null && _applied.Hash != document.Hash && !WasAdopted(document))
+        {
+            Problem = $"{acceptance.Sentence} The edit is applied once that is fixed; until then the setup before it stays.";
+            IsPendingEdit = Document is not null;
+            return;
+        }
+
         // A document that carries no identity of its own becomes a setup here and now, before it is
         // applied or published. Without one, two devices holding the same hand-written file would
         // look like two different setups to every machine they reach.
-        if (!document.Identity.HasIdentity)
+        if (repeated is null && DocumentAcceptance.NeedsIdentity(tree))
         {
             var assigned = ControllerIdentity.NewSetup(decoded.Identity.Name, DeviceName);
             // A file with no identity becomes a setup of its own, so it is no edit of the one
@@ -178,6 +195,7 @@ public sealed class ConfigStore : IDisposable
             if (StampIdentity(assigned, data, "assigned-setup-id", editedFrom) is { } stampProblem)
             {
                 Problem = stampProblem;
+                IsPendingEdit = Document is not null;
                 return;
             }
             AssignedSetupId = assigned.Id;
@@ -193,7 +211,8 @@ public sealed class ConfigStore : IDisposable
         // process here adopted looks exactly like a hand edit of the one it replaced, and would
         // approve every launch value it changed. It is told apart by being kept, which it already
         // is when the file changes.
-        if (_applied.Hash is { } applied
+        if (repeated is null
+            && _applied.Hash is { } applied
             && applied != document.Hash
             && _applied.MatchesIdentityOf(document.Identity)
             && !WasAdopted(document))
@@ -202,21 +221,28 @@ public sealed class ConfigStore : IDisposable
             if (StampIdentity(next, data, "hand-edit", AppliedEditedFrom()) is { } stampProblem)
             {
                 Problem = stampProblem;
+                IsPendingEdit = Document is not null;
                 return;
             }
             Load();
             return;
         }
 
-        Problem = null;
-        Warnings = decoded.Warnings();
+        Problem = acceptance.Errors.Count == 0
+            ? null
+            : $"{acceptance.Sentence} Nothing is published until this is fixed"
+              + (acceptance.BrokenMachines.Count > 0 ? ", and a machine it is inside is not reached or run from here." : ".");
+        Acceptance = acceptance;
+        Warnings = acceptance.Warnings.Select(warning => warning.Message).ToList();
+        IsPendingEdit = false;
         RawBytes = data;
-        var unchanged = Config == decoded && Document?.Hash == document.Hash;
+        var usable = decoded.WithoutMachinesAt(acceptance.BrokenMachines);
+        var unchanged = Config == usable && Document?.Hash == document.Hash;
         Document = document;
         Ledger.Remember(document);
         RecordApplied(document);
         if (unchanged) return;
-        Config = decoded;
+        Config = usable;
         Changed?.Invoke();
     }
 
@@ -313,10 +339,9 @@ public sealed class ConfigStore : IDisposable
     {
         try
         {
-            var json = Value.Parse(document.Text);
-            if (!json.IsObject) return "The setup is not a JSON object.";
-            var problems = document.Decoded.Problems();
-            if (problems.Count > 0) return string.Join(" ", problems);
+            // What is adopted came from a peer, a kept revision or a merge, which contract section
+            // 9.7 holds to peer intake: nothing with an error replaces the setup here.
+            if (DocumentAcceptance.Check(document.Bytes, Intake.Peer) is { Valid: false } refused) return refused.Sentence;
             if (Document is not null) Ledger.Remember(Document);
             // Kept before it is written, so that another process reading the file in the moment
             // before it is recorded as applied still knows it for an adoption (see [WasAdopted]).
@@ -369,21 +394,12 @@ public sealed class ConfigStore : IDisposable
 
     private (ControllerDocument? Document, string? Problem) ApplyEditCore(string editedText, string description)
     {
-        ControllerDocument candidate;
-        try
-        {
-            candidate = ControllerDocument.FromText(editedText);
-        }
-        catch (Canonical.NotUtf8)
-        {
-            return (null, "That is not valid UTF-8.");
-        }
-
-        var json = Value.Parse(candidate.Text);
-        if (!json.IsObject) return (null, "That is not a JSON object.");
-        var decoded = ControllerConfig.From(json);
-        var problems = decoded.Problems();
-        if (problems.Count > 0) return (null, string.Join(" ", problems));
+        // A document typed or pasted here is held to section 9.7 under local intake: one without an
+        // identity is checked as the setup of its own it is about to become.
+        var acceptance = DocumentAcceptance.Check(editedText, Intake.Local);
+        if (!acceptance.Valid) return (null, acceptance.Sentence);
+        var candidate = ControllerDocument.FromText(editedText);
+        var decoded = candidate.Decoded;
 
         var parentHash = Document?.Hash;
         var identity = Document?.Identity ?? decoded.Identity;
@@ -391,15 +407,7 @@ public sealed class ConfigStore : IDisposable
             ? identity.Next(parentHash, DeviceName)
             : ControllerIdentity.NewSetup(decoded.Identity.Name, DeviceName);
 
-        JsonObject root;
-        try
-        {
-            root = JsonNode.Parse(candidate.Text) as JsonObject ?? new JsonObject();
-        }
-        catch (JsonException error)
-        {
-            return (null, $"That is not valid JSON: {error.Message}");
-        }
+        var root = JsonNode.Parse(candidate.Text) as JsonObject ?? new JsonObject();
         root["controller"] = IdentityJson(next, root["controller"] as JsonObject);
         var stamped = ControllerDocument.FromText(root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
 

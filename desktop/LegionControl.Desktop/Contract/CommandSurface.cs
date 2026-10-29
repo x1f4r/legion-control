@@ -254,7 +254,9 @@ public static class CommandSurface
     }
 
     /// Hands the machine the setup document. The bytes go in on stdin; only the identity travels as
-    /// arguments, which is why those are the only two things validated here.
+    /// arguments, which is why those are the only two things validated here. The id is held to the
+    /// setup-id grammar the agent applies, not the wider token grammar: an id with `@` or `/` in it
+    /// passes the one and is refused by the agent as a bad argument.
     ///
     /// `--replace` is never added on this app's own initiative. It is the explicit human decision
     /// that one setup replaces another, made in front of a preview of what changes.
@@ -263,7 +265,7 @@ public static class CommandSurface
         var argv = new List<string> { "config", "set" };
         if (capabilities.SupportsSetupLineage && controllerId is not null && revision is not null)
         {
-            Require("controller id", controllerId);
+            if (!IsValidSetupId(controllerId)) throw new InvalidArgument("setup id", controllerId);
             argv.AddRange(new[] { "--controller-id", controllerId, "--revision", revision.Value.ToString() });
         }
         if (replace)

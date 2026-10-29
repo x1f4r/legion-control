@@ -92,8 +92,8 @@ public sealed class ImportSetup : Window
                 fetched = null;
                 var machine = Build(); var (document, failure) = await machine.FetchSetupAsync();
                 if (document is null) { problem.Text = failure; return; }
-                var errors = document.Decoded.Problems();
-                if (errors.Count > 0) { problem.Text = string.Join(" ", errors); return; }
+                // Read from a machine, so held to section 9.7 under peer intake like any other.
+                if (DocumentAcceptance.Check(document.Bytes, Intake.Peer) is { Valid: false } refused) { problem.Text = refused.Sentence; return; }
                 fetched = document; preview.Text = document.Text;
                 problem.Text = string.Join("\n", SetupConflictPreview.Between(app.Config.Config, document.Decoded).Lines());
             }
