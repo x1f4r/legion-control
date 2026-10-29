@@ -369,7 +369,9 @@ async function stopGroup(group, { graceMs, settleMs }) {
  * the command while it is alive; the walk afterwards finds what it could not
  * reach, children of a command that ended just as its deadline came, stops
  * those, and is what says whether anything is left. When that walk cannot run,
- * taskkill's own success and the command's exit are the only evidence there is.
+ * taskkill having stopped the whole tree, and the command's exit, are the only
+ * evidence there is; a command that ended before taskkill reached it leaves
+ * none about its children.
  */
 async function stopTree(child, entry, { settleMs }) {
   const killed = child.exitCode === null && child.signalCode === null
@@ -378,7 +380,7 @@ async function stopTree(child, entry, { settleMs }) {
   const exited = await within(settleMs, () => child.exitCode !== null || child.signalCode !== null);
   const left = await windowsLeft({ ...entry, endedAt: exited ? new Date().toISOString() : null }, { treeOf: true, stop: true });
   if (left !== null) return left.length === 0;
-  return exited && (killed === null || killed.ok);
+  return exited && killed !== null && killed.ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +454,9 @@ function supervise(file, args, options, entry) {
 
   return new Promise((resolve) => {
     let child;
+    // Taken again here, after the ledger write, because it is what a later
+    // check holds the process's own start time against.
+    entry.startedAt = new Date().toISOString();
     try {
       child = spawn(file, args, {
         cwd: options.cwd,
@@ -510,7 +515,9 @@ function supervise(file, args, options, entry) {
     entry.pid = child.pid;
     entry.group = IS_WINDOWS ? null : child.pid;
     children.set(entry.id, child);
-    const recorded = changeLedger((commands) => commands.map((existing) => (existing.id === entry.id ? { ...existing, pid: entry.pid, group: entry.group } : existing)));
+    const recorded = changeLedger((commands) => commands.map((existing) => (
+      existing.id === entry.id ? { ...existing, pid: entry.pid, group: entry.group, startedAt: entry.startedAt } : existing
+    )));
 
     child.once('exit', (code, signal) => {
       exit = { code, signal };
