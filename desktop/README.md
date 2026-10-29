@@ -45,6 +45,12 @@ A request somebody cancelled is 0, as it always was. One the machine finished wi
 deferred while busy, by its schedule or a lock, or expired before the machine was idle, is 1: that
 it did not happen is known. Builds before 1.4.0 gave `--command op` 2 for a deferred operation, and
 a change interrupted part way 1; nobody knows whether an interrupted change took effect, so it is 2.
+An error the command line did not plan for still ends in one of the three: 1 for a command that
+only reads, 2 for one that may have changed something, with the details in the log.
+
+`--smoke` changes nothing on disk: a setup with no controller block is not given one, a first
+start's approvals are evaluated without being recorded, and no wake hold is released. With
+`--json` it prints the JSON report and nothing else.
 
 ## Where things live
 
@@ -57,8 +63,16 @@ a change interrupted part way 1; nobody knows whether an interrupted change took
 | operations this app started | `operations.json` beside it | the same |
 | desktop preferences | `desktop-settings.json` beside it | the same |
 | ssh's own log while a command runs, deleted after each attempt | `ssh-logs/` beside it | the same |
+| what went wrong that nothing on screen planned for | `legion-control-desktop.log` beside it | the same |
+| the last update helper's log, and the one before | `updates/update.log`, `updates/update.log.1` | the same |
 
 Linux uses `$XDG_CONFIG_HOME/legion-control/` instead when `XDG_CONFIG_HOME` is set.
+
+The window and the command line both write these files. Each change takes the file's `.lock`,
+reads it again and applies only that change, so neither writes back what the other changed since
+it started. A file that is there but cannot be read is moved aside to `<name>.corrupt-<unix time>`
+before anything is written in its place, and the log says so. Only one window opens on a state
+directory; a second start of the window says it is already open and exits.
 
 Three environment variables move all of it, which is how a test run touches nothing that matters:
 
@@ -251,9 +265,24 @@ visible. Changing the configured release repository clears it immediately and in
 review, even if the repository is then changed back.
 
 **Review update → Download and verify** downloads the exact artifact for this OS and architecture
-and checks its size and hash against the signed manifest. **Install and restart** explicitly starts
-the replacement helper. The previous build is retained and restored if the new window cannot
-render. Checks do not download or install an app automatically.
+and checks its size and hash against the signed manifest. The release list, manifest and signature
+are read only up to 1 MiB, 256 KiB and 4 KiB, a manifest of any schema but 1 is refused, and the
+archive is streamed to disk and stopped at the first byte past the size the manifest signed. The
+release repository must be a GitHub `owner/name`. **Install and restart** explicitly starts the
+replacement helper. Checks do not download or install an app automatically.
+
+The helper waits until every copy of the app has exited, the window and any command line run
+alike, and changes nothing if one is still running after two minutes. It then copies the new build
+beside the installation and swaps the two directories by renaming them, so the installation is
+always one whole build and a file a release dropped goes with the old one. The build it replaced is
+kept beside it as `<installation>.previous`. The new build has a minute to draw its window
+(`updateHealthSeconds` in `desktop-settings.json`, 10 to 600); if it does not, it is stopped, and
+once it has gone the previous build is renamed back and started. Every way out that leaves the app
+closed starts it again.
+
+Because the whole directory is swapped, the installation directory must hold the app and nothing
+else, in a directory this account can write. Anything else there, or a directory it cannot write,
+is named before the app quits, and nothing is changed.
 
 Headless invocations do not run an update-check timer. Check or explicitly install from the CLI:
 
@@ -263,9 +292,11 @@ legion-control --command app-update --yes
 ```
 
 The second command verifies and stages the update, then starts the helper. It reports completion
-as pending until the replacement launches; the helper opens the graphical app. On a Pi without a
-desktop session, verify the signed manifest and archive, then replace the complete installation
-directory instead of using the restart helper, whose health check requires a rendered window.
+as pending until the replacement launches; the helper opens the graphical app. The helper's health
+check requires a rendered window, so the command refuses where none can be drawn (no `DISPLAY` or
+`WAYLAND_DISPLAY`, or the Windows services session an ssh login runs in), and while a window is
+open, which the helper would otherwise wait for. On a Pi without a desktop session, verify the
+signed manifest and archive, then replace the complete installation directory by hand.
 
 ## Building
 
