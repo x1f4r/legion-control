@@ -14,15 +14,11 @@ namespace LegionControl.Desktop.Tests;
 /// The index says which groups this client consumes and how many cases of each. Every consumed
 /// group runs through exactly one adapter, every case it lists for this client runs, and the count
 /// has to match: a group that quietly ran nothing would pass for the wrong reason. A missing corpus
-/// is a failure, never a skip.
+/// is a failure, never a skip, and so is a family the index adds with a group naming this client
+/// and no adapter here.
 public class VectorTests
 {
     private const string Consumer = "desktop";
-
-    /// The families this client runs. A family joins this list when its port lands here, and from
-    /// then on the accounting test holds it to the index exactly.
-    private static readonly string[] Families =
-        { "hash", "identifiers", "outcome", "transport", "launch", "setup-acceptance", "setup-reconcile", "setup-merge", "wake" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -267,23 +263,18 @@ public class VectorTests
     [Fact]
     public void EveryConsumedGroupHasExactlyOneAdapter()
     {
-        var index = JsonNode.Parse(Repo.ReadContract("vectors/index.json"))!;
-        var known = index["families"]!.AsArray().Select(family => family!["family"]!.GetValue<string>()).ToList();
-        Assert.All(Families, family => Assert.Contains(family, known));
-
         var consumed = Consumed().Select(entry => $"{entry.Family}/{entry.Group}").OrderBy(key => key, StringComparer.Ordinal);
         Assert.Equal(consumed, Adapters.Keys.OrderBy(key => key, StringComparer.Ordinal));
     }
 
-    /// Every group of a listed family that names this client, with the number of cases it says
-    /// this client runs.
+    /// Every group of every family in the index that names this client, with the number of cases
+    /// it says this client runs.
     private static IEnumerable<(string Family, string Group, int Count)> Consumed()
     {
         var index = JsonNode.Parse(Repo.ReadContract("vectors/index.json"))!;
         foreach (var family in index["families"]!.AsArray())
         {
             var name = family!["family"]!.GetValue<string>();
-            if (!Families.Contains(name)) continue;
             foreach (var group in family["groups"]!.AsArray())
             {
                 if (group!["consumers"]![Consumer] is { } count)
