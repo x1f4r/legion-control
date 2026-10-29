@@ -37,13 +37,18 @@ if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
 }
 
 # What the agent and the Windows tools it runs need from the session: where
-# things are, the locale, the connection it answers, and the command itself.
-# Nothing here names code to load.
+# things are, the locale, the connection it answers, the command itself, and
+# what Windows says about the machine, which powershell.exe, reg, schtasks and
+# npm read like any other program. Nothing here names code to load.
+# PSModulePath does, the folders PowerShell loads modules from, so it stays
+# out; a powershell.exe started without it builds the default again.
 $allowed = @(
     'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES', 'TZ', 'TMPDIR',
     'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_ORIGINAL_COMMAND',
     'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
-    'PROGRAMDATA', 'PROGRAMFILES', 'TEMP', 'TMP', 'USERNAME', 'USERDOMAIN'
+    'PROGRAMDATA', 'PROGRAMFILES', 'TEMP', 'TMP', 'USERNAME', 'USERDOMAIN',
+    'SYSTEMDRIVE', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)', 'COMMONPROGRAMW6432',
+    'ALLUSERSPROFILE', 'PUBLIC', 'COMPUTERNAME', 'OS', 'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS'
 )
 $process = [System.EnvironmentVariableTarget]::Process
 $kept = @{}
@@ -52,8 +57,12 @@ foreach ($name in $allowed) {
     if ($null -ne $value) { $kept[$name] = $value }
 }
 # Cleared and refilled in this process, so the agent inherits exactly this and
-# its standard streams stay the ones sshd gave this script.
+# its standard streams stay the ones sshd gave this script. Windows keeps each
+# drive's working directory in hidden variables named like =C:, which .NET
+# leaves out of this list and SetEnvironmentVariable would refuse. They name no
+# code, and skipping one keeps a name like that from ever stopping the script.
 foreach ($name in @([Environment]::GetEnvironmentVariables($process).Keys)) {
+    if (([string] $name).StartsWith('=')) { continue }
     [Environment]::SetEnvironmentVariable([string] $name, $null, $process)
 }
 foreach ($name in $kept.Keys) {

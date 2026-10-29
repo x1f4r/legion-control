@@ -6,10 +6,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { checkReply } from '../../contract/validate.mjs';
+import { pathToFileURL } from 'node:url';
+import { checkReply, schemaForCommand } from '../../contract/validate.mjs';
 import { canonicalHash } from '../src/controller.mjs';
 import { authorize, parseCommandLine, ownEntry, RESTRICTED_COMMANDS } from '../src/dispatch.mjs';
-import { REPO, cli, withHome } from './helpers.mjs';
+import { REPO, cli, fixtureConfig, fixtureData, withHome, writeConfig } from './helpers.mjs';
 
 const quote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
 const NODE = quote(process.execPath);
@@ -330,6 +331,89 @@ test('the Windows forced command starts the agent with only the variables it lis
     assert.equal(seen.restricted, '1');
     assert.deepEqual([].concat(seen.arguments), ['dispatch']);
     for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'UNLISTED_CANARY']) assert.equal(seen.names.includes(name), false, name);
-    assert.ok(seen.names.includes('SYSTEMROOT'));
+    // What Windows says about the machine arrives, as every tool expects it to.
+    for (const name of ['SYSTEMROOT', 'SYSTEMDRIVE', 'PROGRAMFILES(X86)', 'PROCESSOR_ARCHITECTURE']) {
+      if (process.env[name] !== undefined) assert.ok(seen.names.includes(name), name);
+    }
   } finally { fs.rmSync(bin, { recursive: true, force: true }); }
+});
+
+/**
+ * A base laid out as an installer leaves it, around a copy of this agent: the
+ * stable launcher in bin/, the agent tree in agent/, and a config whose one
+ * service is the test fixture. Beside it is the code a hostile NODE_OPTIONS
+ * would run before the agent's first line, if anything let it through; it
+ * leaves a file behind.
+ */
+function installedBase(base) {
+  const bin = path.join(base, 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.cpSync(path.join(REPO, 'agent', 'src'), path.join(base, 'agent', 'src'), { recursive: true });
+  fs.copyFileSync(path.join(REPO, 'agent', 'package.json'), path.join(base, 'agent', 'package.json'));
+  fs.copyFileSync(path.join(INSTALL, 'launcher.mjs'), path.join(bin, 'launcher.mjs'));
+  writeConfig(base, fixtureConfig(fixtureData(base)));
+  const marker = path.join(base, 'ran');
+  const payload = path.join(base, 'payload.mjs');
+  fs.writeFileSync(payload, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'ran');\n`);
+  return { bin, marker, options: `--import=${pathToFileURL(payload).href}` };
+}
+
+/**
+ * Send status and doctor through the whole chain a restricted key takes, as a
+ * client names the installed agent, and hold each reply to its schema.
+ */
+function throughTheChain(base, send) {
+  const line = (command) => [process.execPath, path.join(base, 'bin', 'launcher.mjs'), command].map(quote).join(' ');
+  const replies = {};
+  for (const command of ['status', 'doctor']) {
+    const run = send(line(command));
+    let reply = null;
+    try { reply = JSON.parse(run.stdout); } catch { /* reported below */ }
+    assert.ok(reply, `${command}: one JSON object\n${run.stdout}${run.stderr}`);
+    assert.deepEqual(checkReply(schemaForCommand(command, reply), reply, { where: `restricted ${command}` }), [], JSON.stringify(reply, null, 2));
+    // Doctor says ok only where no check fails, and a test machine has no
+    // scheduled update; what matters is that doctor answered, not a refusal.
+    assert.equal(command === 'doctor' ? Array.isArray(reply.checks) : reply.ok, true, JSON.stringify(reply, null, 2));
+    replies[command] = reply;
+  }
+  // The agent answered from the base the launcher found, not the one the session named.
+  assert.equal(replies.status.system.id, 'test');
+  return replies;
+}
+
+test('a restricted status and doctor run through the installed forced command, launcher and agent', { skip: process.platform === 'win32' && 'POSIX shell wrapper' }, () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "restricted chain's "));
+  try {
+    const { bin, marker, options } = installedBase(base);
+    fs.copyFileSync(path.join(INSTALL, 'dispatch.sh'), path.join(bin, 'dispatch.sh'));
+    fs.writeFileSync(path.join(bin, 'legionctl'), fs.readFileSync(path.join(INSTALL, 'launcher.sh'), 'utf8').replace('@NODE_SHELL@', () => quote(process.execPath)), { mode: 0o755 });
+    throughTheChain(base, (line) => spawnSync('/bin/sh', [path.join(bin, 'dispatch.sh')], {
+      env: hostile({ NODE_OPTIONS: options, SSH_ORIGINAL_COMMAND: line }), encoding: 'utf8', timeout: 120000,
+    }));
+    assert.equal(fs.existsSync(marker), false, 'NODE_OPTIONS ran code in the chain');
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('a restricted status and doctor run through the installed Windows forced command, launcher and agent', { skip: !powershell && 'PowerShell on Windows only' }, () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'restricted chain '));
+  try {
+    const { bin, marker, options } = installedBase(base);
+    fs.copyFileSync(path.join(INSTALL, 'dispatch.ps1'), path.join(bin, 'dispatch.ps1'));
+    // Rendered the way install-windows.ps1 renders it.
+    const literal = `'${process.execPath.replaceAll("'", "''")}'`;
+    fs.writeFileSync(path.join(bin, 'legionctl.ps1'), fs.readFileSync(path.join(INSTALL, 'launcher.ps1'), 'utf8').replace('@NODE_POWERSHELL@', () => literal));
+    const replies = throughTheChain(base, (line) => spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(bin, 'dispatch.ps1')], {
+      env: { ...process.env, NODE_OPTIONS: options, NODE_PATH: 'C:\\elsewhere', LEGIONCTL_HOME: 'C:\\not-the-base', SSH_ORIGINAL_COMMAND: line },
+      encoding: 'utf8',
+      timeout: 120000,
+    }));
+    assert.equal(fs.existsSync(marker), false, 'NODE_OPTIONS ran code in the chain');
+    // Both checks start a Windows tool, powershell.exe with a module it
+    // autoloads and reg, from the environment the forced command left.
+    for (const id of ['files.private', 'ssh.shell']) {
+      const found = replies.doctor.checks.find((entry) => entry.id === id);
+      assert.ok(found, id);
+      assert.doesNotMatch(found.summary, /could not be read/, JSON.stringify(found));
+    }
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
