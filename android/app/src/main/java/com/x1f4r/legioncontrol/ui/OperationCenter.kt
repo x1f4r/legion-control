@@ -9,6 +9,7 @@ import com.x1f4r.legioncontrol.agent.OpRecord
 import com.x1f4r.legioncontrol.agent.OperationEvent
 import com.x1f4r.legioncontrol.agent.OperationIntent
 import com.x1f4r.legioncontrol.agent.OperationRecord
+import com.x1f4r.legioncontrol.agent.ReasonCode
 import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.parseInstantMillis
 import com.x1f4r.legioncontrol.agent.reduce
@@ -356,13 +357,39 @@ class OperationCenter(
         }
     }
 
-    /** Withdraws a queued change. */
+    /**
+     * Withdraws a queued change.
+     *
+     * The reply to `cancel` says whether cancelling worked, and only the record it carries says what
+     * became of the change. A reply with no record is never applied to the change as if it were one:
+     * its outcome is the cancel's, and a refused cancel is not a failed boot. `not-configured` means
+     * the machine no longer has the record, which is what an `op` read answering `op: null` means
+     * too; any other refusal leaves the change as it was, with the reason on its log.
+     */
     fun cancel(client: MachineClient, record: OperationRecord) {
         if (!record.isCancellable) return
         scope.launch {
             client.cancel(record.id).fold(
                 onSuccess = { result ->
-                    apply(record.id, OperationEvent.Replied(result, System.currentTimeMillis()))
+                    val now = System.currentTimeMillis()
+                    val why = result.effectiveMessage ?: ReasonCode.describe(result.reasonCode)
+                    val event = when {
+                        result.op != null -> OperationEvent.Replied(result, now)
+                        result.reasonCode == ReasonCode.NOT_CONFIGURED.wire -> OperationEvent.NotRecorded(now)
+                        result.ok == false -> OperationEvent.Note(
+                            "Could not cancel it: ${why ?: "the agent gave no reason"}",
+                            isError = true,
+                            at = now,
+                        )
+
+                        // Answered without the record, which only reading it by its id can settle.
+                        else -> OperationEvent.Note(
+                            "${record.machineName} answered the cancel without a record of it" +
+                                why?.let { ": $it" }.orEmpty(),
+                            at = now,
+                        )
+                    }
+                    apply(record.id, event)
                 },
                 onFailure = { failure ->
                     apply(

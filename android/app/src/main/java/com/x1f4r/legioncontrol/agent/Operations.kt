@@ -334,7 +334,7 @@ sealed interface OperationEvent {
 
     /**
      * `op ID` answered that the machine has no such operation: `op: null`, under `not-configured`
-     * or, from a 3.0.x agent, `bad-argument`.
+     * or, from a 3.0.x agent, `bad-argument`. `cancel ID` says the same with `not-configured`.
      *
      * For a change the agent was never heard from about, that settles it: the agent writes the record
      * before it acts, so the request never arrived. For one the agent had already answered about, the

@@ -3,16 +3,20 @@ package com.x1f4r.legioncontrol.ui
 import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentActionResult
 import com.x1f4r.legioncontrol.agent.AgentFailure
+import com.x1f4r.legioncontrol.agent.AgentJson
 import com.x1f4r.legioncontrol.agent.AgentStatus
 import com.x1f4r.legioncontrol.agent.DispatchStage
 import com.x1f4r.legioncontrol.agent.Machine
+import com.x1f4r.legioncontrol.agent.OpAction
 import com.x1f4r.legioncontrol.agent.OpKind
 import com.x1f4r.legioncontrol.agent.OpRecord
 import com.x1f4r.legioncontrol.agent.OpResult
 import com.x1f4r.legioncontrol.agent.OperationIntent
+import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.Outcome
 import com.x1f4r.legioncontrol.agent.SystemInfo
 import com.x1f4r.legioncontrol.agent.TrackedState
+import com.x1f4r.legioncontrol.contract.ContractCorpus
 import com.x1f4r.legioncontrol.data.OperationStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,6 +58,7 @@ class OperationCenterTest {
         val reads = mutableListOf<String>()
         var op: (String) -> Result<OpRecord> = { error("no op read was expected") }
         var reading: () -> Result<AgentStatus> = { error("no status was expected") }
+        var cancelling: (String) -> Result<AgentActionResult> = { error("no cancel was expected") }
 
         override suspend fun operation(operationId: String, waitSeconds: Int?): Result<OpRecord> {
             reads += operationId
@@ -61,6 +66,8 @@ class OperationCenterTest {
         }
 
         override suspend fun status(): Result<AgentStatus> = reading()
+
+        override suspend fun cancel(operationId: String): Result<AgentActionResult> = cancelling(operationId)
     }
 
     private val agent = Agent()
@@ -125,5 +132,76 @@ class OperationCenterTest {
         assertEquals("the refused one stays as it was", TrackedState.FINISHED, store.get(first.id)!!.state)
         assertEquals(true, store.get(second.id)!!.succeeded)
         assertFalse(store.get(second.id)!!.retryable)
+    }
+
+    /** A boot queued for the next idle moment, as the agent accepted it, waiting to be withdrawn. */
+    private fun queued(): OperationRecord = store.put(
+        OperationRecord(
+            id = "8c3a5f60-1d29-4b74-a8e3-5f0c7b91d642",
+            machineId = agent.machine.id,
+            machineName = agent.machine.name,
+            intent = OperationIntent(kind = OpKind.BOOT, target = "windows", whenIdle = true, expires = "4h", repeatable = true),
+            subjectName = "Windows",
+            initiator = "this phone",
+            startedAt = 1_700_000_000_000L,
+            updatedAt = 1_700_000_000_000L,
+            state = TrackedState.QUEUED,
+            phase = "queued",
+            summary = "Boot on Windows is waiting for Tower to be idle.",
+            trackable = true,
+            outcome = Outcome.PENDING,
+        ),
+    )
+
+    private fun fixture(name: String): Result<AgentActionResult> = Result.success(
+        AgentJson.decodeFromString(AgentActionResult.serializer(), ContractCorpus.file("fixtures/$name").readText()),
+    )
+
+    @Test
+    fun `a cancel the machine has no record for leaves how the change ended unknown`() {
+        // The refusal describes the cancel. Its outcome, failed, is not the boot's: the machine had
+        // the boot queued and has since let the record go, so whether it ran is not known.
+        agent.cancelling = { fixture("cancel.not-found.json") }
+        val record = queued()
+
+        center.cancel(agent, record)
+
+        val stored = store.get(record.id)!!
+        assertEquals(TrackedState.FINISHED, stored.state)
+        assertEquals(Outcome.UNKNOWN, stored.outcome)
+        assertFalse("it may have run, so it is not asked for again", stored.retryable)
+        assertFalse(stored.canTryAgain)
+        assertNotEquals(OpAction.FAILED, stored.opAction)
+    }
+
+    @Test
+    fun `a cancel refused without a record leaves the change as it was`() {
+        agent.cancelling = {
+            Result.success(AgentActionResult(ok = false, contract = 3, reasonCode = "restricted-command", outcome = "failed"))
+        }
+        val record = queued()
+
+        center.cancel(agent, record)
+
+        val stored = store.get(record.id)!!
+        assertEquals("a refused cancel is not a failed boot", TrackedState.QUEUED, stored.state)
+        assertEquals(Outcome.PENDING, stored.outcome)
+        assertTrue(stored.isCancellable)
+        assertTrue(stored.log.last().isError)
+        assertTrue(stored.log.last().text.startsWith("Could not cancel it"))
+    }
+
+    @Test
+    fun `a cancel that carries the record settles the change from the record`() {
+        agent.cancelling = { fixture("cancel.cancelled.json") }
+        val record = queued()
+
+        center.cancel(agent, record)
+
+        val stored = store.get(record.id)!!
+        assertEquals(TrackedState.FINISHED, stored.state)
+        assertEquals(OpAction.CANCELLED, stored.opAction)
+        assertEquals("the record's outcome, not the reply's succeeded", Outcome.DEFERRED, stored.outcome)
+        assertTrue("nothing ran, so it can be asked for again", stored.canTryAgain)
     }
 }
