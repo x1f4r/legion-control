@@ -871,6 +871,12 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     /// or when the agent is new enough to take it on stdin. Shown before the install is offered.
     var legacyInstallRefusal: String? {
         guard let status, AgentBootstrap.isAuthenticatedLegacy(status), let system = commandableSystem else { return nil }
+        // The bootstrap runs under the system's own interpreter, which is part of its command. A
+        // system this device has not approved a command for has none to run it under, and an
+        // installation base worked out from nothing would be asked of the person instead.
+        if system.launchState == .notDriven {
+            return "\(system.name) is not driven from this device until its command is approved."
+        }
         return AgentBootstrap.remoteRefusal(system: system, restrictedSession: status.isRestrictedSession)
     }
 

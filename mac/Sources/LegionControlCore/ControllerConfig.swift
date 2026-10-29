@@ -425,7 +425,13 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
     /// why it has none, worked out from `platform`, `shell` and `restricted` as the document has
     /// them. A route whose last status reported a restricted session can still move it to the
     /// dispatcher's grammar at run time; nothing moves it anywhere else.
+    ///
+    /// On a model the app runs, this and `agent` are the launch gate's (LaunchGate.swift): the tuple
+    /// this device approved, whatever the document says now.
     var grammar: Result<CommandGrammar, CommandLineRefusal>
+    /// Whether this device runs this system's command, and which one. Never decoded: it is set by
+    /// the launch gate, and a system built rather than decoded is taken as approved.
+    var launchState: LaunchState = .approved
 
     private enum CodingKeys: String, CodingKey {
         case id, name, platform, agent, symbol, shell, restricted
@@ -460,7 +466,11 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
 
     var symbolName: String { symbol ?? platform.symbolName }
 
-    var isRestricted: Bool { restricted == true }
+    /// True when this system's lines are written in the dispatcher's grammar, because its key is
+    /// restricted to a forced command. Read from the grammar rather than from `restricted`: on a
+    /// gated model that is the approved tuple's grammar (section 13 of the contract), and a peer
+    /// clearing `restricted` in the document does not make this device treat the key as a full one.
+    var isRestricted: Bool { grammar == .success(.dispatch) }
 }
 
 enum Platform: String, Decodable, Sendable, Equatable, CaseIterable {
@@ -586,9 +596,11 @@ extension ControllerConfig {
                 guard seenSystems.insert(system.id).inserted else {
                     throw ConfigProblem("Machine \"\(machine.id)\" has two systems with the id \"\(system.id)\".")
                 }
-                guard !system.agent.isEmpty else {
-                    throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" has no \"agent\" command. It has to be the argv to run over ssh.")
-                }
+                // A system with no agent command is not driven, and that is all it is: the shared
+                // schema allows it, a restricted key may empty one, and refusing the whole document
+                // for it would stop this device carrying a setup every other peer accepts.
+                // `warnings()` says so instead.
+                //
                 // The argv is run over ssh word by word, so an empty word or a control character in
                 // one is never something a person meant. The agent refuses the same items.
                 for item in system.agent where !SetupGuard.isAgentArg(item) {
@@ -700,7 +712,9 @@ extension ControllerConfig {
                 }
             }
             for system in machine.systems {
-                if case .failure(let refusal) = system.grammar {
+                if system.agent.isEmpty {
+                    out.append("\(system.name) on \(machine.name) has no agent command, so it is not driven.")
+                } else if case .failure(let refusal) = system.grammar {
                     out.append("\(system.name) on \(machine.name) is never sent anything. \(refusal.message)")
                 }
             }
@@ -984,6 +998,18 @@ final class ConfigStore {
     /// Called after a load that actually changed something, so the app can rebuild its machines.
     var onChange: (@MainActor () -> Void)?
 
+    /// Called with the document an edit made on this device started from, nil when there was none,
+    /// and the document it produced, just before that one is written. This is how a local edit
+    /// approves the launch values it changed (section 9.9 of the contract), before they can flash up
+    /// for review. Nothing that arrives from a peer passes through here.
+    var onLocalEdit: (@MainActor (_ before: Data?, _ after: Data) -> Void)?
+
+    /// This device's record of approved launch values: beside the applied-setup state, so it moves
+    /// with `LEGION_CONTROL_HOME` exactly as that does.
+    var approvalsURL: URL {
+        appliedStateURL.deletingLastPathComponent().appending(path: "approved-launch.json")
+    }
+
     init(url: URL? = nil, revisionsDirectory: URL? = nil, appliedStateURL: URL? = nil) {
         let resolvedURL = url ?? Self.defaultURL
         self.url = resolvedURL
@@ -1147,6 +1173,9 @@ final class ConfigStore {
             ) { _ in }
             let decoded = try JSONDecoder().decode(ControllerConfig.self, from: edited.bytes)
             _ = try decoded.validated()
+            // A hand edit that kept the controller block is an edit made on this device, so it
+            // approves the launch values it changed since the revision it was made to.
+            onLocalEdit?(previous, edited.bytes)
             expectedWriteHash = Canonical.sha256(edited.bytes)
             try AtomicFile.write(edited.bytes, to: url)
             load()
@@ -1216,7 +1245,7 @@ final class ConfigStore {
     /// Read through `FileManager` rather than `URL.resourceValues`, which caches on the URL object:
     /// the store holds one URL for its whole life, so the cached values would be answered forever and
     /// an edit made while the app was open would never be noticed.
-    private static func signature(of url: URL) -> String? {
+    static func signature(of url: URL) -> String? {
         let path = url.path(percentEncoded: false)
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
               let modified = attributes[.modificationDate] as? Date
@@ -1343,10 +1372,15 @@ final class ConfigStore {
     /// The edit takes effect here immediately — an offline edit is a first-class edit — and reaches
     /// the machines on the next poll, as a fast-forward from whatever they are holding. Returns nil
     /// on success or a sentence to show.
+    ///
+    /// An edit approves the launch values it changed, unless `approvesLaunchChanges` is false:
+    /// putting a kept revision back is an edit too, but what it restores was written by whoever
+    /// wrote that revision, not by the person pressing the button.
     @discardableResult
     func applyEdit(
         describedAs description: String,
         deviceName: String,
+        approvesLaunchChanges: Bool = true,
         change: (inout [String: Any]) throws -> Void
     ) -> String? {
         guard let raw = rawBytes ?? (try? Data(contentsOf: url)) else {
@@ -1367,6 +1401,7 @@ final class ConfigStore {
             let decoded = try JSONDecoder().decode(ControllerConfig.self, from: edited.bytes)
             _ = try decoded.validated()
 
+            if approvesLaunchChanges { onLocalEdit?(raw, edited.bytes) }
             keepRevision(try Canonical.bytes(raw))
             expectedWriteHash = Canonical.sha256(edited.bytes)
             try AtomicFile.write(edited.bytes, to: url)
@@ -1387,13 +1422,30 @@ final class ConfigStore {
     /// Adopt a document read off a machine, or produced by a merge.
     ///
     /// The bytes are written exactly as they are: this device is not the author, and re-serialising
-    /// them would change the hash and turn a fast-forward into a divergence.
+    /// them would change the hash and turn a fast-forward into a divergence. Adopting approves no
+    /// launch value: an automatic fetch, taking theirs, a merge and keeping mine all come through
+    /// here, and what the document asks this device to run waits for a person.
     @discardableResult
     func adopt(_ bytes: Data, describedAs description: String) -> String? {
+        adopt(bytes, describedAs: description, enrolling: false)
+    }
+
+    /// Adopt a document as this device's first setup, approving every launch value in it.
+    ///
+    /// Only for enrolment: a device that applies no setup yet, taking one a person chose after every
+    /// launch value in it was shown to them and they confirmed. The approvals are recorded before
+    /// the file is written, so nothing it runs flashes up for review.
+    @discardableResult
+    func enrol(_ bytes: Data, describedAs description: String) -> String? {
+        adopt(bytes, describedAs: description, enrolling: true)
+    }
+
+    private func adopt(_ bytes: Data, describedAs description: String, enrolling: Bool) -> String? {
         do {
             let canonical = try Canonical.bytes(bytes)
             let decoded = try JSONDecoder().decode(ControllerConfig.self, from: canonical)
             _ = try decoded.validated()
+            if enrolling { onLocalEdit?(nil, canonical) }
             if let raw = rawBytes ?? (try? Data(contentsOf: url)) {
                 keepRevision(try Canonical.bytes(raw))
             }
@@ -1426,7 +1478,8 @@ final class ConfigStore {
         else {
             return "The kept revision \(revision.shortHash) could not be read."
         }
-        return applyEdit(describedAs: "restored \(revision.name)", deviceName: deviceName) { root in
+        return applyEdit(describedAs: "restored \(revision.name)", deviceName: deviceName,
+                         approvesLaunchChanges: false) { root in
             // Everything is replaced except the identity, which carries on counting up and keeps its
             // lineage, so the machines see an ordinary new revision rather than a rollback.
             let identity = root["controller"]
@@ -1451,6 +1504,9 @@ final class ConfigStore {
             )
             let data = Data(Self.exampleConfig.utf8)
             expectedWriteHash = try Canonical.hash(data)
+            // The example is this app's own, written because a person asked for it, so what it runs
+            // is approved like any other edit made here.
+            onLocalEdit?(nil, data)
             try data.write(to: url, options: .atomic)
             load()
             return nil

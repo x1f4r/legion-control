@@ -111,6 +111,7 @@ enum ControllerEditor {
         }
         if let ssh = machine["ssh"] as? [String: Any] { try requireDialable(ssh) }
         for endpoint in (machine["endpoints"] as? [[String: Any]]) ?? [] { try requireDialable(endpoint) }
+        for system in (machine["systems"] as? [[String: Any]]) ?? [] { try requireRunnable(system) }
         var machines = (root["machines"] as? [[String: Any]]) ?? []
         if let index = machines.firstIndex(where: { $0["id"] as? String == id }) {
             var merged = machines[index]
@@ -143,6 +144,11 @@ enum ControllerEditor {
     static func upsertSystem(_ system: [String: Any], onMachine machineId: String, in root: inout [String: Any]) throws {
         try mutateMachine(machineId, in: &root) { machine in
             try upsertKeyed(system, in: &machine, list: "systems", what: "system")
+            // Checked as it ends up, after the merge: an entry that only renames a system keeps the
+            // command it had.
+            if let saved = (machine["systems"] as? [[String: Any]])?.first(where: { $0["id"] as? String == system["id"] as? String }) {
+                try requireRunnable(saved)
+            }
             guard var systems = machine["systems"] as? [[String: Any]],
                   let index = systems.firstIndex(where: { $0["id"] as? String == system["id"] as? String }),
                   systems[index]["platform"] as? String == "windows",
@@ -261,6 +267,53 @@ enum ControllerEditor {
         root["appUpdates"] = updates
     }
 
+    /// Put back a launch value this device approved, over the one waiting at that place: what a
+    /// review's Revert writes, as an ordinary edit that replicates (section 9.9 of the contract).
+    ///
+    /// A system's approval holds the grammar, not the fields it is worked out from, so the argv is
+    /// written back as it was and `restricted` and `shell` are moved only as far as it takes for
+    /// section 15.1 to give the approved grammar again.
+    static func restoreLaunchValue(_ value: LaunchValue, at location: LaunchLocation, in root: inout [String: Any]) throws {
+        switch (location, value) {
+        case (.system(let machineId, let systemId), .tuple(let tuple)):
+            try mutateMachine(machineId, in: &root) { machine in
+                var systems = (machine["systems"] as? [[String: Any]]) ?? []
+                guard let index = systems.firstIndex(where: { $0["id"] as? String == systemId }) else {
+                    throw EditFailure("\(machineId) no longer has the system \"\(systemId)\".")
+                }
+                var system = systems[index]
+                system["agent"] = tuple.agent
+                func grammarMatches() -> Bool {
+                    LaunchValues.tuple(of: system).map { LaunchValues.same($0.grammar, tuple.grammar) } ?? false
+                }
+                if !grammarMatches(), let grammar = tuple.commandGrammar {
+                    if grammar == .dispatch {
+                        system["restricted"] = true
+                    } else {
+                        system.removeValue(forKey: "restricted")
+                        if !grammarMatches() { system["shell"] = grammar.rawValue }
+                    }
+                }
+                systems[index] = system
+                machine["systems"] = systems
+            }
+        case (.identityFile(let machineId), .text(let path)):
+            try mutateMachine(machineId, in: &root) { machine in
+                var ssh = (machine["ssh"] as? [String: Any]) ?? [:]
+                ssh["identityFile"] = path
+                machine["ssh"] = ssh
+            }
+        case (.repo, .text(let repo)):
+            try setUpdateRepo(repo, in: &root)
+        case (.local, .local(let agent)):
+            var local = (root["local"] as? [String: Any]) ?? [:]
+            if let agent { local["agent"] = agent } else { local.removeValue(forKey: "agent") }
+            root["local"] = local
+        default:
+            throw EditFailure("That value does not belong at \(location.path).")
+        }
+    }
+
     /// Take this device's private settings out of the shared document.
     ///
     /// Never done on its own. `machine.ssh.identityFile` is a path that means something on exactly
@@ -295,6 +348,21 @@ enum ControllerEditor {
         let target = SSHTarget(host: host, user: entry["user"] as? String, port: entry["port"] as? Int, identityFile: nil)
         if let part = Addresses.undialablePart(of: target) {
             throw EditFailure("\(target.display) cannot be saved: \(part) is not one this app dials, scans or pins.")
+        }
+    }
+
+    /// Refuses a system whose command could not be run or approved (section 9.9 of the contract):
+    /// no argv at all, an empty word, a control character, or an invisible or direction-changing
+    /// character that would make the command a person reads differ from the one that runs.
+    ///
+    /// A peer's copy may carry any of these, and this app keeps it and does not drive that system.
+    /// An editor is where a person is typing one, so it is refused there instead. An empty argv
+    /// matters beyond this device too: a 1.3 Mac refuses a whole document that holds one.
+    private static func requireRunnable(_ system: [String: Any]) throws {
+        let id = system["id"] as? String ?? "this system"
+        guard let argv = system["agent"] as? [String], !argv.isEmpty,
+              argv.allSatisfy({ SetupGuard.isAgentArg($0) && LaunchValues.isLaunchText($0) }) else {
+            throw EditFailure("\(id) needs an agent command of at least one argument, none of them empty or holding a control, invisible or direction-changing character.")
         }
     }
 

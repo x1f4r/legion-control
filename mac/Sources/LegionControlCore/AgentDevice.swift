@@ -107,6 +107,10 @@ final class DeviceCore {
     var controllerConfig: (@MainActor () -> ControllerDocument?)?
     /// Adopt a document read off this device's agent.
     var adoptSetup: (@MainActor (Data, String) -> String?)?
+    /// Take a document a person asked to take from this device's agent. With no setup applied here
+    /// that is enrolment: every launch value in it is shown, and nothing is written until the
+    /// person confirms. With one applied it is adopting a different setup, which approves nothing.
+    var takeSetup: (@MainActor (Data, ControllerIdentity, String) -> SetupTaking)?
     /// The bytes of the newest document both lineages remember, when this device kept them. Without
     /// it a merge can still be done, but every difference needs a decision instead of only the ones
     /// both sides touched.
@@ -285,6 +289,11 @@ extension AgentDevice {
     var adoptSetup: (@MainActor (Data, String) -> String?)? {
         get { core.adoptSetup }
         set { core.adoptSetup = newValue }
+    }
+
+    var takeSetup: (@MainActor (Data, ControllerIdentity, String) -> SetupTaking)? {
+        get { core.takeSetup }
+        set { core.takeSetup = newValue }
     }
 
     var setupBase: (@MainActor (ControllerIdentity, ControllerIdentity) -> Data?)? {

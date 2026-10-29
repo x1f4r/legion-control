@@ -94,8 +94,9 @@ struct RemoteAgent: Sendable {
     /// The order to try things in.
     ///
     /// Routes outer, systems inner. A system hint orders both routes and command shapes, while the
-    /// authenticated response establishes what is actually running. A system with no agent command
-    /// is never driven, so it is not tried at all.
+    /// authenticated response establishes what is actually running. A system with no agent command,
+    /// or one whose command this device has not approved, is never driven, so it is not tried at
+    /// all: no line is ever built for it, let alone sent.
     static func attempts(
         machine: Machine,
         preferredSystem: SystemConfig?,
@@ -104,7 +105,7 @@ struct RemoteAgent: Sendable {
         preferLAN: Bool = false
     ) -> [Attempt] {
         let allRoutes = machine.routes(bindings: bindings)
-        let drivable = machine.systems.filter { !$0.agent.isEmpty }
+        let drivable = machine.systems.filter { !$0.agent.isEmpty && $0.launchState != .notDriven }
         guard !allRoutes.isEmpty, !drivable.isEmpty else { return [] }
 
         var routes = allRoutes
@@ -179,6 +180,10 @@ struct RemoteAgent: Sendable {
         guard !attempts.isEmpty else {
             if machine.routes(bindings: bindings).isEmpty {
                 throw AgentFailure(.noRoute, detail: "\(machine.name) has no ssh host and no endpoints.", dispatch: .never)
+            }
+            if machine.systems.contains(where: { $0.launchState == .notDriven }) {
+                throw AgentFailure(.badRequest, detail: "No system on \(machine.name) has a command this device runs: either the setup names none, or the one it names is waiting for approval here.",
+                                   dispatch: .never)
             }
             throw AgentFailure(.badRequest, detail: CommandLineRefusal("no-command").message, dispatch: .never)
         }

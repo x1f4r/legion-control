@@ -13,6 +13,16 @@ struct SetupCopyState {
     var isSharing = false
 }
 
+/// What became of a setup a person asked to take from a device's agent.
+enum SetupTaking: Sendable, Equatable {
+    /// It is applied here.
+    case adopted
+    /// Nothing is applied yet: what it runs is on screen, waiting for the person to confirm it.
+    case awaitingConfirmation
+    /// It was not applied, and this says why.
+    case refused(String)
+}
+
 /// Everything the divergence sheet needs.
 struct SetupDivergence: Sendable, Identifiable {
     var machineId: String
@@ -298,19 +308,27 @@ extension AgentDevice {
     }
 
     /// Adopt what the agent holds, dropping this device's branch.
+    ///
+    /// On a device that applies no setup yet this is enrolment, and nothing is applied until the
+    /// person has seen every command the setup would have this device run and confirmed it.
     func adoptRemoteSetup() {
         Task { @MainActor in
             guard let fetched = await self.readRemoteDocument() else {
                 self.onStateChange?()
                 return
             }
-            if let problem = self.adoptSetup?(fetched.bytes, "took the setup from \(self.setupHolder)") {
-                self.setStatus(problem, isError: true)
-            } else {
+            let taking = self.takeSetup?(fetched.bytes, fetched.identity, self.setupHolder)
+                ?? .refused("The setup from \(self.setupHolder) has nowhere to go on this device.")
+            switch taking {
+            case .adopted:
                 self.setStatus("This device now uses the setup from \(self.setupHolder).")
                 self.core.setup.remoteIdentity = nil
                 self.core.setup.remoteLineageForHash = nil
                 self.core.setup.decision = .unknown
+            case .awaitingConfirmation:
+                self.setStatus("The setup from \(self.setupHolder) is waiting for you to confirm what it runs. Nothing has been applied yet.")
+            case .refused(let problem):
+                self.setStatus(problem, isError: true)
             }
             self.onStateChange?()
         }
