@@ -111,13 +111,20 @@ public class LaunchGateTests
         var directory = Path.Combine(home.Path, name);
         Directory.CreateDirectory(directory);
         if (applied is not null) File.WriteAllBytes(Path.Combine(directory, "config.json"), applied.Bytes);
-        var store = new ConfigStore(Path.Combine(directory, "config.json"), Path.Combine(directory, "setup-state.json"),
-            new SetupLedger(Path.Combine(directory, "revisions")), name, watch: false);
-        return new AppModel(store, runner ?? new FakeRunner(_ => FakeRunner.SshFailure("ssh: connect to host: Connection refused")),
+        return new AppModel(Store(home, name), runner ?? new FakeRunner(_ => FakeRunner.SshFailure("ssh: connect to host: Connection refused")),
             new OperationTracker(Path.Combine(directory, "operations.json")), DesktopSettings.Default, new RecordingSink(),
             Bindings.Empty,
             new AppUpdateSuggestions((repo, _) => updates?.Invoke(repo) ?? Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))),
             new LaunchApprovals(RecordPath(home, name)));
+    }
+
+    /// The setup files of the device [name], read by a store of their own: another process on the
+    /// same device, the command line beside the window for one.
+    private static ConfigStore Store(TempHome home, string name)
+    {
+        var directory = Path.Combine(home.Path, name);
+        return new ConfigStore(Path.Combine(directory, "config.json"), Path.Combine(directory, "setup-state.json"),
+            new SetupLedger(Path.Combine(directory, "revisions")), name, watch: false);
     }
 
     private static string RecordPath(TempHome home, string name) => Path.Combine(home.Path, name, "approved-launch.json");
@@ -540,6 +547,86 @@ public class LaunchGateTests
         store.Load();
         Assert.Equal(LaunchValues.SystemPath("pi", "linux"),
             Assert.Single(LaunchGate.Effective(store.Config!, store.Document, approvals.Current).Review).Path);
+    }
+
+    /// Mine is applied in the window when the command line, on the same files, takes theirs: two
+    /// branches from one parent, so the same setup id, revision and lineage. The window reads the
+    /// file either after the command line recorded it as applied or in the moment before.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TheirsTakenOnTheCommandLineIsNeverReadAsAnEditInTheWindow(bool recordedAsApplied)
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        using var window = Device(home, "laptop", applied: d0);
+        var mine = LaunchDocuments.Descendant(d0, root => LaunchDocuments.Machine(root, "tower")["name"] = "My tower");
+        var theirs = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "touch /tmp/x"));
+        Assert.Equal((mine.Identity.Id, mine.Identity.RevisionNumber), (theirs.Identity.Id, theirs.Identity.RevisionNumber));
+        Assert.Equal(mine.Identity.Lineage, theirs.Identity.Lineage);
+        Assert.Null(window.Config.Apply(mine, "adopted from pi"));
+        var approved = Record(home, "laptop").ToJsonString();
+        var state = Path.Combine(home.Path, "laptop", "setup-state.json");
+        var stateBefore = File.ReadAllBytes(state);
+
+        using (var line = Store(home, "laptop")) Assert.Null(line.Apply(theirs, "took the setup from tower"));
+        if (!recordedAsApplied) File.WriteAllBytes(state, stateBefore);
+        window.Config.Load();
+
+        Assert.Equal(theirs.Hash, window.Config.Document!.Hash);
+        Assert.Equal(approved, Record(home, "laptop").ToJsonString());
+        Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(window.LaunchReview).Path);
+        Assert.Equal(LaunchDocuments.Tower, Gated(window, "tower", "linux").Agent);
+    }
+
+    /// The command line adopts a document with no identity of its own, and the window reads the
+    /// file in the moment before the command line has recorded it or given it one.
+    [Fact]
+    public void AnUnidentifiedSetupTheCommandLineAdoptedIsNeverTheWindowsOwn()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        using var window = Device(home, "laptop", applied: d0);
+        var anonymous = LaunchDocuments.Root();
+        anonymous.Remove("controller");
+        LaunchDocuments.System(anonymous, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "touch /tmp/x");
+        var adopted = LaunchDocuments.Of(anonymous);
+        var approved = Record(home, "laptop").ToJsonString();
+        var state = Path.Combine(home.Path, "laptop", "setup-state.json");
+        var stateBefore = File.ReadAllBytes(state);
+
+        using (var line = Store(home, "laptop")) Assert.Null(line.Apply(adopted, "took the setup from tower"));
+        File.WriteAllBytes(state, stateBefore);
+        File.WriteAllBytes(window.Config.Path, adopted.Bytes);
+        window.Config.Load();
+
+        Assert.Equal(approved, Record(home, "laptop").ToJsonString());
+        Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(window.LaunchReview).Path);
+        Assert.Equal(LaunchDocuments.Tower, Gated(window, "tower", "linux").Agent);
+    }
+
+    [Fact]
+    public void AHandEditOfWhatTheCommandLineTookApprovesOnlyWhatThePersonChanged()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        using var window = Device(home, "laptop", applied: d0);
+        Assert.Null(window.Config.Apply(LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.Machine(root, "tower")["name"] = "My tower"), "adopted from pi"));
+        var theirs = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "touch /tmp/x"));
+        using (var line = Store(home, "laptop")) Assert.Null(line.Apply(theirs, "took the setup from tower"));
+
+        // Edited by hand, keeping its controller block, before the window looked at the file. It
+        // was made to theirs, not to the mine the window last applied.
+        File.WriteAllText(window.Config.Path, theirs.Text.Replace(LaunchDocuments.Pi[1], "/srv/pi/bin/launcher.mjs"));
+        window.Config.Load();
+
+        Assert.Contains(theirs.Hash, window.Config.Document!.Identity.Lineage);
+        Assert.Equal(new[] { "node", "/srv/pi/bin/launcher.mjs" }, Gated(window, "pi", "linux").Agent);
+        Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(window.LaunchReview).Path);
+        Assert.Equal(LaunchDocuments.Tower, Gated(window, "tower", "linux").Agent);
     }
 
     [Fact]

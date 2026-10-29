@@ -27,6 +27,7 @@ public sealed class ConfigStore : IDisposable
     private FileSystemWatcher? _watcher;
     private string? _lastSignature;
     private AppliedSetup _applied = new();
+    private string? _appliedSignature;
     private readonly object _gate = new();
 
     /// [localEdit] is subscribed to [LocalEdit] before the file is first read, because that first
@@ -44,7 +45,6 @@ public sealed class ConfigStore : IDisposable
         Ledger = ledger ?? new SetupLedger();
         DeviceName = deviceName ?? Environment.MachineName;
         if (localEdit is not null) LocalEdit += localEdit;
-        _applied = AppliedSetup.Load(StatePath);
         Load();
         if (watch) StartWatching();
     }
@@ -75,7 +75,8 @@ public sealed class ConfigStore : IDisposable
     ///
     /// Raised by [ApplyEdit], by a hand edit of the file that keeps its `controller` block, by a
     /// file with no identity that is given one here, and by [WriteExample]. Never by [Apply] or
-    /// [ApplyIfCurrent]: what another peer wrote, a merge and a kept revision approve nothing.
+    /// [ApplyIfCurrent], and never for a document either of those wrote, here or in another process
+    /// on this device: what another peer wrote, a merge and a kept revision approve nothing.
     public event Action<byte[]?, ControllerDocument>? LocalEdit;
 
     public IReadOnlyList<MachineConfig> Machines => Config?.Machines ?? Array.Empty<MachineConfig>();
@@ -151,6 +152,11 @@ public sealed class ConfigStore : IDisposable
             return;
         }
 
+        // The window and the command line both adopt documents into this file. What the other one
+        // applied counts as applied here too, or its Take theirs would read as an edit of the
+        // revision it replaced.
+        ReloadApplied();
+
         // A document that carries no identity of its own becomes a setup here and now, before it is
         // applied or published. Without one, two devices holding the same hand-written file would
         // look like two different setups to every machine they reach.
@@ -158,8 +164,11 @@ public sealed class ConfigStore : IDisposable
         {
             var assigned = ControllerIdentity.NewSetup(decoded.Identity.Name, DeviceName);
             // A file with no identity is the user's own: one written by hand, or the first one on
-            // this device. Whatever it changed from what was applied here is theirs.
-            if (StampIdentity(assigned, data, "assigned-setup-id", AppliedEditedFrom()) is { } stampProblem)
+            // this device. Whatever it changed from what was applied here is theirs. One that a
+            // process here adopted is stamped onto exactly itself, so nothing it carries counts as
+            // changed.
+            var editedFrom = WasAdopted(document) ? new EditedFrom(document.Bytes) : AppliedEditedFrom();
+            if (StampIdentity(assigned, data, "assigned-setup-id", editedFrom) is { } stampProblem)
             {
                 Problem = stampProblem;
                 return;
@@ -172,9 +181,15 @@ public sealed class ConfigStore : IDisposable
         // A file somebody edited by hand carries the identity of the revision it was edited from.
         // That is an edit like any other: it gets the next revision, and the document it came from
         // goes into the lineage so every machine holding that document fast-forwards to this one.
+        //
+        // Two branches edited from the same parent carry the same identity, so a sibling that a
+        // process here adopted looks exactly like a hand edit of the one it replaced, and would
+        // approve every launch value it changed. It is told apart by being kept, which it already
+        // is when the file changes.
         if (_applied.Hash is { } applied
             && applied != document.Hash
-            && _applied.MatchesIdentityOf(document.Identity))
+            && _applied.MatchesIdentityOf(document.Identity)
+            && !WasAdopted(document))
         {
             var next = document.Identity.Next(applied, DeviceName);
             if (StampIdentity(next, data, "hand-edit", AppliedEditedFrom()) is { } stampProblem)
@@ -205,15 +220,27 @@ public sealed class ConfigStore : IDisposable
     /// it never applied one, and null when it did but those bytes are no longer anywhere. Without
     /// them nobody can say which launch values the edit changed, so it approves none of them and
     /// they wait for review like any other.
-    ///
-    /// A document handed over by another peer is recorded as applied before it is read back, so
-    /// when it has no identity of its own, the one it is given here is stamped onto exactly what
-    /// was applied: nothing it carries counts as changed, and it approves nothing.
     private EditedFrom? AppliedEditedFrom()
     {
         if (_applied.Hash is not { } hash) return new EditedFrom(null);
         if (Document?.Hash == hash) return new EditedFrom(Document.Bytes);
         return Ledger.Read(hash) is { } kept ? new EditedFrom(kept.Bytes) : null;
+    }
+
+    /// Whether the file holds a document that a process on this device adopted rather than one a
+    /// person wrote. [ApplyCore] keeps what it adopts before it writes the file, so this holds even
+    /// while the applied state still names the document before it: the window can read the file
+    /// the command line just wrote before the command line has recorded it as applied.
+    private bool WasAdopted(ControllerDocument document) => Ledger.Has(document.Hash);
+
+    /// Reads the applied state again when another process wrote it since this one last read or
+    /// wrote it.
+    private void ReloadApplied()
+    {
+        var signature = Signature(StatePath);
+        if (signature == _appliedSignature) return;
+        _appliedSignature = signature;
+        _applied = AppliedSetup.Load(StatePath);
     }
 
     /// Rewrites only the `controller` block of the file on disk, keeping everything else exactly as
@@ -284,8 +311,10 @@ public sealed class ConfigStore : IDisposable
             var problems = document.Decoded.Problems();
             if (problems.Count > 0) return string.Join(" ", problems);
             if (Document is not null) Ledger.Remember(Document);
-            AtomicWrite.Bytes(Path, document.Bytes);
+            // Kept before it is written, so that another process reading the file in the moment
+            // before it is recorded as applied still knows it for an adoption (see [WasAdopted]).
             Ledger.Remember(document);
+            AtomicWrite.Bytes(Path, document.Bytes);
             RecordApplied(document);
             _lastSignature = null;
             Load();
@@ -372,11 +401,13 @@ public sealed class ConfigStore : IDisposable
             Revision = document.Identity.RevisionNumber,
             Lineage = document.Identity.Lineage,
         };
+        ReloadApplied();
         if (applied == _applied) return;
         _applied = applied;
         try
         {
             applied.Save(StatePath);
+            _appliedSignature = Signature(StatePath);
         }
         catch (Exception)
         {
