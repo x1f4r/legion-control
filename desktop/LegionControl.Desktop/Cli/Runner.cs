@@ -845,7 +845,7 @@ public static class Runner
                 return false;
             }
             if (!StillCurrent()) return Failed;
-            var installer = new AppInstaller();
+            var installer = new AppInstaller { HealthWindow = app.Settings.UpdateHealthWindow };
             var archive = installer.DownloadPath(ready.Artifact.Name);
             var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, token);
             if (!StillCurrent()) return Failed;
@@ -854,7 +854,9 @@ public static class Runner
             if (staged is null) { output.WriteLine(stageProblem); return Failed; }
             if (!StillCurrent()) return Failed;
             var (started, failure) = installer.Apply();
-            output.WriteLine(started ? "Verified update staged; the helper will replace and launch the app after this command exits. Completion is pending." : failure);
+            output.WriteLine(started
+                ? $"Verified update staged; the helper will replace and launch the app after this command exits. Completion is pending; the helper writes what it does to {installer.LogPath}."
+                : failure);
             return started ? NotKnown : Failed;
         }
         return availability is UpdateAvailability.Unavailable ? Failed : Ok;

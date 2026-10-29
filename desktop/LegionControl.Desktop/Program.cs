@@ -1,6 +1,7 @@
 using Avalonia;
 using LegionControl.Desktop.Cli;
 using LegionControl.Desktop.Config;
+using LegionControl.Desktop.Updates;
 
 namespace LegionControl.Desktop;
 
@@ -27,6 +28,10 @@ internal static class Program
             AppLog.Write("a background task nobody waited for", unobserved.Exception);
             unobserved.SetObserved();
         };
+
+        // Every copy holds this until it exits, the window and the command line alike, so an
+        // update helper never renames the installation while one runs from it.
+        using var instance = InstanceLock.Share(TimeSpan.FromSeconds(30));
 
         // A bare verb is part of the documented CLI too. Treat an unknown bare verb as a CLI
         // error rather than quietly opening a window and ignoring it.

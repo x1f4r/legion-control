@@ -960,7 +960,7 @@ public sealed class MainWindow : Window
         if (!StillCurrent()) return;
         if (!await Sheets.AskAsync(this, "App update available", ready.Sentence_, "Download and verify")) return;
         if (!StillCurrent()) return;
-        var installer = new AppInstaller();
+        var installer = new AppInstaller { HealthWindow = _app.Settings.UpdateHealthWindow };
         var archive = installer.DownloadPath(ready.Artifact.Name);
         var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, _updateLifetime.Token);
         if (!StillCurrent()) return;

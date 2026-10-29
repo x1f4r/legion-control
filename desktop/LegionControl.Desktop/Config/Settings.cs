@@ -33,6 +33,15 @@ public sealed record DesktopSettings
 
     public bool CheckForAppUpdates { get; init; } = true;
 
+    /// How long a new build has, after an update, to draw its window before the helper stops it
+    /// and puts the build before it back. A minute by default; a slow machine may need more.
+    public int UpdateHealthSeconds { get; init; } = (int)Updates.AppInstaller.DefaultHealthWindow.TotalSeconds;
+
+    /// [UpdateHealthSeconds] as the helper is given it: never so short that a working build is
+    /// undone for taking a moment, nor so long that a broken one leaves nothing open for an hour.
+    [JsonIgnore]
+    public TimeSpan UpdateHealthWindow => TimeSpan.FromSeconds(Math.Clamp(UpdateHealthSeconds, 10, 600));
+
     public static DesktopSettings Default => new();
 
     private static readonly JsonSerializerOptions Options = new()

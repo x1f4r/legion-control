@@ -104,6 +104,12 @@ for runtime in $targets; do
     -p:DebugType=none \
     --output "$staging"
 
+  # The names the release puts at the top of the directory it is unpacked into. An update swaps
+  # that whole directory, and refuses to while it holds anything this list and the new release do
+  # not name, so a file a later release drops is still known for one of this app's own.
+  (cd "$staging" && { ls -A; echo legion-control.contents; } | LC_ALL=C sort -u) > "$here/artifacts/$runtime.contents"
+  mv "$here/artifacts/$runtime.contents" "$staging/legion-control.contents"
+
   # Archives carry stable metadata as well as stable file bytes. 1980 is the earliest timestamp
   # zip can represent, and the generated staging tree is safe to normalise in place.
   find "$staging" -exec touch -t 198001010000 {} +
