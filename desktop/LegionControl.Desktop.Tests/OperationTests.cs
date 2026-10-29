@@ -541,6 +541,36 @@ public class MachineRequestTests
     }
 
     [Fact]
+    public void AServiceDeclaredNeverBusyIsWatchedAndNothingWarns()
+    {
+        // `busy.type: "none"` is an answer (contract section 6). Agent 3.1.0 says monitored true;
+        // agents before it said monitored false beside the same evidence, and that is not a gap.
+        var services = Value.Parse(Repo.ReadContract("fixtures/busy.declared-none.json"))["services"].AsArray();
+        var none = BusyState.From(services[0])!;
+        Assert.Equal("none", none.Evidence);
+        Assert.False(none.IsUnmonitored);
+        Assert.True(BusyState.From(services[1])!.IsUnmonitored);
+        var legacy = AgentStatus.From(Value.Parse("""
+            { "ok": true, "contract": 3, "agentVersion": "3.0.1",
+              "services": [ { "id": "demo", "busy": { "busy": false, "unknown": false, "monitored": false,
+                              "reason": "declared never busy", "evidence": "none" } } ] }
+            """));
+        var declared = legacy.Service("demo")!.Busy!;
+        Assert.False(declared.IsUnmonitored);
+        Assert.True(declared.IsSafeToDisturb);
+        Assert.IsType<BusyVerdict.Idle>(BusyVerdict.Read(legacy, "demo"));
+        Assert.False(Confirmation.For(new MachineRequest { Kind = RequestKind.Restart, Service = "demo" }, legacy, "Pi").NeedsForce);
+
+        // Only the evidence of a missing probe is unwatched, and that still blocks.
+        var unwatched = AgentStatus.From(Value.Parse("""
+            { "ok": true, "contract": 3,
+              "services": [ { "id": "edge", "busy": { "busy": true, "unknown": true, "monitored": false, "evidence": "unmonitored" } } ] }
+            """));
+        Assert.True(unwatched.Service("edge")!.Busy!.IsUnmonitored);
+        Assert.IsType<BusyVerdict.Unknown>(BusyVerdict.Read(unwatched, "edge"));
+    }
+
+    [Fact]
     public void TheConfirmationSaysWhatForceDoesAndDoesNot()
     {
         var status = AgentStatus.From(Value.Parse("""

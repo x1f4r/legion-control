@@ -65,7 +65,8 @@ public sealed record BusyState
 {
     public bool Busy { get; init; }
     public bool Unknown { get; init; }
-    /// Null on an agent that predates the idea. Treated as unmonitored only when the agent says so.
+    /// Null on an agent that predates the idea. Kept as sent; whether anything watches the service
+    /// is [IsUnmonitored]'s to say, from the evidence.
     public bool? Monitored { get; init; }
     public string? Reason { get; init; }
     /// t3-sqlite | command | http | none | unmonitored | probe-error | timed-out
@@ -111,9 +112,14 @@ public sealed record BusyState
         };
     }
 
-    /// Whether the busy state is unwatched: the agent said so, or it reported an evidence of
-    /// "unmonitored". Missing configuration is unmonitored, and unmonitored is not idle.
-    public bool IsUnmonitored => Monitored == false || Evidence == "unmonitored";
+    /// Whether the busy state is unwatched: the agent reported an evidence of "unmonitored", which
+    /// is what missing configuration reads as, and unmonitored is not idle.
+    ///
+    /// Only the evidence says so. A service configured `busy.type: "none"` is declared never busy,
+    /// which is an answer rather than a gap (contract section 6), and an agent before 3.1.0 sends
+    /// it, and a machine with no services, with `monitored: false` beside `evidence: "none"`.
+    /// Reading that as unwatched would warn about, and ask to force past, a setting somebody chose.
+    public bool IsUnmonitored => Evidence == "unmonitored";
 
     /// Whether a disruptive change may go ahead without the user being asked to force it.
     ///
