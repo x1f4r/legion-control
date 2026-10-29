@@ -1395,6 +1395,59 @@ public class LaunchGateTests
         }
     }
 
+    /// The same file read out while tower's command waits, with its controller block taken out:
+    /// nothing in it says it is from before the revert.
+    [Fact]
+    public async Task TheCommandLineEditTakesAFileWithNoControllerBlockOnlyAgainstTheSetupItNames()
+    {
+        using var home = new TempHome();
+        var record = Path.Combine(home.Path, "approved-launch.json");
+        var d0 = LaunchDocuments.Of(Unreachable(LaunchDocuments.Root()));
+        File.WriteAllText(record, LaunchRecord.Seeded(LaunchProjection.Of(d0), d0.Hash).ToJson().ToJsonString());
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "id"));
+        File.WriteAllBytes(home.ConfigPath, d1.Bytes);
+        var exported = Path.Combine(home.Path, "exported.json");
+        void Strip()
+        {
+            var root = JsonNode.Parse(File.ReadAllText(exported))!.AsObject();
+            root.Remove("controller");
+            File.WriteAllText(exported, root.ToJsonString().Replace("\"Beacon\"", "\"Pi upstairs\""));
+        }
+        Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, home.ConfigPath);
+        try
+        {
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--out", exported }, new StringWriter()));
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(
+                new[] { "--command", "setup", "--revert-launch", "machines[tower].systems[linux]" }, new StringWriter()));
+            var reverted = ControllerDocument.FromRaw(File.ReadAllBytes(home.ConfigPath));
+            var approved = File.ReadAllText(record);
+            Strip();
+
+            var unnamed = new StringWriter();
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "edit", "--in", exported }, unnamed));
+            Assert.Contains("has no controller block", unnamed.ToString());
+            Assert.DoesNotContain(reverted.Hash, unnamed.ToString());
+            var earlier = new StringWriter();
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "edit", "--in", exported, "--hash", d1.Hash }, earlier));
+            Assert.Contains("was not read out from the setup this device holds now", earlier.ToString());
+            Assert.Equal(reverted.Bytes, File.ReadAllBytes(home.ConfigPath));
+            Assert.Equal(approved, File.ReadAllText(record));
+
+            // Read out from the setup as it is now and named by its hash, the same rename applies.
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--out", exported }, new StringWriter()));
+            Strip();
+            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--in", exported, "--hash", reverted.Hash }, new StringWriter()));
+            var applied = ControllerDocument.FromRaw(File.ReadAllBytes(home.ConfigPath));
+            Assert.Equal("Pi upstairs", applied.Decoded.Machine("pi")!.Name);
+            Assert.Equal(LaunchDocuments.Tower, LaunchProjection.Of(applied).TupleAt("tower", "linux")!.Agent);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(AppPaths.ConfigOverride, null);
+        }
+    }
+
     /// The same setup with no address anywhere, so a command-line run never reaches for ssh.
     private static JsonObject Unreachable(JsonObject root)
     {

@@ -107,11 +107,13 @@ waits for review.
 An edit made here approves what it changed. In the editor and with `--command edit --in`, it is
 refused when the setup moved on since the text was read (start again from the setup as it is now),
 and when it changes a command that waits for approval or carries one somewhere else: under a renamed
-machine or on a new system, with or without a shell of its own. A hand edit of the file that keeps
-its `controller` block is never refused, because it is already written when it is read: it applies,
-approves what it changed, and leaves a waiting command it changed or carried waiting. Importing a
-setup into a device that has none approves everything in it, after showing all of it. Nothing that
-arrives from another peer approves anything, and neither do merges.
+machine or on a new system, with or without a shell of its own. A file given to
+`--command edit --in` without its `controller` block also needs `--hash HASH`, the setup it was
+written against. A hand edit of the file that keeps its `controller` block is never refused, because
+it is already written when it is read: it applies, approves what it changed, and leaves a waiting
+command it changed or carried waiting. Importing a setup into a device that has none approves
+everything in it, after showing all of it. Nothing that arrives from another peer approves anything,
+and neither do merges.
 
 `--approve-launch` takes the hash the listing printed, and approves nothing once the setup is no
 longer that document, so a revision adopted in between is never approved unseen.

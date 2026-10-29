@@ -814,15 +814,26 @@ public static class Runner
             // The file was read out from one revision and is applied as an edit of it. Over any
             // other it would put back what that one held, a command reverted since included, and an
             // edit approves what it changes. A file without a controller block says nothing about
-            // where it came from, and is taken as written against the setup as it is.
+            // where it came from, so while a setup is applied it is taken only with --hash naming
+            // the one it was written against, as --command setup prints it.
             var applied = app.Config.Document;
             var readFrom = ControllerIdentity.From(Value.Parse(text)["controller"]);
-            if (applied is not null && readFrom.HasIdentity
-                && (readFrom.Id != applied.Identity.Id || readFrom.RevisionNumber != applied.Identity.RevisionNumber
-                    || readFrom.UpdatedAt != applied.Identity.UpdatedAt
-                    || !readFrom.Lineage.SequenceEqual(applied.Identity.Lineage, StringComparer.Ordinal)))
+            var named = line.Value("hash");
+            if (applied is not null && !readFrom.HasIdentity && named is null)
             {
-                output.WriteLine($"{input} was not read out from the setup this device holds now (revision {applied.Identity.RevisionNumber}, hash {applied.Hash}). Nothing was applied.");
+                output.WriteLine($"{input} has no controller block, so it does not say which setup it was read out from. Nothing was applied.");
+                output.WriteLine("Read it out again with --command edit --out PATH, or name the setup it was written against with --hash HASH.");
+                return Failed;
+            }
+            if ((named is not null && named != applied?.Hash)
+                || (applied is not null && readFrom.HasIdentity
+                    && (readFrom.Id != applied.Identity.Id || readFrom.RevisionNumber != applied.Identity.RevisionNumber
+                        || readFrom.UpdatedAt != applied.Identity.UpdatedAt
+                        || !readFrom.Lineage.SequenceEqual(applied.Identity.Lineage, StringComparer.Ordinal))))
+            {
+                output.WriteLine(applied is null
+                    ? $"This device holds no setup for {input} to be an edit of. Nothing was applied."
+                    : $"{input} was not read out from the setup this device holds now (revision {applied.Identity.RevisionNumber}, hash {applied.Hash}). Nothing was applied.");
                 output.WriteLine("Read it out again with --command edit --out PATH, make the change there, and apply that.");
                 return Failed;
             }
@@ -1177,7 +1188,10 @@ public static class Runner
           --command bindings [--device NAME] [--self MACHINE [--system ID]] [--clear-self]
                              [--local-agent "node /path/to/agent/src/index.mjs"]
                              [--identity ~/.ssh/key] [--site ID] [--machine ID --alias NAME]
-          --command edit --in FILE            apply an edited document as the next revision
+          --command edit --in FILE [--hash HASH]
+                                              apply an edited document as the next revision; a file
+                                              with no controller block needs the hash of the setup
+                                              it was written against
 
         The setup, when peers disagree. Each is a decision, and none of them happens on its own:
           --reconcile-once                    one pass: publish where behind, adopt where ahead
