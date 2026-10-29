@@ -437,6 +437,40 @@ struct LaunchGateTests {
         #expect(!recorder.destinations.contains { $0.contains("192.0.2.60") })
     }
 
+    @Test("the enrolment summary marks each value confirming cannot approve, and exactly those come back for review")
+    func enrolmentMarksWhatItCannotApprove() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try Self.app(nil, in: home)
+        let hidden = ["/usr/bin/node", "/home/me/.legion-control/bin/\u{202E}sjm.rehcnual"]
+        let document = try Self.held { root in
+            Self.system("tower", "linux", in: &root) { $0["agent"] = hidden }
+            // A restricted key with three words, which the dispatcher refuses.
+            Self.system("pi", "linux", in: &root) { $0["agent"] = Self.piLauncher + ["--verbose"] }
+        }
+        let identity = try JSONDecoder().decode(ControllerConfig.self, from: document).identity
+        #expect(app.takeSetup(document, identity: identity, from: "Tower") == .awaitingConfirmation)
+        let marked = try #require(app.enrolment).unapprovable
+        #expect(marked.map(\.path) == ["machines[tower].systems[linux]", "machines[pi].systems[linux]"])
+        #expect(LaunchText.whyNotEnrolled(marked[0]).hasPrefix("It holds a control, invisible or direction-changing character"))
+        #expect(LaunchText.whyNotEnrolled(marked[1]).hasPrefix("This command is never sent anywhere."))
+        #expect(marked.allSatisfy { LaunchText.whyNotEnrolled($0).hasSuffix("Confirming does not approve it, so this device does not run it.") })
+
+        #expect(app.confirmEnrolment() == nil)
+        #expect(app.launchReview.map(\.path) == marked.map(\.path))
+        #expect(app.launchReview.allSatisfy { !$0.approvable && $0.approved == nil })
+        let tower = try #require(app.machine(id: "tower")?.machine)
+        #expect(tower.system(id: "windows")?.launchState == .approved)
+        #expect(tower.system(id: "linux")?.launchState == .notDriven)
+
+        // The editor reads the document as written, where that system is still marked restricted
+        // although no grammar can be worked out for it.
+        let pi = try #require(app.config.config?.machine(id: "pi")?.system(id: "linux"))
+        #expect(pi.restricted == true)
+        #expect(!pi.isRestricted)
+        #expect(pi.grammar == .failure(CommandLineRefusal("restricted-agent-shape")))
+    }
+
     @Test("a setup taken from an agent with none applied waits for confirmation; with one applied it approves nothing")
     func takingAnAgentsSetup() async throws {
         let runner = MacModelTests.FakeRunner()

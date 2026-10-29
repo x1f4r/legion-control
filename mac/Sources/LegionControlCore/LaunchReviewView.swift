@@ -13,11 +13,9 @@ struct LaunchReviewView: View {
 
     @State private var problem: String?
 
-    private var entries: [LaunchReviewEntry] { model.launchReview }
-
     /// Machines in the order the setup lists them, then whatever is about this device itself.
     /// Grouped by id and titled by name, so two machines that happen to share a name stay apart.
-    private var groups: [(id: String, title: String, entries: [LaunchReviewEntry])] {
+    private func groups(_ entries: [LaunchReviewEntry]) -> [(id: String, title: String, entries: [LaunchReviewEntry])] {
         var groups: [(id: String, title: String, entries: [LaunchReviewEntry])] = []
         for entry in entries {
             let id = entry.location.machineId.map { "machine:" + $0 } ?? "device"
@@ -32,6 +30,9 @@ struct LaunchReviewView: View {
     }
 
     var body: some View {
+        // Approve all records the rows this pass draws, not whatever the model holds when it is
+        // pressed: a document adopted before the sheet redraws would otherwise be approved unseen.
+        let shown = model.launchReview
         VStack(alignment: .leading, spacing: 0) {
             PageHeading(title: "Approve commands from the shared setup")
 
@@ -40,7 +41,7 @@ struct LaunchReviewView: View {
             QuietNote(text: "Approving lets this device run this command over ssh with its own key.")
                 .padding(.top, 6)
 
-            ForEach(groups, id: \.id) { group in
+            ForEach(groups(shown), id: \.id) { group in
                 SectionHeading(title: group.title)
                 VStack(alignment: .leading, spacing: 22) {
                     ForEach(group.entries) { entry in row(entry) }
@@ -57,8 +58,8 @@ struct LaunchReviewView: View {
             }
 
             FlowRow(spacing: 10) {
-                if entries.filter(\.approvable).count > 1 {
-                    Button("Approve all") { model.approveLaunch(entries) }
+                if shown.filter(\.approvable).count > 1 {
+                    Button("Approve all") { model.approveLaunch(shown) }
                 }
                 // The answer that changes nothing is the one Return gives.
                 Button("Not now") { model.deferLaunchReview(model.config.hash) }
@@ -119,7 +120,8 @@ struct LaunchReviewView: View {
 ///
 /// Enrolment approves a whole document a peer wrote, which nothing else does, so every launch value
 /// in it is on screen here: each machine and system with its argv and grammar, any identity file,
-/// a repository other than the built-in one, and a local agent. Cancel applies nothing.
+/// a repository other than the built-in one, and a local agent. A value nothing could approve is
+/// marked where it is drawn, because confirming does not approve it either. Cancel applies nothing.
 struct LaunchEnrolmentView: View {
     let model: AppModel
     let enrolment: LaunchEnrolment
@@ -129,12 +131,15 @@ struct LaunchEnrolmentView: View {
     private var projection: LaunchProjection { enrolment.projection }
 
     var body: some View {
+        let held = Dictionary(enrolment.unapprovable.map { ($0.location, $0) }, uniquingKeysWith: { first, _ in first })
         VStack(alignment: .leading, spacing: 0) {
             PageHeading(title: "Use the setup from \(enrolment.holder)?")
 
             Text(LaunchText.provenance(enrolment.identity))
                 .fixedSize(horizontal: false, vertical: true)
-            QuietNote(text: "Confirming applies this setup and lets this device run each command below over ssh with its own key. Cancel applies nothing.")
+            QuietNote(text: held.isEmpty
+                      ? "Confirming applies this setup and lets this device run each command below over ssh with its own key. Cancel applies nothing."
+                      : "Confirming applies this setup and lets this device run each command below over ssh with its own key, except the ones marked as not approved. Cancel applies nothing.")
                 .padding(.top, 6)
 
             ForEach(projection.machines, id: \.id) { machine in
@@ -142,13 +147,13 @@ struct LaunchEnrolmentView: View {
                 SectionHeading(title: named?.name ?? machine.id)
                 VStack(alignment: .leading, spacing: 14) {
                     ForEach(machine.systems, id: \.id) { system in
-                        DetailRow(label: named?.system(id: system.id)?.name ?? system.id) {
-                            LaunchValueText(value: system.tuple.map(LaunchValue.tuple), scope: .system,
-                                            absent: "no command, so it is not driven")
-                        }
+                        let location = LaunchLocation.system(machine: machine.id, system: system.id)
+                        row(named?.system(id: system.id)?.name ?? system.id, system.tuple.map(LaunchValue.tuple),
+                            at: location, held: held[location])
                     }
                     if let path = machine.identityFile {
-                        DetailRow(label: "Identity file") { LaunchValueText(value: .text(path), scope: .identityFile) }
+                        let location = LaunchLocation.identityFile(machine: machine.id)
+                        row("Identity file", .text(path), at: location, held: held[location])
                     }
                 }
             }
@@ -157,10 +162,10 @@ struct LaunchEnrolmentView: View {
                 SectionHeading(title: "This device")
                 VStack(alignment: .leading, spacing: 14) {
                     if let repo = projection.repo {
-                        DetailRow(label: "Update repository") { LaunchValueText(value: .text(repo), scope: .repo) }
+                        row("Update repository", .text(repo), at: .repo, held: held[.repo])
                     }
                     if let local = projection.local {
-                        DetailRow(label: "Local agent") { LaunchValueText(value: .local(agent: local.agent), scope: .local) }
+                        row("Local agent", .local(agent: local.agent), at: .local, held: held[.local])
                     }
                 }
             }
@@ -181,6 +186,20 @@ struct LaunchEnrolmentView: View {
                     .keyboardShortcut(.cancelAction)
             }
             .padding(.top, 24)
+        }
+    }
+
+    /// One launch value, with why confirming leaves it unapproved when nothing could approve it.
+    /// Only a system's value can be absent here, and an absent one runs nothing.
+    private func row(_ label: String, _ value: LaunchValue?, at location: LaunchLocation,
+                     held: LaunchReviewEntry?) -> some View {
+        DetailRow(label: label) {
+            VStack(alignment: .leading, spacing: 4) {
+                LaunchValueText(value: value, scope: location.scope, absent: "no command, so it is not driven")
+                if let held {
+                    QuietNote(text: LaunchText.whyNotEnrolled(held))
+                }
+            }
         }
     }
 }
@@ -267,14 +286,25 @@ enum LaunchText {
 
     /// Why a value can only be reverted or left.
     static func whyNotApprovable(_ entry: LaunchReviewEntry) -> String {
+        "\(reason(entry)) It can only be reverted or left."
+    }
+
+    /// The same, in the enrolment summary: confirming does not approve it, so it is not run, and it
+    /// waits in the review afterwards like anything else nothing could approve.
+    static func whyNotEnrolled(_ entry: LaunchReviewEntry) -> String {
+        "\(reason(entry)) Confirming does not approve it, so this device does not run it."
+    }
+
+    /// What about a value keeps anyone from approving it.
+    private static func reason(_ entry: LaunchReviewEntry) -> String {
         switch entry.offered {
         case .tuple(let tuple) where tuple.commandGrammar == nil:
             let code = tuple.grammar.hasPrefix("refused:") ? String(tuple.grammar.dropFirst("refused:".count)) : tuple.grammar
-            return "This command is never sent anywhere, so it can only be reverted or left. \(CommandLineRefusal(code).message)"
+            return "This command is never sent anywhere. \(CommandLineRefusal(code).message)"
         case .text where entry.scope == .repo:
-            return "This is not a GitHub owner/name, so it can only be reverted or left."
+            return "This is not a GitHub owner/name."
         default:
-            return "It holds a control, invisible or direction-changing character, written out above, which would make what you read differ from what runs. It can only be reverted or left."
+            return "It holds a control, invisible or direction-changing character, written out above, which would make what you read differ from what runs."
         }
     }
 }

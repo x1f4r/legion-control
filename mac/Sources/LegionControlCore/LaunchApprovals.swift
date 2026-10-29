@@ -153,6 +153,17 @@ struct LaunchEnrolment: Sendable {
     var projection: LaunchProjection
     /// The same document decoded, for the machine and system names the summary shows.
     var config: ControllerConfig?
+
+    /// The values in it that confirming does not approve, because nothing could: an argv item or
+    /// path holding a hidden or direction-changing character, a grammar that is refused, a
+    /// repository that is not owner/name. Confirming is an edit made here, which records only what
+    /// can be approved, so these come back in the review as values that can only be left, and the
+    /// summary says so beside each of them rather than promising to run it.
+    var unapprovable: [LaunchReviewEntry] {
+        // With nothing recorded, every value the document offers is an entry, each saying whether
+        // it could be approved at all, which depends on the value alone.
+        LaunchValues.review(record: LaunchRecord(object: [:]), projection: projection).filter { !$0.approvable }
+    }
 }
 
 /// The file `approved-launch.json`, beside the applied-setup state, and what it says.
