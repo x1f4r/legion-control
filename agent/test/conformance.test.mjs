@@ -26,8 +26,9 @@ import { checkReply, schemaForCommand } from '../../contract/validate.mjs';
 import { OK_REPLY_ACTIONS } from '../../contract/tools/outcome.mjs';
 import { canonicalBytes, canonicalHash } from '../src/controller.mjs';
 import { acquireOperationLock } from '../src/lock.mjs';
+import { beginOperation, updateOperation } from '../src/operations.mjs';
 import {
-  cli, commandService, ENTRY, fakeNpm, FIXTURE, fixtureConfig, fixtureData, npmService, readFixture, withHome, writeConfig, writeFixture,
+  cli, commandService, deadPid, ENTRY, fakeNpm, FIXTURE, fixtureConfig, fixtureData, npmService, readFixture, withHome, writeConfig, writeFixture,
 } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
@@ -681,6 +682,40 @@ test('an installer whose agent was killed holds recovery and every update until 
     assert.equal(readFixture(dir, 'update-runs'), '1', 'the update was never run a second time');
     assert.equal(invoke(home, ['op', id]).op.result.action, 'interrupted');
     assert.deepEqual(ledger(home), []);
+  });
+});
+
+test('a recovery the process probe cannot settle stays owed, and the cycle and the record say why', async () => {
+  await withHome(async (home) => {
+    // What an update killed during its install leaves: a record still running
+    // under a process that is gone, and a service it had stopped. This time
+    // the process probe cannot run either.
+    const dir = fixtureData(home, { running: 'off' });
+    const service = (running) => commandService(dir, { process: { type: 'command', running, start: call(dir, 'start'), stop: call(dir, 'stop') } });
+    // Automatic updates are off: recovery runs whatever the policy says, and an
+    // update would only wait out the stop loop over a probe that cannot answer.
+    const updates = { automatic: false, maintenanceWindows: [] };
+    writeConfig(home, fixtureConfig(dir, { updates, services: [service([path.join(home, 'no-such-probe')])] }));
+    const id = 'probe-owed-update-0001';
+    beginOperation({ id, kind: 'update', service: 'demo', systemId: 'test' });
+    updateOperation(id, { pid: deadPid(), phase: 'installing' });
+
+    const status = invoke(home, ['status']);
+    assert.notEqual(status.services[0].process.error, null);
+    // Section 5.5: a failed probe keeps the obligation and says why.
+    const kept = invoke(home, ['cycle']);
+    assert.equal(kept.action, 'cycled');
+    assert.deepEqual(kept.recovered.map((entry) => [entry.opId, entry.action]), [[id, 'interrupted']]);
+    assert.match(kept.message, /recovery is still owed: Demo was neither started nor taken for running/);
+    assert.equal(readFixture(dir, 'start-runs'), '');
+    assert.match(invoke(home, ['op', id]).op.log.at(-1).line, /^recovery is still owed: .*no-such-probe/);
+
+    // And once the probe answers, the next cycle puts the service back.
+    writeConfig(home, fixtureConfig(dir, { updates, services: [service(call(dir, 'running'))] }));
+    const restored = invoke(home, ['cycle']);
+    assert.doesNotMatch(restored.message, /still owed/);
+    assert.equal(readFixture(dir, 'running'), 'on');
+    assert.equal(readFixture(dir, 'start-runs'), '1');
   });
 });
 

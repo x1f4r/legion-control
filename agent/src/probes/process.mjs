@@ -369,24 +369,47 @@ export async function probeProcessAsync(service, { clock = deadline(15000), incl
 }
 
 /**
+ * What the process probe can say about whether the service is up: `running`,
+ * `stopped`, or `unknown` with the reason it could not say (contract section
+ * 6). Unknown is never read as either of the others. Each caller turns it into
+ * the answer that is safe for what it is about to do, and the two that act on
+ * it want opposite answers: the stop loop may let an installer at the files
+ * only on a positive "stopped", and recovery may drop its obligation to put a
+ * service back only on a positive "running" (section 5.5).
+ */
+export function processEvidence(service) {
+  const type = service.process?.type;
+  if (type === 'systemd-user' || type === 'systemd-system') {
+    const active = systemctl(service, 'is-active', 10000);
+    const state = active.stdout.trim();
+    // An empty answer means systemctl told us nothing at all.
+    if (!state) return { state: 'unknown', error: describeFailure(active) };
+    if (state === 'inactive' || state === 'failed' || state === 'unknown') return { state: 'stopped', error: null };
+    if (state === 'active' || state === 'reloading') return { state: 'running', error: null };
+    // Activating, deactivating: on its way to one or the other, and neither yet.
+    return { state: 'unknown', error: `${service.process.unit} is ${state}` };
+  }
+  if (type === 'app') {
+    const { pids, error } = appProvider.appPids(service);
+    if (error) return { state: 'unknown', error };
+    return { state: pids.length > 0 ? 'running' : 'stopped', error: null };
+  }
+  const probe = probeProcess(service);
+  if (probe.error) return { state: 'unknown', error: probe.error };
+  // A command process with no running command reads as running, so that the
+  // stop loop never takes it for stopped, but nothing has looked at it.
+  if (probe.unitState === 'unknown') return { state: 'unknown', error: `${service.name} has no running command, so nothing here can say whether it is up` };
+  return { state: probe.running ? 'running' : 'stopped', error: null };
+}
+
+/**
  * Just "is it up", and it FAILS CLOSED. The stop loop uses this to decide when
  * it is safe to let an installer rewrite files underneath the service, so a
  * probe we could not complete has to read as "still running": timing out costs
  * one deferred update, guessing "stopped" corrupts a live service.
  */
 export function isRunning(service) {
-  const type = service.process?.type;
-  if (type === 'systemd-user' || type === 'systemd-system') {
-    const active = systemctl(service, 'is-active', 10000);
-    const state = active.stdout.trim();
-    if (!state) return true;
-    return state !== 'inactive' && state !== 'failed' && state !== 'unknown';
-  }
-  // isAppRunning already fails closed on a probe it could not complete.
-  if (type === 'app') return appProvider.isAppRunning(service);
-  const probe = probeProcess(service);
-  if (probe.error) return true;
-  return probe.running;
+  return processEvidence(service).state !== 'stopped';
 }
 
 /**

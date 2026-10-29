@@ -7,13 +7,13 @@
 import { describeFailure, detectPlatform, sleep } from './config.mjs';
 import { runMutationArgv } from './process-runner.mjs';
 import { checkHealth, healthPort } from './probes/health.mjs';
-import { isRunning, probeProcess, processStartedAt, startProcess, stopProcess, systemctlMutation } from './probes/process.mjs';
+import { isRunning, probeProcess, processEvidence, processStartedAt, startProcess, stopProcess, systemctlMutation } from './probes/process.mjs';
 import { NO_RELAY, probeRelay } from './probes/relay.mjs';
 import * as appProvider from './providers/app.mjs';
 
 const BIND_GRACE_MS = 2000;
 
-export { isRunning, healthPort, processStartedAt };
+export { isRunning, healthPort, processEvidence, processStartedAt };
 
 /** Find the service the command should act on. */
 export function selectService(config, id) {

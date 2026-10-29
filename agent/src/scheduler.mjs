@@ -29,6 +29,7 @@ import { REASON } from './contract.mjs';
 import { acquireOperationLock, acquireServiceLock, clearStaleLocks } from './lock.mjs';
 import { log, note } from './log.mjs';
 import {
+  appendLog,
   beginOperation,
   cancelOperation,
   dueQueue,
@@ -48,7 +49,8 @@ import { stillAtWork } from './operate.mjs';
 import { orderServices, scheduledEligibility } from './policy.mjs';
 import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
-import { isRunning, livenessOf, startAndSettle, waitForServiceHealth } from './service.mjs';
+import { describeHealth } from './probes/health.mjs';
+import { livenessOf, processEvidence, startAndSettle, waitForServiceHealth } from './service.mjs';
 import { runRestart, runUpdate } from './update.mjs';
 import { runAction } from './actions.mjs';
 import { ensureServiceStateWritable, serviceState } from './state.mjs';
@@ -69,6 +71,20 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
   const completed = (service) => {
     for (const record of pending.filter((entry) => entry.service === service)) updateOperation(record.id, { recoveryPending: false });
   };
+  const settled = (record, service, action, message) => {
+    restored.push({ service: service.id, action, settled: true, message, opId: record.id, phase: record.phase ?? null });
+    log(message, 'recover');
+    completed(service.id);
+  };
+  // An obligation that stays says why, on the record that owes it, so `op ID`
+  // answers the question a cycle cannot: what is still wrong, and what it is
+  // waiting for. A reason is written once, and again only when it changes.
+  const owed = (record, service, action, message, reasonCode = null) => {
+    restored.push({ service: service.id, action, settled: false, reasonCode, message, opId: record.id, phase: record.phase ?? null });
+    log(message, 'recover');
+    const line = `recovery is still owed: ${message}`;
+    if (record.log?.at(-1)?.line !== line) appendLog(record.id, line);
+  };
 
   for (const record of servicesNeedingRecovery(pending)) {
     const service = config.services.find((entry) => entry.id === record.service);
@@ -76,16 +92,24 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
       completed(record.service);
       continue;
     }
-    if (isRunning(service)) {
-      restored.push({ service: service.id, action: 'already-running', opId: record.id, phase: record.phase ?? null });
-      completed(service.id);
+    // Only a positive reading settles anything (contract section 5.5). The stop
+    // loop's isRunning() fails closed, and recovery used to read that as "it is
+    // up": a process probe that could not run dropped the obligation, and the
+    // service an interrupted update had stopped stayed off for good.
+    const evidence = processEvidence(service);
+    if (evidence.state === 'unknown') {
+      owed(record, service, 'unknown', `${service.name} was neither started nor taken for running, because nothing can tell whether it is: ${evidence.error}`);
+      continue;
+    }
+    if (evidence.state === 'running') {
+      settled(record, service, 'already-running', `${service.name} was already running after an interrupted ${record.kind} (${record.phase})`);
       continue;
     }
     // The cycle owns the machine mutex, but the external watchdog understands
     // only this service lock. Recovery must obey it just like an update does.
     const serviceLock = acquireServiceLock(service.lockFile, 'recovery');
     if (!serviceLock.ok) {
-      restored.push({ service: service.id, action: 'conflict', reasonCode: serviceLock.reasonCode, message: serviceLock.message, opId: record.id, phase: record.phase ?? null });
+      owed(record, service, 'conflict', `${service.name} was not started: ${serviceLock.message}`, serviceLock.reasonCode);
       continue;
     }
     try {
@@ -93,16 +117,13 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
       note(`${service.name} was left stopped by an interrupted ${record.kind}; starting it`, 'recover');
       await startAndSettle(service);
       const health = await waitForServiceHealth(service, 60000);
-      restored.push({ service: service.id, action: health.ok ? 'started' : 'start-failed', opId: record.id, phase: record.phase ?? null });
-      if (health.ok) completed(service.id);
-      log(
-        health.ok
-          ? `${service.name} was restarted after an interrupted ${record.kind} (${record.phase})`
-          : `${service.name} could not be restarted after an interrupted ${record.kind} (${record.phase})`,
-        'recover',
-      );
+      if (health.ok) {
+        settled(record, service, 'started', `${service.name} was restarted after an interrupted ${record.kind} (${record.phase})`);
+      } else {
+        owed(record, service, 'start-failed', `${service.name} could not be restarted after an interrupted ${record.kind} (${record.phase}): ${describeHealth(health)}`);
+      }
     } catch (error) {
-      restored.push({ service: service.id, action: 'start-failed', reasonCode: REASON.internal, message: error?.message ?? String(error), opId: record.id, phase: record.phase ?? null });
+      owed(record, service, 'start-failed', `${service.name} could not be restarted: ${error?.message ?? String(error)}`, REASON.internal);
     } finally {
       serviceLock.release();
     }
@@ -382,10 +403,14 @@ export async function runCycle(config, options = {}) {
 
     const failed = report.children.filter((child) => child.action === 'failed');
     const updated = report.children.filter((child) => child.action === 'updated');
-    const message =
+    const walked =
       report.children.length === 0
         ? 'no services on this machine are eligible for a scheduled update'
         : `${updated.length} updated, ${report.children.length - updated.length - failed.length} left alone, ${failed.length} failed`;
+    // A service recovery could not put back is named in the cycle's own answer
+    // too, which is what a client shows, with what it is waiting for.
+    const owed = report.recovery.restored.filter((entry) => entry.settled === false);
+    const message = owed.length === 0 ? walked : `${walked}; recovery is still owed: ${owed.map((entry) => entry.message).join('; ')}`;
 
     // A failed cycle says why with the reason of the first service that failed,
     // so it is never the failure with no code that contract 3 exists to remove.
