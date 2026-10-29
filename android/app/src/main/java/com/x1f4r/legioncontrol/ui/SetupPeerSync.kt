@@ -177,10 +177,7 @@ internal class SetupPeerSync(
         return when (admission) {
             SetupAdmission.HEAD_MOVED -> Step.Again
             SetupAdmission.MOVED -> Step.Done(null)
-            SetupAdmission.UNVERIFIABLE -> Step.Done(
-                "$name's control agent has to be updated before its setup can be taken automatically: what it " +
-                    "sent does not match the hash it reported.",
-            )
+            SetupAdmission.UNVERIFIABLE -> Step.Done(unverifiable(name, "taken automatically"))
 
             SetupAdmission.INVALID -> Step.Done(
                 "$name is carrying a setup this app cannot use. ${fetched.verdict.errors.firstOrNull()?.message.orEmpty()}".trim(),
@@ -282,9 +279,12 @@ internal class SetupPeerSync(
 
         val fetched = read(client, head, state) as? Read.Bytes ?: return null
         if (fetched.hash != remote) {
-            // Bytes that are not what the status described cannot be shown as that document.
-            if (fetched.replyHash != fetched.hash) state.settled += key
-            return null
+            // Bytes that are not what the status described cannot be shown as that document. If
+            // they are their own reply's hash the machine moved on, and its next status says to
+            // what; if not, an agent before 3.1.0 rebuilt them, and only an updated one can say.
+            if (fetched.replyHash == fetched.hash) return null
+            state.settled += key
+            return unverifiable(name, if (decision == SetupDecision.DIVERGED) "merged" else "weighed against this one")
         }
         if (!fetched.verdict.valid) {
             state.settled += key
@@ -327,6 +327,11 @@ internal class SetupPeerSync(
         }
         return open?.hash != head
     }
+
+    /** Why a copy an agent before 3.1.0 rebuilt cannot be [used]: its bytes are not the ones it hashed. */
+    private fun unverifiable(name: String, used: String): String =
+        "$name's control agent has to be updated before its setup can be $used: what it sent does not match the " +
+            "hash it reported."
 
     /** What reading `config` gave. */
     private sealed interface Read {

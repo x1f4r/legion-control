@@ -302,6 +302,22 @@ class SetupPeerSyncTest {
         assertEquals("pi", store.identityClash.value!!.machineId)
     }
 
+    @Test
+    fun `a diverged copy an older agent rebuilt says once that the agent has to be updated`() = runBlocking {
+        val theirs = descendant(name = "Edited on the laptop")
+        edit("Edited here")
+        val respelled = theirs.replace("  ", "    ")
+        val machine = FakeMachine("pi")
+        machine.meta = { Result.success(metaOf(theirs)) }
+        machine.fetch = { Result.success(served(respelled).copy(replyHash = hashOf(theirs))) }
+
+        val line = machine.poll(status(hashOf(theirs), version = "3.0.1"))!!
+        assertTrue(line, line.startsWith("Pi's control agent has to be updated before its setup can be merged"))
+        assertNull(machine.poll(status(hashOf(theirs), version = "3.0.1")))
+        assertEquals(listOf("meta", "config"), machine.calls)
+        assertNull("nothing unverified is put on screen", store.divergence.value)
+    }
+
     // MARK: - The guardrails (C7)
 
     @Test
