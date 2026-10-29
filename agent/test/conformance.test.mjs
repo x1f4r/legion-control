@@ -619,7 +619,7 @@ test('config conforms through a whole lineage, and serves exactly the bytes it h
 test('a hand-placed setup file is served as its canonical text', async () => {
   await withHome(async (home) => {
     oneService(home);
-    const handWritten = '﻿{\r\n  "version": 1,\r\n  "machines": []\r\n}\r\n\r\n';
+    const handWritten = '\uFEFF{\r\n  "version": 1,\r\n  "machines": []\r\n}\r\n\r\n';
     fs.writeFileSync(path.join(home, 'controller.json'), handWritten);
     const read = invoke(home, ['config']);
     assert.deepEqual(read.controller, { version: 1, machines: [] }, 'a byte order mark does not stop the document parsing');

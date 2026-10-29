@@ -14,7 +14,7 @@ test('a document with no final newline hashes the same as one with it', () => {
   const document = '{"version":1,"machines":[]}';
   assert.equal(canonicalHash(document), canonicalHash(`${document}\n`));
   assert.equal(canonicalHash(document), canonicalHash(`\n\n${document}\n\n\n`));
-  assert.equal(canonicalHash(document), canonicalHash(`﻿${document}`));
+  assert.equal(canonicalHash(document), canonicalHash(`\uFEFF${document}`));
   assert.equal(canonicalHash(document), canonicalHash(document.replace(/\n/g, '\r\n')));
 });
 
