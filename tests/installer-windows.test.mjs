@@ -63,6 +63,27 @@ test('the Windows installer gives the base to the task\'s account alone', () => 
   assert.match(installer, /'\*' \+ \$_ \+ ':\(OI\)\(CI\)F'/);
 });
 
+// icacls changes what a link leads to, wherever that is, so the base is searched for one before
+// icacls touches it, and no call that goes down the tree may follow one.
+test('the Windows installer looks for links in the base before icacls changes it, and never lets icacls follow one', () => {
+  const from = installer.indexOf('function Protect-Base');
+  const protect = installer.slice(from, installer.indexOf('\n}\n', from));
+  assert.ok(protect.indexOf('Get-BaseLink') > 0 && protect.indexOf('Get-BaseLink') < protect.indexOf('Invoke-IcaclsCommand'), 'links first');
+  const recursive = installer.match(/Invoke-IcaclsCommand -Arguments [^\n]*'\/T'[^\n]*/g);
+  assert.ok(recursive.length >= 3, recursive.join('\n'));
+  for (const call of recursive) assert.match(call, /'\/L'/, call);
+});
+
+// What is there already is judged before anything is changed; what this session makes is made with
+// New-Item, which fails on a folder somebody else made in the meantime.
+test('the Windows installer judges a base and node for SYSTEM before it changes anything, and makes a new base itself', () => {
+  const judged = installer.indexOf('$intrusion = @(Get-BaseTakeover)');
+  assert.ok(judged > installer.indexOf("Step 'Principal'") && judged < installer.indexOf("Step 'Base'"), 'judged in the principal step');
+  assert.match(installer, /\$realNode = Resolve-LinkedPath \$NodeExe\s[\s\S]*?Test-Inside \$realNode \$profileRoots[\s\S]*?Get-ForeignAccess \(Split-Path -Parent \$realNode\) \$ChangeRights[\s\S]*?\$NodeExe = \$realNode/);
+  assert.match(installer, /New-Item -ItemType Directory -Path \$Base -ErrorAction Stop \|/);
+  assert.match(installer, /Protect-Base -Sids @\(\$AdministratorsSid, \$SystemSid\) -Owner \$AdministratorsSid -Fresh:\$fresh/);
+});
+
 // What sshd hands a command to decides how the clients quote it, so the installer says, as the
 // agent's doctor does.
 test('the Windows installer says which shell sshd runs commands with', () => {
@@ -216,13 +237,14 @@ test('every PowerShell script is ASCII, which Windows PowerShell reads the same 
 
 // --- A real install, on Windows ---------------------------------------------------
 
-// Windows PowerShell, the way an SSH session and the documented command run the installer.
-function runScript(source, base, home, args = []) {
+// Windows PowerShell, the way an SSH session and the documented command run the installer, with the
+// node in `node` first on PATH.
+function runScript(source, base, home, args = [], { node = path.dirname(process.execPath) } = {}) {
   const script = path.join(source, 'install', 'install-windows.ps1');
   return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...args], {
     encoding: 'utf8',
     timeout: 180000,
-    env: { ...process.env, PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`, LEGIONCTL_HOME: base, USERPROFILE: home },
+    env: { ...process.env, PATH: `${node}${path.delimiter}${process.env.PATH}`, LEGIONCTL_HOME: base, USERPROFILE: home },
   });
 }
 
@@ -265,6 +287,11 @@ function agentSource(root) {
   for (const part of ['src', 'install']) fs.cpSync(path.join(repository, 'agent', part), path.join(agent, part), { recursive: true });
   fs.copyFileSync(path.join(repository, 'agent', 'package.json'), path.join(agent, 'package.json'));
   return agent;
+}
+
+function icacls(...args) {
+  const result = spawnSync('icacls.exe', args, { encoding: 'utf8' });
+  assert.equal(result.status, 0, `icacls ${args.join(' ')}: ${result.stdout}${result.stderr}`);
 }
 
 // A task name of its own, so the scheduler the installer was told to leave alone can be asked.
@@ -367,6 +394,47 @@ test('the Windows uninstaller removes the launchers and the agent, and keeps its
   assert.equal(taskExists(name), false);
 });
 
+// icacls changes what a link leads to, so a base that holds one is refused before icacls is run at
+// all: the base still takes what the folder above allows, and what the link leads to is as it was.
+test('the Windows installer refuses a base that holds a link before it changes anything', { skip: process.platform !== 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows link '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const base = path.join(home, '.legion-control');
+  const elsewhere = path.join(root, 'somewhere else');
+  fs.mkdirSync(path.join(elsewhere, 'inside'), { recursive: true });
+  fs.mkdirSync(path.join(base, 'state'), { recursive: true });
+  fs.symlinkSync(elsewhere, path.join(base, 'state', 'records'), 'junction');
+  const before = { base: accessOf(base), elsewhere: accessOf(elsewhere), inside: accessOf(path.join(elsewhere, 'inside')) };
+
+  const refused = runInstaller(agentSource(root), base, home);
+  assert.equal(refused.status, 1, `${refused.stdout}\n${refused.stderr}`);
+  assert.match(`${refused.stdout}\n${refused.stderr}`, /holds links, which would carry what this script changes somewhere else: .*records\. Remove them and run this again\. Nothing was changed\./);
+  assert.deepEqual({ base: accessOf(base), elsewhere: accessOf(elsewhere), inside: accessOf(path.join(elsewhere, 'inside')) }, before);
+  assert.equal(before.base.protected, false);
+  assert.equal(fs.lstatSync(path.join(base, 'state', 'records')).isSymbolicLink(), true);
+  assert.deepEqual(fs.readdirSync(base), ['state']);
+});
+
+// A task definition an older installer left in the base for an elevated import is removed: whoever
+// could write it chose what that import would register.
+test('the Windows installer removes the task XML an older installer left in the base', { skip: process.platform !== 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows old xml '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const base = path.join(home, '.legion-control');
+  const name = taskName();
+  const left = path.join(base, `${name.replace(/[^\w-]/g, '-')}.xml`);
+  fs.mkdirSync(base, { recursive: true });
+  fs.writeFileSync(left, '<Task/>\n');
+
+  const installed = runInstaller(agentSource(root), base, home, ['-TaskName', name]);
+  assert.equal(installed.status, 0, `${installed.stdout}\n${installed.stderr}`);
+  assert.equal(fs.existsSync(left), false);
+  assert.match(installed.stdout, /removed .*\.xml, which an older installer left for an elevated import/);
+  assert.equal(taskExists(name), false);
+});
+
 // Given to one account alone, a profile would lose every other account's access, SYSTEM's too, and
 // uninstalling from it would take its bin folder.
 test('the Windows installer refuses a base that is a profile, installing or uninstalling', { skip: process.platform !== 'win32' }, (t) => {
@@ -438,25 +506,76 @@ test('the Windows installer registers the task as the installing user with the c
   assert.equal(fs.existsSync(base), false);
 });
 
-test('the Windows installer refuses a task that runs as SYSTEM, and keeps one only on -AllowSystemPrincipal\'s terms', { skip: !windowsCi }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows system '));
-  const name = taskName();
-  const machineBase = path.join(process.env.ProgramData ?? 'C:\\ProgramData', `legion-control-test-${process.pid}-${Date.now()}`);
+// A task that runs cmd.exe as `principal`, a New-ScheduledTaskPrincipal argument list, first due a
+// year from now.
+function taskAs(name, principal) {
+  powershellJson(
+    "Register-ScheduledTask -TaskName $env:LEGION_TEST_TASK -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 0') " +
+    "-Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1)) " +
+    `-Principal (New-ScheduledTaskPrincipal ${principal}) | Out-Null; '{}'`,
+    { LEGION_TEST_TASK: name },
+  );
+}
+const systemTask = (name) => taskAs(name, "-UserId 'NT AUTHORITY\\SYSTEM' -LogonType ServiceAccount -RunLevel Highest");
+
+// Whoever can write the agent's files would run code as the task's principal, so any other account
+// is refused, a group too, and nothing is installed, with -SkipScheduler as well.
+test('the Windows installer refuses a task that runs as another account or as a group', { skip: !windowsCi }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows other principal '));
+  const names = [];
   t.after(() => {
-    spawnSync('schtasks.exe', ['/Delete', '/TN', name, '/F']);
+    for (const name of names) spawnSync('schtasks.exe', ['/Delete', '/TN', name, '/F']);
     fs.rmSync(root, { recursive: true, force: true });
-    fs.rmSync(machineBase, { recursive: true, force: true });
   });
   const home = path.join(root, 'home');
   const base = path.join(home, '.legion-control');
   const source = agentSource(root);
-  // A task that runs as SYSTEM, first due a year from now.
-  powershellJson(
-    "Register-ScheduledTask -TaskName $env:LEGION_TEST_TASK -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 0') " +
-    "-Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1)) " +
-    "-Principal (New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\\SYSTEM' -LogonType ServiceAccount -RunLevel Highest) | Out-Null; '{}'",
-    { LEGION_TEST_TASK: name },
-  );
+  // Named as the runner's English Windows names them, like SYSTEM above.
+  const principals = [["-UserId 'NT AUTHORITY\\LOCAL SERVICE' -LogonType ServiceAccount", /runs as .*LOCAL ?SERVICE|runs as S-1-5-19/i], ["-GroupId 'BUILTIN\\Users'", /runs as the group /]];
+  const actionOf = (name) => powershellJson('[pscustomobject] @{ execute = (Get-ScheduledTask -TaskName $env:LEGION_TEST_TASK).Actions[0].Execute } | ConvertTo-Json -Compress', { LEGION_TEST_TASK: name }).execute;
+  for (const [principal, who] of principals) {
+    const name = taskName();
+    names.push(name);
+    taskAs(name, principal);
+    for (const args of [[], ['-SkipScheduler']]) {
+      const refused = runScript(source, base, home, ['-TaskName', name, ...args]);
+      const output = `${refused.stdout}\n${refused.stderr}`;
+      assert.equal(refused.status, 1, output);
+      assert.match(output, who);
+      assert.match(output, /who is installing it, and whoever can write the agent's files would run code as .* through it\. Nothing was changed\./);
+      assert.equal(fs.existsSync(base), false);
+    }
+    assert.equal(actionOf(name), 'cmd.exe');
+  }
+});
+
+// A folder of the test's own in ProgramData, which anybody may make folders in.
+const machineFolder = (label) => path.join(process.env.ProgramData ?? 'C:\\ProgramData', `legion-control-test-${label}-${process.pid}-${Date.now()}`);
+
+// node, copied into a folder of its own that only Administrators and SYSTEM may change and Users
+// get `users` on: RX, as an install for all users has it, or M, as a folder made under C:\ has.
+function nodeIn(directory, users) {
+  fs.mkdirSync(directory, { recursive: true });
+  icacls(directory, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', `*S-1-5-32-545:(OI)(CI)${users}`);
+  fs.copyFileSync(process.execPath, path.join(directory, 'node.exe'));
+  icacls(path.join(directory, 'node.exe'), '/reset');
+  icacls(directory, '/setowner', '*S-1-5-32-544', '/T');
+  return directory;
+}
+
+test('the Windows installer refuses a task that runs as SYSTEM, and keeps one only on -AllowSystemPrincipal\'s terms', { skip: !windowsCi }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows system '));
+  const name = taskName();
+  const machineBase = machineFolder('base');
+  const node = nodeIn(machineFolder('node'), 'RX');
+  t.after(() => {
+    spawnSync('schtasks.exe', ['/Delete', '/TN', name, '/F']);
+    for (const folder of [root, machineBase, node]) fs.rmSync(folder, { recursive: true, force: true });
+  });
+  const home = path.join(root, 'home');
+  const base = path.join(home, '.legion-control');
+  const source = agentSource(root);
+  systemTask(name);
 
   // Refused, before anything was installed, with -SkipScheduler as well.
   for (const args of [[], ['-SkipScheduler']]) {
@@ -467,17 +586,18 @@ test('the Windows installer refuses a task that runs as SYSTEM, and keeps one on
   }
 
   // Kept only from a base outside every profile.
-  const inProfile = runScript(source, base, home, ['-TaskName', name, '-AllowSystemPrincipal']);
+  const inProfile = runScript(source, base, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node });
   assert.equal(inProfile.status, 1, `${inProfile.stdout}\n${inProfile.stderr}`);
   assert.match(`${inProfile.stdout}\n${inProfile.stderr}`, /is inside a user profile, and that user could change what SYSTEM runs/);
   assert.equal(fs.existsSync(base), false);
 
-  const kept = runScript(source, machineBase, home, ['-TaskName', name, '-AllowSystemPrincipal']);
+  const kept = runScript(source, machineBase, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node });
   assert.equal(kept.status, 0, `${kept.stdout}\n${kept.stderr}`);
   assert.match(kept.stdout, /runs as SYSTEM, kept by -AllowSystemPrincipal/);
   const task = taskOf(name);
   assert.equal(task.sid, 'S-1-5-18');
   assert.equal(task.limit, 'PT30M');
+  assert.ok(sameFile(task.execute, path.join(node, 'node.exe')), task.execute);
   assert.equal(task.arguments, `"${path.join(machineBase, 'bin', 'launcher.mjs')}" cycle`);
   const access = accessOf(machineBase);
   assert.equal(access.protected, true);
@@ -485,8 +605,69 @@ test('the Windows installer refuses a task that runs as SYSTEM, and keeps one on
   assert.equal(access.owner, 'S-1-5-32-544');
   assert.equal(accessOf(path.join(machineBase, 'bin', 'launcher.mjs')).owner, 'S-1-5-32-544');
 
-  const removed = runScript(source, machineBase, home, ['-Uninstall', '-Purge', '-TaskName', name]);
+  // Run again, the base an earlier run made is taken as it is.
+  const again = runScript(source, machineBase, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node });
+  assert.equal(again.status, 0, `${again.stdout}\n${again.stderr}`);
+  assert.match(again.stdout, /previous agent retained at /);
+
+  const removed = runScript(source, machineBase, home, ['-Uninstall', '-Purge', '-TaskName', name], { node });
   assert.equal(removed.status, 0, `${removed.stdout}\n${removed.stderr}`);
   assert.equal(taskExists(name), false);
   assert.equal(fs.existsSync(machineBase), false);
+});
+
+// What SYSTEM would run must be nobody else's to change: node and its folder, the folders above
+// the base, and a base that is there already, which anybody may have made in ProgramData first and
+// filled. Each is refused before anything is changed.
+test('the Windows installer keeps a SYSTEM task only with a node and a base nobody else could have changed', { skip: !windowsCi }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows system refusals '));
+  const name = taskName();
+  const node = nodeIn(machineFolder('node'), 'RX');
+  const openNode = nodeIn(machineFolder('open-node'), 'M');
+  const openParent = machineFolder('open-parent');
+  const planted = machineFolder('planted');
+  t.after(() => {
+    spawnSync('schtasks.exe', ['/Delete', '/TN', name, '/F']);
+    for (const folder of [root, node, openNode, openParent, planted]) fs.rmSync(folder, { recursive: true, force: true });
+  });
+  const home = path.join(root, 'home');
+  const source = agentSource(root);
+  systemTask(name);
+  const run = (base, nodeFolder) => {
+    const result = runScript(source, base, home, ['-TaskName', name, '-AllowSystemPrincipal'], { node: nodeFolder });
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+    return `${result.stdout}\n${result.stderr}`;
+  };
+
+  // A node that Users may change, or put a DLL beside.
+  const fresh = machineFolder('base');
+  assert.match(run(fresh, openNode), /could change node at .*, which SYSTEM would run: .*S-1-5-32-545 may change .*node\.exe/);
+  assert.equal(fs.existsSync(fresh), false);
+
+  // A base in a folder that Users may delete in, and so put another base in its place.
+  fs.mkdirSync(openParent);
+  icacls(openParent, '/grant', '*S-1-5-32-545:(OI)(CI)M');
+  const underOpen = path.join(openParent, 'legion-control');
+  assert.match(run(underOpen, node), /could put another folder where the base is: S-1-5-32-545 may move or re-permission /);
+  assert.equal(fs.existsSync(underOpen), false);
+
+  // A base somebody made first, that Users may change, with a config in it and a junction that
+  // leads elsewhere. Nothing in it, and nothing the junction leads to, is changed.
+  const elsewhere = path.join(root, 'somewhere else');
+  fs.mkdirSync(path.join(elsewhere, 'inside'), { recursive: true });
+  fs.mkdirSync(planted);
+  icacls(planted, '/grant', '*S-1-5-32-545:(OI)(CI)M');
+  fs.writeFileSync(path.join(planted, 'config.json'), '{"sentinel":"planted"}\n');
+  fs.symlinkSync(elsewhere, path.join(planted, 'agent'), 'junction');
+  const before = { base: accessOf(planted), config: accessOf(path.join(planted, 'config.json')), elsewhere: accessOf(elsewhere), inside: accessOf(path.join(elsewhere, 'inside')) };
+  const refused = run(planted, node);
+  assert.match(refused, /is already there, and was not made for Administrators and SYSTEM alone: /);
+  assert.match(refused, /S-1-5-32-545 is in the ACL of /);
+  assert.match(refused, /agent is a link/);
+  assert.match(refused, /S-1-5-32-545 may change .*config\.json/);
+  assert.match(refused, /Nothing was changed\./);
+  assert.deepEqual({ base: accessOf(planted), config: accessOf(path.join(planted, 'config.json')), elsewhere: accessOf(elsewhere), inside: accessOf(path.join(elsewhere, 'inside')) }, before);
+  assert.deepEqual(fs.readdirSync(planted).sort(), ['agent', 'config.json']);
+  assert.equal(fs.readFileSync(path.join(planted, 'config.json'), 'utf8'), '{"sentinel":"planted"}\n');
+  assert.equal(taskOf(name).execute, 'cmd.exe');
 });

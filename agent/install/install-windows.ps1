@@ -38,10 +38,17 @@
     anything is changed.
 
     -AllowSystemPrincipal keeps an existing task that runs as SYSTEM, on these
-    terms only: the session is elevated, the base and node are outside every
-    user profile, nobody but Administrators and SYSTEM may rename or
-    re-permission a folder above the base, and the base is then given to
-    Administrators and SYSTEM alone. Nothing a user can write is run as SYSTEM.
+    terms only: the session is elevated; the base and node are outside every
+    user profile, where they really are once every link is followed; nobody
+    but Administrators, SYSTEM and TrustedInstaller may change node or what is
+    in its folder, or rename or re-permission a folder above either; and the
+    base does not exist yet, so that it is made for Administrators and SYSTEM
+    alone before anything goes in, or an earlier run made it that way and
+    nothing in it is anybody else's, may be changed by anybody else or is a
+    link. A base somebody else made first is refused, not taken over: what they
+    put in it would run as SYSTEM. What the config has the agent run is the
+    config's business, and a command in it that a user can change runs as
+    SYSTEM too.
 
     Elevation. A task that runs as the current user can be registered and
     re-registered without it, so only -AllowSystemPrincipal needs an elevated
@@ -99,6 +106,15 @@ $MinNodeMajor  = 24
 $SystemSid           = 'S-1-5-18'
 $AdministratorsSid   = 'S-1-5-32-544'
 $TrustedInstallerSid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+
+# The rights that let somebody put another folder where a folder is: delete or
+# rename it or what it holds, re-permission it or take it over, or generic all
+# and generic write, which include those.
+$MoveRights   = [int] ([Security.AccessControl.FileSystemRights] 'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership') -bor 0x10000000 -bor 0x40000000
+# Those, and the rights that change what a file holds or what is in a folder:
+# write or append to the file, or add a file or a folder, such as a DLL that
+# node.exe would load before its own.
+$ChangeRights = $MoveRights -bor [int] ([Security.AccessControl.FileSystemRights] 'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes')
 
 $UserProfile = $env:USERPROFILE
 $Base        = if ($env:LEGIONCTL_HOME) { $env:LEGIONCTL_HOME } else { Join-Path $UserProfile '.legion-control' }
@@ -199,13 +215,39 @@ function Test-Inside([string] $Path, [string[]] $Roots) {
     return $false
 }
 
+# Who besides Administrators, SYSTEM and TrustedInstaller holds any of $Rights
+# on $Path, by SID, said as what they "may $Verb": its owner, who may always
+# re-permission it and so grant itself the rest, and anybody an entry in its
+# ACL grants one of them. Nobody, when the list is empty.
+function Get-ForeignAccess([string] $Path, [int] $Rights, [string] $Verb) {
+    $trusted = @($SystemSid, $AdministratorsSid, $TrustedInstallerSid)
+    $found = New-Object System.Collections.Generic.List[string]
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+    } catch {
+        $found.Add("$Path does not let this session read who may change it")
+        return $found
+    }
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($trusted -notcontains $owner) {
+        $found.Add("$owner owns $Path")
+    }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($rule.PropagationFlags.HasFlag([Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+        if ($trusted -contains $rule.IdentityReference.Value) { continue }
+        $line = "$($rule.IdentityReference.Value) may $Verb $Path"
+        if ((([int] $rule.FileSystemRights -band $Rights) -ne 0) -and -not $found.Contains($line)) {
+            $found.Add($line)
+        }
+    }
+    return $found
+}
+
 # Who besides Administrators and SYSTEM could put another folder where $Path
 # is: whoever owns a folder above it or may delete, rename or re-permission one,
 # or what it holds, and any link on the way. Nobody, when the list is empty.
 function Get-PathTakeover([string] $Path) {
-    $trusted = @($SystemSid, $AdministratorsSid, $TrustedInstallerSid)
-    # Generic all and generic write, besides the rights that move or re-permission a folder.
-    $dangerous = [int] ([Security.AccessControl.FileSystemRights] 'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership') -bor 0x10000000 -bor 0x40000000
     $found = New-Object System.Collections.Generic.List[string]
     if ((Test-Path -LiteralPath $Path) -and (Get-Item -LiteralPath $Path -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
         $found.Add("$Path is a link")
@@ -218,23 +260,106 @@ function Get-PathTakeover([string] $Path) {
             if ((Get-Item -LiteralPath $folder -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
                 $found.Add("$folder is a link")
             }
-            $acl = Get-Acl -LiteralPath $folder
-            $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-            if ($trusted -notcontains $owner) {
-                $found.Add("$owner owns $folder")
-            }
-            foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-                if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-                if ($rule.PropagationFlags.HasFlag([Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
-                if ($trusted -contains $rule.IdentityReference.Value) { continue }
-                if (([int] $rule.FileSystemRights -band $dangerous) -ne 0) {
-                    $found.Add("$($rule.IdentityReference.Value) may move or re-permission $folder")
-                }
+            foreach ($line in @(Get-ForeignAccess $folder $MoveRights 'move or re-permission')) {
+                $found.Add($line)
             }
         }
         $parent = Split-Path -Parent $folder
         if ($parent -eq $folder) { break }
         $folder = $parent
+    }
+    return $found
+}
+
+# Where $Path really is, with every link on the way followed, a folder's or the
+# file's own. GetFullPath only tidies the name, and a name outside every profile
+# can lead into one: with nvm-windows, C:\Program Files\nodejs is a link into
+# the profile of whoever installed it.
+function Resolve-LinkedPath([string] $Path) {
+    $resolved = [IO.Path]::GetFullPath($Path)
+    for ($hop = 0; $hop -lt 32; $hop += 1) {
+        # The link nearest the file, if there is one on the way.
+        $link = $resolved
+        while ($link -and -not ((Test-Path -LiteralPath $link) -and (Get-Item -LiteralPath $link -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint))) {
+            $parent = Split-Path -Parent $link
+            $link = if ($parent -and $parent -ne $link) { $parent } else { $null }
+        }
+        if (-not $link) { return $resolved }
+        $target = @((Get-Item -LiteralPath $link -Force).Target) | Select-Object -First 1
+        if (-not $target) {
+            throw "$link is a reparse point this script cannot follow, so where $Path really is cannot be checked. Nothing was changed."
+        }
+        if (-not [IO.Path]::IsPathRooted($target)) { $target = Join-Path (Split-Path -Parent $link) $target }
+        $resolved = [IO.Path]::GetFullPath($target.TrimEnd('\') + $resolved.Substring($link.Length))
+    }
+    throw "$Path leads through more than 32 links. Nothing was changed."
+}
+
+# Everything inside $Path, without going into a link: what a link leads to is
+# somewhere else, and following one could lead round in a circle.
+function Get-TreeEntry([string] $Path) {
+    $entries = New-Object System.Collections.Generic.List[object]
+    $folders = New-Object System.Collections.Generic.Queue[string]
+    $folders.Enqueue($Path)
+    while ($folders.Count -gt 0) {
+        $folder = $folders.Dequeue()
+        try {
+            $items = @(Get-ChildItem -LiteralPath $folder -Force)
+        } catch {
+            throw "What is in $folder cannot be read by this session, so it cannot be checked: $($_.Exception.Message)"
+        }
+        foreach ($item in $items) {
+            $entries.Add($item)
+            if ($item.PSIsContainer -and -not $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
+                $folders.Enqueue($item.FullName)
+            }
+        }
+    }
+    return $entries
+}
+
+# Every link in the base, a junction or a symbolic link, to a folder or a file.
+function Get-BaseLink {
+    return @(Get-TreeEntry $Base | Where-Object { $_.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) } | ForEach-Object { $_.FullName })
+}
+
+# Who besides Administrators and SYSTEM has had a hand in the base, for a task
+# that runs what is in it as SYSTEM: its owner, anybody else in its ACL, the
+# folder above when it inherits from there, and inside it anything that
+# somebody else owns or may change, and every link. Nobody, when the list is
+# empty, which holds only for a base that was given to Administrators and
+# SYSTEM before anything went in. Whatever else is in one would look like
+# Administrators' own once Protect-Base had made it theirs.
+function Get-BaseTakeover {
+    $found = New-Object System.Collections.Generic.List[string]
+    if (-not (Test-Path -LiteralPath $Base -PathType Container)) {
+        $found.Add("$Base is not a folder")
+        return $found
+    }
+    $acl = Get-Acl -LiteralPath $Base
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if (@($AdministratorsSid, $SystemSid) -notcontains $owner) {
+        $found.Add("$owner owns $Base")
+    }
+    if (-not $acl.AreAccessRulesProtected) {
+        $found.Add("$Base takes what the folder above allows as well")
+    }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $line = "$($rule.IdentityReference.Value) is in the ACL of $Base"
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            @($AdministratorsSid, $SystemSid) -notcontains $rule.IdentityReference.Value -and
+            -not $found.Contains($line)) {
+            $found.Add($line)
+        }
+    }
+    foreach ($entry in @(Get-TreeEntry $Base)) {
+        if ($entry.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
+            $found.Add("$($entry.FullName) is a link")
+            continue
+        }
+        foreach ($line in @(Get-ForeignAccess $entry.FullName $ChangeRights 'change')) {
+            $found.Add($line)
+        }
     }
     return $found
 }
@@ -249,13 +374,27 @@ function Invoke-IcaclsCommand([string[]] $Arguments) {
 # Gives the base to $Sids alone: full control for each of them is all that is
 # left on it, nothing comes from the folder above, and everything inside goes
 # back to inheriting just that. With $Owner, that account owns every file and
-# folder in it as well, so one made there by somebody else is no longer theirs
-# to re-permission. The base is closed first and opened to nobody on the way.
-# icacls is given SIDs, never names, which are spelled differently in another
-# language.
-function Protect-Base([string[]] $Sids, [string] $Owner) {
+# folder in it as well. icacls is given SIDs, never names, which are spelled
+# differently in another language.
+#
+# The base is closed first, and what is inside is only changed once nobody
+# else can add to it. A link in it stops this, before anything is changed and
+# again then: icacls changes what a link leads to, wherever that is, and is
+# told /L on the way down all the same. For a task that runs as SYSTEM, what is
+# inside is judged by Get-BaseTakeover before /setowner makes all of it look
+# like Administrators', and a base this session has just made (-Fresh) has to
+# hold nothing at all: whatever is in it was put there by somebody else.
+function Protect-Base([string[]] $Sids, [string] $Owner, [switch] $Fresh) {
     if (-not (Test-Path -LiteralPath $Base -PathType Container)) {
         New-Item -ItemType Directory -Path $Base -Force | Out-Null
+    }
+    $links = @(Get-BaseLink)
+    if ($links.Count -gt 0) {
+        throw ("$Base holds links, which would carry what this script changes somewhere else: " + ($links -join ', ') + ". Remove them and run this again. Nothing was changed.")
+    }
+
+    if ($Owner) {
+        Invoke-IcaclsCommand -Arguments @($Base, '/setowner', ('*' + $Owner), '/L', '/Q')
     }
     $grants = @($Sids | ForEach-Object { '*' + $_ + ':(OI)(CI)F' })
     Invoke-IcaclsCommand -Arguments (@($Base, '/inheritance:r', '/grant:r') + $grants)
@@ -270,10 +409,22 @@ function Protect-Base([string[]] $Sids, [string] $Owner) {
     }
 
     if ($Owner) {
-        Invoke-IcaclsCommand -Arguments @($Base, '/setowner', ('*' + $Owner), '/T', '/C', '/Q')
+        $found = @(Get-BaseTakeover)
+    } else {
+        $found = @(Get-BaseLink | ForEach-Object { "$_ is a link" })
+    }
+    if ($Fresh) {
+        $found += @(Get-ChildItem -LiteralPath $Base -Force | ForEach-Object { "$($_.FullName) was put there while it was being made" })
+    }
+    if ($found.Count -gt 0) {
+        throw ("$Base was closed to everybody else, but what is in it is not this script's to take over: " + ($found -join '; ') + ". Nothing was installed.")
+    }
+
+    if ($Owner) {
+        Invoke-IcaclsCommand -Arguments @($Base, '/setowner', ('*' + $Owner), '/T', '/C', '/L', '/Q')
     }
     if (Get-ChildItem -LiteralPath $Base -Force | Select-Object -First 1) {
-        Invoke-IcaclsCommand -Arguments @((Join-Path $Base '*'), '/reset', '/T', '/C', '/Q')
+        Invoke-IcaclsCommand -Arguments @((Join-Path $Base '*'), '/reset', '/T', '/C', '/L', '/Q')
     }
 
     $acl = Get-Acl -LiteralPath $Base
@@ -543,7 +694,7 @@ if (-not $current) {
     } elseif ($sid -eq $SystemSid) {
         throw ("'$TaskName' runs as SYSTEM, and whoever can write the agent's files would run code as SYSTEM through it. " +
             "Nothing was changed. Remove the task from an elevated session, and this script creates it again running as you: $removal. " +
-            "Or keep it with -AllowSystemPrincipal, from an elevated session and with LEGIONCTL_HOME outside every user profile.")
+            "Or keep it with -AllowSystemPrincipal, from an elevated session, with node installed for all users and LEGIONCTL_HOME a folder outside every user profile that does not exist yet.")
     } else {
         throw ("'$TaskName' runs as $who, not as $($identity.Name), who is installing it, and whoever can write the agent's files would run code as $who through it. " +
             "Nothing was changed. Remove the task, and this script creates it again running as you: $removal")
@@ -559,12 +710,43 @@ if ($TaskRunsAsSystem) {
         throw ("The base $Base is inside a user profile, and that user could change what SYSTEM runs. " +
             "Set LEGIONCTL_HOME to a folder outside every profile, such as " + (Join-Path $env:ProgramData 'legion-control') + ", and run this again. Nothing was changed.")
     }
-    if (Test-Inside $NodeExe $profileRoots) {
-        throw "node at $NodeExe is inside a user profile, and that user could change what SYSTEM runs. Install Node.js for all users and run this again. Nothing was changed."
+
+    # node is what the task starts as SYSTEM, so whoever may change it, or put
+    # a DLL in its folder that it loads before its own, runs code as SYSTEM.
+    # It is judged where it really is, and the task is given that path, so a
+    # link on the way that is pointed elsewhere later changes nothing.
+    $realNode = Resolve-LinkedPath $NodeExe
+    $nodeName = if ($realNode -eq $NodeExe) { $NodeExe } else { "$NodeExe (which is $realNode)" }
+    if (Test-Inside $realNode $profileRoots) {
+        throw "node at $nodeName is inside a user profile, and that user could change what SYSTEM runs. Install Node.js for all users and run this again. Nothing was changed."
     }
+    $nodeTakeover = @(@(Get-PathTakeover $realNode) +
+        @(Get-ForeignAccess (Split-Path -Parent $realNode) $ChangeRights 'change what is in') +
+        @(Get-ForeignAccess $realNode $ChangeRights 'change') | Select-Object -Unique)
+    if ($nodeTakeover.Count -gt 0) {
+        throw ("Somebody besides Administrators and SYSTEM could change node at $nodeName, which SYSTEM would run: " + ($nodeTakeover -join '; ') +
+            ". Install Node.js for all users, where only Administrators may change it, and run this again. Nothing was changed.")
+    }
+    if ($realNode -ne $NodeExe) {
+        Note "node is $realNode, where $NodeExe leads, and the task runs it from there"
+        $NodeExe = $realNode
+    }
+
     $takeover = @(Get-PathTakeover $Base)
     if ($takeover.Count -gt 0) {
         throw ("Somebody besides Administrators and SYSTEM could put another folder where the base is: " + ($takeover -join '; ') + ". Nothing was changed.")
+    }
+
+    # A base that is there already is taken only as an earlier run left it.
+    # Anybody may make a folder in ProgramData, and what they put in it would
+    # run as SYSTEM once it was Administrators' like the rest.
+    if (Test-Path -LiteralPath $Base) {
+        $intrusion = @(Get-BaseTakeover)
+        if ($intrusion.Count -gt 0) {
+            throw ("$Base is already there, and was not made for Administrators and SYSTEM alone: " + ($intrusion -join '; ') + ". " +
+                "Whatever is in it would run as SYSTEM, so it is not taken over. Nothing was changed. " +
+                "Move out what you mean to keep, remove the folder and run this again, and it is made for Administrators and SYSTEM alone before anything goes in.")
+        }
     }
 } elseif ($AllowSystemPrincipal) {
     Note '-AllowSystemPrincipal only keeps a task that already runs as SYSTEM; this one runs as you'
@@ -580,13 +762,29 @@ if ($TaskRunsAsSystem) {
 Step 'Base'
 
 if ($TaskRunsAsSystem) {
-    Protect-Base -Sids @($AdministratorsSid, $SystemSid) -Owner $AdministratorsSid
-    # A link left inside by whoever could write here before would carry what
-    # this script installs out to where they still can.
-    $links = @(Get-ChildItem -LiteralPath $Base -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
-    if ($links.Count -gt 0) {
-        throw ("$Base holds links, which could lead what SYSTEM runs somewhere a user can write: " + (($links | ForEach-Object { $_.FullName }) -join ', ') + ". Remove them and run this again.")
+    # Made here, not found: New-Item without -Force fails on a folder that is
+    # there, so one somebody made since it was looked at above stops this
+    # instead of being taken over. Protect-Base then closes it, and refuses it
+    # if anything was put in it before that.
+    $fresh = -not (Test-Path -LiteralPath $Base)
+    if ($fresh) {
+        $above = Split-Path -Parent $Base
+        if (-not (Test-Path -LiteralPath $above -PathType Container)) {
+            New-Item -ItemType Directory -Path $above -Force | Out-Null
+        }
+        try {
+            New-Item -ItemType Directory -Path $Base -ErrorAction Stop | Out-Null
+        } catch {
+            throw "$Base could not be made, or somebody else made it since it was looked at: $($_.Exception.Message). Run this again. Nothing was installed."
+        }
+        # Administrators', as what an elevated session makes, or this account's
+        # where policy makes whoever creates a folder its owner.
+        $madeBy = (Get-Acl -LiteralPath $Base).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if (@($AdministratorsSid, $UserSid) -notcontains $madeBy) {
+            throw "$Base was made, but $madeBy owns it, not Administrators or this account. Nothing was installed."
+        }
     }
+    Protect-Base -Sids @($AdministratorsSid, $SystemSid) -Owner $AdministratorsSid -Fresh:$fresh
     Note "$Base is Administrators' and SYSTEM's alone"
 } else {
     Protect-Base -Sids @($UserSid)
@@ -722,7 +920,7 @@ Note "stable launcher installed at $LauncherScript and passed version --check"
 # makes whoever creates a file its owner, that is the installing account, and
 # an owner may re-permission what it owns without being elevated.
 if ($TaskRunsAsSystem) {
-    Invoke-IcaclsCommand -Arguments @($Base, '/setowner', ('*' + $AdministratorsSid), '/T', '/C', '/Q')
+    Invoke-IcaclsCommand -Arguments @($Base, '/setowner', ('*' + $AdministratorsSid), '/T', '/C', '/L', '/Q')
 }
 
 # config.json and state.json are deliberately not written here. The agent falls
