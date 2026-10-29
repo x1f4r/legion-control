@@ -62,6 +62,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
 import com.x1f4r.legioncontrol.ui.theme.LocalStatusColors
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -117,6 +118,12 @@ sealed interface Page {
         override val summary get() = "One machine belongs to another setup"
     }
 
+    /** Commands the shared setup changed, which this device does not run until it approves them. */
+    data object LaunchReview : Page {
+        override val title get() = "Approve commands"
+        override val summary get() = "What the shared setup asks this device to run"
+    }
+
     data object Editor : Page {
         override val title get() = "Edit the setup"
         override val summary get() = "Machines, addresses, systems, sites and wake helpers"
@@ -129,7 +136,7 @@ sealed interface Page {
 }
 
 /** The pages there are right now, which follows the setup and the services it found. */
-private fun pagesOf(app: AppModel): List<Page> {
+private fun pagesOf(app: AppModel, review: List<LaunchReviewEntry>): List<Page> {
     val machines = app.machines
     return buildList {
         // A question the app cannot answer on its own goes first, because it is holding everything
@@ -140,6 +147,9 @@ private fun pagesOf(app: AppModel): List<Page> {
         machines.forEach { model ->
             add(Page.OneMachine(model))
         }
+        // After the machines, because it holds nothing up: the setup is in force, and the
+        // approved commands keep running until somebody decides.
+        if (app.showsLaunchReview(review)) add(Page.LaunchReview)
         if (app.editorOpen) add(Page.Editor)
         add(Page.Device)
     }
@@ -157,7 +167,8 @@ fun LegionApp(app: AppModel, updates: AppUpdateModel) {
 
 @Composable
 private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
-    val pages = pagesOf(app)
+    val review = app.launchReview.collectAsStateSafely()
+    val pages = pagesOf(app, review)
     val pager = rememberPagerState(pageCount = { pages.size })
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -170,6 +181,12 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
             .distinctUntilChanged()
             .drop(1)
             .collect { haptics.tick() }
+    }
+
+    // Review, wherever it was pressed, moves to the page it brought back.
+    LaunchedEffect(app.launchReviewRequests) {
+        val index = pages.indexOf(Page.LaunchReview)
+        if (app.launchReviewRequests > 0 && index >= 0) pager.animateScrollToPage(index)
     }
 
     LaunchedEffect(pager, pages) {
@@ -265,6 +282,7 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                             Page.NoMachines -> NoMachinesSection(app)
                             Page.Divergence -> DivergenceSection(app)
                             Page.IdentityClash -> IdentityClashSection(app)
+                            Page.LaunchReview -> LaunchReviewSection(app)
                             Page.Editor -> SetupEditorSection(app)
                             Page.Device, null ->
                                 ThisDeviceSection(app, updates, bindings, app.bindingsActions)

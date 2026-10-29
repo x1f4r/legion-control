@@ -18,6 +18,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.agent.RemoteShell
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
+import com.x1f4r.legioncontrol.data.LaunchScope
 import com.x1f4r.legioncontrol.data.MachineConfig
 import com.x1f4r.legioncontrol.data.SetupMerge
 import com.x1f4r.legioncontrol.data.WakeHelperConfig
@@ -292,13 +294,27 @@ private fun AddEndpointRow(app: AppModel, machine: MachineConfig) {
 @Composable
 private fun SystemsEditor(app: AppModel, machine: MachineConfig) {
     val editor = app.editor
+    // Read so that this recomposes when an approval or a revert settles a pending command.
+    val review = app.launchReview.collectAsStateSafely()
     SectionHeading("Systems", note = "${machine.systems.size}", showsRule = false)
     ExplanationText(
         "The command that runs the control agent. Every part is passed as it is written, so use " +
             "absolute paths: a ~ is not expanded.",
     )
     machine.systems.forEach { system ->
+        val pending = review.firstOrNull {
+            it.scope == LaunchScope.SYSTEM && it.machineId == machine.id && it.systemId == system.id
+        }
         DetailRow(system.name ?: system.id, alignment = Alignment.Top) {
+            if (pending != null) {
+                PendingCommand(app, pending)
+                Actions {
+                    PlainAction("Remove", enabled = true, destructive = true) {
+                        editor.removeSystem(machine.id, system.id)
+                    }
+                }
+                return@DetailRow
+            }
             Column {
                 PlainField(
                     value = system.agent.joinToString(" "),
@@ -359,17 +375,41 @@ private fun SystemsEditor(app: AppModel, machine: MachineConfig) {
     AddSystemRow(app, machine)
 }
 
+/**
+ * A system whose command waits for approval, as it stands, with Approve and Revert in place of the
+ * fields. Its shell and restricted key are not editable either: an edit approves the whole tuple it
+ * changes, so changing the shell here would approve the argv beside it that nobody approved.
+ */
+@Composable
+private fun PendingCommand(app: AppModel, entry: LaunchReviewEntry) {
+    Column {
+        LaunchValueLines(entry.scope, entry.offered)
+        QuietText(
+            "This command came with the shared setup and waits for approval on this device. Approve " +
+                "it or put back the approved one before changing it.",
+            Modifier.padding(top = 2.dp),
+        )
+        Actions {
+            if (entry.approvable) PlainAction("Approve", enabled = true) { app.approveLaunch(listOf(entry)) }
+            if (app.canRevertLaunch(entry)) PlainAction("Revert", enabled = true) { app.revertLaunch(entry) }
+        }
+        app.launchNote?.let { QuietText(it) }
+    }
+}
+
 @Composable
 private fun AddSystemRow(app: AppModel, machine: MachineConfig) {
     var id by remember { mutableStateOf("") }
     var name by remember { mutableStateOf("") }
     var platform by remember { mutableStateOf("linux") }
+    var command by remember { mutableStateOf("") }
     var problem by remember { mutableStateOf<String?>(null) }
 
     DetailRow("New system") {
         Column {
             PlainField(id, { id = it }, "an id, e.g. linux")
             PlainField(name, { name = it }, "what to call it")
+            PlainField(command, { command = it }, "/usr/bin/node /home/me/.legion-control/bin/launcher.mjs")
             Actions {
                 listOf("linux", "windows", "mac").forEach {
                     PlainAction(it, enabled = platform != it, emphasis = platform == it) {
@@ -378,17 +418,27 @@ private fun AddSystemRow(app: AppModel, machine: MachineConfig) {
                 }
             }
             Actions {
-                PlainAction("Add", enabled = id.isNotBlank()) {
-                    problem = app.editor.addSystem(machine.id, id, name, platform)
+                PlainAction("Add", enabled = id.isNotBlank() && command.isNotBlank()) {
+                    problem = app.editor.addSystem(machine.id, id, name, platform, argvOf(command))
                     if (problem == null) {
                         id = ""
                         name = ""
+                        command = ""
                     }
                 }
             }
             problem?.let { QuietText(it) }
         }
     }
+}
+
+/**
+ * The commands the shared setup changed, waiting for this device: the page that shows itself when a
+ * revision brings one, until Not now puts it off for that revision.
+ */
+@Composable
+fun LaunchReviewSection(app: AppModel) {
+    LaunchReviewCard(app, app.launchReview.collectAsStateSafely())
 }
 
 /**

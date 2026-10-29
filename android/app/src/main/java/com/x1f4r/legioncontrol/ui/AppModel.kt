@@ -22,6 +22,8 @@ import com.x1f4r.legioncontrol.agent.shouldAskForMeta
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.EXAMPLE_CONTROLLER_CONFIG
 import com.x1f4r.legioncontrol.data.KeyChange
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
+import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.agent.SetupChangePreview
 import com.x1f4r.legioncontrol.data.SetupMerge
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -41,6 +43,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
@@ -120,7 +126,7 @@ class AppModel(
         private set
 
     /** The setup editor, which every peer has. */
-    val editor = SetupEditorModel(services, bindings)
+    val editor = SetupEditorModel(services)
 
     /** What is in the raw configuration field, which is not in force until Apply says so. */
     var configDraft: String by mutableStateOf(services.configText.value)
@@ -725,14 +731,22 @@ class AppModel(
         }
     }
 
+    /**
+     * What a fetch found. A document is not applied here: it is shown first, every command, key
+     * file and update source in it, and only [confirmEnrolment] puts it in force.
+     */
     private fun applyFetched(fetched: ControllerFetch, source: SetupSource): String = when (fetched) {
-        is ControllerFetch.Document -> {
-            val failure = services.applyEnrolment(fetched.text, services.deviceName())
-            val found = services.config.value?.machines?.size ?: 0
-            failure?.let { "The setup from ${source.host} was refused. $it" }
-                ?: "The setup came from ${source.host}: $found " +
-                    "machine${if (found == 1) "" else "s"}."
-        }
+        is ControllerFetch.Document -> EnrolmentPreview.of(
+            text = fetched.text,
+            host = source.host,
+            approves = services.document.value == null,
+        ).fold(
+            onSuccess = { preview ->
+                enrolment = preview
+                "Check what the setup from ${source.host} runs before using it."
+            },
+            onFailure = { "The setup from ${source.host} was refused. ${it.message}" },
+        )
 
         ControllerFetch.NothingStored ->
             "That machine has no setup stored yet. Paste one here, or fetch from a machine that has one."
@@ -742,6 +756,92 @@ class AppModel(
 
         ControllerFetch.Unreadable ->
             "${source.host} answered with something that is not a setup."
+    }
+
+    // MARK: - Enrolment and the commands this device runs (contract section 9.9)
+
+    /** A fetched setup waiting to be confirmed or cancelled. Nothing of it is applied until then. */
+    var enrolment: EnrolmentPreview? by mutableStateOf(null)
+        private set
+
+    /**
+     * Puts the previewed setup in force. On a device with no setup yet this approves every launch
+     * value the summary showed; on one that had a setup, the values it did not approve wait.
+     */
+    fun confirmEnrolment() {
+        val preview = enrolment ?: return
+        enrolment = null
+        val failure = services.applyEnrolment(preview.text, services.deviceName())
+        val found = services.config.value?.machines?.size ?: 0
+        fetchOutcome = failure?.let { "The setup from ${preview.host} was refused. $it" }
+            ?: "The setup came from ${preview.host}: $found machine${if (found == 1) "" else "s"}."
+    }
+
+    /** Drops the previewed setup. Nothing was applied, and nothing is. */
+    fun cancelEnrolment() {
+        val preview = enrolment ?: return
+        enrolment = null
+        fetchOutcome = "Nothing from ${preview.host} was applied."
+    }
+
+    /** Each launch value of the setup in force that waits for this device's approval. */
+    val launchReview: StateFlow<List<LaunchReviewEntry>> =
+        services.launch.map { it.review }.stateIn(scope, SharingStarted.Eagerly, services.launch.value.review)
+
+    /** Why the record of approved commands could not be read, when it could not. */
+    val launchProblem: StateFlow<String?> get() = services.launchProblem
+
+    var launchNote: String? by mutableStateOf(null)
+        private set
+
+    /** The revision whose review was put off with Not now. Kept in memory, for this run only. */
+    private var deferredReview: String? by mutableStateOf(null)
+
+    /** Set by Review: the review page shows even for a revision it was put off for. */
+    private var reviewAsked: Boolean by mutableStateOf(false)
+
+    /** Bumped each time the review is asked for, so the screen can move to it. */
+    var launchReviewRequests: Int by mutableStateOf(0)
+        private set
+
+    /** Whether the review page is up: something waits, and it was not put off for this revision. */
+    fun showsLaunchReview(review: List<LaunchReviewEntry>): Boolean =
+        review.isNotEmpty() && (reviewAsked || deferredReview != setupProvenance?.hash)
+
+    fun openLaunchReview() {
+        reviewAsked = true
+        launchReviewRequests += 1
+    }
+
+    /** Not now: the page does not come back for this revision in this run. The badge stays. */
+    fun deferLaunchReview(hash: String?) {
+        deferredReview = hash
+        reviewAsked = false
+    }
+
+    /** Approve: records exactly the values shown, at their places. */
+    fun approveLaunch(entries: List<LaunchReviewEntry>) {
+        launchNote = services.approveLaunch(entries)
+            ?: if (entries.size == 1) "Approved on this device." else "Approved ${entries.size} on this device."
+    }
+
+    /** Whether [entry] has an approved value at its place that an edit can put back. */
+    fun canRevertLaunch(entry: LaunchReviewEntry): Boolean =
+        entry.approved != null && services.document.value?.let { LaunchValues.reverted(it.root, entry) } != null
+
+    /**
+     * Revert: an ordinary edit made here that puts back the value this device approved at that
+     * place. It is published like any other edit, so the peer that changed it sees it changed back.
+     */
+    fun revertLaunch(entry: LaunchReviewEntry) {
+        val document = services.document.value ?: return
+        val reverted = LaunchValues.reverted(document.root, entry)
+        if (reverted == null) {
+            launchNote = "There is no approved value to put back here."
+            return
+        }
+        launchNote = services.applyEdit(ControllerDocument.of(reverted), services.deviceName())
+            ?: "Put back the approved value. It is sent to every machine on its next check."
     }
 
     private fun explain(failure: Throwable, source: SetupSource): String = when (failure) {

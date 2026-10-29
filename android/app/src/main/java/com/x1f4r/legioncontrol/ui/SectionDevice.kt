@@ -438,6 +438,22 @@ private fun SetupBlock(app: AppModel, onEdit: () -> Unit = app::openEditor) {
 
     app.advisories.forEach { QuietText(it, Modifier.padding(top = 4.dp)) }
 
+    // The badge stays while anything waits, whether or not the review was put off for now.
+    val review = app.launchReview.collectAsStateSafely()
+    if (review.isNotEmpty()) {
+        Spacer(Modifier.height(8.dp))
+        StatusLine(
+            Mark.Attention,
+            if (review.size == 1) {
+                "A command from the shared setup waits for approval on this device"
+            } else {
+                "${review.size} commands from the shared setup wait for approval on this device"
+            },
+        )
+        Actions { PlainAction("Review", enabled = true, emphasis = true) { app.openLaunchReview() } }
+    }
+    app.launchProblem.collectAsStateSafely()?.let { StatusLine(Mark.Bad, it) }
+
     Actions {
         PlainAction(
             label = "Edit the setup",
@@ -512,6 +528,7 @@ private fun HistoryBlock(app: AppModel) {
  *
  * Every machine carries the document, so one address is enough to get all of it. The key is this
  * phone's own and has to be authorised on that system already, exactly as for every other command.
+ * What comes back is shown, every command in it, and applied only once it is confirmed.
  */
 @Composable
 fun FetchSetupBlock(app: AppModel) {
@@ -548,6 +565,7 @@ fun FetchSetupBlock(app: AppModel) {
         ) { app.fetchSetup() }
     }
     app.fetchOutcome?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
+    EnrolmentSummary(app)
 }
 
 /** The systems by name, or a general word for them when there is no configuration yet. */

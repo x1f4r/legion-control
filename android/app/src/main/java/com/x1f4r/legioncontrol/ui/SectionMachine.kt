@@ -23,9 +23,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.agent.AgentDeploymentPath
 import com.x1f4r.legioncontrol.agent.Contract
+import com.x1f4r.legioncontrol.agent.LaunchState
 import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.humanDuration
+import com.x1f4r.legioncontrol.data.LaunchScope
 import com.x1f4r.legioncontrol.ui.theme.LocalStatusColors
 
 /**
@@ -70,6 +72,7 @@ fun MachineSection(model: MachineModel, app: AppModel) {
         PlainAction("Details", true) { sheet = "Device details" }
     }
     model.wakeableHelper?.let { PlainAction("Wake helper first", !model.isWorking) { model.requestWakeHelper() } }
+    LaunchStateLines(model, app)
 
     OperationsBlock(model, showHistory = false)
     SectionHeading("Services")
@@ -143,6 +146,34 @@ fun MachineSection(model: MachineModel, app: AppModel) {
     model.operationDetails?.let { details -> DetailSheet("Change details", model::dismissOperationDetails) {
         androidx.compose.foundation.text.selection.SelectionContainer { Text(details, style = MaterialTheme.typography.bodySmall) }
     } }
+}
+
+/**
+ * Each system that does not run the command the shared setup names, and why (contract section 9.9).
+ *
+ * Nothing at all for a machine whose every system runs what the setup says, which is the usual case.
+ */
+@Composable
+private fun LaunchStateLines(model: MachineModel, app: AppModel) {
+    val review = app.launchReview.collectAsStateSafely()
+    val systems = model.machine.systems.filter { it.launchState != LaunchState.APPROVED }
+    if (systems.isEmpty()) return
+    systems.forEach { system ->
+        val waiting = review.any {
+            it.scope == LaunchScope.SYSTEM && it.machineId == model.machine.id && it.systemId == system.id
+        }
+        val state = when {
+            system.launchState == LaunchState.APPROVED_WITH_CHANGE_WAITING ->
+                "Runs the approved command. A changed one is waiting for approval."
+
+            waiting -> "Not driven from this device until its command is approved."
+            else -> "Not driven from this device: the setup gives it no command this device can run."
+        }
+        StatusLine(Mark.Attention, if (model.machine.systems.size > 1) "${system.name}: $state" else state)
+    }
+    if (review.any { it.machineId == model.machine.id }) {
+        Actions { PlainAction("Review", enabled = true) { app.openLaunchReview() } }
+    }
 }
 
 private fun compactMachineState(model: MachineModel): String = when (val state = model.link) {

@@ -28,6 +28,7 @@ import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.StdinSource
+import com.x1f4r.legioncontrol.ui.EnrolmentPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
@@ -285,7 +286,7 @@ class LaunchGateTest {
     }
 
     @Test
-    fun `enrolment approves every launch value, and a peer's new machine stays undriven`() = runBlocking {
+    fun `enrolment shows every launch value, approves them all, and a peer's new machine stays undriven`() = runBlocking {
         val everything = descendant(HELD) { root ->
             JsonObject(
                 root.editedMachine(tower) { JsonObject(it + ("ssh" to buildJsonObject { put("identityFile", "~/.ssh/id_tower") })) } +
@@ -293,10 +294,21 @@ class LaunchGateTest {
                     ("local" to buildJsonObject { put("agent", "/Users/me/.legion-control/agent/src/index.mjs") }),
             )
         }
+        val preview = EnrolmentPreview.of(everything, "desk-tower.local", approves = true).getOrThrow()
+        assertEquals(listOf("Tower", "Beacon"), preview.machines.map { it.name })
+        assertEquals(
+            listOf(tuple(LINUX, "posix"), tuple(WINDOWS, "cmd"), tuple(PI, "dispatch")),
+            preview.machines.flatMap { m -> m.systems.map { it.tuple } },
+        )
+        assertEquals("~/.ssh/id_tower", preview.machines.first().identityFile)
+        assertEquals("owner/fork", preview.repo)
+        assertEquals("/Users/me/.legion-control/agent/src/index.mjs", preview.local?.agent)
+
+        // Nothing is applied by looking. Confirm is what applies it, and approves all of it.
         val prefs = MemoryPreferences()
         val store = store(prefs)
         assertEquals(null, store.document.value)
-        assertEquals(null, store.applyEnrolment(everything, "Test phone"))
+        assertEquals(null, store.applyEnrolment(preview.text, "Test phone"))
         assertEquals(emptyList<String>(), store.paths())
         assertEquals("owner/fork", store.launch.value.config?.appUpdates?.githubRepo)
 
