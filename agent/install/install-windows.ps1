@@ -14,6 +14,8 @@
          the account this script runs under. If it does exist, its action, its
          repetition and its time limit are rewritten and everything else about
          it (principal, conditions) is left exactly as found.
+      3. Says which shell OpenSSH runs commands with, which decides what the
+         setup has to say for this system's "shell".
 
     What it deliberately does NOT touch:
       Any other task on the machine. A task that starts a service the agent
@@ -611,6 +613,29 @@ if ($TaskRegistered) {
     if ($liveUser)     { Note ("live principal: " + $liveUser.InnerText) }
     if ($liveLimit)    { Note ("live limit:     " + $liveLimit.InnerText) }
 }
+}
+
+# ---------------------------------------------------------------------------
+# OpenSSH
+# ---------------------------------------------------------------------------
+
+# The shell sshd hands a command to decides how the clients have to quote it:
+# cmd when nothing is set, PowerShell when the setup says "shell": "powershell"
+# for this system. The agent's doctor reads the same value.
+Step 'OpenSSH'
+
+$defaultShell = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell
+if (-not $defaultShell) {
+    Note 'sshd DefaultShell: not set, so ssh runs commands with cmd.exe; this system needs no "shell" in the setup, or "cmd"'
+} else {
+    $shellName = (Split-Path -Leaf $defaultShell).ToLowerInvariant()
+    if ($shellName -eq 'cmd.exe') {
+        Note ('sshd DefaultShell: ' + $defaultShell + '; this system needs no "shell" in the setup, or "cmd"')
+    } elseif ($shellName -eq 'powershell.exe' -or $shellName -eq 'pwsh.exe') {
+        Note ('sshd DefaultShell: ' + $defaultShell + '; set "shell": "powershell" for this system in the setup')
+    } else {
+        Note ('WARNING: sshd DefaultShell: ' + $defaultShell + '. Clients quote commands for cmd and PowerShell only; set it to cmd.exe or powershell.exe, or remove it')
+    }
 }
 
 # ---------------------------------------------------------------------------

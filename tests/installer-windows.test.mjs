@@ -36,6 +36,13 @@ test('the Windows task gets the cycle budget as its time limit, new or rewritten
   assert.match(service, /^TimeoutStartSec=1800$/m);
 });
 
+// What sshd hands a command to decides how the clients quote it, so the installer says, as the
+// agent's doctor does.
+test('the Windows installer says which shell sshd runs commands with', () => {
+  assert.match(installer, /Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell/);
+  assert.match(installer, /set "shell": "powershell" for this system in the setup/);
+});
+
 // The superseded updater one machine once ran is nothing a public installer should know about.
 test('the Windows installer names no updater from before the agent', () => {
   assert.doesNotMatch(installer, /update-nightly|T3Code|AppData\\Local/i);
@@ -95,6 +102,7 @@ test('the Windows installer installs and verifies a real agent, and leaves the s
   const first = runInstaller(source, base, home, ['-TaskName', name]);
   assert.equal(first.status, 0, `${first.stdout}\n${first.stderr}`);
   assert.match(first.stdout, /source verification: unsigned source checkout/);
+  assert.match(first.stdout, /sshd DefaultShell: /);
   assert.match(first.stdout, /stable launcher installed at .* and passed version --check/);
   assert.match(first.stdout, /scheduled task left untouched by -SkipScheduler/);
   assert.match(first.stdout, /config\.json is already there and was left untouched/);
