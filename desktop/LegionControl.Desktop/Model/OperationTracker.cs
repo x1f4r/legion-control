@@ -96,16 +96,26 @@ public sealed record TrackedOperation
 /// Written through a temporary file and a rename, like everything else this app persists, so a
 /// crash in the middle of an update leaves either the old list or the new one and never half of
 /// either.
+///
+/// The window and the command line keep the same list, and a wake hold in it is what stops a
+/// helper command from running on two helpers. So every change takes `operations.json.lock`, folds
+/// in what the other process wrote since this one last read or wrote the file, applies its one
+/// change and writes the whole, the way [Config.LaunchApprovals] does; a hold the command line
+/// recorded while the window was open is never written away by the window. The holds for a machine
+/// are read again whenever the file changed, so a wake planned here sees one recorded there.
 public sealed class OperationTracker
 {
     private readonly string _path;
     private readonly object _gate = new();
     private readonly Dictionary<string, TrackedOperation> _operations = new(StringComparer.Ordinal);
+    /// The file's time and size when this tracker last read or wrote it, and the ids it held then.
+    private string? _signature;
+    private HashSet<string> _onDisk = new(StringComparer.Ordinal);
 
     public OperationTracker(string? path = null)
     {
         _path = path ?? AppPaths.OperationsFile;
-        Load();
+        ReloadIfChanged();
     }
 
     public event Action? Changed;
@@ -139,6 +149,7 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
+            using var held = Fresh();
             if (_operations.TryGetValue(id, out var existing))
             {
                 if (existing.Intent.Key != intent.Key)
@@ -167,7 +178,9 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
-            _operations[operation.Id] = operation;
+            using var held = Fresh();
+            // Stamped here, so a change made in this process wins over the older copy in another.
+            _operations[operation.Id] = operation with { UpdatedAt = DateTimeOffset.UtcNow };
             Prune();
             Save();
         }
@@ -183,6 +196,7 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
+            using var held = Fresh();
             if (!_operations.TryGetValue(id, out var existing)) return null;
             if (!existing.Intent.Matches(record))
             {
@@ -216,6 +230,7 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
+            using var held = Fresh();
             if (!_operations.TryGetValue(id, out var existing)) return;
             _operations[id] = existing with
             {
@@ -229,9 +244,28 @@ public sealed class OperationTracker
         Changed?.Invoke();
     }
 
-    /// The wake holds recorded for [target], oldest first.
-    public IReadOnlyList<TrackedOperation> WakeHoldsFor(string target) =>
-        All.Where(operation => operation.IsWakeHold && operation.WakeTarget == target).Reverse().ToList();
+    /// The wake holds recorded for [target], oldest first, with any the other process recorded or
+    /// released since this one last looked.
+    public IReadOnlyList<TrackedOperation> WakeHoldsFor(string target)
+    {
+        ReloadIfChanged();
+        return All.Where(operation => operation.IsWakeHold && operation.WakeTarget == target).Reverse().ToList();
+    }
+
+    /// Folds in what the other process wrote, when the file's time or size changed since this one
+    /// last read or wrote it, as when the command line ran something while the window was open.
+    /// Returns whether it read the file.
+    public bool ReloadIfChanged()
+    {
+        lock (_gate)
+        {
+            if (Signature() == _signature) return false;
+            // Read under the lock as well: a reader holding the file open can make another
+            // process's rename over it fail on Windows, and that write would be lost.
+            using var held = Lock();
+            return Merge();
+        }
+    }
 
     /// Releases every hold for [target] recorded before [before]: the target answered an
     /// authenticated status asked for after them, or a person chose to try the other helpers. The
@@ -241,10 +275,11 @@ public sealed class OperationTracker
         var released = false;
         lock (_gate)
         {
+            using var held = Fresh();
             foreach (var operation in _operations.Values.Where(operation =>
                          operation.IsWakeHold && operation.WakeTarget == target && operation.StartedAt < before).ToList())
             {
-                _operations[operation.Id] = operation with { WakeTarget = null };
+                _operations[operation.Id] = operation with { WakeTarget = null, UpdatedAt = DateTimeOffset.UtcNow };
                 released = true;
             }
             if (released) Save();
@@ -257,8 +292,9 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
+            using var held = Fresh();
             if (!_operations.TryGetValue(id, out var operation) || operation.WakeTarget is null) return;
-            _operations[id] = operation with { WakeTarget = null };
+            _operations[id] = operation with { WakeTarget = null, UpdatedAt = DateTimeOffset.UtcNow };
             Save();
         }
         Changed?.Invoke();
@@ -268,6 +304,7 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
+            using var held = Fresh();
             _operations.Remove(id);
             Save();
         }
@@ -299,18 +336,87 @@ public sealed class OperationTracker
         }
     }
 
-    private void Load()
+    /// Takes the lock every process that writes the list takes, and folds in the file as it is now,
+    /// for one change made while the lock is held.
+    private FileStream? Fresh()
+    {
+        var held = Lock();
+        Merge();
+        return held;
+    }
+
+    /// Folds in what the other process wrote since this one last read or wrote the list. The side
+    /// that changed an entry later wins; an entry only the file has is taken; one the file held when
+    /// this side last read or wrote it and holds no more was forgotten or pruned there. A file that
+    /// is not there or cannot be read changes nothing here, and the next write puts this list back.
+    private bool Merge()
+    {
+        // Taken before the read: a write that lands in between is then read again next time.
+        _signature = Signature();
+        if (Read() is not { } stored) return false;
+        foreach (var (id, theirs) in stored)
+        {
+            if (!_operations.TryGetValue(id, out var ours) || theirs.UpdatedAt > ours.UpdatedAt) _operations[id] = theirs;
+        }
+        foreach (var id in _onDisk.Where(id => !stored.ContainsKey(id))) _operations.Remove(id);
+        _onDisk = stored.Keys.ToHashSet(StringComparer.Ordinal);
+        return true;
+    }
+
+    /// The exclusive handle that serialises writers across processes. The file is never unlinked,
+    /// so two processes can never each hold a lock on a different file of the same name. Null when
+    /// it cannot be had within ten seconds: the change is then made without it rather than not at
+    /// all, as it was before there was one.
+    private FileStream? Lock()
+    {
+        var until = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (true)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_path) ?? ".");
+                return new FileStream(_path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException) when (DateTimeOffset.UtcNow < until)
+            {
+                Thread.Sleep(50);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+    }
+
+    /// Modification time and size together, as [Config.LaunchApprovals] watches its file.
+    private string? Signature()
     {
         try
         {
-            if (!File.Exists(_path)) return;
+            var info = new FileInfo(_path);
+            return info.Exists ? $"{info.LastWriteTimeUtc.Ticks}:{info.Length}" : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// The list as the file holds it, or null when there is no file or it is not a list.
+    private Dictionary<string, TrackedOperation>? Read()
+    {
+        try
+        {
+            if (!File.Exists(_path)) return null;
             var json = Value.Parse(File.ReadAllText(_path));
+            if (!json["operations"].IsArray) return null;
+            var stored = new Dictionary<string, TrackedOperation>(StringComparer.Ordinal);
             foreach (var entry in json["operations"].AsArray())
             {
                 var id = entry["id"].AsText();
                 var machineId = entry["machineId"].AsText();
                 if (id is null || machineId is null) continue;
-                _operations[id] = new TrackedOperation
+                stored[id] = new TrackedOperation
                 {
                     Id = id,
                     MachineId = machineId,
@@ -335,12 +441,14 @@ public sealed class OperationTracker
                     WakeTarget = entry["wakeTarget"].AsText(),
                 };
             }
+            return stored;
         }
         catch (Exception)
         {
             // A list that cannot be read is a list this app has to start again. Nothing here is
             // worth refusing to start over, and the machines are asked about what they are running
             // on the next status anyway.
+            return null;
         }
     }
 
@@ -393,6 +501,8 @@ public sealed class OperationTracker
                 }).ToList(),
             };
             AtomicWrite.Text(_path, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+            _signature = Signature();
+            _onDisk = _operations.Keys.ToHashSet(StringComparer.Ordinal);
         }
         catch (Exception)
         {

@@ -299,8 +299,10 @@ public sealed class AppModel : IDisposable
     public async Task RefreshAllAsync(CancellationToken cancellationToken = default)
     {
         Config.ReloadIfChanged();
-        // The command line may have approved something since the last reading.
+        // The command line may have approved something since the last reading, or started an
+        // operation this poll should ask about.
         if (Approvals.ReloadIfChanged()) Rebuild();
+        Tracker.ReloadIfChanged();
         RefreshPresence();
         var before = SnapshotOutcomes();
         await Task.WhenAll(Machines.Select(machine => RefreshOneAsync(machine, cancellationToken)));

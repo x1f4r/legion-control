@@ -143,6 +143,43 @@ public class OperationTrackerTests
     }
 
     [Fact]
+    public void WhatTheOtherProcessWroteSurvivesThisOneWritingTheList()
+    {
+        // The window and the command line keep one list. A hold the command line records while the
+        // window is open is the only thing stopping a second helper's command, so the window's next
+        // write must keep it, and must not bring back what the command line released or forgot.
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var window = new OperationTracker(path);
+        var (shown, _) = window.Begin("op-window-0001", "nas", "linux", UpdateT3);
+        var commandLine = new OperationTracker(path);
+        var run = new OperationIntent("run", ActionId: "wake-tower");
+        commandLine.Begin("op-hold-00001", "pi", "linux", run, wakeTarget: "tower");
+
+        // The window sees it before it plans a wake, and keeps it through a change of its own.
+        Assert.Equal("op-hold-00001", Assert.Single(window.WakeHoldsFor("tower")).Id);
+        window.Update(shown with { Message = "still running" });
+        Assert.Single(new OperationTracker(path).WakeHoldsFor("tower"));
+        Assert.Equal("still running", new OperationTracker(path).Find("op-window-0001")!.Message);
+
+        // Released there, it stays released when the window writes again.
+        commandLine.ReleaseWakeHolds("tower", DateTimeOffset.MaxValue);
+        window.Update(shown with { Message = "finished" });
+        Assert.Empty(new OperationTracker(path).WakeHoldsFor("tower"));
+        Assert.Empty(window.WakeHoldsFor("tower"));
+
+        // Forgotten there, it is not brought back by the window's copy of it.
+        commandLine.Begin("op-never-0001", "pi", "linux", UpdateT3);
+        window.Update(shown with { Message = "again" });
+        Assert.NotNull(window.Find("op-never-0001"));
+        commandLine.Forget("op-never-0001");
+        window.Update(shown with { Message = "once more" });
+        Assert.Null(new OperationTracker(path).Find("op-never-0001"));
+        Assert.Null(window.Find("op-never-0001"));
+        Assert.Equal("once more", new OperationTracker(path).Find("op-window-0001")!.Message);
+    }
+
+    [Fact]
     public void AnIntentMatchesARecordThatSaysNothingAboutTheFieldsItDoesNotHave()
     {
         var record = OperationRecord.From(Value.Parse("""{ "id": "x", "kind": "run", "actionId": "wake-legion" }"""));
