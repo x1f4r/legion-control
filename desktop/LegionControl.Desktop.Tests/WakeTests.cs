@@ -186,10 +186,11 @@ public class WakeTests
     private static IReadOnlyList<WakeHold> Holds(OperationTracker tracker, string target) =>
         tracker.WakeHoldsFor(target).Select(hold => new WakeHold(hold.MachineId, hold.Intent.ActionId!)).ToList();
 
-    /// A walk that never waits and never sends a real packet.
-    private static WakeRunner Walk(OperationTracker tracker, List<(byte[] Packet, IPEndPoint To)>? packets = null, List<TimeSpan>? pauses = null)
+    /// A walk that never waits and never sends a real packet. Its pauses move [clock] instead.
+    private static WakeRunner Walk(
+        OperationTracker tracker, List<(byte[] Packet, IPEndPoint To)>? packets = null, List<TimeSpan>? pauses = null, ManualClock? clock = null)
     {
-        var clock = new ManualClock();
+        clock ??= new ManualClock();
         return new WakeRunner(tracker)
         {
             Time = clock,
@@ -311,6 +312,37 @@ public class WakeTests
         Assert.Equal(7, runner.Calls.Count(call => To(call, "nas") && call.RemoteCommand.Contains(" status")));
         Assert.False(report.Confirmed);
         Assert.Contains("has not answered", report.Sentence);
+    }
+
+    [Fact]
+    public async Task NoReadinessPollStartsMoreThanTwoMinutesAfterTheSend()
+    {
+        // Each poll dials every address and can take far longer than the gap before the next. The
+        // later polls then start late, one after another, and the window still ends 120 s after
+        // the send by the clock rather than seven polls later.
+        using var home = new TempHome();
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var config = Config();
+        var clock = new ManualClock();
+        var sentAt = clock.Now;
+        var starts = new List<TimeSpan>();
+        var runner = new FakeRunner(call =>
+        {
+            if (To(call, "nas") && call.RemoteCommand.Contains(" status"))
+            {
+                starts.Add(clock.Now - sentAt);
+                clock.Now += TimeSpan.FromSeconds(25);
+            }
+            return Unreachable("nas.example");
+        });
+        var models = Models(tracker, runner, config);
+        var presence = SitePresence.Decide(config, Bindings.Empty, new[] { "192.168.1.23/24" });
+        var plan = WakePlanner.Plan(config, "nas", presence, States(models), Array.Empty<WakeHold>());
+
+        var report = await Walk(tracker, clock: clock).RunAsync(models["nas"], plan, models);
+        Assert.False(report.Confirmed);
+        Assert.All(starts, start => Assert.True(start <= TimeSpan.FromMilliseconds(WakeRunner.ReadinessWindowMs), $"a poll started {start} after the send"));
+        Assert.Equal(new[] { 5, 30, 55, 80, 105 }, starts.Select(start => (int)start.TotalSeconds));
     }
 
     [Fact]

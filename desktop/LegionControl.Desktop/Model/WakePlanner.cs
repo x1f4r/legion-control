@@ -452,6 +452,10 @@ public sealed class WakeRunner(OperationTracker tracker)
     /// send. Its addresses are dialled at every poll: a machine coming up is expected to fail the
     /// first ones, and leaving an address alone for a minute after each would let the window pass
     /// unread.
+    ///
+    /// Dialling every address makes one poll slower than the gap before the next, so a late poll
+    /// starts as soon as the one before it ends, and none starts once 120 s have passed since the
+    /// send by the clock. The schedule says when polls are due; the clock says when the window ends.
     private async Task<bool> AnswersAsync(MachineModel target, CancellationToken cancellationToken)
     {
         var sentAt = Time.GetUtcNow();
@@ -459,6 +463,7 @@ public sealed class WakeRunner(OperationTracker tracker)
         {
             var wait = sentAt + TimeSpan.FromMilliseconds(start) - Time.GetUtcNow();
             if (wait > TimeSpan.Zero) await Pause(wait, cancellationToken);
+            if (Time.GetUtcNow() - sentAt > TimeSpan.FromMilliseconds(ReadinessWindowMs)) break;
             await target.RefreshAsync(cancellationToken, dialEveryRoute: true);
             if (target.Status is not null && target.Failure is null) return true;
         }
