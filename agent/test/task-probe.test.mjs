@@ -82,11 +82,11 @@ function runningTurn(home) {
   return { home: path.join(home, 't3') };
 }
 
+/** A PowerShell that printed "not running" and then ran out of time. */
+const TIMED_OUT = { ok: false, code: null, signal: 'SIGTERM', stdout: absent, stderr: '', timedOut: true, error: null, command: 'powershell.exe' };
+
 test('a failed, timed-out or malformed task reading is unknown, never stopped', () => {
-  const cases = [
-    ...FAILURES.map(result),
-    { ok: false, code: null, signal: 'SIGTERM', stdout: absent, stderr: '', timedOut: true, error: null, command: 'powershell.exe' },
-  ];
+  const cases = [...FAILURES.map(result), TIMED_OUT];
   for (const failed of cases) {
     const { probe, parsed } = readTaskProbe(failed);
     assert.equal(parsed, null, failed.stdout);
@@ -102,10 +102,10 @@ test('a failed, timed-out or malformed task reading is unknown, never stopped', 
 });
 
 test('status reads a failing task probe exactly as the stop guard does', async () => {
-  for (const failure of FAILURES) {
-    const probe = await probeProcessAsync(service, { clock: deadline(1000), runner: async () => result(failure) });
-    assert.equal(probe.unitState, 'unknown', failure.name);
-    assert.notEqual(probe.error, null, failure.name);
+  for (const answer of [...FAILURES.map(result), TIMED_OUT]) {
+    const probe = await probeProcessAsync(service, { clock: deadline(1000), runner: async () => answer });
+    assert.equal(probe.unitState, 'unknown', answer.stdout);
+    assert.notEqual(probe.error, null, answer.stdout);
   }
 });
 
