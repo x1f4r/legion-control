@@ -246,13 +246,16 @@ public sealed class AppModel : IDisposable
     /// Whether adopting an imported setup would be enrolment: this device applies none yet.
     public bool IsEnrolment => Config.Document is null;
 
-    /// Applies a setup fetched in the explicit import flow. On a device that applies none yet this
-    /// is enrolment: every launch value of it is approved, which is why the caller shows all of
-    /// them and asks first. Anywhere else it is adopting a different setup, which approves nothing,
-    /// and what this device has not approved waits for review.
-    public string? AdoptImported(ControllerDocument document)
+    /// Applies a setup fetched in the explicit import flow. [enrolmentConfirmed] says a person was
+    /// shown every launch value of exactly this document and confirmed them. On a device that still
+    /// applies none, that is enrolment, and every launch value of it is approved. Anywhere else,
+    /// or without that confirmation, it is adopting a setup, which approves nothing, and what this
+    /// device has not approved waits for review: a device that gained a setup while the summary
+    /// was open, or lost one after the caller decided no summary was needed, never approves on a
+    /// confirmation it did not ask for.
+    public string? AdoptImported(ControllerDocument document, bool enrolmentConfirmed)
     {
-        if (IsEnrolment && Approvals.ApproveAll(document) is { } problem) return problem;
+        if (enrolmentConfirmed && IsEnrolment && Approvals.ApproveAll(document) is { } problem) return problem;
         return Config.Apply(document, "imported from a machine");
     }
 

@@ -339,7 +339,7 @@ public class LaunchGateTests
         Assert.Null(app.Config.Document);
         Assert.Null(Record(home, "laptop")["machines"]);
 
-        Assert.Null(app.AdoptImported(fetched));
+        Assert.Null(app.AdoptImported(fetched, enrolmentConfirmed: true));
         Assert.Empty(app.LaunchReview);
         AssertRunsAsTheDocument(app);
 
@@ -373,9 +373,27 @@ public class LaunchGateTests
         other["controller"]!["id"] = "setup-somebody-else";
         LaunchDocuments.System(other, "tower", "linux")["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/srv/other/launcher.mjs");
 
+        // Even on a confirmation, as when this device gained a setup while the summary was open.
         Assert.False(app.IsEnrolment);
-        Assert.Null(app.AdoptImported(LaunchDocuments.Of(other)));
+        Assert.Null(app.AdoptImported(LaunchDocuments.Of(other), enrolmentConfirmed: true));
         Assert.Equal(LaunchValues.SystemPath("tower", "linux"), Assert.Single(app.LaunchReview).Path);
+    }
+
+    [Fact]
+    public void AnImportNobodyConfirmedApprovesNothingEvenWhereNoSetupIsApplied()
+    {
+        using var home = new TempHome();
+        using var app = Device(home, "laptop");
+        Assert.True(app.IsEnrolment);
+        var seeded = Record(home, "laptop").ToJsonString();
+
+        // The caller decided no summary was needed, and this device lost its setup since.
+        Assert.Null(app.AdoptImported(LaunchDocuments.Of(LaunchDocuments.Root()), enrolmentConfirmed: false));
+        Assert.Equal(seeded, Record(home, "laptop").ToJsonString());
+        Assert.Equal(new[] { LaunchValues.SystemPath("tower", "linux"), LaunchValues.SystemPath("pi", "linux") },
+            app.LaunchReview.Select(entry => entry.Path));
+        Assert.All(app.EffectiveMachines().SelectMany(machine => machine.Systems),
+            system => Assert.Equal(LaunchState.NotDriven, system.LaunchState));
     }
 
     [Fact]

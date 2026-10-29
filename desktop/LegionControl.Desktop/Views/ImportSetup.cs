@@ -109,8 +109,9 @@ public sealed class ImportSetup : Window
                 // and Cancel applies nothing. A device that already applies a setup approves
                 // nothing by adopting another one: what it has not approved waits for review.
                 var document = fetched;
-                if (app.IsEnrolment && !await ConfirmEnrolmentAsync(document)) return;
-                var failure = app.AdoptImported(document);
+                var enrolment = app.IsEnrolment;
+                if (enrolment && !await ConfirmEnrolmentAsync(document)) return;
+                var failure = app.AdoptImported(document, enrolmentConfirmed: enrolment);
                 if (failure is not null) { problem.Text = failure; return; }
                 Close();
             }
