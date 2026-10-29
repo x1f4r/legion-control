@@ -238,6 +238,20 @@ class Report {
   }
 }
 
+/**
+ * What a value of the wrong type is, said without quoting it. Where a block, a
+ * list or a command belongs, a string is as likely as not a command line put
+ * there by mistake, its arguments are private, and a restricted key reads
+ * these messages in status (contract section 13). A number, true, false or
+ * null holds nothing private and is quoted as it is.
+ */
+function shapeOf(value) {
+  if (typeof value === 'string') return 'a string';
+  if (Array.isArray(value)) return 'an array';
+  if (value !== null && typeof value === 'object') return 'an object';
+  return JSON.stringify(value);
+}
+
 /** A string that must be a string when it is present at all. */
 function reqStr(report, where, value, fallback = null) {
   if (value === undefined || value === null) return fallback;
@@ -317,7 +331,7 @@ function reqArgv(report, where, value, { required = false } = {}) {
     );
   }
   if (!Array.isArray(value)) {
-    return report.error(where, `expected an array of strings, got ${JSON.stringify(value)}`);
+    return report.error(where, `expected an array of strings, got ${shapeOf(value)}`);
   }
   const parts = argv(value);
   if (!parts) return report.error(where, 'the command array has no usable arguments in it');
@@ -326,7 +340,7 @@ function reqArgv(report, where, value, { required = false } = {}) {
 
 function stringList(report, where, value, fallback = []) {
   if (value === undefined || value === null) return fallback;
-  if (!Array.isArray(value)) return report.error(where, `expected an array of strings, got ${JSON.stringify(value)}`) ?? [];
+  if (!Array.isArray(value)) return report.error(where, `expected an array of strings, got ${shapeOf(value)}`) ?? [];
   const bad = value.find((item) => typeof item !== 'string');
   if (bad !== undefined) return report.error(where, `every entry must be a string; found ${JSON.stringify(bad)}`) ?? [];
   return value.filter((item) => item.trim().length > 0);
@@ -384,7 +398,7 @@ function normalizeProcess(report, where, raw, { kind }) {
   if (kind === 'app' && raw === undefined) return { type: 'app' };
   if (raw === undefined || raw === null) return { type: 'none' };
   if (!isPlainObject(raw)) {
-    return report.error(where, `expected an object describing the process, got ${JSON.stringify(raw)}`) ?? { type: 'none' };
+    return report.error(where, `expected an object describing the process, got ${shapeOf(raw)}`) ?? { type: 'none' };
   }
   rejectUnknownKeys(report, where, raw, PROCESS_KEYS);
 
@@ -442,7 +456,7 @@ function normalizeHealth(report, where, raw) {
   if (raw === undefined || raw === null) return { type: 'none', timeoutSeconds: 5 };
   if (!isPlainObject(raw)) {
     return (
-      report.error(where, `expected an object describing the health check, got ${JSON.stringify(raw)}`) ?? {
+      report.error(where, `expected an object describing the health check, got ${shapeOf(raw)}`) ?? {
         type: 'none',
         timeoutSeconds: 5,
       }
@@ -504,7 +518,7 @@ function normalizeBusy(report, where, raw, { serviceId }) {
   }
   if (!isPlainObject(raw)) {
     return (
-      report.error(where, `expected an object describing the busy probe, got ${JSON.stringify(raw)}`) ?? {
+      report.error(where, `expected an object describing the busy probe, got ${shapeOf(raw)}`) ?? {
         type: 'unmonitored',
         timeoutSeconds: 8,
       }
@@ -572,7 +586,7 @@ function normalizeBusy(report, where, raw, { serviceId }) {
  */
 function normalizeDrain(report, where, raw) {
   if (raw === undefined || raw === null) return null;
-  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${JSON.stringify(raw)}`);
+  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${shapeOf(raw)}`);
   rejectUnknownKeys(report, where, raw, ['command', 'timeoutSeconds']);
   const command = reqArgv(report, `${where}.command`, raw.command, { required: true });
   if (!command) return null;
@@ -581,7 +595,7 @@ function normalizeDrain(report, where, raw) {
 
 function normalizeRelay(report, where, raw) {
   if (raw === undefined || raw === null) return null;
-  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${JSON.stringify(raw)}`);
+  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${shapeOf(raw)}`);
   rejectUnknownKeys(report, where, raw, ['type']);
   if (raw.type === 'none') return null;
   if (raw.type !== 'cloudflared') {
@@ -592,7 +606,7 @@ function normalizeRelay(report, where, raw) {
 
 function normalizeLatest(report, where, raw) {
   if (raw === undefined || raw === null) return null;
-  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${JSON.stringify(raw)}`);
+  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${shapeOf(raw)}`);
   rejectUnknownKeys(report, where, raw, ['type', 'repo', 'prerelease']);
   if (raw.type !== 'github-releases') {
     return report.error(`${where}.type`, `unknown release feed ${JSON.stringify(raw.type)}`, 'only "github-releases" is supported');
@@ -614,7 +628,7 @@ function normalizeLatest(report, where, raw) {
  */
 function normalizeEndpoint(report, where, raw) {
   if (raw === undefined || raw === null) return null;
-  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${JSON.stringify(raw)}`);
+  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${shapeOf(raw)}`);
   rejectUnknownKeys(report, where, raw, ['url', 'timeoutSeconds', 'expectStatus']);
   const url = reqStr(report, `${where}.url`, raw.url);
   if (!url) return report.error(`${where}.url`, 'an endpoint needs a url', 'for example "https://t3.example.com/"');
@@ -642,7 +656,7 @@ export const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const UPDATES_KEYS = ['automatic', 'pauseUntil', 'maintenanceWindows', 'order', 'after'];
 
 function normalizeWindow(report, where, raw) {
-  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${JSON.stringify(raw)}`);
+  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${shapeOf(raw)}`);
   rejectUnknownKeys(report, where, raw, ['days', 'from', 'to']);
 
   const days = stringList(report, `${where}.days`, raw.days, [...WEEKDAYS]).map((day) => day.slice(0, 3).toLowerCase());
@@ -682,7 +696,7 @@ function normalizeUpdates(report, where, raw, { perService }) {
 
   if (raw === undefined || raw === null) return value;
   if (!isPlainObject(raw)) {
-    report.error(where, `expected an object describing the update policy, got ${JSON.stringify(raw)}`);
+    report.error(where, `expected an object describing the update policy, got ${shapeOf(raw)}`);
     return value;
   }
   rejectUnknownKeys(report, where, raw, perService ? UPDATES_KEYS : ['automatic', 'pauseUntil', 'maintenanceWindows']);
@@ -694,7 +708,7 @@ function normalizeUpdates(report, where, raw, { perService }) {
     if (!Array.isArray(raw.maintenanceWindows)) {
       report.error(
         `${where}.maintenanceWindows`,
-        `expected an array of windows, got ${JSON.stringify(raw.maintenanceWindows)}`,
+        `expected an array of windows, got ${shapeOf(raw.maintenanceWindows)}`,
         'an empty array means "any time"; omit the key on a service to inherit',
       );
     } else {
@@ -743,7 +757,7 @@ const KIND_KEYS = {
 function normalizeService(report, raw, index, { platform, base }) {
   const where = `services[${index}]`;
   if (!isPlainObject(raw)) {
-    return report.error(where, `expected an object describing a service, got ${JSON.stringify(raw)}`);
+    return report.error(where, `expected an object describing a service, got ${shapeOf(raw)}`);
   }
   const id = reqStr(report, `${where}.id`, raw.id, `service-${index + 1}`);
   if (id !== null && !CONFIGURED_ID_PATTERN.test(id)) {
@@ -935,7 +949,7 @@ function synthesizeLegacyServices(report, raw, { platform, base }) {
 const BOOT_METHODS = ['efi-bootnext', 'clear-bootsequence', 'bootsequence', 'grub-reboot', 'command'];
 
 function normalizeBootTarget(report, where, id, raw) {
-  if (!isPlainObject(raw)) return report.error(where, `expected an object describing a boot target, got ${JSON.stringify(raw)}`);
+  if (!isPlainObject(raw)) return report.error(where, `expected an object describing a boot target, got ${shapeOf(raw)}`);
   rejectUnknownKeys(report, where, raw, ['name', 'method', 'match', 'entry', 'arm', 'verify']);
   if (!CONFIGURED_ID_PATTERN.test(id)) {
     report.error(`${where}`, `the boot target id ${JSON.stringify(id)} cannot be passed safely over SSH`, 'use letters, digits, dot, dash and underscore only');
@@ -994,7 +1008,7 @@ function normalizeBoot(report, raw, { platform, legacy }) {
 
   if (raw === undefined || raw === null) return { ...boot, targets: fallback };
   if (!isPlainObject(raw)) {
-    report.error('boot', `expected an object, got ${JSON.stringify(raw)}`);
+    report.error('boot', `expected an object, got ${shapeOf(raw)}`);
     return { ...boot, targets: fallback };
   }
   rejectUnknownKeys(report, 'boot', raw, ['targets', 'reboot', 'rebootHelper']);
@@ -1006,7 +1020,7 @@ function normalizeBoot(report, raw, { platform, legacy }) {
 
   if (raw.targets === undefined || raw.targets === null) return { ...boot, targets: fallback };
   if (!isPlainObject(raw.targets)) {
-    report.error('boot.targets', `expected an object keyed by target id, got ${JSON.stringify(raw.targets)}`);
+    report.error('boot.targets', `expected an object keyed by target id, got ${shapeOf(raw.targets)}`);
     return { ...boot, targets: fallback };
   }
 
@@ -1036,14 +1050,14 @@ function normalizeSleep(report, raw) {
   const sleepConfig = { before: [], settle: 2, command: null, tools: [...DEFAULT_WINDOWS_SLEEP_TOOLS] };
   if (raw === undefined || raw === null) return sleepConfig;
   if (!isPlainObject(raw)) {
-    report.error('sleep', `expected an object, got ${JSON.stringify(raw)}`);
+    report.error('sleep', `expected an object, got ${shapeOf(raw)}`);
     return sleepConfig;
   }
   rejectUnknownKeys(report, 'sleep', raw, ['before', 'settle', 'command', 'tools']);
 
   if (raw.before !== undefined && raw.before !== null) {
     if (!Array.isArray(raw.before)) {
-      report.error('sleep.before', `expected an array of commands, got ${JSON.stringify(raw.before)}`);
+      report.error('sleep.before', `expected an array of commands, got ${shapeOf(raw.before)}`);
     } else {
       sleepConfig.before = raw.before
         .map((entry, index) => reqArgv(report, `sleep.before[${index}]`, entry, { required: true }))
@@ -1067,7 +1081,7 @@ function normalizeSleep(report, raw) {
  * for a restricted key, and already takes the operation lock.
  */
 function normalizeWol(report, where, raw) {
-  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${JSON.stringify(raw)}`);
+  if (!isPlainObject(raw)) return report.error(where, `expected an object, got ${shapeOf(raw)}`);
   rejectUnknownKeys(report, where, raw, ['mac', 'broadcast', 'ports', 'repeats']);
 
   const mac = reqStr(report, `${where}.mac`, raw.mac);
@@ -1087,7 +1101,7 @@ function normalizeWol(report, where, raw) {
   let ports = [9, 7];
   if (raw.ports !== undefined && raw.ports !== null) {
     if (!Array.isArray(raw.ports)) {
-      report.error(`${where}.ports`, `expected an array of port numbers, got ${JSON.stringify(raw.ports)}`);
+      report.error(`${where}.ports`, `expected an array of port numbers, got ${shapeOf(raw.ports)}`);
     } else {
       ports = raw.ports.map((port, index) => reqPort(report, `${where}.ports[${index}]`, port)).filter((port) => port !== null);
       if (ports.length === 0) report.error(`${where}.ports`, 'no usable port numbers');
@@ -1105,7 +1119,7 @@ function normalizeWol(report, where, raw) {
 function normalizeActions(report, raw) {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw)) {
-    report.error('actions', `expected an array of actions, got ${JSON.stringify(raw)}`);
+    report.error('actions', `expected an array of actions, got ${shapeOf(raw)}`);
     return [];
   }
   const actions = [];
@@ -1113,7 +1127,7 @@ function normalizeActions(report, raw) {
   raw.forEach((entry, index) => {
     const where = `actions[${index}]`;
     if (!isPlainObject(entry)) {
-      report.error(where, `expected an object describing an action, got ${JSON.stringify(entry)}`);
+      report.error(where, `expected an object describing an action, got ${shapeOf(entry)}`);
       return;
     }
     rejectUnknownKeys(report, where, entry, ['id', 'name', 'command', 'wol', 'confirm', 'busyGated', 'timeoutSeconds']);
@@ -1245,7 +1259,7 @@ export function normalizeConfig(raw, options = {}) {
   const present = options.present !== false;
 
   if (raw !== undefined && raw !== null && !isPlainObject(raw)) {
-    report.error('', `config.json must contain a JSON object, got ${JSON.stringify(raw)}`);
+    report.error('', `config.json must contain a JSON object, got ${shapeOf(raw)}`);
     return { ok: false, config: null, errors: report.errors, warnings: report.warnings, migrations: report.migrations };
   }
   const source = isPlainObject(raw) ? raw : {};
@@ -1268,7 +1282,7 @@ export function normalizeConfig(raw, options = {}) {
 
   const system = source.system;
   if (system !== undefined && system !== null && !isPlainObject(system)) {
-    report.error('system', `expected an object, got ${JSON.stringify(system)}`);
+    report.error('system', `expected an object, got ${shapeOf(system)}`);
   }
   const systemBlock = isPlainObject(system) ? system : {};
   rejectUnknownKeys(report, 'system', systemBlock, ['id', 'name']);
@@ -1322,7 +1336,7 @@ export function normalizeConfig(raw, options = {}) {
 
   if (source.services !== undefined && source.services !== null) {
     if (!Array.isArray(source.services)) {
-      report.error('services', `expected an array of services, got ${JSON.stringify(source.services)}`);
+      report.error('services', `expected an array of services, got ${shapeOf(source.services)}`);
     } else {
       const seen = new Set();
       source.services.forEach((entry, index) => {

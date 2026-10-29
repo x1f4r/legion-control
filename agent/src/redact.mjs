@@ -36,14 +36,26 @@ const SHORT_VALUE = 4;
 const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
+ * The keys config.mjs reads as one command, an argv, and `before`, which
+ * holds a list of them. A command written there as one string is refused, and
+ * the refusal shows how to write it by quoting it word by word; an array that
+ * holds something other than strings runs with those items left out. Either
+ * way, the words after the first are as private as an argv's arguments.
+ */
+const COMMAND_KEYS = new Set([
+  'start', 'stop', 'running', 'command', 'installedVersion', 'latestVersion', 'update', 'verify', 'rollback', 'arm', 'reboot', 'rebootHelper',
+]);
+const COMMAND_LIST_KEYS = new Set(['before']);
+
+/**
  * A function that redacts the configured values of `sources` from any string,
  * array or object it is given, without changing the original.
  *
- * Collected are every argument of a configured argv after its executable, the
- * value of every assignment among those arguments, every value under a
- * credential-named key, and the user, password and credential-named query
- * values inside every URL. This cannot identify a secret that appears only in
- * a command's output.
+ * Collected are every argument of a configured argv after its executable,
+ * every word after the first of a command written as one string, the value of
+ * every assignment among those arguments, every value under a credential-named
+ * key, and the user, password and credential-named query values inside every
+ * URL. This cannot identify a secret that appears only in a command's output.
  */
 export function valueRedactor(...sources) {
   const values = new Set();
@@ -54,9 +66,15 @@ export function valueRedactor(...sources) {
       values.add(JSON.stringify(value).slice(1, -1));
     }
   };
-  const collect = (value, sensitive = false) => {
+  const argument = (item) => {
+    collect(item, true);
+    const assignment = typeof item === 'string' ? /^[^=\s]+=(.*)$/s.exec(item) : null;
+    if (assignment) remember(assignment[1]);
+  };
+  const collect = (value, sensitive = false, shape = null) => {
     if (typeof value === 'string') {
       if (sensitive) remember(value);
+      if (shape) value.split(/\s+/).filter(Boolean).slice(1).forEach(argument);
       try {
         const url = new URL(value);
         for (const credential of [url.username, url.password]) {
@@ -73,16 +91,17 @@ export function valueRedactor(...sources) {
         }
       } catch { /* most config strings are not URLs */ }
     } else if (Array.isArray(value)) {
-      const argv = value.every((item) => typeof item === 'string');
+      const argv = shape === 'command' || value.every((item) => typeof item === 'string');
       value.forEach((item, index) => {
-        collect(item, sensitive || (argv && index > 0));
-        if (argv && index > 0) {
-          const assignment = /^[^=\s]+=(.*)$/s.exec(item);
-          if (assignment) remember(assignment[1]);
-        }
+        if (argv && index > 0) argument(item);
+        else collect(item, sensitive);
+        if (shape === 'commands') collect(item, sensitive, 'command');
       });
     } else if (value && typeof value === 'object') {
-      for (const [key, inner] of Object.entries(value)) collect(inner, sensitive || sensitiveKey(key));
+      for (const [key, inner] of Object.entries(value)) {
+        const inside = COMMAND_KEYS.has(key) ? 'command' : COMMAND_LIST_KEYS.has(key) ? 'commands' : null;
+        collect(inner, sensitive || sensitiveKey(key), inside);
+      }
     }
   };
   sources.forEach((source) => collect(source));

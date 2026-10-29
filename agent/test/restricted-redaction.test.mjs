@@ -137,6 +137,55 @@ test('a config.json that stops parsing is reported by line and column, and its l
   });
 });
 
+test('a command of any shape keeps its arguments from a restricted key', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const words = ['canary-word-0001', 'canary-word-0002', 'canary-word-0003', 'canary-word-0004', 'canary-word-0005', 'canary-word-0006'];
+    const clean = (reply, where) => {
+      const text = JSON.stringify(reply);
+      for (const word of [SHORT, ...words]) assert.equal(text.includes(word), false, `${where} shows ${word}:\n${JSON.stringify(reply, null, 2)}`);
+    };
+
+    // An array that holds something other than strings runs without it, and
+    // its output echoes the rest.
+    writeConfig(home, fixtureConfig(dir, { actions: [{ id: 'say', name: 'Say', command: [...talker(home)(0, words[0]), 5] }] }));
+    assert.match(cli(['run', 'say'], { home }).payload.output, new RegExp(words[0]));
+    clean(restricted(home, ['run', 'say']), 'run');
+
+    // A string command is refused with each of its words quoted, to show how to write it.
+    writeConfig(home, fixtureConfig(dir, {
+      services: [commandService(dir, { rollback: `tool ${SHORT} --password=${words[1]}` })],
+      boot: { targets: {}, reboot: `  tool   ${words[2]}` },
+      sleep: { before: [`tool --token=${words[3]}`, ['tool', SHORT]] },
+    }));
+    const own = JSON.stringify(cli(['status'], { home }).payload.config.problems);
+    for (const word of words.slice(1, 4)) assert.equal(own.includes(word), true, `the owner is shown ${word}:\n${own}`);
+    assert.match(own, /write \[\\"tool\\", \\"q7x\\"/);
+    const replies = {
+      status: restricted(home, ['status']),
+      doctor: restricted(home, ['doctor']),
+      bundle: restricted(home, ['bundle']),
+    };
+    for (const [where, reply] of Object.entries(replies)) clean(reply, where);
+    // The executable is still named, so the owner can find the command.
+    assert.match(JSON.stringify(replies.status.config.problems), /write \[\\"tool\\", \\"<redacted>\\"/);
+
+    // Where a block, a list or a command belongs, a value of the wrong type
+    // is named and never quoted, to anyone.
+    for (const shape of [
+      { sleep: `tool --token=${words[4]}` },
+      { sleep: { before: `tool --token=${words[4]}`, command: { run: `tool ${words[5]}` } } },
+      { services: [commandService(dir, { health: `curl --header=${words[4]}` })] },
+      { actions: [`tool ${words[5]}`] },
+    ]) {
+      writeConfig(home, fixtureConfig(dir, shape));
+      const { problems } = cli(['status'], { home }).payload.config;
+      assert.match(JSON.stringify(problems), /got (a string|an object)/);
+      clean(problems, Object.keys(shape)[0]);
+    }
+  });
+});
+
 test('a reply that cannot be redacted is never sent as it was', async () => {
   await withHome(async (home) => {
     const depth = 1_000_000;
