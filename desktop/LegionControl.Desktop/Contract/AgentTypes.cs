@@ -1,3 +1,6 @@
+using System.Text.Json;
+using LegionControl.Desktop.Config;
+
 namespace LegionControl.Desktop.Contract;
 
 // What the agent says, as this client reads it.
@@ -1308,14 +1311,24 @@ public sealed record LogsReply(AgentEnvelope Envelope, IReadOnlyList<string> Lin
 public sealed record ConfigReply
 {
     public AgentEnvelope Envelope { get; init; } = new();
+    /// The reply exactly as it came, for the readings contract section 9.5 makes without coercing
+    /// anything: `ok` is true only when it is the JSON value true.
+    public Value Json { get; init; }
     public string? Hash { get; init; }
     public long? Bytes { get; init; }
     /// What the machine holds now, when it says: id, revision, lineage, who wrote it.
     public ControllerMark? Meta { get; init; }
-    /// The document itself, on a `config` read. The agent sends it as the parsed object, so it is
-    /// re-serialised here only to be canonicalised and hashed again on this side; the hash is
-    /// compared against the reported one before anything is adopted.
+    /// The stored document as text, on a `config` read from agent 3.1.0: exactly the canonical
+    /// bytes `hash` covers. These are what is hashed and adopted.
+    public string? Raw { get; init; }
+    /// The document to hash and adopt from a `config` read: `raw` when the agent sent it. An agent
+    /// before 3.1.0 sends only the parsed `controller`, and the reply's own spacing of it is not
+    /// what it stored, so it is rebuilt the way `JSON.stringify(controller, null, 2)` writes it,
+    /// in the order received (contract section 9.5). That reproduces every document a client
+    /// wrote in that form, and the hash check before adoption declines any other.
     public string? Document { get; init; }
+    /// On a `config-invalid` refusal: what the document breaks, first problem first.
+    public IReadOnlyList<ConfigProblem> Problems { get; init; } = Array.Empty<ConfigProblem>();
     /// stored | noop | replaced, on a `config set`.
     public string? Action { get; init; }
     /// Set on a refusal that is a real divergence rather than merely being behind.
@@ -1340,17 +1353,35 @@ public sealed record ConfigReply
                 Lineage = json["lineage"].AsStringList(),
             };
         }
+        var raw = json["raw"].Raw.ValueKind == JsonValueKind.String ? json["raw"].Raw.GetString() : null;
         return new ConfigReply
         {
             Envelope = AgentEnvelope.From(json),
+            Json = json,
             Hash = json["hash"].AsText(),
             Bytes = json["bytes"].AsLong(),
             Meta = meta,
-            Document = controller.IsObject ? controller.RawText() : controller.AsText(),
+            Raw = raw,
+            Document = raw ?? Rebuilt(controller),
             Action = json["action"].AsText(),
             Divergent = json["divergent"].AsBool() ?? false,
             Current = ControllerMark.From(json["current"]),
+            Problems = json["problems"].Map(ConfigProblem.From),
         };
+    }
+
+    private static string? Rebuilt(Value controller)
+    {
+        if (controller.Raw.ValueKind == JsonValueKind.String) return controller.Raw.GetString();
+        if (!controller.IsObject) return null;
+        try
+        {
+            return DocumentJson.Print(DocumentJson.Read(controller.RawText(), out _));
+        }
+        catch (DocumentJson.Malformed)
+        {
+            return null;
+        }
     }
 
     /// Whether the machine stored the document, took it as already held, or replaced what it had.

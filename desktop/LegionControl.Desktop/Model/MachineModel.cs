@@ -784,37 +784,43 @@ public sealed class MachineModel
         }
     }
 
-    /// Reads the document this machine holds, so this device can fast-forward to it or merge it.
-    ///
-    /// The hash is checked here rather than trusted: a document whose bytes do not hash to what the
-    /// machine says they hash to is not adopted at all.
-    public async Task<(ControllerDocument? Document, string? Problem)> FetchSetupAsync(CancellationToken cancellationToken = default)
+    /// Reads `config` and returns the reply as it came, or null with what went wrong.
+    public async Task<(ConfigReply? Reply, string? Problem)> ReadSetupAsync(CancellationToken cancellationToken = default)
     {
         try
         {
             var reply = await NewAgent().ReadConfigAsync(PreferredSystem(), null, cancellationToken);
-            var text = reply.Value.Document;
-            if (text is null) return (null, $"{Name} did not send a setup document.");
-            ControllerDocument document;
-            try
-            {
-                document = ControllerDocument.FromText(text);
-            }
-            catch (Canonical.NotUtf8)
-            {
-                return (null, $"{Name} sent something that is not valid UTF-8.");
-            }
-            if (reply.Value.Hash is { } hash && hash != document.Hash)
-            {
-                return (null,
-                    $"{Name} reports the hash {hash} for a document that hashes to {document.Hash} here. Nothing was adopted.");
-            }
-            return (document, null);
+            return (reply.Value, null);
         }
         catch (AgentFailure failure)
         {
             return (null, failure.Sentence(Name));
         }
+    }
+
+    /// Reads the document this machine holds, verified, for a person to compare, merge or adopt.
+    ///
+    /// The bytes are the agent's `raw` text, or what an agent before 3.1.0 sends rebuilt as section
+    /// 9.5 says, and they are adopted only when they hash to exactly what the machine says they
+    /// hash to. A reply without a hash describes no document at all.
+    public async Task<(ControllerDocument? Document, string? Problem)> FetchSetupAsync(CancellationToken cancellationToken = default)
+    {
+        var (reply, problem) = await ReadSetupAsync(cancellationToken);
+        if (reply is null) return (null, problem);
+        return Verified(reply);
+    }
+
+    /// The document a `config` reply carries, when its bytes are the ones its hash covers.
+    public (ControllerDocument? Document, string? Problem) Verified(ConfigReply reply)
+    {
+        if (reply.Envelope.Ok == false) return (null, reply.Envelope.Sentence() ?? $"{Name} did not send its setup.");
+        if (reply.Hash is not { } hash) return (null, $"{Name} holds no setup, or did not say which one it holds.");
+        if (reply.Document is not { } text) return (null, $"{Name} did not send a setup document.");
+        var document = ControllerDocument.FromText(text);
+        if (document.Hash == hash) return (document, null);
+        return (null, reply.Raw is null
+            ? $"{Name} reports the hash {hash}, and the document it sent hashes to {document.Hash} here. Its agent sends the document only as parsed JSON, which this device cannot always rebuild byte for byte, so the agent on {Name} has to be updated before its setup can be adopted. Nothing was adopted."
+            : $"{Name} reports the hash {hash} for a document that hashes to {document.Hash} here. Nothing was adopted.");
     }
 
     // MARK: plumbing

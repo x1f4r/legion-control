@@ -1,4 +1,7 @@
 using System.Text;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Model;
@@ -10,19 +13,30 @@ namespace LegionControl.Desktop.Tests;
 /// A machine that answers with whatever document it is currently holding.
 ///
 /// This is the other half of the peer story: the client's rules are only worth anything against an
-/// agent that enforces the same descent rule, so the fake does exactly that.
+/// agent that enforces the same descent rule, so the fake does exactly that. Every setup reply is
+/// one of the shared fixtures with the held document written into it, and written out compactly the
+/// way an agent prints it, so a client that hashed the reply's own spacing of `controller` rather
+/// than `raw` fails here as it fails against a real agent.
 internal sealed class FakeMachine
 {
     public ControllerDocument? Held { get; set; }
     public int Contract { get; set; } = 3;
+    public string AgentVersion { get; set; } = "3.1.0";
+    /// False for an agent before 3.1.0, which sends `controller` and no `raw`.
+    public bool SendsRaw { get; set; } = true;
     public bool Running { get; set; }
-    public bool RefuseNextPush { get; set; }
+    /// Fixtures the next pushes are refused with, one per push, before the descent rule is asked.
+    public Queue<string> Refusals { get; } = new();
     public int MetaReads { get; private set; }
+    public int Reads { get; private set; }
     public Action? OnRead { get; set; }
+    public Action? OnMeta { get; set; }
     public List<string> Pushes { get; } = new();
     public bool SawReplace { get; private set; }
 
     public IProcessRunner Runner => new FakeRunner(Answer);
+
+    private static readonly JsonSerializerOptions AsAnAgentPrints = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
     private CommandResult Answer(FakeCall call)
     {
@@ -33,16 +47,43 @@ internal sealed class FakeMachine
         return Status();
     }
 
+    /// A shared fixture with [change] made to it, printed compactly.
+    private static CommandResult Reply(string fixture, Action<JsonObject>? change = null)
+    {
+        var reply = JsonNode.Parse(Repo.ReadFixture(fixture + ".json"))!.AsObject();
+        change?.Invoke(reply);
+        return FakeRunner.Ok(reply.ToJsonString(AsAnAgentPrints));
+    }
+
+    private JsonObject Mark(ControllerDocument document) => new()
+    {
+        ["id"] = document.Identity.Id,
+        ["revision"] = document.Identity.RevisionNumber,
+        ["updatedAt"] = document.Identity.UpdatedAt,
+        ["source"] = document.Identity.Source,
+        ["lineage"] = new JsonArray(document.Identity.Lineage.Select(hash => (JsonNode)hash!).ToArray()),
+        ["device"] = document.Identity.Device,
+        ["hash"] = document.Hash,
+        ["bytes"] = document.Bytes.Length,
+    };
+
+    private void Stamp(JsonObject reply)
+    {
+        reply["agentVersion"] = AgentVersion;
+        reply["contract"] = Contract;
+    }
+
     private CommandResult Status()
     {
+        // A 3.x agent that holds nothing still reports the block, with no hash (status.no-services).
         var mark = Held is null
-            ? "null"
+            ? """{ "hash": null, "id": null, "revision": 0, "updatedAt": null, "source": null }"""
             : $$"""{ "hash": "{{Held.Hash}}", "id": "{{Held.Identity.Id}}", "revision": {{Held.Identity.RevisionNumber}}, "source": "cli" }""";
         var running = Running
             ? """{ "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "kind": "update", "state": "running", "phase": "installing" }"""
             : "";
         return FakeRunner.Ok($$"""
-            { "ok": true, "contract": {{Contract}}, "agentVersion": "3.0.0", "system": { "id": "linux" },
+            { "ok": true, "contract": {{Contract}}, "agentVersion": "{{AgentVersion}}", "system": { "id": "linux" },
               "controller": {{mark}},
               "operations": { "running": [{{running}}], "queued": [], "recent": [] } }
             """);
@@ -51,23 +92,31 @@ internal sealed class FakeMachine
     private CommandResult Meta()
     {
         MetaReads++;
-        if (Held is null) return FakeRunner.Ok("""{ "ok": true, "contract": 3, "hash": null, "meta": null }""");
-        var lineage = string.Join(", ", Held.Identity.Lineage.Select(hash => $"\"{hash}\""));
-        return FakeRunner.Ok($$"""
-            { "ok": true, "contract": 3, "hash": "{{Held.Hash}}",
-              "meta": { "id": "{{Held.Identity.Id}}", "revision": {{Held.Identity.RevisionNumber}},
-                        "hash": "{{Held.Hash}}", "source": "cli", "device": "the machine",
-                        "lineage": [{{lineage}}] } }
-            """);
+        var held = Held;
+        OnMeta?.Invoke();
+        if (held is null) return Reply("config.meta-empty", Stamp);
+        return Reply("config.meta", reply =>
+        {
+            Stamp(reply);
+            reply["meta"] = Mark(held);
+            reply["hash"] = held.Hash;
+        });
     }
 
     private CommandResult Read()
     {
+        Reads++;
         OnRead?.Invoke();
-        if (Held is null) return FakeRunner.Ok("""{ "ok": true, "contract": 3, "hash": null }""");
-        return FakeRunner.Ok($$"""
-            { "ok": true, "contract": 3, "hash": "{{Held.Hash}}", "controller": {{Held.Text}} }
-            """);
+        if (Held is not { } held) return Reply("config.read-empty", Stamp);
+        return Reply(SendsRaw ? "config.read" : "config.read-without-raw", reply =>
+        {
+            Stamp(reply);
+            reply["controller"] = JsonNode.Parse(held.Text);
+            if (SendsRaw) reply["raw"] = held.Text;
+            reply["hash"] = held.Hash;
+            reply["bytes"] = held.Bytes.Length;
+            reply["meta"] = Mark(held);
+        });
     }
 
     /// The agent's own acceptance rule, which is the thing the client's rules have to agree with.
@@ -82,119 +131,87 @@ internal sealed class FakeMachine
         }
         catch (Canonical.NotUtf8)
         {
-            return FakeRunner.Ok("""{ "ok": false, "contract": 3, "reasonCode": "config-invalid" }""");
+            return Reply("error.bad-argument");
         }
         Pushes.Add(pushed.Hash);
-        if (RefuseNextPush)
+        var held = Held;
+        void Pushed(JsonObject reply)
         {
-            RefuseNextPush = false;
-            return FakeRunner.Ok("""{"ok":false,"contract":3,"reasonCode":"operation-in-progress"}""");
+            Stamp(reply);
+            reply["id"] = pushed.Identity.Id;
+            reply["revision"] = pushed.Identity.RevisionNumber;
+            if (held is not null) reply["current"] = Mark(held);
         }
+        void Stored(JsonObject reply)
+        {
+            Stamp(reply);
+            reply["hash"] = pushed.Hash;
+            reply["bytes"] = pushed.Bytes.Length;
+            reply["id"] = pushed.Identity.Id;
+            reply["revision"] = pushed.Identity.RevisionNumber;
+            reply["source"] = pushed.Identity.Source;
+            reply["lineage"] = new JsonArray(pushed.Identity.Lineage.Select(hash => (JsonNode)hash!).ToArray());
+        }
+        if (Refusals.TryDequeue(out var refusal)) return Reply(refusal, Pushed);
 
-        if (Held is null)
+        if (held is null)
         {
             Held = pushed;
-            return FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "stored" }""");
+            return Reply("config.set.stored", Stored);
         }
-        if (Held.Hash == pushed.Hash)
+        if (held.Hash == pushed.Hash) return Reply("config.set.noop", Stored);
+        if (held.Identity.Id != pushed.Identity.Id)
         {
-            return FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "noop" }""");
-        }
-        if (Held.Identity.Id != pushed.Identity.Id)
-        {
-            if (!replace)
-            {
-                return FakeRunner.Ok("""
-                    { "ok": false, "contract": 3, "reasonCode": "controller-conflict", "divergent": false }
-                    """);
-            }
+            if (!replace) return Reply("config.set.conflict-other-id", Pushed);
             Held = pushed;
-            return FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "replaced", "replaced": true }""");
+            return Reply("config.set.replaced", Stored);
         }
-        if (pushed.Identity.Lineage.Contains(Held.Hash))
+        if (pushed.Identity.Lineage.Contains(held.Hash))
         {
             Held = pushed;
-            return FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "stored" }""");
+            return Reply("config.set.stored", Stored);
         }
-        if (Held.Identity.Lineage.Contains(pushed.Hash))
-        {
-            return FakeRunner.Ok("""{ "ok": false, "contract": 3, "reasonCode": "stale-revision" }""");
-        }
+        if (held.Identity.Lineage.Contains(pushed.Hash)) return Reply("config.set.stale-revision", Pushed);
         if (replace)
         {
             Held = pushed;
-            return FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "replaced", "replaced": true }""");
+            return Reply("config.set.replaced", Stored);
         }
-        return FakeRunner.Ok("""
-            { "ok": false, "contract": 3, "reasonCode": "controller-conflict", "divergent": true }
-            """);
+        return Reply("config.set.conflict-divergent", Pushed);
     }
 }
 
 /// Reconciliation: what happens on its own, and what stops and asks.
 public class ReconcilerTests
 {
-    [Fact]
-    public async Task ARefusedPushRetriesAfterTheBackoffWithIdenticalBytes()
-    {
-        using var home = new TempHome();
-        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
-        var (store, model, fake) = Build(home, mine);
-        fake.RefuseNextPush = true;
-        var reconciler = new Reconciler(store, Bindings.Empty);
-        await model.RefreshAsync();
-        Assert.IsType<ReconcileOutcome.Failed>(await reconciler.ReconcileAsync(model));
-        Assert.IsType<ReconcileOutcome.Held>(await reconciler.ReconcileAsync(model));
-        Assert.IsType<ReconcileOutcome.Published>(await reconciler.ReconcileAsync(model, now: DateTimeOffset.UtcNow.AddSeconds(61)));
-        Assert.Equal(new[] { mine.Hash, mine.Hash }, fake.Pushes);
-    }
-
-    [Fact]
-    public async Task AHandEditDuringFetchCannotBeReplacedByTheFetchedBranch()
-    {
-        using var home = new TempHome();
-        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
-        var (store, model, fake) = Build(home, mine);
-        fake.Held = Documents.Make("setup-a", 4, new[] { mine.Hash }, "Peer edit");
-        fake.OnRead = () => File.WriteAllText(home.ConfigPath, mine.Text.Replace("Beacon", "Local offline edit"));
-        var reconciler = new Reconciler(store, Bindings.Empty);
-        await model.RefreshAsync();
-        Assert.IsType<ReconcileOutcome.Failed>(await reconciler.ReconcileAsync(model));
-        Assert.Equal("Local offline edit", store.Config!.Machines[0].Name);
-        Assert.Contains(mine.Hash, store.Identity.Lineage);
-    }
-
-    [Fact]
-    public async Task UnchangedDivergenceReusesMetadataAcrossPolls()
-    {
-        using var home = new TempHome();
-        var ancestor = Documents.Make("setup-a", 3, Array.Empty<string>());
-        var mine = Documents.Make("setup-a", 4, new[] { ancestor.Hash }, "Mine");
-        var (store, model, fake) = Build(home, mine);
-        fake.Held = Documents.Make("setup-a", 4, new[] { ancestor.Hash }, "Theirs");
-        var reconciler = new Reconciler(store, Bindings.Empty);
-        await model.RefreshAsync();
-        await reconciler.ReconcileAsync(model);
-        await model.RefreshAsync();
-        await reconciler.ReconcileAsync(model);
-        Assert.Equal(1, fake.MetaReads);
-    }
-
     private static (ConfigStore Store, MachineModel Model, FakeMachine Machine) Build(
-        TempHome home, ControllerDocument mine)
+        TempHome home, ControllerDocument mine, OperationTracker? tracker = null)
     {
         File.WriteAllBytes(home.ConfigPath, mine.Bytes);
-        var store = new ConfigStore(home.ConfigPath,
-            statePath: Path.Combine(home.Path, "setup-state.json"),
-            ledger: new SetupLedger(Path.Combine(home.Path, "revisions")),
-            deviceName: "test device",
-            watch: false);
+        var store = Store(home);
         var fake = new FakeMachine();
         var machine = new MachineModel(
             store.Config!.Machines[0], fake.Runner,
-            new OperationTracker(Path.Combine(home.Path, "operations.json")));
+            tracker ?? new OperationTracker(Path.Combine(home.Path, "operations.json")));
         return (store, machine, fake);
     }
+
+    /// The store a process on this device keeps over the shared setup files.
+    private static ConfigStore Store(TempHome home) => new(home.ConfigPath,
+        statePath: Path.Combine(home.Path, "setup-state.json"),
+        ledger: new SetupLedger(Path.Combine(home.Path, "revisions")),
+        deviceName: "test device",
+        watch: false);
+
+    /// A document written the way JSON.stringify(document, null, 2) writes it, which is the one
+    /// spelling an agent before 3.1.0 lets a client rebuild.
+    private static ControllerDocument AsJavaScriptWritesIt(ControllerDocument document) =>
+        ControllerDocument.FromText(DocumentJson.Print(DocumentJson.Parse(document.Text)));
+
+    /// The same document spelled in a way no client's rebuild reproduces: compact, with a name
+    /// escaped that JSON.stringify writes as itself.
+    private static ControllerDocument Unrebuildable(ControllerDocument document) =>
+        ControllerDocument.FromText(JsonNode.Parse(document.Text)!.ToJsonString().Replace("Beacon", "B\\u0065acon"));
 
     [Fact]
     public async Task PublishesToAMachineThatHoldsNothing()
@@ -250,6 +267,63 @@ public class ReconcilerTests
     }
 
     [Fact]
+    public async Task AdoptsTheAgentsRawTextByteForByte()
+    {
+        // A document whose stored spelling no rebuild of the parsed `controller` reproduces. The
+        // desktop used to hash the reply's own spacing of `controller`, which matches nothing an
+        // agent stores, so it could never adopt a peer's document at all.
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 4, Array.Empty<string>());
+        var theirs = Unrebuildable(Documents.Make("setup-a", 5, new[] { mine.Hash }, "Beacon from elsewhere"));
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = theirs;
+        var reconciler = new Reconciler(store, Bindings.Empty);
+
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Adopted>(await reconciler.ReconcileAsync(model));
+        Assert.Equal(theirs.Bytes, store.Document!.Bytes);
+        Assert.Equal(theirs.Bytes, File.ReadAllBytes(home.ConfigPath));
+    }
+
+    [Fact]
+    public async Task AnAgentWithoutRawIsAdoptedFromWhenItsDocumentRebuildsExactly()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 4, Array.Empty<string>());
+        var theirs = AsJavaScriptWritesIt(Documents.Make("setup-a", 5, new[] { mine.Hash }, "Büro's +1 tower 🎉"));
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = theirs;
+        fake.SendsRaw = false;
+        fake.AgentVersion = "3.0.1";
+        var reconciler = new Reconciler(store, Bindings.Empty);
+
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Adopted>(await reconciler.ReconcileAsync(model));
+        Assert.Equal(theirs.Hash, store.Document!.Hash);
+    }
+
+    [Fact]
+    public void TheSharedConfigReadFixtureIsAdoptedFromRaw()
+    {
+        // The reply a 3.1.0 agent sends, exactly as the shared corpus has it: the bytes adopted are
+        // `raw`, and they hash to `hash`.
+        var fixture = Value.Parse(Repo.ReadFixture("config.read.json"));
+        var reply = ConfigReply.From(fixture);
+        Assert.Equal(fixture["raw"].Raw.GetString(), reply.Document);
+        Assert.Equal(fixture["hash"].AsText(), ControllerDocument.FromText(reply.Document!).Hash);
+
+        // An agent before 3.1.0 sends no `raw`. Its stored document is rebuilt from `controller`
+        // in the order received, whatever spacing the reply itself used, and hashes to the same.
+        var older = JsonNode.Parse(Repo.ReadFixture("config.read-without-raw.json"))!;
+        foreach (var spelling in new[] { older.ToJsonString(), older.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) })
+        {
+            var rebuilt = ConfigReply.From(Value.Parse(spelling));
+            Assert.Null(rebuilt.Raw);
+            Assert.Equal(older["hash"]!.GetValue<string>(), ControllerDocument.FromText(rebuilt.Document!).Hash);
+        }
+    }
+
+    [Fact]
     public async Task TwoOfflineEditsStopAtAPersonAndNothingIsOverwritten()
     {
         using var home = new TempHome();
@@ -267,6 +341,22 @@ public class ReconcilerTests
         // Neither side moved.
         Assert.Equal(theirs.Hash, fake.Held!.Hash);
         Assert.Equal(mine.Hash, store.Document!.Hash);
+    }
+
+    [Fact]
+    public async Task UnchangedDivergenceReusesMetadataAcrossPolls()
+    {
+        using var home = new TempHome();
+        var ancestor = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var mine = Documents.Make("setup-a", 4, new[] { ancestor.Hash }, "Mine");
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = Documents.Make("setup-a", 4, new[] { ancestor.Hash }, "Theirs");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        await reconciler.ReconcileAsync(model);
+        await model.RefreshAsync();
+        await reconciler.ReconcileAsync(model);
+        Assert.Equal(1, fake.MetaReads);
     }
 
     [Fact]
@@ -368,6 +458,36 @@ public class ReconcilerTests
         await model.RefreshAsync();
         Assert.IsType<ReconcileOutcome.Unsupported>(await reconciler.ReconcileAsync(model));
         Assert.Empty(fake.Pushes);
+    }
+
+    [Fact]
+    public async Task AFailedPushBacksOffForAMinuteThenRetriesIdenticalBytes()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var (store, model, fake) = Build(home, mine);
+        fake.Refusals.Enqueue("error.internal");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Failed>(await reconciler.ReconcileAsync(model));
+        Assert.IsType<ReconcileOutcome.Held>(await reconciler.ReconcileAsync(model, now: DateTimeOffset.UtcNow.AddSeconds(59)));
+        Assert.IsType<ReconcileOutcome.Published>(await reconciler.ReconcileAsync(model, now: DateTimeOffset.UtcNow.AddSeconds(61)));
+        Assert.Equal(new[] { mine.Hash, mine.Hash }, fake.Pushes);
+    }
+
+    [Fact]
+    public async Task AHandEditDuringFetchCannotBeReplacedByTheFetchedBranch()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = Documents.Make("setup-a", 4, new[] { mine.Hash }, "Peer edit");
+        fake.OnRead = () => File.WriteAllText(home.ConfigPath, mine.Text.Replace("Beacon", "Local offline edit"));
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Failed>(await reconciler.ReconcileAsync(model));
+        Assert.Equal("Local offline edit", store.Config!.Machines[0].Name);
+        Assert.Contains(mine.Hash, store.Identity.Lineage);
     }
 
     [Fact]
