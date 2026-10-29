@@ -677,6 +677,42 @@ struct AppUpdateModelTests {
         #expect(FileManager.default.fileExists(atPath: previous.path))
     }
 
+    @Test("a roll back that lands deletes the build it replaced, and no other bundle under that name",
+          arguments: [nil, "3.1.0"] as [String?])
+    func rollBackDiscardsReplacedBuild(otherBuild: String?) async throws {
+        let (model, preferences, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        try AppUpdateTests.makeBundle(at: model.bundleURL, identifier: "id", executable: "LegionControl", version: "3.0.0")
+        let previous = directory.appending(path: AppUpdates.previousName)
+        try AppUpdateTests.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "2.9.0")
+        let replaced = directory.appending(path: AppUpdates.stagedName)
+        // What the helper leaves once the kept build is up: that build at the real path, and the
+        // one it replaced under the staged name.
+        model.performSwap = { staged, current, marker, id, _ in
+            try FileManager.default.moveItem(at: current, to: staged.previous)
+            try FileManager.default.moveItem(at: staged.bundle, to: current)
+            // Or some other build under that name, which is not this roll back's to delete.
+            if let otherBuild {
+                try FileManager.default.removeItem(at: staged.previous)
+                try AppUpdateTests.makeBundle(at: staged.previous, identifier: "id", executable: "LegionControl",
+                                              version: otherBuild)
+            }
+            try Self.helperEnds(AppUpdates.SwapOutcome.landed, swap: id, marker: marker)
+        }
+        model.quit = { }
+        model.rollBack()
+        #expect(AppUpdates.version(ofBundleAt: replaced) == otherBuild ?? "3.0.0")
+
+        let (back, _) = relaunch(after: model, preferences: preferences, store: store, as: "2.9.0")
+        back.confirmLaunch()
+        #expect(back.loadPendingSwap() == nil)
+        #expect(back.failure == nil)
+        #expect(AppUpdates.version(ofBundleAt: replaced) == otherBuild)
+        #expect(AppUpdates.version(ofBundleAt: back.bundleURL) == "2.9.0")
+        #expect(AppUpdates.retainedPrevious(beside: back.bundleURL) == nil)
+    }
+
     @Test("a roll back into a build that never settles it is not reported as failed by a later launch")
     func rollBackIntoOlderReleaseLands() async throws {
         let (model, preferences, directory) = fixture()

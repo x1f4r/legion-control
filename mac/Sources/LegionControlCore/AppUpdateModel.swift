@@ -500,8 +500,10 @@ final class AppUpdateModel {
         AppUpdates.forgetSwapOutcome(support: supportDirectory)
 
         if isTarget, outcome == nil || outcome == AppUpdates.SwapOutcome.landed {
-            // A roll back that landed needs nothing more: the build it asked for is the one running.
-            if pending.kind == .update { updateCameUp(pending) }
+            switch pending.kind {
+            case .update: updateCameUp(pending)
+            case .rollBack: discardReplaced(by: pending)
+            }
         } else if outcome == AppUpdates.SwapOutcome.landed {
             // The helper saw the build it put in place come up, and something has replaced it since:
             // most often a roll back into an older release, then an update or a reinstall.
@@ -524,6 +526,20 @@ final class AppUpdateModel {
             self?.settleTask = nil
             self?.resolvePendingSwap()
         }
+    }
+
+    /// After a roll back that landed, the build it replaced is left where the helper moved it, under
+    /// the staged name. Nothing ever starts it from there, discarding only reaches the kept build,
+    /// and the next install stages over it, so until then it is a second whole copy of the app that
+    /// only Spotlight can find. The update offer is the way back to it.
+    ///
+    /// Only the build the roll back replaced, by its version, and never from a copy running out of
+    /// one of the names beside the real app, which may be that very bundle.
+    private func discardReplaced(by pending: PendingSwap) {
+        guard AppUpdates.siblingReason(for: bundleURL) == nil else { return }
+        let replaced = bundleURL.deletingLastPathComponent().appending(path: AppUpdates.stagedName)
+        guard AppUpdates.version(ofBundleAt: replaced) == pending.from else { return }
+        try? FileManager.default.removeItem(at: replaced)
     }
 
     private func updateCameUp(_ pending: PendingSwap) {
