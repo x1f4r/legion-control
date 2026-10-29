@@ -476,14 +476,14 @@ export async function suspendMachine(config) {
   const result = runArgv(chosen.command, { timeoutMs: 30000 });
   const label = path.basename(chosen.command[0]);
   if (accepted(result)) {
-    const accepted = suspendAccepted(label);
+    const wording = suspendAccepted(label);
     if (warnings.length > 0) {
       return {
         ok: true,
-        message: `${accepted}. Note: ${warnings.join('; ')}, so the machine may stay awake`,
+        message: `${wording}. Note: ${warnings.join('; ')}, so the machine may stay awake`,
       };
     }
-    return { ok: true, message: accepted };
+    return { ok: true, message: wording };
   }
   if (result.timedOut) {
     return { ok: false, message: `${result.command} never returned, so whether the machine is suspending is unknown` };
