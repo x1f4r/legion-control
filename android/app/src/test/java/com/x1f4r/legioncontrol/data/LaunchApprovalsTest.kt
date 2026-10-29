@@ -157,7 +157,7 @@ class LaunchApprovalsTest {
         val paths = mapOf<String, (ConfigStore, String) -> Unit>(
             "automatic fetch" to { store, text -> store.adoptAsFetched(text) },
             "take theirs" to { store, text ->
-                store.recordDivergence("Tower", "edited twice", text)
+                store.recordDivergence("tower", "Tower", "edited twice", text)
                 val divergence = store.divergence.value!!
                 store.adoptFromMachine(divergence.theirText, divergence.theirProvenance.hash, divergence.mineProvenance?.hash, "Tower")
             },

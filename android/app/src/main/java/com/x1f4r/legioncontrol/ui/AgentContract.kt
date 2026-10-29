@@ -358,11 +358,11 @@ interface ControlServices {
      */
     fun adoptFromMachine(text: String, expectedRemoteHash: String?, expectedLocalHash: String?, machineName: String): SetupOutcome
 
-    /** A copy of the same setup that neither side descends from, from the machine's verified bytes. */
-    fun recordDivergence(machineName: String, reason: String, theirText: String)
+    /** A copy of the same setup that neither side descends from, from the verified bytes of the machine [machineId]. */
+    fun recordDivergence(machineId: String, machineName: String, reason: String, theirText: String)
 
-    /** A machine carrying another setup entirely, from its verified bytes. */
-    fun recordIdentityClash(machineName: String, reason: String, theirText: String)
+    /** The machine [machineId] carrying another setup entirely, from its verified bytes. */
+    fun recordIdentityClash(machineId: String, machineName: String, reason: String, theirText: String)
 
     fun clearDivergence()
 

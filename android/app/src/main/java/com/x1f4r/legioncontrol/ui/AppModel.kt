@@ -460,6 +460,13 @@ class AppModel(
     val mergeChoices = mutableStateMapOf<String, SetupMerge.Choice>()
 
     /**
+     * The two hashes [mergeChoices] were made for. A choice about one copy says nothing about
+     * another, so the choices start again from the defaults whenever the question on screen is a
+     * different one.
+     */
+    private var choicesFor: String? = null
+
+    /**
      * Why Merge and Keep mine cannot be offered for the divergence on screen, or null: this device's
      * copy has an error that leaves its entries undefined, and is fixed in the editor first. Take
      * theirs is always offered.
@@ -486,6 +493,11 @@ class AppModel(
             SetupMerge.differences(mine.canonicalText, divergence.theirText, baseOf(divergence))
         } catch (refused: SetupMerge.Unmergeable) {
             return emptyList()
+        }
+        val question = "${mine.hash} ${divergence.theirProvenance.hash}"
+        if (choicesFor != question) {
+            mergeChoices.clear()
+            choicesFor = question
         }
         if (mergeChoices.isEmpty()) differences.forEach { mergeChoices[it.entry] = it.defaultChoice }
         return differences
@@ -601,10 +613,14 @@ class AppModel(
         editorOpen = false
     }
 
-    /** Replaces a machine's different setup with this one. The only place `--replace` is ever sent. */
+    /**
+     * Replaces a machine's different setup with this one. The only place `--replace` is ever sent,
+     * so it goes to the machine that served the copy on screen, found by its id: a name is free
+     * text, and another machine may carry the same one.
+     */
     fun replaceTheirSetup() {
         val clash = identityClash ?: return
-        val client = clients.firstOrNull { it.machine.name == clash.machineName } ?: return
+        val client = clients.firstOrNull { it.machine.id == clash.machineId } ?: return
         val document = services.document.value ?: return
         val identity = document.identity ?: return
         scope.launch {
@@ -629,10 +645,13 @@ class AppModel(
         settled(services.adoptOtherSetup(clash)) { "This device now follows the setup from ${clash.machineName}." }
     }
 
-    /** Leave it: not asked about again until this device's setup or the machine's copy changes. */
+    /**
+     * Leave it: not asked about again until this device's setup or that copy changes, on any
+     * machine carrying the same copy.
+     */
     fun dismissIdentityClash() {
         val clash = identityClash ?: return
-        clients.firstOrNull { it.machine.name == clash.machineName }?.let { sync.leave(it.machine.id, clash.theirProvenance.hash) }
+        sync.leave(clash.theirProvenance.hash)
         services.clearIdentityClash()
     }
 

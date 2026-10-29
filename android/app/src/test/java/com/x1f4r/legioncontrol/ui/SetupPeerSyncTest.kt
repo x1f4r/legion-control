@@ -57,11 +57,11 @@ class SetupPeerSyncTest {
 
     private fun hashOf(text: String) = ControllerDocument.parse(text).getOrThrow().hash
 
-    private fun status(hash: String?, running: Int = 0, version: String = "3.1.0") = AgentStatus(
+    private fun status(hash: String?, running: Int = 0, version: String = "3.1.0", id: String? = setupId) = AgentStatus(
         ok = true,
         contract = 3,
         agentVersion = version,
-        controller = ControllerMark(hash = hash, id = hash?.let { setupId }),
+        controller = ControllerMark(hash = hash, id = hash?.let { id }),
         operations = OperationsBlock(running = List(running) { OpSummary(id = "op-$it") }),
     )
 
@@ -213,6 +213,93 @@ class SetupPeerSyncTest {
         // An updated agent is asked again.
         machine.holding(newer)
         assertEquals("Setup updated from Pi.", machine.poll(status(hashOf(newer), version = "3.1.0")))
+    }
+
+    // MARK: - Questions for a person (C7)
+
+    /**
+     * A peer that edited apart from this device usually published to the whole fleet, so this is
+     * the ordinary case. The question is about two documents: it is read once, and it does not
+     * change hands from poll to poll.
+     */
+    @Test
+    fun `machines carrying the same diverged copy are one question, read once`() = runBlocking {
+        val theirs = descendant(name = "Edited on the laptop")
+        edit("Edited here")
+        val tower = FakeMachine("tower").apply { holding(theirs) }
+        val pi = FakeMachine("pi").apply { holding(theirs) }
+
+        assertEquals("Tower has a copy of the setup that was edited separately. It is waiting to be merged.", tower.poll(status(hashOf(theirs))))
+        val asked = store.divergence.value!!
+        repeat(4) {
+            now += 15_000L
+            assertNull(pi.poll(status(hashOf(theirs))))
+            assertNull(tower.poll(status(hashOf(theirs))))
+        }
+        assertEquals("one read for the question, whichever machine carries it", 1, (tower.calls + pi.calls).count { it == "config" })
+        assertEquals(listOf("meta"), pi.calls)
+        assertEquals(asked, store.divergence.value)
+        assertEquals("tower", store.divergence.value!!.machineId)
+    }
+
+    /**
+     * Somebody may be halfway through choosing on the screen, so another machine's copy does not
+     * replace it. Once it is settled, that machine is decided on again from the new head.
+     */
+    @Test
+    fun `a question on screen is not replaced by another copy, which is asked about once it is settled`() = runBlocking {
+        val fromLaptop = descendant(name = "Edited on the laptop")
+        val fromTablet = descendant(name = "Edited on the tablet")
+        edit("Edited here")
+        val tower = FakeMachine("tower").apply { holding(fromLaptop) }
+        val pi = FakeMachine("pi").apply { holding(fromTablet) }
+
+        assertTrue(tower.poll(status(hashOf(fromLaptop)))!!.contains("edited separately"))
+        val asked = store.divergence.value!!
+        repeat(3) {
+            now += 15_000L
+            assertNull(pi.poll(status(hashOf(fromTablet))))
+        }
+        assertEquals(asked, store.divergence.value)
+        assertEquals("nothing is read for a question that cannot be shown", listOf("meta"), pi.calls)
+
+        // Take Tower's. Pi's copy is still a branch of the new head, and that is the next question.
+        assertTrue(store.adoptFromMachine(asked.theirText, asked.theirProvenance.hash, asked.mineProvenance?.hash, asked.machineName) is SetupOutcome.Applied)
+        assertNull(store.divergence.value)
+        assertTrue(pi.poll(status(hashOf(fromTablet)))!!.contains("edited separately"))
+        val next = store.divergence.value!!
+        assertEquals("pi", next.machineId)
+        assertEquals(hashOf(fromTablet), next.theirProvenance.hash)
+        assertEquals(hashOf(fromLaptop), next.mineProvenance?.hash)
+    }
+
+    @Test
+    fun `Leave it on another setup holds for every machine carrying it`() = runBlocking {
+        val otherId = "setup-0b4f6a12-3c5d-4e7f-8a9b-0c1d2e3f4a5b"
+        val other = LaunchDocuments.HELD.replace(setupId, otherId)
+        val tower = FakeMachine("tower").apply { holding(other) }
+        val pi = FakeMachine("pi").apply { holding(other) }
+
+        assertEquals("Tower is carrying a different setup. It is waiting for a decision.", tower.poll(status(hashOf(other), id = otherId)))
+        assertNull(pi.poll(status(hashOf(other), id = otherId)))
+        val clash = store.identityClash.value!!
+        assertEquals("tower", clash.machineId)
+
+        // Leave it, the way the screen does it.
+        sync.leave(clash.theirProvenance.hash)
+        store.clearIdentityClash()
+        repeat(3) {
+            now += 15_000L
+            assertNull(tower.poll(status(hashOf(other), id = otherId)))
+            assertNull(pi.poll(status(hashOf(other), id = otherId)))
+        }
+        assertNull("asked once, not once per machine", store.identityClash.value)
+        assertEquals(1, (tower.calls + pi.calls).count { it == "config" })
+
+        // A change on this side is a new question.
+        edit("Edited here")
+        assertTrue(pi.poll(status(hashOf(other), id = otherId))!!.contains("different setup"))
+        assertEquals("pi", store.identityClash.value!!.machineId)
     }
 
     // MARK: - The guardrails (C7)

@@ -50,8 +50,11 @@ internal class SetupPeerSync(
     /** Why each machine's last push was held, by machine: the hash it was held for and the sentence. */
     private val holds = HashMap<String, Pair<String, String>>()
 
-    /** The questions a person left, by machine: `head remote`, until either hash changes. */
-    private val left = HashMap<String, String>()
+    /**
+     * The questions a person left, as `head remote`, until either hash changes. Kept by the two
+     * documents rather than by machine: every machine carrying the same copy is the same question.
+     */
+    private val left = HashSet<String>()
 
     fun state(machineId: String): SetupPeerState = states.getOrPut(machineId) { SetupPeerState() }
 
@@ -73,10 +76,15 @@ internal class SetupPeerSync(
         holds.remove(machineId)
     }
 
-    /** "Leave it" on a divergence or a different setup: not asked again until either side changes. */
-    fun leave(machineId: String, remoteHash: String?) {
+    /**
+     * "Leave it" on a divergence or a different setup: not asked again until either side changes,
+     * on whichever machine carries [remoteHash]. Only questions about the document in force can
+     * come up again, so the ones left about earlier documents are forgotten here.
+     */
+    fun leave(remoteHash: String?) {
         val head = services.document.value?.hash ?: return
-        left[machineId] = "$head $remoteHash"
+        left.removeAll { !it.startsWith("$head ") }
+        left += "$head $remoteHash"
     }
 
     /**
@@ -249,8 +257,13 @@ internal class SetupPeerSync(
     /**
      * Another setup, or a branch of this one: a person decides, from the machine's own bytes, so
      * they are read and verified first. A read is never held for a running operation, but it is one
-     * request in flight and it backs off, and a question already on screen for these two documents
-     * is not read again.
+     * request in flight and it backs off.
+     *
+     * A question is about two documents, not about a machine, and there is one of each kind on
+     * screen. While one built against this head is open, no machine is read for it: the same two
+     * hashes are the same question whichever machine serves them, and a machine carrying another
+     * copy would replace the screen while somebody is choosing on it. Each machine is decided on
+     * again at its next status once the open question is settled.
      */
     private suspend fun ask(
         client: MachineClient,
@@ -262,12 +275,7 @@ internal class SetupPeerSync(
     ): String? {
         val name = client.machine.name
         val remote = mark.hash ?: return null
-        val recorded = if (decision == SetupDecision.DIVERGED) {
-            services.divergence.value?.let { Triple(it.machineName, it.theirProvenance.hash, it.mineProvenance?.hash) }
-        } else {
-            services.identityClash.value?.let { Triple(it.machineName, it.theirProvenance.hash, it.mineProvenance?.hash) }
-        }
-        if (recorded == Triple(name, remote, head.hash) || left[client.machine.id] == "${head.hash} $remote") return null
+        if (!mayAsk(decision, head.hash, remote)) return null
         if (state.inFlight || state.backingOff(head.hash, clock())) return null
         val key = settledKey(head.hash, remote, status.version)
         if (key in state.settled) return null
@@ -282,8 +290,12 @@ internal class SetupPeerSync(
             state.settled += key
             return "$name is carrying a setup this app cannot use. ${fetched.verdict.errors.firstOrNull()?.message.orEmpty()}".trim()
         }
+        // The read was suspended: the document in force may have moved, and another machine may
+        // have put a question up meanwhile. Either way the next status decides.
+        if (services.document.value?.hash != head.hash || !mayAsk(decision, head.hash, remote)) return null
         return if (decision == SetupDecision.DIVERGED) {
             services.recordDivergence(
+                client.machine.id,
                 name,
                 "This device and $name each have a copy of the setup that was edited separately, and neither was made from the other.",
                 fetched.text,
@@ -291,6 +303,7 @@ internal class SetupPeerSync(
             "$name has a copy of the setup that was edited separately. It is waiting to be merged."
         } else {
             services.recordIdentityClash(
+                client.machine.id,
                 name,
                 "This device has the setup \"${head.id}\" and $name is carrying \"${fetched.id ?: "one with no id"}\". " +
                     "Two setups cannot be merged; one of them has to replace the other.",
@@ -298,6 +311,21 @@ internal class SetupPeerSync(
             )
             "$name is carrying a different setup. It is waiting for a decision."
         }
+    }
+
+    /**
+     * Whether the question about [remote] over [head] may be put to a person now: it was not left,
+     * and no question of its kind built against [head] is open, whichever machine it came from and
+     * whatever copy it is about. One built against an earlier head is out of date and gives way.
+     */
+    private fun mayAsk(decision: SetupDecision, head: String, remote: String): Boolean {
+        if ("$head $remote" in left) return false
+        val open = if (decision == SetupDecision.DIVERGED) {
+            services.divergence.value?.mineProvenance
+        } else {
+            services.identityClash.value?.mineProvenance
+        }
+        return open?.hash != head
     }
 
     /** What reading `config` gave. */

@@ -118,11 +118,11 @@ private class WiredServices(private val control: LegionControl) : ControlService
         machineName: String,
     ): SetupOutcome = control.config.adoptFromMachine(text, expectedRemoteHash, expectedLocalHash, machineName)
 
-    override fun recordDivergence(machineName: String, reason: String, theirText: String) =
-        control.config.recordDivergence(machineName, reason, theirText)
+    override fun recordDivergence(machineId: String, machineName: String, reason: String, theirText: String) =
+        control.config.recordDivergence(machineId, machineName, reason, theirText)
 
-    override fun recordIdentityClash(machineName: String, reason: String, theirText: String) =
-        control.config.recordIdentityClash(machineName, reason, theirText)
+    override fun recordIdentityClash(machineId: String, machineName: String, reason: String, theirText: String) =
+        control.config.recordIdentityClash(machineId, machineName, reason, theirText)
 
     override fun clearDivergence() = control.config.clearDivergence()
 

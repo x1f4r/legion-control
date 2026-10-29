@@ -35,11 +35,11 @@ internal fun servicesOver(store: ConfigStore): ControlServices {
         override fun adoptFromMachine(text: String, expectedRemoteHash: String?, expectedLocalHash: String?, machineName: String): SetupOutcome =
             store.adoptFromMachine(text, expectedRemoteHash, expectedLocalHash, machineName)
 
-        override fun recordDivergence(machineName: String, reason: String, theirText: String) =
-            store.recordDivergence(machineName, reason, theirText)
+        override fun recordDivergence(machineId: String, machineName: String, reason: String, theirText: String) =
+            store.recordDivergence(machineId, machineName, reason, theirText)
 
-        override fun recordIdentityClash(machineName: String, reason: String, theirText: String) =
-            store.recordIdentityClash(machineName, reason, theirText)
+        override fun recordIdentityClash(machineId: String, machineName: String, reason: String, theirText: String) =
+            store.recordIdentityClash(machineId, machineName, reason, theirText)
 
         override fun clearDivergence() = store.clearDivergence()
         override fun clearIdentityClash() = store.clearIdentityClash()

@@ -26,8 +26,12 @@ data class SetupSource(
  * Recorded only from bytes that hash to what the machine reported, and [theirProvenance] is what
  * those bytes say about themselves. [mineProvenance] is the document this screen was built against:
  * Merge, Keep mine and Take theirs each replace it only if it is still the one in force.
+ *
+ * [machineId] is the machine that served the bytes. A name is only what to call it: names are free
+ * text, and two machines may share one.
  */
 data class SetupDivergence(
+    val machineId: String,
     val machineName: String,
     val reason: String,
     /** Their document, exactly as the machine stores it. */
@@ -39,8 +43,12 @@ data class SetupDivergence(
     val at: Long,
 )
 
-/** Two different setups entirely, which is a replace-or-adopt question and never a merge. */
+/**
+ * Two different setups entirely, which is a replace-or-adopt question and never a merge. Replace
+ * goes to [machineId], the machine that served [theirText], and to no other.
+ */
 data class SetupIdentityClash(
+    val machineId: String,
     val machineName: String,
     val reason: String,
     val theirText: String,
@@ -296,10 +304,11 @@ class ConfigStore internal constructor(
      * this device's document that theirs descends from too and whose kept copy still hashes to it
      * (contract section 9.8); a copy that does not is no base at all.
      */
-    fun recordDivergence(machineName: String, reason: String, theirText: String) {
+    fun recordDivergence(machineId: String, machineName: String, reason: String, theirText: String) {
         val theirs = ControllerDocument.parse(theirText).getOrNull() ?: return
         val mine = _provenance.value
         _divergence.value = SetupDivergence(
+            machineId = machineId,
             machineName = machineName,
             reason = reason,
             theirText = theirs.canonicalText,
@@ -315,9 +324,10 @@ class ConfigStore internal constructor(
     }
 
     /** Remembers a machine carrying another setup entirely, from its verified bytes. */
-    fun recordIdentityClash(machineName: String, reason: String, theirText: String) {
+    fun recordIdentityClash(machineId: String, machineName: String, reason: String, theirText: String) {
         val theirs = ControllerDocument.parse(theirText).getOrNull() ?: return
         _clash.value = SetupIdentityClash(
+            machineId = machineId,
             machineName = machineName,
             reason = reason,
             theirText = theirs.canonicalText,
