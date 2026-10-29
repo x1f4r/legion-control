@@ -374,7 +374,8 @@ private fun forDecoding(node: SetupJson): JsonElement = when (node) {
  */
 internal fun wholeNumberOf(node: SetupJson?): Long? {
     val value = (node as? SetupJson.Number)?.lexeme?.toDoubleOrNull() ?: return null
-    // Past the range of a Long, toLong() gives the largest one.
+    // Past either end of the range of a Long, toLong() stops at that end: the largest Long above
+    // it, the smallest below it.
     return if (value.isFinite() && value == Math.floor(value)) value.toLong() else null
 }
 
