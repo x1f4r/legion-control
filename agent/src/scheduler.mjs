@@ -117,9 +117,9 @@ export function cycleBudget({ budgetMs = CYCLE_BUDGET_MS, startedAt = Date.now()
  */
 export async function recoverMachine(config, { lockFiles = [], budget = null } = {}) {
   const interrupted = recoverOperations({ systemId: config.system.id });
-  let putBackAny = false;
   const cleared = clearStaleLocks(lockFiles);
   const restored = [];
+  let putBackAny = false;
   const pending = listOperations({ recoveryPending: true, limit: 200 });
   const completed = (owing) => {
     for (const record of owing) updateOperation(record.id, { recoveryPending: false });

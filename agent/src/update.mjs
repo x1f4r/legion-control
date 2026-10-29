@@ -47,13 +47,13 @@ import { appendLog, listOperations, recordPhase, updateOperation, whenStarted } 
 import { mutationWorstCaseMs, runMutationArgv, unsettledWork } from './process-runner.mjs';
 import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
+import { PROCESS_COMMAND_MS } from './probes/process.mjs';
 import { hasUpdatePath, scheduledEligibility } from './policy.mjs';
 import { log, note } from './log.mjs';
 import { ensureServiceStateWritable, requireServiceStateSave as saveServiceState, ServiceStateError, serviceState } from './state.mjs';
 import * as appProvider from './providers/app.mjs';
 import * as commandProvider from './providers/command.mjs';
 import * as npmProvider from './providers/npm.mjs';
-import { PROCESS_COMMAND_MS } from './probes/process.mjs';
 import {
   BIND_GRACE_MS,
   canDrain,
@@ -163,20 +163,18 @@ function deferred({ service, from = null, to = null, busy, message }) {
 // How long it can take
 // ---------------------------------------------------------------------------
 
-/*
- * A scheduled cycle has a deadline, because its scheduler ends a cycle that
- * runs too long (scheduler.mjs), and it only starts what can be done by then.
- * These are the longest each piece of work can take, added up from the
- * timeouts its steps use, the mutation runner's stop of a command that runs
- * out included.
- *
- * What is counted is the part that can leave the service down: for an update,
- * from the drain to the health check that says it is back. What comes before
- * it changes nothing, and a cycle ended there loses only time. A rollback the
- * update turns out to need is not counted: it is what puts the service back,
- * and it is never skipped for time. If the scheduler ends the cycle in the
- * middle of one, the next cycle's recovery takes over what it left.
- */
+// A scheduled cycle has a deadline, because its scheduler ends a cycle that
+// runs too long (scheduler.mjs), and it only starts what can be done by then.
+// These are the longest each piece of work can take, added up from the
+// timeouts its steps use, the mutation runner's stop of a command that runs
+// out included.
+//
+// What is counted is the part that can leave the service down: for an update,
+// from the drain to the health check that says it is back. What comes before
+// it changes nothing, and a cycle ended there loses only time. A rollback the
+// update turns out to need is not counted: it is what puts the service back,
+// and it is never skipped for time. If the scheduler ends the cycle in the
+// middle of one, the next cycle's recovery takes over what it left.
 
 function stopWorstMs(service) {
   if (service.process?.type === 'app') return mutationWorstCaseMs(appProvider.APP_COMMAND_MS) + appProvider.QUIT_WAIT_MS;
