@@ -1,32 +1,18 @@
 // Outcome: the one field a client decides on (contract section 5.6).
 //
 // The agent states it on every mutating reply, every record and every summary,
-// computed with the same reducer every client ports. Two things here matter
-// more than the rest: the agent's copy of the reducer agrees with the shared
-// vectors, and a producer can move an outcome in exactly one direction, from
-// failed to unknown, and never towards anything more optimistic.
+// computed with the same reducer every client ports, which vectors.test.mjs
+// holds to the shared vectors. What matters most here is that a producer can
+// move an outcome in exactly one direction, from failed to unknown, and never
+// towards anything more optimistic.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { MUTATING_PHASES, OUTCOMES, outcomeOf, producedOutcome } from '../src/contract.mjs';
-import { cli, commandService, fixtureConfig, fixtureData, fresh, REPO, withHome, writeConfig } from './helpers.mjs';
+import { MUTATING_PHASES, OUTCOMES, producedOutcome } from '../src/contract.mjs';
+import { cli, commandService, fixtureConfig, fixtureData, fresh, withHome, writeConfig } from './helpers.mjs';
 
-const VECTORS = path.join(REPO, 'contract', 'vectors');
-const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
-
-test('outcomeOf agrees with every reduce vector the agent consumes', () => {
-  const index = readJson(path.join(VECTORS, 'index.json'));
-  const family = index.families.find((entry) => entry.family === 'outcome');
-  assert.ok(family, 'contract/vectors/index.json lists the outcome family; the agent tests need the shared corpus');
-  const group = family.groups.find((entry) => entry.group === 'reduce');
-  const cases = readJson(path.join(VECTORS, '..', family.file)).groups.reduce.filter((entry) => entry.consumers.includes('agent'));
-  assert.equal(cases.length, group.consumers.agent, 'every case the index promises the agent runs here');
-  for (const entry of cases) {
-    assert.deepEqual({ outcome: outcomeOf(entry.input) }, entry.expect, entry.name);
-  }
-});
 
 test('a producer may lower failed to unknown, and nothing else', () => {
   const failed = { ok: false, action: 'failed', reasonCode: 'internal' };

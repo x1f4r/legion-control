@@ -8,22 +8,7 @@ import test from 'node:test';
 import {
   MAX_CONTROLLER_BYTES, canonicalBytes, canonicalHash, judgeIncoming, readControllerBlock, readController, readControllerMeta, storeController,
 } from '../src/controller.mjs';
-import { REPO, fresh, withHome } from './helpers.mjs';
-
-const vectors = JSON.parse(fs.readFileSync(path.join(REPO, 'contract', 'hash-vectors.json'), 'utf8'));
-
-test('every shared hash vector agrees with this implementation', () => {
-  assert.ok(vectors.vectors.length >= 20, 'the shared vectors should be present');
-  for (const vector of vectors.vectors) {
-    const input = Buffer.from(vector.inputBase64, 'base64');
-    if (vector.sha256 === null) {
-      assert.throws(() => canonicalHash(input), new RegExp('UTF-8'), `${vector.name} should have no hash`);
-      continue;
-    }
-    assert.equal(canonicalHash(input), vector.sha256, vector.name);
-    assert.equal(canonicalBytes(input).toString('base64'), vector.canonicalBase64, `${vector.name} bytes`);
-  }
-});
+import { fresh, withHome } from './helpers.mjs';
 
 test('a document with no final newline hashes the same as one with it', () => {
   const document = '{"version":1,"machines":[]}';
