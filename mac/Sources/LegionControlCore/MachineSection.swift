@@ -16,6 +16,7 @@ struct MachineSection: View {
                 VStack(alignment: .leading, spacing: 12) { heading; deviceActions }
             }
             hostKeyBlock
+            launchBlock
             if case .conflict = model.setupSharing { setupVerdict }
             unresolvedBlock
             operationsBlock
@@ -83,6 +84,38 @@ struct MachineSection: View {
             Text(model.name).font(.system(size: 22, weight: .semibold))
             Text(deviceState)
                 .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Which of this machine's commands are waiting for approval here, and what runs meanwhile.
+    ///
+    /// The machine's own state line says what it is doing, and from that alone a system nothing is
+    /// sent to looks like one that is simply not answering.
+    @ViewBuilder
+    private var launchBlock: some View {
+        let waiting = app.launchReview.filter { $0.location.machineId == model.id }
+        if !waiting.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(waiting) { entry in
+                    StatusText(symbol: "exclamationmark.shield", text: launchLine(entry), tint: .orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Button("Review…") { app.reviewLaunch() }
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    private func launchLine(_ entry: LaunchReviewEntry) -> String {
+        guard case .system(_, let systemId) = entry.location, let system = model.machine.system(id: systemId) else {
+            return "Its identity file is waiting for approval. This device offers the one it approved, or none."
+        }
+        let prefix = model.machine.systems.count > 1 ? "\(system.name): " : ""
+        switch system.launchState {
+        case .approvedWithChangeWaiting:
+            return prefix + "Runs the approved command. A changed one is waiting for approval."
+        case .approved, .notDriven:
+            return prefix + "Not driven from this device until its command is approved."
         }
     }
 

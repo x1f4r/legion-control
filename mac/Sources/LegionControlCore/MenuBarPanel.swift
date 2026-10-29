@@ -38,6 +38,7 @@ struct MenuBarPanel: View {
     private var rowCount: Int { model.machines.count + (model.mac == nil ? 0 : 1) }
     private var noticeHeight: CGFloat {
         (model.unresolvedOperations.isEmpty ? 0 : 34)
+        + (model.launchReview.isEmpty ? 0 : 34)
         + (model.lastActionOutcome?.isError == true ? 44 : 0)
     }
     /// The app's own row, which is always there below the devices.
@@ -119,6 +120,22 @@ struct MenuBarPanel: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .menuStyle(.borderlessButton)
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+        }
+        // A command waiting for approval is one this device does not run, which is worth saying
+        // here: from the panel alone a machine that is not driven looks like one that is merely idle.
+        if !model.launchReview.isEmpty {
+            Button {
+                panel.openSection("setup")
+                model.reviewLaunch()
+            } label: {
+                Label("Commands waiting for approval (\(model.launchReview.count))", systemImage: "exclamationmark.shield")
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             .padding(.horizontal, 12)
             .frame(height: 34)
         }

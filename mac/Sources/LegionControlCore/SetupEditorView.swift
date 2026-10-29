@@ -26,6 +26,11 @@ struct SetupEditorView: View {
         VStack(alignment: .leading, spacing: 0) {
             PageHeading(title: "Setup", note: model.config.config?.identity.name)
 
+            if LaunchWaitingNotice.isNeeded(model) {
+                LaunchWaitingNotice(model: model)
+                    .padding(.bottom, 16)
+            }
+
             Picker("", selection: $selection) {
                 Text("Sites").tag(Selection.sites)
                 Text("This device").tag(Selection.bindings)
@@ -260,20 +265,49 @@ private struct MachineEditor: View {
                             .controlSize(.small)
                         }
                     }
-                    Text(system.agent.joined(separator: " "))
+                    Text(LaunchValues.visible(system.agent.joined(separator: " ")))
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                    if let waiting = waiting(system) {
+                        waitingRow(waiting)
+                    }
                 }
                 .padding(.bottom, 10)
             }
 
-            SystemForm { entry in
+            SystemForm(waiting: Set(machine.systems.filter { waiting($0) != nil }.map(\.id))) { entry in
                 problem = model.editSetup("added a system to \(machine.name)") { root in
                     try ControllerEditor.upsertSystem(entry, onMachine: machine.id, in: &root)
                 }
                 return problem == nil
+            }
+        }
+    }
+
+    /// The review entry for a system whose command is waiting for approval on this device.
+    private func waiting(_ system: SystemConfig) -> LaunchReviewEntry? {
+        model.launchReview.first { $0.location == .system(machine: machine.id, system: system.id) }
+    }
+
+    /// A waiting command is read-only here, with its two answers beside it. Editing one field of it
+    /// would otherwise make the rest of what the shared setup says about that system this device's
+    /// own edit, approved without ever being shown whole.
+    private func waitingRow(_ entry: LaunchReviewEntry) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            StatusText(symbol: "exclamationmark.shield",
+                       text: entry.approvable ? "Waiting for approval on this device" : "Cannot be approved on this device",
+                       tint: .orange)
+                .font(.caption)
+            Spacer(minLength: 8)
+            if entry.approvable {
+                Button("Approve") { model.approveLaunch([entry]) }
+                    .controlSize(.small)
+            }
+            if entry.approved != nil {
+                Button("Revert") { problem = model.revertLaunch(entry) }
+                    .controlSize(.small)
             }
         }
     }
@@ -545,6 +579,9 @@ private func undialablePart(host: String, user: String, port: String = "") -> St
 }
 
 private struct SystemForm: View {
+    /// The ids of systems whose command is waiting for approval here, which this form will not
+    /// write over.
+    var waiting: Set<String> = []
     var save: ([String: Any]) -> Bool
 
     @State private var id = ""
@@ -601,13 +638,19 @@ private struct SystemForm: View {
                 if restricted { entry["restricted"] = true }
                 if save(entry) { id = ""; name = ""; shell = platform == .windows ? "cmd" : ""; argv = ""; restricted = false }
             }
-            .disabled(!AgentToken.isValid(id.trimmingCharacters(in: .whitespaces)) || !argumentsFit)
+            .disabled(!AgentToken.isValid(id.trimmingCharacters(in: .whitespaces)) || !argumentsFit || isWaiting)
+
+            if isWaiting {
+                QuietNote(text: "The command for \(id.trimmingCharacters(in: .whitespaces)) is waiting for approval on this device. Approve or revert it before changing it.")
+            }
         }
         .onChange(of: platform) { _, newPlatform in
             // cmd is what a stock Windows OpenSSH runs, so it is what a new Windows system starts with.
             if newPlatform == .windows, shell.isEmpty { shell = "cmd" }
         }
     }
+
+    private var isWaiting: Bool { waiting.contains(id.trimmingCharacters(in: .whitespaces)) }
 
     /// A restricted system the dispatcher could not take would be saved only to be refused on every
     /// command.

@@ -129,6 +129,34 @@ struct ContentView: View {
                 .frame(width: 760, height: 640)
             }
         }
+        // Closing the review any way at all is "not now": it does not come up by itself again for
+        // this document in this run.
+        .sheet(isPresented: Binding(
+            get: { model.isReviewingLaunch && !model.launchReview.isEmpty },
+            set: { if !$0 { model.deferLaunchReview(model.config.hash) } }
+        )) {
+            ScrollView {
+                LaunchReviewView(model: model)
+                    .padding(.horizontal, 32)
+                    .padding(.vertical, 30)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(width: 760, height: 640)
+        }
+        .sheet(isPresented: Binding(
+            get: { model.enrolment != nil },
+            set: { if !$0 { model.cancelEnrolment() } }
+        )) {
+            if let enrolment = model.enrolment {
+                ScrollView {
+                    LaunchEnrolmentView(model: model, enrolment: enrolment)
+                        .padding(.horizontal, 32)
+                        .padding(.vertical, 30)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(width: 760, height: 640)
+            }
+        }
     }
 
     private var configured: some View {
@@ -264,6 +292,7 @@ private struct Sidebar: View {
     /// waiting to be settled.
     private var setupSummary: String {
         if model.divergence != nil { return "needs a decision" }
+        if !model.launchReview.isEmpty { return "commands waiting for approval" }
         guard let identity = model.config.config?.identity, identity.id != nil else { return "no identity yet" }
         return "revision \(identity.revisionNumber)"
     }
