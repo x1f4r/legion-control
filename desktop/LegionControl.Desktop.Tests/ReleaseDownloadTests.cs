@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -172,5 +173,25 @@ public class ReleaseDownloadTests
         var (updates, ready, host) = Offer(() => new Unannounced("abc"u8.ToArray()), size: 0);
         Assert.Contains("no size", await updates.DownloadAsync(ready, Path.Combine(home.Path, "fixture.bin")));
         Assert.Empty(host.Asked);
+    }
+
+    [Fact]
+    public void ADownloadedArchiveIsUnpackedFromDiskAndThenRemoved()
+    {
+        using var home = new TempHome();
+        var installer = new AppInstaller { StagingRoot = Path.Combine(home.Path, "updates"), ExecutableName = "legion-control" };
+        var archive = installer.DownloadPath(AppUpdates.WindowsAsset);
+        Directory.CreateDirectory(Path.GetDirectoryName(archive)!);
+        using (var zip = ZipFile.Open(archive, ZipArchiveMode.Create))
+        {
+            using var writer = new StreamWriter(zip.CreateEntry("legion-control").Open());
+            writer.Write("#!/bin/sh\n");
+        }
+
+        var (directory, problem) = installer.Stage(archive, AppUpdates.WindowsAsset);
+        Assert.Null(problem);
+        Assert.True(File.Exists(Path.Combine(directory!, "legion-control")));
+        // Nothing reads the archive again, so a hundred megabytes do not stay behind.
+        Assert.False(File.Exists(archive));
     }
 }
