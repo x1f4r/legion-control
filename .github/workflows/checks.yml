@@ -5,9 +5,15 @@ on:
   pull_request:
 permissions:
   contents: read
+# A newer push to a pull request makes the run still going on it moot, so that run is cancelled.
+# Every push to main runs to the end in a group of its own: release.sh releases only a commit whose
+# checks all passed, and a run that was cancelled, or left waiting behind a newer one, would leave
+# that commit unreleasable.
 concurrency:
-  group: checks-${{ github.ref }}
-  cancel-in-progress: true
+  group: checks-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# Every action is pinned to the commit of the release named beside it, so a tag that moves cannot
+# change what runs here. Dependabot (.github/dependabot.yml) proposes the updates.
 jobs:
   agent:
     name: Agent (${{ matrix.os }}, Node ${{ matrix.node }})
@@ -17,33 +23,54 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         node: [24, 26]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
       - run: bash scripts/check.sh agent
+
   mac:
     name: macOS
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: bash scripts/check.sh mac
+
   android:
     name: Android
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The wrapper jar is the one binary in the repository that runs code, so it has to be a jar
+      # Gradle published.
+      - uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
+          cache: gradle
+          cache-dependency-path: |
+            android/*.gradle.kts
+            android/app/*.gradle.kts
+            android/gradle/libs.versions.toml
+            android/gradle/wrapper/gradle-wrapper.properties
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           # The runner's command-line tools no longer offer the legacy "tools" package the
           # action asks for by default, and sdkmanager then fails the job before Gradle starts.
           packages: platform-tools
       - run: bash scripts/check.sh android
+
   desktop:
     name: Desktop (${{ matrix.os }})
     strategy:
@@ -51,11 +78,19 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '10.0.x'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('desktop/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
       - run: bash scripts/check.sh desktop
       - name: Publish Linux
         if: runner.os == 'Linux'
