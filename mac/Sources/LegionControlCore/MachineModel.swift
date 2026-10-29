@@ -255,7 +255,8 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         }
     }
 
-    /// The second line of the machine's row in the sidebar.
+    /// The state of the machine's row in the sidebar, which VoiceOver reads as the row's value
+    /// (SidebarRow.summary).
     var sidebarSummary: String {
         if let reboot = rebootInProgress, !isAwake { return "restarting into \(reboot.target.name)" }
         if !unresolvedOperations.isEmpty { return "outcome not known yet" }
@@ -267,7 +268,8 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         }
     }
 
-    /// The second line of a service's row.
+    /// The state of a service's row in the sidebar, which VoiceOver reads as the row's value
+    /// (SidebarRow.summary).
     func sidebarSummary(for service: ServiceStatus) -> String {
         guard currentSystem != nil else { return "not readable" }
         if service.installed == nil { return "not installed" }

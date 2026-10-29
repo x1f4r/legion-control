@@ -133,7 +133,8 @@ final class MacModel: AgentDevice {
         return nil
     }
 
-    /// The second line of the sidebar entry for this Mac.
+    /// The state of this Mac's row in the sidebar, which VoiceOver reads as the row's value
+    /// (SidebarRow.summary).
     var sidebarSummary: String {
         if failure != nil { return "not readable" }
         guard !services.isEmpty else { return "checking" }
