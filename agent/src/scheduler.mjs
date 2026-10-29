@@ -233,6 +233,8 @@ export async function drainQueue(config, { lock, force = false } = {}) {
     const liveness = {};
     for (const service of config.services) liveness[service.id] = livenessOf(service);
     const { busy } = await checkAllBusy(config, { liveness });
+    // A request queued with --force by an agent before 3.1.0, which refuses
+    // that combination now, keeps what it asked for.
     if (busy.busy && !force && record.force !== true) {
       results.push({
         opId: record.id,

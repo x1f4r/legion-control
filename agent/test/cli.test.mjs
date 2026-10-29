@@ -207,6 +207,41 @@ test('a queued request waits, is visible, and the cycle runs it when idle', asyn
   );
 });
 
+test('a queued request takes no --force, and no expiry in the past or past the week', async () => {
+  const withAction = (dir) => ({ ...fixtureConfig(dir), actions: [{ id: 'hello', name: 'Hello', command: [process.execPath, '-e', ''] }] });
+  await withService(async ({ home }) => {
+    for (const args of [
+      ['update', '--when-idle', '--force'],
+      ['restart', '--when-idle', '--force'],
+      ['run', 'hello', '--when-idle', '--force'],
+      ['sleep', '--when-idle', '--force'],
+    ]) {
+      const refused = cli(args, { home });
+      assert.equal(refused.exitCode, 1, args.join(' '));
+      assert.equal(refused.payload.reasonCode, 'bad-argument');
+      assert.equal(refused.payload.argument, '--force');
+      assert.match(refused.payload.message, /--when-idle waits until the machine is idle, and --force does not wait for that/);
+    }
+    assert.match(cli(['help'], { home }).payload.commands.find((command) => command.name === 'update').summary, /cannot be combined with --force/);
+
+    const waiting = cli(['restart', '--when-idle', '--expires', '30m'], { home }).payload;
+    assert.equal(waiting.action, 'queued');
+    const past = cli(['restart', '--when-idle', '--expires', new Date(Date.now() - 60000).toISOString()], { home });
+    assert.equal(past.payload.reasonCode, 'bad-argument');
+    assert.equal(past.payload.argument, '--expires');
+    assert.match(past.payload.message, /already past/);
+    const queued = cli(['status'], { home }).payload.operations.queued;
+    assert.deepEqual(queued.map((summary) => summary.id), [waiting.op.id], 'the request that waits was not replaced');
+
+    const week = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    for (const expires of ['30d', new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()]) {
+      const capped = cli(['update', '--when-idle', '--expires', expires], { home }).payload;
+      assert.equal(capped.action, 'queued', expires);
+      assert.ok(Math.abs(Date.parse(capped.op.expiresAt) - week) < 60000, `${expires} is the week at most, not ${capped.op.expiresAt}`);
+    }
+  }, { config: withAction });
+});
+
 test('a queued request can be cancelled before it runs', async () => {
   await withService(async ({ home }) => {
     const queued = cli(['restart', '--when-idle'], { home });

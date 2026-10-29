@@ -92,26 +92,26 @@ const COMMANDS = {
     flags: ['force', 'detach', 'when-idle'],
     options: ['service', 'op', 'expires'],
     mutates: true,
-    summary: 'update one service',
+    summary: 'update one service; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
   },
   restart: {
     flags: ['force', 'detach', 'when-idle'],
     options: ['service', 'op', 'expires'],
     mutates: true,
-    summary: 'restart one service',
+    summary: 'restart one service; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
   },
   boot: {
     flags: ['force', 'no-reboot', 'when-idle'],
     options: ['op', 'expires'],
     mutates: true,
-    summary: 'arm a boot target and reboot into it',
+    summary: 'arm a boot target and reboot into it; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
   },
-  sleep: { flags: ['force', 'when-idle'], options: ['op', 'expires'], mutates: true, summary: 'suspend this machine' },
+  sleep: { flags: ['force', 'when-idle'], options: ['op', 'expires'], mutates: true, summary: 'suspend this machine; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force' },
   run: {
     flags: ['force', 'detach', 'when-idle'],
     options: ['op', 'expires'],
     mutates: true,
-    summary: 'run a configured action',
+    summary: 'run a configured action; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
   },
   cycle: { flags: ['dry-run', 'force'], options: ['op'], mutates: true, summary: 'the scheduled maintenance cycle over every eligible service' },
   'auto-update': { flags: [], options: ['service'], mutates: true, summary: 'on, off, pause <duration> or resume' },
@@ -355,8 +355,21 @@ function queuedShape(kind, { service, target, actionId }) {
   return {};
 }
 
-/** Park a request until the machine is idle, and answer `queued`. */
+/**
+ * Park a request until the machine is idle, and answer `queued`.
+ *
+ * `--when-idle` with `--force` is refused. One asks to wait until nothing is
+ * busy, the other not to care whether anything is, and a queued request that
+ * did both used to skip the wait and the busy gate alike: an interruption
+ * nobody watching asked for, at a time nobody chose.
+ */
 function queueRequest({ kind, service = null, target = null, actionId = null, flags, options, config }) {
+  if (flags.has('force')) {
+    return badArgument(
+      `${kind} --when-idle waits until the machine is idle, and --force does not wait for that; ask for one or the other`,
+      { command: kind, argument: '--force' },
+    );
+  }
   const ttl = queueTtl(options);
   if (!ttl.ok) return badArgument(ttl.error, { command: kind, argument: '--expires' });
 
@@ -366,7 +379,6 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
     service,
     target,
     actionId,
-    force: flags.has('force'),
     systemId: config.system.id,
     noReboot: flags.has('no-reboot'),
     ttlMs: ttl.ttlMs,
@@ -376,6 +388,7 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
   // An id already bound to another request is a bad --op, never a replay and
   // never a conflict to wait out (contract section 5.5).
   if (queued.conflict) return badArgument(queued.error, { command: kind, argument: '--op' });
+  if (queued.badExpiry) return badArgument(queued.error, { command: kind, argument: '--expires' });
   if (!queued.ok) {
     return refuse(REASON.internal, `the request could not be recorded: ${queued.error}`, { command: kind, argument: null, error: queued.error });
   }

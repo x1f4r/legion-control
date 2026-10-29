@@ -396,11 +396,67 @@ test('a queued request expires, and one per slot replaces the last', async () =>
     assert.equal(ops.dueQueue().length, 2);
 
     // And an expiry is not optional.
-    ops.queueOperation({ id: '66666666-1111-4111-8111-111111111111', kind: 'update', service: 'demo', expiresAt: new Date(Date.now() - 1000).toISOString() });
-    assert.equal(ops.dueQueue().length, 2, 'an expired request is not due');
-    const expired = ops.expireQueue();
-    assert.equal(expired.length, 1);
-    assert.equal(expired[0].result.action, 'expired');
+    ops.queueOperation({ id: '66666666-1111-4111-8111-111111111111', kind: 'update', service: 'demo', ttlMs: 60000 });
+    const later = Date.now() + 2 * 60000;
+    assert.equal(ops.dueQueue({ now: later }).length, 0, 'an expired request is not due');
+    const expired = ops.expireQueue({ now: later });
+    assert.equal(expired.length, 3, 'the one that was replaced is not waiting any more');
+    assert.ok(expired.every((record) => record.result.action === 'expired'));
+  });
+});
+
+test('an expiry lands between a minute and a week from now, however it is written', async () => {
+  const ops = await fresh('operations.mjs');
+  const now = Date.parse('2026-10-29T12:00:00.000Z');
+  const at = (input) => ops.queueExpiry(input, { now }).expiresAt;
+  assert.equal(at({}), '2026-10-29T16:00:00.000Z', 'four hours when nothing is named');
+  assert.equal(at({ ttlMs: 30 * 60000 }), '2026-10-29T12:30:00.000Z');
+  assert.equal(at({ ttlMs: 30 * 24 * 60 * 60000 }), '2026-11-05T12:00:00.000Z', 'a duration past the week is the week');
+  assert.equal(at({ expiresAt: '2027-01-01T00:00:00.000Z' }), '2026-11-05T12:00:00.000Z', 'so is a time past it');
+  assert.equal(at({ expiresAt: '2026-10-29T12:00:10.000Z' }), '2026-10-29T12:01:00.000Z', 'a time in the next minute is the minute');
+  assert.equal(at({ expiresAt: '2026-10-30T09:15:00.000Z' }), '2026-10-30T09:15:00.000Z');
+  for (const past of ['2026-10-29T12:00:00.000Z', '2026-10-28T12:00:00.000Z', '2001-05-01T00:00:00.000Z']) {
+    const refused = ops.queueExpiry({ expiresAt: past }, { now });
+    assert.equal(refused.ok, false, past);
+    assert.match(refused.error, /already past/);
+  }
+  assert.equal(ops.queueExpiry({ expiresAt: 'whenever' }, { now }).ok, false);
+});
+
+test('a request whose expiry has passed is refused without touching the one that waits', async () => {
+  await withHome(async () => {
+    const ops = await fresh('operations.mjs');
+    const waiting = '36363636-1111-4111-8111-111111111111';
+    ops.queueOperation({ id: waiting, kind: 'restart', service: 'demo', ttlMs: 60 * 60000 });
+    const stale = ops.queueOperation({ id: '37373737-1111-4111-8111-111111111111', kind: 'restart', service: 'demo', expiresAt: new Date(Date.now() - 1000).toISOString() });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.badExpiry, true);
+    assert.equal(ops.readOperation('37373737-1111-4111-8111-111111111111'), null, 'nothing was written');
+    assert.deepEqual(ops.dueQueue().map((record) => record.id), [waiting]);
+
+    // A retry of the request that waits is answered with it, whatever the
+    // expiry it was first sent with says by now.
+    const retry = ops.queueOperation({ id: waiting, kind: 'restart', service: 'demo', expiresAt: new Date(Date.now() - 1000).toISOString() });
+    assert.equal(retry.ok, true);
+    assert.equal(retry.replay, true);
+    assert.equal(ops.readOperation(waiting).state, 'queued');
+  });
+});
+
+test('boot and sleep wait in one slot, whatever the target', async () => {
+  await withHome(async () => {
+    const ops = await fresh('operations.mjs');
+    const boot = ops.queueOperation({ id: '38383838-1111-4111-8111-111111111111', kind: 'boot', target: 'windows', ttlMs: 60000 });
+    const otherTarget = ops.queueOperation({ id: '39393939-1111-4111-8111-111111111111', kind: 'boot', target: 'linux', ttlMs: 60000 });
+    assert.equal(otherTarget.replaced, boot.record.id, 'the machine makes one power transition');
+    const sleep = ops.queueOperation({ id: '40404040-1111-4111-8111-111111111111', kind: 'sleep', ttlMs: 60000 });
+    assert.equal(sleep.replaced, otherTarget.record.id);
+    assert.match(ops.readOperation(otherTarget.record.id).result.message, /one power transition at a time/);
+    assert.deepEqual(ops.dueQueue().map((record) => record.kind), ['sleep']);
+
+    // Everything else still has a slot of its own beside it.
+    ops.queueOperation({ id: '41414141-1111-4111-8111-111111111111', kind: 'restart', service: 'demo', ttlMs: 60000 });
+    assert.deepEqual(ops.dueQueue().map((record) => record.kind).sort(), ['restart', 'sleep']);
   });
 });
 

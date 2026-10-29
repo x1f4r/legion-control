@@ -33,8 +33,9 @@ import { ownStartTime, processIsAlive, writeJsonAtomic } from './state.mjs';
 /** How many finished records are kept, and for how long. */
 export const HISTORY_LIMIT = 200;
 export const HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-/** A queued request with no expiry of its own. */
+/** A queued request with no expiry of its own, and the bounds of any it names. */
 export const DEFAULT_QUEUE_TTL_MS = 4 * 60 * 60 * 1000;
+export const MIN_QUEUE_TTL_MS = 60 * 1000;
 export const MAX_QUEUE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Per-operation log lines kept in the record. */
 export const LOG_LIMIT = 200;
@@ -642,25 +643,61 @@ export function claimOperation(id, { pid = process.pid, parentPid = process.ppid
 // ---------------------------------------------------------------------------
 
 /**
+ * When a queued request expires: `expiresAt`, an absolute time, or `ttlMs`
+ * from now, four hours when neither is given. Whichever it is, it lands in
+ * [now + 1 minute, now + 7 days], so no way of writing it buys a request that
+ * outlives the week or one that is gone before a cycle could see it.
+ *
+ * A time already past is refused rather than raised to the minute. Nobody asks
+ * for a request that has expired before it was made, and accepting one would
+ * still replace whatever waited in its slot: the valid request would be
+ * cancelled for one that never runs.
+ */
+export function queueExpiry({ ttlMs = null, expiresAt = null } = {}, { now = Date.now() } = {}) {
+  let at = now + (Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_QUEUE_TTL_MS);
+  if (expiresAt !== null && expiresAt !== undefined) {
+    at = Date.parse(expiresAt);
+    if (Number.isNaN(at)) return { ok: false, expiresAt: null, error: `the expiry ${JSON.stringify(expiresAt)} is not a time` };
+    if (at <= now) {
+      return { ok: false, expiresAt: null, error: `the expiry ${new Date(at).toISOString()} is already past, so the request was not queued and nothing waiting was replaced` };
+    }
+  }
+  return { ok: true, expiresAt: new Date(Math.min(Math.max(at, now + MIN_QUEUE_TTL_MS), now + MAX_QUEUE_TTL_MS)).toISOString(), error: null };
+}
+
+/**
+ * The slot a queued request takes. A person who presses "update when idle"
+ * twice meant it once, and two records would run the same update twice in a
+ * row, so each service, target or action has one. Boot and sleep share a
+ * single slot, whatever the target: the machine makes one power transition,
+ * and two queued ones would both fire, the second on whatever the first left.
+ */
+function queueSlot(record) {
+  if (record.kind === 'boot' || record.kind === 'sleep') return 'power';
+  return `${record.kind}:${record.service ?? record.target ?? record.actionId ?? '-'}`;
+}
+
+/**
  * Park a request until the machine is idle.
  *
  * The expiry is not optional. A "restart when idle" that is still waiting three
  * days later is not a request anybody remembers making, and applying it then is
- * worse than dropping it.
+ * worse than dropping it (queueExpiry). At most one request waits in each slot
+ * (queueSlot), and a newer one replaces it.
  *
- * At most one queued request per (kind, service|target|actionId): a person who
- * presses "update when idle" twice meant it once, and two records would run the
- * same update twice in a row.
+ * Returns what beginOperation does, with `replaced`, or `badExpiry` with the
+ * error when the expiry is refused, in which case nothing was written.
  */
 export function queueOperation(input) {
-  const ttlMs = Math.min(
-    Number.isFinite(input.ttlMs) && input.ttlMs > 0 ? input.ttlMs : DEFAULT_QUEUE_TTL_MS,
-    MAX_QUEUE_TTL_MS,
-  );
-  const expiresAt = input.expiresAt ?? new Date(Date.now() + ttlMs).toISOString();
+  const expiry = queueExpiry(input);
 
   try {
     return withOperationsStore(() => {
+      // A retry of a request already queued is answered whatever its expiry
+      // says by now, which may have passed since it was first sent.
+      if (!expiry.ok && !(input.id && readOperation(input.id))) {
+        return { ok: false, badExpiry: true, error: expiry.error, replaced: null };
+      }
       // Bind or validate the incoming id before changing the existing slot. In
       // particular, replaying an older replaced id must not cancel the request
       // that replaced it.
@@ -670,21 +707,23 @@ export function queueOperation(input) {
         phase: 'queued',
         mode: 'queued',
         queueRequested: true,
-        expiresAt,
+        expiresAt: expiry.expiresAt,
       });
       if (!opened.ok || opened.replay) return { ...opened, replaced: null };
 
-      const slot = `${input.kind}:${input.service ?? input.target ?? input.actionId ?? '-'}`;
+      const slot = queueSlot(input);
       let replaced = null;
       try {
-        for (const record of listOperations({ limit: HISTORY_LIMIT, state: 'queued' })) {
+        for (const record of scanOperations({ state: 'queued' })) {
           if (record.id === opened.record.id) continue;
-          if (`${record.kind}:${record.service ?? record.target ?? record.actionId ?? '-'}` !== slot) continue;
+          if (queueSlot(record) !== slot) continue;
           finishOperationUnlocked(record.id, {
             ok: true,
             action: 'cancelled',
             reasonCode: REASON.cancelled,
-            message: 'replaced by a newer request for the same thing',
+            message: slot === 'power'
+              ? 'replaced by a newer boot or sleep request: the machine makes one power transition at a time'
+              : 'replaced by a newer request for the same thing',
           });
           replaced = record.id;
         }
@@ -709,7 +748,7 @@ export function queueOperation(input) {
 
 /** Queued records that have not expired, oldest first: a queue, not a stack. */
 export function dueQueue({ now = Date.now() } = {}) {
-  return listOperations({ limit: HISTORY_LIMIT, state: 'queued' })
+  return scanOperations({ state: 'queued' })
     .filter((record) => {
       const expires = Date.parse(record.expiresAt ?? '');
       return Number.isNaN(expires) || expires > now;
@@ -721,7 +760,7 @@ export function dueQueue({ now = Date.now() } = {}) {
 export function expireQueue({ now = Date.now() } = {}) {
   return withOperationsStore(() => {
     const expired = [];
-    for (const record of listOperations({ limit: HISTORY_LIMIT, state: 'queued' })) {
+    for (const record of scanOperations({ state: 'queued' })) {
       const expires = Date.parse(record.expiresAt ?? '');
       if (Number.isNaN(expires) || expires > now) continue;
       const finished = finishOperationUnlocked(record.id, {
