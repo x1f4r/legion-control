@@ -213,7 +213,12 @@ export async function withOperation(options, body) {
       return { ...result, opId: id, op: summarize(finished) };
     }
     // Replacing the agent touches no service, and is how a machine gets the
-    // fix for whatever is holding it, so only it goes ahead regardless.
+    // fix for whatever is holding it, so only it goes ahead regardless. A
+    // reboot would clear the ledger too, and is still held: it would cut off
+    // whatever the command is in the middle of, which is the very overlap the
+    // ledger is there to prevent, and arming one runs commands of its own. A
+    // person who judges that worth it can stop the command, or restart the
+    // machine, themselves; the next mutation then finds the ledger clear.
     const unsettled = kind === 'self-update' ? null : await unsettledWork();
     if (unsettled) {
       const result = unsettled.conflict
