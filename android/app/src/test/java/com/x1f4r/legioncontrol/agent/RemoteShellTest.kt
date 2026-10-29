@@ -48,7 +48,7 @@ class RemoteShellTest {
                     ),
                 ),
             ),
-        ).toMachines().single()
+        ).approvedHere().toMachines().single()
         val system = machine.systems.single()
         assertEquals(RemoteShell.DISPATCH, system.grammar)
 

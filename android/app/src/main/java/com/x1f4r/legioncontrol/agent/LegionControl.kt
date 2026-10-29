@@ -4,7 +4,6 @@ import android.content.Context
 import android.os.Build
 import com.x1f4r.legioncontrol.data.BindingsStore
 import com.x1f4r.legioncontrol.data.ConfigStore
-import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.DeviceIdentity
 import com.x1f4r.legioncontrol.data.HostKeyStore
 import com.x1f4r.legioncontrol.data.OperationStore
@@ -35,8 +34,9 @@ class MachineControl(
  * Build one of these per process and hand it to whatever holds the screen state.
  *
  * The machines are not part of that wiring, because they are not known at build time. They come out
- * of [config] and are rebuilt with [controls] whenever it changes, which is also the moment the
- * stored host keys and route hints are pruned back to what the configuration still names.
+ * of the launch gate's view of [config] and are rebuilt with [controls] whenever it changes, which is
+ * also the moment the stored host keys and route hints are pruned back to what the configuration
+ * still names.
  */
 class LegionControl(context: Context) {
     private val appContext = context.applicationContext
@@ -109,13 +109,17 @@ class LegionControl(context: Context) {
     }
 
     /**
-     * The machines [configuration] describes, each with its own transport, routes and agent.
+     * The machines the gate's configuration describes, each with its own transport, routes and agent.
+     *
+     * Only [LaunchGate.Effective] is taken, never a configuration read from a document: what each
+     * machine is sent is the command this device approved (contract section 9.9), and there is no
+     * way to build a control from the shared document's own.
      *
      * Route hints and local operation history follow the configured machines. Host identities are
      * private trust decisions and remain intact when shared topology changes.
      */
-    fun controls(configuration: ControllerConfig?): List<MachineControl> {
-        val machines = configuration?.toMachines().orEmpty()
+    fun controls(gated: LaunchGate.Effective): List<MachineControl> {
+        val machines = gated.toMachines()
         settings.retainOnly(machines.map { it.id }.toSet())
         operations.retainOnly(machines.map { it.id }.toSet())
 

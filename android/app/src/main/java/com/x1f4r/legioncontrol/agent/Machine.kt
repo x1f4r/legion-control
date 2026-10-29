@@ -1,6 +1,5 @@
 package com.x1f4r.legioncontrol.agent
 
-import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.MachineConfig
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.RouteKind
@@ -24,7 +23,8 @@ enum class Platform(val wire: String) {
  *
  * [id] is the whole of the contract with the far side: it is what the agent's own `system.id`
  * reports, what a boot target is named by, and what the interpreter path is chosen with. [agent] is
- * the argv run over ssh, straight out of the configuration and never assembled here.
+ * the argv run over ssh, as the launch gate left it and never assembled here: the command this
+ * device approved, which is not always the one the shared document names.
  */
 data class MachineSystem(
     val id: String,
@@ -32,11 +32,11 @@ data class MachineSystem(
     val platform: Platform,
     val agent: List<String>,
     /**
-     * The grammar this system's command line is written in, as contract section 15.1 gives it from
-     * the document's `platform`, `shell` and `restricted`, or null when it has none.
+     * The grammar this system's command line is written in: the one recorded with the tuple this
+     * device approved (contract section 9.9), or null when it runs nothing.
      *
-     * Computed once, here, and never derived anywhere else. A route whose last status reported a
-     * restricted session can only ever move it to [RemoteShell.DISPATCH] at run time.
+     * Decided once, by the launch gate, and never derived anywhere else. A route whose last status
+     * reported a restricted session can only ever move it to [RemoteShell.DISPATCH] at run time.
      */
     val grammar: RemoteShell? = RemoteShell.POSIX,
     /** Why [grammar] is null: `unknown-shell` or `restricted-agent-shape`. */
@@ -58,11 +58,10 @@ data class MachineSystem(
     val isConfigured: Boolean get() = agent.isNotEmpty()
 
     /**
-     * Whether commands are sent to this system at all: it names an agent, and its document gives
-     * that agent a grammar. A system whose `shell` is not one the contract knows is kept and shown,
-     * and never driven.
+     * Whether commands are sent to this system at all: it has an approved command and a grammar to
+     * write it in. Anything else is kept and shown, and never driven.
      */
-    val isDriven: Boolean get() = isConfigured && grammar != null
+    val isDriven: Boolean get() = isConfigured && grammar != null && launchState != LaunchState.NOT_DRIVEN
 }
 
 /** Where a system's command stands with this device's approvals (contract section 9.9). */
@@ -133,27 +132,27 @@ data class Machine(
     val addresses: List<String> get() = endpoints.map { it.address }
 }
 
-/** The machines the configuration describes, in the order it lists them. */
-fun ControllerConfig.toMachines(): List<Machine> = machines.map { it.toMachine() }
+/**
+ * The machines of the gate's configuration, in the order the document lists them.
+ *
+ * Only the gate's configuration is ever turned into machines. The systems take their command and
+ * grammar from what the gate wrote into them, and a system it did not decide on, which is every
+ * system of a configuration read straight from a document, runs nothing.
+ */
+fun LaunchGate.Effective.toMachines(): List<Machine> = config?.machines.orEmpty().map { it.toMachine() }
 
 private fun MachineConfig.toMachine(): Machine {
     val systems = systems.map { system ->
-        // The document's own strings, compared exactly. Platform.fromWire forgives a capital letter
-        // for the sake of a glyph; the grammar does not, or two clients would quote differently.
-        val choice = grammarFor(
-            platform = system.platform,
-            shell = system.shell,
-            restricted = system.restricted,
-            restrictedSession = false,
-            agentLength = system.agent.size,
-        )
+        val driven = system.launchState != LaunchState.NOT_DRIVEN && system.grammar != null
         MachineSystem(
             id = system.id,
             name = system.name?.takeIf { it.isNotBlank() } ?: system.id,
+            // Platform.fromWire forgives a capital letter for the sake of a glyph. Nothing that
+            // decides how a line is quoted reads it: that is the gate's grammar.
             platform = Platform.fromWire(system.platform),
-            agent = system.agent,
-            grammar = choice.grammar,
-            grammarRefusal = choice.refusal,
+            agent = if (driven) system.agent else emptyList(),
+            grammar = system.grammar.takeIf { driven },
+            launchState = if (driven) system.launchState else LaunchState.NOT_DRIVEN,
         )
     }
     val endpoints = endpoints.map { endpoint ->
@@ -224,5 +223,7 @@ fun Machine.resolveSystem(reportedId: String?, reportedName: String?, platformNa
         name = reportedName?.takeIf { it.isNotBlank() } ?: id,
         platform = Platform.fromWire(platformName),
         agent = emptyList(),
+        grammar = null,
+        launchState = LaunchState.NOT_DRIVEN,
     )
 }

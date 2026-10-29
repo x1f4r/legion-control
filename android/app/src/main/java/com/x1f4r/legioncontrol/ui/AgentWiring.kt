@@ -14,6 +14,7 @@ import com.x1f4r.legioncontrol.agent.DoctorReport
 import com.x1f4r.legioncontrol.agent.EndpointDiagnosis
 import com.x1f4r.legioncontrol.agent.HistoryReply
 import com.x1f4r.legioncontrol.agent.InterruptRequest
+import com.x1f4r.legioncontrol.agent.LaunchGate
 import com.x1f4r.legioncontrol.agent.LegionControl
 import com.x1f4r.legioncontrol.agent.LogsReply
 import com.x1f4r.legioncontrol.agent.Machine
@@ -29,6 +30,7 @@ import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.KeyChange
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
 import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -66,6 +68,10 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override val config: StateFlow<ControllerConfig?> get() = control.config.config
 
+    override val launch: StateFlow<LaunchGate.Effective> get() = control.config.launch
+
+    override val launchProblem: StateFlow<String?> get() = control.config.launchProblem
+
     override val configText: StateFlow<String> get() = control.config.text
 
     override val provenance: StateFlow<SetupProvenance?> get() = control.config.provenance
@@ -94,6 +100,11 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override fun applyEdit(document: ControllerDocument, deviceName: String?): String? =
         control.config.applyEdit(document, deviceName)
+
+    override fun applyEnrolment(text: String, deviceName: String?): String? =
+        control.config.applyEnrolment(text, deviceName)
+
+    override fun approveLaunch(entries: List<LaunchReviewEntry>): String? = control.config.approveLaunch(entries)
 
     override fun adoptFromMachine(
         text: String,
@@ -204,8 +215,8 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override fun forgetHostKeys(address: String) = control.hostKeys.forget(address)
 
-    override fun clients(configuration: ControllerConfig?): List<MachineClient> =
-        control.controls(configuration).map { WiredMachineClient(control, it) }
+    override fun clients(launch: LaunchGate.Effective): List<MachineClient> =
+        control.controls(launch).map { WiredMachineClient(control, it) }
 }
 
 private class WiredMachineClient(

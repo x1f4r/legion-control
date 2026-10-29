@@ -238,11 +238,17 @@ class AppModel(
     }
 
     init {
+        // Machines are rebuilt from what the gate lets this device run, which changes with the
+        // document and with every approval. The editor and the raw field follow the document alone:
+        // approving a command must not throw away an edit somebody is halfway through.
         scope.launch {
-            services.config.collect { configuration ->
-                rebuild(configuration?.let { services.clients(it) } ?: emptyList())
+            services.launch.collect { gated ->
+                rebuild(gated.config?.let { services.clients(gated) } ?: emptyList())
                 recomputeSite()
             }
+        }
+        scope.launch {
+            services.config.collect { followDocument() }
         }
         scope.launch {
             services.networkAddresses().collect { current ->
@@ -721,7 +727,7 @@ class AppModel(
 
     private fun applyFetched(fetched: ControllerFetch, source: SetupSource): String = when (fetched) {
         is ControllerFetch.Document -> {
-            val failure = services.applyPasted(fetched.text, services.deviceName())
+            val failure = services.applyEnrolment(fetched.text, services.deviceName())
             val found = services.config.value?.machines?.size ?: 0
             failure?.let { "The setup from ${source.host} was refused. $it" }
                 ?: "The setup came from ${source.host}: $found " +
@@ -757,6 +763,9 @@ class AppModel(
             machines.forEach { it.startPolling() }
             operations.resume(clients)
         }
+    }
+
+    private fun followDocument() {
         editor.reset(services.document.value)
         // The field follows what is in force only while nobody is halfway through typing into it.
         // Losing an edit to a document that arrived from another peer is exactly the thing the whole

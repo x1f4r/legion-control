@@ -43,13 +43,15 @@ class MainActivity : ComponentActivity() {
         // Held here for the same reason the model is, plus one of its own: the page that draws it
         // is a page of a pager and is disposed the moment it is swiped away from. State kept inside
         // it would ask GitHub for the release list again on every swipe back.
-        // The repository the setup names, held to GitHub's grammar first: UpdateSource falls back to
-        // the built-in one, and says so, rather than put a peer's arbitrary text into a URL.
+        // The repository this device approved, never the one the shared setup merely names: where
+        // this app's own updates come from is a launch value (contract section 9.9), and one waiting
+        // for approval leaves the approved or the built-in source in place. It is held to GitHub's
+        // grammar again on the way into a URL.
         updates = AppUpdateModel(applicationContext) {
-            UpdateSource.of(services.config.value?.appUpdates?.githubRepo)
+            UpdateSource.of(services.launch.value.config?.appUpdates?.githubRepo)
         }
-        updates.observeRepositories(services.config.map { config ->
-            UpdateSource.of(config?.appUpdates?.githubRepo)
+        updates.observeRepositories(services.launch.map { gated ->
+            UpdateSource.of(gated.config?.appUpdates?.githubRepo)
         })
         setContent {
             LegionTheme {

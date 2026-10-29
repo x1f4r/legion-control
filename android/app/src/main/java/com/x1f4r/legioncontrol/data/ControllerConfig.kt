@@ -4,12 +4,14 @@ import com.x1f4r.legioncontrol.agent.Addresses
 import com.x1f4r.legioncontrol.agent.CommandLineRefusal
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.ControllerSource
+import com.x1f4r.legioncontrol.agent.LaunchState
 import com.x1f4r.legioncontrol.agent.RemoteShell
 import com.x1f4r.legioncontrol.agent.buildRemoteCommand
 import com.x1f4r.legioncontrol.agent.describeRefusal
 import com.x1f4r.legioncontrol.agent.grammarFor
 import com.x1f4r.legioncontrol.net.parseMacAddress
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.Json
 
 /**
@@ -218,6 +220,19 @@ data class SystemConfig(
      * the serialisation right, before anything has answered.
      */
     val restricted: Boolean = false,
+    /**
+     * The grammar this device writes the system's line in, as the launch gate decided it.
+     *
+     * Never read from a document, which has no such key: it is written by `LaunchGate` together
+     * with [agent], from the tuple this device approved (contract section 9.9). A document saying
+     * `"grammar"` here is an unknown key like any other.
+     */
+    @Transient val grammar: RemoteShell? = null,
+    /**
+     * Whether this device runs [agent] at all. Not driven until the launch gate says otherwise, so a
+     * configuration that never went through the gate drives nothing.
+     */
+    @Transient val launchState: LaunchState = LaunchState.NOT_DRIVEN,
 )
 
 @Serializable

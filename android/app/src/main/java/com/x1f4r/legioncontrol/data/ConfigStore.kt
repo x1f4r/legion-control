@@ -2,6 +2,7 @@ package com.x1f4r.legioncontrol.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.x1f4r.legioncontrol.agent.LaunchGate
 import com.x1f4r.legioncontrol.agent.SetupProvenance
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -65,13 +66,19 @@ sealed interface SetupOutcome {
  * The text and not the parsed object is what is stored, because the text is what gets hashed and
  * what other devices compare against. A field showing a re-serialised document would also reformat
  * what somebody typed and turn every visit into a diff they did not ask for.
+ *
+ * Beside the text sits this device's record of the commands it approved (contract section 9.9), in
+ * the same preferences and written in the same edit. Adopting a document never approves anything in
+ * it: [launch] is what every machine is driven from, and it holds only what this device approved.
  */
-class ConfigStore(
-    context: Context,
+class ConfigStore internal constructor(
+    private val prefs: SharedPreferences,
     private val revisions: RevisionCache,
 ) {
-    private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences("legion-config", Context.MODE_PRIVATE)
+    constructor(context: Context, revisions: RevisionCache) : this(
+        context.applicationContext.getSharedPreferences("legion-config", Context.MODE_PRIVATE),
+        revisions,
+    )
 
     private val _text = MutableStateFlow(prefs.getString(KEY_TEXT, null).orEmpty())
 
@@ -89,6 +96,23 @@ class ConfigStore(
 
     /** The configuration in force. Null means there is none, which is the first-run state. */
     val config: StateFlow<ControllerConfig?> = _config.asStateFlow()
+
+    // Seeded before anything evaluates the gate, so the first start of this build drives exactly
+    // what the one before it did.
+    private val approvals = LaunchApprovals(prefs).also { it.seedIfMissing(_text.value, _document.value?.root) }
+
+    private val _launch = MutableStateFlow(gate(settledRecord()))
+
+    /**
+     * What every machine is driven from: [config] with each command, grammar and the update source
+     * as this device approved them, and what waits for approval.
+     */
+    val launch: StateFlow<LaunchGate.Effective> = _launch.asStateFlow()
+
+    private val _launchProblem = MutableStateFlow(approvals.read().problem)
+
+    /** Why the record of approved commands could not be read, when it could not. Everything waits meanwhile. */
+    val launchProblem: StateFlow<String?> = _launchProblem.asStateFlow()
 
     private val _provenance = MutableStateFlow(storedProvenance())
 
@@ -120,8 +144,24 @@ class ConfigStore(
      *
      * Nothing is stored on a failure, on purpose: an app that is working against a good
      * configuration must not lose it because a half-finished edit was applied by accident.
+     *
+     * A paste is an edit made on this device, so every command it changes is approved, at its new
+     * value, in the same write as the document (contract section 9.9).
      */
-    fun applyPasted(text: String, deviceName: String?): String? {
+    fun applyPasted(text: String, deviceName: String?): String? = paste(text, deviceName, Approving.EDIT)
+
+    /**
+     * Puts a setup fetched from a machine into force, once every launch value in it was shown and
+     * the person confirmed it.
+     *
+     * Enrolment (contract section 9.9): on a device that applies no setup yet, confirming approves
+     * every one of them. On a device that already applies one it is taking a different document,
+     * which approves nothing, and anything this device has not approved waits for review.
+     */
+    fun applyEnrolment(text: String, deviceName: String?): String? =
+        paste(text, deviceName, if (_document.value == null) Approving.EVERYTHING else Approving.NOTHING)
+
+    private fun paste(text: String, deviceName: String?, approving: Approving): String? {
         val parsed = ControllerDocument.parse(text).getOrElse { return it.message }
         val applied = _document.value
         val document = when {
@@ -133,19 +173,38 @@ class ConfigStore(
 
             else -> parsed
         }
-        return store(document)
+        return store(document, approving = approving)
     }
 
     /**
      * Puts an edit of the applied document into force.
      *
      * R2. The edit becomes current at once, because an edit made with no machine in reach is a real
-     * edit and not a draft; publishing is what happens on the next poll of each machine.
+     * edit and not a draft; publishing is what happens on the next poll of each machine. The
+     * commands it changes are approved in the same write.
      */
     fun applyEdit(edited: ControllerDocument, deviceName: String?): String? {
-        val applied = _document.value ?: return store(edited.withFreshIdentity(deviceName, now()))
+        val applied = _document.value
+            ?: return store(edited.withFreshIdentity(deviceName, now()), approving = Approving.EDIT)
         if (edited.canonicalText == applied.canonicalText) return null
-        return store(edited.asEditOf(applied, deviceName, now()))
+        return store(edited.asEditOf(applied, deviceName, now()), approving = Approving.EDIT)
+    }
+
+    /**
+     * Records exactly the values [entries] showed, at their places: Approve on the review (contract
+     * section 9.9). A newer value offered since is a new entry, and stays one.
+     *
+     * An entry that cannot be approved is left as it is. A value that cannot be shown faithfully can
+     * only be reverted or left.
+     */
+    fun approveLaunch(entries: List<LaunchReviewEntry>): String? {
+        val changes = entries.filter { it.approvable }.map { it.change() }
+        if (changes.isEmpty()) return "Nothing here can be approved. It can only be reverted or left."
+        val editor = prefs.edit()
+        val record = approvals.update(editor, _document.value?.root, changes)
+        editor.apply()
+        announce(record)
+        return null
     }
 
     /**
@@ -272,10 +331,29 @@ class ConfigStore(
         _source.value = source
     }
 
-    private fun store(document: ControllerDocument, readFrom: String? = null): String? {
+    /**
+     * Stores [document] as the one in force.
+     *
+     * [approving] says what it approves, and only an edit made here and enrolment approve anything.
+     * Taking a copy off a machine, a merge, keeping this device's copy and following another setup
+     * are all adoption: the document applies in full, and each command in it this device did not
+     * approve waits.
+     */
+    private fun store(
+        document: ControllerDocument,
+        readFrom: String? = null,
+        approving: Approving = Approving.NOTHING,
+    ): String? {
         val text = document.canonicalText
         val typed = readControllerConfig(text)
         typed.exceptionOrNull()?.let { return it.message ?: "That configuration could not be read." }
+
+        val after = LaunchValues.projection(document.root)
+        val changes = when (approving) {
+            Approving.NOTHING -> emptyList()
+            Approving.EDIT -> LaunchValues.changes(_document.value?.let { LaunchValues.projection(it.root) }, after)
+            Approving.EVERYTHING -> LaunchValues.changes(null, after)
+        }
 
         val identity = document.identity
         val provenance = SetupProvenance(
@@ -289,7 +367,9 @@ class ConfigStore(
             readFrom = readFrom ?: "this device",
         )
 
-        prefs.edit()
+        // The approvals go into the same edit as the document they belong to, recorded before
+        // anything can read the document back, so an edit made here never shows up for review.
+        val editor = prefs.edit()
             .putString(KEY_TEXT, text)
             .putString(KEY_HASH, provenance.hash)
             .putString(KEY_AUTHORITY, provenance.authority)
@@ -299,7 +379,8 @@ class ConfigStore(
             .putString(KEY_SOURCE_KIND, provenance.sourceKind)
             .putString(KEY_DEVICE, provenance.device)
             .putString(KEY_PROVENANCE_SOURCE, provenance.readFrom)
-            .apply()
+        val record = approvals.update(editor, document.root, changes)
+        editor.apply()
 
         // Kept before it is announced, so a merge that needs this revision as a base can find it
         // even if the app is killed in the next moment.
@@ -310,7 +391,41 @@ class ConfigStore(
         _document.value = document
         _config.value = typed.getOrNull()
         _divergence.value = null
+        announce(record)
         return null
+    }
+
+    /** What an applied document approves. */
+    private enum class Approving {
+        /** Adoption of any kind. */
+        NOTHING,
+
+        /** An edit made on this device: each launch value it changed. */
+        EDIT,
+
+        /** Enrolment: every launch value of the document. */
+        EVERYTHING,
+    }
+
+    /** The gate over what is in force, for [record]. */
+    private fun gate(record: LaunchApprovals.Record): LaunchGate.Effective =
+        LaunchGate.effective(_config.value, _document.value?.root, record.values)
+
+    private fun announce(record: LaunchApprovals.Record) {
+        _launchProblem.value = record.problem
+        _launch.value = gate(record)
+    }
+
+    /**
+     * The record at load, with what the applied document reuses recorded at its places, written back
+     * when that changed it: the gate's evaluation at load is an evaluation like any other.
+     */
+    private fun settledRecord(): LaunchApprovals.Record {
+        val before = approvals.read()
+        val editor = prefs.edit()
+        val settled = approvals.update(editor, _document.value?.root, emptyList())
+        if (settled != before) editor.apply()
+        return settled
     }
 
     private fun storedProvenance(): SetupProvenance? {

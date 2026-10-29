@@ -12,6 +12,7 @@ import com.x1f4r.legioncontrol.agent.DoctorReport
 import com.x1f4r.legioncontrol.agent.EndpointDiagnosis
 import com.x1f4r.legioncontrol.agent.HistoryReply
 import com.x1f4r.legioncontrol.agent.InterruptRequest
+import com.x1f4r.legioncontrol.agent.LaunchGate
 import com.x1f4r.legioncontrol.agent.LogsReply
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.MachineSystem
@@ -24,6 +25,7 @@ import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.KeyChange
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
 import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
@@ -280,8 +282,17 @@ interface ControlServices {
      */
     suspend fun replaceUnreadableKey()
 
-    /** The configuration in force, or null when there is none. */
+    /** The configuration in force, or null when there is none. What it says, for the screen. */
     val config: StateFlow<ControllerConfig?>
+
+    /**
+     * What machines are driven from: the configuration in force with every command as this device
+     * approved it (contract section 9.9), and each launch value that waits for approval.
+     */
+    val launch: StateFlow<LaunchGate.Effective>
+
+    /** Why the record of approved commands could not be read, when it could not. */
+    val launchProblem: StateFlow<String?>
 
     /** Exactly the text that was applied, so the field on screen starts where the user left it. */
     val configText: StateFlow<String>
@@ -321,6 +332,15 @@ interface ControlServices {
 
     /** Puts an edit of the applied document in force, as a revision descending from it. */
     fun applyEdit(document: ControllerDocument, deviceName: String?): String?
+
+    /**
+     * Puts a fetched setup in force after a person was shown all of its launch values. Approves them
+     * on a device that applied no setup before, and nothing on one that did.
+     */
+    fun applyEnrolment(text: String, deviceName: String?): String?
+
+    /** Records exactly the values [entries] showed as approved on this device. Returns null, or why not. */
+    fun approveLaunch(entries: List<LaunchReviewEntry>): String?
 
     /** Takes a copy off a machine. Only ever called when it descends from this device's copy. */
     fun adoptFromMachine(text: String, expectedHash: String?, machineName: String): SetupOutcome
@@ -386,8 +406,8 @@ interface ControlServices {
     /** Drops every key for one address, so the next connection asks about whatever is offered. */
     fun forgetHostKeys(address: String)
 
-    /** One client per machine the configuration describes, in the order it lists them. */
-    fun clients(configuration: ControllerConfig?): List<MachineClient>
+    /** One client per machine the gate's configuration describes, in the order it lists them. */
+    fun clients(launch: LaunchGate.Effective): List<MachineClient>
 }
 
 // MARK: - Reading a failure

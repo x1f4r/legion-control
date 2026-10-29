@@ -762,6 +762,17 @@ class AgentClient(
          */
         onlySystem: MachineSystem? = null,
     ): AgentReply<T> {
+        // Contract section 9.9: nothing is sent to a system this device approved no command for, and
+        // with none approved on the whole machine there is nothing to try on any route. Said in those
+        // words, so the machine is not drawn as one that is asleep.
+        if (overrideArgv == null && machine.systems.isNotEmpty() &&
+            machine.systems.all { it.launchState == LaunchState.NOT_DRIVEN }
+        ) {
+            throw AgentFailure.BadRequest(
+                "Nothing on ${machine.name} is driven from this device.",
+                "Not driven from this device until its command is approved.",
+            )
+        }
         val deadline = clock() + timeoutMillis
         val walk = AttemptWalk(safety)
         val failures = Failures()
@@ -784,14 +795,18 @@ class AgentClient(
                 val remaining = deadline - clock()
                 if (attemptsMade > 0 && remaining < MINIMUM_ATTEMPT_MILLIS) break@routes
 
-                val argv = (overrideArgv ?: system.agent) + arguments + if (budgeted && abilities.speaksV3) {
+                val launcher = overrideArgv ?: system.agent
+                val argv = launcher + arguments + if (budgeted && abilities.speaksV3) {
                     val budget = statusBudget(remaining, attemptsMade) ?: break@routes
                     listOf("--budget-ms", budget.toString())
                 } else {
                     emptyList()
                 }
                 val line = try {
-                    commandLine(grammarOn(endpoint, system, (overrideArgv ?: system.agent).size), argv)
+                    // A guard behind the launch gate, which leaves a system it does not drive no
+                    // command: with nothing in front of the verb, the verb alone would be the command.
+                    if (launcher.isEmpty()) throw refusedLine(CommandLineRefusal("no-command", null, null))
+                    commandLine(grammarOn(endpoint, system, launcher.size), argv)
                 } catch (refused: AgentFailure.BadRequest) {
                     // Nothing was sent, and another system's line may be fine: a request that could
                     // not be made is never sent, which is what lets the walk go on.
@@ -874,12 +889,14 @@ class AgentClient(
     private fun commandLine(grammar: RemoteShell, argv: List<String>): String = try {
         buildRemoteCommand(grammar, argv)
     } catch (refusal: CommandLineRefusal) {
-        // Nothing was sent, and the fix is a field in the document.
-        throw AgentFailure.BadRequest(
-            "This app cannot write that command for the shell on the far side.",
-            refusal.message,
-        )
+        throw refusedLine(refusal)
     }
+
+    /** Nothing was sent, and the fix is a field in the document. */
+    private fun refusedLine(refusal: CommandLineRefusal) = AgentFailure.BadRequest(
+        "This app cannot write that command for the shell on the far side.",
+        refusal.message,
+    )
 
     /** The reply decoded, or null when it is a JSON object this build cannot read as [deserializer]. */
     private fun <T : Any> decode(outcome: CommandOutcome, deserializer: KSerializer<T>): T? {
