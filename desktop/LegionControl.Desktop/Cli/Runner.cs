@@ -148,7 +148,7 @@ public static class Runner
         if (app.Config.Document is { } document)
         {
             var identity = document.Identity;
-            output.WriteLine($"Setup           {identity.Id ?? "no id"} revision {identity.RevisionNumber}, hash {document.Hash[..12]}, lineage {identity.Lineage.Count}");
+            output.WriteLine($"Setup           {identity.Id ?? "no id"} revision {identity.RevisionNumber}, hash {ReconcileOutcome.Short(document.Hash)}, lineage {identity.Lineage.Count}");
         }
         foreach (var warning in app.Config.Warnings) output.WriteLine($"Setup warning    {warning}");
         if (app.Approvals.Problem is { } launchProblem) output.WriteLine($"Approvals        {launchProblem}");
@@ -367,7 +367,7 @@ public static class Runner
         // waiting commands below are approved from this listing.
         output.WriteLine($"Revision  {document.Identity.RevisionNumber} by {(document.Identity.Device is { } device ? LaunchGate.Show(device) : "?")} ({(document.Identity.Source is { } source ? LaunchGate.Show(source) : "?")})");
         output.WriteLine($"Hash      {document.Hash}");
-        output.WriteLine($"Lineage   {(document.Identity.Lineage.Count == 0 ? "none" : string.Join(", ", document.Identity.Lineage.Select(hash => hash[..12])))}");
+        output.WriteLine($"Lineage   {(document.Identity.Lineage.Count == 0 ? "none" : string.Join(", ", document.Identity.Lineage.Select(ReconcileOutcome.Short)))}");
         output.WriteLine($"Kept      {app.Config.Ledger.Hashes().Count} earlier documents");
         if (app.Approvals.Problem is { } launchProblem) output.WriteLine($"Approvals {launchProblem}");
         WriteLaunchReview(app, output);
@@ -377,7 +377,7 @@ public static class Runner
             await each.RefreshAsync(token);
             var mark = each.Status?.Controller;
             output.WriteLine();
-            output.WriteLine($"{each.Name,-16} {(mark?.Hash is { } hash ? hash[..12] : "nothing")}"
+            output.WriteLine($"{each.Name,-16} {(mark?.Hash is { } hash ? ReconcileOutcome.Short(hash) : "nothing")}"
                              + (mark?.Revision is { } revision ? $" revision {revision}" : "")
                              + $"  {each.EvaluateSharing(document).Sentence_ ?? "unknown"}");
         }
@@ -1186,7 +1186,7 @@ public static class Runner
         }
         if (status.Controller is { } mark)
         {
-            output.WriteLine($"setup      {mark.Hash?[..12] ?? "none"} revision {mark.RevisionNumber} from {mark.Provenance}");
+            output.WriteLine($"setup      {(mark.Hash is { } hash ? ReconcileOutcome.Short(hash) : "none")} revision {mark.RevisionNumber} from {mark.Provenance}");
         }
     }
 

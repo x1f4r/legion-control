@@ -91,4 +91,19 @@ public class CommandLineSafetyTests
         Assert.NotNull(app.Config.Document!.Identity.Id);
         Assert.Contains("\"controller\"", File.ReadAllText(home.ConfigPath));
     }
+
+    [Fact]
+    public async Task AHashShorterThanAnAbbreviationIsShownWhole()
+    {
+        using var home = new TempHome();
+        // A lineage entry a peer wrote that is no hash at all: the setup is applied with the error
+        // shown, and the listing prints what is there rather than stopping on it.
+        var document = JsonNode.Parse(Documents.Make("setup-a", 2, new[] { "abc" }).Text)!;
+        document["machines"] = new JsonArray();
+        File.WriteAllText(home.ConfigPath, document.ToJsonString());
+        var output = new StringWriter();
+        Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "setup" }, output));
+        Assert.Contains("Lineage   abc", output.ToString());
+        Assert.Equal("abc", ReconcileOutcome.Short("abc"));
+    }
 }
