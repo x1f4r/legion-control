@@ -1182,6 +1182,21 @@ public sealed record DoctorReport(AgentEnvelope Envelope, IReadOnlyList<DoctorCh
     public int Warnings => Checks.Count(check => check.Verdict == DoctorVerdict.Warning);
 }
 
+/// The reply to `op ID`.
+///
+/// Three different answers. A record says what became of the operation. A present `"op": null`
+/// says there is no such operation on the machine: it never arrived there, or was pruned long since.
+/// Agent 3.1.0 sends that with `not-configured` and 3.0.x with `bad-argument`, and the code is not
+/// what decides (contract section 4). Anything else, a refusal with no `op` at all for one, says
+/// nothing about the operation and is no more evidence than a poll that never came back.
+public sealed record OperationReply(AgentEnvelope Envelope, OperationRecord? Record, bool NoRecord)
+{
+    public static OperationReply From(Value json) => new(
+        AgentEnvelope.From(json),
+        OperationRecord.From(json["op", "operation"]),
+        json.Has("op") && !json["op"].Exists);
+}
+
 public sealed record HistoryReply(AgentEnvelope Envelope, IReadOnlyList<OperationSummary> Operations)
 {
     public static HistoryReply From(Value json)

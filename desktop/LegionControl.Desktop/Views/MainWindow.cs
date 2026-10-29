@@ -759,9 +759,10 @@ public sealed class MainWindow : Window
         try
         {
             var reply = await machine.NewAgent().OperationAsync(id, null, machine.Capabilities);
-            var record = reply.Value;
-            Sheets.Text(this, "Operation details", record is null ? "No operation record returned." :
-                $"{record.Describe()}\n{record.Result?.Message}\n\n{record.Result?.Output}");
+            var record = reply.Value.Record;
+            Sheets.Text(this, "Operation details", record is not null
+                ? $"{record.Describe()}\n{record.Result?.Message}\n\n{record.Result?.Output}"
+                : reply.Value.NoRecord ? $"{machine.Name} has no operation {id}." : reply.Value.Envelope.Sentence() ?? "No operation record returned.");
         }
         catch (AgentFailure failure) { Sheets.Text(this, "Operation details", failure.Sentence(machine.Name)); }
     }

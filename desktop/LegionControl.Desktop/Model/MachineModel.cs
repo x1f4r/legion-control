@@ -474,17 +474,27 @@ public sealed class MachineModel
             {
                 var reply = await NewAgent().OperationAsync(operationId, 20, Capabilities, PreferredSystem(), null,
                     cancellationToken);
-                if (reply.Value is not { } record)
+                if (reply.Value.NoRecord)
                 {
-                    // The agent has no record of an id it was given. That is an answer: nothing
-                    // with this id ever ran there.
-                    var missing = $"{Name} has no record of {operationId}. Nothing with that id ran there.";
-                    if (tracked is not null)
-                    {
-                        _tracker.Update(tracked with { Outcome = OperationOutcome.Unknown, Message = missing });
-                    }
+                    // The agent has no record of an id it was given. That is an answer: the request
+                    // never started there.
+                    var missing = NeverStarted(operationId, reply.Value.Envelope.ReasonCode);
                     Changed?.Invoke();
-                    return new CommandOutcome.NotKnown(missing, operationId);
+                    return new CommandOutcome.Failed(missing, null);
+                }
+                if (reply.Value.Record is not { } record)
+                {
+                    // A reply that names no operation at all says nothing about this one, no more
+                    // than a poll that never came back: the same id is asked again.
+                    var silent = reply.Value.Envelope.Sentence() ?? $"{Name} answered without the record of {operationId}.";
+                    if (++lostLinks >= 4)
+                    {
+                        _tracker.MarkUnknown(operationId, silent);
+                        Changed?.Invoke();
+                        return new CommandOutcome.NotKnown($"{silent} The operation id is {operationId}.", operationId);
+                    }
+                    await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
+                    continue;
                 }
                 tracked = _tracker.Apply(operationId, record) ?? tracked;
                 Changed?.Invoke();
@@ -550,8 +560,10 @@ public sealed class MachineModel
         {
             var reply = await NewAgent().OperationAsync(operationId, null, Capabilities, PreferredSystem(), null,
                 cancellationToken);
-            if (reply.Value is not { } record) return _tracker.Find(operationId);
-            var updated = _tracker.Apply(operationId, record);
+            if (reply.Value.NoRecord) NeverStarted(operationId, reply.Value.Envelope.ReasonCode);
+            else if (reply.Value.Record is { } record) _tracker.Apply(operationId, record);
+            else return _tracker.Find(operationId);
+            var updated = _tracker.Find(operationId);
             if (Transition is { OperationId: var pending } watch && pending == operationId && updated?.IsResolved == true)
                 Transition = watch with
                 {
@@ -566,6 +578,27 @@ public sealed class MachineModel
             // Still unknown. That is the honest state and it stays on screen as one.
             return _tracker.Find(operationId);
         }
+    }
+
+    /// Resolves an operation the machine has no record of as one that never started: not in effect
+    /// there, and a new attempt is a new request. A record pruned long since reads the same, which
+    /// is why the sentence says both. Returns that sentence.
+    private string NeverStarted(string operationId, string? reasonCode)
+    {
+        var sentence = $"{Name} has no record of {operationId}: the request never arrived there, or was pruned long since. Nothing with that id is running.";
+        if (_tracker.Find(operationId) is { } tracked)
+        {
+            _tracker.Update(tracked with
+            {
+                UpdatedAt = DateTimeOffset.UtcNow,
+                State = OperationState.Finished,
+                Outcome = OperationOutcome.Failed,
+                Message = sentence,
+                ReasonCode = reasonCode,
+                OutcomeUnknown = false,
+            });
+        }
+        return sentence;
     }
 
     public async Task<CommandOutcome> CancelAsync(string operationId, CancellationToken cancellationToken = default)

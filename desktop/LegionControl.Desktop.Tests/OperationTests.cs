@@ -446,19 +446,77 @@ public class MachineRequestTests
         Assert.Single(runner.Calls);
     }
 
-    [Fact]
-    public async Task ARequestWithAnIdTheAgentHasNeverHeardOfIsNotASuccess()
+    [Theory]
+    [InlineData("not-configured")]
+    [InlineData("bad-argument")]
+    public async Task ARequestWithAnIdTheAgentHasNeverHeardOfNeverStarted(string code)
     {
+        // `op: null` is the agent saying it has no such operation, with not-configured from 3.1.0
+        // and bad-argument from 3.0.x. The request never arrived: it is resolved as not in effect,
+        // never as a success, and a new attempt is a new request.
         using var home = new TempHome();
         var runner = new FakeRunner(call => call.RemoteCommand.Contains(" op ")
-            ? FakeRunner.Ok("""{ "ok": false, "contract": 3, "reasonCode": "bad-argument", "op": null }""")
+            ? FakeRunner.Ok($$"""{ "ok": false, "contract": 3, "reasonCode": "{{code}}", "op": null }""")
             : FakeRunner.Ok(V3Status));
         var model = NewModel(home, runner);
         await model.RefreshAsync();
         var outcome = await model.FollowAsync("abcdefab-1234-4567-8901-abcdefabcdef",
             new MachineRequest { Kind = RequestKind.Update, Service = "t3" }, limit: TimeSpan.FromSeconds(5));
-        var notKnown = Assert.IsType<CommandOutcome.NotKnown>(outcome);
-        Assert.Contains("no record", notKnown.Sentence);
+        var failed = Assert.IsType<CommandOutcome.Failed>(outcome);
+        Assert.Contains("no record", failed.Sentence);
+        Assert.False(outcome.IsKnownSuccess);
+    }
+
+    [Theory]
+    [InlineData("not-configured")]
+    [InlineData("bad-argument")]
+    public async Task AnUnknownOutcomeTheMachineHasNoRecordOfIsResolvedAsNeverStarted(string code)
+    {
+        using var home = new TempHome();
+        var id = DispatchedAndLost(home);
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains(" op ")
+            ? FakeRunner.Ok($$"""{ "ok": false, "contract": 3, "reasonCode": "{{code}}", "op": null }""")
+            : FakeRunner.Ok(V3Status));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+
+        var resolved = await model.ResolveAsync(id);
+        Assert.NotNull(resolved);
+        Assert.Equal(OperationOutcome.Failed, resolved!.Outcome);
+        Assert.Equal(OperationState.Finished, resolved.State);
+        Assert.True(resolved.IsResolved);
+        Assert.False(resolved.OutcomeUnknown);
+        Assert.Contains("no record", resolved.Message);
+        Assert.Empty(model.UnresolvedOperations);
+    }
+
+    [Fact]
+    public async Task AnOpReplyThatNamesNoOperationIsNoAnswerAboutOne()
+    {
+        // A refusal with no `op` key at all says nothing about the operation. It is not "no
+        // record", and the row stays what it was until something that is evidence arrives.
+        using var home = new TempHome();
+        var id = DispatchedAndLost(home);
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains(" op ")
+            ? FakeRunner.Ok("""{ "ok": false, "contract": 3, "reasonCode": "internal", "message": "the record store is locked" }""")
+            : FakeRunner.Ok(V3Status));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+        var still = await model.ResolveAsync(id);
+        Assert.Contains(runner.Calls, call => call.RemoteCommand.Contains($"op {id}"));
+        Assert.False(still!.IsResolved);
+        Assert.True(still.OutcomeUnknown);
+    }
+
+    /// A restart of t3 on pi whose reply was lost after it was dispatched, as the operations file
+    /// the model starts from holds it.
+    private static string DispatchedAndLost(TempHome home)
+    {
+        const string id = "abcdefab-1234-4567-8901-abcdefabcdef";
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        tracker.Begin(id, "pi", "linux", new OperationIntent("restart", "t3"));
+        tracker.MarkUnknown(id, "the link went away after the command was sent");
+        return id;
     }
 
     [Fact]

@@ -131,11 +131,10 @@ public sealed class RemoteAgent
     /// Ask what became of an operation this app started earlier. Read-only, and the whole point of
     /// an operation having an id: an outcome that was lost can be asked about rather than guessed
     /// at or, far worse, asked for again.
-    public Task<AgentReply<OperationRecord?>> OperationAsync(
+    public Task<AgentReply<OperationReply>> OperationAsync(
         string id, int? waitSeconds, AgentCapabilities capabilities,
         SystemConfig? preferring = null, MachineRoute? route = null, CancellationToken cancellationToken = default) =>
-        CallAsync(CommandSurface.ReadOperation(id, waitSeconds, capabilities),
-            json => OperationRecord.From(json["op", "operation"]),
+        CallAsync(CommandSurface.ReadOperation(id, waitSeconds, capabilities), OperationReply.From,
             TimeSpan.FromSeconds((waitSeconds ?? 0) + 40), CommandSafety.ReadOnly, preferring, route,
             cancellationToken: cancellationToken);
 
