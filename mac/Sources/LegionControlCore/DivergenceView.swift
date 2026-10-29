@@ -138,7 +138,9 @@ struct DivergenceView: View {
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 if difference.needsDecision {
-                    Picker("Keep", selection: Binding(
+                    // Named after its difference, so that among the form controls VoiceOver lists
+                    // each picker says which setting it decides, not only that it keeps something.
+                    Picker("Which to keep for \(difference.label)", selection: Binding(
                         get: { choices[difference.id] ?? difference.defaultChoice },
                         set: { choices[difference.id] = $0 }
                     )) {
