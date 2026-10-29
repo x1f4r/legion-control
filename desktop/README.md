@@ -95,7 +95,11 @@ here until it is fixed, and a machine the error is inside is neither reached nor
 no document at all, half saved for one, never replaces the setup before it.
 
 `--replace` is the one command that overwrites a different setup, and it is only ever sent after a
-person has answered that question in front of a preview of what changes.
+person has answered that question in front of a preview of what changes, while the machine still
+holds the copy the preview was built from. It is never sent over a copy of this device's own setup.
+A different setup whose copy cannot be verified, or is one this device does not accept, can still
+be replaced: the preview is built from what the machine sent, and only taking its setup needs the
+verified bytes.
 
 ## Commands from the shared setup
 

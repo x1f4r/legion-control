@@ -46,17 +46,31 @@ public abstract record ReconcileOutcome
 /// Merge, Keep mine and Take theirs act on exactly these documents and nothing fetched later: what a
 /// person answered is what is written, and only while the setup here is still [Mine] (contract
 /// section 9.5, adopting is a compare-and-swap).
+///
+/// [Theirs] is what the machine sent and [TheirsHash] what it says it holds. When [TakeProblem]
+/// says those bytes are not the ones the hash covers, or that this device does not accept them,
+/// only a different setup has a session at all, and the one answer to it is replacing it: that
+/// needs nothing of its bytes but the preview of what it overwrites.
 public sealed record MergeSession(
     ControllerDocument? Mine,
     ControllerDocument Theirs,
+    string TheirsHash,
     ControllerDocument? Base,
     IReadOnlyList<SetupDifference> Differences,
     SetupConflictPreview Preview,
     bool DifferentSetup,
-    string? MergeProblem)
+    string? MergeProblem,
+    string? TakeProblem = null)
 {
-    /// Whether Merge and Keep mine can be offered. Take theirs always can.
-    public bool CanMerge => !DifferentSetup && Mine is not null && MergeProblem is null;
+    /// Whether Merge and Keep mine can be offered.
+    public bool CanMerge => !DifferentSetup && Mine is not null && MergeProblem is null && TakeProblem is null;
+
+    /// Whether Take theirs can be offered: only for verified bytes this device accepts.
+    public bool CanTakeTheirs => TakeProblem is null;
+
+    /// Whether this device's setup can be sent over the machine's with `--replace`: only over a
+    /// different setup, never over a copy of this one.
+    public bool CanReplace => DifferentSetup && Mine is not null;
 }
 
 /// Keeps every machine's copy of the setup in step with this device's, without ever losing an edit.
@@ -335,9 +349,14 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
 
     // MARK: the decisions a person makes
 
-    /// Builds the divergence screen from the machine's verified document: the differences of
-    /// section 9.8 against the base this device still has, the change adopting it would make, and
-    /// whether Merge and Keep mine can be offered at all.
+    /// Builds the divergence screen from the machine's document: the differences of section 9.8
+    /// against the base this device still has, the change adopting it would make, and which of the
+    /// answers can be offered at all.
+    ///
+    /// A different setup gets a screen even when its bytes cannot be verified or are refused here,
+    /// an agent before 3.1.0 holding a file no client rebuilds for one: replacing it never uses its
+    /// bytes, and refusing the screen left nothing that could replace it. Everything else needs the
+    /// verified document this device accepts.
     public async Task<(MergeSession? Session, string? Problem)> PrepareMergeAsync(
         MachineModel machine, CancellationToken cancellationToken = default)
     {
@@ -346,15 +365,23 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
         {
             if (_config.IsPendingEdit) return (null, "The setup file here holds an edit that is not applied yet. Save or fix it first.");
             var mine = _config.Document;
-            var (theirs, problem) = await machine.FetchSetupAsync(cancellationToken);
-            if (theirs is null) return (null, problem);
-            if (SetupMerge.WhyTheirsCannotMerge(theirs.Text) is { } refused) return (null, refused);
-            if (mine is not null && mine.Hash == theirs.Hash) return (null, $"{machine.Name} holds exactly this device's setup now.");
+            var (reply, readProblem) = await machine.ReadSetupAsync(cancellationToken);
+            if (reply is null) return (null, readProblem);
+            var (verified, unverified) = machine.Verified(reply);
+            // Bytes that do not hash to what the machine reports still show what it holds, and
+            // that is all they are used for.
+            var theirs = verified ?? (reply is { Envelope.Ok: not false, Hash: not null, Document: { } sent } ? ControllerDocument.FromText(sent) : null);
+            if (theirs is null) return (null, unverified);
+            var theirsHash = reply.Hash!;
+            if (mine is not null && mine.Hash == theirsHash) return (null, $"{machine.Name} holds exactly this device's setup now.");
+            var takeProblem = unverified ?? SetupMerge.WhyTheirsCannotMerge(theirs.Text);
 
-            var preview = SetupConflictPreview.Between(_config.Config, theirs.Decoded);
             var different = mine is null || mine.Identity.Id != theirs.Identity.Id;
+            if (takeProblem is not null && (!different || mine is null)) return (null, takeProblem);
+            var preview = SetupConflictPreview.Between(_config.Config, theirs.Decoded);
             if (different || mine is null)
-                return (new MergeSession(mine, theirs, null, Array.Empty<SetupDifference>(), preview, DifferentSetup: true, MergeProblem: null), null);
+                return (new MergeSession(mine, theirs, theirsHash, null, Array.Empty<SetupDifference>(), preview,
+                    DifferentSetup: true, MergeProblem: null, takeProblem), null);
 
             var baseHash = SetupSync.CommonBase(mine.Hash, theirs.Hash, mine.Identity.Lineage, theirs.Identity.Lineage,
                 hash => _config.Ledger.Read(hash)?.Text);
@@ -367,7 +394,7 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
             var differences = mergeProblem is null
                 ? SetupMerge.Differences(mine.Text, theirs.Text, baseDocument?.Text)
                 : Array.Empty<SetupDifference>();
-            return (new MergeSession(mine, theirs, baseDocument, differences, preview, DifferentSetup: false, mergeProblem), null);
+            return (new MergeSession(mine, theirs, theirsHash, baseDocument, differences, preview, DifferentSetup: false, mergeProblem), null);
         }
         finally { _reconcileGate.Release(); }
     }
@@ -410,6 +437,7 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
     /// throws away something somebody typed.
     public async Task<string?> TakeTheirsAsync(MachineModel machine, MergeSession session, CancellationToken cancellationToken = default)
     {
+        if (!session.CanTakeTheirs) return session.TakeProblem;
         await _reconcileGate.WaitAsync(cancellationToken);
         try
         {
@@ -425,14 +453,19 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
 
     /// Sends this device's document with `--replace`, which is the one command that overwrites a
     /// different setup. Only ever called from a control a person pressed after reading the preview,
-    /// and only while the setup here is still the one they read it against.
+    /// only while the setup here is still the one they read it against, and only while the
+    /// machine's latest reading still names the document the preview was built from: `--replace`
+    /// itself takes whatever the machine holds by then.
     public async Task<string?> ReplaceTheirsAsync(MachineModel machine, MergeSession session, CancellationToken cancellationToken = default)
     {
+        if (!session.CanReplace) return $"{machine.Name} holds a copy of this setup, which is merged, kept or taken, never replaced.";
         await _reconcileGate.WaitAsync(cancellationToken);
         try
         {
             if (_config.Document is not { } mine) return "this device has no setup to send";
             if (_config.IsPendingEdit || mine.Hash != session.Mine?.Hash) return ConfigStore.HeadMovedSentence;
+            if (machine.Status?.Controller?.Hash is { } holds && holds != session.TheirsHash)
+                return $"{machine.Name} holds another document now, not the one shown. Nothing was sent; read it again first.";
             var state = StateOf(machine.Id);
             var (reply, problem) = await InFlight(state, () => machine.PushSetupAsync(mine, replace: true, cancellationToken));
             var reading = SetupSync.AfterPush(reply?.Json ?? Value.Missing, mine.Hash);

@@ -220,7 +220,9 @@ public static class Sheets
         body.Children.Add(Ui.DetailRow("Here", Revision(session.Mine?.Identity)));
         body.Children.Add(Ui.DetailRow(machineName, Revision(session.Theirs.Identity)));
         body.Children.Add(Ui.Note(differentSetup
-            ? "Adopt the machine's setup here or explicitly replace its copy with this device's setup. Review the differences first."
+            ? session.CanTakeTheirs
+                ? "Adopt the machine's setup here or explicitly replace its copy with this device's setup. Review the differences first."
+                : $"{session.TakeProblem} Its copy can still be replaced with this device's setup. Review the differences first."
             : session.MergeProblem ?? "Merging keeps both sides: every entry only one side changed is taken from that side. The entries below were changed on both, or nothing says which side changed them, so they need an answer."));
 
         body.Children.Add(Ui.SectionHeading("What differs"));
@@ -275,12 +277,12 @@ public static class Sheets
             answer = new DivergenceAnswer("keep-mine", choices);
             dialog.Close();
         }, explanation: "Writes a new revision that descends from both, so the machine accepts it without being forced."));
-        if (differentSetup && session.Mine is not null) buttons.Children.Add(Ui.Action("Replace the machine's copy with mine", () =>
+        if (session.CanReplace) buttons.Children.Add(Ui.Action("Replace the machine's copy with mine", () =>
         {
             answer = new DivergenceAnswer("replace-theirs", choices);
             dialog.Close();
         }));
-        buttons.Children.Add(Ui.Action("Take theirs", () =>
+        if (session.CanTakeTheirs) buttons.Children.Add(Ui.Action("Take theirs", () =>
         {
             answer = new DivergenceAnswer("take-theirs", choices);
             dialog.Close();

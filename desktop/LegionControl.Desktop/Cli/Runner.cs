@@ -319,9 +319,9 @@ public static class Runner
                 output.WriteLine(sessionProblem);
                 return Failed;
             }
-            if (line.Value("hash") is { } shown && shown != session.Theirs.Hash)
+            if (line.Value("hash") is { } shown && shown != session.TheirsHash)
             {
-                output.WriteLine($"{machine.Name} holds {session.Theirs.Hash} now, not {shown}. Nothing was changed; read it again with --command setup.");
+                output.WriteLine($"{machine.Name} holds {session.TheirsHash} now, not {shown}. Nothing was changed; read it again with --command setup.");
                 return Failed;
             }
             var problem = line switch

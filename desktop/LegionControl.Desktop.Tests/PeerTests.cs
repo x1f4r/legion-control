@@ -531,6 +531,93 @@ public class ReconcilerTests
         Assert.Equal(mine.Hash, fake.Held!.Hash);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ADifferentSetupThisDeviceCannotAdoptCanStillBeReplaced(bool unverifiable)
+    {
+        // An agent before 3.1.0 holding a file no client rebuilds byte for byte, or a document this
+        // device refuses. Replacing it never uses its bytes, and refusing the whole screen left no
+        // way to replace it from here at all.
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 2, Array.Empty<string>());
+        ControllerDocument theirs;
+        var (store, model, fake) = Build(home, mine);
+        if (unverifiable)
+        {
+            theirs = Unrebuildable(Documents.Make("setup-b", 9, Array.Empty<string>(), "somebody else's"));
+            fake.SendsRaw = false;
+            fake.AgentVersion = "3.0.1";
+        }
+        else
+        {
+            var refused = JsonNode.Parse(Documents.Make("setup-b", 9, Array.Empty<string>(), "somebody else's").Text)!.AsObject();
+            refused["sites"] = new JsonArray(new JsonObject { ["id"] = "home", ["lanPrefixes"] = new JsonArray("10.0.0") });
+            refused["machines"]![0]!["site"] = "elsewhere";
+            theirs = ControllerDocument.FromText(refused.ToJsonString());
+            Assert.Contains(DocumentAcceptance.Check(theirs.Bytes, Intake.Peer).Errors, error => error.Code == "unknown-site");
+        }
+        fake.Held = theirs;
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        Assert.IsType<SetupSharing.DifferentSetup>(Assert.IsType<ReconcileOutcome.NeedsDecision>(await reconciler.ReconcileAsync(model)).Sharing);
+
+        var (session, problem) = await reconciler.PrepareMergeAsync(model);
+        Assert.Null(problem);
+        Assert.True(session!.DifferentSetup);
+        Assert.Equal(theirs.Hash, session.TheirsHash);
+        Assert.Contains(unverifiable ? "has to be updated" : "does not accept", session.TakeProblem);
+        Assert.False(session.CanTakeTheirs);
+        Assert.False(session.CanMerge);
+        Assert.True(session.CanReplace);
+        Assert.Contains("Machines changed: pi", session.Preview.Lines());
+
+        Assert.Equal(session.TakeProblem, await reconciler.TakeTheirsAsync(model, session));
+        Assert.Equal(mine.Hash, store.Document!.Hash);
+        Assert.Null(await reconciler.ReplaceTheirsAsync(model, session));
+        Assert.True(fake.SawReplace);
+        Assert.Equal(mine.Hash, fake.Held!.Hash);
+    }
+
+    [Fact]
+    public async Task AReplacementGoesOnlyOverTheCopyThePreviewShowed()
+    {
+        // `--replace` takes whatever the machine holds by the time it arrives, so a machine whose
+        // latest reading names another document is not replaced from a screen built before.
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 2, Array.Empty<string>());
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = Documents.Make("setup-b", 9, Array.Empty<string>(), "somebody else's");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        var (session, _) = await reconciler.PrepareMergeAsync(model);
+
+        fake.Held = Documents.Make("setup-b", 10, new[] { fake.Held.Hash }, "edited there meanwhile");
+        await model.RefreshAsync();
+        Assert.Contains("another document", await reconciler.ReplaceTheirsAsync(model, session!));
+        Assert.False(fake.SawReplace);
+        Assert.Empty(fake.Pushes);
+    }
+
+    [Fact]
+    public async Task ACopyOfThisSetupIsNeverReplaced()
+    {
+        // The agent takes `--replace` over a divergent copy of the same setup too. Only a different
+        // setup is ever replaced; a copy of this one is merged, kept or taken.
+        using var home = new TempHome();
+        var shared = Documents.Make("setup-a", 5, Array.Empty<string>());
+        var (store, model, fake) = Build(home, Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from here"));
+        fake.Held = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from there");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        var (session, _) = await reconciler.PrepareMergeAsync(model);
+
+        Assert.False(session!.CanReplace);
+        Assert.NotNull(await reconciler.ReplaceTheirsAsync(model, session));
+        Assert.False(fake.SawReplace);
+        Assert.Empty(fake.Pushes);
+    }
+
     [Fact]
     public async Task NothingIsPublishedWhileAnOperationIsRunningThere()
     {
