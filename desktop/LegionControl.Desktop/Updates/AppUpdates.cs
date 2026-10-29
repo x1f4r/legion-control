@@ -278,7 +278,8 @@ public sealed class AppInstaller
     }
 
     /// The same, from the file [AppUpdates.DownloadAsync] verified, which is deleted once it is
-    /// unpacked or refused: nothing reads it again.
+    /// unpacked or refused: nothing reads it again. A release is a hundred megabytes unpacked, so
+    /// the window calls this off its own thread.
     public (string? Directory, string? Problem) Stage(string archivePath, string assetName)
     {
         try

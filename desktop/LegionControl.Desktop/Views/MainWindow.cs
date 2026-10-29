@@ -962,7 +962,8 @@ public sealed class MainWindow : Window
         var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, _updateLifetime.Token);
         if (!StillCurrent()) return;
         if (downloadProblem is not null) { Sheets.Text(this, "App update", downloadProblem); return; }
-        var (staged, stageProblem) = installer.Stage(archive, ready.Artifact.Name);
+        // A hundred megabytes unpacked: off the window's thread, or the window stops drawing.
+        var (staged, stageProblem) = await Task.Run(() => installer.Stage(archive, ready.Artifact.Name));
         if (staged is null) { Sheets.Text(this, "App update", stageProblem ?? "Staging failed."); return; }
         if (!StillCurrent()) return;
         if (!await Sheets.AskAsync(this, "Verified update ready",
