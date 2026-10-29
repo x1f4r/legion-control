@@ -97,11 +97,12 @@ one this device approved there, and a system with no approved command is not dri
 person approves the new one here.
 
 `approved-launch.json` holds what this device approved. It is never published. The first start of
-this build approves everything in the setup it already applies; deleting the file does that again.
-An edit made here, in the editor, with `--command edit --in` or by hand in the file, approves what
-it changed, and is refused when the setup moved on since the text was read: start again from the
-setup as it is now. Importing a setup into a device that has none approves everything in it, after
-showing all of it. Nothing that arrives from another peer approves anything, and neither do merges.
+this build approves everything in the setup it already applies; deleting the file makes the next
+start do that again, and until then nothing counts as approved. An edit made here, in the editor,
+with `--command edit --in` or by hand in the file, approves what it changed, and is refused when the
+setup moved on since the text was read: start again from the setup as it is now. Importing a setup
+into a device that has none approves everything in it, after showing all of it. Nothing that arrives
+from another peer approves anything, and neither do merges.
 
 ```
 legion-control --command setup                                   # what waits, beside what was approved

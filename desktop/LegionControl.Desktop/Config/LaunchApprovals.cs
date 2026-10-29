@@ -15,13 +15,18 @@ namespace LegionControl.Desktop.Config;
 /// A record that cannot be read approves nothing: everything waits and the problem is shown. It is
 /// never seeded again on its own, because that would approve whatever the document holds now. The
 /// next write that approves something moves the old file aside to
-/// `approved-launch.json.corrupt-<unix time>` and starts a new one.
+/// `approved-launch.json.corrupt-<unix time>` and starts a new one. A record that is not there is
+/// seeded at a start and only then (contract section 11): gone while the app runs, or not written
+/// at the start, it approves nothing until the next one. Seeded later, it would approve whatever
+/// a peer's revision had brought in by then.
 public sealed class LaunchApprovals
 {
     private static readonly object Sync = new();
     private static readonly JsonSerializerOptions Writing = new() { WriteIndented = true };
 
     private string? _signature;
+    /// Set once the start has had its one chance to seed.
+    private bool _started;
 
     public LaunchApprovals(string? path = null)
     {
@@ -59,17 +64,30 @@ public sealed class LaunchApprovals
     /// applies is approved, with `seededFrom` its hash, so an upgrade drives exactly what it drove
     /// before and asks nothing. With no document the record says so (`"none"`), and no later
     /// adoption can count as a seed. A record that exists, readable or not, is left alone.
-    public string? SeedIfMissing(ControllerDocument? document) => Change(current =>
-        current is { Missing: true }
-            ? LaunchRecord.Seeded(LaunchProjection.Of(document), document?.Hash ?? "none")
-            : null);
+    ///
+    /// Called once, at the start, before anything is evaluated against the record. Only that call
+    /// seeds, whether or not it could write: from then on a missing record approves nothing until
+    /// the next start.
+    public string? SeedIfMissing(ControllerDocument? document)
+    {
+        lock (Sync)
+        {
+            if (_started) return null;
+            _started = true;
+            return Change(current =>
+                current is { Missing: true }
+                    ? LaunchRecord.Seeded(LaunchProjection.Of(document), document?.Hash ?? "none")
+                    : null);
+        }
+    }
 
     /// An edit made on this device approves each launch value it changed, at its new value, and
     /// nothing else. Called before the setup file is written, so the window never flashes a review
     /// of what the person just typed.
     ///
-    /// An edit that arrives before the first seed (a hand edit found while the setup is loaded on
-    /// the first start) seeds from the document it was made to, then approves the edit on top.
+    /// An edit that arrives before the seed (a hand edit found while the setup is loaded at the
+    /// start) seeds from the document it was made to, then approves the edit on top. One that
+    /// arrives later over a missing record approves only what it changed.
     public string? RecordLocalEdit(byte[]? before, ControllerDocument after)
     {
         LaunchProjection? previous;
@@ -84,7 +102,7 @@ public sealed class LaunchApprovals
         var changes = LaunchValues.Changes(previous, LaunchProjection.Of(after));
         return Change(current =>
         {
-            if (current.Missing)
+            if (current.Missing && !_started)
                 return Apply(LaunchRecord.Seeded(previous ?? LaunchProjection.Empty, before is null ? "none" : Canonical.Hash(before)), changes);
             return changes.Count == 0 ? null : Apply(current.Record ?? LaunchRecord.Empty(), changes);
         }, setAside: true);
@@ -216,7 +234,9 @@ public sealed class LaunchApprovals
         var (record, problem) = Read();
         Record = record;
         IsMissing = record is null && problem is null;
-        Problem = problem;
+        Problem = problem ?? (IsMissing && _started
+            ? $"There is no record of approved commands at {Path}, so nothing counts as approved on this device. The next start records the setup it applies then, as a first start does."
+            : null);
     }
 
     private (LaunchRecord? Record, string? Problem) Read()

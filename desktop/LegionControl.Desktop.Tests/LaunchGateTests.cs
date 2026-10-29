@@ -659,6 +659,93 @@ public class LaunchGateTests
     }
 
     [Fact]
+    public void ARecordThatIsGoneWhileTheAppRunsApprovesNothingUntilTheNextStart()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "touch /tmp/x"));
+        using (var app = Device(home, "laptop", applied: d0))
+        {
+            File.Delete(RecordPath(home, "laptop"));
+            Assert.Null(app.Config.Apply(d1, "adopted from pi"));
+
+            Assert.False(File.Exists(RecordPath(home, "laptop")));
+            Assert.NotNull(app.Approvals.Problem);
+            Assert.Contains(app.LaunchReview, entry => entry.Path == LaunchValues.SystemPath("tower", "linux"));
+            Assert.Equal(LaunchState.NotDriven, Gated(app, "tower", "linux").LaunchState);
+        }
+        // Deleting it was a local reset, which the next start makes (contract section 11).
+        using (Device(home, "laptop")) Assert.Equal(d1.Hash, Record(home, "laptop")["seededFrom"]!.GetValue<string>());
+
+        // An edit made while it is gone approves what it changed, not the document it was made to.
+        using var desk = Device(home, "desk", applied: d0);
+        File.Delete(RecordPath(home, "desk"));
+        Assert.Null(desk.Config.Apply(d1, "adopted from pi"));
+        var edited = JsonNode.Parse(d1.Text)!.AsObject();
+        edited["machines"]!.AsArray().Add(new JsonObject
+        {
+            ["id"] = "nas", ["name"] = "Storage",
+            ["systems"] = new JsonArray(new JsonObject { ["id"] = "linux", ["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/srv/nas/launcher.mjs") }),
+        });
+        Assert.NotNull(desk.ApplyEdit(edited.ToJsonString(), d1.Hash, "edited here").Document);
+        Assert.Equal("nas", Assert.Single(Record(home, "desk")["machines"]!.AsObject()).Key);
+        Assert.Equal(LaunchState.Approved, Gated(desk, "nas", "linux").LaunchState);
+        Assert.Equal(LaunchState.NotDriven, Gated(desk, "tower", "linux").LaunchState);
+    }
+
+    [Fact]
+    public void ASeedThatCouldNotBeWrittenIsNeverMadeLaterFromAPeersRevision()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("sh", "-c", "touch /tmp/x"));
+        // Something stands where the record goes, so the first start cannot write its seed.
+        Directory.CreateDirectory(RecordPath(home, "laptop"));
+        using var app = Device(home, "laptop", applied: d0);
+        Assert.NotNull(app.Approvals.Problem);
+        Assert.Equal(LaunchState.NotDriven, Gated(app, "tower", "linux").LaunchState);
+
+        // The way is clear again by the time a peer's revision arrives: it is not what gets seeded.
+        Directory.Delete(RecordPath(home, "laptop"));
+        Assert.Null(app.Config.Apply(d1, "adopted from pi"));
+        Assert.False(File.Exists(RecordPath(home, "laptop")));
+        Assert.Equal(LaunchState.NotDriven, Gated(app, "tower", "linux").LaunchState);
+        Assert.Contains(app.LaunchReview, entry => entry.Path == LaunchValues.SystemPath("tower", "linux"));
+    }
+
+    [Fact]
+    public void AHandEditFoundAtTheFirstStartSeedsFromWhatItWasMadeTo()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        File.WriteAllBytes(home.ConfigPath, d0.Bytes);
+        using (Started()) { }
+        // As a device upgrading to this build is: no record yet, and a file edited by hand while
+        // the app was closed.
+        var record = Path.Combine(home.Path, "approved-launch.json");
+        File.Delete(record);
+        File.WriteAllText(home.ConfigPath, d0.Text.Replace(LaunchDocuments.TowerLauncher, "/srv/edited/launcher.mjs"));
+
+        using var app = Started();
+        Assert.Equal(d0.Hash, JsonNode.Parse(File.ReadAllText(record))!["seededFrom"]!.GetValue<string>());
+        Assert.Empty(app.LaunchReview);
+        Assert.Equal(new[] { "/usr/bin/node", "/srv/edited/launcher.mjs" }, Gated(app, "tower", "linux").Agent);
+        Assert.Equal(LaunchDocuments.Pi, Gated(app, "pi", "linux").Agent);
+    }
+
+    /// The app as it starts outside a test: the model builds the setup store and the record itself,
+    /// in its own order, in the state directory [TempHome] points at.
+    private static AppModel Started() => new(
+        runner: new FakeRunner(_ => FakeRunner.SshFailure("ssh: connect to host: Connection refused")),
+        tracker: new OperationTracker(Path.Combine(AppPaths.Home, "operations.json")),
+        settings: DesktopSettings.Default,
+        notifications: new RecordingSink(),
+        bindings: Bindings.Empty,
+        updateSuggestions: new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))));
+
+    [Fact]
     public void ADocumentWithNoIdentityApprovesOnlyWhenItIsThisDevicesOwn()
     {
         using var home = new TempHome();

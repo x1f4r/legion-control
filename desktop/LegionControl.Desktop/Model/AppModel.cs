@@ -44,7 +44,8 @@ public sealed class AppModel : IDisposable
             Config.LocalEdit += RecordLocalEdit;
         }
         // The first start of this build approves what it already applies, before anything is
-        // evaluated against the record, so an upgrade drives what it drove before.
+        // evaluated against the record, so an upgrade drives what it drove before. Only here: by
+        // the time anything evaluates the record again, the document may be one a peer wrote.
         Approvals.SeedIfMissing(Config.Document);
         Tracker = tracker ?? new OperationTracker();
         Settings = settings ?? DesktopSettings.Load();
@@ -137,11 +138,12 @@ public sealed class AppModel : IDisposable
     /// The record is read again first when another process wrote it. A value accepted because it
     /// is approved somewhere else, or is the launcher migration of an approved one, is then recorded
     /// where it now sits, and the gate runs once more over the record that wrote.
+    ///
+    /// A record that is gone stays gone until the next start, which seeds it again (contract
+    /// section 11). Seeded here, it would approve whatever was adopted in the meantime.
     private void Gate()
     {
         Approvals.ReloadIfChanged();
-        // Deleting the record is a local reset: it is seeded again from the current document.
-        if (Approvals.IsMissing) Approvals.SeedIfMissing(Config.Document);
         if (Config.Config is not { } config)
         {
             Effective = null;
