@@ -259,7 +259,8 @@ start of this build, which approves what the phone already applies. Adopting fro
 merging, keeping this phone's copy and following another setup approve nothing. The launcher
 migration of an approved command to `<base>/bin/launcher.mjs` is taken without asking. In the
 editor, a system whose command waits is read-only, with Approve and Revert, because changing its
-shell would otherwise approve the argv beside it. The record is the `approved-launch` preference
+shell would otherwise approve the argv beside it; Revert is applied at once, so it waits while an
+edit is in progress. The record is the `approved-launch` preference
 beside the setup text, written in the same edit as the document; clearing the app's data clears
 both, and the next setup confirmed here counts as the first.
 

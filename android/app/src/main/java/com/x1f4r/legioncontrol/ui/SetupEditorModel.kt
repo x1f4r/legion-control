@@ -272,6 +272,29 @@ class SetupEditorModel(
         editSystem(machineId, systemId, transform)
     }
 
+    /**
+     * Why Revert cannot be pressed right now, or null when it can.
+     *
+     * Revert is an edit of what is in force, applied at once, and the editor starts again from every
+     * document put in force. Pressed with an edit in progress here, it would throw that edit away
+     * without a word, so it waits until the edit is applied or discarded.
+     */
+    val revertWaits: String?
+        get() = if (hasChanges) "Apply or discard your changes first: Revert is applied at once." else null
+
+    /**
+     * Revert (contract section 9.9): an ordinary edit made here that puts back the value this device
+     * approved at [entry]'s place. It is published like any other edit, so the peer that changed it
+     * sees it changed back. Returns what happened, for the page.
+     */
+    fun revertLaunch(entry: LaunchReviewEntry): String {
+        revertWaits?.let { return it }
+        val reverted = services.document.value?.let { LaunchValues.reverted(it.root, entry) }
+            ?: return "There is no approved value to put back here."
+        return services.applyEdit(ControllerDocument.of(reverted), services.deviceName())
+            ?: "Put back the approved value. It is sent to every machine on its next check."
+    }
+
     // MARK: - Waking
 
     fun setWakeMac(machineId: String, mac: String) = change {

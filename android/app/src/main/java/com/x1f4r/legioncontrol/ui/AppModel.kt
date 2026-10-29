@@ -831,17 +831,10 @@ class AppModel(
 
     /**
      * Revert: an ordinary edit made here that puts back the value this device approved at that
-     * place. It is published like any other edit, so the peer that changed it sees it changed back.
+     * place, made by the editor, which waits while it holds an edit of its own.
      */
     fun revertLaunch(entry: LaunchReviewEntry) {
-        val document = services.document.value ?: return
-        val reverted = LaunchValues.reverted(document.root, entry)
-        if (reverted == null) {
-            launchNote = "There is no approved value to put back here."
-            return
-        }
-        launchNote = services.applyEdit(ControllerDocument.of(reverted), services.deviceName())
-            ?: "Put back the approved value. It is sent to every machine on its next check."
+        launchNote = editor.revertLaunch(entry)
     }
 
     private fun explain(failure: Throwable, source: SetupSource): String = when (failure) {

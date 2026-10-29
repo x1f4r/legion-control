@@ -389,10 +389,12 @@ private fun PendingCommand(app: AppModel, entry: LaunchReviewEntry) {
                 "it or put back the approved one before changing it.",
             Modifier.padding(top = 2.dp),
         )
+        val revertible = app.canRevertLaunch(entry)
         Actions {
             if (entry.approvable) PlainAction("Approve", enabled = true) { app.approveLaunch(listOf(entry)) }
-            if (app.canRevertLaunch(entry)) PlainAction("Revert", enabled = true) { app.revertLaunch(entry) }
+            if (revertible) PlainAction("Revert", enabled = app.editor.revertWaits == null) { app.revertLaunch(entry) }
         }
+        if (revertible) app.editor.revertWaits?.let { QuietText(it) }
         app.launchNote?.let { QuietText(it) }
     }
 }

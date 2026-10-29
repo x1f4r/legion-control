@@ -97,4 +97,28 @@ class SetupEditorLaunchTest {
         assertEquals(listOf(LaunchDocuments.TOWER_LINUX), store.launch.value.review.map { it.path })
         assertEquals(tuple(LaunchDocuments.WINDOWS, "powershell"), store.offered("tower", "windows"))
     }
+
+    @Test
+    fun `Revert waits for an edit in progress, which it would otherwise throw away`() {
+        val store = enrolled()
+        store.adoptFromMachine(descendant(store.text.value) { it.withSystemValue("tower", "linux", "agent", listOf("sh", "-c", "id")) }, null, "Tower")
+        val editor = editor(store)
+        val entry = editor.pendingCommand("tower", "linux")!!
+
+        // Revert puts a new document in force at once, and the editor starts again from every one.
+        editor.setMachineName("pi", "Beacon 2")
+        val adopted = store.text.value
+        assertNotNull(editor.revertWaits)
+        assertEquals(editor.revertWaits, editor.revertLaunch(entry))
+        assertEquals(adopted, store.text.value)
+        assertTrue(editor.hasChanges)
+        assertEquals(listOf(LaunchDocuments.TOWER_LINUX), store.launch.value.review.map { it.path })
+
+        // With the edit discarded it goes ahead: the approved command is back, and nothing waits.
+        editor.discard()
+        assertNull(editor.revertWaits)
+        editor.revertLaunch(entry)
+        assertEquals(LINUX, store.offered("tower", "linux")?.agent)
+        assertEquals(emptyList<String>(), store.launch.value.review.map { it.path })
+    }
 }
