@@ -79,6 +79,8 @@ data class BusyStatus(
     val evidence: String? = null,
     val checkedAt: String? = null,
     val elapsedMs: Long? = null,
+    /** The `busy` reply of a machine with several services: each service's own answer. */
+    val services: List<BusyStatus>? = null,
 ) {
     val isBusy: Boolean get() = busy == true
 
@@ -142,7 +144,13 @@ data class ServiceProcess(
     val state: String? = null,
     val startedAt: String? = null,
     val error: String? = null,
-)
+) {
+    /**
+     * Whether the probe failed, so [running] says nothing (contract section 6). A probe that could
+     * not read the process list is not a process that stopped, and is never drawn as one.
+     */
+    val isUnknown: Boolean get() = error != null
+}
 
 /** v3: whether the service answers, separated from whether its process exists. */
 @Serializable
@@ -751,6 +759,9 @@ data class AgentActionResult(
     /** v3: what `self-update` verified. */
     val manifest: AgentManifestSummary? = null,
 
+    /** v3: each service's part of a `cycle`, with the id of the operation it ran under. */
+    val children: List<OpChild>? = null,
+
     /** v3.1: how the request stands, which is what a client decides on. See [Outcome]. */
     val outcome: String? = null,
 ) {
@@ -819,7 +830,18 @@ data class ConfigSetReply(
     val current: ControllerMeta? = null,
     /** Every rule the document broke, on a `config-invalid` refusal. */
     val problems: List<ConfigProblem>? = null,
+    /**
+     * On a `restricted` refusal, the launch values this machine does not hold, by path (contract
+     * section 9.4): what a restricted key may not publish.
+     */
+    val launchChanges: List<String>? = null,
+    /** v3.1: how the request stands. See [Outcome]. */
+    val outcome: String? = null,
 ) {
+    /** How the request stands, stated or reduced from the reply's own fields (contract section 5.6). */
+    val effectiveOutcome: Outcome
+        get() = Outcome.reduce(outcome = outcome, ok = ok, action = action, reasonCode = reasonCode)
+
     val stored: Boolean get() = action == "stored" || action == "replaced"
     val unchanged: Boolean get() = action == "noop"
     val accepted: Boolean get() = ok == true && (stored || unchanged)
@@ -893,6 +915,8 @@ data class DoctorReport(
     val contract: Int? = null,
     val agentVersion: String? = null,
     val checks: List<DoctorCheck>? = null,
+    /** How many checks came out at each level: ok, warn and fail. */
+    val counts: Map<String, Int>? = null,
     val message: String? = null,
     val error: String? = null,
 ) {

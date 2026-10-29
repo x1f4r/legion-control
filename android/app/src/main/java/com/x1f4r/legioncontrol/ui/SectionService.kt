@@ -71,6 +71,7 @@ private fun compactServiceState(model: MachineModel, service: ServiceStatus?): S
     model.currentSystem == null || service == null -> "Unavailable"
     compactActivityState(service.busy) != null -> compactActivityState(service.busy)!!
     service.healthy == false -> "Needs attention"
+    service.process?.isUnknown == true -> "Process unknown"
     service.running == false -> "Stopped"
     service.running == true || service.healthy == true -> "Running"
     else -> "Status unknown"
@@ -395,6 +396,13 @@ private fun RunningVerdict(service: ServiceStatus) {
     val process = service.process
     val health = service.health
     when {
+        // A process probe that failed says nothing about the process (contract section 6), so it is
+        // never drawn as stopped. Whether the service answers is still a fact of its own.
+        process?.isUnknown == true -> StatusLine(
+            Mark.Unknown,
+            if (health?.ok == true) "Answering, but its process could not be read" else "Process could not be read",
+        )
+
         process != null && health != null -> when {
             process.running != true -> StatusLine(Mark.Bad, "Stopped")
             health.ok == true -> StatusLine(Mark.Good, port?.let { "Healthy on port $it" } ?: "Healthy")
