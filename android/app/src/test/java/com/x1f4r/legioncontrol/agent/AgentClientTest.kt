@@ -297,6 +297,20 @@ class AgentClientTest {
         assertEquals(1, transport.sent.size)
     }
 
+    /**
+     * C10: a setup id has its own grammar, narrower than a token. One the token grammar allows and
+     * the agent's `--controller-id` does not used to be sent and turned away with `bad-argument`.
+     */
+    @Test
+    fun `a setup id the agent would refuse is never sent`() = runBlocking {
+        val transport = FakeTransport { accepted }
+        val (agent, _) = client(machine(), transport)
+        for (id in listOf("me@tower", "a/b", "a".repeat(65))) {
+            failsWith<AgentFailure.BadRequest> { agent.configSet("{}\n", id, 1L) }
+        }
+        assertTrue(transport.sent.isEmpty())
+    }
+
     @Test
     fun `an address outside the dial grammar is never handed to the transport`() = runBlocking {
         val transport = FakeTransport { accepted }
