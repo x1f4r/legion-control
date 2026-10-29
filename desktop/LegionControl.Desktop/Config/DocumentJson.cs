@@ -104,12 +104,19 @@ public sealed class DocumentLiteral : DocumentValue
     public override DocumentValue Clone() => this;
 }
 
-/// Reading and printing setup documents exactly as every other client reads and prints them.
+/// Reading and writing setup documents so that every client reads the same document and writes the
+/// same bytes for it.
 ///
 /// The reader takes exactly what `JSON.parse` takes, as it takes it, and says where a member name
 /// is written twice, which parsers disagree about. The printer writes the layout
 /// `JSON.stringify(document, null, 2)` gives: two spaces, LF, one final newline, strings escaped
 /// exactly as JavaScript escapes them and nothing else, and every number spelled as it was read.
+///
+/// That layout is the one a device rebuilds a document in when it fetched it from an agent before
+/// 3.1.0, which sends only the parsed object. The desktop wrote its documents with .NET's default
+/// encoder, which escapes `'`, `+` and everything outside ASCII, so no other client could rebuild a
+/// document this one wrote, and the hash never matched. Everything this app writes as a setup
+/// document goes through [Print] or [Write].
 public static class DocumentJson
 {
     /// How deeply a document may nest. The .NET readers the rest of this app edits documents with

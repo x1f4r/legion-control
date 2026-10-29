@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -283,10 +284,10 @@ public sealed class ConfigStore : IDisposable
     {
         try
         {
-            var root = JsonNode.Parse(Encoding.UTF8.GetString(Canonical.Bytes(current))) as JsonObject;
-            if (root is null) return "The setup file is not a JSON object.";
-            root["controller"] = IdentityJson(identity, root["controller"] as JsonObject);
-            var stamped = ControllerDocument.FromText(root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            if (DocumentJson.Parse(Encoding.UTF8.GetString(Canonical.Bytes(current))) is not DocumentObject root)
+                return "The setup file is not a JSON object.";
+            root.Set("controller", IdentityBlock(identity, root["controller"] as DocumentObject));
+            var stamped = ControllerDocument.FromText(DocumentJson.Print(root));
             // The previous bytes go into the ledger before the file changes: a stamp that lost the
             // document it stamped would leave a merge with no base.
             if (Document is not null) Ledger.Remember(Document);
@@ -301,6 +302,22 @@ public sealed class ConfigStore : IDisposable
         }
     }
 
+    /// The `controller` block for [identity], keeping every other key [original] has where it
+    /// stands, unknown ones included.
+    internal static DocumentObject IdentityBlock(ControllerIdentity identity, DocumentObject? original = null)
+    {
+        var block = original?.Clone() as DocumentObject ?? new DocumentObject();
+        block.Set("id", new DocumentString(identity.Id ?? ""));
+        block.Set("revision", new DocumentNumber(identity.RevisionNumber.ToString(CultureInfo.InvariantCulture)));
+        block.Set("updatedAt", new DocumentString(identity.UpdatedAt ?? DateTimeOffset.UtcNow.ToString("o")));
+        block.Set("source", new DocumentString(identity.Source ?? ControllerIdentity.ThisSource));
+        if (identity.Name is not null) block.Set("name", new DocumentString(identity.Name));
+        if (identity.Device is not null) block.Set("device", new DocumentString(identity.Device));
+        block.Set("lineage", new DocumentArray(identity.Lineage.Select(hash => new DocumentString(hash))));
+        return block;
+    }
+
+    /// The same block for an editor that works on a System.Text.Json tree.
     internal static JsonObject IdentityJson(ControllerIdentity identity, JsonObject? original = null)
     {
         var block = original?.DeepClone() as JsonObject ?? new JsonObject();
@@ -407,9 +424,9 @@ public sealed class ConfigStore : IDisposable
             ? identity.Next(parentHash, DeviceName)
             : ControllerIdentity.NewSetup(decoded.Identity.Name, DeviceName);
 
-        var root = JsonNode.Parse(candidate.Text) as JsonObject ?? new JsonObject();
-        root["controller"] = IdentityJson(next, root["controller"] as JsonObject);
-        var stamped = ControllerDocument.FromText(root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        var root = (DocumentObject)DocumentJson.Parse(candidate.Text);
+        root.Set("controller", IdentityBlock(next, root["controller"] as DocumentObject));
+        var stamped = ControllerDocument.FromText(DocumentJson.Print(root));
 
         LocalEdit?.Invoke(Document?.Bytes, stamped);
         var problem = Apply(stamped, description);

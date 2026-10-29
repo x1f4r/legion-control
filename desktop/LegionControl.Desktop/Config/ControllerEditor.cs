@@ -28,8 +28,6 @@ public sealed record EditPlan(
 /// including the user's key order.
 public static class ControllerEditor
 {
-    private static readonly JsonSerializerOptions Writing = new() { WriteIndented = true };
-
     /// Applies a change to the document text and works out what it would mean.
     public static EditPlan Plan(string currentText, ControllerConfig? current, string description, Action<JsonObject> change)
     {
@@ -55,8 +53,9 @@ public static class ControllerEditor
                 SetupConflictPreview.Between(current, new ControllerConfig()));
         }
 
-        // Held to section 9.7 as a document typed here is.
-        var text = root.ToJsonString(Writing);
+        // Written the way every client writes a document, so the text shown is the text saved, and
+        // held to section 9.7 as a document typed here is.
+        var text = DocumentJson.Write(root);
         var decoded = ControllerConfig.From(Value.Parse(text));
         var acceptance = DocumentAcceptance.Check(text, Intake.Local);
         return new EditPlan(description, text, acceptance.Errors.Select(error => error.Message).ToList(),

@@ -116,7 +116,7 @@ public static class SetupMerge
 
         var identity = ControllerIdentity.Merged(mine.Identity, mineHash, theirs.Identity, theirHash, deviceName);
         result["controller"] = ConfigStore.IdentityJson(identity, result["controller"] as JsonObject);
-        return ControllerDocument.FromText(result.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        return ControllerDocument.FromText(DocumentJson.Write(result));
     }
 
     /// The comparable entries of a document, keyed by the path a person would name.

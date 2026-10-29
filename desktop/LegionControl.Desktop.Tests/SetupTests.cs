@@ -241,12 +241,14 @@ public class ConfigStoreTests
     {
         using var home = new TempHome();
         var raw = JsonNode.Parse(Documents.Make("setup-a", 3, Array.Empty<string>()).Text)!.AsObject();
-        raw["controller"]!["future"] = new JsonObject { ["nested"] = true };
+        raw["controller"]!["future"] = new JsonObject { ["nested"] = true, ["weight"] = JsonNode.Parse("22.0") };
         File.WriteAllText(home.ConfigPath, raw.ToJsonString());
         using var store = new ConfigStore(home.ConfigPath, watch: false);
         var (edited, problem) = store.ApplyEdit(store.Document!.Text.Replace("Beacon", "Renamed"));
         Assert.Null(problem);
         Assert.True(JsonNode.Parse(edited!.Text)!["controller"]!["future"]!["nested"]!.GetValue<bool>());
+        // And spelled as it was: an edit never rewrites a number somebody else wrote.
+        Assert.Contains("\"weight\": 22.0", edited.Text);
     }
 
     [Fact]

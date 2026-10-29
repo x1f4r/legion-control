@@ -310,7 +310,6 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
         var root = System.Text.Json.Nodes.JsonNode.Parse(document.Text) as System.Text.Json.Nodes.JsonObject
                    ?? new System.Text.Json.Nodes.JsonObject();
         root["controller"] = ConfigStore.IdentityJson(identity, root["controller"] as System.Text.Json.Nodes.JsonObject);
-        return ControllerDocument.FromText(
-            root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        return ControllerDocument.FromText(DocumentJson.Write(root));
     }
 }

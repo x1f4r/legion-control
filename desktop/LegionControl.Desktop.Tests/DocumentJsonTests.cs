@@ -1,10 +1,12 @@
+using System.Text;
+using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
 using Xunit;
 
 namespace LegionControl.Desktop.Tests;
 
-/// How setup documents are read and printed: exactly the JSON every other client reads, and every
-/// number spelled as it was written.
+/// How setup documents are read and written, so that every client writes the same bytes for the
+/// same document and keeps what it does not understand exactly as it found it.
 public class DocumentJsonTests
 {
     [Fact]
@@ -51,6 +53,27 @@ public class DocumentJsonTests
         // writes it; printing it parsed gives back the same bytes, so its hash.
         var raw = Value(Repo.ReadFixture("config.read.json"), "raw");
         Assert.Equal(raw, DocumentJson.Print(DocumentJson.Parse(raw)));
+    }
+
+    [Fact]
+    public void WhatThisDeviceWritesEveryOtherClientCanRebuild()
+    {
+        // The desktop wrote documents with .NET's default encoder, which escapes ', + and every
+        // character outside ASCII. A client rebuilding the document from an agent before 3.1.0
+        // writes those as themselves, so no other client could ever reproduce a document this one
+        // wrote.
+        using var home = new TempHome();
+        File.WriteAllBytes(home.ConfigPath, Documents.Make("setup-a", 2, Array.Empty<string>()).Bytes);
+        using var store = new ConfigStore(home.ConfigPath, watch: false);
+        var edited = JsonNode.Parse(store.Document!.Text)!.AsObject();
+        edited["machines"]![0]!["name"] = "Büro's +1 tower 🎉";
+        var (document, problem) = store.ApplyEdit(edited.ToJsonString());
+        Assert.Null(problem);
+
+        var written = File.ReadAllText(home.ConfigPath);
+        Assert.Contains("\"Büro's +1 tower 🎉\"", written);
+        Assert.Equal(written, DocumentJson.Print(DocumentJson.Parse(written)));
+        Assert.Equal(document!.Hash, Canonical.Hash(Encoding.UTF8.GetBytes(DocumentJson.Print(DocumentJson.Parse(written)))));
     }
 
     private static string Value(string json, string key) => ((DocumentString)((DocumentObject)DocumentJson.Parse(json))[key]!).Value;
