@@ -597,6 +597,54 @@ struct ConfigTests {
         #expect(try Data(contentsOf: store.url) == unfinished)
     }
 
+    @Test("a save the poll cannot see is loaded by the adoption that finds it")
+    func adoptionLoadsASaveThePollMissed() throws {
+        let (store, home, child) = try Self.storeWithChild()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let head = try #require(store.document?.hash)
+        let raw = try #require(store.rawBytes)
+
+        // The poll compares the modification time and the size. Each save below is pinned to a time
+        // and keeps the size, so the poll cannot tell it from the file before.
+        func save(_ data: Data, at seconds: TimeInterval) throws {
+            try data.write(to: store.url)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: seconds)],
+                                                  ofItemAtPath: store.path)
+        }
+        try save(raw, at: 1_700_000_000)
+        store.reloadIfChanged()
+        let signature = ConfigStore.signature(of: store.url)
+
+        // A hand edit of the same length. Nothing is written over it, and what is applied here is
+        // the edit, not the head it replaced: deciding again from that head would only fetch the
+        // same bytes and find the head moved once more, round after round.
+        let edit = Data(String(decoding: raw, as: UTF8.self).replacingOccurrences(of: "\"Tower\"", with: "\"Tawer\"").utf8)
+        try #require(edit.count == raw.count && edit != raw)
+        try save(edit, at: 1_700_000_000)
+        try #require(ConfigStore.signature(of: store.url) == signature)
+        store.reloadIfChanged()
+        #expect(store.document?.hash == head)
+
+        #expect(store.adopt(child, describedAs: "adopted", replacing: head) == .headMoved(current: try Canonical.hash(edit)))
+        #expect(try Data(contentsOf: store.url) == edit)
+        #expect(store.document?.hash != head)
+        #expect(store.hasPendingExternalEdit)
+        #expect(store.config?.machine(id: "tower")?.name == "Tawer")
+
+        // And back: a half-saved file saved whole again in the same second and to the same size is
+        // the head once more, and the adoption goes ahead rather than finding a file that is gone.
+        let unfinished = Data(String(decoding: raw, as: UTF8.self).replacingOccurrences(of: "\"Tower\"", with: "\"Tower,").utf8)
+        try #require(unfinished.count == raw.count)
+        try save(unfinished, at: 1_700_000_100)
+        store.reloadIfChanged()
+        #expect(store.hasBrokenFile)
+        let brokenSignature = ConfigStore.signature(of: store.url)
+        try save(raw, at: 1_700_000_100)
+        try #require(ConfigStore.signature(of: store.url) == brokenSignature)
+        #expect(store.adopt(child, describedAs: "adopted", replacing: head) == .adopted(hash: try Canonical.hash(child)))
+        #expect(store.rawBytes == child)
+    }
+
     @Test("setting helpers writes the compatibility alias too")
     func helpersWriteTheAlias() throws {
         let (store, home) = try Self.store(Self.twoMachines)

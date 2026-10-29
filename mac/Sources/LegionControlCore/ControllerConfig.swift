@@ -789,6 +789,9 @@ final class ConfigStore {
     @ObservationIgnored private var watcher: DispatchSourceFileSystemObject?
     @ObservationIgnored private var watchedDescriptor: CInt = -1
     @ObservationIgnored private var lastSignature: String?
+    /// The bytes the last load read, nil when it could read none. An adoption holds storage to these
+    /// rather than to the signature, which a save can leave as it was.
+    @ObservationIgnored private var lastRead: Data?
 
     /// Called after a load that actually changed something, so the app can rebuild its machines.
     var onChange: (@MainActor () -> Void)?
@@ -872,6 +875,7 @@ final class ConfigStore {
         lastSignature = Self.signature(of: url)
 
         guard let data = try? Data(contentsOf: url) else {
+            lastRead = nil
             isMissing = true
             // Not an error worth showing: no file is the state a fresh install is in, and the setup
             // page says what to do about it. An earlier config is kept, so a file that is being
@@ -890,6 +894,7 @@ final class ConfigStore {
             return
         }
 
+        lastRead = data
         isMissing = false
         // Section 12 first: bytes it refuses are no document at all, and not even the document this
         // device applies is kept on them. The one read before stays in force.
@@ -1289,21 +1294,26 @@ final class ConfigStore {
                        enrolling: Bool) -> AdoptOutcome {
         reloadIfChanged()
         // The swap is against what storage holds now, not against the last document read cleanly.
+        // The signature the poll compares is the modification time and the size, and a save can
+        // leave both as they were, so the file is read again and loaded again when it is not what
+        // the last load read. Loaded, not only compared: when nothing is written, the next status
+        // decides from what is applied here, and from a document storage no longer holds it would
+        // only fetch the same bytes and find the head moved, round after round, until the file's
+        // signature changed.
+        if (try? Data(contentsOf: url)) != lastRead { load() }
         // A half-saved file is kept out of `config`, but it is the person's all the same, and a hand
         // edit not yet recorded as a revision is an edit made after whatever the adoption was
         // decided against. Neither is written over.
-        switch storedHead() {
-        case .file(hash: nil):
+        if hasBrokenFile {
             guard expectedHead != nil else {
                 return .refused("The file at \(path) is not a setup document, so nothing was written over it: it may be an edit somebody is in the middle of. Fix it in an editor or move it away first.")
             }
             return .headMoved(current: nil)
-        case .file(hash: let stored?):
-            guard !hasPendingExternalEdit, stored == expectedHead, document?.hash == expectedHead else {
-                return .headMoved(current: stored)
-            }
-        case .nothing:
+        }
+        if isMissing {
             guard expectedHead == nil else { return .headMoved(current: nil) }
+        } else {
+            guard !hasPendingExternalEdit, hash == expectedHead else { return .headMoved(current: hash) }
         }
         if let refusal = Canonical.rejection(bytes) {
             return .refused("That setup could not be adopted: \(refusal.sentence)")
@@ -1326,23 +1336,6 @@ final class ConfigStore {
         } catch {
             return .refused("That setup could not be written to \(path). \(error.localizedDescription)")
         }
-    }
-
-    /// What the file at the path holds at this moment.
-    private enum StoredHead: Equatable {
-        case nothing
-        /// The canonical hash of its bytes, nil when they are no setup document.
-        case file(hash: String?)
-    }
-
-    /// Read the file again rather than trusting the last load: the signature the poll compares is
-    /// the modification time and the size, and a save can leave both as they were.
-    private func storedHead() -> StoredHead {
-        guard FileManager.default.fileExists(atPath: path) else { return .nothing }
-        guard !hasBrokenFile, let data = try? Data(contentsOf: url), Canonical.rejection(data) == nil else {
-            return .file(hash: nil)
-        }
-        return .file(hash: try? Canonical.hash(data))
     }
 
     /// The last change made from here, for the provenance line. Not persisted: it is about this run.
