@@ -389,6 +389,8 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
             // A kept revision is held to peer intake like anything else a merge reads. One this
             // build refuses, kept by an older one, is no base: every difference is then asked
             // about, which fails toward a question rather than toward a merge that cannot start.
+            // Section 9.8 has not settled this yet, and the reference merge refuses such a base
+            // instead, so Merge and Keep mine wait there where they are offered here.
             if (baseDocument is not null && SetupMerge.WhyTheirsCannotMerge(baseDocument.Text) is not null) baseDocument = null;
             var mergeProblem = SetupMerge.WhyMineCannotMerge(mine.Text);
             var differences = mergeProblem is null

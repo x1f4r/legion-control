@@ -452,6 +452,43 @@ public class ReconcilerTests
     }
 
     [Fact]
+    public async Task AKeptBaseThisDeviceRefusesIsNoBaseAndTheMergeStillWrites()
+    {
+        // The revision both sides descend from, kept here, is one peer intake refuses: an older
+        // client could publish it through an agent before 3.1.0. Section 9.8 does not say yet
+        // whether such a base stops the merge, as the reference's does, or counts as none. Here it
+        // counts as none, so every difference is asked about and the merge still writes.
+        using var home = new TempHome();
+        var refused = JsonNode.Parse(Documents.Make("setup-a", 5, Array.Empty<string>()).Text)!.AsObject();
+        refused["sites"] = new JsonArray(new JsonObject { ["id"] = "home", ["lanPrefixes"] = new JsonArray("10.0.0") });
+        refused["machines"]![0]!["site"] = "elsewhere";
+        var shared = ControllerDocument.FromText(refused.ToJsonString());
+        Assert.False(DocumentAcceptance.Check(shared.Bytes, Intake.Peer).Valid);
+        var mine = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from here", extra: "mine");
+        var theirs = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from there");
+        var (store, model, fake) = Build(home, mine);
+        store.Ledger.Remember(shared);
+        fake.Held = theirs;
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        await reconciler.ReconcileAsync(model);
+
+        var (session, problem) = await reconciler.PrepareMergeAsync(model);
+        Assert.Null(problem);
+        Assert.Null(session!.Base);
+        Assert.True(session.CanMerge);
+        Assert.Equal(new[] { "extra", "machines[pi].fields" }, session.Differences.Select(difference => difference.Entry));
+        Assert.All(session.Differences, difference => Assert.Equal(SetupChange.NoBase, difference.Kind));
+
+        Assert.Null(await reconciler.MergeAsync(model, session, null));
+        Assert.Contains(mine.Hash, store.Document!.Identity.Lineage);
+        Assert.Contains(theirs.Hash, store.Document.Identity.Lineage);
+        // Both entries were questions, and theirs is the default answer.
+        Assert.DoesNotContain("\"extra\"", store.Document.Text);
+        Assert.Equal("Beacon from there", store.Config!.Machines[0].Name);
+    }
+
+    [Fact]
     public async Task KeepingMineProducesARevisionTheMachineAcceptsRatherThanAReplacement()
     {
         using var home = new TempHome();
