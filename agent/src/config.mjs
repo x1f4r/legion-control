@@ -1713,7 +1713,12 @@ export function runCommand(file, args = [], options = {}) {
   const command = commandLabel(file);
 
   return {
-    ok: result.status === 0,
+    // A reading that ran out of time says nothing, whatever the command exited
+    // with. spawnSync waits for the output pipes as well as the command, so a
+    // command that exited 0 while something it started still held stdout came
+    // back with status 0 and a timeout, and a health check, a version or the
+    // staged self-test read that as a pass.
+    ok: result.status === 0 && !timedOut,
     code: result.status,
     signal: result.signal ?? null,
     stdout,

@@ -273,6 +273,19 @@ function sudoAllows(args) {
 }
 
 /**
+ * Whether a reboot or suspend command took the request: it exited zero.
+ *
+ * These run on the plain runner, whose `ok` is false for a command that exited
+ * zero while something it started still held its output open at the timeout.
+ * For a reading that is no answer at all. For a reboot helper or a suspend
+ * command it is the request taken, and what holds the pipe is the work it
+ * handed on, as with a start command's daemon.
+ */
+function accepted(result) {
+  return result.code === 0;
+}
+
+/**
  * Reboot a few seconds from now, so this process can still print its JSON object
  * and let an ssh session close cleanly before the machine goes down.
  *
@@ -300,9 +313,9 @@ export function scheduleReboot(config) {
   if (helper) {
     const result = runArgv(helper, { timeoutMs: 20000 });
     return {
-      ok: result.ok,
+      ok: accepted(result),
       via: 'rebootHelper',
-      message: result.ok ? 'the configured reboot helper accepted the request' : describeFailure(result),
+      message: accepted(result) ? 'the configured reboot helper accepted the request' : describeFailure(result),
     };
   }
 
@@ -310,16 +323,16 @@ export function scheduleReboot(config) {
   if (override) {
     const result = runArgv(override, { timeoutMs: 20000 });
     return {
-      ok: result.ok,
+      ok: accepted(result),
       via: 'boot.reboot',
-      message: result.ok ? 'the configured reboot command was accepted' : describeFailure(result),
+      message: accepted(result) ? 'the configured reboot command was accepted' : describeFailure(result),
     };
   }
 
   const current = detectPlatform();
   if (current === 'windows') {
     const result = runCommand('shutdown', ['/r', '/t', '3'], { timeoutMs: 20000 });
-    return { ok: result.ok, via: 'shutdown', message: result.ok ? 'reboot scheduled in 3 s' : describeFailure(result) };
+    return { ok: accepted(result), via: 'shutdown', message: accepted(result) ? 'reboot scheduled in 3 s' : describeFailure(result) };
   }
   if (current === 'mac') {
     const allowed = sudoAllows(['/sbin/shutdown', '-r', '+1']);
@@ -327,7 +340,7 @@ export function scheduleReboot(config) {
       return { ok: false, via: null, message: `passwordless sudo will not run shutdown: ${allowed.message}` };
     }
     const result = runCommand('sudo', ['-n', 'shutdown', '-r', '+1'], { timeoutMs: 20000 });
-    return { ok: result.ok, via: 'shutdown', message: result.ok ? 'reboot scheduled in 1 minute' : describeFailure(result) };
+    return { ok: accepted(result), via: 'shutdown', message: accepted(result) ? 'reboot scheduled in 1 minute' : describeFailure(result) };
   }
   if (current === 'linux') {
     const allowed = sudoAllows(['/usr/bin/systemctl', 'reboot']);
@@ -454,7 +467,7 @@ export async function suspendMachine(config) {
   const warnings = [];
   for (const command of sleepConfig.before ?? []) {
     const result = runArgv(command, { timeoutMs: 20000 });
-    if (!result.ok) warnings.push(describeFailure(result));
+    if (!accepted(result)) warnings.push(describeFailure(result));
   }
   if ((sleepConfig.before ?? []).length > 0 && sleepConfig.settle > 0) {
     await sleep(sleepConfig.settle * 1000);
@@ -462,7 +475,7 @@ export async function suspendMachine(config) {
 
   const result = runArgv(chosen.command, { timeoutMs: 30000 });
   const label = path.basename(chosen.command[0]);
-  if (result.ok) {
+  if (accepted(result)) {
     const accepted = suspendAccepted(label);
     if (warnings.length > 0) {
       return {
