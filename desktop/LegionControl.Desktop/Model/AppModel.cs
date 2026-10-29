@@ -274,22 +274,27 @@ public sealed class AppModel : IDisposable
         return Config.Apply(document, "imported from a machine");
     }
 
-    public string? UpdateSettings(DesktopSettings settings)
+    /// Changes this desktop's preferences. [change] is applied to them as the file holds them now,
+    /// so a preference another process changed since this one read them stays as it was set there.
+    public string? UpdateSettings(Func<DesktopSettings, DesktopSettings> change)
     {
+        var (settings, problem) = DesktopSettings.Change(change);
         Settings = settings;
         foreach (var machine in Machines) machine.Settings = settings;
         Changed?.Invoke();
-        return settings.Save();
+        return problem;
     }
 
-    /// Changes this device's private settings and applies them everywhere at once.
-    public string? UpdateBindings(Bindings bindings)
+    /// Changes this device's private settings and applies them everywhere at once. [change] is
+    /// applied to them as the file holds them now, as for [UpdateSettings].
+    public string? UpdateBindings(Func<Bindings, Bindings> change)
     {
+        var (bindings, problem) = Bindings.Change(change);
         Bindings = bindings;
         Reconciler.Bindings = bindings;
         Config.DeviceName = bindings.Device;
         Rebuild();
-        return bindings.Save();
+        return problem;
     }
 
     // MARK: reading

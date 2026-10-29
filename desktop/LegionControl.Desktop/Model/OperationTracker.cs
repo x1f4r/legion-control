@@ -103,6 +103,9 @@ public sealed record TrackedOperation
 /// change and writes the whole, the way [Config.LaunchApprovals] does; a hold the command line
 /// recorded while the window was open is never written away by the window. The holds for a machine
 /// are read again whenever the file changed, so a wake planned here sees one recorded there.
+///
+/// A file that is there but is not a list is moved aside before the next change is written over it,
+/// so the operations it held can still be read by a person, and the log says where it went.
 public sealed class OperationTracker
 {
     private readonly string _path;
@@ -111,6 +114,8 @@ public sealed class OperationTracker
     /// The file's time and size when this tracker last read or wrote it, and the ids it held then.
     private string? _signature;
     private HashSet<string> _onDisk = new(StringComparer.Ordinal);
+    /// Why the file could not be read when this tracker last tried, or null.
+    private string? _unreadable;
 
     public OperationTracker(string? path = null)
     {
@@ -354,6 +359,7 @@ public sealed class OperationTracker
         // Taken before the read: a write that lands in between is then read again next time.
         _signature = Signature();
         if (Read() is not { } stored) return false;
+        _unreadable = null;
         foreach (var (id, theirs) in stored)
         {
             if (!_operations.TryGetValue(id, out var ours) || theirs.UpdatedAt > ours.UpdatedAt) _operations[id] = theirs;
@@ -402,14 +408,19 @@ public sealed class OperationTracker
         }
     }
 
-    /// The list as the file holds it, or null when there is no file or it is not a list.
+    /// The list as the file holds it, or null when there is no file or it is not a list. A file
+    /// that is there and holds no list is noted in [_unreadable], so the next write sets it aside.
     private Dictionary<string, TrackedOperation>? Read()
     {
         try
         {
             if (!File.Exists(_path)) return null;
             var json = Value.Parse(File.ReadAllText(_path));
-            if (!json["operations"].IsArray) return null;
+            if (!json["operations"].IsArray)
+            {
+                _unreadable = json.Exists ? "it holds no operations list" : "it is not JSON";
+                return null;
+            }
             var stored = new Dictionary<string, TrackedOperation>(StringComparer.Ordinal);
             foreach (var entry in json["operations"].AsArray())
             {
@@ -446,9 +457,9 @@ public sealed class OperationTracker
         }
         catch (Exception)
         {
-            // A list that cannot be read is a list this app has to start again. Nothing here is
-            // worth refusing to start over, and the machines are asked about what they are running
-            // on the next status anyway.
+            // A list that cannot be read this time is read again next time. Nothing here is worth
+            // refusing to start over, and the machines are asked about what they are running on
+            // the next status anyway.
             return null;
         }
     }
@@ -471,6 +482,11 @@ public sealed class OperationTracker
     {
         try
         {
+            if (_unreadable is { } why && File.Exists(_path))
+            {
+                StateFile.SetAside(_path, why);
+                _unreadable = null;
+            }
             var payload = new
             {
                 version = 1,

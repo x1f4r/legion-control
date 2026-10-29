@@ -343,8 +343,9 @@ public sealed class MainWindow : Window
                 section.Children.Add(Ui.DetailRow(reading.Name, reading.Value is { } value ? $"{value:g} {reading.Unit}".Trim() : "unavailable"));
                 if (reading.Error is { } error) section.Children.Add(Ui.Actions(Ui.Action("Details", () => Sheets.Text(this, reading.Name, error))));
             }
-            section.Children.Add(Ui.Actions(Ui.Action(_app.Settings.KeepMetricsHistory ? "Stop keeping telemetry history" : "Keep telemetry history",
-                () => _app.UpdateSettings(_app.Settings with { KeepMetricsHistory = !_app.Settings.KeepMetricsHistory }))));
+            var keep = !_app.Settings.KeepMetricsHistory;
+            section.Children.Add(Ui.Actions(Ui.Action(keep ? "Keep telemetry history" : "Stop keeping telemetry history",
+                () => _app.UpdateSettings(settings => settings with { KeepMetricsHistory = keep }))));
             if (_app.Settings.KeepMetricsHistory)
                 section.Children.Add(Ui.Actions(Ui.Action("Telemetry history", () => Sheets.Text(this, "Telemetry history",
                     string.Join("\n", machine.Metrics.Readings.SelectMany(snapshot => snapshot.Reading.Readings.Select(reading =>
@@ -634,14 +635,13 @@ public sealed class MainWindow : Window
             _app.Settings.NotifyOnOperationFinished
                 ? _app.Notifications.IsAvailable ? "on" : "on, but " + _app.Notifications.Describe()
                 : "off"));
+        // What the button says it does, whatever another process wrote to the file since.
+        var announce = !_app.Settings.NotifyOnOperationFinished;
         _content.Children.Add(Ui.Actions(
             Ui.Action("Edit the setup", () => new SetupEditor(_app).Show(this)),
             Ui.Action("This device's own settings", () => new BindingsEditor(_app).Show(this)),
-            Ui.Action(_app.Settings.NotifyOnOperationFinished ? "Stop announcing operations" : "Announce finished operations",
-                () => _app.UpdateSettings(_app.Settings with
-                {
-                    NotifyOnOperationFinished = !_app.Settings.NotifyOnOperationFinished,
-                })),
+            Ui.Action(announce ? "Announce finished operations" : "Stop announcing operations",
+                () => _app.UpdateSettings(settings => settings with { NotifyOnOperationFinished = announce })),
             Ui.Action("Check for an update to this app", CheckForUpdate)));
         if (_app.UpdateSuggestions.LastResult is { } updateResult)
             _content.Children.Add(Ui.Note(updateResult.Sentence_));

@@ -308,20 +308,26 @@ public sealed class BindingsEditor : Window
         var problems = Ui.Column(2);
         var buttons = new WrapPanel { Margin = new Thickness(0, 12, 0, 0) };
         buttons.Children.Add(Ui.Action("Cancel", Close));
+        // The bindings as the fields say, from the argv [localAgent] parses to.
+        Bindings Typed(IReadOnlyList<string> argv) => bindings with
+        {
+            DeviceName = Blank(name.Text),
+            Self = Blank(self.Text) is { } machine ? new SelfBinding(machine, Blank(system.Text)) : null,
+            LocalAgent = argv,
+            IdentityFile = Blank(identity.Text),
+            CurrentSite = Blank(site.Text),
+        };
+        // Save changes only the fields a person changed, on the bindings as the file holds them
+        // then: the command line may have set an alias or a site while this was open, and saving
+        // the rest as they were shown would put back what it replaced.
+        var opened = Typed(bindings.LocalAgent);
         buttons.Children.Add(Ui.Action("Save", () =>
         {
             IReadOnlyList<string> argv;
             try { argv = JsonSerializer.Deserialize<string[]>(localAgent.Text ?? "[]") ?? Array.Empty<string>(); }
             catch (JsonException error) { problems.Children.Clear(); problems.Children.Add(Ui.Note(error.Message, Ui.Bad)); return; }
-            var updated = bindings with
-            {
-                DeviceName = Blank(name.Text),
-                Self = Blank(self.Text) is { } machine ? new SelfBinding(machine, Blank(system.Text)) : null,
-                LocalAgent = argv,
-                IdentityFile = Blank(identity.Text),
-                CurrentSite = Blank(site.Text),
-            };
-            var problem = app.UpdateBindings(updated);
+            var saved = Typed(argv);
+            var problem = app.UpdateBindings(current => current.WithChanges(opened, saved));
             if (problem is null)
             {
                 Close();

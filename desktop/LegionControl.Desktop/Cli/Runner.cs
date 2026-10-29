@@ -949,33 +949,31 @@ public static class Runner
     }
 
     /// This device's own settings. Never published, and never part of the document.
+    ///
+    /// Each flag is one change, applied to the bindings as the file holds them when they are
+    /// written, so a window that saved something else meanwhile keeps it.
     private static int Bindings(AppModel app, CommandLine line, TextWriter output)
     {
-        var bindings = app.Bindings;
-        var changed = false;
+        var changes = new List<Func<Config.Bindings, Config.Bindings>>();
 
         if (line.Value("device") is { } device)
         {
-            bindings = bindings with { DeviceName = device };
-            changed = true;
+            changes.Add(bindings => bindings with { DeviceName = device });
         }
         if (line.Has("clear-self"))
         {
-            bindings = bindings with { Self = null, LocalAgent = Array.Empty<string>() };
-            changed = true;
+            changes.Add(bindings => bindings with { Self = null, LocalAgent = Array.Empty<string>() });
         }
         if (line.Value("self") is { } self)
         {
-            bindings = bindings with { Self = new SelfBinding(self, line.Value("system") ?? bindings.Self?.System) };
-            changed = true;
+            changes.Add(bindings => bindings with { Self = new SelfBinding(self, line.Value("system") ?? bindings.Self?.System) });
         }
         if (line.Value("local-agent") is { } localAgent)
         {
-            bindings = bindings with
+            changes.Add(bindings => bindings with
             {
                 LocalAgent = localAgent.Split(' ', StringSplitOptions.RemoveEmptyEntries),
-            };
-            changed = true;
+            });
         }
         if (line.Value("local-agent-json") is { } localJson)
         {
@@ -984,34 +982,33 @@ public static class Runner
                 var argv = JsonSerializer.Deserialize<string[]>(localJson);
                 if (argv is null || argv.Length == 0 || argv.Any(string.IsNullOrEmpty))
                     throw new JsonException("Use a nonempty JSON array of argv strings.");
-                bindings = bindings with { LocalAgent = argv };
-                changed = true;
+                changes.Add(bindings => bindings with { LocalAgent = argv });
             }
             catch (JsonException error) { output.WriteLine(error.Message); return Failed; }
         }
         if (line.Value("identity") is { } identity)
         {
-            bindings = bindings with { IdentityFile = identity };
-            changed = true;
+            changes.Add(bindings => bindings with { IdentityFile = identity });
         }
         if (line.Value("site") is { } site)
         {
-            bindings = bindings with { CurrentSite = site };
-            changed = true;
+            changes.Add(bindings => bindings with { CurrentSite = site });
         }
         if (line.Value("alias") is { } alias && line.Value("machine") is { } machineId)
         {
-            var machines = bindings.Machines.ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.Ordinal);
-            machines[machineId] = machines.TryGetValue(machineId, out var existing)
-                ? existing with { SshAlias = alias }
-                : new MachineBinding(null, alias);
-            bindings = bindings with { Machines = machines };
-            changed = true;
+            changes.Add(bindings =>
+            {
+                var machines = bindings.Machines.ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.Ordinal);
+                machines[machineId] = machines.TryGetValue(machineId, out var existing)
+                    ? existing with { SshAlias = alias }
+                    : new MachineBinding(null, alias);
+                return bindings with { Machines = machines };
+            });
         }
 
-        if (changed)
+        if (changes.Count > 0)
         {
-            var problem = app.UpdateBindings(bindings);
+            var problem = app.UpdateBindings(bindings => changes.Aggregate(bindings, (current, change) => change(current)));
             if (problem is not null)
             {
                 output.WriteLine(problem);

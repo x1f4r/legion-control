@@ -51,37 +51,59 @@ public sealed record DesktopSettings
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
+    /// Settings that cannot be read are settings at their defaults. There is nothing here worth
+    /// refusing to start over, but a file that is not settings is moved aside before the next
+    /// change is written, never written over (see [Change]).
     public static DesktopSettings Load(string? path = null)
     {
-        path ??= AppPaths.SettingsFile;
         try
         {
-            if (!File.Exists(path)) return Default;
-            return JsonSerializer.Deserialize<DesktopSettings>(File.ReadAllText(path), Options) ?? Default;
+            return Read(path ?? AppPaths.SettingsFile).Settings;
         }
         catch (Exception)
         {
-            // Settings that cannot be read are settings at their defaults. There is nothing here
-            // worth refusing to start over.
             return Default;
         }
     }
 
-    /// Returns null on success, or a sentence to show. Settings that could not be saved are worth
-    /// saying out loud: silently forgetting a preference is worse than not offering it.
-    public string? Save(string? path = null)
+    /// The settings [path] holds, and why they are not settings when the file is there but holds
+    /// none. Throws when it cannot be read at all, which is not the same thing.
+    private static (DesktopSettings Settings, string? Corrupt) Read(string path)
+    {
+        if (!File.Exists(path)) return (Default, null);
+        var text = File.ReadAllText(path);
+        try
+        {
+            return JsonSerializer.Deserialize<DesktopSettings>(text, Options) is { } settings
+                ? (settings, null)
+                : (Default, "it holds no settings");
+        }
+        catch (JsonException error)
+        {
+            return (Default, error.Message);
+        }
+    }
+
+    /// Applies [change] to the settings as the file holds them now, under its lock, and writes the
+    /// result: the window and the command line both keep preferences here, and a change made in one
+    /// never writes the other's back to what it was when this process started. Returns the settings
+    /// now in force, and a sentence when they could not be saved: silently forgetting a preference
+    /// is worse than not offering it.
+    public static (DesktopSettings Settings, string? Problem) Change(Func<DesktopSettings, DesktopSettings> change, string? path = null)
     {
         path ??= AppPaths.SettingsFile;
         try
         {
-            var directory = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-            AtomicWrite.Text(path, JsonSerializer.Serialize(this, Options));
-            return null;
+            using var held = StateFile.Lock(path);
+            var (current, corrupt) = Read(path);
+            var next = change(current);
+            if (corrupt is not null) StateFile.SetAside(path, corrupt);
+            AtomicWrite.Text(path, JsonSerializer.Serialize(next, Options));
+            return (next, null);
         }
         catch (Exception error)
         {
-            return $"Could not save settings to {path}: {error.Message}";
+            return (change(Load(path)), $"Could not save settings to {path}: {error.Message}");
         }
     }
 }

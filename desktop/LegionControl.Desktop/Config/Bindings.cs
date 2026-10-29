@@ -43,87 +43,125 @@ public sealed record Bindings
 
     public static string DefaultPath => Path.Combine(AppPaths.Home, "bindings.json");
 
+    /// Bindings that cannot be read are bindings at their defaults: ssh falls back to the user's
+    /// own configuration, which is what an unconfigured install does anyway. A file that is there
+    /// and is not bindings is moved aside before the next change is written, never written over
+    /// (see [Change]).
     public static Bindings Load(string? path = null)
     {
-        path ??= DefaultPath;
         try
         {
-            if (!File.Exists(path)) return Empty;
-            var json = Value.Parse(File.ReadAllText(path));
-            if (!json.IsObject) return Empty;
-            var machines = new Dictionary<string, MachineBinding>(StringComparer.Ordinal);
-            foreach (var entry in json["machines"].Properties())
-            {
-                machines[entry.Key] = new MachineBinding(
-                    entry.Value["identityFile"].AsText(),
-                    entry.Value["sshAlias"].AsText());
-            }
-            return new Bindings
-            {
-                DeviceName = json["deviceName"].AsText(),
-                Self = SelfBinding.From(json["self"]),
-                LocalAgent = json["localAgent"]["argv"].AsStringList() is { Count: > 0 } argv
-                    ? argv
-                    : json["localAgent"].AsStringList(),
-                IdentityFile = json["identityFile"].AsText(),
-                KnownHostsFile = json["knownHostsFile"].AsText(),
-                Machines = machines,
-                CurrentSite = json["currentSite"].AsText(),
-            };
+            return Read(path ?? DefaultPath).Bindings;
         }
         catch (Exception)
         {
-            // Bindings that cannot be read are bindings at their defaults: ssh falls back to the
-            // user's own configuration, which is what an unconfigured install does anyway.
             return Empty;
         }
     }
 
-    public string? Save(string? path = null)
+    /// The bindings [path] holds, and why they are not bindings when the file is there but holds
+    /// none. Throws when it cannot be read at all, which is not the same thing.
+    private static (Bindings Bindings, string? Corrupt) Read(string path)
+    {
+        if (!File.Exists(path)) return (Empty, null);
+        var json = Value.Parse(File.ReadAllText(path));
+        if (!json.IsObject) return (Empty, "it is not a JSON object");
+        var machines = new Dictionary<string, MachineBinding>(StringComparer.Ordinal);
+        foreach (var entry in json["machines"].Properties())
+        {
+            machines[entry.Key] = new MachineBinding(
+                entry.Value["identityFile"].AsText(),
+                entry.Value["sshAlias"].AsText());
+        }
+        return (new Bindings
+        {
+            DeviceName = json["deviceName"].AsText(),
+            Self = SelfBinding.From(json["self"]),
+            LocalAgent = json["localAgent"]["argv"].AsStringList() is { Count: > 0 } argv
+                ? argv
+                : json["localAgent"].AsStringList(),
+            IdentityFile = json["identityFile"].AsText(),
+            KnownHostsFile = json["knownHostsFile"].AsText(),
+            Machines = machines,
+            CurrentSite = json["currentSite"].AsText(),
+        }, null);
+    }
+
+    /// Applies [change] to the bindings as the file holds them now, under its lock, and writes the
+    /// result. The window and the command line both change these, and a change made in one never
+    /// puts back what the other changed since this process read them: an alias set on the command
+    /// line survives the window saving this device's name. Returns the bindings now in force, and
+    /// a sentence when they could not be saved.
+    public static (Bindings Bindings, string? Problem) Change(Func<Bindings, Bindings> change, string? path = null)
     {
         path ??= DefaultPath;
         try
         {
-            var payload = new JsonObject();
-            if (DeviceName is not null) payload["deviceName"] = DeviceName;
-            if (Self is not null)
-            {
-                payload["self"] = new JsonObject
-                {
-                    ["machine"] = Self.Machine,
-                    ["system"] = Self.System,
-                };
-            }
-            if (LocalAgent.Count > 0)
-            {
-                payload["localAgent"] = new JsonObject
-                {
-                    ["argv"] = new JsonArray(LocalAgent.Select(part => (JsonNode)part!).ToArray()),
-                };
-            }
-            if (IdentityFile is not null) payload["identityFile"] = IdentityFile;
-            if (KnownHostsFile is not null) payload["knownHostsFile"] = KnownHostsFile;
-            if (CurrentSite is not null) payload["currentSite"] = CurrentSite;
-            if (Machines.Count > 0)
-            {
-                var machines = new JsonObject();
-                foreach (var (id, binding) in Machines)
-                {
-                    var entry = new JsonObject();
-                    if (binding.IdentityFile is not null) entry["identityFile"] = binding.IdentityFile;
-                    if (binding.SshAlias is not null) entry["sshAlias"] = binding.SshAlias;
-                    machines[id] = entry;
-                }
-                payload["machines"] = machines;
-            }
-            AtomicWrite.Text(path, payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-            return null;
+            using var held = StateFile.Lock(path);
+            var (current, corrupt) = Read(path);
+            var next = change(current);
+            if (corrupt is not null) StateFile.SetAside(path, corrupt);
+            AtomicWrite.Text(path, next.Serialize());
+            return (next, null);
         }
         catch (Exception error)
         {
-            return $"Could not save the private settings to {path}: {error.Message}";
+            return (change(Load(path)), $"Could not save the private settings to {path}: {error.Message}");
         }
     }
+
+    private string Serialize()
+    {
+        var payload = new JsonObject();
+        if (DeviceName is not null) payload["deviceName"] = DeviceName;
+        if (Self is not null)
+        {
+            payload["self"] = new JsonObject
+            {
+                ["machine"] = Self.Machine,
+                ["system"] = Self.System,
+            };
+        }
+        if (LocalAgent.Count > 0)
+        {
+            payload["localAgent"] = new JsonObject
+            {
+                ["argv"] = new JsonArray(LocalAgent.Select(part => (JsonNode)part!).ToArray()),
+            };
+        }
+        if (IdentityFile is not null) payload["identityFile"] = IdentityFile;
+        if (KnownHostsFile is not null) payload["knownHostsFile"] = KnownHostsFile;
+        if (CurrentSite is not null) payload["currentSite"] = CurrentSite;
+        if (Machines.Count > 0)
+        {
+            var machines = new JsonObject();
+            foreach (var (id, binding) in Machines)
+            {
+                var entry = new JsonObject();
+                if (binding.IdentityFile is not null) entry["identityFile"] = binding.IdentityFile;
+                if (binding.SshAlias is not null) entry["sshAlias"] = binding.SshAlias;
+                machines[id] = entry;
+            }
+            payload["machines"] = machines;
+        }
+        return payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    /// These bindings with every field [after] changed from [before] taken from [after], and every
+    /// other field left as it is here: what an editor that opened on [before] and saved [after]
+    /// changed, applied to the bindings as the file holds them now. A field nobody touched keeps
+    /// whatever another process set it to while the editor was open.
+    public Bindings WithChanges(Bindings before, Bindings after) => this with
+    {
+        DeviceName = after.DeviceName == before.DeviceName ? DeviceName : after.DeviceName,
+        Self = after.Self == before.Self ? Self : after.Self,
+        LocalAgent = after.LocalAgent.SequenceEqual(before.LocalAgent) ? LocalAgent : after.LocalAgent,
+        IdentityFile = after.IdentityFile == before.IdentityFile ? IdentityFile : after.IdentityFile,
+        KnownHostsFile = after.KnownHostsFile == before.KnownHostsFile ? KnownHostsFile : after.KnownHostsFile,
+        Machines = after.Machines.Count == before.Machines.Count && after.Machines.All(entry =>
+            before.Machines.TryGetValue(entry.Key, out var was) && was == entry.Value) ? Machines : after.Machines,
+        CurrentSite = after.CurrentSite == before.CurrentSite ? CurrentSite : after.CurrentSite,
+    };
 
     /// The name to put on a setup revision this device writes.
     public string Device => DeviceName is { Length: > 0 } name ? name : Environment.MachineName;
