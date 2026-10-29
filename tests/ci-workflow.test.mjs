@@ -91,6 +91,8 @@ test('the release dry run builds what release.sh builds, and reads no secret', (
 });
 
 test('the Gradle wrapper is validated before Gradle runs, and Gradle and NuGet are cached', () => {
+  // The jar is checked by CI and the distribution it downloads by the wrapper itself.
+  assert.match(read('android/gradle/wrapper/gradle-wrapper.properties'), /^distributionSha256Sum=[0-9a-f]{64}$/m);
   for (const id of ['android', 'release-android']) {
     const lines = job(id);
     const validated = lines.indexOf('gradle/actions/wrapper-validation@');
