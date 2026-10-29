@@ -12,8 +12,8 @@
       2. Points a scheduled task at the agent's update cycle, every 15 minutes.
          If the task named by -TaskName does not exist it is created, running as
          the account this script runs under. If it does exist, its action and
-         its repetition are rewritten and everything else about it — principal,
-         time limit, conditions — is left exactly as found.
+         its repetition are rewritten and everything else about it (principal,
+         time limit, conditions) is left exactly as found.
       3. Retires a superseded update-nightly.ps1 if one is still lying around,
          by renaming it. Nothing is ever deleted.
 
@@ -39,6 +39,11 @@
     Safe to re-run.
 #>
 
+# Write-Host on purpose: what this prints is for the person running it, over ssh
+# or at a prompt, and none of it is output for a pipeline. The file stays ASCII,
+# because Windows PowerShell reads a script without a byte order mark in the
+# ANSI code page.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [CmdletBinding()]
 param(
     # The scheduled task that runs the update cycle. Created if it is missing.
