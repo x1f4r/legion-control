@@ -39,6 +39,7 @@ import { checkHealth } from './probes/health.mjs';
 import { listOperations } from './operations.mjs';
 import { redactConfig, redactReply, valueRedactor } from './redact.mjs';
 import { describeSystemUpdates, scheduledEligibility } from './policy.mjs';
+import { SCHEDULER_LIMIT_MS } from './scheduler.mjs';
 import { livenessOf, probeService } from './service.mjs';
 import { trustFingerprint } from './trust.mjs';
 import * as commandProvider from './providers/command.mjs';
@@ -516,6 +517,65 @@ export function linuxSchedulerCommand(unit, { base = basePath(), node = process.
   return { ok: stable || legacy, execLine };
 }
 
+const SPAN_UNITS = {
+  us: 0.001, ms: 1, s: 1000, sec: 1000, second: 1000, seconds: 1000, m: 60000, min: 60000, minute: 60000, minutes: 60000,
+  h: 3600000, hr: 3600000, hour: 3600000, hours: 3600000, d: 86400000, day: 86400000, days: 86400000,
+};
+
+/**
+ * How long a scheduler lets a cycle run, in milliseconds, from the text it
+ * keeps that in: a Windows task's ExecutionTimeLimit, an ISO 8601 duration
+ * such as PT15M, which is 72 hours when the task names none; or a systemd
+ * unit's TimeoutStartSec, in seconds or a span such as "30min". No limit at
+ * all (PT0S, infinity, 0) is Infinity, and anything else null: nothing here
+ * can say.
+ */
+export function schedulerTimeLimitMs(text, { kind }) {
+  if (kind === 'task') {
+    const limit = /<ExecutionTimeLimit>\s*([^<]*?)\s*<\/ExecutionTimeLimit>/.exec(String(text ?? ''));
+    if (!limit) return 72 * SPAN_UNITS.h;
+    const iso = /^P(?:([0-9]+)D)?(?:T(?:([0-9]+)H)?(?:([0-9]+)M)?(?:([0-9]+)S)?)?$/.exec(limit[1]);
+    if (!iso || limit[1] === 'P' || limit[1].endsWith('T')) return null;
+    const [days, hours, minutes, seconds] = iso.slice(1).map((value) => Number(value ?? 0));
+    const ms = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+    return ms === 0 ? Infinity : ms;
+  }
+  const value = [...String(text ?? '').matchAll(/^\s*TimeoutStartSec\s*=\s*(.*?)\s*$/gm)].at(-1)?.[1];
+  if (value === undefined) return null;
+  if (value === 'infinity') return Infinity;
+  if (!/^(?:[0-9]+(?:\.[0-9]+)?\s*[a-z]*\s*)+$/.test(value)) return null;
+  let ms = 0;
+  for (const [, amount, unit] of value.matchAll(/([0-9]+(?:\.[0-9]+)?)\s*([a-z]*)/g)) {
+    const scale = unit === '' ? SPAN_UNITS.s : SPAN_UNITS[unit];
+    if (scale === undefined) return null;
+    ms += Number(amount) * scale;
+  }
+  return ms === 0 ? Infinity : ms;
+}
+
+/**
+ * Whether the scheduler lets a cycle run as long as a cycle budgets for
+ * (scheduler.mjs). One that ends it sooner can cut an update off part way, and
+ * the service stays down until the next cycle puts it back; an install from
+ * before agent 3.1.0 that nobody has run the installer for since is the usual
+ * one. A limit nothing can read adds no check.
+ */
+export function schedulerTimeLimitCheck(limitMs, fix) {
+  if (limitMs === null) return null;
+  const budget = `${SCHEDULER_LIMIT_MS / 60000} min`;
+  if (limitMs >= SCHEDULER_LIMIT_MS) {
+    const summary = limitMs === Infinity ? 'the scheduler lets a cycle run as long as it needs' : `the scheduler lets a cycle run for ${Math.floor(limitMs / 60000)} min`;
+    return check('scheduler.timeLimit', 'ok', summary, null, null);
+  }
+  return check(
+    'scheduler.timeLimit',
+    'warn',
+    `the scheduler ends a cycle after ${Math.max(1, Math.floor(limitMs / 60000))} min, sooner than the ${budget} a cycle may take`,
+    'an update it ends part way leaves its service down until the next cycle puts it back',
+    fix,
+  );
+}
+
 /** Check the scheduler's cycle command and when it last ran. */
 function schedulerChecks(config) {
   const checks = [];
@@ -538,6 +598,8 @@ function schedulerChecks(config) {
     const unit = runCommand('systemctl', ['--user', 'cat', 'legion-control-update.service'], { timeoutMs: 10000 });
     const scheduled = linuxSchedulerCommand(unit.stdout);
     const execLine = scheduled.execLine;
+    const unitLimit = unit.ok ? schedulerTimeLimitCheck(schedulerTimeLimitMs(unit.stdout, { kind: 'unit' }), 're-run agent/install/install-linux.sh, which sets TimeoutStartSec=1800') : null;
+    if (unitLimit) checks.push(unitLimit);
     checks.push(
       unit.ok && scheduled.ok
         ? check('scheduler.command', 'ok', 'the timer runs this agent\'s cycle', execLine.trim(), null)
@@ -563,6 +625,8 @@ function schedulerChecks(config) {
             'run agent/install/install-windows.ps1',
           ),
     );
+    const taskLimit = task.ok ? schedulerTimeLimitCheck(schedulerTimeLimitMs(task.stdout, { kind: 'task' }), 're-run agent/install/install-windows.ps1 to give the task a longer time limit') : null;
+    if (taskLimit) checks.push(taskLimit);
     checks.push(
       !task.ok
         ? check('scheduler.command', 'fail', 'not reached', 'the task has to exist first', 'run agent/install/install-windows.ps1')
