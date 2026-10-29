@@ -571,12 +571,7 @@ public static class Runner
         if (tracked.Message is { } message) output.WriteLine($"message {message}");
         if (!json && tracked.Output is { } commandOutput) output.WriteLine(commandOutput);
         if (json) output.WriteLine(JsonSerializer.Serialize(tracked, Indented));
-        return tracked.Outcome switch
-        {
-            OperationOutcome.Succeeded => Ok,
-            OperationOutcome.Failed or OperationOutcome.Deferred => Failed,
-            _ => NotKnown,
-        };
+        return ExitFor(tracked);
     }
 
     private static async Task<int> CancelAsync(AppModel app, CommandLine line, TextWriter output, CancellationToken token)
@@ -1089,6 +1084,18 @@ public static class Runner
 
     private static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };
 
+    /// The exit code `--command op` gives an operation this device tracks. A request a person
+    /// cancelled exits 0, as it always has: the contract calls it deferred, and the cancel is what
+    /// was asked for. Any other deferral, turned down while busy, by a policy or a lock, or expired
+    /// before the machine was idle, is known not to have acted and exits 1.
+    public static int ExitFor(TrackedOperation operation) => operation.Outcome switch
+    {
+        OperationOutcome.Succeeded => Ok,
+        OperationOutcome.Deferred when operation.ReasonCode == ReasonCode.Cancelled => Ok,
+        OperationOutcome.Failed or OperationOutcome.Deferred => Failed,
+        _ => NotKnown,
+    };
+
     private static int ExitFor(CommandOutcome outcome) => outcome switch
     {
         CommandOutcome.Done done => done.Outcome switch
@@ -1198,7 +1205,8 @@ public static class Runner
         legion-control [--smoke | --command <verb> [options]]
 
         With no arguments it opens its window. Everything below runs without one and exits:
-          0 it did what was asked, 1 it did not, 2 the outcome is not known.
+          0 it did what was asked, 1 it did not, 2 the outcome is not known. An operation a person
+          cancelled reads 0; one deferred, refused while busy or expired before it ran reads 1.
 
         Reading, and changing nothing:
           --smoke [--machine ID] [--json]     read the setup and every machine, and say what is wrong

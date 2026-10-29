@@ -1,3 +1,4 @@
+using LegionControl.Desktop.Cli;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Model;
@@ -271,6 +272,45 @@ public class MachineRequestTests
         { "ok": true, "contract": 3, "agentVersion": "3.0.0", "system": { "id": "linux" },
           "services": [ { "id": "t3", "busy": { "busy": false, "unknown": false, "monitored": true } } ] }
         """;
+
+    [Fact]
+    public async Task AnOperationAPersonCancelledExitsZeroAsItAlwaysDidAndAnyOtherDeferralOne()
+    {
+        // Scripts written for 1.3 read 0 from `--command op` for a cancelled request. The contract
+        // calls it deferred now, and its reason code is what keeps it apart from being turned down.
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var tracker = new OperationTracker(path);
+        var cancelReply = Repo.ReadFixture("cancel.cancelled.json");
+        var runner = new FakeRunner(call => FakeRunner.Ok(call.RemoteCommand.Contains("status") ? V3Status : cancelReply));
+        var model = new MachineModel(Machine, runner, tracker, DesktopSettings.Default with { FollowOperations = false });
+        await model.RefreshAsync();
+        const string id = "8c3a5f60-1d29-4b74-a8e3-5f0c7b91d642";
+        var boot = new OperationIntent("boot", Target: "windows", WhenIdle: true);
+        tracker.Begin(id, "pi", "linux", boot);
+        Assert.True((await model.CancelAsync(id)).IsKnownSuccess);
+        var cancelled = tracker.Find(id)!;
+        Assert.Equal(OperationOutcome.Deferred, cancelled.Outcome);
+        Assert.Equal(Runner.Ok, Runner.ExitFor(cancelled));
+
+        // The cancelled request's own record reads the same, and so does what an earlier build kept.
+        var other = new OperationTracker(Path.Combine(home.Path, "other.json"));
+        other.Begin(id, "pi", "linux", boot);
+        var record = OperationRecord.From(Value.Parse(cancelReply)["op"])!;
+        Assert.Equal(Runner.Ok, Runner.ExitFor(other.Apply(id, record)!));
+        var earlier = new OperationTracker(home.Write("earlier.json", """
+            { "version": 1, "operations": [
+              { "id": "op-cancel-001", "machineId": "pi", "intent": { "kind": "boot" }, "state": "finished", "outcome": "Cancelled" } ] }
+            """));
+        Assert.Equal(Runner.Ok, Runner.ExitFor(earlier.Find("op-cancel-001")!));
+
+        // Turned down while busy, or expired, it is known not to have happened.
+        Assert.Equal(Runner.Failed, Runner.ExitFor(cancelled with { ReasonCode = ReasonCode.Busy }));
+        Assert.Equal(Runner.Failed, Runner.ExitFor(cancelled with { ReasonCode = ReasonCode.Expired }));
+        Assert.Equal(Runner.Failed, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Failed }));
+        Assert.Equal(Runner.NotKnown, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Unknown }));
+        Assert.Equal(Runner.NotKnown, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Pending, ReasonCode = null }));
+    }
 
     [Fact]
     public async Task ADeferredReplyIsNotAFailureAndOffersForce()

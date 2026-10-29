@@ -623,12 +623,15 @@ public sealed class MachineModel
             var reply = await NewAgent().MutateAsync(argv, TimeSpan.FromSeconds(40), PreferredSystem(), null,
                 cancellationToken: cancellationToken);
             var result = reply.Value;
-            // The cancel succeeded; the request it cancelled is deferred, finished without acting.
+            // The cancel succeeded; the request it cancelled is deferred, finished without acting,
+            // with the reason code its own record carries, so it reads as cancelled rather than as
+            // turned down.
             if (result.Outcome == OperationOutcome.Succeeded && result.Action == "cancelled")
             {
                 if (_tracker.Find(operationId) is { } tracked)
                 {
-                    _tracker.Update(tracked with { State = OperationState.Finished, Outcome = OperationOutcome.Deferred, Message = "Cancelled." });
+                    _tracker.Update(tracked with { State = OperationState.Finished, Outcome = OperationOutcome.Deferred, Message = "Cancelled.",
+                        ReasonCode = ReasonCode.Cancelled });
                 }
                 Changed?.Invoke();
                 return new CommandOutcome.Done(result, OperationOutcome.Succeeded, "Cancelled.");

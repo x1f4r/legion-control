@@ -41,6 +41,11 @@ Nothing here returns 0 for an outcome nobody observed. A command whose reply was
 operation id, and `--command op --machine ID --op ID` asks the machine what became of it rather than
 sending it again.
 
+A request somebody cancelled is 0, as it always was. One the machine finished without acting,
+deferred while busy, by its schedule or a lock, or expired before the machine was idle, is 1: that
+it did not happen is known. Builds before 1.4.0 gave `--command op` 2 for a deferred operation, and
+a change interrupted part way 1; nobody knows whether an interrupted change took effect, so it is 2.
+
 ## Where things live
 
 | what | Linux | Windows |

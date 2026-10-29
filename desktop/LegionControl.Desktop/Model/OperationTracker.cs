@@ -435,7 +435,8 @@ public sealed class OperationTracker
                     Outcome = ReadOutcome(entry["outcome"].AsText()),
                     Message = entry["message"].AsText(),
                     Output = entry["output"].AsText(),
-                    ReasonCode = entry["reasonCode"].AsText(),
+                    // An earlier build kept a cancelled request as a word of its own and no code.
+                    ReasonCode = entry["reasonCode"].AsText() ?? (entry["outcome"].AsText() == "Cancelled" ? ReasonCode.Cancelled : null),
                     ExpiresAt = entry["expiresAt"].AsInstant(),
                     OutcomeUnknown = entry["outcomeUnknown"].AsBool() ?? false,
                     WakeTarget = entry["wakeTarget"].AsText(),
