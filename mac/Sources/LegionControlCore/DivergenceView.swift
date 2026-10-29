@@ -39,9 +39,7 @@ struct DivergenceView: View {
                     }
                 }
                 DetailRow(label: "Common ancestor") {
-                    Text(divergence.baseBytes == nil
-                         ? "not kept on this device, so every difference needs a decision"
-                         : "found, so only the entries both sides changed need a decision")
+                    Text(divergence.ancestorNote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }

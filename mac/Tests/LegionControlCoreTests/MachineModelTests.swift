@@ -1121,11 +1121,11 @@ struct MachineModelTests {
         }.bytes
     }
 
-    static func setupStatus(holding hash: String) -> String {
+    static func setupStatus(holding hash: String, id: String = setupId) -> String {
         """
         { "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "linux", "name": "Linux" },
           "agent": { "version": "3.1.0", "contract": 3 }, "services": [],
-          "controller": { "hash": "\(hash)", "id": "\(setupId)" } }
+          "controller": { "hash": "\(hash)", "id": "\(id)" } }
         """
     }
 
@@ -1294,6 +1294,59 @@ struct MachineModelTests {
         let blocker = try #require(divergence.mergeBlocker)
         #expect(blocker.contains("common ancestor"))
         #expect(blocker.contains("ghost"))
+        // The row above it says the ancestor was found and no more, not that it narrows anything down.
+        #expect(divergence.ancestorNote == "found")
+    }
+
+    @Test("a different setup is compared, never merged, and the sheet says so when this device's setup has an error")
+    func differentSetupSheetSaysWhatCannotBeCompared() async throws {
+        let home = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-setup-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        // Two sites with one id: applied intake keeps the document with that error, and it is not one
+        // a comparison can be made over.
+        let file = home.appending(path: "config.json")
+        try Data("""
+        { "version": 1,
+          "controller": { "id": "\(Self.setupId)", "name": "Home", "revision": 1, "lineage": [] },
+          "sites": [ { "id": "home", "name": "Home" }, { "id": "home", "name": "Cabin" } ],
+          "machines": [
+            { "id": "pi", "name": "Pi", "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.5", "user": "me" } ],
+              "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] } ] }
+        """.utf8).write(to: file)
+        let store = ConfigStore(url: file)
+        let local = try #require(store.document)
+        #expect(SetupMerge.blocker(mine: local.bytes) != nil)
+
+        let otherId = "setup-5b1e7d02-6c3a-4f19-8e47-2a9d0c6b1f38"
+        let theirs = Data("""
+        { "version": 1,
+          "controller": { "id": "\(otherId)", "name": "Office", "revision": 4, "lineage": [] },
+          "machines": [
+            { "id": "pi", "name": "Office Pi", "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.5", "user": "me" } ],
+              "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] } ] }
+        """.utf8)
+        #expect(DocumentAcceptance.check(theirs, intake: .peer).valid)
+        let runner = SetupRunner()
+        runner.answer("status", Self.setupStatus(holding: try Canonical.hash(theirs), id: otherId))
+        runner.answer("config", try Self.setupRead(theirs))
+        let model = try Self.setupModel("pi", runner: runner, store: store, logs: home)
+        var raised: SetupDivergence?
+        model.onSetupDiverged = { raised = $0 }
+
+        await model.refresh(userInitiated: false)
+        await Self.eventually { !model.core.setup.isSharing }
+        #expect(model.setupDecision.decision == .differentSetup)
+        model.openSetupDivergence()
+        await Self.eventually { raised != nil }
+
+        let divergence = try #require(raised)
+        #expect(divergence.isDifferentSetup)
+        #expect(divergence.differences.isEmpty)
+        let blocker = try #require(divergence.mergeBlocker)
+        #expect(blocker.contains("before the two can be compared"))
+        #expect(!blocker.contains("merged"))
+        #expect(divergence.ancestorNote == "not kept on this device")
     }
 
     @Test("two reads out at once cannot both adopt: the second finds the head the first one wrote")

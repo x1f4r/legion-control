@@ -34,6 +34,18 @@ struct SetupDivergence: Sendable, Identifiable {
     var mergeBlocker: String?
 
     var id: String { machineId }
+
+    /// What the sheet says about the common ancestor. With a blocker nothing is decided entry by
+    /// entry, so it says only whether one was found: the blocker says why the two cannot be
+    /// compared, and that may be this very ancestor, kept here but refused by peer intake.
+    var ancestorNote: String {
+        switch (baseBytes != nil, mergeBlocker != nil) {
+        case (false, false): "not kept on this device, so every difference needs a decision"
+        case (true, false): "found, so only the entries both sides changed need a decision"
+        case (false, true): "not kept on this device"
+        case (true, true): "found"
+        }
+    }
 }
 
 // MARK: - The channel
@@ -108,11 +120,14 @@ extension AgentDevice {
             let base = self.setupBase?(local.hash, local.identity.ancestors, theirs.hash, theirs.identity.ancestors)
             // Two documents that could not be compared are said to be that, never drawn as two that
             // differ in nothing: a kept base that peer intake refuses, for one, stops the merge just
-            // as it stops the comparison.
+            // as it stops the comparison. An error in this device's own document is said for the
+            // sheet it is on: a different setup is only ever compared, never merged or kept.
             var blocker: String?
             var differences: [SetupMerge.Difference] = []
-            if verdict.decision == .diverged, let problem = SetupMerge.blocker(mine: local.bytes) {
-                blocker = "This device's setup has to be fixed in the editor before it can be merged or kept: \(problem)"
+            if let problem = SetupMerge.blocker(mine: local.bytes) {
+                blocker = verdict.decision == .diverged
+                    ? "This device's setup has to be fixed in the editor before it can be merged or kept: \(problem)"
+                    : "This device's setup has to be fixed in the editor before the two can be compared: \(problem)"
             } else {
                 do {
                     differences = try SetupMerge.differences(base: base, mine: local.bytes, theirs: theirs.bytes)
