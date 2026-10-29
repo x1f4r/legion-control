@@ -885,6 +885,20 @@ public static class Runner
         output.WriteLine(availability.Sentence_);
         if (availability is UpdateAvailability.Ready ready && line.Has("yes"))
         {
+            // The helper counts the new build as working only once it has drawn its window. Where
+            // none can be drawn every update is undone, and with a window open the helper waits
+            // for it, and changes nothing, rather than swap it out from under it. Either way it is
+            // refused here, before anything is downloaded.
+            if (AppInstaller.CannotProveHealth() is { } headless)
+            {
+                output.WriteLine(headless);
+                return Failed;
+            }
+            if (InstanceLock.IsWindowOpen())
+            {
+                output.WriteLine("The window is open. Install the update from there, or quit it and run this again.");
+                return Failed;
+            }
             var review = app.BeginAppUpdateReview(ready);
             bool StillCurrent()
             {

@@ -523,6 +523,27 @@ public sealed class AppInstaller
         return null;
     }
 
+    /// Why a build started here could not prove that it works, or null when it could.
+    ///
+    /// The helper counts a new build as working once it has drawn its window. Where no window can
+    /// be drawn, a Linux session with no display or the Windows services session ssh runs in, every
+    /// update would be undone, so an update is not started there at all.
+    public static string? CannotProveHealth() => CannotProveHealth(
+        Environment.GetEnvironmentVariable, OperatingSystem.IsWindows(), Process.GetCurrentProcess().SessionId);
+
+    public static string? CannotProveHealth(Func<string, string?> environment, bool windows, int session)
+    {
+        const string Instead = "Run this from a desktop session, or verify the release and put it in place of the installation directory by hand.";
+        if (windows)
+        {
+            return session == 0
+                ? $"This runs in the Windows services session, where a new build cannot draw the window that proves it works, so every update would be undone. {Instead}"
+                : null;
+        }
+        if (!string.IsNullOrEmpty(environment("DISPLAY")) || !string.IsNullOrEmpty(environment("WAYLAND_DISPLAY"))) return null;
+        return $"There is no display here (neither DISPLAY nor WAYLAND_DISPLAY is set), so a new build cannot draw the window that proves it works, and every update would be undone. {Instead}";
+    }
+
     /// Names in a directory compare the way its file system compares them.
     private static StringComparer NameComparer => AppPaths.IsWindows ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 

@@ -2,6 +2,7 @@ using System.Text.Json.Nodes;
 using LegionControl.Desktop.Cli;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Model;
+using LegionControl.Desktop.Updates;
 using Xunit;
 
 namespace LegionControl.Desktop.Tests;
@@ -125,5 +126,48 @@ public class CommandLineSafetyTests
         Assert.Equal(Runner.NotKnown, await Runner.RunAsync(new[] { "--reconcile-once" }, new StringWriter(), Broken));
 
         Assert.Contains("the disk went away", File.ReadAllText(AppPaths.LogFile));
+    }
+
+    /// An app whose update check offers a verified release, with nothing to download it from.
+    private static AppModel Offering(TempHome home)
+    {
+        var manifest = ReleaseManifest.Parse(File.ReadAllBytes(Path.Combine(Repo.TrustFixtures, "manifest.json")))!;
+        var ready = new UpdateAvailability.Ready(manifest with { Version = "9.0.0" }, manifest.Artifact("fixture.bin")!, "https://example.invalid/app");
+        File.WriteAllBytes(home.ConfigPath, Documents.Make("setup-a", 1, Array.Empty<string>()).Bytes);
+        return new AppModel(new ConfigStore(home.ConfigPath, watch: false), FakeRunner.Replying("{}"),
+            new OperationTracker(Path.Combine(home.Path, "operations.json")), DesktopSettings.Default, new RecordingSink(), Bindings.Empty,
+            new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(ready)));
+    }
+
+    [UnixFact("whether a window can be drawn is read from DISPLAY and WAYLAND_DISPLAY off Windows; Windows goes by its session, checked on its own")]
+    public async Task AnUpdateFromACommandLineWithNoDisplayIsRefusedBeforeAnythingIsDownloaded()
+    {
+        using var home = new TempHome();
+        var display = Environment.GetEnvironmentVariable("DISPLAY");
+        var wayland = Environment.GetEnvironmentVariable("WAYLAND_DISPLAY");
+        Environment.SetEnvironmentVariable("DISPLAY", null);
+        Environment.SetEnvironmentVariable("WAYLAND_DISPLAY", null);
+        try
+        {
+            var output = new StringWriter();
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "app-update", "--yes" }, output, () => Offering(home)));
+            Assert.Contains("no display", output.ToString());
+            Assert.False(Directory.Exists(AppPaths.UpdatesDirectory), "nothing was downloaded or staged");
+
+            // With a display but a window open, the helper would wait for the window: refused too.
+            Environment.SetEnvironmentVariable("DISPLAY", ":99");
+            using (InstanceLock.Window())
+            {
+                output = new StringWriter();
+                Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "app-update", "--yes" }, output, () => Offering(home)));
+                Assert.Contains("The window is open", output.ToString());
+            }
+            Assert.False(Directory.Exists(AppPaths.UpdatesDirectory), "nothing was downloaded or staged");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DISPLAY", display);
+            Environment.SetEnvironmentVariable("WAYLAND_DISPLAY", wayland);
+        }
     }
 }

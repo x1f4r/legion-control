@@ -384,6 +384,17 @@ public class UpdateHelperTests
     }
 
     [Fact]
+    public void ABuildThatCannotProveItselfIsNeverStartedWhereNoWindowCanBeDrawn()
+    {
+        string? None(string _) => null;
+        Assert.Contains("no display", AppInstaller.CannotProveHealth(None, windows: false, session: 1));
+        Assert.Null(AppInstaller.CannotProveHealth(name => name == "DISPLAY" ? ":0" : null, windows: false, session: 1));
+        Assert.Null(AppInstaller.CannotProveHealth(name => name == "WAYLAND_DISPLAY" ? "wayland-0" : null, windows: false, session: 1));
+        Assert.Contains("services session", AppInstaller.CannotProveHealth(None, windows: true, session: 0));
+        Assert.Null(AppInstaller.CannotProveHealth(None, windows: true, session: 2));
+    }
+
+    [Fact]
     public void EveryCopySharesTheLockTheHelperTakesAlone()
     {
         using var home = new TempHome();
