@@ -540,13 +540,20 @@ extension AgentDevice {
                 intent: .init(detach: dialect.supportsDetach, operationId: operation),
                 interpret: { result, conclusion in
                     let children = conclusion.operation?.children ?? result.children ?? []
-                    let updated = children.filter { $0.action == "updated" }.count
-                    let held = children.filter { $0.action == "deferred" || $0.action == "queued" }.count
-                    let failed = children.filter { $0.action == "failed" || $0.action == "rolled-back" }.count
+                    // Each service's part is read by its outcome, as the cycle's own is. Counted by
+                    // action word, an update that timed out half-way counted as a plain failure, and
+                    // an interrupted one was not counted at all, so a cycle that may have left a
+                    // service half-updated was filed as a success.
+                    let outcomes = children.map { Outcome.of($0) }
+                    let updated = zip(children, outcomes).filter { $1 == .succeeded && $0.action == "updated" }.count
+                    let held = outcomes.filter { $0 == .deferred || $0 == .pending }.count
+                    let failed = outcomes.filter { $0 == .failed }.count
+                    let unknown = outcomes.filter { $0 == .unknown }.count
                     var parts: [String] = []
                     if updated > 0 { parts.append("\(updated) updated") }
                     if held > 0 { parts.append("\(held) held back") }
                     if failed > 0 { parts.append("\(failed) failed") }
+                    if unknown > 0 { parts.append("\(unknown) may or may not have updated") }
                     if parts.isEmpty { parts.append("nothing to do") }
                     let sentence = "Maintenance cycle on \(self.name): \(parts.joined(separator: ", "))."
                     // The counts say how it went; the lines say which service it went that way for,
@@ -554,9 +561,13 @@ extension AgentDevice {
                     let detail = children.map { child in
                         "\(child.service ?? "service"): \(child.action ?? "no result")\(child.reasonCode.map { " (\($0))" } ?? "")"
                     }.joined(separator: "\n")
-                    self.setStatus(sentence, isError: failed > 0, detail: detail.isEmpty ? result.message : detail)
-                    return .init(state: failed == 0 ? .succeeded : .failed, summary: sentence,
-                                 detail: detail.isEmpty ? result.message : detail, refresh: true)
+                    // A service nobody can say the end of makes the whole cycle owed, never failed:
+                    // its record is read again by its id, and nothing is sent twice.
+                    let state: OperationState = unknown > 0 ? .unknown : failed > 0 ? .failed : .succeeded
+                    self.setStatus(sentence, isError: state.isProblem, detail: detail.isEmpty ? result.message : detail)
+                    return .init(state: state, summary: sentence,
+                                 detail: detail.isEmpty ? result.message : detail, refresh: true,
+                                 unresolved: state == .unknown)
                 }
             )
         }
@@ -681,7 +692,25 @@ extension AgentDevice {
             do {
                 let request = try AgentRequest.policySet(service: serviceId, patch: patch)
                 let result = try await self.send(request, decoding: AgentPolicyResult.self)
-                guard result.ok != false else {
+                // Decided on the outcome, as every other change is. Read off `ok`, a policy held
+                // back by the lock read as refused, and one the agent failed on half-way through
+                // writing read as not changed, when nobody can say whether it was.
+                let reason = AgentReason(code: result.reasonCode)
+                switch Outcome.of(result) {
+                case .succeeded:
+                    break
+                case .deferred:
+                    let said = reason?.sentence(subject: subject, message: result.message) ?? result.message ?? "\(self.name) is busy."
+                    let sentence = "The policy change was held back: \(said)"
+                    self.setStatus(sentence, detail: result.message)
+                    return .init(state: .deferred, summary: sentence, detail: result.message, refresh: true)
+                case .unknown, .pending:
+                    // A `policy set` is answered in one round trip, so nothing follows a pending one.
+                    let said = result.message ?? reason?.sentence(subject: subject, message: nil)
+                    let sentence = "The policy change may or may not have taken effect: \(said ?? "\(self.name) could not say.")"
+                    self.setStatus(sentence, isError: true, detail: result.message)
+                    return .init(state: .unknown, summary: sentence, detail: result.message, refresh: true, unresolved: true)
+                case .failed:
                     let sentence = result.message ?? "\(subject): the policy was not changed."
                     self.setStatus(sentence, isError: true)
                     return .init(state: .failed, summary: sentence)

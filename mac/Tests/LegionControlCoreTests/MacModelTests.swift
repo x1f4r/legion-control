@@ -312,6 +312,101 @@ struct MacModelTests {
         #expect(model.noteDetail == record.detail)
     }
 
+    @Test("a cycle reads each service's part by its outcome, and one nobody can say the end of leaves it owed")
+    func cycleChildrenByOutcome() async throws {
+        // Counted by action word, an update that timed out half-way was a plain failure and an
+        // interrupted one was not counted at all, so this cycle was filed as failed, and one with
+        // only the interrupted service in it as a success (C5).
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("cycle", json: """
+        { "ok": true, "contract": 3, "action": "cycled",
+          "children": [ { "service": "t3", "action": "updated" },
+                        { "service": "edge", "action": "interrupted" },
+                        { "service": "demo", "action": "failed", "reasonCode": "timed-out" },
+                        { "service": "cache", "action": "failed", "reasonCode": "apply-failed" },
+                        { "service": "web", "action": "queued" } ] }
+        """)
+        runner.answer("status", json: Self.status)
+        runner.answer("cycle", json: """
+        { "ok": true, "contract": 3, "action": "cycled", "children": [ { "service": "edge", "action": "interrupted" } ] }
+        """)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        model.runCycle()
+        await Self.settle(model)
+        let record = try #require(store.newestFirst.first { $0.kind == .updateAll })
+        #expect(record.state == .unknown)
+        #expect(record.needsReconciliation)
+        #expect(record.summary == "Maintenance cycle on This Mac: 1 updated, 1 held back, 1 failed, 2 may or may not have updated.")
+        #expect(model.noteIsError)
+
+        model.runCycle()
+        await Self.settle(model)
+        let second = try #require(store.newestFirst.first { $0.kind == .updateAll })
+        #expect(second.id != record.id)
+        #expect(second.state == .unknown)
+        #expect(second.summary == "Maintenance cycle on This Mac: 1 may or may not have updated.")
+    }
+
+    @Test("a policy change is decided on its outcome: held back by the lock, unknown, or refused")
+    func policyByOutcome() async throws {
+        // Read off `ok`, all three of these were one "not changed", and the one the agent failed
+        // on half-way through writing may well have changed it.
+        let runner = FakeRunner()
+        for _ in 0..<4 { runner.answer("status", json: Self.status) }
+        runner.answer("policy", json: #"{"ok":false,"contract":3,"reasonCode":"lock-held","message":"an update holds the lock"}"#, exit: 1)
+        runner.answer("policy", json: #"{"ok":false,"contract":3,"reasonCode":"internal","message":"the agent failed while writing the policy"}"#, exit: 1)
+        runner.answer("policy", json: #"{"ok":false,"contract":3,"reasonCode":"bad-argument","outcome":"failed","message":"that is not a window"}"#, exit: 1)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await model.refresh()
+
+        var states: [OperationState] = []
+        for _ in 0..<3 {
+            model.pause(for: 4 * 60 * 60, service: nil)
+            await Self.settle(model)
+            states.append(try #require(store.newestFirst.first { $0.kind == .policy }).state)
+        }
+        #expect(states == [.deferred, .unknown, .failed])
+        #expect(model.note == "that is not a window")
+        #expect(store.newestFirst.filter { $0.kind == .policy }.map(\.summary).contains {
+            $0.hasPrefix("The policy change may or may not have taken effect: the agent failed")
+        })
+    }
+
+    @Test("replacing the setup is decided on its outcome: a push the lock held back is not a refusal")
+    func setupReplacementByOutcome() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: String(decoding: try ContractCorpus.data("fixtures/config.set.locked.json"), as: UTF8.self), exit: 1)
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: #"{"ok":false,"contract":3,"reasonCode":"internal","outcome":"unknown","message":"ENOSPC"}"#, exit: 1)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = Self.document
+        model.controllerConfig = { document }
+        await model.refresh()
+
+        model.replaceSetup()
+        await Self.settle(model)
+        let held = try #require(store.newestFirst.first { $0.kind == .shareSetup })
+        #expect(held.state == .deferred)
+        #expect(held.summary.contains("was not replaced yet"))
+        #expect(!model.noteIsError)
+
+        model.replaceSetup()
+        await Self.settle(model)
+        let unknown = try #require(store.newestFirst.first { $0.kind == .shareSetup })
+        #expect(unknown.id != held.id)
+        #expect(unknown.state == .unknown)
+        #expect(model.note == "The setup may or may not have been replaced: ENOSPC")
+    }
+
     @Test("a local action that never reached the agent is followed by a fresh read straight away")
     func localNeverDispatchedRereads() async throws {
         // A failure that proves nothing ran asks for no read over ssh. Here the read costs one local

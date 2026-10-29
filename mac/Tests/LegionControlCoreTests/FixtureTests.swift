@@ -164,7 +164,7 @@ struct FixtureTests {
         "config-set.schema.json": { data, _ in
             let set = try AgentReplyDecoder.decode(AgentConfigResult.self, from: data)
             return Reading(ok: set.ok, action: set.action, reasonCode: set.reasonCode,
-                           outcome: reduced(outcome: set.outcome, ok: set.ok, action: set.action, reasonCode: set.reasonCode),
+                           outcome: Outcome.of(set),
                            projection: ["hash": VectorJSON(set.hash), "current": VectorJSON(set.current?.hash),
                                         "launchChanges": strings(set.launchChanges ?? []),
                                         "problems": strings((set.problems ?? []).map(\.path))])
@@ -173,8 +173,7 @@ struct FixtureTests {
             // The plain switch is read as the mutation it is; a policy read or patch as a policy.
             if entry.command == "auto-update" { return try mutation(data, entry) }
             let policy = try AgentReplyDecoder.decode(AgentPolicyResult.self, from: data)
-            return Reading(ok: policy.ok, reasonCode: policy.reasonCode,
-                           outcome: reduced(outcome: policy.outcome, ok: policy.ok, reasonCode: policy.reasonCode))
+            return Reading(ok: policy.ok, reasonCode: policy.reasonCode, outcome: Outcome.of(policy))
         },
         "service-config.schema.json": { data, entry in
             let reply = try AgentReplyDecoder.decode(ServiceConfigReply.self, from: data)

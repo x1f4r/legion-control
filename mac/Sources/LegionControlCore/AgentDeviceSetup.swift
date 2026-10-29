@@ -196,8 +196,25 @@ extension AgentDevice {
         perform("Replacing the setup on \(name)", kind: .shareSetup, subject: "setup") { _ in
             do {
                 let result = try await self.configSet(local, replace: true)
-                if result.ok == false {
-                    let sentence = result.error ?? result.message ?? "the agent refused the document."
+                // Decided on the outcome, not on `ok`: a push the lock held back is a later
+                // attempt, not a refusal, and one the agent failed on while it wrote may have
+                // replaced the copy or not.
+                let said = result.error ?? result.message
+                switch Outcome.of(result) {
+                case .succeeded:
+                    break
+                case .deferred:
+                    let sentence = said ?? result.reason?.sentence(subject: "the setup", message: nil) ?? "\(self.name) is busy."
+                    self.setStatus("The setup was not replaced yet: \(sentence)")
+                    return .init(state: .deferred, summary: "The setup on \(self.setupHolder) was not replaced yet. \(sentence)",
+                                 refresh: true)
+                case .unknown, .pending:
+                    let sentence = said ?? "\(self.name) could not say."
+                    self.setStatus("The setup may or may not have been replaced: \(sentence)", isError: true)
+                    return .init(state: .unknown, summary: "The setup on \(self.setupHolder) may or may not have been replaced. \(sentence)",
+                                 refresh: true, unresolved: true)
+                case .failed:
+                    let sentence = said ?? "the agent refused the document."
                     self.setStatus("The setup was not replaced: \(sentence)", isError: true)
                     return .init(state: .failed, summary: "The setup on \(self.setupHolder) was not replaced. \(sentence)")
                 }

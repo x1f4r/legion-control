@@ -87,6 +87,16 @@ enum Outcome: String, Sendable, Equatable, CaseIterable {
         reduce(Evidence(outcome: reply.outcome, state: nil, ok: reply.ok, action: reply.action, reasonCode: reply.reasonCode))
     }
 
+    /// The outcome of a `policy set`, which names no action: `ok` and the reason code decide.
+    static func of(_ reply: AgentPolicyResult) -> Outcome {
+        reduce(Evidence(outcome: reply.outcome, state: nil, ok: reply.ok, action: nil, reasonCode: reply.reasonCode))
+    }
+
+    /// The outcome of a `config set`.
+    static func of(_ reply: AgentConfigResult) -> Outcome {
+        reduce(Evidence(outcome: reply.outcome, state: nil, ok: reply.ok, action: reply.action, reasonCode: reply.reasonCode))
+    }
+
     /// The outcome of an operation, as a record or as the summary `status` and `history` carry.
     ///
     /// A record is read from its result in the light of its state, with the outcome the record
