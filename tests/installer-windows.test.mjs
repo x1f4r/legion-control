@@ -4,10 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { checkoutFiles } from '../scripts/checkout-files.mjs';
 
 const repository = path.resolve(import.meta.dirname, '..');
-const installer = fs.readFileSync(path.join(repository, 'agent', 'install', 'install-windows.ps1'), 'utf8');
+// Without carriage returns, so a checkout with Windows line endings reads the same.
+const installer = fs.readFileSync(path.join(repository, 'agent', 'install', 'install-windows.ps1'), 'utf8').replaceAll('\r\n', '\n');
+const linuxInstaller = fs.readFileSync(path.join(repository, 'agent', 'install', 'install-linux.sh'), 'utf8').replaceAll('\r\n', '\n');
 const service = fs.readFileSync(path.join(repository, 'agent', 'install', 'legion-control-update.service'), 'utf8');
 
 test('Windows installer stages before moving live and uses the stable cycle launcher', () => {
@@ -70,6 +73,68 @@ test('the Windows installer says which shell sshd runs commands with', () => {
 // The superseded updater one machine once ran is nothing a public installer should know about.
 test('the Windows installer names no updater from before the agent', () => {
   assert.doesNotMatch(installer, /update-nightly|T3Code|AppData\\Local/i);
+});
+
+// --- The code both installers remove the agent's files with ------------------------
+
+const removalCode = (text, start, end) => {
+  const from = text.indexOf(start);
+  assert.ok(from >= 0, start);
+  return text.slice(from + start.length, text.indexOf(end, from + start.length));
+};
+const windowsRemoval = () => removalCode(installer, "$RemoveAgentFiles = @'\n", "\n'@\n");
+const linuxRemoval = () => removalCode(linuxInstaller, `"$NODE_BIN" --input-type=module - "$BASE" "$1" <<'NODE'\n`, '\nNODE\n');
+
+test('both installers remove the agent\'s files with the same code', () => {
+  assert.equal(windowsRemoval(), linuxRemoval());
+});
+
+// That code, run here the way the installers run it: on Windows CI as well, where it is the only
+// way to see what -Uninstall removes without a scheduled task.
+test('uninstalling takes the agent\'s code, purging its records too, and nothing that is not the agent\'s', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion removal '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const base = path.join(root, "home with ' apostrophe", '.legion-control');
+  const run = (scope) => spawnSync(process.execPath, ['--input-type=module', '-', base, scope], { input: windowsRemoval(), encoding: 'utf8' });
+  const code = ['bin', 'agent', 'agent.prev', 'agent.new', 'agent.install.new.1234', 'agent-swap.json', 'agent-baseline.json'];
+  const records = ['config.json', 'config.last-good.json', 'controller.json', 'controller.meta.json', 'agent-floor.json', 'legionctl.log', 'legionctl.log.1', 'state', 'ops', 'incoming'];
+  const theirs = ['private', 'release-signing.key', 'notes.txt'];
+  fs.mkdirSync(base, { recursive: true });
+  for (const name of [...code, ...records, ...theirs]) {
+    if (/\.(?:json|log|1|key|txt)$/.test(name)) fs.writeFileSync(path.join(base, name), `${name}\n`);
+    else fs.mkdirSync(path.join(base, name, 'inside'), { recursive: true });
+  }
+
+  // An operation that holds the lock keeps everything where it is.
+  const db = new DatabaseSync(path.join(base, 'op.lock.sqlite'));
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const locked = run('purge');
+    assert.equal(locked.status, 1);
+    assert.equal(locked.stderr.trim(), 'another operation is running; nothing was removed');
+    assert.equal(locked.stdout, '');
+  } finally { db.exec('ROLLBACK'); db.close(); }
+  for (const name of [...code, ...records, ...theirs]) assert.equal(fs.existsSync(path.join(base, name)), true, name);
+
+  const uninstalled = run('code');
+  assert.equal(uninstalled.status, 0, uninstalled.stderr);
+  assert.deepEqual(uninstalled.stdout.trim().split('\n'), [...code].sort().map((name) => `removed ${path.join(base, name)}`));
+  assert.deepEqual(fs.readdirSync(base).sort(), [...records, ...theirs, 'op.lock.sqlite'].sort());
+
+  const purged = run('purge');
+  assert.equal(purged.status, 0, purged.stderr);
+  assert.deepEqual(fs.readdirSync(base).sort(), [...theirs].sort());
+  assert.ok(purged.stdout.split('\n').includes(`kept ${path.join(base, 'private')}, which is not the agent's`), purged.stdout);
+
+  for (const name of theirs) fs.rmSync(path.join(base, name), { recursive: true });
+  const emptied = run('purge');
+  assert.equal(emptied.status, 0, emptied.stderr);
+  assert.equal(emptied.stdout, `removed ${base}\n`);
+  assert.equal(fs.existsSync(base), false);
+  // And there is nothing to do once it is gone.
+  const again = run('purge');
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(again.stdout, '');
 });
 
 // Windows PowerShell reads a script without a byte order mark in the ANSI code page, so anything
@@ -206,6 +271,37 @@ test('the Windows installer keeps the live agent when the staged one fails its s
   assert.equal(versionOf(path.join(base, 'agent')), version);
 });
 
+test('the Windows uninstaller removes the launchers and the agent, and keeps its config and records until -Purge', { skip: process.platform !== 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows uninstall '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "home with ' apostrophe");
+  const base = path.join(home, '.legion-control');
+  const source = agentSource(root);
+  // A task name nothing has, so uninstalling finds no task and touches the scheduler not at all.
+  const name = taskName();
+  const installed = runInstaller(source, base, home, ['-TaskName', name]);
+  assert.equal(installed.status, 0, `${installed.stdout}\n${installed.stderr}`);
+  fs.writeFileSync(path.join(base, 'config.json'), '{"sentinel":"leave exactly alone"}\n');
+  fs.mkdirSync(path.join(base, 'ops'), { recursive: true });
+  fs.writeFileSync(path.join(base, 'ops', 'op-1.json'), '{}\n');
+  fs.mkdirSync(path.join(base, 'private'));
+  fs.writeFileSync(path.join(base, 'private', 'terms.txt'), 'terms\n');
+
+  const removed = runScript(source, base, home, ['-Uninstall', '-TaskName', name]);
+  assert.equal(removed.status, 0, `${removed.stdout}\n${removed.stderr}`);
+  assert.match(removed.stdout, /no scheduled task '.*' to remove/);
+  for (const gone of ['bin', 'agent']) assert.equal(fs.existsSync(path.join(base, gone)), false, gone);
+  assert.equal(fs.readFileSync(path.join(base, 'config.json'), 'utf8'), '{"sentinel":"leave exactly alone"}\n');
+  assert.equal(fs.existsSync(path.join(base, 'ops', 'op-1.json')), true);
+  assert.match(removed.stdout, /-Uninstall -Purge/);
+
+  const purged = runScript(source, base, home, ['-Uninstall', '-Purge', '-TaskName', name]);
+  assert.equal(purged.status, 0, `${purged.stdout}\n${purged.stderr}`);
+  assert.deepEqual(fs.readdirSync(base), ['private']);
+  assert.match(purged.stdout, /kept .*private, which is not the agent's/);
+  assert.equal(taskExists(name), false);
+});
+
 // --- The scheduler, on CI's Windows only ---------------------------------------------
 
 // These register real tasks, one of them as SYSTEM, and so run only on a throwaway runner, which is
@@ -213,7 +309,7 @@ test('the Windows installer keeps the live agent when the staged one fails its s
 const windowsCi = process.platform === 'win32' && process.env.GITHUB_ACTIONS === 'true';
 const sameFile = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 
-test('the Windows installer registers the task as the installing user with the cycle budget', { skip: !windowsCi }, (t) => {
+test('the Windows installer registers the task as the installing user with the cycle budget, and -Uninstall takes it away', { skip: !windowsCi }, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows task '));
   const name = taskName();
   t.after(() => {
@@ -247,6 +343,14 @@ test('the Windows installer registers the task as the installing user with the c
   task = taskOf(name);
   assert.equal(task.sid, access.user);
   assert.equal(task.limit, 'PT30M');
+
+  const removed = runScript(source, base, home, ['-Uninstall', '-TaskName', name]);
+  assert.equal(removed.status, 0, `${removed.stdout}\n${removed.stderr}`);
+  assert.equal(taskExists(name), false);
+  for (const gone of ['bin', 'agent']) assert.equal(fs.existsSync(path.join(base, gone)), false, gone);
+  const purged = runScript(source, base, home, ['-Uninstall', '-Purge', '-TaskName', name]);
+  assert.equal(purged.status, 0, `${purged.stdout}\n${purged.stderr}`);
+  assert.equal(fs.existsSync(base), false);
 });
 
 test('the Windows installer refuses a task that runs as SYSTEM, and keeps one only on -AllowSystemPrincipal\'s terms', { skip: !windowsCi }, (t) => {
@@ -295,4 +399,9 @@ test('the Windows installer refuses a task that runs as SYSTEM, and keeps one on
   assert.deepEqual(access.holders, ['S-1-5-18', 'S-1-5-32-544']);
   assert.equal(access.owner, 'S-1-5-32-544');
   assert.equal(accessOf(path.join(machineBase, 'bin', 'launcher.mjs')).owner, 'S-1-5-32-544');
+
+  const removed = runScript(source, machineBase, home, ['-Uninstall', '-Purge', '-TaskName', name]);
+  assert.equal(removed.status, 0, `${removed.stdout}\n${removed.stderr}`);
+  assert.equal(taskExists(name), false);
+  assert.equal(fs.existsSync(machineBase), false);
 });

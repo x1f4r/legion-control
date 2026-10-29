@@ -39,9 +39,11 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends dash zsh fish
-      # On Windows this also runs agent/install/install-windows.ps1 for real, with the scheduler
-      # left alone, and checks what it installed (tests/installer-windows.test.mjs). On Linux and
-      # macOS it renders the systemd units against a systemctl that only takes notes.
+      # On Windows this also runs agent/install/install-windows.ps1 for real and checks what it
+      # installed and removed (tests/installer-windows.test.mjs), including the scheduled tasks it
+      # registers, as the runner's user and as SYSTEM, which only a throwaway runner is given to
+      # do. On Linux and macOS it renders the systemd units against a systemctl that only takes
+      # notes, and uninstalls them again.
       - run: bash scripts/check.sh agent
 
   private-data:

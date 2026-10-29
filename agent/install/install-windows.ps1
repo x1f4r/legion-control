@@ -19,6 +19,10 @@
       3. Says which shell OpenSSH runs commands with, which decides what the
          setup has to say for this system's "shell".
 
+    -Uninstall takes the task, the launchers and the agent trees away again,
+    and leaves what the agent was configured with and what it recorded.
+    -Uninstall -Purge removes those as well.
+
     What it deliberately does NOT touch:
       Any other task on the machine. A task that starts a service the agent
       manages, a watchdog that supervises it, or anything that arms the
@@ -66,7 +70,14 @@ param(
     [switch] $SkipScheduler,
 
     # Keep an existing task that runs as SYSTEM, on the terms described above.
-    [switch] $AllowSystemPrincipal
+    [switch] $AllowSystemPrincipal,
+
+    # Remove the task, the launchers and the agent trees instead of installing.
+    [switch] $Uninstall,
+
+    # With -Uninstall, remove what the agent was configured with and what it
+    # recorded as well.
+    [switch] $Purge
 )
 
 $ErrorActionPreference = 'Stop'
@@ -291,6 +302,12 @@ Note ("running as " + $identity.Name + " (" + $UserSid + "), elevated=" + $IsEle
 if ($Base.Contains("`n") -or $Base.Contains("`r")) {
     throw 'Install paths containing a line break are unsupported.'
 }
+if ($Uninstall -and ($SkipCopy -or $SkipScheduler -or $AllowSystemPrincipal)) {
+    throw '-Uninstall takes -TaskName and -Purge, and nothing else.'
+}
+if ($Purge -and -not $Uninstall) {
+    throw '-Purge only goes with -Uninstall.'
+}
 
 $nodeCmd = Get-Command 'node.exe' -ErrorAction SilentlyContinue
 if (-not $nodeCmd) {
@@ -322,6 +339,140 @@ Note ("node $nodeVersion at $NodeExe")
 if ($NodeExe.ToLowerInvariant().StartsWith($UserProfile.ToLowerInvariant())) {
     Note ("WARNING: node lives inside the user profile. A per user Node manager")
     Note ("         would break the task the moment it moves node.")
+}
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+# Takes the agent's own entries out of the base, under the operation lock
+# every mutating agent command takes: the same code as remove_agent_files in
+# install-linux.sh, which says what it removes and why.
+$RemoveAgentFiles = @'
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+const [base, scope] = process.argv.slice(2);
+const CODE = /^(?:bin|agent|agent\..+|agent-swap\.json|agent-baseline\.json)$/;
+const DATA = /^(?:config\..+|controller\..+|agent-floor\.json.*|state|state\.json.*|ops|incoming|legionctl\.log.*|launchd\.log|update\.lock.*|op\.lock.*)$/;
+const say = (line) => process.stdout.write(`${line}\n`);
+
+function remove() {
+  if (!fs.existsSync(base)) return;
+  const db = new DatabaseSync(path.join(base, 'op.lock.sqlite'));
+  try {
+    db.exec('PRAGMA busy_timeout = 250');
+    try { db.exec('BEGIN IMMEDIATE'); }
+    catch (error) {
+      if (error?.errcode === 5) throw new Error('another operation is running; nothing was removed');
+      throw error;
+    }
+    const doomed = fs.readdirSync(base).filter((name) => CODE.test(name) || (scope === 'purge' && DATA.test(name))).sort();
+    for (const name of doomed.filter((each) => !each.startsWith('op.lock'))) {
+      fs.rmSync(path.join(base, name), { recursive: true, force: true });
+      say(`removed ${path.join(base, name)}`);
+    }
+  } finally {
+    try { db.exec('ROLLBACK'); } catch { /* no transaction if acquisition failed */ }
+    db.close();
+  }
+  if (scope !== 'purge') return;
+  for (const name of fs.readdirSync(base).filter((each) => each.startsWith('op.lock'))) {
+    fs.rmSync(path.join(base, name), { recursive: true, force: true });
+  }
+  const kept = fs.readdirSync(base).sort();
+  if (kept.length === 0) {
+    fs.rmdirSync(base);
+    say(`removed ${base}`);
+  }
+  for (const name of kept) say(`kept ${path.join(base, name)}, which is not the agent's`);
+}
+
+try { remove(); }
+catch (error) {
+  process.stderr.write(`${error.message}\n`);
+  process.exitCode = 1;
+}
+'@
+
+if ($Uninstall) {
+    Step 'Uninstall'
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($task) {
+        $runs = (@($task.Actions) | ForEach-Object { [string] $_.Execute + ' ' + [string] $_.Arguments }) -join '; '
+        if ($runs.IndexOf($Base, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw "'$TaskName' does not run the agent in $Base (it runs $runs), so it is not this script's to remove. Nothing was changed."
+        }
+        # A cycle that is running is left to finish. Stopped part way it can
+        # leave a service down, and with the task gone nothing comes back to
+        # recover it.
+        if ($task.State -eq 'Running') {
+            throw "'$TaskName' is running an update cycle right now. It finishes within 30 minutes; run this again then. Nothing was changed."
+        }
+        if ((Resolve-AccountSid ([string] $task.Principal.UserId)) -ne $UserSid -and -not $IsElevated) {
+            throw "'$TaskName' runs as $($task.Principal.UserId)$($task.Principal.GroupId), and only an elevated session can remove it. Run this again from one. Nothing was changed."
+        }
+    }
+
+    if (Test-Path -LiteralPath $OldXmlPath -PathType Leaf) {
+        Remove-Item -LiteralPath $OldXmlPath -Force
+        Note ("removed " + $OldXmlPath + ", which an older installer left for an elevated import")
+    }
+
+    # The files first, so an operation holding the lock stops the uninstall
+    # before anything of the agent's has changed. A run the task starts in the
+    # moment before it goes finds no launcher and fails, which does no harm.
+    $scope = if ($Purge) { 'purge' } else { 'code' }
+    $removed = @($RemoveAgentFiles | & $NodeExe --input-type=module - $Base $scope)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Uninstalling stopped there. The scheduled task was left as it was.'
+    }
+    foreach ($line in $removed) {
+        if ($line) { Note $line }
+    }
+
+    if ($task) {
+        Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false
+        Note "removed the scheduled task '$TaskName'"
+    } else {
+        Note "no scheduled task '$TaskName' to remove"
+    }
+
+    # This copy of the installer may have been the installed agent's and gone
+    # with it, and then it is run again from a copy of the repository.
+    $again = 'agent\install\install-windows.ps1'
+    if (Test-Path -LiteralPath $PSCommandPath -PathType Leaf) { $again = $PSCommandPath }
+    $again = 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + $again + '"'
+    if ($PSBoundParameters.ContainsKey('TaskName')) { $again = $again + ' -TaskName "' + $TaskName + '"' }
+
+    Say ''
+    Say '== Legion Control, Windows side removed'
+    Say ''
+    foreach ($line in $Summary) {
+        Say ('  ' + $line)
+    }
+    if (-not $Purge -and (Test-Path -LiteralPath $Base)) {
+        Say ''
+        Say '  What the agent was configured with and what it recorded were left in:'
+        Say ('    ' + $Base)
+        Say ''
+        Say '  Remove those too:'
+        Say ('    ' + $again + ' -Uninstall -Purge')
+    }
+    foreach ($keys in @((Join-Path $UserProfile '.ssh\authorized_keys'), (Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'))) {
+        if ((Test-Path -LiteralPath $keys -PathType Leaf) -and (Select-String -LiteralPath $keys -SimpleMatch 'dispatch.ps1' -Quiet -ErrorAction SilentlyContinue)) {
+            Say ''
+            Say ('  A key in ' + $keys + ' runs dispatch.ps1, which is gone, so it is refused')
+            Say '  from now on. Take its line out.'
+        }
+    }
+    Say ''
+    Say '  Put the agent back:'
+    Say ('    ' + $again)
+    Say ''
+    exit 0
 }
 
 # ---------------------------------------------------------------------------
@@ -900,6 +1051,6 @@ Say ''
 
 # Exit codes, so a script driving this over SSH can tell the outcomes apart
 # instead of reading the prose:
-#   0  fully installed, the task now runs the agent
+#   0  fully installed, the task now runs the agent, or with -Uninstall removed
 #   1  something threw, see the message; a refused principal changed nothing
 exit 0
