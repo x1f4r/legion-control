@@ -539,6 +539,33 @@ final class AppModel {
         dialog.alternative?()
     }
 
+    // MARK: - Legion Control itself
+
+    /// Going back quits this build and starts the kept one, so it is asked first, in the one place
+    /// the window and the panel both draw a question.
+    func requestRollback() {
+        guard let version = appUpdates.rollbackVersion else { return }
+        dialog = PendingDialog(
+            id: "app-roll-back",
+            title: "Go back to Legion Control \(version)?",
+            message: "Legion Control quits, puts \(version) back in its place and starts it.",
+            confirmTitle: "Go back",
+            perform: { [weak self] in self?.appUpdates.rollBack() }
+        )
+    }
+
+    /// Discarding cannot be undone, so it is asked first too.
+    func requestDiscardPreviousBuild() {
+        guard let version = appUpdates.rollbackVersion else { return }
+        dialog = PendingDialog(
+            id: "app-discard-previous",
+            title: "Discard Legion Control \(version)?",
+            message: "The build kept from the last update is deleted, and going back to it is no longer possible.",
+            confirmTitle: "Discard",
+            perform: { [weak self] in self?.appUpdates.discardPrevious() }
+        )
+    }
+
     // MARK: - Diagnostics
 
     /// Everything a bug report needs, as one piece of text.

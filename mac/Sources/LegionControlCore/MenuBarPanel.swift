@@ -9,6 +9,10 @@ final class MenuBarPanelState {
     var loginProblem: String?
     var isWindowVisible = false
     var maximumHeight: CGFloat = 560
+    /// Kept here rather than in the view, because the popover is torn down while the save panel is
+    /// up and the reading goes on after it.
+    var isExportingDiagnostics = false
+    var exportProblem: String?
 
     @ObservationIgnored var openWindow: @MainActor () -> Void = {}
     @ObservationIgnored var openSection: @MainActor (String) -> Void = { _ in }
@@ -30,16 +34,16 @@ struct MenuBarPanel: View {
     let model: AppModel
     let panel: MenuBarPanelState
     @State private var showsResult = false
-    @State private var showsUpdate = false
 
     private var rowCount: Int { model.machines.count + (model.mac == nil ? 0 : 1) }
     private var noticeHeight: CGFloat {
-        (model.appUpdates.availableVersion == nil ? 0 : 38)
-        + (model.unresolvedOperations.isEmpty ? 0 : 34)
+        (model.unresolvedOperations.isEmpty ? 0 : 34)
         + (model.lastActionOutcome?.isError == true ? 44 : 0)
     }
+    /// The app's own row, which is always there below the devices.
+    private static let appRowHeight: CGFloat = 55
     private var listHeight: CGFloat {
-        min(CGFloat(max(rowCount, 1)) * 54, max(0, panel.maximumHeight - 90 - noticeHeight))
+        min(CGFloat(max(rowCount, 1)) * 54, max(0, panel.maximumHeight - 90 - noticeHeight - Self.appRowHeight))
     }
 
     var body: some View {
@@ -66,6 +70,8 @@ struct MenuBarPanel: View {
                 }
                 .frame(height: listHeight)
                 notices
+                Divider()
+                AppRow(model: model, panel: panel)
             }
             Divider()
             footer
@@ -130,30 +136,6 @@ struct MenuBarPanel: View {
             .padding(.horizontal, 12)
             .frame(height: 44)
         }
-        if let version = model.appUpdates.availableVersion {
-            HStack {
-                Text("Update \(version) available").lineLimit(1)
-                Spacer(minLength: 4)
-                Button("Review") { showsUpdate = true }
-                    .popover(isPresented: $showsUpdate) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Legion Control \(version)").font(.headline)
-                            if let text = model.appUpdates.note {
-                                ScrollView { Text(text).textSelection(.enabled) }.frame(maxHeight: 180)
-                            }
-                            if let reason = model.appUpdates.installBlockedReason {
-                                Text(reason).font(.caption).foregroundStyle(.orange)
-                            }
-                            Button(model.appUpdates.phase.isWorking ? model.appUpdates.summary : "Install and restart") {
-                                model.appUpdates.install()
-                            }
-                            .disabled(model.appUpdates.phase.isWorking || model.appUpdates.installBlockedReason != nil)
-                        }.padding(14).frame(width: 292)
-                    }
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 38)
-        }
     }
 
     private func openOperation(_ record: OperationRecord) {
@@ -170,8 +152,6 @@ struct MenuBarPanel: View {
                 Toggle("Start at login", isOn: Binding(get: { panel.startsAtLogin }, set: { panel.setStartsAtLogin($0) }))
                 if let problem = panel.loginProblem { Text(problem) }
                 else if panel.needsLoginApproval { Text("Approve in System Settings → Login Items") }
-                Button("Check for updates") { model.appUpdates.checkNow() }
-                    .disabled(model.appUpdates.phase.isWorking)
                 Divider()
                 Button("Quit Legion Control") { panel.quit() }.keyboardShortcut("q")
             } label: {
@@ -185,6 +165,91 @@ struct MenuBarPanel: View {
         }
         .padding(.horizontal, 12)
         .frame(height: 44)
+    }
+}
+
+/// Legion Control itself, always under the devices: which build runs, what the last look at the
+/// releases found, and the app's own actions, whether or not this Mac drives an agent.
+private struct AppRow: View {
+    let model: AppModel
+    let panel: MenuBarPanelState
+    @State private var showsUpdate = false
+
+    private var updates: AppUpdateModel { model.appUpdates }
+
+    private var status: String {
+        if panel.isExportingDiagnostics { return "Collecting diagnostics…" }
+        if let problem = panel.exportProblem { return problem }
+        return updates.summary
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button { panel.openSection("app") } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: updates.availableVersion == nil ? "app" : "app.badge")
+                        .foregroundStyle(.secondary).frame(width: 20)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Legion Control \(updates.installedVersion)").lineLimit(1)
+                        Text(status).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }.buttonStyle(.plain)
+            if let version = updates.availableVersion {
+                Button("Review") { showsUpdate = true }
+                    .popover(isPresented: $showsUpdate) { review(version) }
+            }
+            Menu { actions } label: { Image(systemName: "ellipsis").frame(width: 20, height: 24) }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .help("Legion Control actions").accessibilityLabel("Legion Control actions")
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 12)
+        .frame(height: 54)
+        .contentShape(Rectangle())
+        .contextMenu { actions }
+    }
+
+    private func review(_ version: String) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Legion Control \(version)").font(.headline)
+            if let text = updates.note {
+                ScrollView { Text(text).textSelection(.enabled) }.frame(maxHeight: 180)
+            }
+            if let reason = updates.installBlockedReason {
+                Text(reason).font(.caption).foregroundStyle(.orange)
+            }
+            Button(updates.phase.isWorking ? updates.summary : "Install and restart") { updates.install() }
+                .disabled(updates.phase.isWorking || updates.installBlockedReason != nil)
+        }.padding(14).frame(width: 292)
+    }
+
+    @ViewBuilder private var actions: some View {
+        Button("Open Legion Control") { panel.openSection("app") }
+        Divider()
+        Button("Check for updates") { updates.checkNow() }.disabled(updates.phase.isWorking)
+        if let version = updates.availableVersion {
+            Button("Install \(version) and restart") { updates.install() }
+                .disabled(updates.phase.isWorking || updates.installBlockedReason != nil)
+        }
+        if let previous = updates.rollbackVersion {
+            Button("Go back to \(previous)…") { model.requestRollback() }
+                .disabled(updates.phase.isWorking || updates.swapBlockedReason != nil)
+            Button("Discard \(previous)…") { model.requestDiscardPreviousBuild() }
+                .disabled(updates.phase.isWorking || updates.swapBlockedReason != nil)
+        }
+        Divider()
+        Button("Export diagnostics…") { exportDiagnostics() }.disabled(panel.isExportingDiagnostics)
+    }
+
+    private func exportDiagnostics() {
+        panel.isExportingDiagnostics = true
+        panel.exportProblem = nil
+        Task { @MainActor in
+            panel.exportProblem = await DiagnosticsExport.exportAll(model)
+            panel.isExportingDiagnostics = false
+        }
     }
 }
 

@@ -6,6 +6,8 @@ enum SidebarItem: Hashable, Identifiable {
     case service(machine: String, service: String)
     case local
     case setup
+    /// Legion Control itself, which is there whatever the setup holds.
+    case app
 
     var id: String {
         switch self {
@@ -13,6 +15,7 @@ enum SidebarItem: Hashable, Identifiable {
         case .service(let machine, let service): "service:\(machine)/\(service)"
         case .local: "local"
         case .setup: "setup"
+        case .app: "app"
         }
     }
 
@@ -20,6 +23,7 @@ enum SidebarItem: Hashable, Identifiable {
     init?(id: String) {
         if id == "local" { self = .local; return }
         if id == "setup" { self = .setup; return }
+        if id == "app" { self = .app; return }
         if id.hasPrefix("machine:") { self = .machine(String(id.dropFirst(8))); return }
         if id.hasPrefix("service:") {
             let rest = id.dropFirst(8)
@@ -51,6 +55,7 @@ struct ContentView: View {
         }
         if model.mac != nil { items.append(.local) }
         items.append(.setup)
+        items.append(.app)
         return items
     }
 
@@ -170,6 +175,7 @@ struct ContentView: View {
         case .machine(let id): model.machine(id: id)?.name ?? id
         case .local: model.mac?.name ?? "This device"
         case .setup: "Setup"
+        case .app: "Legion Control"
         case .service(_, let id): id
         }
     }
@@ -203,6 +209,8 @@ struct ContentView: View {
             }
         case .setup:
             SetupEditorView(model: model)
+        case .app:
+            AppSection(model: model)
         case nil:
             EmptyView()
         }
@@ -246,6 +254,9 @@ private struct Sidebar: View {
             }
         case .setup:
             row(item, symbol: "list.bullet.rectangle", title: "Setup", summary: setupSummary)
+        case .app:
+            row(item, symbol: model.appUpdates.availableVersion == nil ? "app" : "app.badge",
+                title: "Legion Control", summary: model.appUpdates.summary)
         }
     }
 

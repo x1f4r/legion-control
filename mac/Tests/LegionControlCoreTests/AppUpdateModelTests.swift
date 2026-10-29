@@ -561,11 +561,36 @@ struct AppUpdateModelTests {
         #expect(model.installBlockedReason == model.swapBlockedReason)
         model.install()
         model.rollBack()
+        model.discardPrevious()
         await settle(model)
         #expect(downloads == 0)
         #expect(swaps == 0)
         #expect(quits == 0)
         #expect(model.failure == model.swapBlockedReason)
         #expect(model.rollbackVersion == "2.9.0")
+        #expect(FileManager.default.fileExists(atPath: previous.path))
+    }
+
+    @Test("discarding the kept build deletes it, and with it the way back")
+    func discardPrevious() throws {
+        let (model, _, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try AppUpdateTests.makeBundle(at: model.bundleURL, identifier: "id", executable: "LegionControl", version: "3.0.0")
+        let previous = directory.appending(path: "Legion Control.previous.app")
+        try AppUpdateTests.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "2.9.0")
+        var redraws = 0
+        model.onStateChange = { redraws += 1 }
+        #expect(model.rollbackVersion == "2.9.0")
+
+        model.discardPrevious()
+        #expect(!FileManager.default.fileExists(atPath: previous.path))
+        #expect(model.rollbackVersion == nil)
+        #expect(model.failure == nil)
+        #expect(redraws == 1)
+        // The running build is never what goes.
+        #expect(AppUpdates.version(ofBundleAt: model.bundleURL) == "3.0.0")
+        // Nothing left to discard is not an error either.
+        model.discardPrevious()
+        #expect(model.failure == nil)
     }
 }

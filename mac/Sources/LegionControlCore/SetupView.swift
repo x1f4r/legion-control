@@ -64,6 +64,10 @@ struct SetupView: View {
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                // There is no sidebar yet, so the app's own page is drawn here: an update, a roll
+                // back and a diagnostics export are needed most when nothing is set up.
+                AppSection(model: model, isPage: false)
             }
             .padding(.horizontal, 32)
             .padding(.top, 30)

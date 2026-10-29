@@ -117,4 +117,50 @@ struct AppModelTests {
         app.openBindingsInEditor()
         #expect(opened == [app.config.path, app.bindings.path])
     }
+
+    @Test("going back and discarding the kept build are asked first, and the answer does it")
+    func appActionsAreConfirmed() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try Self.app(Self.twoMachines, in: home)
+        let updates = app.appUpdates
+        updates.bundleURL = home.appending(path: "Legion Control.app")
+        updates.supportDirectory = home.appending(path: "support")
+        updates.isIsolatedRun = false
+        let previous = home.appending(path: "Legion Control.previous.app")
+        try AppUpdateTests.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "1.3.4")
+        var handed: [URL] = []
+        updates.performSwap = { staged, _, _, _ in handed.append(staged.bundle) }
+        updates.quit = { }
+
+        app.requestRollback()
+        let rollBack = try #require(app.dialog)
+        #expect(rollBack.title.contains("1.3.4"))
+        #expect(handed.isEmpty)
+        app.confirm(rollBack)
+        #expect(handed == [previous])
+
+        // A fresh model for the second question, as after a relaunch: the first one is waiting to quit.
+        let next = try Self.app(Self.twoMachines, in: home)
+        next.appUpdates.bundleURL = updates.bundleURL
+        next.appUpdates.supportDirectory = updates.supportDirectory
+        next.appUpdates.isIsolatedRun = false
+        next.requestDiscardPreviousBuild()
+        let discard = try #require(next.dialog)
+        #expect(FileManager.default.fileExists(atPath: previous.path))
+        next.confirm(discard)
+        #expect(!FileManager.default.fileExists(atPath: previous.path))
+        #expect(next.dialog == nil)
+
+        // With nothing kept there is nothing to ask about.
+        next.requestRollback()
+        next.requestDiscardPreviousBuild()
+        #expect(next.dialog == nil)
+    }
+
+    @Test("the app's own page has a stable sidebar identifier, like every other row")
+    func appSidebarItem() {
+        #expect(SidebarItem.app.id == "app")
+        #expect(SidebarItem(id: "app") == .app)
+    }
 }

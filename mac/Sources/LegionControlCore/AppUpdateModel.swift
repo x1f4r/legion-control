@@ -254,8 +254,13 @@ final class AppUpdateModel {
         return "This run was pointed at its own home with LEGION_CONTROL_HOME or LEGION_CONTROL_CONFIG, so it does not install, roll back or discard builds of the app. Do that from an ordinary run."
     }
 
+    /// Bumped when this process changes what is kept beside the bundle. The kept build is read from
+    /// the disk, which nothing observes, so this is what has a view that shows it draw again.
+    private var retainedChanges = 0
+
     /// The kept bundle from the last update, when there is one.
     var rollbackVersion: String? {
+        _ = retainedChanges
         guard let previous = AppUpdates.retainedPrevious(beside: bundleURL) else { return nil }
         return AppUpdates.version(ofBundleAt: previous)
     }
@@ -380,6 +385,24 @@ final class AppUpdateModel {
             failure = (error as? AppUpdates.InstallFailure)?.message ?? error.localizedDescription
             phase = .idle
         }
+    }
+
+    /// Throw away the build kept from the last update, because the user asked. Afterwards there is
+    /// nothing to go back to, which is the point: it is a whole second copy of the app.
+    func discardPrevious() {
+        guard phase == .idle, AppUpdates.retainedPrevious(beside: bundleURL) != nil else { return }
+        if let blocked = swapBlockedReason {
+            failure = blocked
+            return
+        }
+        do {
+            try AppUpdates.discardRetained(beside: bundleURL)
+            failure = nil
+        } catch {
+            failure = (error as? AppUpdates.InstallFailure)?.message ?? error.localizedDescription
+        }
+        retainedChanges &+= 1
+        onStateChange?()
     }
 
     /// What the helper exiting means to a process that is still here to hear it: that it gave up

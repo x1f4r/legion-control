@@ -181,6 +181,9 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         panelClosedAt = Date()
         statusItem.button?.highlight(false)
         anchor.orderOut(nil)
+        // An export that could not be written has been on screen once by now, or lands after this
+        // close and is shown on the next open.
+        if !panel.isExportingDiagnostics { panel.exportProblem = nil }
         guard host?.isWindowVisible != true else { return }
         // Nothing left is looking, so nothing is read until something is.
         model.viewerDisappeared()

@@ -834,9 +834,14 @@ enum AppUpdates {
         )
     }
 
-    /// Throw away the bundle kept from the last update.
-    static func discardRetained(beside bundleURL: URL) {
+    /// Throw away the bundle kept from the last update. It is a whole second copy of the app, kept
+    /// only so there is something to go back to, and it stays until someone says it can go.
+    static func discardRetained(beside bundleURL: URL) throws {
         guard let previous = retainedPrevious(beside: bundleURL) else { return }
-        try? FileManager.default.removeItem(at: previous)
+        do {
+            try FileManager.default.removeItem(at: previous)
+        } catch {
+            throw InstallFailure("\(previous.lastPathComponent) could not be deleted. \(error.localizedDescription)")
+        }
     }
 }
