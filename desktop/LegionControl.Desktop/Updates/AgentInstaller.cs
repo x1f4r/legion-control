@@ -313,4 +313,21 @@ public sealed class AgentInstaller(IProcessRunner runner)
         if (parts[^2] != "src" || parts[^3] != "agent" || parts[^1] != "index.mjs") return null;
         return string.Join("/", parts[..^3]).TrimEnd('/');
     }
+
+    /// The command for system [systemId] of [machine] with its agent script moved to the stable
+    /// launcher under [installationBase], or null when there is nothing to move: the machine or
+    /// the system is no longer in the setup, or its command runs no `agent/src/index.mjs`.
+    ///
+    /// [machine] is read after the install, as this device runs it now. An install takes minutes,
+    /// and the setup can change while it runs; offering to edit the command it had before would
+    /// put back whatever changed in it since.
+    public static (IReadOnlyList<string> Agent, string Launcher)? LauncherCommand(MachineConfig? machine, string systemId, string installationBase)
+    {
+        if (machine?.System(systemId) is not { } system) return null;
+        var argv = system.Agent.ToArray();
+        var script = Array.FindIndex(argv, item => item.Replace('\\', '/').EndsWith("/agent/src/index.mjs", StringComparison.Ordinal));
+        if (script < 0) return null;
+        argv[script] = installationBase.TrimEnd('/', '\\') + "/bin/launcher.mjs";
+        return (argv, argv[script]);
+    }
 }

@@ -868,12 +868,11 @@ public sealed class MainWindow : Window
         Sheets.Text(this, "Agent", outcome.Report);
         await machine.RefreshAsync();
         if (outcome is not AgentInstallOutcome.Installed || system is null || installationBase is null || _app.Config.Document is not { } document) return;
-        var argv = system.Agent.ToArray();
-        var script = Array.FindIndex(argv, item => item.Replace('\\', '/').EndsWith("/agent/src/index.mjs", StringComparison.Ordinal));
-        if (script < 0) return;
-        argv[script] = installationBase.TrimEnd('/', '\\') + "/bin/launcher.mjs";
+        // Read again: the install took minutes, and the machine, its system or its command may
+        // have changed in the setup, or left it, while it ran.
+        if (AgentInstaller.LauncherCommand(_app.Machine(machine.Id)?.Machine, system.Id, installationBase) is not (var argv, var launcher)) return;
         if (!await Sheets.AskAsync(this, "Use the stable agent launcher?",
-            $"The upgrade succeeded. Update only this system's script argument in the shared setup to {argv[script]}? The remaining arguments are preserved.", "Update launcher path")) return;
+            $"The upgrade succeeded. Update only this system's script argument in the shared setup to {launcher}? The remaining arguments are preserved.", "Update launcher path")) return;
         if (_app.Config.Document?.Hash != document.Hash)
         { Sheets.Text(this, "Setup changed", "The setup changed while this choice was open. Review its current agent path before editing it."); return; }
         var (_, problem, refused) = _app.MigrateAgentCommand(machine.Id, system.Id, argv, document.Hash);

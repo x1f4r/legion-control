@@ -1,4 +1,5 @@
 using LegionControl.Desktop.Config;
+using LegionControl.Desktop.Updates;
 using LegionControl.Desktop.Views;
 using Xunit;
 
@@ -48,5 +49,30 @@ public class CrashContainmentTests
         {
             Environment.SetEnvironmentVariable(AppPaths.HomeOverride, home.Path);
         }
+    }
+
+    [Fact]
+    public void TheLauncherIsOfferedForTheSystemAsItIsAfterTheInstall()
+    {
+        var machine = new MachineConfig
+        {
+            Id = "pi",
+            Name = "Pi",
+            Systems = new[]
+            {
+                new SystemConfig { Id = "linux", Name = "Linux", Agent = new[] { "node", "--no-warnings", "/home/me/.legion-control/agent/src/index.mjs" } },
+                new SystemConfig { Id = "other", Name = "Other", Agent = new[] { "/usr/local/bin/legionctl" } },
+            },
+        };
+        var moved = AgentInstaller.LauncherCommand(machine, "linux", "/home/me/.legion-control/");
+        Assert.Equal(new[] { "node", "--no-warnings", "/home/me/.legion-control/bin/launcher.mjs" }, moved?.Agent);
+        Assert.Equal("/home/me/.legion-control/bin/launcher.mjs", moved?.Launcher);
+        // The machine or the system left the setup while the install ran, or its command runs no
+        // agent script any more: there is nothing to offer, and nothing throws.
+        Assert.Null(AgentInstaller.LauncherCommand(null, "linux", "/home/me/.legion-control"));
+        Assert.Null(AgentInstaller.LauncherCommand(machine, "gone", "/home/me/.legion-control"));
+        Assert.Null(AgentInstaller.LauncherCommand(machine, "other", "/home/me/.legion-control"));
+        var windows = machine with { Systems = new[] { new SystemConfig { Id = "windows", Name = "Windows", Agent = new[] { "node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs" } } } };
+        Assert.Equal("C:\\Users\\me\\.legion-control/bin/launcher.mjs", AgentInstaller.LauncherCommand(windows, "windows", "C:\\Users\\me\\.legion-control\\")?.Launcher);
     }
 }
