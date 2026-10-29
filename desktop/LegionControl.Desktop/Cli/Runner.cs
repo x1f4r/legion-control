@@ -766,12 +766,19 @@ public static class Runner
         if (!line.Has("yes"))
         {
             var (bundle, problem) = AgentBundle.Load();
+            var goesBack = bundle is null ? null : AgentInstaller.GoesBack(bundle.Version, machine.Capabilities);
             output.WriteLine(bundle is null
                 ? problem!
-                : $"This build carries agent {bundle.Version}, verified against the release key. {machine.Name} answers {machine.Capabilities.Summary}. Add --yes to install.");
+                : goesBack is null
+                    ? $"This build carries agent {bundle.Version}, verified against the release key. {machine.Name} answers {machine.Capabilities.Summary}. Add --yes to install."
+                    : $"This build carries agent {bundle.Version}, verified against the release key, {goesBack} on {machine.Name}. "
+                      + (AgentVersions.IsOlder(bundle.Version, machine.Capabilities.Floor) ? "Going back lowers the machine's version floor to it. " : "")
+                      + "Add --allow-downgrade --yes to go back deliberately.");
             return bundle is null ? Failed : Ok;
         }
-        var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, token, line.Value("base"));
+        // Going back is a decision of its own: --yes alone never installs an older agent.
+        var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, token, line.Value("base"),
+            allowDowngrade: line.Has("allow-downgrade"));
         output.WriteLine(outcome.Report);
         return outcome switch
         {
@@ -1205,7 +1212,7 @@ public static class Runner
           --command cancel  --machine ID --op ID
           --command policy  --machine ID [--service ID] [--automatic on|off|inherit]
                             [--pause 4h | --resume] [--windows "mon,tue:02:00-06:00" | --windows none]
-          --command agent-install --machine ID [--yes]
+          --command agent-install --machine ID [--yes] [--allow-downgrade]
           --command app-update
 
         Changing this device's own settings, or the setup document:

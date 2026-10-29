@@ -117,6 +117,81 @@ public class CommandSurfaceTests
     }
 
     [Fact]
+    public void GoingBackIsSentOnlyWhenAskedForAndOnlyToAnAgentThatHasAFloor()
+    {
+        // Agent 3.1.0 reports a version floor; only such an agent knows --allow-downgrade.
+        var floored = AgentCapabilities.Of(AgentStatus.From(Value.Parse(Repo.ReadContract("fixtures/status.full.json"))));
+        Assert.True(floored.ReportsFloor);
+        Assert.Equal("3.1.0", floored.Floor);
+        Assert.True(floored.SupportsAllowDowngrade);
+
+        // Nothing in this app adds it on its own initiative.
+        Assert.DoesNotContain("--allow-downgrade", CommandSurface.SelfUpdateFromStdin("abcdefab-1234-4567-8901-abcdefabcdef", floored));
+        Assert.DoesNotContain("--allow-downgrade", CommandSurface.SelfUpdateRollback(floored));
+        Assert.Equal(new[] { "self-update", "--stdin", "--allow-downgrade", "--op", "abcdefab-1234-4567-8901-abcdefabcdef" },
+            CommandSurface.SelfUpdateFromStdin("abcdefab-1234-4567-8901-abcdefabcdef", floored, allowDowngrade: true));
+        Assert.Equal(new[] { "self-update", "--rollback", "--allow-downgrade" }, CommandSurface.SelfUpdateRollback(floored, allowDowngrade: true));
+
+        // An agent that predates the floor has never heard of the flag, and a restricted key has it
+        // refused by the dispatcher: neither is ever sent it.
+        var unfloored = AgentCapabilities.Of(AgentStatus.From(Value.Parse("""
+            { "ok": true, "contract": 3, "agentVersion": "3.0.1", "agent": { "version": "3.0.1", "contract": 3 } }
+            """)));
+        Assert.False(unfloored.ReportsFloor);
+        Assert.Throws<CommandSurface.NotAvailable>(() => CommandSurface.SelfUpdateFromStdin(null, unfloored, allowDowngrade: true));
+        Assert.Throws<CommandSurface.NotAvailable>(() => CommandSurface.SelfUpdateRollback(unfloored, allowDowngrade: true));
+        var restricted = floored with { RestrictedSession = true };
+        Assert.False(restricted.SupportsAllowDowngrade);
+        Assert.Throws<CommandSurface.NotAvailable>(() => CommandSurface.SelfUpdateFromStdin(null, restricted, allowDowngrade: true));
+
+        // A floor the agent could not read is still a floor it reports, as null.
+        var unreadable = AgentCapabilities.Of(AgentStatus.From(Value.Parse("""
+            { "ok": true, "contract": 3, "agentVersion": "3.1.0", "agent": { "version": "3.1.0", "contract": 3, "floor": null } }
+            """)));
+        Assert.True(unreadable.ReportsFloor);
+        Assert.Null(unreadable.Floor);
+    }
+
+    [Fact]
+    public void AnOlderBundleIsAWayBackAndNeverAnUpgrade()
+    {
+        var running = new AgentCapabilities { ContractVersion = 3, AgentVersion = "3.2.0", Floor = "3.1.0", ReportsFloor = true };
+        Assert.Contains("older than the 3.2.0", AgentInstaller.GoesBack("3.1.0", running));
+        Assert.Null(AgentInstaller.GoesBack("3.2.0", running));
+        Assert.Null(AgentInstaller.GoesBack("3.10.0", running));
+        // Below the floor is a way back even where the running agent is older still.
+        Assert.Contains("below the version floor 3.1.0",
+            AgentInstaller.GoesBack("3.0.9", running with { AgentVersion = "3.0.1" }));
+        // A version that cannot be read is not taken for an older one.
+        Assert.Null(AgentInstaller.GoesBack("3.1.0", running with { AgentVersion = "nightly", Floor = null }));
+    }
+
+    [Theory]
+    [InlineData("3.10.0", "3.9.0", 1)]
+    [InlineData("3.1.0", "3.1.0", 0)]
+    [InlineData("3.1.0-beta.2", "3.1.0", 0)]
+    [InlineData("03.001.0", "3.1.0", 0)]
+    [InlineData("2.9.99", "3.0.0", -1)]
+    [InlineData("99999999999999999999999999999999.0.0", "3.0.0", 1)]
+    public void AgentVersionsCompareNumericallyOnTheirFirstThreeNumbers(string left, string right, int expected)
+    {
+        Assert.Equal(expected, AgentVersions.Compare(left, right));
+        Assert.Equal(-expected, AgentVersions.Compare(right, left));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("3.1")]
+    [InlineData("v3.1.0")]
+    [InlineData("٣.1.0")]
+    public void SomethingThatIsNotAVersionComparesWithNothing(string? version)
+    {
+        Assert.Null(AgentVersions.Compare(version, "3.1.0"));
+        Assert.False(AgentVersions.IsOlder(version, "3.1.0"));
+    }
+
+    [Fact]
     public void CapabilitiesAreOneNumberAndSayWhatTheyMean()
     {
         Assert.False(V2.SpeaksV3);

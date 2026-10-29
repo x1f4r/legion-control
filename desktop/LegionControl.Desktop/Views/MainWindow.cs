@@ -529,7 +529,16 @@ public sealed class MainWindow : Window
         items.Add(Ui.MenuAction("Machine schedule", () => EditPolicy(machine, null), machine.Capabilities.SupportsPolicy));
         var (bundle, bundleProblem) = AgentBundle.Load();
         if (status is not null && (bundle is null || status.AgentVersion != bundle.Version))
-            items.Add(Ui.MenuAction("Install agent " + (bundle?.Version ?? AgentContract.BundledAgentVersion), () => InstallAgent(machine), bundle is not null, bundleProblem));
+        {
+            // A bundle older than the agent, or below its version floor, is never offered as an
+            // install. Going back is offered only to an agent that can be told so, and only through
+            // a confirmation that says what it does.
+            var goesBack = bundle is null ? null : AgentInstaller.GoesBack(bundle.Version, machine.Capabilities);
+            if (goesBack is null)
+                items.Add(Ui.MenuAction("Install agent " + (bundle?.Version ?? AgentContract.BundledAgentVersion), () => InstallAgent(machine), bundle is not null, bundleProblem));
+            else if (machine.Capabilities.SupportsAllowDowngrade)
+                items.Add(Ui.MenuAction("Go back to agent " + bundle!.Version + "…", () => GoBackToAgent(machine, bundle.Version, goesBack)));
+        }
         items.Add(new MenuItem { Header = "Diagnostics", ItemsSource = new[]
         {
             Ui.MenuAction("Check agent", () => Doctor(machine), machine.Capabilities.SupportsDoctor),
@@ -777,6 +786,23 @@ public sealed class MainWindow : Window
             await new ServiceEditor(machine, reply.Value).ShowDialog(this);
         }
         catch (AgentFailure failure) { Sheets.Text(this, "Service setup", failure.Sentence(machine.Name)); }
+    }
+
+    /// Installs the bundled agent where it is older than the one running, or below the version
+    /// floor: only after a person answered a question that says so, and then with the agent told
+    /// in as many words.
+    private async void GoBackToAgent(MachineModel machine, string version, string goesBack)
+    {
+        var floor = AgentVersions.IsOlder(version, machine.Capabilities.Floor)
+            ? $" and lowers the machine's version floor to it, so the machine accepts agents from {version} up until a newer one raises the floor again"
+            : "";
+        var confirmed = await Sheets.AskAsync(this, $"Go back to agent {version}?",
+            $"This build carries agent {version}, {goesBack} on {machine.Name}. Going back installs it anyway{floor}.",
+            "Go back");
+        if (!confirmed) return;
+        var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, allowDowngrade: true);
+        Sheets.Text(this, "Agent", outcome.Report);
+        await machine.RefreshAsync();
     }
 
     private async void InstallAgent(MachineModel machine)

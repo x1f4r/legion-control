@@ -534,7 +534,13 @@ public sealed record StatusTiming(long? BudgetMs, long? ElapsedMs, bool Partial)
     }
 }
 
-public sealed record AgentInfo(string? Version, int? ContractVersion, string? Base, string? Node, bool? RestrictedSession)
+/// The agent block of a status. [Floor] is the version floor from agent 3.1.0 on: the oldest agent
+/// this machine may be replaced by (contract section 13). It is null both when the agent states
+/// none, its floor file being unreadable, and when it predates the idea; [ReportsFloor] tells the
+/// two apart, because only an agent that reports a floor knows `--allow-downgrade` at all.
+public sealed record AgentInfo(
+    string? Version, int? ContractVersion, string? Base, string? Node, bool? RestrictedSession,
+    string? Floor = null, bool ReportsFloor = false)
 {
     public static AgentInfo? From(Value json)
     {
@@ -544,7 +550,9 @@ public sealed record AgentInfo(string? Version, int? ContractVersion, string? Ba
             json["contract"].AsInt(),
             json["base"].AsText(),
             json["node"].AsText(),
-            json["restrictedSession"].AsBool());
+            json["restrictedSession"].AsBool(),
+            json["floor"].AsText(),
+            json.Has("floor"));
     }
 }
 

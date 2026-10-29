@@ -114,13 +114,24 @@ public sealed class AgentInstaller(IProcessRunner runner)
 {
     private readonly IProcessRunner _runner = runner;
 
+    /// [allowDowngrade] is a person's confirmed decision to go back: to put in a bundle older than
+    /// the agent the machine runs, or below its version floor. Without it such a bundle is not
+    /// installed at all, and with it the agent is told so in as many words (contract section 13).
     public async Task<AgentInstallOutcome> InstallAsync(
-        MachineModel machine, CancellationToken cancellationToken = default, string? installationBase = null)
+        MachineModel machine, CancellationToken cancellationToken = default, string? installationBase = null,
+        bool allowDowngrade = false)
     {
         if (machine.Status is null || machine.Failure is not null)
             return new AgentInstallOutcome.Unavailable("Read an authenticated agent status before installing or upgrading it.");
         var (bundle, problem) = AgentBundle.Load();
         if (bundle is null) return new AgentInstallOutcome.Unavailable(problem ?? "No agent bundle.");
+        var goesBack = GoesBack(bundle.Version, machine.Capabilities);
+        if (goesBack is not null && !allowDowngrade)
+            return new AgentInstallOutcome.Unavailable($"This build carries agent {bundle.Version}, {goesBack} on {machine.Name}, so it is not installed as an upgrade. Going back is a separate decision.");
+        if (goesBack is not null && !machine.Capabilities.SupportsAllowDowngrade)
+            return new AgentInstallOutcome.Unavailable(machine.Capabilities.RestrictedSession
+                ? $"A restricted key can only move the agent on {machine.Name} forward. Go back to agent {bundle.Version} from an administrator SSH connection."
+                : $"The agent on {machine.Name} reports no version floor, so it cannot be taken back deliberately from here. Install agent {bundle.Version} on it by hand.");
 
         var routes = machine.Bindings.RoutesFor(machine.Machine);
         var system = (machine.Routes.RememberedSystemId is { } id ? machine.Machine.System(id) : null)
@@ -141,7 +152,7 @@ public sealed class AgentInstaller(IProcessRunner runner)
             try
             {
                 var reply = await agent.MutateAsync(
-                    CommandSurface.SelfUpdateFromStdin(CommandSurface.NewOperationId(), machine.Capabilities),
+                    CommandSurface.SelfUpdateFromStdin(CommandSurface.NewOperationId(), machine.Capabilities, allowDowngrade: goesBack is not null),
                     TimeSpan.FromMinutes(5), system, route, bundle.Archive, cancellationToken);
                 var result = reply.Value;
                 if (result.Envelope.Ok == true)
@@ -243,6 +254,16 @@ public sealed class AgentInstaller(IProcessRunner runner)
         return new AgentInstallOutcome.Failed(
             envelope.Sentence() ?? $"The staged agent on {machine.Name} refused to install itself.", null);
     }
+
+    /// How installing agent [version] would take the machine back, or null when it would not: older
+    /// than the agent it runs, or below its version floor. Only versions known to be older count; a
+    /// version that cannot be read is not taken for an older one.
+    public static string? GoesBack(string version, AgentCapabilities capabilities) =>
+        AgentVersions.IsOlder(version, capabilities.AgentVersion)
+            ? $"older than the {capabilities.AgentVersion} it runs"
+            : AgentVersions.IsOlder(version, capabilities.Floor)
+                ? $"below the version floor {capabilities.Floor}"
+                : null;
 
     /// What a bootstrap step that did not finish means. A failure only when it provably never
     /// ran; anything else may have done some or all of its work, and is not known. Either way what
