@@ -141,7 +141,10 @@ struct OperationDriver {
         result.exitCode = operation.result?.exitCode
         result.ok = operation.result?.ok ?? accepted.ok
         // The record's outcome, never the accepted reply's `pending`: the record is what finished.
-        result.outcome = operation.outcome ?? operation.result?.outcome
+        // Its own reduction when it states none, because the fields above are not all the record's.
+        // A finished record from before 3.1.0 with no result reduces to `unknown`, and read again
+        // from the `ok` it inherited from the accepted reply, it was filed as a success.
+        result.outcome = operation.outcome ?? operation.result?.outcome ?? Outcome.of(operation).rawValue
         result.op = operation
         return result
     }

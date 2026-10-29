@@ -296,6 +296,42 @@ struct OperationTests {
         #expect(polls == OperationDriver.pollTries)
     }
 
+    @Test("a finished record with no result is read by its own reduction, never by the accepted reply's ok")
+    func finishedWithoutAResultIsUnknown() async throws {
+        // A record from before 3.1.0 that finished and kept no result. Reduced on its own it is
+        // unknown, which ended the polling, but the final reply was then read again from the `ok`
+        // it inherited from the accepted one, and the update was filed as a success.
+        let bare = """
+        { "ok": true, "contract": 3,
+          "op": { "id": "\(Self.opId)", "kind": "update", "service": "demo", "state": "finished", "phase": "done", "result": null } }
+        """
+        let driver = OperationDriver(send: { _ in try Self.reply(Self.accepted) }, readOperation: { _ in try Self.poll(bare) })
+        let request = try AgentRequest.update(service: "demo", intent: .init(detach: true, operationId: Self.opId), dialect: .v3)
+        let conclusion = try await driver.perform(request, operationId: Self.opId, dialect: .v3)
+        let operation = try #require(conclusion.operation)
+        #expect(!conclusion.stillRunning)
+        #expect(Outcome.of(operation) == .unknown)
+        #expect(Outcome.of(conclusion.result) == .unknown)
+        #expect(OperationOutcome.state(for: conclusion.result, stillRunning: false) == .unknown)
+
+        // And the history files the same record the same way when it is read back later.
+        let (store, directory) = try Self.store()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var record = Self.record()
+        record.id = Self.opId
+        store.begin(record)
+        store.finish(record.id, state: .unknown, summary: "The update may or may not have happened.")
+        store.reconcile(record.id, with: operation)
+        #expect(store.record(id: record.id)?.state == .unknown)
+
+        // A record that states its outcome, or whose result does, is read by that as before.
+        var stated = operation
+        stated.result = AgentOperation.Result(ok: true, action: "updated", reasonCode: nil)
+        #expect(Outcome.of(OperationDriver.finalResult(from: stated, accepted: try Self.reply(Self.accepted))) == .succeeded)
+        stated.outcome = "unknown"
+        #expect(Outcome.of(OperationDriver.finalResult(from: stated, accepted: try Self.reply(Self.accepted))) == .unknown)
+    }
+
     @Test("a replay of a request still running is followed by its id like an accepted one")
     func replayStillRunningIsFollowed() async throws {
         let replay = try String(decoding: ContractCorpus.data("fixtures/update.replayed.json"), as: UTF8.self)
