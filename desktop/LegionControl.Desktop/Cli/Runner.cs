@@ -47,7 +47,45 @@ public static class Runner
     /// The same, with [open] told whether the run may change anything on disk. A smoke run may
     /// not: it reads everything and changes nothing, so a setup with no identity yet is not given
     /// one, a first start's approvals are not recorded, and no wake hold is released.
+    ///
+    /// Whatever escapes a command is still one of the three exit codes, with a sentence and a line
+    /// in the log: a runtime's own crash code means nothing to whoever reads it. A command that can
+    /// change something on a machine is then not known (2), because nobody can say how far it got;
+    /// one that only reads did not do what was asked, and that is known (1).
     public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output, Func<bool, AppModel> open)
+    {
+        try
+        {
+            return await RunCoreAsync(arguments, output, open);
+        }
+        catch (Exception error)
+        {
+            AppLog.Write($"the command line ({string.Join(" ", arguments.Take(2))})", error);
+            var reads = arguments.Contains("--smoke") || arguments.Contains("--version") || arguments.Contains("-h")
+                || arguments.Contains("--help") || CommandOf(arguments) is { } verb && ReadingVerbs.Contains(verb);
+            output.WriteLine($"The command stopped on an error this app did not expect: {error.Message}"
+                             + (reads ? "" : " Whether anything changed on the far side is not known.")
+                             + $" The details are in {AppLog.Path}.");
+            return reads ? Failed : NotKnown;
+        }
+    }
+
+    /// The verbs that change nothing anywhere, as the usage lists them under "Reading". `wake`,
+    /// `trust`, `edit` and `bindings` are not here: each of them changes something when asked to.
+    private static readonly HashSet<string> ReadingVerbs = new(StringComparer.Ordinal)
+    {
+        "status", "doctor", "logs", "history", "bundle", "op", "templates", "version",
+    };
+
+    /// The verb, however it was spelled, before anything else is parsed.
+    private static string? CommandOf(IReadOnlyList<string> arguments)
+    {
+        var index = arguments.ToList().IndexOf("--command");
+        if (index >= 0) return index + 1 < arguments.Count ? arguments[index + 1] : null;
+        return arguments.Count > 0 && !arguments[0].StartsWith("--", StringComparison.Ordinal) ? arguments[0] : null;
+    }
+
+    private static async Task<int> RunCoreAsync(IReadOnlyList<string> arguments, TextWriter output, Func<bool, AppModel> open)
     {
         if (arguments.Contains("-h")) { WriteUsage(output); return Ok; }
         var command = arguments.Count > 0 && !arguments[0].StartsWith("--", StringComparison.Ordinal)

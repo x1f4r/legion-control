@@ -106,4 +106,24 @@ public class CommandLineSafetyTests
         Assert.Contains("Lineage   abc", output.ToString());
         Assert.Equal("abc", ReconcileOutcome.Short("abc"));
     }
+
+    [Fact]
+    public async Task AnErrorNobodyPlannedForStillEndsInADocumentedExitCode()
+    {
+        using var home = new TempHome();
+        AppModel Broken() => throw new InvalidOperationException("the disk went away");
+
+        // A command that changes something may have got as far as the machine: not known.
+        var output = new StringWriter();
+        Assert.Equal(Runner.NotKnown, await Runner.RunAsync(new[] { "--command", "restart", "--machine", "pi", "--yes" }, output, Broken));
+        Assert.Contains("the disk went away", output.ToString());
+        Assert.Contains("not known", output.ToString());
+
+        // One that only reads did not do what was asked, and that is known.
+        Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "status", "--machine", "pi" }, new StringWriter(), Broken));
+        Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--smoke" }, new StringWriter(), Broken));
+        Assert.Equal(Runner.NotKnown, await Runner.RunAsync(new[] { "--reconcile-once" }, new StringWriter(), Broken));
+
+        Assert.Contains("the disk went away", File.ReadAllText(AppPaths.LogFile));
+    }
 }
