@@ -201,8 +201,13 @@ async function posixGroupLeft(entry) {
  * because Windows reuses ids quickly every link is checked against when the
  * process started. The command itself must have started when it was spawned;
  * its children no earlier than that, and no later than it was seen to end; and
- * everything further down no earlier than the command did. A process that does
- * not fit is somebody else's that happens to have an id the tree once used.
+ * everything further down no earlier than the command did, nor than the
+ * process it names as its parent. A process that does not fit is somebody
+ * else's that happens to have an id the tree once used.
+ *
+ * A command nobody saw end, because its agent died first, has no end to bound
+ * its children by. When a newer process holds its id by now, the command ended
+ * before that process started, and a child born since is the newer process's.
  */
 function windowsTreeScript(entry, { treeOf = true, stop = false } = {}) {
   const spawned = Date.parse(entry.startedAt);
@@ -216,18 +221,24 @@ function windowsTreeScript(entry, { treeOf = true, stop = false } = {}) {
     `$root = ${Number(entry.pid)}`,
     `$from = ${spawned - SAME_PROCESS_SLACK_MS}`,
     `$rootBy = ${spawned + SAME_PROCESS_SLACK_MS}`,
-    `$childBy = ${parentEnded}`,
+    `$endedBy = ${parentEnded}`,
     'function Born($process) { if ($process.CreationDate) { ([DateTimeOffset]$process.CreationDate).ToUnixTimeMilliseconds() } else { -1 } }',
     'function Left {',
     '  $all = @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ProcessId -ne $PID })',
+    '  $childBy = $endedBy',
+    '  foreach ($holder in @($all | Where-Object { $_.ProcessId -eq $root -and (Born $_) -gt $rootBy })) {',
+    '    $taken = (Born $holder) - 1',
+    '    if ($childBy -lt 0 -or $taken -lt $childBy) { $childBy = $taken }',
+    '  }',
     '  $found = @{}',
     `  $frontier = @($all | Where-Object { $born = Born $_; $born -ge $from -and (${roots}) })`,
     '  while ($frontier.Count -gt 0) {',
     '    foreach ($process in $frontier) { $found[[string]$process.ProcessId] = $true }',
     ...(treeOf
       ? [
-        '    $parents = @($frontier | ForEach-Object { $_.ProcessId })',
-        '    $frontier = @($all | Where-Object { -not $found.ContainsKey([string]$_.ProcessId) -and ($parents -contains $_.ParentProcessId) -and (Born $_) -ge $from })',
+        '    $parents = @{}',
+        '    foreach ($process in $frontier) { $since = Born $process; if ($since -lt $from) { $since = $from }; $parents[[string]$process.ProcessId] = $since }',
+        '    $frontier = @($all | Where-Object { $parent = [string]$_.ParentProcessId; -not $found.ContainsKey([string]$_.ProcessId) -and $parents.ContainsKey($parent) -and (Born $_) -ge $parents[$parent] })',
       ]
       : ['    $frontier = @()']),
     '  }',
@@ -290,6 +301,14 @@ async function windowsLeft(entry, options = {}) {
  * names: one naming this process's id that it did not write was written by an
  * agent that died and left the id free, and an agent that is still alive
  * counts as another all the same.
+ *
+ * Among what such an entry holds the machine for is a daemon a start command
+ * had launched before its agent died, or the app a configured action had
+ * opened: nothing on Windows tells either apart from a child the command had
+ * not finished with, and a child like that going on unwatched is the overlap
+ * the ledger is there to prevent. It holds the machine for as long as it runs,
+ * until somebody stops it or restarts the machine; replacing the agent still
+ * goes ahead.
  *
  * Nothing outlives a reboot, and anything the agent cannot read counts as
  * running.

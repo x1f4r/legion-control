@@ -422,8 +422,20 @@ test('a process id handed to a newer process, or a reboot since, does not hold t
     const hour = 60 * 60 * 1000;
     const written = new Date(Date.now() - hour).toISOString();
     // A process started just now, so long after the entry was written that it
-    // cannot be the command the entry names, and with no children of its own.
-    const newer = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+    // cannot be the command the entry names, with a child of its own. On
+    // Windows an entry nobody saw end is judged by its whole tree, and the
+    // child names the entry's process id as its parent; but it was born after
+    // the newer process took that id, so it is that process's. It used to
+    // hold the machine for as long as it ran.
+    const newer = spawn(process.execPath, ['-e', "const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); process.stdout.write(child.pid + '\\n'); setInterval(() => {}, 1000)"], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let printed = '';
+    newer.stdout.setEncoding('utf8');
+    for await (const chunk of newer.stdout) {
+      printed += chunk;
+      if (printed.includes('\n')) break;
+    }
+    const grandchild = Number(printed.trim());
+    assert.ok(Number.isInteger(grandchild) && grandchild > 0);
     const base = { platform: process.platform, command: 'node', endedAt: null, agentPid: deadPid(), opId: null, kind: null, service: null, phase: null, opStartedAt: null };
     fs.mkdirSync(path.dirname(ledgerPath()), { recursive: true });
     fs.writeFileSync(ledgerPath(), JSON.stringify({
@@ -444,6 +456,7 @@ test('a process id handed to a newer process, or a reboot since, does not hold t
         else process.env[name] = value;
       }
       newer.kill('SIGKILL');
+      try { process.kill(grandchild, 'SIGKILL'); } catch { /* already gone */ }
     }
     assert.deepEqual(ledger(), []);
   });
