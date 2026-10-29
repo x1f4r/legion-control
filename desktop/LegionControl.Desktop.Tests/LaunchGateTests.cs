@@ -658,6 +658,37 @@ public class LaunchGateTests
         Assert.Equal(LaunchDocuments.Tower, Gated(window, "tower", "linux").Agent);
     }
 
+    /// A peer's command for tower waits. Then the file is edited by hand, keeping its controller
+    /// block: tower's shell changed, the waiting command copied onto a new system, and pi given a
+    /// launcher of the person's own.
+    [Fact]
+    public void AHandEditApprovesNeitherAWaitingCommandItReshellsNorOneItCopies()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        using var app = Device(home, "laptop", applied: d0);
+        var offered = new[] { "sh", "-c", "touch /tmp/x" };
+        var d1 = LaunchDocuments.Descendant(d0, root => LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv(offered));
+        Assert.Null(app.Config.Apply(d1, "adopted from pi"));
+
+        var edited = JsonNode.Parse(d1.Text)!.AsObject();
+        LaunchDocuments.System(edited, "tower", "linux")["shell"] = "powershell";
+        LaunchDocuments.Machine(edited, "tower")["systems"]!.AsArray().Add(new JsonObject
+        {
+            ["id"] = "spare", ["name"] = "Spare", ["platform"] = "linux", ["shell"] = "posix", ["agent"] = LaunchDocuments.Argv(offered),
+        });
+        LaunchDocuments.System(edited, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/srv/pi/bin/launcher.mjs");
+        File.WriteAllText(app.Config.Path, edited.ToJsonString());
+        app.Config.Load();
+
+        Assert.Contains(d1.Hash, app.Config.Document!.Identity.Lineage);
+        Assert.Equal(new[] { LaunchValues.SystemPath("tower", "linux"), LaunchValues.SystemPath("tower", "spare") },
+            app.LaunchReview.Select(entry => entry.Path));
+        Assert.Equal(LaunchDocuments.Tower, Gated(app, "tower", "linux").Agent);
+        Assert.Equal(LaunchState.NotDriven, Gated(app, "tower", "spare").LaunchState);
+        Assert.Equal(new[] { "node", "/srv/pi/bin/launcher.mjs" }, Gated(app, "pi", "linux").Agent);
+    }
+
     [Fact]
     public void ARecordThatIsGoneWhileTheAppRunsApprovesNothingUntilTheNextStart()
     {

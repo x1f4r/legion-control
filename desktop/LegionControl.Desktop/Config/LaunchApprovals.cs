@@ -88,6 +88,10 @@ public sealed class LaunchApprovals
     /// An edit that arrives before the seed (a hand edit found while the setup is loaded at the
     /// start) seeds from the document it was made to, then approves the edit on top. One that
     /// arrives later over a missing record approves only what it changed.
+    ///
+    /// What waited for review in the document the edit was made to stays waiting (see
+    /// [LeavingWaiting]). An edit whose starting point cannot be read approves nothing, because
+    /// nobody can say what it changed.
     public string? RecordLocalEdit(byte[]? before, ControllerDocument after)
     {
         LaunchProjection? previous;
@@ -97,16 +101,30 @@ public sealed class LaunchApprovals
         }
         catch (Canonical.NotUtf8)
         {
-            previous = null;
+            return null;
         }
         var changes = LaunchValues.Changes(previous, LaunchProjection.Of(after));
         return Change(current =>
         {
             if (current.Missing && !_started)
                 return Apply(LaunchRecord.Seeded(previous ?? LaunchProjection.Empty, before is null ? "none" : Canonical.Hash(before)), changes);
-            return changes.Count == 0 ? null : Apply(current.Record ?? LaunchRecord.Empty(), changes);
+            var record = current.Record ?? LaunchRecord.Empty();
+            var approved = previous is null ? changes : LeavingWaiting(changes, LaunchValues.Review(record, previous));
+            return approved.Count == 0 ? null : Apply(record, approved);
         }, setAside: true);
     }
+
+    /// The changes of a local edit less the two that would approve a value nobody here chose, given
+    /// what waited for review before it: a value that waits somewhere, carried to another place,
+    /// and a new tuple at a system whose own tuple waits, which is what an edit to the shell of a
+    /// peer's command makes of that command. The editors refuse both edits outright. A hand edit of
+    /// the file is already written by the time it is read, so it applies, and the values it carried
+    /// wait for review like any other.
+    private static IReadOnlyList<LaunchChange> LeavingWaiting(IReadOnlyList<LaunchChange> changes, IReadOnlyList<LaunchReviewEntry> waiting) =>
+        changes.Where(change => !waiting.Any(entry => entry.Scope == change.Scope
+            && (JsonNode.DeepEquals(entry.Offered, change.Value)
+                || (change.Scope == LaunchScope.System && entry.MachineId == change.MachineId && entry.SystemId == change.SystemId))))
+            .ToList();
 
     /// Records exactly the values the entries showed, at their places. An entry that cannot be
     /// approved is skipped: a value that cannot be shown faithfully can only be reverted or left.
