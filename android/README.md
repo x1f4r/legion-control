@@ -204,7 +204,7 @@ unavailable, with probe errors under Details; the phone does not retain a teleme
 history remains readable when the machine is offline. Diagnostics offers address checks, agent
 checks and an explicit deep check; logs and secondary results are shown on demand.
 
-Four things about the actions are worth knowing.
+Five things about the actions are worth knowing.
 
 **Update now is dead unless a newer version was actually found**: an agent that could not reach
 the registry does not know, and an update pressed on the strength of an unknown stops the
@@ -225,6 +225,12 @@ id before anything leaves the phone, the record survives the app being closed, a
 the machine what became of that id rather than repeating the command. Being told to reboot is
 not the same as having rebooted: the row says the outcome is not known until the machine answers
 as the system that was asked for.
+
+**Locking the phone does not stop a change.** While one is being sent or watched, the app keeps
+itself running with a quiet "Seeing a change through" notification, which goes once the machine
+has said how the change ended or after half an hour of not saying. With *Finished changes* on,
+the outcome is announced only when you are not looking at the app, and tapping it opens the
+machine.
 
 ## Editing the setup
 
