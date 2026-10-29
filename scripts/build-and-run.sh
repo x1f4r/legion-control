@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# Build the Mac app into mac/build and run that copy, for working on the app. The Run action of
+# .codex/environments/environment.toml runs it.
+#
+#   ./scripts/build-and-run.sh             stop the copy started before, build, open the new one
+#   ./scripts/build-and-run.sh --debug     the same with a debug build, and lldb attached to it
+#   ./scripts/build-and-run.sh --logs      the same, then stream the app's log (--telemetry too)
+#   ./scripts/build-and-run.sh --verify    the same, and fail unless the app is still running
+#
+# Nothing is installed, and a copy in /Applications keeps running beside this one. With
+# LEGION_CONTROL_HOME set, the app is opened on that state instead of the real one.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 MODE="${1:-run}"
