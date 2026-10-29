@@ -127,11 +127,34 @@ function changeLedger(mutate) {
   return changed;
 }
 
-/** When a process started, from ps, or null when ps cannot say. */
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * A start time as `ps -o lstart=` prints it in the C locale, "Thu Oct 29
+ * 10:15:42 2026" in local time, in milliseconds; null for anything else.
+ */
+export function parseProcessStart(text) {
+  const match = /^\s*[A-Z][a-z]{2}\s+([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(String(text ?? ''));
+  const month = match ? MONTHS.indexOf(match[1]) : -1;
+  if (month < 0) return null;
+  const [day, hours, minutes, seconds, year] = match.slice(2).map(Number);
+  return new Date(year, month, day, hours, minutes, seconds).getTime();
+}
+
+/**
+ * When a process started, from ps, or null when ps cannot say.
+ *
+ * ps prints the time in the format of its locale, and an ssh session passes on
+ * whatever locale its client had: a start time in German reads as no start
+ * time at all, a reused process id then never looks reused, and its entry holds
+ * the machine until the next reboot. So ps is always asked in the C locale.
+ */
 async function processStartedAt(pid) {
-  const result = await runCommandAsync('ps', ['-o', 'lstart=', '-p', String(pid)], { timeoutMs: 5000 });
-  const parsed = Date.parse(result.stdout.trim());
-  return result.ok && !Number.isNaN(parsed) ? parsed : null;
+  const result = await runCommandAsync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+    timeoutMs: 5000,
+    env: { ...process.env, LC_ALL: 'C' },
+  });
+  return result.ok ? parseProcessStart(result.stdout) : null;
 }
 
 /** A newer process now holds this id: the one the entry names started well before it. */

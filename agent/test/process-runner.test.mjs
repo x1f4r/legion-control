@@ -16,7 +16,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { producedOutcome } from '../src/contract.mjs';
 import { withOperation } from '../src/operate.mjs';
 import { beginOperation, bootIdentity, readOperation, updateOperation, wireRecord } from '../src/operations.mjs';
-import { ledgerPath, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
+import { ledgerPath, parseProcessStart, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
 import { deadPid, withHome } from './helpers.mjs';
 
 const posix = process.platform !== 'win32';
@@ -332,13 +332,29 @@ test('a process id handed to a newer process, or a reboot since, does not hold t
         { ...base, id: 'rebooted', pid: newer.pid, group: posix ? newer.pid : null, state: 'unconfirmed', startedAt: new Date().toISOString(), bootId: 'an-earlier-boot' },
       ],
     }));
+    // In whatever locale the ssh session handed on: ps prints its start time
+    // in that, and a time nobody can read never looks like a newer process.
+    const locale = { LANG: process.env.LANG, LC_ALL: process.env.LC_ALL, LC_TIME: process.env.LC_TIME };
+    Object.assign(process.env, { LANG: 'de_DE.UTF-8', LC_ALL: 'de_DE.UTF-8', LC_TIME: 'de_DE.UTF-8' });
     try {
       assert.equal(await unsettledWork(), null);
     } finally {
+      for (const [name, value] of Object.entries(locale)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
       newer.kill('SIGKILL');
     }
     assert.deepEqual(ledger(), []);
   });
+});
+
+test('a start time is read only as ps prints it in the C locale', () => {
+  assert.equal(parseProcessStart('Thu Oct 29 10:15:42 2026\n'), new Date(2026, 9, 29, 10, 15, 42).getTime());
+  assert.equal(parseProcessStart('  Thu Oct  1 09:05:02 2026  '), new Date(2026, 9, 1, 9, 5, 2).getTime());
+  for (const text of ['Do. 29 Okt. 10:15:42 2026', 'jeu. 29 oct. 2026 10:15:42', 'Thu Okt 29 10:15:42 2026', '', null]) {
+    assert.equal(parseProcessStart(text), null, String(text));
+  }
 });
 
 test('a ledger that cannot be read keeps every mutation from starting', async () => {
