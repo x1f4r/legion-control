@@ -131,4 +131,43 @@ public class StateMergeTests
         Assert.Equal("setup-a", store.Document?.Identity.Id);
         store.Dispose();
     }
+
+    [Fact]
+    public void AnOperationsListThatCouldNotBeOpenedOnceIsReadAgainOnTheNextCheck()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        new OperationTracker(path).Begin("abcdefab-1234-4567-8901-abcdefabcdef", "pi", "linux", new OperationIntent("update", "t3"));
+        OperationTracker tracker;
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            tracker = new OperationTracker(path);
+            Assert.Empty(tracker.All);
+        }
+        Assert.True(tracker.ReloadIfChanged());
+        Assert.Single(tracker.All);
+    }
+
+    [Fact]
+    public void ApprovalsThatCouldNotBeOpenedOnceAreReadAgainAndNeverSetAside()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "approved-launch.json");
+        var document = Documents.Make("setup-a", 1, Array.Empty<string>());
+        Assert.Null(new LaunchApprovals(path).SeedIfMissing(document));
+        var seeded = File.ReadAllText(path);
+
+        LaunchApprovals approvals;
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            approvals = new LaunchApprovals(path);
+            Assert.Null(approvals.Record);
+            // Unread is not unreadable: an approval made now writes nothing and moves nothing aside.
+            Assert.NotNull(approvals.ApproveAll(document));
+        }
+        Assert.Empty(SetAside(path));
+        Assert.Equal(seeded, File.ReadAllText(path));
+        Assert.True(approvals.ReloadIfChanged());
+        Assert.NotNull(approvals.Record);
+    }
 }

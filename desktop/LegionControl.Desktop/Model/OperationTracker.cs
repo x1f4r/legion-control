@@ -462,9 +462,10 @@ public sealed class OperationTracker
         }
         catch (Exception)
         {
-            // A list that cannot be read this time is read again next time. Nothing here is worth
-            // refusing to start over, and the machines are asked about what they are running on
-            // the next status anyway.
+            // A list that cannot be read this time is read again on the next check, not taken for
+            // read until the file changes. Nothing here is worth refusing to start over, and the
+            // machines are asked about what they are running on the next status anyway.
+            _signature = null;
             return null;
         }
     }

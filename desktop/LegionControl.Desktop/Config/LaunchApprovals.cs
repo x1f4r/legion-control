@@ -217,7 +217,10 @@ public sealed class LaunchApprovals
             {
                 Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path) ?? ".");
                 using var held = Lock();
-                var (record, problem) = Read();
+                var (record, problem, unread) = Read();
+                // A file that could not be opened this once is not one that cannot be read: it is
+                // neither set aside nor written over, and the change waits for the next try.
+                if (unread) throw new IOException(problem);
                 var unreadable = problem is not null;
                 var next = change(new OnDisk(unreadable && setAside ? LaunchRecord.Empty() : record, record is null && !unreadable));
                 if (next is not null && unreadable && setAside)
@@ -268,8 +271,12 @@ public sealed class LaunchApprovals
 
     private void Reload()
     {
-        _signature = Signature();
-        var (record, problem) = Read();
+        // Taken before the read, and kept only when the file was read: one that a virus scanner
+        // or a writer held open for that one read is read again on the next check, rather than
+        // taken for a record that cannot be read until it changes.
+        var signature = Signature();
+        var (record, problem, unread) = Read();
+        _signature = unread ? null : signature;
         Record = record;
         IsMissing = record is null && problem is null;
         Problem = problem ?? (IsMissing && _started
@@ -279,21 +286,24 @@ public sealed class LaunchApprovals
             : null);
     }
 
-    private (LaunchRecord? Record, string? Problem) Read()
+    /// The record, or why there is none. [Unread] is a file that could not be opened or read this
+    /// time, which says nothing about what it holds.
+    private (LaunchRecord? Record, string? Problem, bool Unread) Read()
     {
-        if (!File.Exists(Path)) return (null, null);
+        if (!File.Exists(Path)) return (null, null, false);
         try
         {
             if (JsonNode.Parse(File.ReadAllText(Path)) is not JsonObject json)
-                return (null, $"The approved commands in {Path} are not a JSON object, so nothing counts as approved.");
+                return (null, $"The approved commands in {Path} are not a JSON object, so nothing counts as approved.", false);
             if (json["schema"] is not JsonValue schema || schema.GetValueKind() != JsonValueKind.Number
                 || !schema.TryGetValue<int>(out var version) || version != 1)
-                return (null, $"The approved commands in {Path} use a format this build does not know, so nothing counts as approved.");
-            return (new LaunchRecord(json), null);
+                return (null, $"The approved commands in {Path} use a format this build does not know, so nothing counts as approved.", false);
+            return (new LaunchRecord(json), null, false);
         }
         catch (Exception error)
         {
-            return (null, $"The approved commands in {Path} could not be read ({error.Message}), so nothing counts as approved.");
+            return (null, $"The approved commands in {Path} could not be read ({error.Message}), so nothing counts as approved.",
+                error is IOException or UnauthorizedAccessException);
         }
     }
 
