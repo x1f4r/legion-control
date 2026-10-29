@@ -115,15 +115,21 @@ public sealed class ConfigStore : IDisposable
 
     private void LoadCore()
     {
-        _lastSignature = Signature(Path);
+        // Taken before the read, so a write that lands in between is read again next time, and
+        // kept only once the read succeeded: a file that could not be read this once, held open by
+        // an editor saving it or a virus scanner, is read again on the next check rather than
+        // taken for read until it changes again.
+        var signature = Signature(Path);
 
         byte[] data;
         try
         {
             data = File.ReadAllBytes(Path);
+            _lastSignature = signature;
         }
         catch (Exception)
         {
+            _lastSignature = null;
             IsMissing = true;
             // Not an error worth showing: no file is the state a fresh install is in, and the setup
             // page says what to do about it. An earlier document is kept, so a file being rewritten
@@ -272,8 +278,10 @@ public sealed class ConfigStore : IDisposable
     {
         var signature = Signature(StatePath);
         if (signature == _appliedSignature) return;
+        // As the setup file: only a read that succeeded counts as having read it.
+        if (AppliedSetup.TryLoad(StatePath) is not { } applied) return;
         _appliedSignature = signature;
-        _applied = AppliedSetup.Load(StatePath);
+        _applied = applied;
     }
 
     /// Rewrites only the `controller` block of the file on disk, keeping everything else exactly as
@@ -588,7 +596,11 @@ public sealed record AppliedSetup
         && Revision == identity.RevisionNumber
         && Lineage.SequenceEqual(identity.Lineage, StringComparer.Ordinal);
 
-    public static AppliedSetup Load(string path)
+    public static AppliedSetup Load(string path) => TryLoad(path) ?? new AppliedSetup();
+
+    /// What [path] says was applied, nothing when there is no file, or null when it is there but
+    /// could not be read this time.
+    public static AppliedSetup? TryLoad(string path)
     {
         try
         {
@@ -604,7 +616,7 @@ public sealed record AppliedSetup
         }
         catch (Exception)
         {
-            return new AppliedSetup();
+            return null;
         }
     }
 

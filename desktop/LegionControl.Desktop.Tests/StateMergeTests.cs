@@ -112,4 +112,23 @@ public class StateMergeTests
         tracker.Update(tracker.All[0] with { Phase = "installing" });
         Assert.Single(SetAside(path));
     }
+
+    [Fact]
+    public void ASetupFileThatCouldNotBeReadOnceIsReadAgainOnTheNextCheck()
+    {
+        using var home = new TempHome();
+        File.WriteAllBytes(home.ConfigPath, Documents.Make("setup-a", 1, Array.Empty<string>()).Bytes);
+        ConfigStore store;
+        // Held open by something else while the store first looks, as an editor saving it or a
+        // virus scanner reading it can.
+        using (new FileStream(home.ConfigPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            store = new ConfigStore(home.ConfigPath, watch: false);
+            Assert.Null(store.Document);
+        }
+        // Same time, same size: only a store that never took that failed read for a read sees it.
+        store.ReloadIfChanged();
+        Assert.Equal("setup-a", store.Document?.Identity.Id);
+        store.Dispose();
+    }
 }
