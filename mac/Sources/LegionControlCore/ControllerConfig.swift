@@ -429,8 +429,10 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
     /// On a model the app runs, this and `agent` are the launch gate's (LaunchGate.swift): the tuple
     /// this device approved, whatever the document says now.
     var grammar: Result<CommandGrammar, CommandLineRefusal>
-    /// Whether this device runs this system's command, and which one. Never decoded: it is set by
-    /// the launch gate, and a system built rather than decoded is taken as approved.
+    /// Whether this device runs this system's command, and which one. Never read from a document:
+    /// a decoded system starts not driven, so the launch gate is the only thing that makes one
+    /// runnable, and a transport built from the document as it arrived rather than the gated model
+    /// sends nothing. A system built in code rather than decoded is taken as approved.
     var launchState: LaunchState = .approved
 
     private enum CodingKeys: String, CodingKey {
@@ -448,6 +450,7 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
         restricted = try container.decodeIfPresent(Bool.self, forKey: .restricted)
         grammar = CommandGrammar.resolve(platform: platform, shell: shell, restricted: restricted,
                                          restrictedSession: false, agentLength: agent.count)
+        launchState = .notDriven
     }
 
     /// Used by the tests and by the guided setup, which build systems rather than decode them.

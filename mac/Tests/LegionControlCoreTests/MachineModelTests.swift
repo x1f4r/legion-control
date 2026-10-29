@@ -759,7 +759,7 @@ struct MachineModelTests {
         // Waking used to be read off the activity line, compared with the machine's name as it is
         // now. An edit lands on the busy model since the setup stopped replacing it, so a rename
         // mid-wake turned the button back to "Wake" while the wake was still running.
-        let setup = try JSONDecoder().decode(ControllerConfig.self, from: Data("""
+        let document = Data("""
         { "version": 1, "machines": [
           { "id": "pi", "name": "Pi",
             "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.5", "user": "me" } ],
@@ -768,7 +768,13 @@ struct MachineModelTests {
           { "id": "hub", "name": "Hub",
             "endpoints": [ { "id": "lan", "kind": "lan", "host": "10.0.0.7", "user": "me" } ],
             "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] } ] }
-        """.utf8)).validated()
+        """.utf8)
+        // The setup as the app runs it, through the launch gate with all of it approved: a system
+        // read straight from a document is not driven, so the hub would never be asked anything.
+        let setup = LaunchGate.effective(
+            try JSONDecoder().decode(ControllerConfig.self, from: document).validated(), document: document,
+            record: LaunchValues.approvals(from: try JSONSerialization.jsonObject(with: document), seededFrom: "none")
+        ).config
         let pi = try #require(setup.machine(id: "pi"))
         let hubEntry = try #require(setup.machine(id: "hub"))
         let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-model-\(UUID().uuidString)")

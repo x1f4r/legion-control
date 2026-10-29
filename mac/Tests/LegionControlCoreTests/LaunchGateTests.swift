@@ -743,6 +743,21 @@ struct LaunchGateTests {
                 == .failure(CommandLineRefusal("restricted-agent-shape")))
     }
 
+    @Test("a system read from a document is not driven until the gate says so, so only the gated model reaches ssh")
+    func decodedSystemsAreNotDriven() throws {
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try Self.app(try Self.held(), in: home)
+
+        let applied = try #require(app.config.config?.machine(id: "tower"))
+        #expect(applied.systems.allSatisfy { $0.launchState == .notDriven })
+        #expect(RemoteAgent.attempts(machine: applied, preferredSystem: nil, preferredRoute: nil).isEmpty)
+
+        let gated = try #require(app.machine(id: "tower")?.machine)
+        #expect(gated.systems.allSatisfy { $0.launchState == .approved })
+        #expect(RemoteAgent.attempts(machine: gated, preferredSystem: nil, preferredRoute: nil).count == 2)
+    }
+
     @Test("a system this device has not approved is never bootstrapped over a 2.x agent")
     func notDrivenIsNeverBootstrapped() async throws {
         let runner = MachineModelTests.FakeRunner()
