@@ -39,7 +39,10 @@ data class MachineSystem(
      * reported a restricted session can only ever move it to [RemoteShell.DISPATCH] at run time.
      */
     val grammar: RemoteShell? = RemoteShell.POSIX,
-    /** Why [grammar] is null: `unknown-shell` or `restricted-agent-shape`. */
+    /**
+     * Why no line can be written for the command the setup offers here, `unknown-shell` or
+     * `restricted-agent-shape`, when that is why it is not driven.
+     */
     val grammarRefusal: String? = null,
     /**
      * Whether this device approved the command it runs here (contract section 9.9).
@@ -50,6 +53,11 @@ data class MachineSystem(
      * words rather than by the empty argv alone.
      */
     val launchState: LaunchState = LaunchState.APPROVED,
+    /**
+     * Whether the command the setup offers here waits for an approval this device can give: for a
+     * system that is not driven, the one thing that would make it driven.
+     */
+    val awaitsApproval: Boolean = false,
 ) {
     /**
      * A system the agent named that the configuration does not have. It can still be reported and
@@ -152,7 +160,9 @@ private fun MachineConfig.toMachine(): Machine {
             platform = Platform.fromWire(system.platform),
             agent = if (driven) system.agent else emptyList(),
             grammar = system.grammar.takeIf { driven },
+            grammarRefusal = system.grammarRefusal.takeUnless { driven },
             launchState = if (driven) system.launchState else LaunchState.NOT_DRIVEN,
+            awaitsApproval = system.awaitsApproval,
         )
     }
     val endpoints = endpoints.map { endpoint ->

@@ -44,7 +44,9 @@ object LaunchGate {
      * typed model, which a lenient decoder fills in. A system is matched to its tuple by its machine
      * and system ids, and one the projection does not have, such as an id that is not a string in
      * the document, is not driven. A system that runs gets the approved argv and grammar; any other
-     * gets no argv at all, so no command line can be built for it.
+     * gets no argv at all, so no command line can be built for it, and keeps why: whether what the
+     * setup offers there waits for an approval this device can give, and the refusal of a grammar
+     * no line can be written in. That is what a command refused for it says.
      */
     fun effective(config: ControllerConfig?, document: JsonObject?, record: JsonObject): Effective {
         val projection = LaunchValues.projection(document)
@@ -53,7 +55,7 @@ object LaunchGate {
 
         val decided = LaunchValues.effective(record, projection)
         val runs = decided.filter { it.scope == LaunchScope.SYSTEM }.associateBy { it.machineId to it.systemId }
-        val waiting = review.filter { it.scope == LaunchScope.SYSTEM }.map { it.machineId to it.systemId }.toSet()
+        val waiting = review.filter { it.scope == LaunchScope.SYSTEM }.associateBy { it.machineId to it.systemId }
         val machines = config.machines.map { machine ->
             machine.copy(
                 systems = machine.systems.map { system ->
@@ -61,8 +63,15 @@ object LaunchGate {
                     val tuple = runs[place]?.tuple
                     val agent = tuple?.agent
                     val grammar = RemoteShell.fromGrammar(tuple?.grammar)
+                    val awaitsApproval = waiting[place]?.approvable == true
                     if (agent == null || grammar == null) {
-                        system.copy(agent = emptyList(), grammar = null, launchState = LaunchState.NOT_DRIVEN)
+                        system.copy(
+                            agent = emptyList(),
+                            grammar = null,
+                            launchState = LaunchState.NOT_DRIVEN,
+                            grammarRefusal = projection.machine(machine.id)?.system(system.id)?.tuple?.grammarRefusal,
+                            awaitsApproval = awaitsApproval,
+                        )
                     } else {
                         system.copy(
                             agent = agent,
@@ -72,6 +81,7 @@ object LaunchGate {
                             } else {
                                 LaunchState.APPROVED
                             },
+                            awaitsApproval = awaitsApproval,
                         )
                     }
                 },

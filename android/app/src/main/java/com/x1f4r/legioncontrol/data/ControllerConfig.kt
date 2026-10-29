@@ -233,6 +233,13 @@ data class SystemConfig(
      * configuration that never went through the gate drives nothing.
      */
     @Transient val launchState: LaunchState = LaunchState.NOT_DRIVEN,
+    /**
+     * Why no line can be written for the command the setup offers here: the code of its tuple's
+     * `refused:<code>` grammar (contract section 15.1), as the launch gate read it, or null.
+     */
+    @Transient val grammarRefusal: String? = null,
+    /** Whether the command the setup offers here waits for an approval this device can give. */
+    @Transient val awaitsApproval: Boolean = false,
 )
 
 @Serializable

@@ -566,6 +566,9 @@ data class LaunchTuple(
 ) {
     val isInert: Boolean get() = agent == null
 
+    /** The section 15.1 refusal code when [grammar] is `refused:<code>`, and null otherwise. */
+    val grammarRefusal: String? get() = grammar?.takeIf { it.startsWith(REFUSED) }?.removePrefix(REFUSED)
+
     /**
      * Whether this tuple can be run: every argv item shown faithfully, and a grammar section 15.2
      * writes lines in. A tuple that cannot is never run, wherever it is recorded.
@@ -581,6 +584,8 @@ data class LaunchTuple(
 
     companion object {
         val INERT = LaunchTuple(null, null)
+
+        private const val REFUSED = "refused:"
 
         /** The tuple a record holds, or null when it is not one: a non-empty argv of strings and a grammar. */
         fun from(element: JsonElement?): LaunchTuple? {

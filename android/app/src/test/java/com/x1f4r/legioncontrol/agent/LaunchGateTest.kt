@@ -100,6 +100,26 @@ class LaunchGateTest {
     private fun enrolled(prefs: MemoryPreferences = MemoryPreferences(), text: String = HELD): ConfigStore =
         store(prefs).also { assertEquals(null, it.applyEnrolment(text, "Test phone")) }
 
+    /** [root] with a machine called Nas added by a peer, whose one system runs [agent]. */
+    private fun withNas(root: JsonObject, agent: List<String>): JsonObject {
+        val nas = buildJsonObject {
+            put("id", "nas")
+            put("name", "Nas")
+            put("endpoints", JsonArray(listOf(buildJsonObject { put("id", "lan"); put("kind", "lan"); put("host", "192.0.2.50"); put("user", "me"); put("port", 22) })))
+            put("systems", JsonArray(listOf(buildJsonObject { put("id", "linux"); put("platform", "linux"); put("agent", LaunchDocuments.argv(agent)) })))
+        }
+        return JsonObject(root + ("machines" to JsonArray(root["machines"]!!.jsonArray + nas)))
+    }
+
+    /** What [machineId] is refused with when it is asked for its status, and that nothing was sent. */
+    private suspend fun ConfigStore.refusedStatus(machineId: String): AgentFailure.BadRequest {
+        val transport = Recording()
+        val failure = runCatching { client(machineId, transport).status() }.exceptionOrNull()
+        assertEquals(emptyList<Sent>(), transport.sent)
+        return failure as? AgentFailure.BadRequest
+            ?: throw AssertionError("a machine with nothing driven was not refused: ${failure ?: "it answered"}")
+    }
+
     // MARK: - The contract's own cases, through the store and the gate
 
     /**
@@ -318,28 +338,38 @@ class LaunchGateTest {
 
         // A machine a peer adds with a launcher nobody here approved is not driven, and nothing is
         // dialled for it at all.
-        store.adopt(
-            descendant(store.text.value) { root ->
-                val nas = buildJsonObject {
-                    put("id", "nas")
-                    put("name", "Nas")
-                    put("endpoints", JsonArray(listOf(buildJsonObject { put("id", "lan"); put("kind", "lan"); put("host", "192.0.2.50"); put("user", "me"); put("port", 22) })))
-                    put("systems", JsonArray(listOf(buildJsonObject { put("id", "linux"); put("platform", "linux"); put("agent", LaunchDocuments.argv(listOf("/usr/bin/node", "/srv/nas/bin/launcher.mjs"))) })))
-                }
-                JsonObject(root + ("machines" to JsonArray(root["machines"]!!.jsonArray + nas)))
-            },
-        )
+        store.adopt(descendant(store.text.value) { withNas(it, listOf("/usr/bin/node", "/srv/nas/bin/launcher.mjs")) })
         assertTrue("machines[nas].systems[linux]" in store.paths())
         val nas = store.launch.value.toMachines().single { it.id == "nas" }
         assertEquals(LaunchState.NOT_DRIVEN, nas.system("linux")!!.launchState)
-        val transport = Recording()
-        try {
-            store.client("nas", transport).status()
-            fail("a machine with nothing approved was asked something")
-        } catch (refused: AgentFailure.BadRequest) {
-            assertEquals("Not driven from this device until its command is approved.", refused.detail)
-        }
-        assertEquals(emptyList<Sent>(), transport.sent)
+        assertEquals("Not driven from this device until its command is approved.", store.refusedStatus("nas").detail)
+    }
+
+    @Test
+    fun `a machine with nothing driven is refused with what would change that`() = runBlocking {
+        // Recorded at enrolment and refused by section 15.1: a restricted key whose command is not an
+        // interpreter and an entry. Nothing waits, so there is nothing to approve; the shape of the
+        // command is what is wrong, and that is what is said.
+        val store = enrolled(text = descendant(HELD) { it.withSystemValue("pi", "linux", "agent", PI + "--verbose") })
+        assertEquals(emptyList<String>(), store.paths())
+        val pi = store.launch.value.toMachines().single { it.id == "pi" }.system("linux")!!
+        assertEquals(LaunchState.NOT_DRIVEN, pi.launchState)
+        assertEquals(RESTRICTED_AGENT_SHAPE, pi.grammarRefusal)
+        assertFalse(pi.awaitsApproval)
+        val shaped = store.refusedStatus("pi")
+        assertEquals("This app cannot write commands for Raspberry Pi OS.", shaped.summary)
+        assertEquals(describeRefusal(RESTRICTED_AGENT_SHAPE, null), shaped.detail)
+
+        // A machine a peer adds with a command that can only be reverted waits for review, and
+        // approving is still not what would drive it.
+        store.adopt(descendant(store.text.value) { withNas(it, listOf("/usr/bin/node", "/srv/nas/\u202Esjm.rehcnual/nib")) })
+        assertEquals(listOf(false), store.launch.value.review.filter { it.machineId == "nas" }.map { it.approvable })
+        val nas = store.launch.value.toMachines().single { it.id == "nas" }.system("linux")!!
+        assertFalse(nas.awaitsApproval)
+        assertEquals(null, nas.grammarRefusal)
+        val unshowable = store.refusedStatus("nas")
+        assertEquals("Nothing on Nas is driven from this device.", unshowable.summary)
+        assertEquals("The setup gives it no command this device can run.", unshowable.detail)
     }
 
     @Test

@@ -762,16 +762,11 @@ class AgentClient(
          */
         onlySystem: MachineSystem? = null,
     ): AgentReply<T> {
-        // Contract section 9.9: nothing is sent to a system this device approved no command for, and
-        // with none approved on the whole machine there is nothing to try on any route. Said in those
-        // words, so the machine is not drawn as one that is asleep.
-        if (overrideArgv == null && machine.systems.isNotEmpty() &&
-            machine.systems.all { it.launchState == LaunchState.NOT_DRIVEN }
-        ) {
-            throw AgentFailure.BadRequest(
-                "Nothing on ${machine.name} is driven from this device.",
-                "Not driven from this device until its command is approved.",
-            )
+        // Contract section 9.9: nothing is sent to a system this device does not drive, and with none
+        // driven on the whole machine there is nothing to try on any route. Said as what would change
+        // that, so the machine is not drawn as one that is asleep.
+        if (overrideArgv == null && machine.systems.isNotEmpty() && machine.systems.none { it.isDriven }) {
+            throw notDriven()
         }
         val deadline = clock() + timeoutMillis
         val walk = AttemptWalk(safety)
@@ -850,19 +845,25 @@ class AgentClient(
             }
         }
 
-        if (attemptsMade == 0) {
-            failures.worthReporting()?.let { throw it }
-            // Not a single system on this machine can be driven: every one either names no agent or
-            // has a shell this app does not write for. Saying "did not answer" would send the user
-            // to look at the network.
-            machine.systems.firstOrNull { it.isConfigured && it.grammar == null }?.let { system ->
-                throw AgentFailure.BadRequest(
-                    "This app cannot write commands for ${system.name}.",
-                    describeRefusal(system.grammarRefusal ?: UNKNOWN_SHELL, null),
-                )
-            }
-        }
         throw failures.worthReporting() ?: AgentFailure.Unreachable(machine.name, routes.probeSummary())
+    }
+
+    /**
+     * Why not a single system on this machine is driven, by what would change it: an approval this
+     * device can give, a shell the setup names that no line can be written for, or a setup that gives
+     * it no command this device could run at all. The machine page says the same of each system.
+     * Saying "did not answer" would send the user to look at the network.
+     */
+    private fun notDriven(): AgentFailure.BadRequest {
+        val nothing = "Nothing on ${machine.name} is driven from this device."
+        if (machine.systems.any { it.awaitsApproval }) {
+            return AgentFailure.BadRequest(nothing, "Not driven from this device until its command is approved.")
+        }
+        for (system in machine.systems) {
+            val refusal = system.grammarRefusal ?: continue
+            return AgentFailure.BadRequest("This app cannot write commands for ${system.name}.", describeRefusal(refusal, null))
+        }
+        return AgentFailure.BadRequest(nothing, "The setup gives it no command this device can run.")
     }
 
     /**

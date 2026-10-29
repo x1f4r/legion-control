@@ -27,7 +27,6 @@ import com.x1f4r.legioncontrol.agent.LaunchState
 import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.humanDuration
-import com.x1f4r.legioncontrol.data.LaunchScope
 import com.x1f4r.legioncontrol.ui.theme.LocalStatusColors
 
 /**
@@ -159,14 +158,13 @@ private fun LaunchStateLines(model: MachineModel, app: AppModel) {
     val systems = model.machine.systems.filter { it.launchState != LaunchState.APPROVED }
     if (systems.isEmpty()) return
     systems.forEach { system ->
-        val waiting = review.any {
-            it.scope == LaunchScope.SYSTEM && it.machineId == model.machine.id && it.systemId == system.id
-        }
+        // What the gate decided, in the words a command refused for this machine uses too. A command
+        // that waits and can only be reverted is not one to wait for.
         val state = when {
             system.launchState == LaunchState.APPROVED_WITH_CHANGE_WAITING ->
                 "Runs the approved command. A changed one is waiting for approval."
 
-            waiting -> "Not driven from this device until its command is approved."
+            system.awaitsApproval -> "Not driven from this device until its command is approved."
             else -> "Not driven from this device: the setup gives it no command this device can run."
         }
         StatusLine(Mark.Attention, if (model.machine.systems.size > 1) "${system.name}: $state" else state)
