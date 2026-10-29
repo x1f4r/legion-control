@@ -89,6 +89,12 @@ final class MacModel: AgentDevice {
 
     var isReachable: Bool { status != nil }
 
+    /// What this Mac's last read of its own agent says about it as a wake helper (section 10.2).
+    var wakeHelperState: WakePlan.HelperState {
+        if status != nil { return .init(.ready, actionKinds: status?.actions.map(WakePlan.HelperState.kinds)) }
+        return failure.map(WakePlan.HelperState.init(after:)) ?? .unknown
+    }
+
     var isBusy: Bool { status?.busy?.isBusy ?? false }
 
     var autoUpdate: Bool? { status?.updates?.automatic ?? status?.autoUpdate }

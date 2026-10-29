@@ -299,8 +299,7 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     /// settled by the pinned host key, on every connection.
     var isOnMachineNetwork: Bool {
         guard let placement = placement?() else { return false }
-        if let site = machine.site { return placement.effective == site }
-        return SiteAwareness.matchesLANPrefix(machine.wake?.lanPrefix, addresses: SiteAwareness.localAddresses())
+        return SiteAwareness.network(of: machine, sites: setup?()?.allSites ?? [], placement: placement).isOn
     }
 
     func refresh(userInitiated: Bool, duringAction: Bool = false) async {
@@ -314,6 +313,7 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         }
 
         if userInitiated { setStatus("Checking \(machine.name).") }
+        let asked = Date()
 
         do {
             let reply = try await agent.status(dialect: dialect, preferring: rebootInProgress?.target ?? commandableSystem, route: lastRoute)
@@ -330,6 +330,9 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
             }
             hostKeyPrompt = nil
             apply(reply.value, fallback: reply.system)
+            // The machine answered, so whatever a helper's command recorded before this read was
+            // doing, it is up: every wake hold for it from before the read ends.
+            operations?.releaseWakeHolds(target: machine.id, before: asked, reason: "\(machine.name) answered")
             // The entry may have been edited while the read was out, and the reply names the route
             // as the entry had it then. Kept as it is, it would put an address back that the edit
             // took away, and the legacy agent install uploads to exactly that address.
@@ -544,137 +547,225 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
 
     // MARK: - Power
 
-    /// What waking this machine would do from where this device is, and what stands in the way.
-    var wakePlan: WakePlan.Plan {
-        let here = placement?() ?? SiteAwareness.Placement(matching: [], confirmed: nil)
-        guard let setup = setup?() else {
-            return WakePlan.Plan(steps: [], unavailable: [], placement: here)
+    /// What this machine's last status read this session says about it as a wake helper, the only
+    /// evidence a wake plan reads about a helper (section 10.2). Never an extra read.
+    var wakeHelperState: WakePlan.HelperState {
+        if !machine.systems.isEmpty, machine.systems.allSatisfy({ $0.launchState == .notDriven }) {
+            return .init(.notDriven, note: "none of its systems is approved on this device, so nothing is sent to it.")
         }
-        var states: [String: WakePlan.HelperState] = [:]
-        for helper in machine.wake?.orderedHelpers ?? [] {
-            if let local = localPeer?(helper.machine) {
-                states[helper.machine] = WakePlan.HelperState(isAwake: true, isCommandable: local.isReachable,
-                                                            canBeWoken: false, lastCheckedAt: local.lastChecked)
-                continue
-            }
-            guard let model = peer?(helper.machine) else { continue }
-            states[helper.machine] = WakePlan.HelperState(
-                isAwake: model.isAwake,
-                isCommandable: model.commandableSystem != nil,
-                canBeWoken: model.canWake,
-                lastCheckedAt: model.lastChecked
-            )
+        switch link {
+        case .unknown:
+            return .unknown
+        case .online:
+            return .init(.ready, actionKinds: status?.actions.map(WakePlan.HelperState.kinds))
+        case .reachableWithoutAgent:
+            return .init(.unusable, note: "it is awake but its control agent is not answering.")
+        case .offline(let failure):
+            return WakePlan.HelperState(after: failure)
         }
-        return WakePlan.plan(
-            for: machine,
-            in: setup,
-            placement: here,
-            addresses: SiteAwareness.localAddresses(),
-            helperStates: states
-        )
     }
 
-    /// Wake the machine: from here when this device is on its network, and through a helper when it
-    /// is not.
+    /// The wake holds this device keeps for this machine, as the plan reads them.
+    var wakeHolds: [WakePlan.Hold] {
+        (operations?.wakeHolds(target: machine.id) ?? []).map { WakePlan.Hold(helper: $0.machineId, action: $0.subject) }
+    }
+
+    /// What waking this machine would do from where this device is, and what stands in the way.
+    var wakePlan: WakePlan.Plan {
+        plan(from: placement?() ?? .nowhere)
+    }
+
+    /// Whether pressing Wake can do anything: there is a step to take, or a hold that the press
+    /// reads again before it plans, which may well leave a step.
+    var canTryWaking: Bool { !wakePlan.isEmpty || !wakeHolds.isEmpty }
+
+    private func plan(from here: SiteAwareness.Placement) -> WakePlan.Plan {
+        guard let setup = setup?() else { return .empty(here) }
+        var states: [String: WakePlan.HelperState] = [:]
+        for helper in machine.wake?.orderedHelpers ?? [] {
+            states[helper.machine] = helperState(helper.machine)
+        }
+        return WakePlan.plan(for: machine, in: setup, placement: here, helpers: states, holds: wakeHolds)
+    }
+
+    /// A helper's state, from whichever model drives it here. A machine this device has no model
+    /// for has never been read.
+    private func helperState(_ id: String) -> WakePlan.HelperState {
+        if let local = localPeer?(id) { return local.wakeHelperState }
+        return peer?(id)?.wakeHelperState ?? .unknown
+    }
+
+    /// The device that drives a helper here, the local Mac included.
+    private func helperDevice(_ id: String) -> (any AgentDevice)? {
+        if let local = localPeer?(id) { return local }
+        return peer?(id)
+    }
+
+    /// Where this device is right now, read from the interfaces again rather than from the last poll:
+    /// a laptop that has just joined another network wakes from where it is.
+    var freshPlacement: (@MainActor () -> SiteAwareness.Placement)?
+
+    /// How the direct step sends its packets. The tests hand in one that writes down what it was
+    /// asked to send and sends nothing.
+    @ObservationIgnored var sendWakePackets: @MainActor (WakeOnLAN.Packets) async -> String? = { await WakeOnLAN.sendMagicPackets($0) }
+
+    /// The clock the readiness polls are timed on. The tests hand in one that moves only when a
+    /// poll waits.
+    @ObservationIgnored var wakeClock = WakeClock.system
+
+    /// Wake the machine: from here when this device is on its network, and through its helpers.
     ///
     /// The helpers are tried in the order the setup lists them and no further than that. Nothing is
     /// ever woken in order to become a helper: a cascade would turn the machine the user is trying
     /// not to run into one that runs whenever anything else needs waking, which is the opposite of
     /// what was asked for. When a helper is itself asleep, the app says so and offers waking it as a
     /// separate, explicit step.
+    ///
+    /// A helper's command whose run may still be going leaves a wake hold, and while one stands only
+    /// a declared `wol` action runs: before planning, each held helper that keeps records is asked
+    /// about it once, and a hold that appears during the walk takes every later command out of it.
     func wake() {
-        guard machine.wake != nil else { return }
-        let plan = wakePlan
-        guard !plan.isEmpty else {
-            setStatus(plan.nothingToTry, isError: true)
+        guard machine.wake != nil else {
+            wakeThenBoot = nil
+            return
+        }
+        // Nothing to try and nothing a press could settle: said without starting anything.
+        let cached = wakePlan
+        if cached.isEmpty, wakeHolds.isEmpty {
+            wakeThenBoot = nil
+            setStatus(cached.nothingToTry, isError: true)
             onStateChange?()
             return
         }
 
         let started = perform("Waking \(machine.name)", kind: .wake, subject: machine.name) { operation in
             defer { self.isWaking = false }
-            var attempts: [String] = []
-
-            for step in plan.steps {
-                switch step {
-                case .direct(let broadcasts, let ports):
-                    self.setStatus("Sending the wake packet to \(self.machine.name).")
-                    guard let wake = self.machine.wake else { continue }
-                    let sent = WakeConfig(mac: wake.mac, broadcast: broadcasts, ports: ports)
-                    if let failure = await WakeOnLAN.sendMagicPackets(sent) {
-                        attempts.append("sending it from here: \(failure)")
-                        continue
-                    }
-                    self.operations?.addPhase(operation, name: "packet sent from this device")
-                    attempts.append("sent from this device to \(broadcasts.joined(separator: ", "))")
-
-                case .helper(let helper, let machineName):
-                    let outcome: WakeActionOutcome
-                    if let local = self.localPeer?(helper.machine) {
-                        outcome = await local.runWakeAction(helper.action, target: self.machine.name)
-                    } else if let host = self.peer?(helper.machine) {
-                        self.setStatus("Asking \(machineName) to wake \(self.machine.name).")
-                        outcome = await host.runWakeAction(helper.action, target: self.machine.name)
-                    } else {
-                        attempts.append("\(machineName): this device has no model for it")
-                        continue
-                    }
-                    self.operations?.addPhase(operation, name: "asked \(machineName)", detail: outcome.summary)
-                    attempts.append("\(machineName): \(outcome.summary)")
-                    if !outcome.sent {
-                        // An ambiguous outcome on anything but a declared magic packet has to be
-                        // settled before something else is tried. A `wol` action is an idempotent UDP
-                        // send and costs three more datagrams to repeat; a general command may do
-                        // anything, and "the link dropped" must not turn one requested action into
-                        // two performed ones.
-                        if let failure = outcome.failure,
-                           !WakePlan.mayTryNextHelper(after: failure, actionIsDeclaredWakePacket: outcome.isDeclaredWakePacket) {
-                            self.setStatus(
-                                "\(machineName) may or may not have run \(helper.action), so no other helper was tried. \(failure.message(machine: machineName))",
-                                isError: true
-                            )
-                            return .init(
-                                state: .unknown,
-                                summary: "Waking \(self.machine.name) through \(machineName) ended in an unknown state, so no other helper was tried.",
-                                detail: attempts.joined(separator: "\n"),
-                                unresolved: true
-                            )
-                        }
-                        continue
-                    }
-                }
-
-                // Something was sent. Readiness is decided by an authenticated agent call, never by
-                // opening a TCP connection to port 22 and dropping it: repeated connections that
-                // never complete authentication are exactly what OpenSSH's per-source penalties are
-                // for, and earning a temporary refusal from the machine you are trying to reach is a
-                // self-inflicted outage.
-                self.setStatus("Waiting for \(self.machine.name) to answer.")
-                if await self.waitUntilAgentAnswers(timeout: 120) {
-                    self.setStatus("\(self.machine.name) is awake.")
-                    self.sleepExpectation = nil
-                    self.continueWakeIntoTargetIfNeeded()
-                    return .init(state: .succeeded, summary: "\(self.machine.name) is awake.",
-                                 detail: attempts.joined(separator: "\n"))
-                }
-                attempts.append("no answer within two minutes")
+            let resolution = await self.walkWakePlan(operation: operation)
+            // Only a machine seen answering goes on into the system it was asked to wake into. Every
+            // other ending lets the request go, so a later wake that does work never boots into a
+            // target nobody asked for this time (M13).
+            if resolution.state == .succeeded {
+                self.continueWakeIntoTargetIfNeeded()
+            } else {
+                self.wakeThenBoot = nil
             }
-
-            // Every step was taken and it is still not answering. A packet leaving is not a machine
-            // waking, and saying otherwise would invent the one fact that matters.
-            self.wakeThenBoot = nil
-            let unavailable = plan.unavailable.map { "\($0.what): \($0.reason)" }
-            self.setStatus("\(self.machine.name) did not come up.", isError: true,
-                           detail: (attempts + unavailable).joined(separator: "\n"))
-            return .init(
-                state: .unknown,
-                summary: "\(self.machine.name) was asked to wake and had not answered two minutes later.",
-                detail: (attempts + unavailable).joined(separator: "\n")
-            )
+            return resolution
         }
         // The work itself starts on a later turn of the main actor, so the flag goes up here, and
         // only when this wake took the device rather than finding another action on it.
-        if started { isWaking = true }
+        if started { isWaking = true } else { wakeThenBoot = nil }
+    }
+
+    /// Release every hold for this machine because a person chose to, then wake it.
+    func tryOtherHelpers() {
+        operations?.releaseWakeHolds(target: machine.id, before: .distantFuture,
+                                     reason: "you chose to try the other helpers anyway")
+        wake()
+    }
+
+    private func walkWakePlan(operation: String) async -> ActionResolution {
+        await settleWakeHolds()
+        let plan = self.plan(from: freshPlacement?() ?? placement?() ?? .nowhere)
+        guard !plan.isEmpty else {
+            setStatus(plan.nothingToTry, isError: true)
+            return .init(state: .failed, summary: plan.nothingToTry)
+        }
+        let entries = machine.wake?.orderedHelpers ?? []
+        var lines: [String] = []
+
+        for step in plan.steps {
+            switch step {
+            case .direct(let broadcasts, let ports):
+                setStatus("Sending the wake packet to \(machine.name).")
+                let packets = WakeOnLAN.Packets(mac: machine.wake?.mac, broadcasts: broadcasts, ports: ports)
+                if let failure = await sendWakePackets(packets) {
+                    // No packet left, so there is nothing to wait for.
+                    lines.append("sending it from here: \(failure)")
+                    continue
+                }
+                operations?.addPhase(operation, name: "packet sent from this device")
+                lines.append("sent from this device to \(broadcasts.joined(separator: ", ")), ports \(ports.map(String.init).joined(separator: ", "))")
+
+            case .helper(let helper, let machineName, let readFirst):
+                // Read once just before its step, when it was not read this session. A helper read
+                // and still not ready is skipped as asleep or as unusable, never asked anyway.
+                var state = helperState(helper.machine)
+                if readFirst {
+                    let device = helperDevice(helper.machine)
+                    if let device {
+                        setStatus("Checking \(machineName) before asking it to wake \(machine.name).")
+                        await device.refreshStatus(duringAction: false)
+                        state = helperState(helper.machine)
+                    }
+                    if state.state == .unknown {
+                        state = .init(.unusable, note: device == nil ? "this device does not drive it."
+                                                                     : "it did not answer the read just before its turn.")
+                    }
+                }
+                // Asked again with what the walk has learnt since it planned: a helper it has just
+                // read, and a hold an earlier step made.
+                guard let setup = setup?() else { continue }
+                let index = entries.firstIndex(of: helper) ?? entries.count
+                if let reason = WakePlan.skipReason(for: helper, target: machine, earlier: entries[..<index],
+                                                    in: setup, state: state, holds: wakeHolds) {
+                    let skip = WakePlan.skip(helper, reason, target: machine, in: setup, state: state)
+                    lines.append("\(skip.what): \(skip.why)")
+                    continue
+                }
+
+                setStatus("Asking \(machineName) to wake \(machine.name).")
+                guard let device = helperDevice(helper.machine) else {
+                    lines.append("\(machineName): this device has no model for it")
+                    continue
+                }
+                let outcome = await device.runWakeAction(helper.action, target: machine.name, targetId: machine.id)
+                operations?.addPhase(operation, name: "asked \(machineName)", detail: outcome.summary)
+                lines.append("\(machineName): \(outcome.summary)")
+                // Anything but `ran` moves straight on. An ambiguous command has left a hold, and
+                // every later step that is not a declared magic packet is skipped for it.
+                guard outcome.sent else { continue }
+            }
+
+            // Something was sent. Readiness is decided by an authenticated agent call, never by
+            // opening a TCP connection to port 22 and dropping it: repeated connections that
+            // never complete authentication are exactly what OpenSSH's per-source penalties are
+            // for, and earning a temporary refusal from the machine you are trying to reach is a
+            // self-inflicted outage.
+            setStatus("Waiting for \(machine.name) to answer.")
+            if await waitUntilAgentAnswers() {
+                setStatus("\(machine.name) is awake.")
+                sleepExpectation = nil
+                return .init(state: .succeeded, summary: "\(machine.name) is awake.",
+                             detail: (lines + plan.skipped.map { "\($0.what): \($0.why)" }).joined(separator: "\n"))
+            }
+            lines.append("no answer within two minutes")
+        }
+
+        // Every step was taken and it is still not answering. A packet leaving is not a machine
+        // waking, and saying otherwise would invent the one fact that matters.
+        let detail = (lines + plan.skipped.map { "\($0.what): \($0.why)" }).joined(separator: "\n")
+        setStatus("\(machine.name) did not come up.", isError: true, detail: detail)
+        return .init(state: .unknown, summary: "\(machine.name) was asked to wake and had not answered two minutes after the last step.",
+                     detail: detail)
+    }
+
+    /// Ask each held helper that keeps records about its command, once, before a wake is planned.
+    ///
+    /// A helper last seen asleep is not asked: the answer would be a timeout, and a hold is never
+    /// released by its helper being unreachable. A 2.x helper keeps no records, so its hold waits
+    /// for this machine to answer, for the helper to leave the setup, or for a person.
+    private func settleWakeHolds() async {
+        guard let operations else { return }
+        for held in operations.wakeHolds(target: machine.id) where held.agentTracked {
+            guard helperState(held.machineId).state != .asleep, let device = helperDevice(held.machineId) else { continue }
+            guard let reply = try? await device.send(try AgentRequest.operation(id: held.id, wait: nil),
+                                                     decoding: AgentOperationResult.self) else { continue }
+            if let record = reply.operation {
+                operations.reconcile(held.id, with: record)
+            } else if reply.isUnknownOperation {
+                operations.resolveAsNeverStarted(held.id)
+            }
+        }
     }
 
     /// Wake this machine and then boot it into a particular system.
@@ -696,18 +787,23 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         requestBoot(into: target)
     }
 
-    /// Poll for the machine by asking the agent a real, authenticated question, backing off between
-    /// tries. Never faster than every three seconds, which is the contract's floor.
-    private func waitUntilAgentAnswers(timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        var wait: TimeInterval = 5
-        while Date() < deadline {
-            try? await Task.sleep(for: .seconds(wait))
+    /// Poll for the machine by asking the agent a real, authenticated question, at the times the
+    /// contract gives: 5 s after the send, then at intervals growing 1.6 times to at most 20 s, for
+    /// two minutes. Never faster than every three seconds, which is the contract's floor.
+    ///
+    /// Each poll is a real one. An address that did not answer is otherwise given a minute before
+    /// it is dialled again, and the polls at 13, 25.8 and 45.8 seconds fell inside the minute the
+    /// first one started, so a machine that came up in twenty seconds was not seen for over sixty.
+    /// A packet has just been sent, and coming up is exactly what the machine is expected to do.
+    private func waitUntilAgentAnswers() async -> Bool {
+        let sent = wakeClock.now()
+        for start in WakePlan.readinessSchedule(sentAnything: true) {
+            let wait = sent.addingTimeInterval(Double(start) / 1000).timeIntervalSince(wakeClock.now())
+            if wait > 0 { await wakeClock.sleep(wait) }
             if Task.isCancelled { return false }
-            if Date() >= deadline { break }
+            for route in machine.routes(bindings: agent.bindings) { agent.backoff.clear(route.target) }
             await refresh(userInitiated: false, duringAction: true)
             if isAwake { return true }
-            wait = min(wait * 1.6, 20)
         }
         return false
     }

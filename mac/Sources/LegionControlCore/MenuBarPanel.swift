@@ -307,9 +307,9 @@ private struct RemoteDeviceRow: View {
                     .disabled(machine.isWorking)
             } else if !machine.isAwake, machine.canWake {
                 Button { machine.wake() } label: { Image(systemName: "power").frame(width: 24, height: 24) }
-                    .help(machine.wakePlan.isEmpty ? machine.wakePlan.nothingToTry : "Wake \(machine.name)")
+                    .help(machine.canTryWaking ? "Wake \(machine.name)" : machine.wakePlan.nothingToTry)
                     .accessibilityLabel("Wake \(machine.name)")
-                    .disabled(machine.isWorking || machine.wakePlan.isEmpty)
+                    .disabled(machine.isWorking || !machine.canTryWaking)
             }
             Menu { actions } label: { Image(systemName: "ellipsis").frame(width: 20, height: 24) }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
@@ -333,8 +333,8 @@ private struct RemoteDeviceRow: View {
                 Button("Restart into \(target.name)…") { machine.requestBoot(into: target) }.disabled(machine.isWorking)
             }
         } else if !machine.isAwake, machine.canWake {
-            Button("Wake") { machine.wake() }.disabled(machine.isWorking || machine.wakePlan.isEmpty)
-            if machine.wakePlan.isEmpty { Text(machine.wakePlan.nothingToTry) }
+            Button("Wake") { machine.wake() }.disabled(machine.isWorking || !machine.canTryWaking)
+            if !machine.canTryWaking { Text(machine.wakePlan.nothingToTry) }
         }
         if !machine.actions.isEmpty {
             Divider()

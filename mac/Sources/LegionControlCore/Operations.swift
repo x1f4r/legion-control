@@ -159,6 +159,10 @@ struct OperationRecord: Codable, Sendable, Equatable, Identifiable {
     var agentProgress: String?
     /// When a queued request stops waiting.
     var expiresAt: Date?
+    /// Set on a helper's wake action that is not a declared `wol`: the machine it was run to wake.
+    /// While it is set the record is a wake hold (section 10.2), and no other helper runs a command
+    /// for that machine; it is cleared when the hold is released. Old builds ignore the key.
+    var wakeTarget: String?
 
     init(
         id: String = UUID().uuidString,
@@ -173,7 +177,8 @@ struct OperationRecord: Codable, Sendable, Equatable, Identifiable {
         startedAt: Date = Date(),
         state: OperationState = .running,
         summary: String,
-        agentTracked: Bool = false
+        agentTracked: Bool = false,
+        wakeTarget: String? = nil
     ) {
         self.id = id
         self.machineId = machineId
@@ -198,6 +203,7 @@ struct OperationRecord: Codable, Sendable, Equatable, Identifiable {
         self.agentPhase = nil
         self.agentProgress = nil
         self.expiresAt = nil
+        self.wakeTarget = wakeTarget
     }
 
     var title: String { "\(kind.title): \(subject)" }
@@ -256,6 +262,17 @@ final class OperationStore {
         newestFirst.filter { $0.machineId == machineId }
     }
 
+    /// The wake holds this device keeps for a machine, oldest first.
+    ///
+    /// A hold is the record of a helper's command whose run may still be going. It lives in this
+    /// device's own history and is never published, and nothing releases it but evidence: the
+    /// record read as finished, the helper saying it has no such operation, the target answering,
+    /// the helper leaving the setup, or a person choosing to try the other helpers. Time, a restart
+    /// and an unreachable helper release nothing.
+    func wakeHolds(target: String) -> [OperationRecord] {
+        records.filter { $0.wakeTarget == target }.sorted { $0.startedAt < $1.startedAt }
+    }
+
     /// The most recent finished operation, for the one-line summary the panel shows.
     var lastFinished: OperationRecord? {
         records.filter { $0.state.isFinished }.max { $0.finishedAt ?? $0.startedAt < $1.finishedAt ?? $1.startedAt }
@@ -312,9 +329,11 @@ final class OperationStore {
     /// What the far side eventually said about an operation we had lost track of.
     ///
     /// The agent's record is authoritative and this app's guess is not, so a record written down as
-    /// "outcome unknown" is corrected here even when that means turning a red row green.
+    /// "outcome unknown" is corrected here even when that means turning a red row green. A finished
+    /// record ends a wake hold on it, whatever its result: the command is no longer running.
     func reconcile(_ id: String, with operation: AgentOperation) {
         update(id) { record in
+            if operation.isFinished { Self.release(&record, reason: "the helper's record of it finished") }
             switch operation.state {
             case "finished":
                 record.state = OperationOutcome.state(
@@ -381,6 +400,7 @@ final class OperationStore {
     /// every operation it starts and has no record of this one never started it.
     func resolveAsNeverStarted(_ id: String) {
         update(id) { record in
+            Self.release(&record, reason: "the helper has no record of it")
             record.state = .failed
             record.needsReconciliation = false
             record.summary = "\(record.title) never reached \(record.machineName): the agent has no record of it."
@@ -388,9 +408,40 @@ final class OperationStore {
         }
     }
 
-    /// The user has read the unknown outcome and does not want to be asked again.
+    /// The user has read the unknown outcome and does not want to be asked again. A wake hold on it
+    /// goes with it: a person has decided they are done with that command.
     func dismissReconciliation(_ id: String) {
-        update(id) { $0.needsReconciliation = false }
+        update(id) { record in
+            record.needsReconciliation = false
+            Self.release(&record, reason: "you dismissed its unknown outcome")
+        }
+    }
+
+    /// End one wake hold, saying why in the record's own history.
+    func releaseWakeHold(id: String, reason: String) {
+        guard record(id: id)?.wakeTarget != nil else { return }
+        update(id) { Self.release(&$0, reason: reason) }
+    }
+
+    /// End every hold for `target` recorded before `date`: the target answered after they were
+    /// recorded, so whatever those commands were doing, the machine is up.
+    func releaseWakeHolds(target: String, before date: Date, reason: String) {
+        for held in wakeHolds(target: target) where held.startedAt < date {
+            releaseWakeHold(id: held.id, reason: reason)
+        }
+    }
+
+    /// End every hold on a helper that is no longer in the setup, which no wake asks any more.
+    func releaseWakeHolds(onHelpersOtherThan machines: Set<String>, reason: String) {
+        for held in records where held.wakeTarget != nil && !machines.contains(held.machineId) {
+            releaseWakeHold(id: held.id, reason: reason)
+        }
+    }
+
+    private static func release(_ record: inout OperationRecord, reason: String) {
+        guard let target = record.wakeTarget else { return }
+        record.wakeTarget = nil
+        record.phases.append(OperationPhase(name: "wake hold released", at: Date(), detail: "\(target): \(reason)"))
     }
 
     func clearHistory() {
@@ -406,10 +457,11 @@ final class OperationStore {
 
     private func trim() {
         guard records.count > Self.limit else { return }
-        // Never drop something still unanswered, however old it is.
+        // Never drop something still unanswered, however old it is, or a wake hold, which only
+        // evidence releases.
         let sorted = records.sorted { $0.startedAt > $1.startedAt }
         let keep = sorted.prefix(Self.limit)
-        let owed = sorted.dropFirst(Self.limit).filter { $0.needsReconciliation || $0.state == .running }
+        let owed = sorted.dropFirst(Self.limit).filter { $0.needsReconciliation || $0.state == .running || $0.wakeTarget != nil }
         records = Array(keep) + owed
     }
 

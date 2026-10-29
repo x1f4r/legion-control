@@ -11,9 +11,9 @@ import Testing
 struct ContractVectorTests {
     static let consumer = "mac"
 
-    /// The families this suite runs. A family joins when this app has a port of its reference to
-    /// run, and the contract has nine.
-    static let families = ["hash", "identifiers", "outcome", "transport", "setup-acceptance", "launch", "setup-reconcile", "setup-merge"]
+    /// The families this suite runs: all nine the contract has.
+    static let families = ["hash", "identifiers", "outcome", "transport", "setup-acceptance", "launch", "setup-reconcile",
+                           "setup-merge", "wake"]
 
     typealias Adapter = @Sendable (VectorJSON) throws -> VectorJSON
 
@@ -100,6 +100,47 @@ struct ContractVectorTests {
                  "grammar": VectorJSON(entry.tuple?.grammar), "text": VectorJSON(entry.text)]
             }),
             "restrictedRefused": .bool(refused),
+        ]
+    }
+
+    /// Section 10.2 as the `wake/plans` group reads it: the shared document, this device's
+    /// addresses and chosen site, each helper's last status read, and the holds for the target.
+    static func wakePlan(_ input: VectorJSON) throws -> VectorJSON {
+        let config = try JSONDecoder().decode(ControllerConfig.self, from: Data(try string(input, "documentText").utf8))
+        let target = try #require(config.machine(id: try string(input, "target")))
+        let here = try #require(input["here"])
+        let placement = SiteAwareness.placement(sites: config.allSites,
+                                                addresses: try strings(here, "addresses").compactMap(LocalAddress.init),
+                                                confirmed: here["currentSite"]?.string)
+        var helpers: [String: WakePlan.HelperState] = [:]
+        for (id, read) in input["helpers"]?.object ?? [:] {
+            guard let state = WakePlan.HelperState.State(rawValue: try string(read, "state")) else {
+                throw BadInput(description: "unknown helper state")
+            }
+            helpers[id] = WakePlan.HelperState(state, actionKinds: read["actions"]?.object?.compactMapValues(\.string))
+        }
+        let holds = try (input["holds"]?.array ?? []).map { WakePlan.Hold(helper: try string($0, "helper"), action: try string($0, "action")) }
+        let plan = WakePlan.plan(for: target, in: config, placement: placement, helpers: helpers, holds: holds)
+        let steps: [VectorJSON] = plan.steps.map { step in
+            switch step {
+            case .direct(let broadcasts, let ports):
+                return ["kind": "direct", "machine": nil, "action": nil, "readFirst": nil,
+                        "broadcast": .array(broadcasts.map(VectorJSON.string)),
+                        "ports": .array(ports.map { .number(Double($0)) }), "repeats": VectorJSON(WakeOnLAN.repeats)]
+            case .helper(let helper, _, let readFirst):
+                return ["kind": "helper", "machine": .string(helper.machine), "action": .string(helper.action),
+                        "readFirst": .bool(readFirst), "broadcast": nil, "ports": nil, "repeats": nil]
+            }
+        }
+        return [
+            "matching": .array(plan.placement.matching.map(VectorJSON.string)),
+            "effective": VectorJSON(plan.placement.effective),
+            "steps": .array(steps),
+            "skipped": .array(plan.skipped.map { skip in
+                ["kind": .string(skip.kind.rawValue), "machine": VectorJSON(skip.machine), "action": VectorJSON(skip.action),
+                 "reason": .string(skip.reason.rawValue)]
+            }),
+            "offerWakeFirst": .array(plan.offerWakeFirst.map(VectorJSON.string)),
         ]
     }
 
@@ -331,6 +372,23 @@ struct ContractVectorTests {
             let b = SetupJSON.decimalKey(try string(input, "b"))
             guard a != nil, b != nil else { throw BadInput(description: "not a number lexeme") }
             return ["equal": .bool(a == b)]
+        },
+
+        // Sections 10.1 and 10.2.
+        "wake/prefixes": { input in
+            let prefix = LanPrefix(try string(input, "prefix"))
+            return ["valid": .bool(prefix != nil),
+                    "contains": .array(try strings(input, "addresses").map { text in
+                        .bool(LanPrefix.ipv4(text).map { prefix?.contains($0) ?? false } ?? false)
+                    })]
+        },
+        "wake/broadcasts": { input in
+            ["valid": .bool(LanPrefix.ipv4(try string(input, "text")) != nil)]
+        },
+        "wake/plans": wakePlan,
+        "wake/readiness": { input in
+            ["pollStartsMs": .array(WakePlan.readinessSchedule(sentAnything: input["sentAnything"]?.bool ?? false)
+                .map { .number(Double($0)) })]
         },
 
         // Section 9.9.

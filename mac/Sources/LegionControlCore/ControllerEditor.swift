@@ -243,7 +243,7 @@ enum ControllerEditor {
         }
     }
 
-    /// Add or replace one site.
+    /// Add or replace one site. A null value takes the key away, and is never written.
     static func upsertSite(_ site: [String: Any], in root: inout [String: Any]) throws {
         guard let id = site["id"] as? String, !id.isEmpty else {
             throw EditFailure("A site needs an id.")
@@ -256,9 +256,33 @@ enum ControllerEditor {
             }
             sites[index] = merged
         } else {
-            sites.append(site)
+            sites.append(site.filter { !($0.value is NSNull) })
         }
         root["sites"] = sites
+    }
+
+    /// A site as an editor writes it (section 10.1).
+    ///
+    /// Every prefix is written the way every client reads one: an octet-aligned prefix as dotted
+    /// octets with the trailing dot, because a client that predates the section matches prefixes as
+    /// text and is right only when one ends in a dot, and any other length as CIDR. A value that is
+    /// neither — a full address without a length, host bits set, a wildcard — would never match
+    /// anything, so it is refused here rather than saved. An empty `lanPrefixes` or `broadcast` is
+    /// never written: the schema refuses an empty prefix list, and a site with no prefixes is simply
+    /// one the person names as where they are.
+    static func siteEntry(id: String, name: String, prefixes: [String], broadcast: [String]) throws -> [String: Any] {
+        let written = try prefixes.map { text in
+            guard let prefix = LanPrefix(text) else {
+                throw EditFailure("\"\(text)\" is not a network prefix. Write one to three octets, like 192.168.1., or a network and its length, like 192.168.16.0/20.")
+            }
+            return prefix.normalised
+        }
+        return [
+            "id": id,
+            "name": name,
+            "lanPrefixes": written.isEmpty ? NSNull() : written,
+            "broadcast": broadcast.isEmpty ? NSNull() : broadcast,
+        ]
     }
 
     static func removeSite(id: String, in root: inout [String: Any]) throws {

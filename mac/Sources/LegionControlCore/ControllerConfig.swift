@@ -306,8 +306,14 @@ struct WakeConfig: Decodable, Sendable, Equatable {
     /// The hardware address a magic packet carries. A block without one is woken only through its
     /// helpers: the schema allows it, and section 9.7 makes it a warning rather than a refusal.
     var mac: String?
+    /// The broadcast addresses as the setup lists them, none when it lists none. Which of them a
+    /// packet goes to, and what it falls back to, is the plan's to decide (section 10.2): the site's
+    /// own broadcast comes before 255.255.255.255, and this used to default to the latter here,
+    /// where the plan could no longer tell "none" from "255.255.255.255".
     var broadcast: [String]
+    /// The ports as the setup lists them; the plan falls back to 9 and 7.
     var ports: [UInt16]
+    /// Not used: readiness is an authenticated status poll, never a TCP probe. Kept for 1.2 setups.
     var probe: Probe?
     /// A machine that names no site falls back to this prefix. Advisory, exactly as a site's
     /// prefixes are.
@@ -337,15 +343,15 @@ struct WakeConfig: Decodable, Sendable, Equatable {
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         mac = try container.decodeIfPresent(String.self, forKey: .mac)
-        broadcast = try container.decodeIfPresent([String].self, forKey: .broadcast) ?? ["255.255.255.255"]
-        ports = try container.decodeIfPresent([UInt16].self, forKey: .ports) ?? [9, 7]
+        broadcast = try container.decodeIfPresent([String].self, forKey: .broadcast) ?? []
+        ports = try container.decodeIfPresent([UInt16].self, forKey: .ports) ?? []
         probe = try container.decodeIfPresent(Probe.self, forKey: .probe)
         lanPrefix = try container.decodeIfPresent(String.self, forKey: .lanPrefix)
         helpers = try container.decodeIfPresent([WakeHelper].self, forKey: .helpers)
         helper = try container.decodeIfPresent(WakeHelper.self, forKey: .helper)
     }
 
-    init(mac: String?, broadcast: [String] = ["255.255.255.255"], ports: [UInt16] = [9, 7],
+    init(mac: String?, broadcast: [String] = [], ports: [UInt16] = [],
          probe: Probe? = nil, lanPrefix: String? = nil, helpers: [WakeHelper]? = nil,
          helper: WakeHelper? = nil) {
         self.mac = mac

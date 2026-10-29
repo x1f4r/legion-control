@@ -174,7 +174,7 @@ struct MachineSection: View {
                 Button("Sleep") { model.requestSleep() }.disabled(model.isWorking || model.commandableSystem == nil)
             } else if model.canWake {
                 Button(model.isWaking ? "Waking…" : "Wake") { model.wake() }
-                    .disabled(model.isWorking || model.wakePlan.isEmpty)
+                    .disabled(model.isWorking || !model.canTryWaking)
             }
             if !model.bootTargets.isEmpty || (!model.isAwake && model.canWake) {
                 Menu(model.isAwake ? "Restart" : "Wake into") {
@@ -185,7 +185,7 @@ struct MachineSection: View {
                         }
                     } else {
                         ForEach(model.machine.systems) { system in
-                            Button(system.name) { model.wake(into: system) }.disabled(model.isWorking || model.wakePlan.isEmpty)
+                            Button(system.name) { model.wake(into: system) }.disabled(model.isWorking || !model.canTryWaking)
                         }
                     }
                 }.fixedSize()
@@ -549,11 +549,11 @@ struct MachineSection: View {
             FlowRow(spacing: 10) {
                 if model.canWake {
                     Button(model.isWaking ? "Waking" : "Wake") { model.wake() }
-                        .disabled(model.isWorking || model.isAwake || model.wakePlan.isEmpty)
+                        .disabled(model.isWorking || model.isAwake || !model.canTryWaking)
                     ForEach(model.machine.systems) { system in
                         if !model.isAwake {
                             Button("Wake into \(system.name)") { model.wake(into: system) }
-                                .disabled(model.isWorking || model.wakePlan.isEmpty)
+                                .disabled(model.isWorking || !model.canTryWaking)
                         }
                     }
                 }
@@ -593,33 +593,38 @@ struct MachineSection: View {
                         Text("\(index + 1). Send the packet from this device to \(broadcasts.joined(separator: ", ")).")
                             .font(.callout)
                             .foregroundStyle(.secondary)
-                    case .helper(let helper, let machineName):
+                    case .helper(let helper, let machineName, _):
                         Text("\(index + 1). Ask \(machineName) to run \(helper.action).")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
                 }
 
-                ForEach(plan.unavailable) { unavailable in
+                ForEach(plan.skipped) { skip in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("\(unavailable.what): \(unavailable.reason)")
+                        Text("\(skip.what): \(skip.why)")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        if let first = unavailable.wakeableFirst,
-                           let helper = helperModel(named: first) {
-                            Button("Wake \(first) first") { helper.wake() }
+                        if skip.reason == .asleep, let id = skip.machine, plan.offerWakeFirst.contains(id),
+                           let helper = app.machine(id: id) {
+                            Button("Wake \(helper.name) first") { helper.wake() }
                                 .controlSize(.small)
+                                .disabled(helper.isWorking)
                         }
                     }
+                }
+
+                if !model.wakeHolds.isEmpty {
+                    // A hold is released by evidence, or by a person who has looked and decided.
+                    Button("Try the other helpers anyway") { model.tryOtherHelpers() }
+                        .controlSize(.small)
+                        .disabled(model.isWorking)
+                        .help("A helper may still be running its command for \(model.name). Trying the others can run a second one.")
                 }
             }
             .padding(.top, 10)
         }
-    }
-
-    private func helperModel(named name: String) -> MachineModel? {
-        app.machines.first { $0.name == name }
     }
 
     private var powerNote: String {

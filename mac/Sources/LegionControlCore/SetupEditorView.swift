@@ -131,7 +131,7 @@ private struct SitesEditor: View {
                         }
                         .controlSize(.small)
                     }
-                    Text("addresses starting \(site.lanPrefixes.isEmpty ? "—" : site.lanPrefixes.joined(separator: ", "))")
+                    Text("addresses in \(site.lanPrefixes.isEmpty ? "—" : site.lanPrefixes.joined(separator: ", "))")
                         .font(.callout).foregroundStyle(.secondary)
                     Text("broadcast \(site.broadcast.isEmpty ? "—" : site.broadcast.joined(separator: ", "))")
                         .font(.callout).foregroundStyle(.secondary)
@@ -144,17 +144,17 @@ private struct SitesEditor: View {
             VStack(alignment: .leading, spacing: 10) {
                 LabelledField("Id", text: $draftId, placeholder: "home-a")
                 LabelledField("Name", text: $draftName, placeholder: "Attic house")
-                LabelledField("Address prefixes", text: $draftPrefixes, placeholder: "10.0.0., 192.168.50.")
+                LabelledField("Address prefixes", text: $draftPrefixes, placeholder: "192.168.50., 10.0.0.0/20")
                 LabelledField("Broadcast", text: $draftBroadcast, placeholder: "10.0.0.255")
 
                 Button("Add the site") {
                     problem = model.editSetup("added the site \(draftName.isEmpty ? draftId : draftName)") { root in
-                        try ControllerEditor.upsertSite([
-                            "id": draftId.trimmingCharacters(in: .whitespaces),
-                            "name": draftName.isEmpty ? draftId : draftName,
-                            "lanPrefixes": splitList(draftPrefixes),
-                            "broadcast": splitList(draftBroadcast)
-                        ], in: &root)
+                        try ControllerEditor.upsertSite(ControllerEditor.siteEntry(
+                            id: draftId.trimmingCharacters(in: .whitespaces),
+                            name: draftName.isEmpty ? draftId : draftName,
+                            prefixes: splitList(draftPrefixes),
+                            broadcast: splitList(draftBroadcast)
+                        ), in: &root)
                     }
                     if problem == nil {
                         draftId = ""; draftName = ""; draftPrefixes = ""; draftBroadcast = ""

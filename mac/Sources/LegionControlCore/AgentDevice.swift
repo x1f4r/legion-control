@@ -185,6 +185,9 @@ struct WakeActionOutcome: Sendable {
     var summary: String
     var failure: AgentFailure?
     var isDeclaredWakePacket: Bool
+    /// True when the command may have run and nothing has said how it ended: a wake hold for the
+    /// target now stands, and no other helper runs a command for it.
+    var isAmbiguous: Bool
 }
 
 /// Whether installing an agent takes a device back rather than forward (section 13).
@@ -607,14 +610,14 @@ extension AgentDevice {
     }
 
     /// Run a configured action here on another machine's behalf and retain its operation identity.
-    func runWakeAction(_ actionId: String, target: String) async -> WakeActionOutcome {
+    func runWakeAction(_ actionId: String, target: String, targetId: String) async -> WakeActionOutcome {
         if !isCommandable { await refreshStatus(duringAction: false) }
         let declared = actions.first { $0.id == actionId }?.isDeclaredWakePacket ?? false
         guard isCommandable else {
-            return .init(sent: false, summary: "not reachable", failure: nil, isDeclaredWakePacket: declared)
+            return .init(sent: false, summary: "not reachable", failure: nil, isDeclaredWakePacket: declared, isAmbiguous: false)
         }
-        return await WakeAction.run(action: actionId, target: target, machineId: historyMachineId, machineName: name,
-                                    declaredPacket: declared, dialect: dialect, operations: operations,
+        return await WakeAction.run(action: actionId, target: target, targetId: targetId, machineId: historyMachineId,
+                                    machineName: name, declaredPacket: declared, dialect: dialect, operations: operations,
                                     send: { try await self.send($0, decoding: AgentActionResult.self) },
                                     read: { try await self.send($0, decoding: AgentOperationResult.self) })
     }

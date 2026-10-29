@@ -107,9 +107,11 @@ final class AppModel {
 
     // MARK: - Where this device is
 
-    /// Recomputed when a viewer appears rather than on every draw: enumerating interfaces is cheap
-    /// but not free, and a laptop does not change network between two rows of a table.
-    private(set) var placement = SiteAwareness.Placement(matching: [], confirmed: nil)
+    /// Recomputed on every poll and immediately before a wake is planned (section 10.1), rather
+    /// than on every draw: enumerating interfaces is cheap but not free, and a laptop does not
+    /// change network between two rows of a table. It used to be read only when a viewer appeared,
+    /// so a laptop that moved house with the window open went on planning from the old one.
+    private(set) var placement = SiteAwareness.Placement.nowhere
 
     func refreshPlacement() {
         placement = SiteAwareness.placement(
@@ -167,6 +169,14 @@ final class AppModel {
             }
 
         rebuildLocalModel(selfMachineId: selfMachineId)
+
+        // A wake hold on a helper the setup no longer has is a hold no wake will ever ask about.
+        // Only the applied setup decides that: a file that fails to load says nothing about which
+        // machines are in it.
+        if let applied = config.config {
+            operations.releaseWakeHolds(onHelpersOtherThan: Set(applied.machines.map(\.id)),
+                                        reason: "the helper is no longer in the setup")
+        }
 
         // A question raised by a machine that has just been edited out of the setup has nothing left
         // to act on.
@@ -262,7 +272,11 @@ final class AppModel {
                 try ControllerEditor.upsertSystem(["id": system, "agent": argv], onMachine: model.id, in: &root)
             }
         }
-        model.placement = { [weak self] in self?.placement ?? SiteAwareness.Placement(matching: [], confirmed: nil) }
+        model.placement = { [weak self] in self?.placement ?? .nowhere }
+        model.freshPlacement = { [weak self] in
+            self?.refreshPlacement()
+            return self?.placement ?? .nowhere
+        }
     }
 
     /// The local model: either this device's own agent as configured by `local`, or the machine this
@@ -700,6 +714,7 @@ final class AppModel {
             while !Task.isCancelled {
                 self?.config.reloadIfChanged()
                 self?.reloadApprovalsIfChanged()
+                self?.refreshPlacement()
                 await self?.refreshEverything(userInitiated: false)
                 try? await Task.sleep(for: .seconds(15))
             }

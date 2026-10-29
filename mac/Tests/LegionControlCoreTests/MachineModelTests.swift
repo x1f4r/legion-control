@@ -736,6 +736,276 @@ struct MachineModelTests {
         #expect(!runner.sentCommands.contains { $0.contains("bad id") })
     }
 
+    // MARK: - Waking
+
+    /// A tower woken directly on 192.0.2.0/24 or through two helpers, through the launch gate with
+    /// all of it approved, as the app runs a setup.
+    static let wakeDocument = Data("""
+    { "version": 1, "machines": [
+      { "id": "tower", "name": "Tower",
+        "endpoints": [ { "id": "lan", "kind": "lan", "host": "192.0.2.20", "user": "me" } ],
+        "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] },
+                     { "id": "other", "platform": "linux", "agent": ["node", "/b.mjs"] } ],
+        "wake": { "mac": "02:00:00:00:00:01", "lanPrefix": "192.0.2.",
+                  "helpers": [ { "machine": "pi", "action": "wake-tower" }, { "machine": "nas", "action": "wake-tower" } ] } },
+      { "id": "pi", "name": "Pi",
+        "endpoints": [ { "id": "lan", "kind": "lan", "host": "198.51.100.5", "user": "me" } ],
+        "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] },
+      { "id": "nas", "name": "NAS",
+        "endpoints": [ { "id": "lan", "kind": "lan", "host": "198.51.100.9", "user": "me" } ],
+        "systems": [ { "id": "linux", "platform": "linux", "agent": ["node", "/a.mjs"] } ] } ] }
+    """.utf8)
+
+    static func wakeSetup(_ document: Data = wakeDocument) throws -> ControllerConfig {
+        LaunchGate.effective(
+            try ControllerConfig.accepted(document), document: document,
+            record: LaunchValues.approvals(from: try JSONSerialization.jsonObject(with: document), seededFrom: "none")
+        ).config
+    }
+
+    /// A helper's status, offering the wake action with the kind given.
+    static func helperStatus(_ kind: String) -> String {
+        """
+        { "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "linux" },
+          "agent": { "version": "3.1.0", "contract": 3 }, "services": [],
+          "actions": [ { "id": "wake-tower", "name": "Wake Tower", "kind": "\(kind)" } ] }
+        """
+    }
+
+    static let towerStatus = """
+    { "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "linux" },
+      "agent": { "version": "3.1.0", "contract": 3 }, "services": [] }
+    """
+
+    /// A clock that moves only when a readiness poll waits, and remembers each wait.
+    final class FakeClock {
+        var now = Date(timeIntervalSince1970: 1_000_000)
+        var waits: [TimeInterval] = []
+
+        @MainActor var clock: WakeClock {
+            WakeClock(now: { self.now }, sleep: { seconds in
+                self.waits.append(seconds)
+                self.now = self.now.addingTimeInterval(seconds)
+            })
+        }
+    }
+
+    /// Three machine models on one setup and one history: the tower and its two helpers.
+    struct WakeRig {
+        var tower: MachineModel
+        var pi: MachineModel
+        var nas: MachineModel
+        var runners: [String: FakeRunner]
+        var clock: FakeClock
+    }
+
+    static func wakeRig(store: OperationStore, logs: URL, setup: ControllerConfig,
+                        here: SiteAwareness.Placement = .nowhere) throws -> WakeRig {
+        var runners: [String: FakeRunner] = [:]
+        var models: [String: MachineModel] = [:]
+        for id in ["tower", "pi", "nas"] {
+            let entry = try #require(setup.machine(id: id))
+            let runner = FakeRunner()
+            var agent = RemoteAgent(machine: entry)
+            agent.logDirectory = logs.appending(path: id)
+            agent.runner = { _, arguments, _, _ in runner.run(arguments) }
+            let model = MachineModel(machine: entry, agent: agent)
+            model.operations = store
+            model.core.pollPause = { _ in }
+            model.setup = { setup }
+            model.placement = { here }
+            model.freshPlacement = { here }
+            runners[id] = runner
+            models[id] = model
+        }
+        let clock = FakeClock()
+        let tower = models["tower"]!
+        tower.peer = { models[$0] }
+        tower.wakeClock = clock.clock
+        tower.sendWakePackets = { _ in "the tests send no packets" }
+        return WakeRig(tower: tower, pi: models["pi"]!, nas: models["nas"]!, runners: runners, clock: clock)
+    }
+
+    static func runs(_ runner: FakeRunner?) -> Int {
+        runner?.sentCommands.filter { $0.contains(" run wake-tower") }.count ?? 0
+    }
+
+    @Test("an ambiguous command holds the target across a restart, until its own record says it finished")
+    func wakeHoldScenario() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-wake-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "operations.json")
+        let setup = try Self.wakeSetup()
+
+        // The Pi takes the command and answers with nothing this app can read: it may well be
+        // running. The NAS is never asked, because a second helper's command could wake the tower
+        // twice over, or do whatever else its command does twice (section 10.2).
+        let first = try Self.wakeRig(store: OperationStore(url: url), logs: directory, setup: setup)
+        first.runners["pi"]?.answer("status", json: Self.helperStatus("command"))
+        first.runners["pi"]?.answer("run", with: [FakeSSH.result(exit: 1, out: "Segmentation fault")])
+        first.runners["nas"]?.answer("status", json: Self.helperStatus("command"))
+        first.tower.wake()
+        await Self.settle(first.tower, timeout: 10)
+        #expect(Self.runs(first.runners["pi"]) == 1)
+        #expect(Self.runs(first.runners["nas"]) == 0)
+        #expect(first.runners["pi"]?.sentCommands.contains { $0.contains(" op ") && $0.contains("--wait 20") } == true, "\(first.runners["pi"]?.sentCommands ?? [])")
+        #expect(first.tower.statusDetail?.contains("NAS: a helper may still be running a command") == true)
+
+        // The app restarts and the Pi is unreachable. The hold is still there; the NAS's command
+        // is still not run, but a NAS that declares a magic packet is.
+        let store = OperationStore(url: url)
+        let hold = try #require(store.wakeHolds(target: "tower").first)
+        #expect(hold.machineId == "pi")
+        let second = try Self.wakeRig(store: store, logs: directory, setup: setup)
+        second.runners["nas"]?.answer("status", json: Self.helperStatus("command"))
+        await second.pi.refresh(userInitiated: false)
+        await second.nas.refresh(userInitiated: false)
+        second.tower.wake()
+        await Self.settle(second.tower, timeout: 10)
+        #expect(Self.runs(second.runners["nas"]) == 0)
+        #expect(store.wakeHolds(target: "tower").count == 1)
+
+        second.runners["nas"]?.answer("status", json: Self.helperStatus("wol"))
+        second.runners["nas"]?.answer("run", json: #"{"ok":true,"contract":3,"action":"ran","output":"magic packet sent"}"#)
+        await second.nas.refresh(userInitiated: false)
+        second.tower.wake()
+        await Self.settle(second.tower, timeout: 10)
+        #expect(Self.runs(second.runners["nas"]) == 1)
+        #expect(store.wakeHolds(target: "tower").count == 1)
+
+        // The Pi is back and its record says the command finished: the next press reads that
+        // first, the hold ends, and the NAS's command runs again.
+        let third = try Self.wakeRig(store: store, logs: directory, setup: setup)
+        third.runners["pi"]?.answer("status", json: Self.helperStatus("command"))
+        third.runners["pi"]?.answer("op", json: """
+        { "ok": true, "contract": 3, "op": { "id": "\(hold.id)", "kind": "run", "actionId": "wake-tower",
+          "state": "finished", "result": { "ok": true, "action": "ran" } } }
+        """)
+        third.runners["pi"]?.answer("run", json: #"{"ok":true,"contract":3,"action":"ran"}"#)
+        third.runners["nas"]?.answer("status", json: Self.helperStatus("command"))
+        third.runners["nas"]?.answer("run", json: #"{"ok":true,"contract":3,"action":"ran"}"#)
+        await third.pi.refresh(userInitiated: false)
+        await third.nas.refresh(userInitiated: false)
+        third.tower.wake()
+        await Self.settle(third.tower, timeout: 10)
+        #expect(store.wakeHolds(target: "tower").isEmpty)
+        #expect(Self.runs(third.runners["nas"]) == 1)
+    }
+
+    @Test("a 2.x helper's hold waits for the target to answer, and a person can let it go")
+    func legacyHelperHold() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-wake-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        let rig = try Self.wakeRig(store: store, logs: directory, setup: try Self.wakeSetup())
+        // A 2.x helper keeps no records, so its hold is never asked about.
+        store.begin(OperationRecord(machineId: "pi", machineName: "Pi", kind: .action, subject: "wake-tower",
+                                    summary: "Asking", agentTracked: false, wakeTarget: "tower"))
+        rig.runners["pi"]?.answer("status", json: Self.helperStatus("command"))
+        await rig.pi.refresh(userInitiated: false)
+        #expect(rig.tower.wakePlan.isEmpty)
+        #expect(rig.tower.canTryWaking)
+        rig.tower.wake()
+        await Self.settle(rig.tower, timeout: 10)
+        #expect(Self.runs(rig.runners["pi"]) == 0)
+        #expect(!(rig.runners["pi"]?.sentCommands.contains { $0.contains(" op ") } ?? true))
+        #expect(store.wakeHolds(target: "tower").count == 1)
+
+        // The tower answering ends it.
+        rig.runners["tower"]?.answer("status", json: Self.towerStatus)
+        await rig.tower.refresh(userInitiated: false)
+        #expect(store.wakeHolds(target: "tower").isEmpty)
+
+        // And so does a person, who has looked and decided to try the others anyway.
+        store.begin(OperationRecord(machineId: "pi", machineName: "Pi", kind: .action, subject: "wake-tower",
+                                    summary: "Asking", agentTracked: false, wakeTarget: "tower"))
+        rig.runners["pi"]?.answer("run", json: #"{"ok":true,"contract":2,"action":"ran"}"#)
+        rig.tower.tryOtherHelpers()
+        await Self.settle(rig.tower, timeout: 10)
+        #expect(store.wakeHolds(target: "tower").isEmpty)
+    }
+
+    @Test("readiness polls start at the contract's times after a send, and a step that sent nothing waits for nothing")
+    func readinessOnAFakeClock() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-wake-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        let here = SiteAwareness.placement(sites: [], addresses: [LocalAddress("192.0.2.7/24")!], confirmed: nil)
+        var rig = try Self.wakeRig(store: store, logs: directory, setup: try Self.wakeSetup(), here: here)
+        var sent: [WakeOnLAN.Packets] = []
+        rig.tower.sendWakePackets = { sent.append($0); return nil }
+        // Asleep for the first two polls, up for the third, and each of them really dialled: an
+        // address that did not answer is otherwise left alone for a minute.
+        let down = FakeSSH.result(exit: 255)
+        rig.runners["tower"]?.answer("status", with: [down, down, FakeSSH.result(out: Self.towerStatus)])
+        rig.tower.wake()
+        await Self.settle(rig.tower, timeout: 10)
+        #expect(sent == [WakeOnLAN.Packets(mac: "02:00:00:00:00:01", broadcasts: ["192.0.2.255"], ports: [9, 7])])
+        #expect(rig.clock.waits.map { Int(($0 * 1000).rounded()) } == [5000, 8000, 12800])
+        #expect(store.newestFirst.first { $0.kind == .wake }?.state == .succeeded)
+        #expect(rig.runners["tower"]?.sentCommands.filter { $0.contains(" status") }.count == 3)
+        #expect(Self.runs(rig.runners["pi"]) == 0)
+
+        // No packet left: straight on to the helpers, with no wait in between.
+        rig = try Self.wakeRig(store: store, logs: directory, setup: try Self.wakeSetup(), here: here)
+        rig.runners["pi"]?.answer("status", json: Self.helperStatus("wol"))
+        rig.runners["pi"]?.answer("run", json: #"{"ok":true,"contract":3,"action":"failed","reasonCode":"internal"}"#)
+        rig.tower.wake()
+        await Self.settle(rig.tower, timeout: 10)
+        #expect(rig.clock.waits.isEmpty)
+        #expect(Self.runs(rig.runners["pi"]) == 1)
+    }
+
+    @Test("a wake into a system that ends early is forgotten, so a later wake boots nothing")
+    func wakeIntoIsForgottenOnEveryEarlyExit() async throws {
+        // M13: an early return left the request standing, and the next wake that did bring the
+        // machine up went on to reboot it into a system nobody had asked for that time.
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-wake-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        let lonely = Data(String(decoding: Self.wakeDocument, as: UTF8.self)
+            .replacingOccurrences(of: #""helpers": [ { "machine": "pi", "action": "wake-tower" }, { "machine": "nas", "action": "wake-tower" } ]"#,
+                                  with: #""broadcast": ["192.0.2.255"]"#).utf8)
+        let setup = try Self.wakeSetup(lonely)
+        let other = try #require(setup.machine(id: "tower")?.system(id: "other"))
+
+        // Off the network with no helper: nothing to try, said without starting anything.
+        let away = try Self.wakeRig(store: store, logs: directory, setup: setup)
+        var asked: [String] = []
+        away.tower.ask = { asked.append($0.id) }
+        away.tower.wake(into: other)
+        #expect(!away.tower.isWorking)
+
+        // Sent and never answered.
+        let here = SiteAwareness.placement(sites: [], addresses: [LocalAddress("192.0.2.7/24")!], confirmed: nil)
+        let silent = try Self.wakeRig(store: store, logs: directory, setup: setup, here: here)
+        silent.tower.sendWakePackets = { _ in nil }
+        silent.runners["tower"]?.answer("status", with: [FakeSSH.result(exit: 255)])
+        silent.tower.ask = { asked.append($0.id) }
+        silent.tower.wake(into: other)
+        await Self.settle(silent.tower, timeout: 10)
+        #expect(silent.tower.statusLine.contains("did not come up"))
+
+        // Each model now wakes again and the tower answers as Linux: neither boots it into the
+        // other system.
+        for rig in [away, silent] {
+            rig.tower.placement = { here }
+            rig.tower.freshPlacement = { here }
+            rig.tower.sendWakePackets = { _ in nil }
+            rig.runners["tower"]?.answer("status", json: Self.towerStatus)
+            rig.tower.wake()
+            await Self.settle(rig.tower, timeout: 10)
+            #expect(rig.tower.isAwake)
+        }
+        #expect(!asked.contains { $0.hasPrefix("boot-") })
+
+        // And one that is asked for and answers does go on.
+        silent.runners["tower"]?.answer("status", with: [FakeSSH.result(exit: 255), FakeSSH.result(out: Self.towerStatus)])
+        silent.tower.wake(into: other)
+        await Self.settle(silent.tower, timeout: 10)
+        #expect(asked.contains("boot-tower-other"))
+    }
+
     // MARK: - Setup edits and remembered settings
 
     /// Holds every command with one verb until the test lets it go, and says when one has arrived.
