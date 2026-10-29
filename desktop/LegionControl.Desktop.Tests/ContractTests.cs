@@ -231,18 +231,29 @@ public class FixtureTests
         return new Reading(result.Envelope, result.Action, result.Outcome, Array.Empty<Projected>());
     }
 
-    /// A cycle: the service and the operation of each child.
+    /// A cycle: the service, the operation, the action and the reason code of each child, as the
+    /// app reads them from the operation record and as that record states them. The reply repeats
+    /// the children at the top, and comparing the record against that copy would pass whatever the
+    /// app read from the record.
     private static Reading Cycle(Value json, JsonNode raw)
     {
         var result = ActionResult.From(json);
         var children = result.Operation?.Children ?? Array.Empty<OperationChild>();
         return new Reading(result.Envelope, result.Action, result.Outcome, new Projected[]
         {
-            new("children[]", List(children.Select(child => (JsonNode?)new JsonObject { ["service"] = child.Service, ["opId"] = child.OpId })),
-                List(Items(raw["children"]).Select(child => (JsonNode?)new JsonObject
+            new("op.children[]", List(children.Select(child => (JsonNode?)new JsonObject
+                {
+                    ["service"] = child.Service,
+                    ["opId"] = child.OpId,
+                    ["action"] = child.Action,
+                    ["reasonCode"] = child.ReasonCode,
+                })),
+                List(Items(raw["op"]?["children"]).Select(child => (JsonNode?)new JsonObject
                 {
                     ["service"] = child?["service"]?.DeepClone(),
                     ["opId"] = child?["opId"]?.DeepClone(),
+                    ["action"] = child?["action"]?.DeepClone(),
+                    ["reasonCode"] = child?["reasonCode"]?.DeepClone(),
                 }))),
         });
     }
