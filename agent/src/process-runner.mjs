@@ -327,21 +327,30 @@ function describeEntry(entry) {
  *
  * Every mutation asks this after it takes the machine lock and before it does
  * anything, and so does every command this file starts. Entries that have
- * ended since are dropped on the way. `opId` narrows the question to one
- * operation's commands. The answer carries the message to give and, when the
- * command belonged to an operation, the `conflict` that names it. A ledger that
- * cannot be read is an answer too: nobody can then say that nothing is running.
+ * ended since are dropped on the way. The answer carries the message to give
+ * and, when the command belonged to an operation, the `conflict` that names
+ * it. A ledger that cannot be read is an answer too: nobody can then say that
+ * nothing is running.
+ *
+ * `opId` narrows the question to one operation's commands, which is what an
+ * operation asks once its body is done, and its commands are ones this process
+ * ran. Every one of those it could not see stop is in `held` as well, so that
+ * question is answered from there when the ledger cannot be read. So the
+ * ending a body came to is rewritten only for a command of its own that may
+ * still be at work, never for a file nobody can read: replacing the agent goes
+ * ahead whatever the ledger says, as the way out for a machine it holds, and
+ * its reply has to say what it did.
  */
 export async function unsettledWork({ opId = null } = {}) {
   const read = readJsonStore(ledgerPath());
-  if (!read.ok) {
+  if (!read.ok && opId === null) {
     return {
       entry: null,
       conflict: null,
       message: `the command ledger cannot be read (${read.error}), so nothing here can say whether an earlier command is still running`,
     };
   }
-  const recorded = (Array.isArray(read.value.commands) ? read.value.commands : []).filter((entry) => entry && typeof entry === 'object');
+  const recorded = (read.ok && Array.isArray(read.value.commands) ? read.value.commands : []).filter((entry) => entry && typeof entry === 'object');
   const known = new Set(recorded.map((entry) => entry.id));
   const candidates = [...recorded, ...[...held.values()].filter((entry) => !known.has(entry.id))]
     .filter((entry) => !inFlight.has(entry.id) && (opId === null || entry.opId === opId));

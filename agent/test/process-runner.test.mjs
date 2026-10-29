@@ -249,6 +249,64 @@ test('an operation whose own command could not be confirmed stopped is unknown, 
   });
 });
 
+test('an operation whose ledger cannot be read at its end keeps the ending its body came to', async () => {
+  await withHome(async () => {
+    // Replacing the agent goes ahead whatever the ledger says, because it is
+    // the way out for a machine the ledger holds, and a ledger nobody can read
+    // holds one. Its ending was rewritten as if a command of its own had run
+    // out of time: failed, with an unknown outcome, for an agent that had in
+    // fact been replaced.
+    fs.mkdirSync(path.dirname(ledgerPath()), { recursive: true });
+    fs.writeFileSync(ledgerPath(), '{ not json');
+    const installed = await withOperation({ kind: 'self-update', opId: 'unreadable-ledger-01', systemId: 'test' }, async () => (
+      { ok: true, action: 'installed', reasonCode: null, message: 'agent 3.1.1 installed' }
+    ));
+    assert.equal(installed.ok, true);
+    assert.equal(installed.action, 'installed');
+    assert.equal(installed.message, 'agent 3.1.1 installed');
+    assert.equal(producedOutcome(installed), 'succeeded');
+    const stored = wireRecord(readOperation('unreadable-ledger-01'));
+    assert.equal(stored.result.action, 'installed');
+    assert.equal(stored.outcome, 'succeeded');
+
+    // Any other operation is refused by a ledger like that before it starts,
+    // so here the ledger breaks under the body, after a command that ended.
+    fs.rmSync(ledgerPath());
+    const ran = await withOperation({ kind: 'run', actionId: 'say', opId: 'unreadable-ledger-02', systemId: 'test' }, async () => {
+      assert.equal((await run(node('process.exit(0)'), { timeoutMs: 5000 })).ok, true);
+      fs.writeFileSync(ledgerPath(), '{ not json');
+      return { ok: true, action: 'ran', reasonCode: null, message: 'say ran' };
+    });
+    assert.equal(ran.action, 'ran');
+    assert.equal(producedOutcome(ran), 'succeeded');
+    assert.equal(wireRecord(readOperation('unreadable-ledger-02')).outcome, 'succeeded');
+  });
+});
+
+test('an operation whose own command could not be confirmed stopped is unknown even when the ledger cannot be read', { skip: !posix && 'POSIX process groups' }, async () => {
+  await withHome(async () => {
+    await withoutGroupSignals(async ({ held, release }) => {
+      // The agent itself still knows about every command of its own it could
+      // not see stop, so an unreadable file does not hide one.
+      let group = null;
+      const result = await withOperation({ kind: 'run', actionId: 'say', opId: 'unreadable-held-01', systemId: 'test' }, async () => {
+        assert.equal((await run(node('setInterval(() => {}, 1000)'), { timeoutMs: 200, graceMs: 200, settleMs: 300 })).terminated, false);
+        group = ledger()[0].group;
+        held(group);
+        fs.writeFileSync(ledgerPath(), '{ not json');
+        return { ok: true, action: 'ran', reasonCode: null, message: 'say ran' };
+      });
+      assert.equal(result.action, 'failed');
+      assert.equal(result.reasonCode, 'timed-out');
+      assert.match(result.message, /^say ran, but node from operation unreadable-held-01 .*could not be confirmed stopped/);
+      assert.equal(result.outcome, 'unknown');
+      assert.equal(wireRecord(readOperation('unreadable-held-01')).outcome, 'unknown');
+      fs.writeFileSync(ledgerPath(), JSON.stringify({ commands: [] }));
+      await release(group);
+    });
+  });
+});
+
 test('a command left behind, running or unconfirmed, holds later mutations only while it runs', async () => {
   const { spawn } = await import('node:child_process');
   for (const state of ['running', 'unconfirmed']) {
