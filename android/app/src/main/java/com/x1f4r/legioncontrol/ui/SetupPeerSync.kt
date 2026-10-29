@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.ui
 
+import android.os.SystemClock
 import com.x1f4r.legioncontrol.agent.AgentStatus
 import com.x1f4r.legioncontrol.agent.ConfigSetReply
 import com.x1f4r.legioncontrol.agent.ControllerFetch
@@ -40,10 +41,14 @@ import com.x1f4r.legioncontrol.data.SetupOutcome
  * The state of each machine lives here rather than in its model, because applying a document or an
  * approval rebuilds every machine model, and a back-off or a hold must not end with the model that
  * earned it.
+ *
+ * [clock] only ever has its readings compared with each other, so it is one that counts up whatever
+ * the wall clock does: a phone whose time is set back an hour must not hold a sixty-second back-off
+ * or a lock for that hour.
  */
 internal class SetupPeerSync(
     private val services: ControlServices,
-    private val clock: () -> Long = System::currentTimeMillis,
+    private val clock: () -> Long = SystemClock::elapsedRealtime,
 ) {
     private val states = HashMap<String, SetupPeerState>()
 
