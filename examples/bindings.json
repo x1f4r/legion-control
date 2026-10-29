@@ -4,7 +4,7 @@
   "self": { "machine": "tower", "system": "windows" },
 
   "localAgent": {
-    "argv": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"]
+    "argv": ["C:\\Program Files\\nodejs\\node.exe", "C:\\Users\\me\\.legion-control\\bin\\launcher.mjs"]
   },
 
   "currentSite": "flat",
