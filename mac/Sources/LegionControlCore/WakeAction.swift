@@ -8,6 +8,11 @@ import Foundation
 /// ssh failure after dispatch, a reply still running when this app stops watching — leaves the hold
 /// behind, on disk, and no other helper runs a command for that target until something settles it.
 /// A terminal answer ends the hold at once, and a run that never left this device never had one.
+///
+/// A reply is not a terminal answer just because it came back. One whose outcome is `unknown` —
+/// the agent failing while it wrote the record, an older agent's `internal`, a record that vanished
+/// while it was followed — says in so many words that nobody knows whether the command ran, and
+/// is ambiguous until a finished record says otherwise.
 @MainActor
 enum WakeAction {
     static func run(action: String, target: String, targetId: String, machineId: String, machineName: String,
@@ -35,11 +40,12 @@ enum WakeAction {
         }
 
         /// The run may have been dispatched and no terminal record has been read. On a helper that
-        /// keeps records, its record is read once, waiting up to twenty seconds for it to finish.
-        func ambiguous(_ failure: AgentFailure, running: Bool) async -> WakeActionOutcome {
+        /// keeps records, its record is read once, waiting up to twenty seconds for it to finish,
+        /// and only a finished record or the helper having none ends the hold.
+        func ambiguous(_ failure: AgentFailure, running: Bool, summary said: String? = nil) async -> WakeActionOutcome {
             if dialect.supportsOperations,
                let reply = try? await read(try AgentRequest.operation(id: id, wait: OperationDriver.pollSeconds)) {
-                if let operation = reply.operation, Outcome.of(operation).isTerminal {
+                if let operation = reply.operation, operation.isFinished {
                     operations?.reconcile(id, with: operation)
                     return settled(OperationDriver.finalResult(from: operation, accepted: AgentActionResult()))
                 }
@@ -51,7 +57,7 @@ enum WakeAction {
             }
             let summary = running
                 ? "\(action) is still running on \(machineName), so how it ends is not known yet."
-                : failure.shortReason
+                : said ?? failure.shortReason
             operations?.finish(id, state: running ? .running : .unknown, summary: summary,
                                detail: running ? nil : failure.detail,
                                agentTracked: dialect.supportsOperations, forceUnresolved: running)
@@ -64,9 +70,20 @@ enum WakeAction {
             var driver = OperationDriver(send: send, readOperation: read)
             driver.beforeRetry = redial
             let conclusion = try await driver.perform(request, operationId: id, dialect: dialect)
-            if conclusion.stillRunning || Outcome.of(conclusion.result) == .pending {
+            let outcome = Outcome.of(conclusion.result)
+            if conclusion.stillRunning || outcome == .pending {
                 let summary = "\(action) is still running on \(machineName)."
                 return await ambiguous(AgentFailure(.agentFailed, detail: summary, dispatch: .acknowledged), running: true)
+            }
+            // An answer that says nobody knows whether the command ran is no ending. Filed as one,
+            // it released the hold, and the next helper's command ran while this one might still
+            // be running. Only a finished record makes an unknown final.
+            if outcome == .unknown, conclusion.operation?.isFinished != true {
+                let result = conclusion.result
+                let said = result.message ?? result.reason?.sentence(subject: action, message: nil)
+                let summary = "\(action) may or may not have run\(said.map { ": \($0)" } ?? ".")"
+                return await ambiguous(AgentFailure(.agentFailed, detail: said ?? "", dispatch: .acknowledged),
+                                       running: false, summary: summary)
             }
             return settled(conclusion.result)
         } catch {

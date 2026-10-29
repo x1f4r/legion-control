@@ -894,6 +894,31 @@ struct MachineModelTests {
         #expect(Self.runs(third.runners["nas"]) == 1)
     }
 
+    @Test("a helper that cannot say whether its command ran holds the target, and the next helper's command is not run")
+    func unknownHelperAnswerHolds() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-wake-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        let rig = try Self.wakeRig(store: store, logs: directory, setup: try Self.wakeSetup())
+        // The Pi answers, and what it says is that it failed while writing the record: its command
+        // may be running. That used to read as the Pi's answer, so the walk went on to the NAS and
+        // ran its command beside it.
+        rig.runners["pi"]?.answer("status", json: Self.helperStatus("command"))
+        rig.runners["pi"]?.answer("run", json: String(decoding: try ContractCorpus.data("fixtures/error.internal.json"), as: UTF8.self),
+                                  exit: 1)
+        rig.runners["nas"]?.answer("status", json: Self.helperStatus("command"))
+        rig.runners["nas"]?.answer("run", json: #"{"ok":true,"contract":3,"action":"ran"}"#)
+        rig.tower.wake()
+        await Self.settle(rig.tower, timeout: 10)
+        #expect(Self.runs(rig.runners["pi"]) == 1)
+        #expect(Self.runs(rig.runners["nas"]) == 0)
+        #expect(store.wakeHolds(target: "tower").map(\.machineId) == ["pi"])
+        #expect(rig.runners["pi"]?.sentCommands.contains { $0.contains(" op ") && $0.contains("--wait 20") } == true)
+        #expect(rig.tower.statusDetail?.contains("Pi: wake-tower may or may not have run: the agent failed while writing") == true,
+                "\(rig.tower.statusDetail ?? "")")
+        #expect(rig.tower.statusDetail?.contains("NAS: a helper may still be running a command") == true)
+    }
+
     @Test("a 2.x helper's hold waits for the target to answer, and a person can let it go")
     func legacyHelperHold() async throws {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-wake-\(UUID().uuidString)")
