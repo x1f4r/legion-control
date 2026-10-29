@@ -92,6 +92,13 @@ final class AppUpdateModel {
         versionOverride ?? (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0")
     }
 
+    /// The repository a check asks: the configured one once it has been held to GitHub's owner/name
+    /// grammar, and the built-in one when it fails that.
+    var repository: String { AppUpdates.source(for: repo()).repository }
+
+    /// Why updates do not come from the repository the setup names, when they do not.
+    var repositoryWarning: String? { AppUpdates.source(for: repo()).warning }
+
     /// The version waiting to be installed, or nil when there is none.
     var availableVersion: String? {
         guard case .available(let release) = check else { return nil }

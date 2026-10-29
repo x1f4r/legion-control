@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import LegionControlCore
@@ -70,6 +71,211 @@ struct AppUpdateTests {
         #expect(!AppUpdates.isNewer("1.3.0", than: "1.3.0"))
         #expect(AppUpdates.version(fromTag: "v1.3.0") == "1.3.0")
         #expect(AppUpdates.version(fromTag: "1.3.0") == "1.3.0")
+    }
+
+    @Test("a tag or a remembered version of any shape compares without crashing", arguments: [
+        "", "-", "--", "v", "-1", "1.4.0-", "1.4.0-beta.2", "1..4", ".", "abc", "１.２", "99999999999999999999.1"
+    ])
+    func oddVersions(_ value: String) {
+        // The tag comes from whichever repository the setup names, and the setup from any peer.
+        _ = AppUpdates.isNewer(value, than: "1.3.0")
+        _ = AppUpdates.isNewer("1.3.0", than: value)
+        _ = AppUpdates.isNewer(value, than: value)
+        #expect(!AppUpdates.isNewer(value, than: value))
+    }
+
+    @Test("an empty or dash-only version is no version at all, and a pre-release reads as its release")
+    func versionEdges() {
+        #expect(!AppUpdates.isNewer("", than: "0"))
+        #expect(!AppUpdates.isNewer("-", than: "0.0.1") && AppUpdates.isNewer("0.0.1", than: "-"))
+        #expect(!AppUpdates.isNewer("1.4.0-beta", than: "1.4.0"))
+        #expect(AppUpdates.isNewer("1.4.1-rc.1", than: "1.4.0"))
+    }
+
+    @Test("only a GitHub owner/name is asked; anything else falls back to the built-in repository with a warning")
+    func repositoryGrammar() {
+        let builtIn = ControllerConfig.AppUpdatesConfig.defaultRepo
+        #expect(AppUpdates.source(for: "someone/a-fork") == ("someone/a-fork", nil))
+        #expect(AppUpdates.source(for: "").repository == builtIn)
+        #expect(AppUpdates.source(for: "").warning == nil)
+        #expect(AppUpdates.source(for: "   ").warning == nil)
+        for hostile in ["someone", "someone/", "/name", "-someone/name", "someone/..", "someone/.",
+                        "some one/name", "someone/name/releases", "someone/name?x=1", "someone/name#x",
+                        "someone/name\n", "../../orgs/x", "someone/na%2Fme", "someone/n\u{202E}ame"] {
+            let source = AppUpdates.source(for: hostile)
+            #expect(source.repository == builtIn, "\(hostile)")
+            #expect(source.warning != nil, "\(hostile)")
+        }
+    }
+
+    // MARK: - Downloading within bounds
+
+    /// A release served by the stub: a manifest naming the Mac archive with `declaredSize`, signed
+    /// with a key of the test's own, its signature, and the archive answered by `archiveRoute`.
+    struct ServedRelease {
+        var release: AppUpdates.Release
+        var key: Curve25519.Signing.PublicKey
+        var urls: [URL]
+        func forget() { StubURLProtocol.forget(urls) }
+    }
+
+    static func serveRelease(archive: Data, declaredSize: Int64? = nil, manifestPadding: Int = 0,
+                             signaturePadding: Int = 0, archiveRoute: StubURLProtocol.Route? = nil) throws -> ServedRelease {
+        let base = URL(string: "https://stub.example/\(UUID().uuidString)")!
+        let manifestURL = base.appending(path: "manifest.json")
+        let signatureURL = base.appending(path: "manifest.json.sig")
+        let archiveURL = base.appending(path: AppUpdates.assetName)
+        var manifest: [String: Any] = [
+            "schema": 1, "version": "1.4.0",
+            "artifacts": [["name": AppUpdates.assetName, "sha256": ReleaseTrust.sha256(of: archive),
+                           "size": declaredSize ?? Int64(archive.count)]]
+        ]
+        if manifestPadding > 0 { manifest["padding"] = String(repeating: "x", count: manifestPadding) }
+        let manifestBytes = try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+        let signer = Curve25519.Signing.PrivateKey()
+        let signature = Data((try signer.signature(for: manifestBytes).base64EncodedString()
+                              + String(repeating: " ", count: signaturePadding) + "\n").utf8)
+        StubURLProtocol.serve(manifestURL, .init(chunks: Self.chunked(manifestBytes)))
+        StubURLProtocol.serve(signatureURL, .init(chunks: [signature]))
+        StubURLProtocol.serve(archiveURL, archiveRoute ?? .init(chunks: Self.chunked(archive)))
+        return ServedRelease(
+            release: AppUpdates.Release(version: "1.4.0", notes: "", assetURL: archiveURL, sizeBytes: Int64(archive.count),
+                                        manifestURL: manifestURL, signatureURL: signatureURL),
+            key: signer.publicKey,
+            urls: [manifestURL, signatureURL, archiveURL]
+        )
+    }
+
+    /// Bodies arrive in pieces, as they do off a network.
+    static func chunked(_ data: Data, size: Int = 64 << 10) -> [Data] {
+        stride(from: 0, to: data.count, by: size).map { data.subdata(in: $0..<min($0 + size, data.count)) }
+    }
+
+    static func randomBytes(_ count: Int) -> Data {
+        Data((0..<count).map { _ in UInt8.random(in: 0...255) })
+    }
+
+    @Test("a signed archive streams to a file and checks out against the manifest")
+    func downloadStreamsToFile() async throws {
+        let parent = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let archive = Self.randomBytes(300_000)
+        let served = try Self.serveRelease(archive: archive)
+        defer { served.forget() }
+
+        let download = try await AppUpdates.download(served.release, session: StubURLProtocol.session(),
+                                                     key: served.key, into: parent)
+        #expect(try Data(contentsOf: download.archive) == archive)
+        #expect(download.artifact.size == Int64(archive.count))
+        AppUpdates.discard(download)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
+    }
+
+    @Test("an archive that runs past its signed size is stopped and deleted, not written out and refused afterwards")
+    func downloadStopsPastSignedSize() async throws {
+        let parent = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let archive = Self.randomBytes(200_000)
+        // The server keeps going well past what the manifest promised, and never says how much.
+        let served = try Self.serveRelease(archive: archive,
+                                           archiveRoute: .init(chunks: Self.chunked(archive + Self.randomBytes(4 << 20))))
+        defer { served.forget() }
+
+        await #expect {
+            try await AppUpdates.download(served.release, session: StubURLProtocol.session(), key: served.key, into: parent)
+        } throws: { error in
+            (error as? AppUpdates.InstallFailure)?.message.contains("ran past the 200000 bytes") == true
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
+    }
+
+    @Test("an archive whose announced length is larger than its signed size is refused before it is read")
+    func downloadRefusesAnnouncedOversize() async throws {
+        let parent = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let archive = Self.randomBytes(1000)
+        let served = try Self.serveRelease(archive: archive, archiveRoute: .init(
+            headers: ["Content-Length": "\(1 << 30)"], chunks: Self.chunked(archive)))
+        defer { served.forget() }
+
+        await #expect(throws: AppUpdates.InstallFailure.self) {
+            try await AppUpdates.download(served.release, session: StubURLProtocol.session(), key: served.key, into: parent)
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
+    }
+
+    @Test("a manifest over 256 KiB is refused, and nothing after it is asked for")
+    func manifestOverLimit() async throws {
+        let parent = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let served = try Self.serveRelease(archive: Self.randomBytes(1000), manifestPadding: 256 << 10)
+        defer { served.forget() }
+
+        await #expect {
+            try await AppUpdates.download(served.release, session: StubURLProtocol.session(), key: served.key, into: parent)
+        } throws: { error in
+            (error as? AppUpdates.InstallFailure)?.message.contains("256 KiB") == true
+        }
+        #expect(!StubURLProtocol.wasRequested(served.urls[1]))
+        #expect(!StubURLProtocol.wasRequested(served.urls[2]))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
+    }
+
+    @Test("a signature over 4 KiB is refused before the archive is asked for")
+    func signatureOverLimit() async throws {
+        let parent = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let served = try Self.serveRelease(archive: Self.randomBytes(1000), signaturePadding: 4 << 10)
+        defer { served.forget() }
+
+        await #expect {
+            try await AppUpdates.download(served.release, session: StubURLProtocol.session(), key: served.key, into: parent)
+        } throws: { error in
+            (error as? AppUpdates.InstallFailure)?.message.contains("4 KiB") == true
+        }
+        #expect(!StubURLProtocol.wasRequested(served.urls[2]))
+    }
+
+    @Test("a signed manifest that gives the archive no size installs nothing and downloads nothing")
+    func zeroSizeArtifact() async throws {
+        let parent = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let served = try Self.serveRelease(archive: Self.randomBytes(1000), declaredSize: 0)
+        defer { served.forget() }
+
+        await #expect(throws: AppUpdates.InstallFailure.self) {
+            try await AppUpdates.download(served.release, session: StubURLProtocol.session(), key: served.key, into: parent)
+        }
+        #expect(!StubURLProtocol.wasRequested(served.urls[2]))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty)
+    }
+
+    @Test("a release reply over 1 MiB is a failed check, not a megabyte of memory")
+    func releaseReplyOverLimit() async throws {
+        let repository = "someone/oversized-\(UUID().uuidString.prefix(8))"
+        let url = URL(string: "https://api.github.com/repos/\(repository)/releases/latest")!
+        let reply = Data(#"{"tag_name":"v9.9.9","body":""#.utf8) + Data(repeating: 0x61, count: 1 << 20) + Data(#""}"#.utf8)
+        StubURLProtocol.serve(url, .init(chunks: Self.chunked(reply)))
+        defer { StubURLProtocol.forget([url]) }
+
+        let result = await AppUpdates.check(repo: repository, installedVersion: "1.3.0", session: StubURLProtocol.session())
+        guard case .failed(let reason) = result else {
+            Issue.record("expected a failed check, got \(result)")
+            return
+        }
+        #expect(reason.contains("1 MiB"))
+    }
+
+    @Test("a repository that is not owner/name is never pasted into a URL; the built-in one is asked")
+    func checkFallsBackToBuiltIn() async throws {
+        let builtIn = URL(string: "https://api.github.com/repos/\(ControllerConfig.AppUpdatesConfig.defaultRepo)/releases/latest")!
+        StubURLProtocol.serve(builtIn, .init(chunks: [Data(#"{"tag_name":"v1.0.0","assets":[]}"#.utf8)]))
+        defer { StubURLProtocol.forget([builtIn]) }
+
+        let result = await AppUpdates.check(repo: "someone/../../orgs/x", installedVersion: "1.3.0",
+                                            session: StubURLProtocol.session())
+        #expect(result == .upToDate(note: nil))
+        #expect(StubURLProtocol.wasRequested(builtIn))
     }
 
     // MARK: - Checking the staged bundle

@@ -526,6 +526,19 @@ struct AppUpdateModelTests {
         #expect(FileManager.default.fileExists(atPath: previous.path))
     }
 
+    @Test("a configured repository that is not owner/name is shown as replaced by the built-in one")
+    func repositoryWarning() {
+        let (model, _, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = Repository()
+        model.repo = { repository.value }
+        #expect(model.repository == "a/a")
+        #expect(model.repositoryWarning == nil)
+        repository.value = "a/a/../../b"
+        #expect(model.repository == ControllerConfig.AppUpdatesConfig.defaultRepo)
+        #expect(model.repositoryWarning?.contains(ControllerConfig.AppUpdatesConfig.defaultRepo) == true)
+    }
+
     @Test("an isolated run never installs, rolls back or discards a build")
     func isolatedRunRefusesSwaps() async throws {
         let (model, _, directory) = fixture()
