@@ -409,8 +409,8 @@ struct AppUpdateTests {
 
             """)
         let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 2,
-                                           launcher: launch.argv)
+                                           marker: marker, pid: try Self.exitedProcessID(), swapID: "swap-1",
+                                           launchTimeout: 2, launcher: launch.argv)
         let run = try await Self.runHelper(script, in: root)
 
         #expect(run.exitCode == 0)
@@ -419,6 +419,13 @@ struct AppUpdateTests {
         #expect(AppUpdates.version(ofBundleAt: current) == "1.4.0")
         #expect(AppUpdates.version(ofBundleAt: previous) == "1.3.0")
         #expect(!FileManager.default.fileExists(atPath: staged.path))
+        #expect(AppUpdates.swapOutcome(support: root) == .init(id: "swap-1", status: AppUpdates.SwapOutcome.landed))
+    }
+
+    /// A launcher step that copies whatever outcome the helper has written so far to `seen`, so a
+    /// test can tell what the build being started would have found.
+    static func notingOutcome(support: URL, into seen: URL) -> String {
+        "cat \(CommandGrammar.posixQuoted(AppUpdates.swapOutcomeURL(support: support).path)) >> \(CommandGrammar.posixQuoted(seen.path)) 2>/dev/null || true\n"
     }
 
     @Test("a replacement that never comes up is rolled back by the helper")
@@ -433,10 +440,11 @@ struct AppUpdateTests {
         try Self.makeBundle(at: staged, identifier: "id", executable: "LegionControl", version: "1.4.0")
 
         // Nothing ever writes the marker: the new build crashed on the way up.
-        let launch = try Self.recordingLauncher(in: root)
+        let seen = root.appending(path: "seen")
+        let launch = try Self.recordingLauncher(in: root, then: Self.notingOutcome(support: root, into: seen))
         let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1,
-                                           launcher: launch.argv)
+                                           marker: marker, pid: try Self.exitedProcessID(), swapID: "swap-1",
+                                           launchTimeout: 1, launcher: launch.argv)
         let run = try await Self.runHelper(script, in: root)
         #expect(run.exitCode == 2)
         // The new build was started once, and then the old one, back at the same path.
@@ -446,6 +454,9 @@ struct AppUpdateTests {
         #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
         #expect(AppUpdates.version(ofBundleAt: staged) == "1.4.0")
         #expect(!FileManager.default.fileExists(atPath: previous.path))
+        // The old build found the outcome waiting when it was started, and nothing before it did.
+        #expect(try String(contentsOf: seen, encoding: .utf8) == "swap-1 2\n")
+        #expect(AppUpdates.swapOutcome(support: root) == .init(id: "swap-1", status: AppUpdates.SwapOutcome.putBack))
     }
 
     @Test("recovery stops a new build that is still coming up before the old one is started")
@@ -580,16 +591,19 @@ struct AppUpdateTests {
         let marker = root.appending(path: "launched-ok")
         try Self.makeBundle(at: current, identifier: "id", executable: "LegionControl", version: "1.3.0")
 
-        let launch = try Self.recordingLauncher(in: root)
+        let seen = root.appending(path: "seen")
+        let launch = try Self.recordingLauncher(in: root, then: Self.notingOutcome(support: root, into: seen))
         let script = AppUpdates.swapScript(current: current, staged: staged, previous: previous,
-                                           marker: marker, pid: try Self.exitedProcessID(), launchTimeout: 1,
-                                           launcher: launch.argv)
+                                           marker: marker, pid: try Self.exitedProcessID(), swapID: "swap-1",
+                                           launchTimeout: 1, launcher: launch.argv)
         let run = try await Self.runHelper(script, in: root)
         #expect(run.exitCode == 1)
         // The one window where the real path could hold nothing is closed by putting the old bundle
         // straight back, and that is the one launch.
         #expect(AppUpdates.version(ofBundleAt: current) == "1.3.0")
         #expect(Self.launched(launch.log) == [current.path(percentEncoded: false)])
+        // Written down before the old build was started, so it reads that nothing moved.
+        #expect(try String(contentsOf: seen, encoding: .utf8) == "swap-1 1\n")
     }
 
     @Test("a live old app aborts the helper without changing bundles, backups, marker or launching")
@@ -620,13 +634,16 @@ struct AppUpdateTests {
         defer { if oldApp.isRunning { oldApp.terminate() } }
         let script = AppUpdates.swapScript(
             current: current, staged: staged, previous: previous, marker: marker,
-            pid: oldApp.processIdentifier, exitTimeout: 1, launchTimeout: 1, launcher: launch.argv
+            pid: oldApp.processIdentifier, swapID: "swap-1", exitTimeout: 1, launchTimeout: 1, launcher: launch.argv
         )
         let run = await Shell.run(executable: "/bin/sh", arguments: ["-c", script], timeout: 10)
         #expect(run.exitCode == 3)
         #expect(oldApp.isRunning)
         #expect(Self.launched(launch.log).isEmpty)
-        #expect(try Self.fileSnapshot(root) == snapshot)
+        // The one thing written is the note of how it ended.
+        #expect(AppUpdates.swapOutcome(support: root) == .init(id: "swap-1", status: AppUpdates.SwapOutcome.notQuit))
+        let outcome = "/" + AppUpdates.swapOutcomeURL(support: root).lastPathComponent
+        #expect(try Self.fileSnapshot(root).filter { !$0.key.hasSuffix(outcome) } == snapshot)
         oldApp.terminate()
         for await _ in exited { break }
     }
@@ -716,6 +733,22 @@ struct AppUpdateTests {
         try Self.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "1.3.0")
         #expect(AppUpdates.retainedPrevious(beside: current) == previous)
         #expect(AppUpdates.version(ofBundleAt: previous) == "1.3.0")
+    }
+
+    @Test("only an outcome naming a swap is read as one")
+    func swapOutcomeReading() throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = AppUpdates.swapOutcomeURL(support: root)
+        #expect(AppUpdates.swapOutcome(support: root) == nil)
+        for unreadable in ["", "\n", " 0\n", "swap-1\n", "swap-1 two\n", "swap-1 0 extra\n"] {
+            try Data(unreadable.utf8).write(to: url)
+            #expect(AppUpdates.swapOutcome(support: root) == nil, "\(unreadable)")
+        }
+        try Data("swap-1 2\n".utf8).write(to: url)
+        #expect(AppUpdates.swapOutcome(support: root) == .init(id: "swap-1", status: 2))
+        AppUpdates.forgetSwapOutcome(support: root)
+        #expect(!FileManager.default.fileExists(atPath: url.path))
     }
 
     @Test("the launch records are written where the helper looks for them, carrying this build's pid")

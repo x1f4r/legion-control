@@ -130,7 +130,7 @@ struct AppModelTests {
         let previous = home.appending(path: "Legion Control.previous.app")
         try AppUpdateTests.makeBundle(at: previous, identifier: "id", executable: "LegionControl", version: "1.3.4")
         var handed: [URL] = []
-        updates.performSwap = { staged, _, _, _ in handed.append(staged.bundle) }
+        updates.performSwap = { staged, _, _, _, _ in handed.append(staged.bundle) }
         updates.quit = { }
 
         app.requestRollback()

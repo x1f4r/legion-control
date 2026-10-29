@@ -61,10 +61,11 @@ final class AppUpdateModel {
     /// real setup, write its marker where this run is not looking, and be rolled back with both
     /// copies left running.
     @ObservationIgnored var isIsolatedRun: Bool = AppPaths.isRedirected
-    /// Set in tests so nothing is ever actually swapped or relaunched. The last argument hears the
-    /// helper's exit status, which this process only lives to hear when the helper gave up.
-    @ObservationIgnored var performSwap: @MainActor (AppUpdates.Staged, URL, URL, @escaping @Sendable (Int32) -> Void) throws -> Void = {
-        try AppUpdates.startSwap(staged: $0, current: $1, marker: $2, onExit: $3)
+    /// Set in tests so nothing is ever actually swapped or relaunched. The string is the id the
+    /// helper writes down with its outcome, and the last argument hears its exit status, which this
+    /// process only lives to hear when the helper gave up.
+    @ObservationIgnored var performSwap: @MainActor (AppUpdates.Staged, URL, URL, String, @escaping @Sendable (Int32) -> Void) throws -> Void = {
+        try AppUpdates.startSwap(staged: $0, current: $1, marker: $2, swapID: $3, onExit: $4)
     }
     @ObservationIgnored var downloadRelease: @MainActor (AppUpdates.Release) async throws -> AppUpdates.Download = { try await AppUpdates.download($0) }
     @ObservationIgnored var stageRelease: @MainActor (AppUpdates.Download, String, URL) async throws -> AppUpdates.Staged = { try await AppUpdates.stage($0, version: $1, replacing: $2) }
@@ -320,14 +321,16 @@ final class AppUpdateModel {
                 // the only one that can say whether it worked, and it has to know what was meant.
                 let pending = PendingSwap(
                     id: record.id, kind: .update, version: release.version, from: self.installedVersion,
-                    operationId: record.id, repository: repository, checkedAt: self.lastChecked
+                    operationId: record.id, repository: repository, checkedAt: self.lastChecked,
+                    handedOverAt: self.now()
                 )
                 self.rememberPendingSwap(pending)
 
                 // The marker is removed by the helper before it launches the new build, and written
                 // again by the new build once it is up. Its absence is what triggers the recovery.
                 do {
-                    try self.performSwap(staged, bundleURL, marker, self.helperExit(pending, discarding: staged.bundle))
+                    try self.performSwap(staged, bundleURL, marker, pending.id,
+                                         self.helperExit(pending, discarding: staged.bundle))
                 } catch {
                     self.forgetPendingSwap()
                     throw error
@@ -365,11 +368,17 @@ final class AppUpdateModel {
         phase = .installing
         failure = nil
         let marker = AppUpdates.launchMarkerURL(support: supportDirectory)
+        let id = UUID().uuidString
         // Only a build that says which version it is can be checked for on the way back up.
         let pending = AppUpdates.version(ofBundleAt: previous).map {
-            PendingSwap(id: UUID().uuidString, kind: .rollBack, version: $0, from: installedVersion)
+            PendingSwap(id: id, kind: .rollBack, version: $0, from: installedVersion, handedOverAt: now())
         }
         if let pending { rememberPendingSwap(pending) }
+        // This build's answer is about this build, and the kept one may be a release that takes any
+        // stored answer as its own: it would come up "up to date" with a newer build one step away.
+        // If the helper puts this build back instead, it simply asks again.
+        let answer = storedData(Self.storageKey)
+        forget(Self.storageKey)
         do {
             // Through the same seam as an install, so nothing here can start the real helper unless
             // the app itself asked for it. The kept build is what goes in, so it is never deleted
@@ -377,11 +386,12 @@ final class AppUpdateModel {
             let ignore: @Sendable (Int32) -> Void = { _ in }
             let onExit = pending.map { helperExit($0, discarding: nil) } ?? ignore
             try AppUpdates.rollBack(to: previous, current: bundleURL, marker: marker) { staged, current, marker in
-                try self.performSwap(staged, current, marker, onExit)
+                try self.performSwap(staged, current, marker, id, onExit)
             }
             quit()
         } catch {
             if pending != nil { forgetPendingSwap() }
+            if let answer { store(answer, Self.storageKey) }
             failure = (error as? AppUpdates.InstallFailure)?.message ?? error.localizedDescription
             phase = .idle
         }
@@ -416,11 +426,12 @@ final class AppUpdateModel {
     private func helperGaveUp(_ pending: PendingSwap, status: Int32, discarding staged: URL?) {
         guard loadPendingSwap()?.id == pending.id else { return }
         forgetPendingSwap()
+        AppUpdates.forgetSwapOutcome(support: supportDirectory)
         if let staged { try? FileManager.default.removeItem(at: staged) }
-        let message = switch pending.kind {
-        case .update: "Legion Control did not quit, so the update helper changed nothing and \(pending.version) was not installed."
-        case .rollBack: "Legion Control did not quit, so the update helper changed nothing and \(pending.version) was not put back."
-        }
+        // A roll back put this build's answer away for the build it was going to start. That build
+        // is not coming, so the answer goes back.
+        if pending.kind == .rollBack, let check { remember(check) }
+        let message = Self.notQuit(pending)
         failure = message
         phase = .idle
         if let id = pending.operationId {
@@ -428,6 +439,13 @@ final class AppUpdateModel {
                                detail: "The update helper exited with status \(status) while this build was still running.")
         }
         onStateChange?()
+    }
+
+    private static func notQuit(_ pending: PendingSwap) -> String {
+        switch pending.kind {
+        case .update: "Legion Control did not quit, so the update helper changed nothing and \(pending.version) was not installed."
+        case .rollBack: "Legion Control did not quit, so the update helper changed nothing and \(pending.version) was not put back."
+        }
     }
 
     /// Called once the app is up. Tells the update helper it launched, which is what stops the
@@ -439,41 +457,81 @@ final class AppUpdateModel {
     }
 
     /// The one place an install is recorded as done: the build running now is the one it installed.
-    /// Anything else means the helper put the previous build back, or never got to move anything,
-    /// and the record and the offer say so rather than "updated".
+    ///
+    /// Any other build settles the swap by what the helper wrote down about it, never by its own
+    /// version alone. A roll back into a release from before swaps were written down lands without
+    /// that release saying so, and the record is next read by a build that knows about it, maybe
+    /// days later: by version alone, that looks exactly like the roll back failing.
     private func resolvePendingSwap() {
         guard let pending = loadPendingSwap() else { return }
-        forgetPendingSwap()
         let running = installedVersion
-        if running == pending.version, pending.kind == .update {
-            if let id = pending.operationId {
-                operations?.finish(id, state: .succeeded,
-                                   summary: "Legion Control \(running) is installed and came up.",
-                                   detail: "The previous build, \(pending.from), is kept beside it until it is discarded.")
+        let outcome = AppUpdates.swapOutcome(support: supportDirectory).flatMap { $0.id == pending.id ? $0.status : nil }
+        // Neither the build it asked for nor a word from the helper, while the helper may still be
+        // at work: this is a copy started beside the swap, and the next launch settles it.
+        if running != pending.version, outcome == nil, let handedOverAt = pending.handedOverAt {
+            let age = now().timeIntervalSince(handedOverAt)
+            if age >= 0 && age < AppUpdates.helperLifetime { return }
+        }
+        forgetPendingSwap()
+        AppUpdates.forgetSwapOutcome(support: supportDirectory)
+
+        if running == pending.version {
+            // A roll back that landed needs no word: the build it asked for is the one running.
+            if pending.kind == .update { updateCameUp(pending) }
+        } else if outcome == AppUpdates.SwapOutcome.landed {
+            // The helper saw the build it put in place come up, and something has replaced it since:
+            // most often a roll back into an older release, then an update or a reinstall.
+            if pending.kind == .update, let id = pending.operationId {
+                operations?.finish(id, state: .succeeded, summary: "Legion Control \(pending.version) was installed and came up.")
             }
-            // The check that offered this build found it the newest there was, and until the next
-            // check that is still the answer, so the new build does not come up with none. Not when
-            // the setup has since named another repository: that one has not been asked.
-            if pending.repository == nil || pending.repository == repo() {
-                let answer = AppUpdates.Check.upToDate(note: "Updated to \(running).")
-                checkedRepo = repo()
-                lastChecked = pending.checkedAt ?? now()
-                check = answer
-                remember(answer)
-            }
-        } else if running != pending.version {
-            let message = switch pending.kind {
-            case .update where running == pending.from:
-                "Legion Control \(pending.version) did not come up, so \(running) is still the build that runs. The update helper puts the previous build back when the new one does not start."
-            case .update:
-                "Legion Control \(pending.version) was not confirmed: the build running now is \(running)."
-            case .rollBack:
-                "Legion Control \(pending.version) did not come up, so \(running) is still the build that runs."
-            }
+        } else {
+            let message = Self.swapFailure(pending, running: running, outcome: outcome)
             failure = message
             if let id = pending.operationId { operations?.finish(id, state: .failed, summary: message) }
         }
         onStateChange?()
+    }
+
+    private func updateCameUp(_ pending: PendingSwap) {
+        let running = installedVersion
+        if let id = pending.operationId {
+            operations?.finish(id, state: .succeeded,
+                               summary: "Legion Control \(running) is installed and came up.",
+                               detail: "The previous build, \(pending.from), is kept beside it until it is discarded.")
+        }
+        // The check that offered this build found it the newest there was, and until the next
+        // check that is still the answer, so the new build does not come up with none. Not when
+        // the setup has since named another repository: that one has not been asked.
+        if pending.repository == nil || pending.repository == repo() {
+            let answer = AppUpdates.Check.upToDate(note: "Updated to \(running).")
+            checkedRepo = repo()
+            lastChecked = pending.checkedAt ?? now()
+            check = answer
+            remember(answer)
+        }
+    }
+
+    /// What a swap that did not land is reported as, by what the helper said happened.
+    private static func swapFailure(_ pending: PendingSwap, running: String, outcome: Int32?) -> String {
+        let undone = pending.kind == .update ? "was not installed" : "was not put back"
+        switch outcome {
+        case AppUpdates.SwapOutcome.putBack?:
+            guard running == pending.from else {
+                return "Legion Control \(pending.version) did not come up, and the build running now is \(running)."
+            }
+            let still = "Legion Control \(pending.version) did not come up, so \(running) is still the build that runs."
+            return pending.kind == .update
+                ? still + " The update helper puts the previous build back when the new one does not start."
+                : still
+        case AppUpdates.SwapOutcome.notMoved?:
+            return "The update helper could not move the bundles, so Legion Control \(pending.version) \(undone) and \(running) is still the build that runs."
+        case AppUpdates.SwapOutcome.notQuit?:
+            return notQuit(pending)
+        case let status?:
+            return "The update helper stopped with status \(status), so Legion Control \(pending.version) \(undone). The build running now is \(running)."
+        case nil:
+            return "Legion Control \(pending.version) was not confirmed: the update helper stopped before it said how the swap ended, and the build running now is \(running)."
+        }
     }
 
     // MARK: - The swap in flight
@@ -493,6 +551,9 @@ final class AppUpdateModel {
         /// Where and when the check that offered the update looked.
         var repository: String?
         var checkedAt: Date?
+        /// When the helper was given the swap, so a launch can tell a helper that may still be at
+        /// work from one that is long gone.
+        var handedOverAt: Date?
     }
 
     private static let pendingKey = "appUpdatePendingSwap"

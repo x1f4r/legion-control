@@ -613,6 +613,9 @@ enum AppUpdates {
     /// exactly one bundle at the real path, and it is always one of the two whole bundles rather
     /// than a mixture, and with one copy of the app running rather than two.
     ///
+    /// Every path also writes down how it ended, as `swapID` and the exit status, for the build
+    /// that comes up next (`swapOutcome`).
+    ///
     /// `launcher` is the argv every path starts a bundle with, the bundle's path appended.
     static func swapScript(
         current: URL,
@@ -620,11 +623,13 @@ enum AppUpdates {
         previous: URL,
         marker: URL,
         pid: Int32,
+        swapID: String = "",
         exitTimeout: Int = 10,
         launchTimeout: Int = 45,
         launcher: [String] = launcher
     ) -> String {
         func quoted(_ url: URL) -> String { CommandGrammar.posixQuoted(bundlePath(url)) }
+        let support = marker.deletingLastPathComponent()
         return """
         #!/bin/sh
         set -u
@@ -632,12 +637,21 @@ enum AppUpdates {
         STAGED=\(quoted(staged))
         PREVIOUS=\(quoted(previous))
         MARKER=\(quoted(marker))
-        STARTING=\(quoted(launchingURL(support: marker.deletingLastPathComponent())))
+        STARTING=\(quoted(launchingURL(support: support)))
+        OUTCOME=\(quoted(swapOutcomeURL(support: support)))
+        SWAP_ID=\(CommandGrammar.posixQuoted(swapID))
         PID=\(pid)
 
         # Every path below starts a bundle through this one function.
         launch() {
             \(launcher.map(CommandGrammar.posixQuoted).joined(separator: " ")) "$1" 2>/dev/null || true
+        }
+
+        # How this swap ended, for the build that comes up next to read. Written before any build is
+        # started on the way out, so the one that comes up never looks before it is there.
+        finish() {
+            printf '%s %s\\n' "$SWAP_ID" "$1" > "$OUTCOME.tmp" 2>/dev/null && mv -f "$OUTCOME.tmp" "$OUTCOME" 2>/dev/null
+            return 0
         }
 
         # Whether a pid names a process running out of the bundle this helper put in place. Asked
@@ -687,6 +701,7 @@ enum AppUpdates {
         done
         if app_is_running; then
             echo "The current app did not exit. No update files were changed." >&2
+            finish 3
             exit 3
         fi
 
@@ -695,6 +710,7 @@ enum AppUpdates {
 
         if ! mv "$CURRENT" "$PREVIOUS"; then
             # Nothing has moved, so the running build is still exactly where it was.
+            finish 1
             launch "$CURRENT"
             exit 1
         fi
@@ -702,6 +718,7 @@ enum AppUpdates {
         if ! mv "$STAGED" "$CURRENT"; then
             # The only window in which the real path holds nothing. Put it back and stop.
             mv "$PREVIOUS" "$CURRENT"
+            finish 1
             launch "$CURRENT"
             exit 1
         fi
@@ -713,6 +730,7 @@ enum AppUpdates {
         i=0
         while [ $i -lt \(launchTimeout * 10) ]; do
             if [ -f "$MARKER" ]; then
+                finish 0
                 exit 0
             fi
             sleep 0.1
@@ -723,12 +741,55 @@ enum AppUpdates {
         # that turns out to be about something else is still diagnosable.
         stop_new_build
         rm -rf "$STAGED"
+        finish 2
         if mv "$CURRENT" "$STAGED" && mv "$PREVIOUS" "$CURRENT"; then
             launch "$CURRENT"
         fi
         exit 2
         """
     }
+
+    /// How the helper ended a swap: its exit status, written down beside the launch marker with the
+    /// id of the swap it was given.
+    ///
+    /// The build that comes up next cannot tell this from the version it is. A roll back into a build
+    /// released before swaps were written down lands, and that build never says so; when this one
+    /// runs again later, the record left behind looks exactly like a roll back that never came up.
+    /// The helper is always written by the build handing over, so it is always one that writes this.
+    struct SwapOutcome: Equatable, Sendable {
+        var id: String
+        var status: Int32
+
+        /// The build the helper put in place came up.
+        static let landed: Int32 = 0
+        /// A bundle could not be moved, and the one that was running is where it was.
+        static let notMoved: Int32 = 1
+        /// The build put in place did not come up, and the previous one was put back.
+        static let putBack: Int32 = 2
+        /// The build that handed over never quit, so nothing was moved.
+        static let notQuit: Int32 = 3
+    }
+
+    static func swapOutcomeURL(support: URL) -> URL {
+        support.appending(path: "swap-outcome")
+    }
+
+    /// What the last helper wrote down, if it wrote anything readable.
+    static func swapOutcome(support: URL) -> SwapOutcome? {
+        guard let text = try? String(contentsOf: swapOutcomeURL(support: support), encoding: .utf8) else { return nil }
+        let fields = text.split(whereSeparator: \.isWhitespace)
+        guard fields.count == 2, let status = Int32(fields[1]) else { return nil }
+        return SwapOutcome(id: String(fields[0]), status: status)
+    }
+
+    static func forgetSwapOutcome(support: URL) {
+        try? FileManager.default.removeItem(at: swapOutcomeURL(support: support))
+    }
+
+    /// How long a helper can still be at work after it was handed a swap: ten seconds for this build
+    /// to quit, forty-five for the next to come up, and up to ten more stopping it, with room to
+    /// spare. A swap with no outcome after this never got one.
+    static let helperLifetime: TimeInterval = 2 * 60
 
     /// A bundle's path as the helper and `ps` spell it: without the trailing slash a directory URL
     /// carries. The running app's own bundle URL has one, and `"$CURRENT"/*` written with it would
@@ -757,10 +818,12 @@ enum AppUpdates {
     /// running out of it. The same check is what stops a test that forgot to replace this from
     /// starting a helper over its fake bundles.
     ///
-    /// `onExit` hears the helper's exit status, which this process only ever lives to hear when the
-    /// helper gave up: it moves nothing until this process has gone.
+    /// `swapID` is what the helper writes down with its outcome, so the next build can tell this
+    /// swap from any other. `onExit` hears the helper's exit status, which this process only ever
+    /// lives to hear when the helper gave up: it moves nothing until this process has gone.
     static func startSwap(
         staged: Staged, current: URL, marker: URL,
+        swapID: String = "",
         launcher: [String] = launcher,
         runningFrom running: URL = Bundle.main.bundleURL,
         onExit: (@Sendable (Int32) -> Void)? = nil
@@ -774,6 +837,7 @@ enum AppUpdates {
             previous: staged.previous,
             marker: marker,
             pid: ProcessInfo.processInfo.processIdentifier,
+            swapID: swapID,
             launcher: launcher
         )
         let helper = URL(fileURLWithPath: NSTemporaryDirectory())
