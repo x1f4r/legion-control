@@ -123,3 +123,29 @@ test('the APK build says why when it cannot read which agent to carry', { skip: 
   assert.match(manifest.stderr, /Legion-Control-agent-manifest\.json is for agent unknown, not 3\.1\.0/);
   assert.equal(fs.existsSync(path.join(sealed, 'gradle-arguments')), false);
 });
+
+test('the APK build stops before Gradle unless it has a JDK 21, and says how to give it one', { skip: process.platform === 'win32' }, (t) => {
+  // The messages say what the build needs and how to point it at that, and nothing about which
+  // java the machine it was written on happened to have.
+  const absent = checkout(t);
+  fs.rmSync(path.join(absent, 'jdk'), { recursive: true });
+  const missing = build(absent);
+  assert.equal(missing.status, 1);
+  assert.equal(missing.stderr.trim(), `ERROR: no JDK 21 at ${path.join(absent, 'jdk')}. Install Temurin 21, or point LEGION_ANDROID_JAVA_HOME at your own copy; AGP 8.13 refuses a newer JDK.`);
+  assert.equal(fs.existsSync(path.join(absent, 'gradle-arguments')), false);
+
+  const newer = checkout(t);
+  fs.writeFileSync(path.join(newer, 'jdk', 'bin', 'java'), "#!/bin/sh\necho '    java.specification.version = 25' >&2\n");
+  const refused = build(newer);
+  assert.equal(refused.status, 1);
+  assert.equal(refused.stderr.trim(), `ERROR: ${path.join(newer, 'jdk')} is Java 25, not 21. AGP 8.13 needs 21.`);
+  assert.equal(fs.existsSync(path.join(newer, 'gradle-arguments')), false);
+
+  // A folder with no java in it used to end the script under set -e without a word.
+  const empty = checkout(t);
+  fs.rmSync(path.join(empty, 'jdk', 'bin', 'java'));
+  const nothing = build(empty);
+  assert.equal(nothing.status, 1);
+  assert.equal(nothing.stderr.trim(), `ERROR: ${path.join(empty, 'jdk')} is Java unknown, not 21. AGP 8.13 needs 21.`);
+  assert.equal(fs.existsSync(path.join(empty, 'gradle-arguments')), false);
+});

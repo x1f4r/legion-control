@@ -21,7 +21,7 @@
     a service is mid work and must be left alone, are all its call.
 
     Which services exist and what updating one means are the agent config's
-    business, not this file's. On this Mac an update can be as small as asking a
+    business, not this file's. On a Mac an update can be as small as asking a
     desktop app that has already downloaded its own build to quit and start
     again, so the whole job of the cycle is deciding when that is safe. That is
     precisely the decision the agent's busy rule exists to make, and it fails

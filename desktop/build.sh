@@ -6,10 +6,10 @@
 # --require-agent stops the build unless dist/ holds the signed agent bundle. A release passes it;
 # any other build without the bundle goes ahead and says so.
 #
-# Self-contained on purpose: the machines this runs on are a Windows box with only the .NET runtime
-# and a Linux box that may have no dotnet at all, so the binary carries its own. The two archives
-# are named exactly as the signed release manifest names them, because the client picks its own
-# update by exact name and never by shape.
+# Self-contained on purpose: a machine the client runs on may have another .NET runtime than the one
+# it was built for, or no dotnet at all, so the binary carries its own. The archives are named
+# exactly as the signed release manifest names them, because the client picks its own update by
+# exact name and never by shape.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
