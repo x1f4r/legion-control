@@ -24,12 +24,12 @@ function psLiteral(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
+function powerShellArgs(script) {
+  return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script];
+}
+
 export function runPowerShell(script, timeoutMs = 30000) {
-  return runCommand(
-    'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-    { timeoutMs },
-  );
+  return runCommand('powershell.exe', powerShellArgs(script), { timeoutMs });
 }
 
 /** PowerShell can prepend warnings, so pick the line that actually looks like JSON. */
@@ -111,8 +111,10 @@ export function processStartedAt(service) {
     }
 
     if (type === 'scheduled-task') {
+      // A failed query says nothing, which is why it stops the script rather
+      // than leaving an empty answer that reads like a process with no start.
       const script = [
-        "$ErrorActionPreference = 'SilentlyContinue'",
+        "$ErrorActionPreference = 'Stop'",
         `$needle = ${psLiteral(taskMatch(service))}`,
         "$procs = @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and " +
           "$_.CommandLine.ToLower().Replace('\\\\', '\\').Contains($needle.ToLower().Replace('\\\\', '\\')) })",
@@ -142,12 +144,20 @@ export function processStartedAt(service) {
   return null;
 }
 
-function windowsTaskScript(service, { includeRelay, readOnly = false }) {
+/**
+ * The one PowerShell script that looks for a scheduled task's process, for
+ * status and for everything that decides whether a service may be stopped.
+ *
+ * It stops at the first error. It used to carry on silently, so a process query
+ * that was denied left an empty list behind it and the script reported, quite
+ * correctly for that list, that nothing was running.
+ */
+function windowsTaskScript(service, { includeRelay, readOnly = false, startedAt = false }) {
   const needle = psLiteral(taskMatch(service, { readOnly }));
   const port = service.health?.type === 'http' ? service.health.port : null;
   const portFlag = port ? psLiteral(`--port ${port}`) : null;
   const lines = [
-    "$ErrorActionPreference = 'SilentlyContinue'",
+    "$ErrorActionPreference = 'Stop'",
     `$needle = ${needle}`,
     // The command line is matched with its runs of backslashes collapsed. An npm
     // cmd shim builds the script path as "%dp0%\node_modules\<pkg>\..." and
@@ -171,8 +181,11 @@ function windowsTaskScript(service, { includeRelay, readOnly = false }) {
       '$relayCommand = Get-Command cloudflared.exe -ErrorAction SilentlyContinue',
     );
   }
+  if (startedAt) {
+    lines.push("$started = if ($procs.Count -gt 0) { ($procs | Sort-Object CreationDate | Select-Object -First 1).CreationDate.ToUniversalTime().ToString('o') } else { $null }");
+  }
   lines.push(
-    '[pscustomobject]@{ running = ($procs.Count -gt 0); pids = (($procs | ForEach-Object { [string]$_.ProcessId }) -join \',\')' +
+    `[pscustomobject]@{ ${startedAt ? 'startedAt = $started; ' : ''}running = ($procs.Count -gt 0); pids = (($procs | ForEach-Object { [string]$_.ProcessId }) -join ',')` +
       (includeRelay
         ? '; relayConfigured = (($relayCommand -ne $null) -or ($relay.Count -gt 0)); relayRunning = ($relay.Count -gt 0)'
         : '') +
@@ -181,25 +194,52 @@ function windowsTaskScript(service, { includeRelay, readOnly = false }) {
   return lines.join('\n');
 }
 
-function windowsTaskProbe(service, { includeRelay }) {
-  const result = runPowerShell(windowsTaskScript(service, { includeRelay }), 30000);
-  const parsed = parsePowerShellJson(result.stdout);
-  if (!parsed) {
-    return { running: false, unitState: 'unknown', pids: [], error: describeFailure(result) };
+/** An ISO timestamp from a probe's text, or null when the text is not one. */
+function timestamp(text) {
+  const value = Date.parse(String(text ?? '').trim().replace(/^[A-Za-z]{3}\s+/, ''));
+  return Number.isNaN(value) ? null : new Date(value).toISOString();
+}
+
+/**
+ * What the scheduled-task script answered, read the same way by `status` and by
+ * the stop loop, the busy gate and recovery, which all act on it.
+ *
+ * Only a script that succeeded and printed a typed Boolean is a reading. The
+ * synchronous probe used to parse whatever was printed, so a PowerShell that
+ * exited 1 after an access-denied query, having printed a perfectly
+ * well-formed "running": false, made the service read as stopped with no error
+ * at all: the stop loop let an installer at its files, and the busy gate retired
+ * the turns it was running. A failed, timed-out or malformed answer is unknown
+ * (contract section 6), and unknown is never stopped.
+ */
+export function readTaskProbe(result) {
+  const parsed = result.ok ? parsePowerShellJson(result.stdout) : null;
+  if (!parsed || typeof parsed.running !== 'boolean') {
+    const error = result.ok ? 'PowerShell printed no process reading' : describeFailure(result);
+    return { probe: { running: false, unitState: 'unknown', pids: [], startedAt: null, error }, parsed: null };
   }
   const pids = String(parsed.pids ?? '')
     .split(',')
     .map((value) => Number(value.trim()))
     .filter((value) => Number.isInteger(value) && value > 0);
-
-  const probe = {
-    running: Boolean(parsed.running),
-    unitState: parsed.running ? 'running' : 'stopped',
-    pids,
-    error: null,
+  return {
+    probe: {
+      running: parsed.running,
+      unitState: parsed.running ? 'running' : 'stopped',
+      pids,
+      startedAt: parsed.running ? timestamp(parsed.startedAt) : null,
+      error: null,
+    },
+    parsed,
   };
-  if (includeRelay) {
-    probe.relay = { configured: Boolean(parsed.relayConfigured), running: Boolean(parsed.relayRunning) };
+}
+
+function windowsTaskProbe(service, { includeRelay }) {
+  const reading = readTaskProbe(runPowerShell(windowsTaskScript(service, { includeRelay }), 30000));
+  // The synchronous probe has never reported a start time; processStartedAt does.
+  const { startedAt, ...probe } = reading.probe;
+  if (includeRelay && reading.parsed) {
+    probe.relay = { configured: Boolean(reading.parsed.relayConfigured), running: Boolean(reading.parsed.relayRunning) };
   }
   return probe;
 }
@@ -256,11 +296,7 @@ export async function probeProcessAsync(service, { clock = deadline(15000), incl
     if (timeoutMs <= 0) return Promise.resolve({ ok: false, code: null, stdout: '', stderr: '', timedOut: true, command: file });
     return runner(file, args, { timeoutMs });
   };
-  const timestamp = (text) => {
-    const value = Date.parse(String(text ?? '').trim().replace(/^[A-Za-z]{3}\s+/, ''));
-    return Number.isNaN(value) ? null : new Date(value).toISOString();
-  };
-  const powershell = (script) => run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], 30000);
+  const powershell = (script) => run('powershell.exe', powerShellArgs(script), 30000);
   const type = service.process?.type;
   let probe;
   if (type === 'systemd-user' || type === 'systemd-system') {
@@ -277,18 +313,9 @@ export async function probeProcessAsync(service, { clock = deadline(15000), incl
           startedAt: fields.ActiveState === 'active' ? timestamp(fields.ActiveEnterTimestamp) : null, error: null }
       : unknown(describeFailure(result));
   } else if (type === 'scheduled-task') {
-    const script = windowsTaskScript(service, { includeRelay, readOnly: true }).replace("$ErrorActionPreference = 'SilentlyContinue'", "$ErrorActionPreference = 'Stop'").replace(
-      '[pscustomobject]@{ running =',
-      "$started = if ($procs.Count -gt 0) { ($procs | Sort-Object CreationDate | Select-Object -First 1).CreationDate.ToUniversalTime().ToString('o') } else { $null }\n[pscustomobject]@{ startedAt = $started; running =",
-    );
-    const result = await powershell(script);
-    const parsed = result.ok ? parsePowerShellJson(result.stdout) : null;
-    probe = parsed && typeof parsed.running === 'boolean'
-      ? { running: parsed.running, unitState: parsed.running ? 'running' : 'stopped',
-          pids: String(parsed.pids ?? '').split(',').map(Number).filter((pid) => Number.isInteger(pid) && pid > 0),
-          startedAt: parsed.running ? timestamp(parsed.startedAt) : null, error: null }
-      : unknown(describeFailure(result));
-    if (includeRelay && parsed) probe.relay = { configured: true, running: parsed.relayRunning === true };
+    const reading = readTaskProbe(await powershell(windowsTaskScript(service, { includeRelay, readOnly: true, startedAt: true })));
+    probe = reading.probe;
+    if (includeRelay && reading.parsed) probe.relay = { configured: true, running: reading.parsed.relayRunning === true };
   } else if (type === 'app') {
     if (!service.path) return unknown('no app path is configured for this service');
     const result = await run('/bin/ps', ['-Ao', 'pid=,comm=']);
