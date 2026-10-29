@@ -497,6 +497,9 @@ struct AgentActionResult: Decodable, Sendable {
     var children: [AgentOperation.Child]?
     /// The effective policy, on an `auto-update` or `policy set` reply.
     var updates: AgentUpdatePolicy?
+    /// What became of it, as agent 3.1.0 states it (section 5.6). Read through `Outcome.of`, which
+    /// reduces it from `ok`, `action` and `reasonCode` when an older agent did not say.
+    var outcome: String?
 
     var didInstallAgent: Bool { ok == true && action == "installed" }
 
@@ -506,13 +509,22 @@ struct AgentActionResult: Decodable, Sendable {
     var operationId: String? { op?.id.isEmpty == false ? op?.id : nil }
 
     /// True when the reply is "I have started it, ask me later". The client then polls `op`.
-    var isAccepted: Bool { action == "accepted" }
+    ///
+    /// A replay of a request that is still running says `already-running` rather than `accepted`
+    /// from agent 3.1.0 on, and is followed in exactly the same way: it is the same work, under the
+    /// same id, still in the agent's hands.
+    var isAccepted: Bool { action == "accepted" || action == "already-running" }
 
     /// True when the far side refused because something else is already running.
     var isConflict: Bool { action == "conflict" }
 
     /// True when the request was taken and is being held for an idle moment.
     var isQueued: Bool { action == "queued" }
+
+    /// True when the agent took a reboot or a suspend and is on its way down. Pending like an
+    /// accepted request, but nothing can be asked about it until the machine is back: it is settled
+    /// by seeing what comes back, not by polling.
+    var isTransition: Bool { action == "rebooting" || action == "sleeping" }
 
     /// `true`, or the id of what was replaced.
     struct ReplacedMarker: Decodable, Sendable, Equatable {
@@ -603,6 +615,26 @@ struct AgentOperationResult: Decodable, Sendable {
     var id: String?
     var kind: String?
     var state: String?
+    /// Whether the reply carried an `op` key at all, null included. Only a present `op: null` is
+    /// the agent saying it has no record; a reply without the key is some other refusal.
+    var carriesOperation = false
+
+    private enum CodingKeys: String, CodingKey {
+        case ok, contract, message, reasonCode, op, id, kind, state
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try container.decodeIfPresent(Bool.self, forKey: .ok)
+        contract = try container.decodeIfPresent(Int.self, forKey: .contract)
+        message = try container.decodeIfPresent(String.self, forKey: .message)
+        reasonCode = try container.decodeIfPresent(String.self, forKey: .reasonCode)
+        op = try container.decodeIfPresent(AgentOperation.self, forKey: .op)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind)
+        state = try container.decodeIfPresent(String.self, forKey: .state)
+        carriesOperation = container.contains(.op)
+    }
 
     var reason: AgentReason? { AgentReason(code: reasonCode) }
 
@@ -613,18 +645,14 @@ struct AgentOperationResult: Decodable, Sendable {
     /// the echoed id would turn that answer into a phantom operation.
     var operation: AgentOperation? { op }
 
-    /// True when the agent answered and has no record of that id.
+    /// True when the agent answered and has no record of that id: `op` is there and null.
     ///
     /// That is itself an answer, and the whole reason an id is carried: an agent that files every
-    /// operation it starts and has no record of this one never started it. Anything else — a
-    /// restricted key, a broken config — leaves the question open rather than settling it wrongly.
-    var isUnknownOperation: Bool {
-        guard op == nil else { return false }
-        switch reason {
-        case nil, .notConfigured: return true
-        default: return false
-        }
-    }
+    /// operation it starts and has no record of this one never started it. Agent 3.1.0 says so
+    /// with `not-configured`, and 3.0.x said it with `bad-argument`, so the code does not decide
+    /// (section 4). A reply without the key — a restricted key, a broken config — is not that
+    /// answer and leaves the question open rather than settling it wrongly.
+    var isUnknownOperation: Bool { carriesOperation && op == nil }
 }
 
 // MARK: - Systems as the app draws them

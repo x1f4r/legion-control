@@ -86,6 +86,10 @@ final class DeviceCore {
     /// The last time the app asked the far side about an operation it had lost track of.
     @ObservationIgnored fileprivate var lastReconcileAttempt: Date = .distantPast
 
+    /// How an action waits before polling its operation again after a poll that did not get
+    /// through. The tests hand in one that returns at once.
+    @ObservationIgnored var pollPause: @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+
     /// How often an operation with an unknown outcome is chased.
     static let reconcileEvery: TimeInterval = 60
 
@@ -605,6 +609,11 @@ extension AgentDevice {
             do {
                 let request = try AgentRequest.autoUpdate(enabled, service: serviceId, dialect: dialect)
                 let result = try await self.send(request, decoding: AgentActionResult.self)
+                // A refusal is a reply too. Read as a saved setting, it put the switch where the
+                // person moved it while the agent kept the old value.
+                guard Outcome.of(result) == .succeeded else {
+                    return self.otherOutcome(result, subject: subject, verb: "The update setting")
+                }
                 let value = result.updates?.automatic ?? result.autoUpdate ?? enabled
                 saved(value)
                 let sentence = value
@@ -693,12 +702,17 @@ extension AgentDevice {
             do {
                 let request = try AgentRequest.cancel(id: operation.id)
                 let result = try await self.send(request, decoding: AgentActionResult.self)
-                let sentence = result.ok == false
-                    ? (result.message ?? "The queued request could not be cancelled.")
-                    : "\(operation.displayName) is no longer queued."
-                self.setStatus(sentence, isError: result.ok == false)
-                if result.ok != false { self.operations?.finish(operation.id, state: .cancelled, summary: sentence) }
-                return .init(state: result.ok == false ? .failed : .succeeded, summary: sentence, refresh: true)
+                // Decided on the outcome, not on `ok`. A request that started while the cancel was
+                // on its way answers `conflict` with `ok: true`: nothing was cancelled, and the work
+                // it was meant to stop is running.
+                let outcome = Outcome.of(result)
+                let sentence = outcome == .succeeded
+                    ? "\(operation.displayName) is no longer queued."
+                    : (result.message ?? "The queued request could not be cancelled.")
+                self.setStatus(sentence, isError: outcome != .succeeded)
+                if outcome == .succeeded { self.operations?.finish(operation.id, state: .cancelled, summary: sentence) }
+                return .init(state: OperationOutcome.state(outcome, action: result.action), summary: sentence, refresh: true,
+                             unresolved: outcome == .unknown)
             } catch let failure as AgentFailure {
                 return self.reportFailure(failure, verb: "The cancellation")
             } catch let invalid as AgentRequest.Invalid {
@@ -833,7 +847,7 @@ extension AgentDevice {
         let dialect = dialect
         do {
             let request = try build(intent)
-            let driver = OperationDriver(
+            var driver = OperationDriver(
                 send: { [weak self] request in
                     guard let self else { throw CancellationError() }
                     return try await self.send(request, decoding: AgentActionResult.self)
@@ -850,6 +864,7 @@ extension AgentDevice {
                     self?.onStateChange?()
                 }
             )
+            driver.pause = core.pollPause
 
             core.watchedOperation = operation
             defer { core.watchedOperation = nil }
@@ -884,6 +899,20 @@ extension AgentDevice {
                 setStatus(sentence)
                 return .init(state: .queued, summary: sentence, detail: result.message,
                              refresh: true, expiresAt: expires)
+            }
+
+            // The outcome is what this app decides on, and an action word is no evidence when the
+            // agent itself does not know how the work went: a producer that knows a failed update
+            // may have changed the machine says `unknown` whatever the action beside it says. The
+            // record is left owed and read again by its id, never sent again.
+            if Outcome.of(result) == .unknown {
+                // The agent's own words first: a reason code's sentence was written for an ending
+                // that is known, and "failed" is exactly what this is not.
+                let said = result.message ?? result.reason?.sentence(subject: subject, message: nil)
+                let sentence = "\(verb) may or may not have taken effect: \(said ?? "\(name) could not say.")"
+                setStatus(sentence, isError: true, detail: result.message)
+                return .init(state: .unknown, summary: sentence, detail: result.message,
+                             refresh: true, unresolved: true)
             }
 
             return interpret(result, conclusion)

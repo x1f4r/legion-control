@@ -242,12 +242,16 @@ struct AgentOperation: Decodable, Sendable, Equatable, Identifiable {
     /// The action name, when a summary carries it flat rather than inside `result`.
     var action: String?
     var reasonCode: String?
+    /// What became of it, as agent 3.1.0 states it: `pending` while queued or running, one of the
+    /// four terminal outcomes once finished (section 5.6). Read through `Outcome.of`, which reduces
+    /// it from the result when an older agent did not say.
+    var outcome: String?
 
     private enum CodingKeys: String, CodingKey {
         case rawId = "id"
         case kind, service, target, actionId, mode, initiator, state, phase, progress
         case requestedAt, startedAt, updatedAt, finishedAt, expiresAt, pid, detached
-        case from, to, result, log, agentVersion, systemId, replayed, children, action, reasonCode
+        case from, to, result, log, agentVersion, systemId, replayed, children, action, reasonCode, outcome
     }
 
     struct Initiator: Decodable, Sendable, Equatable {
@@ -284,6 +288,10 @@ struct AgentOperation: Decodable, Sendable, Equatable, Identifiable {
         var to: String?
         var exitCode: Int?
         var output: String?
+        /// The finished result's own outcome, from agent 3.1.0 on. The record's `outcome` comes
+        /// first when the two differ: a producer that knows a failure may have changed the machine
+        /// says `unknown` there.
+        var outcome: String?
     }
 
     struct LogLine: Decodable, Sendable, Equatable, Identifiable {
@@ -297,6 +305,7 @@ struct AgentOperation: Decodable, Sendable, Equatable, Identifiable {
         var service: String?
         var action: String?
         var reasonCode: String?
+        var outcome: String?
         var id: String { opId ?? service ?? UUID().uuidString }
     }
 

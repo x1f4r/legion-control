@@ -13,7 +13,7 @@ struct ContractVectorTests {
 
     /// The families this suite runs. A family joins when this app has a port of its reference to
     /// run, and the contract has nine.
-    static let families = ["hash", "identifiers", "transport", "setup-acceptance", "launch", "setup-reconcile", "setup-merge"]
+    static let families = ["hash", "identifiers", "outcome", "transport", "setup-acceptance", "launch", "setup-reconcile", "setup-merge"]
 
     typealias Adapter = @Sendable (VectorJSON) throws -> VectorJSON
 
@@ -58,6 +58,11 @@ struct ContractVectorTests {
     /// The codes of a list of problems as the vectors list them: sorted, each once.
     static func codes(_ problems: [DocumentAcceptance.Problem]) -> VectorJSON {
         .array(Set(problems.map(\.code)).sorted().map(VectorJSON.string))
+    }
+
+    /// A case's input as the bytes a reply would have arrived as, for the decoders the app uses.
+    static func decode<Value: Decodable>(_ type: Value.Type, _ input: VectorJSON) throws -> Value {
+        try JSONDecoder().decode(type, from: JSONSerialization.data(withJSONObject: input.foundation, options: [.fragmentsAllowed]))
     }
 
     static func document(_ text: String) throws -> Any {
@@ -116,6 +121,16 @@ struct ContractVectorTests {
         "identifiers/duration": valid(AgentToken.isValidDuration),
         "identifiers/clockTime": valid(AgentToken.isValidClockTime),
         "identifiers/sha256": valid(AgentToken.isValidHash),
+
+        // Section 5.6: the reducer itself, and a record or a summary read through the decoder the
+        // operation lists and the reconciliation use.
+        "outcome/reduce": { input in
+            ["outcome": .string(Outcome.reduce(try decode(Outcome.Evidence.self, input)).rawValue)]
+        },
+        "outcome/records": { input in
+            let value = try #require(input["value"])
+            return ["outcome": .string(Outcome.of(try decode(AgentOperation.self, value)).rawValue)]
+        },
 
         // Section 15.1.
         "transport/grammars": { input in

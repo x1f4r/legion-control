@@ -613,6 +613,87 @@ struct MachineModelTests {
         #expect(runner.sentCommands.contains { $0.contains("op ") })
     }
 
+    @Test("an update whose polls cannot get through is still running there, never failed here")
+    func failedPollIsNotAFailedUpdate() async throws {
+        // A poll is a read, and a read that never left this device is "never sent". Thrown back as
+        // the update's own failure, that filed an update running perfectly well over there as one
+        // that did not happen (C5). The record stays running and owed, and is read again later.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("update", json: """
+        { "ok": true, "contract": 3, "action": "accepted", "detached": true, "outcome": "pending",
+          "op": { "id": "0123456789abcdef", "kind": "update", "service": "demo",
+                  "state": "running", "phase": "installing", "outcome": "pending" } }
+        """)
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.pollPause = { _ in }
+
+        await model.refresh(userInitiated: false)
+        let service = try #require(model.services.first)
+        model.update(service, force: false, whenIdle: false)
+        await Self.settle(model, timeout: 10)
+
+        let record = try #require(store.newestFirst.first { $0.kind == .update })
+        #expect(record.state == .running)
+        #expect(record.needsReconciliation)
+        #expect(model.statusLine.contains("still running"))
+        // Asked about by its id, and never sent again.
+        #expect(runner.sentCommands.contains { $0.contains(" op ") })
+        #expect(runner.sentCommands.filter { $0.contains(" update") }.count == 1)
+    }
+
+    @Test("an outcome the agent states as unknown is owed and read again, whatever the action says")
+    func statedUnknownIsOwed() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("update", json: """
+        { "ok": false, "contract": 3, "action": "rolled-back", "reasonCode": "rolled-back", "outcome": "unknown",
+          "message": "the new build did not come up and the old one may not be back either" }
+        """)
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh(userInitiated: false)
+        let service = try #require(model.services.first)
+        model.update(service, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        let record = try #require(store.newestFirst.first { $0.kind == .update })
+        #expect(record.state == .unknown)
+        #expect(record.needsReconciliation)
+        #expect(model.statusLine.contains("may or may not have taken effect"))
+        #expect(model.statusLine.contains("may not be back"))
+        #expect(runner.sentCommands.filter { $0.contains(" update") }.count == 1)
+    }
+
+    @Test("a cancel that finds the request already running cancels nothing, though ok is true")
+    func cancelThatFindsItRunning() async throws {
+        // The reply is `conflict` with `ok: true`, and the cancel used to read ok alone: the queued
+        // row was filed as cancelled while the update it was meant to stop went on running.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("cancel", json: String(decoding: try ContractCorpus.data("fixtures/cancel.conflict-running.json"), as: UTF8.self))
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh(userInitiated: false)
+        let id = "6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3"
+        store.begin(OperationRecord(id: id, machineId: "pi", machineName: "Pi", kind: .update, subject: "Demo",
+                                    summary: "Updating Demo.", agentTracked: true))
+        store.markQueued(id, expiresAt: nil, summary: "queued")
+        var queued = AgentOperation()
+        queued.rawId = id
+        queued.kind = "update"
+        queued.state = "queued"
+        model.cancelQueued(queued)
+        await Self.settle(model)
+
+        #expect(store.record(id: id)?.state == .queued)
+        #expect(model.statusLine.contains("already running"))
+        #expect(store.newestFirst.first { $0.kind == .queue }?.state == .conflict)
+    }
+
     @Test("the output of a configured action reaches the screen")
     func actionOutputIsShown() async throws {
         // The agent has always returned this and neither app ever showed it, which made "the action
@@ -979,6 +1060,29 @@ struct MachineModelTests {
         #expect(saved["pi/linux"]?.checkedAt != nil)
         #expect(pi.autoUpdateCheckedAt(for: Self.machine().systems[0]) != nil)
         #expect(tower.autoUpdateValue(for: towerMachine.systems[0]) == true)
+    }
+
+    @Test("a refused automatic-update switch is not remembered as saved")
+    func refusedAutoUpdateIsNotSaved() async throws {
+        var saved: [String: RememberedSystem] = [:]
+        let remembered = RememberedSettings(systems: [:], save: { saved = $0 })
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("auto-update", json: #"{"ok":false,"contract":3,"reasonCode":"config-invalid","message":"the agent config is broken"}"#, exit: 1)
+        let logs = FakeSSH.logDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
+        var agent = RemoteAgent(machine: Self.machine())
+        agent.logDirectory = logs
+        agent.runner = { _, arguments, _, _ in runner.run(arguments) }
+        let model = MachineModel(machine: Self.machine(), agent: agent, remembered: remembered)
+
+        await model.refresh(userInitiated: false)
+        model.setAutoUpdate(true, on: Self.machine().systems[0])
+        await Self.settle(model)
+
+        #expect(saved["pi/linux"]?.autoUpdate != true)
+        #expect(model.lastActionOutcome?.isError == true)
+        #expect(model.statusLine.contains("broken") || model.statusLine.contains("config"))
     }
 
     // MARK: - Notes and evidence
