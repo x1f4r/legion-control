@@ -336,9 +336,9 @@ sealed interface OperationEvent {
      * `op ID` answered that the machine has no such operation: `op: null`, under `not-configured`
      * or, from a 3.0.x agent, `bad-argument`.
      *
-     * For a change whose reply was lost, that settles it: the agent writes the record before it
-     * acts, so the request never arrived. For one the agent had already answered about, the record
-     * has been pruned since, and what became of it is not known.
+     * For a change the agent was never heard from about, that settles it: the agent writes the record
+     * before it acts, so the request never arrived. For one the agent had already answered about, the
+     * record has been pruned since, and what became of it is not known.
      */
     data class NotRecorded(override val at: Long) : OperationEvent
 
@@ -408,7 +408,7 @@ fun OperationRecord.reduce(event: OperationEvent): OperationRecord {
 
         is OperationEvent.Observed -> applyRecord(event.record, event.at)
 
-        is OperationEvent.NotRecorded -> if (outcome == null) {
+        is OperationEvent.NotRecorded -> if (!answered) {
             copy(
                 state = TrackedState.FINISHED,
                 action = action ?: OpAction.FAILED.wire,
@@ -487,6 +487,24 @@ fun OperationRecord.reduce(event: OperationEvent): OperationRecord {
         is OperationEvent.Note -> logged(event.at, event.text, event.isError)
     }
 }
+
+/**
+ * Whether the agent has ever answered about this change, with a reply or with a record read back.
+ *
+ * Read off what only an answer leaves behind: an outcome, being queued or running, a phase, progress
+ * or an action. Never off [OperationRecord.outcome] alone, which a build before outcomes did not write,
+ * so a change such a build saw running would otherwise be taken for one that never arrived and be
+ * offered again. A change with none of these was only ever sent, or lost on the way.
+ */
+private val OperationRecord.answered: Boolean
+    get() = outcome != null ||
+        state == TrackedState.RUNNING ||
+        state == TrackedState.QUEUED ||
+        phase != null ||
+        progressNote != null ||
+        progressStep != null ||
+        progressOf != null ||
+        action != null
 
 private fun OperationRecord.unknownSentence(): String =
     if (trackable) {

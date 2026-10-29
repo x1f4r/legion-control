@@ -192,6 +192,37 @@ class OperationReducerTest {
     }
 
     @Test
+    fun `a change a build before outcomes saw answered is not taken for one that never arrived`() {
+        // What a 1.3 build left on disk: the agent's answers are there, and no outcome, because that
+        // build wrote none. The machine has since pruned the record.
+        val written = record(kind = OpKind.UPDATE).copy(trackable = true, outcome = null)
+        val answered = listOf(
+            "running" to written.copy(state = TrackedState.RUNNING),
+            "queued" to written.copy(state = TrackedState.QUEUED, intent = written.intent.copy(whenIdle = true)),
+            "given up on after running" to written.copy(
+                state = TrackedState.OUTCOME_UNKNOWN,
+                phase = "installing",
+                progressStep = 4,
+                progressOf = 8,
+            ),
+            "told it was rebooting" to written.copy(state = TrackedState.OUTCOME_UNKNOWN, action = "rebooting"),
+        )
+
+        answered.forEach { (how, legacy) ->
+            val pruned = legacy.reduce(OperationEvent.NotRecorded(at + 1))
+            assertEquals(how, TrackedState.FINISHED, pruned.state)
+            assertEquals("$how: it may have run, so how it ended is not known", Outcome.UNKNOWN, pruned.outcome)
+            assertFalse("$how: it may have run, so it is not offered again", pruned.retryable)
+            assertTrue(how, pruned.summary.contains("no longer has a record"))
+        }
+
+        // One that build only ever sent, and lost, still never arrived.
+        val lost = written.copy(state = TrackedState.OUTCOME_UNKNOWN).reduce(OperationEvent.NotRecorded(at + 1))
+        assertEquals(Outcome.FAILED, lost.outcome)
+        assertTrue(lost.retryable)
+    }
+
+    @Test
     fun `a reply that could not be read is reconciled like a dropped link, never resent`() {
         val result = record()
             .reduce(OperationEvent.Dispatched(trackable = false, at = at))
