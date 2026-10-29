@@ -249,7 +249,9 @@ export async function withOperation(options, body) {
       const pending = updateOperation(id, { dispatchAcknowledgement: result, lockOwner: null });
       return { ...result, opId: id, op: summarize(pending) };
     }
-    if (existingOpId && readOperation(id)?.queueRequested === true && result.action === 'deferred' && [REASON.busy, REASON.busyUnknown].includes(result.reasonCode)) {
+    // A queued request the machine was too busy for, or a cycle had too little
+    // time left for, goes back to wait for the next one.
+    if (existingOpId && readOperation(id)?.queueRequested === true && result.action === 'deferred' && [REASON.busy, REASON.busyUnknown, REASON.timedOut].includes(result.reasonCode)) {
       const queued = deferQueuedOperation(id, result);
       return { ...result, ...(queued.state === 'queued' ? { action: 'queued' } : queued.result), opId: id, op: summarize(queued) };
     }

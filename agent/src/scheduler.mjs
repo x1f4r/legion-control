@@ -24,6 +24,13 @@
 // it runs is refused with the reason rather than racing an installer. One
 // deferred or failed service never stops the others, and a failed install for
 // one service never rolls back another.
+//
+// And the whole cycle has a deadline. Its scheduler ends a cycle that runs too
+// long, whatever it is in the middle of, and one npm update can take longer
+// than the old Windows limit by its own timeouts. So nothing that can leave a
+// service down is started unless it can be over before then (cycleBudget):
+// what does not fit waits for the next cycle, a quarter of an hour later,
+// rather than being cut off half way.
 
 import { REASON } from './contract.mjs';
 import { acquireOperationLock, acquireServiceLock, clearStaleLocks } from './lock.mjs';
@@ -52,9 +59,51 @@ import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
 import { livenessOf, recoveryEvidence, startAndSettle, waitForServiceHealth } from './service.mjs';
-import { rollBackInterrupted, rollbackOwed, runRestart, runUpdate } from './update.mjs';
-import { runAction } from './actions.mjs';
+import {
+  recoveryWorstCaseMs,
+  RECOVERY_HEALTH_MS,
+  restartWorstCaseMs,
+  rollBackInterrupted,
+  rollbackOwed,
+  runRestart,
+  runUpdate,
+  updateWorstCaseMs,
+} from './update.mjs';
+import { actionWorstCaseMs, findAction, runAction } from './actions.mjs';
 import { ensureServiceStateWritable, serviceState } from './state.mjs';
+
+/**
+ * How long a cycle may run before its scheduler ends it: systemd stops the
+ * unit at TimeoutStartSec=1800, and the Windows task at an ExecutionTimeLimit
+ * of 30 minutes, the shortest of them. A minute of it is kept back for what
+ * comes after the last service and for the reply.
+ */
+export const SCHEDULER_LIMIT_MS = 30 * 60 * 1000;
+export const CYCLE_BUDGET_MS = SCHEDULER_LIMIT_MS - 60 * 1000;
+
+function minutes(ms, round) {
+  return ms < 60000 ? 'less than a minute' : `${round(ms / 60000)} min`;
+}
+
+/**
+ * The time a cycle has, from when it started. `refuses(worstMs, what)` says
+ * why something that can take up to `worstMs` waits for the next cycle, or is
+ * null when it can be over before this one has to end.
+ */
+export function cycleBudget({ budgetMs = CYCLE_BUDGET_MS, startedAt = Date.now() } = {}) {
+  const deadline = startedAt + budgetMs;
+  return {
+    budgetMs,
+    deadline,
+    refuses(worstMs, what) {
+      const left = deadline - Date.now();
+      if (worstMs <= left) return null;
+      const upTo = minutes(worstMs, Math.ceil);
+      if (worstMs > budgetMs) return `${what} can take up to ${upTo}, longer than a whole cycle has (${minutes(budgetMs, Math.floor)}), so no cycle starts it; ask for it directly`;
+      return `${what} can take up to ${upTo}, and this cycle has ${left > 0 ? minutes(left, Math.floor) : 'no time'} left, so it waits for the next cycle`;
+    },
+  };
+}
 
 /**
  * Put back anything an interrupted run left in a state nobody chose.
@@ -66,8 +115,9 @@ import { ensureServiceStateWritable, serviceState } from './state.mjs';
  * up again, and, where an update left a version that is neither the one it
  * started from nor the one it was going to, rolled back to the first.
  */
-export async function recoverMachine(config, { lockFiles = [] } = {}) {
+export async function recoverMachine(config, { lockFiles = [], budget = null } = {}) {
   const interrupted = recoverOperations({ systemId: config.system.id });
+  let putBackAny = false;
   const cleared = clearStaleLocks(lockFiles);
   const restored = [];
   const pending = listOperations({ recoveryPending: true, limit: 200 });
@@ -115,6 +165,17 @@ export async function recoverMachine(config, { lockFiles = [] } = {}) {
       settled(owing, record, service, 'already-running', `${service.name} was already running after an interrupted ${record.kind} (${record.phase})${unrolled(rollback)}`);
       continue;
     }
+    // A put-back that might not be over before the cycle has to end waits for
+    // the next one, but the first of a cycle is always started: no cycle will
+    // ever have more time for it, and nothing else puts the service back.
+    const late = putBackAny
+      ? budget?.refuses(recoveryWorstCaseMs(service, { rollback: rollback.state !== 'none' }), `putting ${service.name} back`)
+      : null;
+    if (late) {
+      owed(owing, record, service, 'deferred', late, REASON.timedOut);
+      continue;
+    }
+    putBackAny = true;
     // The cycle owns the machine mutex, but the external watchdog understands
     // only this service lock. Recovery must obey it just like an update does.
     const serviceLock = acquireServiceLock(service.lockFile, 'recovery');
@@ -163,7 +224,7 @@ async function putBack(config, service, owing, { evidence, rollback }) {
   const after = `after an interrupted ${record.kind} (${record.phase})`;
   note(`${service.name} was left stopped by an interrupted ${record.kind}; starting it`, 'recover');
   await startAndSettle(service);
-  const health = await waitForServiceHealth(service, 60000);
+  const health = await waitForServiceHealth(service, RECOVERY_HEALTH_MS);
   if (!health.ok) return { settled: false, record, action: 'start-failed', message: `${service.name} could not be restarted ${after}: ${describeHealth(health)}` };
 
   // A version command can need the service it asks about, so a version that
@@ -175,9 +236,9 @@ async function putBack(config, service, owing, { evidence, rollback }) {
 }
 
 /** Run one queued request now, reusing the cycle's lock and the record's own id. */
-async function runQueued(config, record, { lock }) {
+async function runQueued(config, record, { lock, budget }) {
   const service = record.service ? config.services.find((entry) => entry.id === record.service) : null;
-  const shared = { existingOpId: record.id, existingLock: lock, force: record.force === true, noReboot: record.noReboot === true, mode: 'queued' };
+  const shared = { existingOpId: record.id, existingLock: lock, force: record.force === true, noReboot: record.noReboot === true, mode: 'queued', budget };
 
   if (record.kind === 'restart' || record.kind === 'update') {
     if (!service) {
@@ -220,16 +281,39 @@ async function runQueued(config, record, { lock }) {
   return { opId: record.id, kind: record.kind, ok: false, action: 'failed' };
 }
 
+/** The longest a queued request can take once it is taken up, or 0 for one that only fails. */
+async function queuedWorstCaseMs(config, record) {
+  const service = record.service ? config.services.find((entry) => entry.id === record.service) : null;
+  if (record.kind === 'update') return service ? updateWorstCaseMs(service) : 0;
+  if (record.kind === 'restart') return service ? restartWorstCaseMs(service) : 0;
+  if (record.kind === 'run') {
+    const action = findAction(config, record.actionId);
+    return action ? actionWorstCaseMs(action) : 0;
+  }
+  if (record.kind === 'boot' || record.kind === 'sleep') {
+    const { powerWorstCaseMs } = await import('./power.mjs');
+    return powerWorstCaseMs(config, record.kind);
+  }
+  return 0;
+}
+
 /**
  * Take up every queued request the machine is now idle enough to honour.
  *
  * Idleness is checked once per request rather than once for the batch: running
  * the first one can legitimately make the machine busy again, and the second
- * request has no business ignoring that.
+ * request has no business ignoring that. A request the cycle no longer has the
+ * time for keeps its place for the next one.
  */
-export async function drainQueue(config, { lock, force = false } = {}) {
+export async function drainQueue(config, { lock, force = false, budget = null } = {}) {
   const results = [];
   for (const record of dueQueue()) {
+    const what = `the queued ${record.kind}${record.service ? ` of ${record.service}` : ''}`;
+    const late = budget?.refuses(await queuedWorstCaseMs(config, record), what);
+    if (late) {
+      results.push({ opId: record.id, kind: record.kind, service: record.service ?? null, action: 'queued', reasonCode: REASON.timedOut, message: late });
+      continue;
+    }
     const liveness = {};
     for (const service of config.services) liveness[service.id] = livenessOf(service);
     const { busy } = await checkAllBusy(config, { liveness });
@@ -246,8 +330,8 @@ export async function drainQueue(config, { lock, force = false } = {}) {
       });
       continue;
     }
-    note(`running the queued ${record.kind}${record.service ? ` of ${record.service}` : ''}`, 'queue');
-    results.push(await runQueued(config, record, { lock }));
+    note(`running ${what}`, 'queue');
+    results.push(await runQueued(config, record, { lock, budget }));
     // A request taken up now would only be refused, and a refusal would spend
     // it. Like everything after a power transition, it waits in the queue.
     if (pendingPowerOperation() || (await unsettledWork())) break;
@@ -291,10 +375,11 @@ export function previewCycle(config) {
  * paused and one is behind because its registry is unreachable.
  */
 export async function runCycle(config, options = {}) {
-  const { force = false, services = null, dryRun = false, opId: requestedId = null } = options;
+  const { force = false, services = null, dryRun = false, opId: requestedId = null, budgetMs = CYCLE_BUDGET_MS } = options;
   if (dryRun) return previewCycle(config);
 
   const started = Date.now();
+  const budget = cycleBudget({ budgetMs, startedAt: started });
   const id = requestedId ?? newOperationId();
   const opened = beginOperation({
     id,
@@ -372,11 +457,11 @@ export async function runCycle(config, options = {}) {
     }
     lock.phase('recovering');
     recordPhase(id, 'recovering');
-    report.recovery = await withOperationContext(id, () => recoverMachine(config, { lockFiles: config.services.map((service) => service.lockFile) }));
+    report.recovery = await withOperationContext(id, () => recoverMachine(config, { lockFiles: config.services.map((service) => service.lockFile), budget }));
 
     lock.phase('queued');
     recordPhase(id, 'queued');
-    report.queue = await drainQueue(config, { lock, force });
+    report.queue = await drainQueue(config, { lock, force, budget });
 
     if (pendingPowerOperation()) {
       const result = { ok: true, action: 'cycled', reasonCode: null, message: 'a queued power transition was dispatched; further maintenance waits until it settles' };
@@ -398,14 +483,18 @@ export async function runCycle(config, options = {}) {
       const eligibility = force
         ? { eligible: true, reasonCode: null, reason: 'forced' }
         : scheduledEligibility(config, service, {});
-      if (!eligibility.eligible) {
+      // One the cycle could not finish even if everything before its stop took
+      // no time at all is not begun. The update checks again at its stop,
+      // with the time it took to get there spent.
+      const late = eligibility.eligible ? budget.refuses(updateWorstCaseMs(service), `the update of ${service.name}`) : null;
+      if (!eligibility.eligible || late) {
         report.children.push({
           opId: null,
           service: service.id,
           name: service.name,
           action: 'deferred',
-          reasonCode: eligibility.reasonCode,
-          message: eligibility.reason,
+          reasonCode: late ? REASON.timedOut : eligibility.reasonCode,
+          message: late ?? eligibility.reason,
         });
         continue;
       }
@@ -414,6 +503,7 @@ export async function runCycle(config, options = {}) {
         mode: 'scheduled',
         force,
         existingLock: lock,
+        budget,
       });
       report.children.push({
         opId: result.opId ?? null,

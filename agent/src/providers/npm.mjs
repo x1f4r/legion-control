@@ -20,6 +20,9 @@ import { loadCache, saveCache } from '../state.mjs';
 
 const LATEST_CACHE_MS = 10 * 60 * 1000;
 const PREFIX_PROBE_INTERVAL_MS = 10 * 60 * 1000;
+/** How long an install gets, and the version check in front of one that allowlists scripts. */
+export const NPM_INSTALL_MS = 600000;
+export const NPM_VERSION_MS = 20000;
 
 function packageJsonPath(service, prefix) {
   return path.join(globalModulesDir(prefix), service.package, 'package.json');
@@ -261,7 +264,7 @@ export function warmCache(service, version, attempts = 3) {
 
 /** npm's own major version, or null when it cannot be determined. */
 function npmMajor(prefix) {
-  const result = runNpm(['--version'], { timeoutMs: 20000, prefix });
+  const result = runNpm(['--version'], { timeoutMs: NPM_VERSION_MS, prefix });
   if (!result.ok) return null;
   const match = /^(\d+)\./.exec(result.stdout.trim());
   return match ? Number.parseInt(match[1], 10) : null;
@@ -298,7 +301,7 @@ export async function installVersion(service, version, prefix) {
       ...allowScriptsArgs(service, prefix),
       `${service.package}@${version}`,
     ],
-    { timeoutMs: 600000, prefix },
+    { timeoutMs: NPM_INSTALL_MS, prefix },
   );
   return { ok: result.ok, message: result.ok ? null : describeFailure(result), result };
 }

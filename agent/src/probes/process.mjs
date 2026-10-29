@@ -418,20 +418,23 @@ export function isRunning(service) {
  * when it exits, and the daemon it leaves running is the whole point of it, so
  * it is never stopped for outliving the command that started it.
  */
+/** How long a start or a stop command gets. */
+export const PROCESS_COMMAND_MS = 60000;
+
 export async function startProcess(service) {
   const type = service.process?.type;
   if (type === 'systemd-user' || type === 'systemd-system') {
-    const result = await systemctlMutation(service, 'start', 60000);
+    const result = await systemctlMutation(service, 'start', PROCESS_COMMAND_MS);
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'scheduled-task') {
-    const result = await runMutation('powershell.exe', powerShellArgs(`Start-ScheduledTask -TaskName ${psLiteral(service.process.task)}`), { timeoutMs: 60000 });
+    const result = await runMutation('powershell.exe', powerShellArgs(`Start-ScheduledTask -TaskName ${psLiteral(service.process.task)}`), { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'app') return appProvider.launchApp(service);
   if (type === 'command') {
     if (!service.process.start) return { ok: false, message: `${service.name} has no start command configured` };
-    const result = await runMutationArgv(service.process.start, { timeoutMs: 60000 });
+    const result = await runMutationArgv(service.process.start, { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   return { ok: true, message: `${service.name} has nothing to start` };
@@ -440,18 +443,18 @@ export async function startProcess(service) {
 export async function stopProcess(service) {
   const type = service.process?.type;
   if (type === 'systemd-user' || type === 'systemd-system') {
-    const result = await systemctlMutation(service, 'stop', 60000);
+    const result = await systemctlMutation(service, 'stop', PROCESS_COMMAND_MS);
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'scheduled-task') {
-    const result = await runMutation('powershell.exe', powerShellArgs(`Stop-ScheduledTask -TaskName ${psLiteral(service.process.task)}`), { timeoutMs: 60000 });
+    const result = await runMutation('powershell.exe', powerShellArgs(`Stop-ScheduledTask -TaskName ${psLiteral(service.process.task)}`), { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   // Asking is all we ever do to an app. There is no forced stop here.
   if (type === 'app') return appProvider.askAppToQuit(service);
   if (type === 'command') {
     if (!service.process.stop) return { ok: false, message: `${service.name} has no stop command configured` };
-    const result = await runMutationArgv(service.process.stop, { timeoutMs: 60000 });
+    const result = await runMutationArgv(service.process.stop, { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   return { ok: true, message: `${service.name} has nothing to stop` };

@@ -68,12 +68,15 @@ export function cachedLatestVersion(service, options = {}) {
   );
 }
 
+/** How long an update command gets. */
+export const UPDATE_COMMAND_MS = 600000;
+
 /**
  * Run the update command. It changes the machine, so it goes through the
  * mutation runner: a deadline stops everything it started before anything
  * after it, a rollback included, may begin.
  */
-export async function update(service, { timeoutMs = 600000 } = {}) {
+export async function update(service, { timeoutMs = UPDATE_COMMAND_MS } = {}) {
   if (!service.update) return { ok: false, message: `${service.name} has no update command configured` };
   const result = await runMutationArgv(service.update, { timeoutMs });
   return { ok: result.ok, message: result.ok ? null : describeFailure(result), result };

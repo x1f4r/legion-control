@@ -34,7 +34,10 @@ import { cachedLookup, channelCacheKey } from './npm.mjs';
 // or a shutdown hook, and neither is something we may override.
 export const QUIT_WAIT_MS = 60000;
 const QUIT_POLL_MS = 1000;
-const LAUNCH_GRACE_MS = 2000;
+export const LAUNCH_GRACE_MS = 2000;
+/** How long osascript gets to ask the app to quit, and open to launch it; and how long a new version gets to show. */
+export const APP_COMMAND_MS = 30000;
+export const VERSION_WAIT_MS = 60000;
 
 export function appPath(service) {
   return service.path;
@@ -268,7 +271,7 @@ export function isAppRunning(service) {
  */
 export async function askAppToQuit(service) {
   if (!service.bundleId) return { ok: false, message: 'no bundle id is configured for this service' };
-  const result = await runMutation('osascript', ['-e', `quit app id "${service.bundleId}"`], { timeoutMs: 30000 });
+  const result = await runMutation('osascript', ['-e', `quit app id "${service.bundleId}"`], { timeoutMs: APP_COMMAND_MS });
   return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
 }
 
@@ -307,7 +310,7 @@ export async function quitAndWait(service, timeoutMs = QUIT_WAIT_MS) {
 
 export async function launchApp(service) {
   if (!service.path) return { ok: false, message: 'no app path is configured for this service' };
-  const result = await runMutation('open', ['-a', service.path], { timeoutMs: 30000 });
+  const result = await runMutation('open', ['-a', service.path], { timeoutMs: APP_COMMAND_MS });
   return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
 }
 
@@ -345,7 +348,7 @@ export async function restartApp(service, { timeoutMs = QUIT_WAIT_MS, launchIfSt
  * read it at all), which would be recorded as "the update did not apply" for an
  * update that applied perfectly well.
  */
-export async function waitForVersion(service, expected, timeoutMs = 60000) {
+export async function waitForVersion(service, expected, timeoutMs = VERSION_WAIT_MS) {
   const deadline = Date.now() + timeoutMs;
   let seen = null;
   for (;;) {

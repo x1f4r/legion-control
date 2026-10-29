@@ -14,8 +14,8 @@ import dgram from 'node:dgram';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { recordPhase } from './operations.mjs';
-import { runMutationArgv } from './process-runner.mjs';
-import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { mutationWorstCaseMs, runMutationArgv } from './process-runner.mjs';
+import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { log, note } from './log.mjs';
 
 const MAX_OUTPUT_LINES = 20;
@@ -140,6 +140,15 @@ export function shapeOutput(stdout, stderr, maxLines = MAX_OUTPUT_LINES) {
   const shown = lines.slice(0, maxLines);
   const hidden = lines.length - shown.length;
   return hidden > 0 ? `${shown.join('\n')}\n… ${hidden} more line${hidden === 1 ? '' : 's'}` : shown.join('\n');
+}
+
+/**
+ * The longest a queued action can take once a cycle takes it up
+ * (scheduler.mjs): its busy check where it has one, and its command or its
+ * wake packets, which share the action's timeout.
+ */
+export function actionWorstCaseMs(action) {
+  return (action.busyGated ? BUSY_BUDGET_MS : 0) + mutationWorstCaseMs(action.timeoutSeconds * 1000);
 }
 
 /** Run one configured action. Always returns an object; never throws. */

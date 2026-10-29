@@ -17,6 +17,17 @@ import path from 'node:path';
 import { describeFailure, detectPlatform, runArgv, runCommand, sleep } from './config.mjs';
 import { runMutation, runMutationArgv } from './process-runner.mjs';
 
+/**
+ * How long a configured arm command gets, and its verify; a command that
+ * dispatches a reboot or prepares a suspend; and the suspend itself. Arming a
+ * firmware entry runs a few commands of up to 20 seconds each, which is never
+ * longer than an arm and its verify.
+ */
+export const ARM_COMMAND_MS = 60000;
+export const ARM_VERIFY_MS = 30000;
+export const DISPATCH_COMMAND_MS = 20000;
+export const SUSPEND_COMMAND_MS = 30000;
+
 // ---------------------------------------------------------------------------
 // efi-bootnext
 // ---------------------------------------------------------------------------
@@ -204,13 +215,13 @@ async function armCommand(target, { requireVerification }) {
     };
   }
 
-  const armed = await runMutationArgv(target.arm, { timeoutMs: 60000 });
+  const armed = await runMutationArgv(target.arm, { timeoutMs: ARM_COMMAND_MS });
   if (!armed.ok) return { ok: false, verified: false, message: `the arm command failed: ${describeFailure(armed)}` };
 
   if (!target.verify) {
     return { ok: true, verified: false, message: `${target.id} armed (no verify command is configured, so this was not read back)` };
   }
-  const verified = await runMutationArgv(target.verify, { timeoutMs: 30000 });
+  const verified = await runMutationArgv(target.verify, { timeoutMs: ARM_VERIFY_MS });
   if (!verified.ok) {
     return { ok: false, verified: false, message: `the arm command ran but verification failed: ${describeFailure(verified)}` };
   }
@@ -311,7 +322,7 @@ export function scheduleReboot(config) {
   // wants this done.
   const helper = config.boot?.rebootHelper;
   if (helper) {
-    const result = runArgv(helper, { timeoutMs: 20000 });
+    const result = runArgv(helper, { timeoutMs: DISPATCH_COMMAND_MS });
     return {
       ok: accepted(result),
       via: 'rebootHelper',
@@ -321,7 +332,7 @@ export function scheduleReboot(config) {
 
   const override = config.boot?.reboot;
   if (override) {
-    const result = runArgv(override, { timeoutMs: 20000 });
+    const result = runArgv(override, { timeoutMs: DISPATCH_COMMAND_MS });
     return {
       ok: accepted(result),
       via: 'boot.reboot',
@@ -331,7 +342,7 @@ export function scheduleReboot(config) {
 
   const current = detectPlatform();
   if (current === 'windows') {
-    const result = runCommand('shutdown', ['/r', '/t', '3'], { timeoutMs: 20000 });
+    const result = runCommand('shutdown', ['/r', '/t', '3'], { timeoutMs: DISPATCH_COMMAND_MS });
     return { ok: accepted(result), via: 'shutdown', message: accepted(result) ? 'reboot scheduled in 3 s' : describeFailure(result) };
   }
   if (current === 'mac') {
@@ -339,7 +350,7 @@ export function scheduleReboot(config) {
     if (!allowed.ok) {
       return { ok: false, via: null, message: `passwordless sudo will not run shutdown: ${allowed.message}` };
     }
-    const result = runCommand('sudo', ['-n', 'shutdown', '-r', '+1'], { timeoutMs: 20000 });
+    const result = runCommand('sudo', ['-n', 'shutdown', '-r', '+1'], { timeoutMs: DISPATCH_COMMAND_MS });
     return { ok: accepted(result), via: 'shutdown', message: accepted(result) ? 'reboot scheduled in 1 minute' : describeFailure(result) };
   }
   if (current === 'linux') {
@@ -466,14 +477,14 @@ export async function suspendMachine(config) {
 
   const warnings = [];
   for (const command of sleepConfig.before ?? []) {
-    const result = runArgv(command, { timeoutMs: 20000 });
+    const result = runArgv(command, { timeoutMs: DISPATCH_COMMAND_MS });
     if (!accepted(result)) warnings.push(describeFailure(result));
   }
   if ((sleepConfig.before ?? []).length > 0 && sleepConfig.settle > 0) {
     await sleep(sleepConfig.settle * 1000);
   }
 
-  const result = runArgv(chosen.command, { timeoutMs: 30000 });
+  const result = runArgv(chosen.command, { timeoutMs: SUSPEND_COMMAND_MS });
   const label = path.basename(chosen.command[0]);
   if (accepted(result)) {
     const wording = suspendAccepted(label);

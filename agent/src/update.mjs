@@ -44,8 +44,8 @@ import { describeFailure } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { appendLog, listOperations, recordPhase, updateOperation, whenStarted } from './operations.mjs';
-import { runMutationArgv, unsettledWork } from './process-runner.mjs';
-import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { mutationWorstCaseMs, runMutationArgv, unsettledWork } from './process-runner.mjs';
+import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
 import { hasUpdatePath, scheduledEligibility } from './policy.mjs';
 import { log, note } from './log.mjs';
@@ -53,7 +53,10 @@ import { ensureServiceStateWritable, requireServiceStateSave as saveServiceState
 import * as appProvider from './providers/app.mjs';
 import * as commandProvider from './providers/command.mjs';
 import * as npmProvider from './providers/npm.mjs';
+import { PROCESS_COMMAND_MS } from './probes/process.mjs';
 import {
+  BIND_GRACE_MS,
+  canDrain,
   canRestart,
   drainService,
   isRunning,
@@ -63,10 +66,16 @@ import {
   serviceHealth,
   startAndSettle,
   stopAndWait,
+  SYSTEMD_RESTART_MS,
   waitForServiceHealth,
 } from './service.mjs';
 
 const HEALTH_WAIT_MS = 120000;
+/** How long a service started again after a failure gets to answer. */
+export const RECOVERY_HEALTH_MS = 60000;
+/** How long a verify command gets, and a rollback command. */
+const VERIFY_COMMAND_MS = 120000;
+const ROLLBACK_COMMAND_MS = 600000;
 // How many times an app is asked to apply the SAME staged build before we stop
 // asking. Three is enough to ride out a transient failure, and small enough that
 // a build which will never apply cannot keep restarting the user's app.
@@ -98,7 +107,7 @@ async function ensureServiceUp(service) {
     return false;
   }
   await startAndSettle(service);
-  const second = await waitForServiceHealth(service, 60000);
+  const second = await waitForServiceHealth(service, RECOVERY_HEALTH_MS);
   if (!second.ok) log(`WARNING: ${service.name} is not answering after the recovery start`, 'update');
   return second.ok;
 }
@@ -106,8 +115,8 @@ async function ensureServiceUp(service) {
 /**
  * Put a service back that a previous run left stopped.
  *
- * A run killed by its scheduler's time limit (systemd TimeoutStartSec=900, the
- * Windows task ExecutionTimeLimit) can have stopped the service deliberately and
+ * A run killed by its scheduler's time limit (systemd's TimeoutStartSec, the
+ * Windows task's ExecutionTimeLimit) can have stopped the service deliberately and
  * then died before starting it again, which no restart policy undoes. This runs
  * before anything else, including the version lookup, so an offline machine
  * still gets its service back.
@@ -148,6 +157,88 @@ function deferred({ service, from = null, to = null, busy, message }) {
     message,
     service: service?.id ?? null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// How long it can take
+// ---------------------------------------------------------------------------
+
+/*
+ * A scheduled cycle has a deadline, because its scheduler ends a cycle that
+ * runs too long (scheduler.mjs), and it only starts what can be done by then.
+ * These are the longest each piece of work can take, added up from the
+ * timeouts its steps use, the mutation runner's stop of a command that runs
+ * out included.
+ *
+ * What is counted is the part that can leave the service down: for an update,
+ * from the drain to the health check that says it is back. What comes before
+ * it changes nothing, and a cycle ended there loses only time. A rollback the
+ * update turns out to need is not counted: it is what puts the service back,
+ * and it is never skipped for time. If the scheduler ends the cycle in the
+ * middle of one, the next cycle's recovery takes over what it left.
+ */
+
+function stopWorstMs(service) {
+  if (service.process?.type === 'app') return mutationWorstCaseMs(appProvider.APP_COMMAND_MS) + appProvider.QUIT_WAIT_MS;
+  return mutationWorstCaseMs(PROCESS_COMMAND_MS) + STOP_WAIT_MS;
+}
+
+function startWorstMs(service) {
+  if (service.process?.type === 'app') return mutationWorstCaseMs(appProvider.APP_COMMAND_MS) + appProvider.LAUNCH_GRACE_MS;
+  return mutationWorstCaseMs(PROCESS_COMMAND_MS) + BIND_GRACE_MS;
+}
+
+/** The drain, and the busy check after it that decides whether the stop goes ahead. */
+function drainWorstMs(service) {
+  return (canDrain(service) ? mutationWorstCaseMs(service.drain.timeoutSeconds * 1000) : 0) + BUSY_BUDGET_MS;
+}
+
+function npmInstallWorstMs() {
+  return npmProvider.NPM_VERSION_MS + mutationWorstCaseMs(npmProvider.NPM_INSTALL_MS);
+}
+
+/** An update, from the drain (an app has none) until the service answers on the new version. */
+export function updateWorstCaseMs(service) {
+  if (service.kind === 'app') return stopWorstMs(service) + startWorstMs(service) + HEALTH_WAIT_MS + appProvider.VERSION_WAIT_MS;
+  const install = service.kind === 'npm'
+    ? npmInstallWorstMs()
+    : mutationWorstCaseMs(commandProvider.UPDATE_COMMAND_MS) + mutationWorstCaseMs(VERIFY_COMMAND_MS);
+  return drainWorstMs(service) + stopWorstMs(service) + install + startWorstMs(service) + HEALTH_WAIT_MS;
+}
+
+/** A restart, until the service answers again. */
+export function restartWorstCaseMs(service) {
+  const type = service.process?.type;
+  const restart = type === 'systemd-user' || type === 'systemd-system'
+    ? mutationWorstCaseMs(SYSTEMD_RESTART_MS) + BIND_GRACE_MS
+    : stopWorstMs(service) + startWorstMs(service);
+  return restart + HEALTH_WAIT_MS;
+}
+
+/**
+ * Recovery putting a service back (scheduler.mjs): a start, and where an
+ * interrupted update may have to be rolled back, the gate in front of that
+ * rollback and the rollback itself, a second start after it included.
+ */
+export function recoveryWorstCaseMs(service, { rollback = false } = {}) {
+  const start = startWorstMs(service) + RECOVERY_HEALTH_MS;
+  if (!rollback) return start;
+  const undo = service.kind === 'npm'
+    ? stopWorstMs(service) + npmInstallWorstMs()
+    : mutationWorstCaseMs(ROLLBACK_COMMAND_MS);
+  return start + BUSY_BUDGET_MS + drainWorstMs(service) + undo + startWorstMs(service) + HEALTH_WAIT_MS + start;
+}
+
+/**
+ * An update that waits for the next cycle, because this one does not have
+ * the time its disruptive part can take. Like one the busy gate defers, it
+ * leaves the version noted as waiting.
+ */
+function outOfTime({ service, from, to, message }) {
+  saveServiceState(service, { pendingRestart: true, pendingVersion: to });
+  log(message, 'update');
+  recordLastUpdate(service, 'deferred', from, to, message);
+  return { ok: true, action: 'deferred', reasonCode: REASON.timedOut, from, to, message, service: service.id };
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +455,7 @@ async function alreadyOnTarget(config, service, from, to, { force, opId }) {
   return { ok: true, action: 'updated', reasonCode: null, from, to, message };
 }
 
-async function runNpmUpdate(config, service, { force, opId, lock }) {
+async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
   const prefix = npmProvider.resolveNpmPrefix(service);
   const from = npmProvider.installedVersion(service);
 
@@ -410,6 +501,11 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
   recordPhase(opId, 'warming', { note: `${service.package}@${to}` });
   const warmed = npmProvider.warmCache(service, to);
   if (!warmed.ok) log(`npm cache add did not succeed after ${warmed.attempts} attempts: ${warmed.message}`, 'update');
+
+  // The drain is the first step that can leave the service down, so it is
+  // where a scheduled cycle decides whether it still has the time.
+  const late = budget?.refuses(updateWorstCaseMs(service), `the update of ${service.name} to ${to}`);
+  if (late) return outOfTime({ service, from, to, message: late });
 
   note(`updating ${service.name} ${from ?? 'nothing'} -> ${to}`, 'update');
 
@@ -493,7 +589,7 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
  * version did not change we have to say the update failed, because the
  * alternative is reporting success for a restart that achieved nothing.
  */
-async function runAppUpdate(config, service, { force, opId, lock }) {
+async function runAppUpdate(config, service, { force, opId, lock, budget }) {
   const state = serviceState(service, { isFirst: config.services[0]?.id === service.id });
   const from = appProvider.installedVersion(service);
   const staged = appProvider.stagedVersion(service);
@@ -571,6 +667,9 @@ async function runAppUpdate(config, service, { force, opId, lock }) {
     recordLastUpdate(service, 'deferred', from, staged, message);
     return deferred({ service, from, to: staged, busy, message });
   }
+
+  const late = budget?.refuses(updateWorstCaseMs(service), `applying ${staged} to ${service.name}`);
+  if (late) return outOfTime({ service, from, to: staged, message: late });
 
   lock.phase('stopping');
   recordPhase(opId, 'stopping', { note: 'asking the app to quit so the staged build applies' });
@@ -671,7 +770,7 @@ async function checkPostcondition(service, { to }) {
   }
 
   if (service.verify) {
-    const result = await runMutationArgv(service.verify, { timeoutMs: 120000 });
+    const result = await runMutationArgv(service.verify, { timeoutMs: VERIFY_COMMAND_MS });
     if (!result.ok) {
       return {
         ok: false,
@@ -748,7 +847,7 @@ async function rollBackCommand(service, enter) {
     };
   }
   enter('rolling-back');
-  const result = await runMutationArgv(service.rollback, { timeoutMs: 600000 });
+  const result = await runMutationArgv(service.rollback, { timeoutMs: ROLLBACK_COMMAND_MS });
   if (!result.ok) {
     await ensureServiceUp(service);
     return { ok: false, installed: finalVersion(), message: `the rollback command failed: ${describeFailure(result)}` };
@@ -773,7 +872,7 @@ async function rollBackCommand(service, enter) {
   };
 }
 
-async function runCommandUpdate(config, service, { force, opId, lock }) {
+async function runCommandUpdate(config, service, { force, opId, lock, budget }) {
   const from = commandProvider.installedVersion(service);
   if (!service.update) {
     return {
@@ -830,6 +929,9 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy, message });
   }
+
+  const late = budget?.refuses(updateWorstCaseMs(service), `the update of ${service.name}${to ? ` to ${to}` : ''}`);
+  if (late) return outOfTime({ service, from, to, message: late });
 
   note(`updating ${service.name} ${from ?? 'nothing'} -> ${to ?? 'whatever the update command installs'}`, 'update');
 
@@ -1120,9 +1222,13 @@ export function installedFor(service) {
  *   reports which policy declined it.
  *   "manual" is a person asking. Policy is not consulted at all — the busy gate
  *   still is, and --force is the only thing that overrides it.
+ *
+ * `budget` is the time a cycle has left (scheduler.mjs). With one, an update
+ * whose disruptive part might not be over before the cycle has to end waits
+ * for the next cycle rather than starting; a person who asks has no deadline.
  */
 export async function runUpdate(config, service, options = {}) {
-  const { mode = 'manual', force = false } = options;
+  const { mode = 'manual', force = false, budget = null } = options;
   let refusal = null;
 
   if (mode === 'scheduled') {
@@ -1168,9 +1274,9 @@ export async function runUpdate(config, service, options = {}) {
       try {
         ensureServiceStateWritable(service);
         stateReady = true;
-        if (service.kind === 'app') return await runAppUpdate(config, service, { force, opId, lock });
-        if (service.kind === 'npm') return await runNpmUpdate(config, service, { force, opId, lock });
-        return await runCommandUpdate(config, service, { force, opId, lock });
+        if (service.kind === 'app') return await runAppUpdate(config, service, { force, opId, lock, budget });
+        if (service.kind === 'npm') return await runNpmUpdate(config, service, { force, opId, lock, budget });
+        return await runCommandUpdate(config, service, { force, opId, lock, budget });
       } catch (error) {
         if (!(error instanceof ServiceStateError)) throw error;
         // Once the state was writable the update may have run, so a failure to

@@ -11,7 +11,9 @@ import { isRunning, probeProcess, processEvidence, processStartedAt, startProces
 import { NO_RELAY, probeRelay } from './probes/relay.mjs';
 import * as appProvider from './providers/app.mjs';
 
-const BIND_GRACE_MS = 2000;
+/** How long a started service gets to bind before anyone checks it, and how long systemd gets to restart one. */
+export const BIND_GRACE_MS = 2000;
+export const SYSTEMD_RESTART_MS = 90000;
 
 export { isRunning, healthPort, processEvidence, processStartedAt };
 
@@ -197,7 +199,7 @@ export async function restartService(service) {
   if (type === 'systemd-user' || type === 'systemd-system') {
     // One `systemctl restart` rather than a stop/start pair: it keeps the unit's
     // own ordering and its restart policy intact.
-    const result = await systemctlMutation(service, 'restart', 90000);
+    const result = await systemctlMutation(service, 'restart', SYSTEMD_RESTART_MS);
     await sleep(BIND_GRACE_MS);
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }

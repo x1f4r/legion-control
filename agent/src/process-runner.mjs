@@ -51,6 +51,9 @@ export const TERM_GRACE_MS = 5000;
  * so anything still there after this is not going to go.
  */
 export const SETTLE_MS = 2000;
+/** How long taskkill gets to stop a Windows tree, and the walk afterwards to find what is left. */
+const TASKKILL_MS = 15000;
+const TREE_WALK_MS = 30000;
 /** How long output still in the pipes is read once the command has exited. */
 const DRAIN_MS = 200;
 const POLL_MS = 50;
@@ -247,7 +250,7 @@ async function windowsLeft(entry, options = {}) {
   const result = await runCommandAsync(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', windowsTreeScript(entry, options)],
-    { timeoutMs: 30000 },
+    { timeoutMs: TREE_WALK_MS },
   );
   if (!result.ok) return null;
   const line = result.stdout.split('\n').map((text) => text.trim()).reverse().find((text) => text.startsWith('{'));
@@ -437,7 +440,7 @@ async function stopGroup(group, { graceMs, settleMs }) {
  */
 async function stopTree(child, entry, { settleMs }) {
   const killed = child.exitCode === null && child.signalCode === null
-    ? await runCommandAsync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeoutMs: 15000 })
+    ? await runCommandAsync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeoutMs: TASKKILL_MS })
     : null;
   const exited = await within(settleMs, () => child.exitCode !== null || child.signalCode !== null);
   const left = await windowsLeft({ ...entry, endedAt: exited ? new Date().toISOString() : null }, { treeOf: true, stop: true });
@@ -501,6 +504,15 @@ export async function runMutation(file, args = [], options = {}) {
   } finally {
     inFlight.delete(entry.id);
   }
+}
+
+/**
+ * The longest runMutation can take with a given timeout: the command's own
+ * time, then stopping its tree and seeing that tree gone. What a deadline has
+ * to leave room for before it starts one.
+ */
+export function mutationWorstCaseMs(timeoutMs) {
+  return timeoutMs + (IS_WINDOWS ? TASKKILL_MS + SETTLE_MS + TREE_WALK_MS : TERM_GRACE_MS + SETTLE_MS);
 }
 
 /** Run a configured argv array through the mutation runner. */

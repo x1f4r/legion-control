@@ -22,13 +22,40 @@
 // that as success sends the controller off waiting for a machine that is never
 // going to appear.
 
-import { armNextBoot, bootTargets, findBootTarget, scheduleReboot, suspendMachine } from './boot.mjs';
+import {
+  ARM_COMMAND_MS,
+  ARM_VERIFY_MS,
+  armNextBoot,
+  bootTargets,
+  DISPATCH_COMMAND_MS,
+  findBootTarget,
+  scheduleReboot,
+  SUSPEND_COMMAND_MS,
+  suspendMachine,
+} from './boot.mjs';
 import { REASON } from './contract.mjs';
 import { log } from './log.mjs';
 import { withOperation } from './operate.mjs';
 import { markPowerDispatch, recordPhase } from './operations.mjs';
-import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { mutationWorstCaseMs } from './process-runner.mjs';
+import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { livenessOf } from './service.mjs';
+
+/**
+ * The longest a queued boot or sleep can take once a cycle takes it up
+ * (scheduler.mjs), so that the scheduler does not end the cycle half way
+ * through arming one: the busy check, then for a boot an arm command and its
+ * verify and the dispatch, with the sudo checks in front of it; for a sleep
+ * the commands that prepare it, its settle and the suspend.
+ */
+export function powerWorstCaseMs(config, kind) {
+  if (kind === 'boot') {
+    return BUSY_BUDGET_MS + mutationWorstCaseMs(ARM_COMMAND_MS) + mutationWorstCaseMs(ARM_VERIFY_MS) + 2 * DISPATCH_COMMAND_MS;
+  }
+  const before = config.sleep?.before ?? [];
+  const settle = before.length > 0 ? (config.sleep?.settle ?? 0) * 1000 : 0;
+  return BUSY_BUDGET_MS + before.length * DISPATCH_COMMAND_MS + settle + SUSPEND_COMMAND_MS;
+}
 
 async function machineBusy(config) {
   const liveness = {};
