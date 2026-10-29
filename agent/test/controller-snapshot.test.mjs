@@ -181,19 +181,34 @@ test('a publication between live document and metadata reads triggers a bounded 
   });
 });
 
-test('concurrent publication and reads never return mixed documents, hashes, or metadata', async () => {
+// The writer and the reader take turns only as far as it takes to be sure they
+// overlapped: the writer publishes a revision once the reader has read at
+// least once since the last one, and the reader reads, without pause, until
+// the writer has exited. No clock decides whether either was quick enough, so
+// a slow machine only makes the test slower.
+test('concurrent publication and reads never return mixed documents, hashes, or metadata', { timeout: 120000 }, async () => {
   await withHome(async (home) => {
     storeController(document(1));
-    const done = path.join(home, 'writer.done');
-    const source = `import fs from 'node:fs';import {storeController,readControllerMeta} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'controller.mjs')).href)};import {acquireOperationLock} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'lock.mjs')).href)};for(let revision=2;revision<=35;revision++){const held=acquireOperationLock({kind:'config',waitMs:5000});if(!held.ok)throw new Error(held.message);try{const meta=readControllerMeta();const raw=JSON.stringify({version:1,controller:{id:'snapshot-test',revision,lineage:[meta.hash,...meta.lineage].slice(0,32),source:'cli'},machines:[{id:'machine',name:'Revision '+revision}]});const result=storeController(raw);if(!result.ok)throw new Error(result.error);}finally{held.lock.release();}}fs.writeFileSync(${JSON.stringify(done)},'done');`;
+    const ready = path.join(home, 'reader.ready');
+    const counter = path.join(home, 'reader.samples');
+    const source = `import fs from 'node:fs';import {storeController,readControllerMeta} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'controller.mjs')).href)};import {acquireOperationLock} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'lock.mjs')).href)};const pause=new Int32Array(new SharedArrayBuffer(4));const read=()=>{try{return Number(fs.readFileSync(${JSON.stringify(counter)},'utf8'))||0}catch{return 0}};while(!fs.existsSync(${JSON.stringify(ready)}))Atomics.wait(pause,0,0,1);let seen=read();for(let revision=2;revision<=35;revision++){while(read()<=seen)Atomics.wait(pause,0,0,1);seen=read();const held=acquireOperationLock({kind:'config',waitMs:5000});if(!held.ok)throw new Error(held.message);try{const meta=readControllerMeta();const raw=JSON.stringify({version:1,controller:{id:'snapshot-test',revision,lineage:[meta.hash,...meta.lineage].slice(0,32),source:'cli'},machines:[{id:'machine',name:'Revision '+revision}]});const result=storeController(raw);if(!result.ok)throw new Error(result.error);}finally{held.lock.release();}}`;
     const writer = spawn(process.execPath, ['--input-type=module', '-e', source], { env: { ...process.env, LEGIONCTL_HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] });
     let error = '';
+    let exited = false;
     writer.stderr.on('data', (chunk) => { error += chunk; });
-    const completion = new Promise((resolve, reject) => { writer.once('error', reject); writer.once('exit', (code) => code === 0 ? resolve() : reject(new Error(error))); });
+    const completion = new Promise((resolve, reject) => {
+      writer.once('error', reject);
+      writer.once('exit', (code) => {
+        exited = true;
+        if (code === 0) resolve();
+        else reject(new Error(error));
+      });
+    });
+    completion.catch(() => {});
     let samples = 0;
-    const deadline = Date.now() + 10000;
     try {
-      while (!fs.existsSync(done) && Date.now() < deadline) {
+      fs.writeFileSync(ready, 'reading');
+      while (!exited) {
         const snapshot = readController();
         if (snapshot.document) {
           assert.equal(snapshot.hash, snapshot.meta.hash);
@@ -202,12 +217,14 @@ test('concurrent publication and reads never return mixed documents, hashes, or 
           assert.deepEqual(snapshot.document.controller.lineage, snapshot.meta.lineage);
         } else assert.ok(snapshot.error);
         samples += 1;
-        if (samples % 10 === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+        if (samples % 5 === 0) {
+          fs.writeFileSync(counter, String(samples));
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
       }
-      assert.ok(fs.existsSync(done), 'writer must finish within the test deadline');
       await completion;
     } finally { if (writer.exitCode === null) writer.kill('SIGKILL'); }
-    assert.ok(samples > 10);
+    assert.ok(samples >= 34 * 5, `the reader read at least once between every two revisions (${samples} reads)`);
     assert.equal(readControllerMeta().revision, 35);
   });
 });
