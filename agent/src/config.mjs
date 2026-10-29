@@ -636,7 +636,10 @@ function normalizeEndpoint(report, where, raw) {
   try {
     parsed = new URL(url);
   } catch {
-    return report.error(`${where}.url`, `not a usable URL: ${JSON.stringify(url)}`);
+    // Not quoted: a URL can hold a user and a password, and a restricted key
+    // reads these messages in status. One that does not parse is not one the
+    // redactor can take apart as reliably as one that does.
+    return report.error(`${where}.url`, 'not a usable URL', 'write it in full, for example "https://t3.example.com/"');
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     return report.error(`${where}.url`, `only http and https endpoints are supported, got ${parsed.protocol}`);

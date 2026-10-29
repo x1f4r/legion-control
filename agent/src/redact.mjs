@@ -48,14 +48,23 @@ const COMMAND_KEYS = new Set([
 const COMMAND_LIST_KEYS = new Set(['before']);
 
 /**
+ * The user and password of a URL as it is written: everything between the
+ * scheme's `//` and the last `@` before the path, query or fragment. A URL
+ * the parser refuses (a port out of range, a space in the host) still shows
+ * them to whoever reads it quoted back, so they are taken from the text too.
+ */
+const WRITTEN_USERINFO = /^\s*[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)@/;
+
+/**
  * A function that redacts the configured values of `sources` from any string,
  * array or object it is given, without changing the original.
  *
  * Collected are every argument of a configured argv after its executable,
  * every word after the first of a command written as one string, the value of
  * every assignment among those arguments, every value under a credential-named
- * key, and the user, password and credential-named query values inside every
- * URL. This cannot identify a secret that appears only in a command's output.
+ * key, the user, password and credential-named query values inside every
+ * URL, and the user and password of one that does not parse. This cannot
+ * identify a secret that appears only in a command's output.
  */
 export function valueRedactor(...sources) {
   const values = new Set();
@@ -71,16 +80,22 @@ export function valueRedactor(...sources) {
     const assignment = typeof item === 'string' ? /^[^=\s]+=(.*)$/s.exec(item) : null;
     if (assignment) remember(assignment[1]);
   };
+  const credential = (value) => {
+    remember(value);
+    try { remember(decodeURIComponent(value)); } catch { /* retain encoded value */ }
+  };
   const collect = (value, sensitive = false, shape = null) => {
     if (typeof value === 'string') {
       if (sensitive) remember(value);
       if (shape) value.split(/\s+/).filter(Boolean).slice(1).forEach(argument);
+      const written = WRITTEN_USERINFO.exec(value);
+      if (written) {
+        const [user, ...password] = written[1].split(':');
+        [written[1], user, password.join(':')].forEach(credential);
+      }
       try {
         const url = new URL(value);
-        for (const credential of [url.username, url.password]) {
-          remember(credential);
-          try { remember(decodeURIComponent(credential)); } catch { /* retain encoded value */ }
-        }
+        [url.username, url.password].forEach(credential);
         for (const [key, inner] of url.searchParams) if (sensitiveKey(key)) remember(inner);
         for (const pair of url.search.slice(1).split('&')) {
           const separator = pair.indexOf('=');

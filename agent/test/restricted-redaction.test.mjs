@@ -186,6 +186,36 @@ test('a command of any shape keeps its arguments from a restricted key', async (
   });
 });
 
+test('the credentials of a configured URL are redacted even when it does not parse', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const user = 'canary-user-0007';
+    const password = 'canarypw-777';
+    // A port out of range and a space in the host: both refused by the URL parser.
+    for (const url of [`https://${user}:${password}@host.example:99999/`, `https://${user}:${password}@host example/`]) {
+      writeConfig(home, fixtureConfig(dir, { services: [commandService(dir, { endpoint: { url } })] }));
+      const problems = JSON.stringify(cli(['status'], { home }).payload.config.problems);
+      assert.match(problems, /services\[0\]\.endpoint\.url/);
+      assert.match(problems, /not a usable URL/);
+      assert.equal(problems.includes(password), false, `the problem quotes the URL:\n${problems}`);
+      for (const command of ['status', 'doctor', 'bundle']) {
+        const text = JSON.stringify(restricted(home, [command]));
+        for (const canary of [user, password]) assert.equal(text.includes(canary), false, `${command} shows ${canary}:\n${text}`);
+      }
+    }
+  });
+
+  // However the text quotes it, the redactor knows what a URL that does not parse holds.
+  const written = 'ftp://some%20one:pa%40ss-word@host:99999/path@x';
+  const redact = valueRedactor({ services: [{ endpoint: { url: written } }] });
+  for (const text of [written, 'as typed: some one, pa@ss-word', JSON.stringify({ url: written })]) {
+    const redacted = redact(text);
+    for (const canary of ['some%20one', 'some one', 'pa%40ss-word', 'pa@ss-word']) assert.equal(redacted.includes(canary), false, `${canary} in ${redacted}`);
+  }
+  // Only the userinfo goes; the host and path are left for the owner to read.
+  assert.equal(redact(written), `ftp://${REDACTED}@host:99999/path@x`);
+});
+
 test('a reply that cannot be redacted is never sent as it was', async () => {
   await withHome(async (home) => {
     const depth = 1_000_000;
