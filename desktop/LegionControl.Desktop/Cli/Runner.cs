@@ -35,7 +35,13 @@ public static class Runner
         "approve-launch", "revert-launch", "hash",
     };
 
-    public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output)
+    public static Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output) =>
+        RunAsync(arguments, output, () => new AppModel());
+
+    /// The same, with the app [open] makes in place of the one this device's own files make. A
+    /// test passes one that drives a runner of its own, so the command line it checks is the one
+    /// that ships.
+    public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output, Func<AppModel> open)
     {
         if (arguments.Contains("-h")) { WriteUsage(output); return Ok; }
         var command = arguments.Count > 0 && !arguments[0].StartsWith("--", StringComparison.Ordinal)
@@ -65,7 +71,7 @@ public static class Runner
 
         if (command == "version") return Version(output);
         var json = line.Has("json");
-        using var app = new AppModel();
+        using var app = open();
         using var cancellation = new CancellationTokenSource(
             TimeSpan.FromSeconds(line.Number("timeout") ?? 300));
         var token = cancellation.Token;

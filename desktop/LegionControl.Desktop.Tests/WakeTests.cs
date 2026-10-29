@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Nodes;
+using LegionControl.Desktop.Cli;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Model;
@@ -563,6 +564,13 @@ public class WakeTests
     private static AppModel Device(TempHome home, string document, IProcessRunner runner)
     {
         File.WriteAllBytes(Path.Combine(home.Path, "config.json"), ControllerDocument.FromText(document).Bytes);
+        return Reopen(home, runner);
+    }
+
+    /// The device of [home] started again, as each run of the command line starts it: from what
+    /// its files say now.
+    private static AppModel Reopen(TempHome home, IProcessRunner runner)
+    {
         var store = new ConfigStore(Path.Combine(home.Path, "config.json"), Path.Combine(home.Path, "setup-state.json"),
             new SetupLedger(Path.Combine(home.Path, "revisions")), "laptop", watch: false);
         return new AppModel(store, runner, new OperationTracker(Path.Combine(home.Path, "operations.json")), DesktopSettings.Default,
@@ -586,6 +594,14 @@ public class WakeTests
             return FakeRunner.Ok("""{ "ok": false, "contract": 3, "action": "failed", "reasonCode": "apply-failed", "outcome": "failed" }""");
         return FakeRunner.Ok(Status("command"));
     });
+
+    /// The fleet with pi as tower's only helper.
+    private static string OnlyPi()
+    {
+        var onlyPi = JsonNode.Parse(Fleet)!.AsObject();
+        onlyPi["machines"]![2]!["wake"]!["helpers"]!.AsArray().RemoveAt(1);
+        return onlyPi.ToJsonString();
+    }
 
     private static int Runs(FakeRunner runner, string host) =>
         runner.Calls.Count(call => To(call, host) && call.RemoteCommand.Contains("run wake-tower"));
@@ -631,9 +647,7 @@ public class WakeTests
         // it anyway changes nothing.
         using var home = new TempHome();
         var runner = HeldOnPi();
-        var onlyPi = JsonNode.Parse(Fleet)!.AsObject();
-        onlyPi["machines"]![2]!["wake"]!["helpers"]!.AsArray().RemoveAt(1);
-        using var app = Device(home, onlyPi.ToJsonString(), runner);
+        using var app = Device(home, OnlyPi(), runner);
         var tower = app.Machine("tower")!;
 
         await app.WakeAsync(tower);
@@ -651,6 +665,73 @@ public class WakeTests
         await app.WakeAsync(tower);
         Assert.Equal(1, Runs(runner, "pi"));
         Assert.Single(app.Tracker.WakeHoldsFor("tower"));
+    }
+
+    /// One run of `--command wake --machine tower` with [flags] on the device of [home], started
+    /// from its files as every run of the command line is.
+    private static async Task<(int Code, string Text)> WakeFromTheCommandLine(TempHome home, IProcessRunner runner, params string[] flags)
+    {
+        var output = new StringWriter();
+        var code = await Runner.RunAsync(new[] { "--command", "wake", "--machine", "tower" }.Concat(flags).ToList(), output,
+            () => Reopen(home, runner));
+        return (code, output.ToString());
+    }
+
+    private static IReadOnlyList<TrackedOperation> HoldsOnDisk(TempHome home) =>
+        new OperationTracker(Path.Combine(home.Path, "operations.json")).WakeHoldsFor("tower");
+
+    [Fact]
+    public async Task TheCommandLineAsksTheOtherHelpersOnlyWhileAHoldKeepsOneBack()
+    {
+        using var home = new TempHome();
+        var runner = HeldOnPi();
+        Device(home, Fleet, runner).Dispose();
+
+        Assert.Equal(Runner.NotKnown, (await WakeFromTheCommandLine(home, runner, "--yes")).Code);
+        Assert.Equal((1, 0), (Runs(runner, "pi"), Runs(runner, "nas")));
+
+        // Held, with nas there to ask: the hint names the other helpers, and nothing runs.
+        var (code, text) = await WakeFromTheCommandLine(home, runner);
+        Assert.Equal(Runner.Failed, code);
+        Assert.Contains("Add --try-other-helpers", text);
+        Assert.Equal((1, 0), (Runs(runner, "pi"), Runs(runner, "nas")));
+
+        // Asked for without --yes, it prints the walk it would make, which asks nas alone.
+        (code, text) = await WakeFromTheCommandLine(home, runner, "--try-other-helpers");
+        Assert.Equal(Runner.Ok, code);
+        Assert.StartsWith("1 way to try: ask NAS to run wake-tower.", text);
+        Assert.Contains("only the other helpers are asked", text);
+        Assert.DoesNotContain("Add --try-other-helpers", text);
+        Assert.Single(HoldsOnDisk(home));
+
+        (code, _) = await WakeFromTheCommandLine(home, runner, "--try-other-helpers", "--yes");
+        Assert.Equal(Runner.NotKnown, code);
+        Assert.Equal((1, 1), (Runs(runner, "pi"), Runs(runner, "nas")));
+        Assert.Empty(HoldsOnDisk(home));
+    }
+
+    [Fact]
+    public async Task TheCommandLineTriesNoOtherHelperWhenTheHeldOneIsTheOnlyOne()
+    {
+        using var home = new TempHome();
+        var runner = HeldOnPi();
+        Device(home, OnlyPi(), runner).Dispose();
+
+        await WakeFromTheCommandLine(home, runner, "--yes");
+        Assert.Equal(1, Runs(runner, "pi"));
+        var first = Assert.Single(HoldsOnDisk(home));
+
+        // Held, with nobody else to ask: no word of other helpers.
+        var (code, text) = await WakeFromTheCommandLine(home, runner);
+        Assert.Equal(Runner.Failed, code);
+        Assert.DoesNotContain("--try-other-helpers", text);
+
+        // Asking for them anyway walks nothing and says there is none.
+        (code, text) = await WakeFromTheCommandLine(home, runner, "--try-other-helpers", "--yes");
+        Assert.Equal(Runner.Failed, code);
+        Assert.Contains("No other helper could be asked to wake Tower", text);
+        Assert.Equal(1, Runs(runner, "pi"));
+        Assert.Equal(first.Id, Assert.Single(HoldsOnDisk(home)).Id);
     }
 
     [Fact]
