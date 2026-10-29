@@ -14,8 +14,6 @@
          the account this script runs under. If it does exist, its action and
          its repetition are rewritten and everything else about it (principal,
          time limit, conditions) is left exactly as found.
-      3. Retires a superseded update-nightly.ps1 if one is still lying around,
-         by renaming it. Nothing is ever deleted.
 
     What it deliberately does NOT touch:
       Any other task on the machine. A task that starts a service the agent
@@ -80,11 +78,6 @@ $BinDir      = Join-Path $Base 'bin'
 $LauncherModule = Join-Path $BinDir 'launcher.mjs'
 $LauncherScript = Join-Path $BinDir 'legionctl.ps1'
 $XmlPath     = Join-Path $Base (($TaskName -replace '[^\w\-]', '-') + '.xml')
-
-# Where the superseded PowerShell updater used to live, if this machine ever ran
-# one. Only read, and only renamed.
-$LegacyDir   = Join-Path $UserProfile 'AppData\Local\T3Code'
-$OldUpdater  = Join-Path $LegacyDir 'update-nightly.ps1'
 
 $Summary = New-Object System.Collections.Generic.List[string]
 
@@ -572,31 +565,6 @@ if (-not $existing) {
     } else {
         Note "NOT registered: this task runs as SYSTEM and this session is not elevated."
     }
-}
-
-# ---------------------------------------------------------------------------
-# Superseded updater script
-# ---------------------------------------------------------------------------
-
-Step 'Old updater'
-
-# Order matters here. Until the task has actually been re-registered it may
-# still be pointing at the old script, so renaming that file first would leave a
-# live task calling something that is not there any more. Only retire it once
-# the task really points somewhere else.
-if (-not (Test-Path $OldUpdater)) {
-    Note 'no superseded updater script to retire'
-} elseif (-not $TaskRegistered) {
-    Note 'update-nightly.ps1 left in place: the task still points at it until the elevated command below has run'
-} else {
-    $superseded = $OldUpdater + '.superseded'
-    if (Test-Path $superseded) {
-        # Never overwrite an earlier backup, keep both.
-        $superseded = $OldUpdater + '.superseded.' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-    }
-    Move-Item -Path $OldUpdater -Destination $superseded
-    Note ("renamed update-nightly.ps1 to " + (Split-Path -Leaf $superseded) + ", nothing was deleted")
-    Note ("it still sits in " + $LegacyDir + " if the old behaviour is ever needed back")
 }
 
 # ---------------------------------------------------------------------------

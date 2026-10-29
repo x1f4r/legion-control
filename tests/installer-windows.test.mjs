@@ -27,6 +27,11 @@ test('scheduler template invokes only the stable launcher and cycles all service
   assert.doesNotMatch(service, /src\/index\.mjs/);
 });
 
+// The superseded updater one machine once ran is nothing a public installer should know about.
+test('the Windows installer names no updater from before the agent', () => {
+  assert.doesNotMatch(installer, /update-nightly|T3Code|AppData\\Local/i);
+});
+
 // Windows PowerShell reads a script without a byte order mark in the ANSI code page, so anything
 // but ASCII in one is read as something else on a machine with another code page.
 test('every PowerShell script is ASCII, which Windows PowerShell reads the same everywhere', () => {
