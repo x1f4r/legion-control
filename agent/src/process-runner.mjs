@@ -116,6 +116,12 @@ const inFlight = new Map();
 const children = new Map();
 /** Commands this process could not see stop, held here as well in case the ledger would not take them. */
 const held = new Map();
+/**
+ * Every entry this process has written. What an entry says about its agent is
+ * a process id, and Windows hands the id of an agent that died to the next
+ * process soon enough, this agent included.
+ */
+const written = new Set();
 
 function changeLedger(mutate) {
   const changed = withStore(
@@ -277,10 +283,13 @@ async function windowsLeft(entry, options = {}) {
  * children leave the job without a word and carry on: the installer an update
  * script started, whatever an npm script runs. So there an entry another agent
  * left is judged by its whole tree too. Its command need not have ended by
- * itself, and then nothing it left behind is there on purpose. Only this
- * agent's own entry, for a command it saw end and could not take out of the
- * ledger, is judged by the command alone. An agent that is still alive counts
- * as another: its process id may be somebody else's by now.
+ * itself, and then nothing it left behind is there on purpose. Only an entry
+ * this agent wrote, for a command it saw end and could not take out of the
+ * ledger, is judged by the command alone. Which entries those are, this
+ * process remembers rather than going by the agent's process id an entry
+ * names: one naming this process's id that it did not write was written by an
+ * agent that died and left the id free, and an agent that is still alive
+ * counts as another all the same.
  *
  * Nothing outlives a reboot, and anything the agent cannot read counts as
  * running.
@@ -288,11 +297,12 @@ async function windowsLeft(entry, options = {}) {
 async function stillRunning(entry, { bootId }) {
   if (entry.bootId && bootId && entry.bootId !== bootId) return false;
   if (entry.platform !== process.platform) return false;
+  const own = written.has(entry.id);
   // Written before the command was started, and its writer never got further.
-  if (!Number.isInteger(entry.pid)) return entry.agentPid !== process.pid && processIsAlive(entry.agentPid);
+  if (!Number.isInteger(entry.pid)) return !own && entry.agentPid !== process.pid && processIsAlive(entry.agentPid);
   const whole = entry.state === 'unconfirmed';
   if (IS_WINDOWS) {
-    const left = await windowsLeft(entry, { treeOf: whole || entry.agentPid !== process.pid });
+    const left = await windowsLeft(entry, { treeOf: whole || !own });
     return left === null || left.length > 0;
   }
   return whole ? posixGroupLeft(entry) : posixLeaderLeft(entry);
@@ -482,6 +492,7 @@ export async function runMutation(file, args = [], options = {}) {
   if (!entered.ok) {
     return notStarted(command, `not started: the command ledger could not be written (${entered.error})`, { refused: true, conflict: null });
   }
+  written.add(entry.id);
   inFlight.set(entry.id, entry);
   try {
     return await supervise(file, args, options, entry);

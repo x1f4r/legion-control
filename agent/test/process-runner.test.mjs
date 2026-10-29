@@ -340,38 +340,79 @@ test('a command left behind, running or unconfirmed, holds later mutations only 
 });
 
 test('what a command left when its agent died holds the machine on Windows, where the command died with the agent', async () => {
-  await withHome(async () => {
-    // The command has ended, and a child it started is still running. On
-    // POSIX the command had a process group of its own and outlived its
-    // agent, so it ended by itself and the child is what it meant to leave,
-    // as with a start command's daemon. On Windows it ended because its agent
-    // did, and the child is whatever it had not finished.
-    const leaver = node("const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); child.unref(); process.stdout.write(String(child.pid))");
-    const startedAt = new Date().toISOString();
-    const command = spawnSync(leaver[0], leaver.slice(1), { encoding: 'utf8' });
-    const left = Number(command.stdout);
-    assert.ok(Number.isInteger(left) && left > 0, command.stderr);
-    const entry = {
-      id: 'left-by-a-dead-agent', pid: command.pid, group: posix ? command.pid : null, platform: process.platform, command: 'node',
-      state: 'running', startedAt, endedAt: null, agentPid: deadPid(), bootId: bootIdentity(),
-      opId: 'killed-update-0002', kind: 'update', service: 'demo', phase: 'installing', opStartedAt: startedAt,
-    };
-    fs.mkdirSync(path.dirname(ledgerPath()), { recursive: true });
-    fs.writeFileSync(ledgerPath(), JSON.stringify({ commands: [entry] }));
-    try {
-      if (posix) {
-        assert.equal(await unsettledWork(), null, 'a command that ended by itself lets go, whatever it left');
-      } else {
-        const blocked = await unsettledWork();
-        assert.ok(blocked, 'what the command left behind holds the machine');
-        assert.equal(blocked.conflict.opId, 'killed-update-0002');
+  // The second agent is one whose process id Windows has since handed to this
+  // one. Its entry was taken for this agent's own, judged by the command alone,
+  // and let go while what the command left was still running.
+  for (const [agent, agentPid] of [['a dead agent', deadPid()], ['a dead agent with this one\'s id', process.pid]]) {
+    await withHome(async () => {
+      // The command has ended, and a child it started is still running. On
+      // POSIX the command had a process group of its own and outlived its
+      // agent, so it ended by itself and the child is what it meant to leave,
+      // as with a start command's daemon. On Windows it ended because its
+      // agent did, and the child is whatever it had not finished.
+      const leaver = node("const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); child.unref(); process.stdout.write(String(child.pid))");
+      const startedAt = new Date().toISOString();
+      const command = spawnSync(leaver[0], leaver.slice(1), { encoding: 'utf8' });
+      const left = Number(command.stdout);
+      assert.ok(Number.isInteger(left) && left > 0, command.stderr);
+      const entry = {
+        id: 'left-by-a-dead-agent', pid: command.pid, group: posix ? command.pid : null, platform: process.platform, command: 'node',
+        state: 'running', startedAt, endedAt: null, agentPid, bootId: bootIdentity(),
+        opId: 'killed-update-0002', kind: 'update', service: 'demo', phase: 'installing', opStartedAt: startedAt,
+      };
+      fs.mkdirSync(path.dirname(ledgerPath()), { recursive: true });
+      fs.writeFileSync(ledgerPath(), JSON.stringify({ commands: [entry] }));
+      try {
+        if (posix) {
+          assert.equal(await unsettledWork(), null, `${agent}: a command that ended by itself lets go, whatever it left`);
+        } else {
+          const blocked = await unsettledWork();
+          assert.ok(blocked, `${agent}: what the command left behind holds the machine`);
+          assert.equal(blocked.conflict.opId, 'killed-update-0002');
+        }
+      } finally {
+        try { process.kill(left, 'SIGKILL'); } catch { /* already gone */ }
       }
+      for (let tries = 0; tries < 100 && alive(left); tries += 1) await delay(50);
+      assert.equal(await unsettledWork(), null, `${agent}: and lets go once that is gone too`);
+      assert.deepEqual(ledger(), []);
+    });
+  }
+});
+
+test('an entry of this agent\'s own, for a command it saw end, is judged by the command alone', async () => {
+  await withHome(async () => {
+    // The start command exits and leaves its daemon, and the write that
+    // takes the entry out of the ledger fails. The command was seen to end, so
+    // the daemon is what it meant to leave, on Windows as anywhere.
+    const daemon = 'setInterval(() => {}, 1000)';
+    const start = node(`const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(daemon)}], { stdio: 'ignore', detached: ${!posix} }); child.unref(); process.stdout.write(String(child.pid))`);
+    const rename = fs.renameSync;
+    let writes = 0;
+    fs.renameSync = (from, to) => {
+      if (to === ledgerPath() && (writes += 1) === 3) throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+      return rename.call(fs, from, to);
+    };
+    let result;
+    try {
+      result = await run(start, { timeoutMs: 20000 });
     } finally {
-      try { process.kill(left, 'SIGKILL'); } catch { /* already gone */ }
+      fs.renameSync = rename;
     }
-    for (let tries = 0; tries < 100 && alive(left); tries += 1) await delay(50);
-    assert.equal(await unsettledWork(), null, 'and lets go once that is gone too');
-    assert.deepEqual(ledger(), []);
+    const pid = Number(result.stdout);
+    try {
+      assert.equal(result.ok, true, result.error ?? result.stderr);
+      assert.ok(Number.isInteger(pid) && pid > 0);
+      const [entry] = ledger();
+      assert.equal(entry?.state, 'running', 'the entry the failed write left');
+      assert.equal(alive(pid), true);
+      assert.equal(await unsettledWork(), null, 'its own command ended, and the daemon does not hold the machine');
+      assert.deepEqual(ledger(), []);
+    } finally {
+      if (pid > 0) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
   });
 });
 
