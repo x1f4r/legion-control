@@ -16,6 +16,10 @@ public sealed class MachineModel
 {
     private readonly IProcessRunner _runner;
     private readonly OperationTracker _tracker;
+    private readonly object _readingGate = new();
+    /// How many readings have started, and the number of the last one applied.
+    private long _readingsStarted;
+    private long _readingApplied;
 
     public MachineModel(
         MachineConfig machine,
@@ -86,40 +90,55 @@ public sealed class MachineModel
 
     // MARK: reading
 
+    /// Reads the machine once. Polls overlap: one stuck on a dead route can still be waiting when
+    /// the next has already come back from a live one. So every reading is numbered when it
+    /// starts, and one that finishes after a later-started reading was applied is dropped, failure
+    /// and success alike: a slow poll never puts an older picture over a newer one.
     public async Task RefreshAsync(CancellationToken cancellationToken = default)
     {
+        var sequence = Interlocked.Increment(ref _readingsStarted);
         try
         {
             var reply = await NewAgent().StatusAsync(Capabilities, PreferredSystem(), null, cancellationToken);
-            var previousSystem = Routes.RememberedSystemId;
-            Status = reply.Value;
-            Failure = null;
-            LastReadAt = DateTimeOffset.UtcNow;
-            Capabilities = AgentCapabilities.Of(reply.Value);
-
-            // A machine that came back as a different system is reached differently: the address
-            // the other system answers on is no longer the one to try first.
-            if (reply.Value.SystemId is { } reported && previousSystem is not null && reported != previousSystem)
+            lock (_readingGate)
             {
-                Routes.ForgetRoute($"the machine answered as {reported} rather than {previousSystem}");
-            }
-            Routes.Remember(reply.Route, reply.System, reply.Value.Agent?.RestrictedSession == true);
+                if (sequence < _readingApplied) return;
+                _readingApplied = sequence;
+                var previousSystem = Routes.RememberedSystemId;
+                Status = reply.Value;
+                Failure = null;
+                LastReadAt = DateTimeOffset.UtcNow;
+                Capabilities = AgentCapabilities.Of(reply.Value);
 
-            ObserveTransition(reply.Value);
-            if (Settings.KeepMetricsHistory && reply.Value.Metrics is { } metrics)
-            {
-                Metrics.Add(metrics, Settings.MetricsHistoryLimit);
+                // A machine that came back as a different system is reached differently: the
+                // address the other system answers on is no longer the one to try first.
+                if (reply.Value.SystemId is { } reported && previousSystem is not null && reported != previousSystem)
+                {
+                    Routes.ForgetRoute($"the machine answered as {reported} rather than {previousSystem}");
+                }
+                Routes.Remember(reply.Route, reply.System, reply.Value.Agent?.RestrictedSession == true);
+
+                ObserveTransition(reply.Value);
+                if (Settings.KeepMetricsHistory && reply.Value.Metrics is { } metrics)
+                {
+                    Metrics.Add(metrics, Settings.MetricsHistoryLimit);
+                }
             }
         }
         catch (AgentFailure failure)
         {
-            Failure = failure;
-            LastReadAt = DateTimeOffset.UtcNow;
-            NoteFailedRoutes(failure);
-            ObserveAbsence(failure);
-            // The status is kept. A machine that has gone to sleep is still a machine we know the
-            // shape of, and blanking the section would lose the very rows that explain why it is
-            // not answering.
+            lock (_readingGate)
+            {
+                if (sequence < _readingApplied) return;
+                _readingApplied = sequence;
+                Failure = failure;
+                LastReadAt = DateTimeOffset.UtcNow;
+                NoteFailedRoutes(failure);
+                ObserveAbsence(failure);
+                // The status is kept. A machine that has gone to sleep is still a machine we know
+                // the shape of, and blanking the section would lose the very rows that explain why
+                // it is not answering.
+            }
         }
         Changed?.Invoke();
     }

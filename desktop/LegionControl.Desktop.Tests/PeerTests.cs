@@ -770,6 +770,50 @@ public class ReconcilerTests
     }
 }
 
+/// Readings of one machine that overlap.
+public class ReadingTests
+{
+    /// A runner whose first status waits until it is let go, and whose later ones answer at once.
+    private sealed class SlowFirstRunner(string first, string later) : IProcessRunner
+    {
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _calls;
+
+        public async Task<CommandResult> RunAsync(string executable, IReadOnlyList<string> arguments, TimeSpan timeout,
+            byte[]? input = null, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _calls) == 1)
+            {
+                await Release.Task;
+                return FakeRunner.Ok(first);
+            }
+            return FakeRunner.Ok(later);
+        }
+    }
+
+    [Fact]
+    public async Task ASlowReadingNeverPutsAnOlderPictureOverANewerOne()
+    {
+        using var home = new TempHome();
+        var machine = MachineConfig.From(Value.Parse("""
+            { "id": "pi", "endpoints": [ { "id": "lan", "host": "pi.example" } ],
+              "systems": [ { "id": "linux", "agent": [ "node", "/agent.mjs" ] } ] }
+            """));
+        var runner = new SlowFirstRunner(
+            """{ "ok": true, "contract": 3, "agentVersion": "3.0.0", "system": { "id": "linux" }, "hostname": "older" }""",
+            """{ "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "linux" }, "hostname": "newer" }""");
+        var model = new MachineModel(machine, runner, new OperationTracker(Path.Combine(home.Path, "operations.json")));
+
+        var slow = model.RefreshAsync();
+        await model.RefreshAsync();
+        Assert.Equal("3.1.0", model.Status!.AgentVersion);
+
+        runner.Release.SetResult();
+        await slow;
+        Assert.Equal("3.1.0", model.Status!.AgentVersion);
+    }
+}
+
 /// Where this device thinks it is, and what that is worth.
 public class SiteSenseTests
 {
