@@ -125,13 +125,9 @@ public sealed class AgentInstaller(IProcessRunner runner)
             return new AgentInstallOutcome.Unavailable("Read an authenticated agent status before installing or upgrading it.");
         var (bundle, problem) = AgentBundle.Load();
         if (bundle is null) return new AgentInstallOutcome.Unavailable(problem ?? "No agent bundle.");
+        if (Refusal(bundle.Version, machine.Capabilities, machine.Name, allowDowngrade) is { } refusal)
+            return new AgentInstallOutcome.Unavailable(refusal);
         var goesBack = GoesBack(bundle.Version, machine.Capabilities);
-        if (goesBack is not null && !allowDowngrade)
-            return new AgentInstallOutcome.Unavailable($"This build carries agent {bundle.Version}, {goesBack} on {machine.Name}, so it is not installed as an upgrade. Going back is a separate decision.");
-        if (goesBack is not null && !machine.Capabilities.SupportsAllowDowngrade)
-            return new AgentInstallOutcome.Unavailable(machine.Capabilities.RestrictedSession
-                ? $"A restricted key can only move the agent on {machine.Name} forward. Go back to agent {bundle.Version} from an administrator SSH connection."
-                : $"The agent on {machine.Name} reports no version floor, so it cannot be taken back deliberately from here. Install agent {bundle.Version} on it by hand.");
 
         var routes = machine.Bindings.RoutesFor(machine.Machine);
         var system = (machine.Routes.RememberedSystemId is { } id ? machine.Machine.System(id) : null)
@@ -253,6 +249,22 @@ public sealed class AgentInstaller(IProcessRunner runner)
         }
         return new AgentInstallOutcome.Failed(
             envelope.Sentence() ?? $"The staged agent on {machine.Name} refused to install itself.", null);
+    }
+
+    /// Why agent [version] is not installed on the machine called [machineName], or null when it
+    /// may be. Going back, to an agent older than the one it runs or below its version floor, takes
+    /// a person's decision ([allowDowngrade]) and an agent that can be told so: one that reports a
+    /// floor, over a key that is not restricted.
+    public static string? Refusal(string version, AgentCapabilities capabilities, string machineName, bool allowDowngrade)
+    {
+        if (GoesBack(version, capabilities) is not { } goesBack) return null;
+        if (!allowDowngrade)
+            return $"This build carries agent {version}, {goesBack} on {machineName}, so it is not installed as an upgrade. Going back is a separate decision.";
+        if (!capabilities.SupportsAllowDowngrade)
+            return capabilities.RestrictedSession
+                ? $"A restricted key can only move the agent on {machineName} forward. Go back to agent {version} from an administrator SSH connection."
+                : $"The agent on {machineName} reports no version floor, so it cannot be taken back deliberately from here. Install agent {version} on it by hand.";
+        return null;
     }
 
     /// How installing agent [version] would take the machine back, or null when it would not: older

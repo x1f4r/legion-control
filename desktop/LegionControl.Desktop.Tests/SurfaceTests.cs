@@ -166,6 +166,20 @@ public class CommandSurfaceTests
         Assert.Null(AgentInstaller.GoesBack("3.1.0", running with { AgentVersion = "nightly", Floor = null }));
     }
 
+    [Fact]
+    public void AnOlderBundleIsInstalledOnlyOnAPersonsDecisionAndOnlyWhereTheAgentCanBeToldSo()
+    {
+        var running = new AgentCapabilities { ContractVersion = 3, AgentVersion = "3.2.0", Floor = "3.1.0", ReportsFloor = true };
+        Assert.Null(AgentInstaller.Refusal("3.2.1", running, "Tower", allowDowngrade: false));
+        // Never as an upgrade: --yes alone does not take a machine back.
+        Assert.Contains("not installed as an upgrade", AgentInstaller.Refusal("3.1.0", running, "Tower", allowDowngrade: false));
+        Assert.Null(AgentInstaller.Refusal("3.1.0", running, "Tower", allowDowngrade: true));
+        // The decision is not enough where the agent cannot be told about it.
+        Assert.Contains("restricted key", AgentInstaller.Refusal("3.1.0", running with { RestrictedSession = true }, "Tower", allowDowngrade: true));
+        Assert.Contains("reports no version floor",
+            AgentInstaller.Refusal("3.1.0", running with { Floor = null, ReportsFloor = false }, "Tower", allowDowngrade: true));
+    }
+
     [Theory]
     [InlineData("3.10.0", "3.9.0", 1)]
     [InlineData("3.1.0", "3.1.0", 0)]
