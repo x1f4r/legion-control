@@ -11,9 +11,9 @@
       1. Stages and self-checks the complete agent tree before replacing it.
       2. Points a scheduled task at the agent's update cycle, every 15 minutes.
          If the task named by -TaskName does not exist it is created, running as
-         the account this script runs under. If it does exist, its action and
-         its repetition are rewritten and everything else about it (principal,
-         time limit, conditions) is left exactly as found.
+         the account this script runs under. If it does exist, its action, its
+         repetition and its time limit are rewritten and everything else about
+         it (principal, conditions) is left exactly as found.
 
     What it deliberately does NOT touch:
       Any other task on the machine. A task that starts a service the agent
@@ -63,6 +63,10 @@ $ErrorActionPreference = 'Stop'
 $TaskNamespace = 'http://schemas.microsoft.com/windows/2004/02/mit/task'
 $Interval      = 'PT15M'
 $IntervalSpan  = New-TimeSpan -Minutes 15
+# How long one cycle may run before the task stops it: the cycle's budget, the
+# same 30 minutes as TimeoutStartSec=1800 in the systemd unit.
+$TimeLimit     = 'PT30M'
+$TimeLimitSpan = New-TimeSpan -Minutes 30
 $MinNodeMajor  = 24
 
 $UserProfile = $env:USERPROFILE
@@ -328,12 +332,13 @@ if (-not $existing) {
     # A cycle that installs and waits for health can outlive a 15 minute window.
     # If the task were allowed to run in parallel, two installs would fight over
     # the same files and wreck the install. IgnoreNew is the only sane policy
-    # here, and the time limit matches: a run that has not finished in 15
-    # minutes is stuck. The agent's OS-backed mutex is released when that
-    # process exits, and the next cycle recovers its interrupted operation.
+    # here, and the time limit is the cycle's budget: a run that has not
+    # finished in 30 minutes is stuck. The agent's OS-backed mutex is released
+    # when that process exits, and the next cycle recovers its interrupted
+    # operation.
     $settings = New-ScheduledTaskSettingsSet `
         -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
+        -ExecutionTimeLimit $TimeLimitSpan `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
         -StartWhenAvailable
@@ -394,11 +399,6 @@ if (-not $existing) {
         # Left exactly as found. S-1-5-18 is SYSTEM.
         Note ("principal:    " + $principalNode.InnerText + " (preserved)")
         $runsAsSystem = ($principalNode.InnerText -eq 'S-1-5-18')
-    }
-
-    $limitNode = $doc.SelectSingleNode('/t:Task/t:Settings/t:ExecutionTimeLimit', $ns)
-    if ($limitNode) {
-        Note ("time limit:   " + $limitNode.InnerText + " (preserved)")
     }
 
     # --- action -------------------------------------------------------------
@@ -500,24 +500,45 @@ if (-not $existing) {
     }
     Note ("new interval: " + $Interval + " on " + $repeating.Count + " of " + $triggerNodes.Count + " trigger(s)")
 
-    # --- overlap policy -----------------------------------------------------
+    # --- overlap policy and time limit ---------------------------------------
+
+    # Settings takes its children in any order (settingsType is an xs:all in the
+    # task schema), unlike a trigger, so a setting that is missing is appended.
+    $settingsNode = $doc.SelectSingleNode('/t:Task/t:Settings', $ns)
+    if (-not $settingsNode) {
+        throw "The exported XML for '$TaskName' has no Settings element. Delete the task and rerun this script to have it created from scratch."
+    }
 
     # A cycle that installs and waits for health can outlive a 15 minute window.
     # If the task were allowed to run in parallel, two installs would fight over
     # the same files and wreck the install. IgnoreNew is the only sane policy.
-    $policyNode = $doc.SelectSingleNode('/t:Task/t:Settings/t:MultipleInstancesPolicy', $ns)
-    if ($policyNode) {
-        if ($policyNode.InnerText -ne 'IgnoreNew') {
-            Note ("overlap policy was " + $policyNode.InnerText + ", set to IgnoreNew")
-            $policyNode.InnerText = 'IgnoreNew'
-        } else {
-            Note 'overlap policy already IgnoreNew'
-        }
+    $policyNode = $settingsNode.SelectSingleNode('t:MultipleInstancesPolicy', $ns)
+    if (-not $policyNode) {
+        $policyNode = $doc.CreateElement('MultipleInstancesPolicy', $TaskNamespace)
+        $policyNode.InnerText = 'IgnoreNew'
+        $settingsNode.AppendChild($policyNode) | Out-Null
+        Note 'overlap policy was not set, set to IgnoreNew'
+    } elseif ($policyNode.InnerText -ne 'IgnoreNew') {
+        Note ("overlap policy was " + $policyNode.InnerText + ", set to IgnoreNew")
+        $policyNode.InnerText = 'IgnoreNew'
     } else {
-        # Not inserting one by hand: Settings has a strict element order and a
-        # misplaced node fails the whole import.
-        Note 'WARNING: no MultipleInstancesPolicy in the task XML, check it by hand in taskschd.msc'
+        Note 'overlap policy already IgnoreNew'
     }
+
+    # The cycle's budget, as for a new task. A shorter limit stops a cycle that
+    # was planned to fit, and a longer one, or the default of 72 hours, lets a
+    # stuck run hold the task while IgnoreNew skips every run behind it.
+    $limitNode = $settingsNode.SelectSingleNode('t:ExecutionTimeLimit', $ns)
+    if (-not $limitNode) {
+        $limitNode = $doc.CreateElement('ExecutionTimeLimit', $TaskNamespace)
+        $settingsNode.AppendChild($limitNode) | Out-Null
+        Note ("time limit:   the default of 72 hours, set to " + $TimeLimit)
+    } elseif ($limitNode.InnerText -ne $TimeLimit) {
+        Note ("time limit:   " + $limitNode.InnerText + ", set to " + $TimeLimit)
+    } else {
+        Note ("time limit:   already " + $TimeLimit)
+    }
+    $limitNode.InnerText = $TimeLimit
 
     # --- write the XML ------------------------------------------------------
 

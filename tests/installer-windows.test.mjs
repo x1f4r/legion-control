@@ -27,6 +27,15 @@ test('scheduler template invokes only the stable launcher and cycles all service
   assert.doesNotMatch(service, /src\/index\.mjs/);
 });
 
+test('the Windows task gets the cycle budget as its time limit, new or rewritten', () => {
+  assert.match(installer, /\$TimeLimit\s+= 'PT30M'/);
+  assert.match(installer, /\$TimeLimitSpan = New-TimeSpan -Minutes 30/);
+  assert.match(installer, /-ExecutionTimeLimit \$TimeLimitSpan/);
+  assert.match(installer, /\$limitNode\.InnerText = \$TimeLimit/);
+  // The same 30 minutes the systemd unit gives one cycle.
+  assert.match(service, /^TimeoutStartSec=1800$/m);
+});
+
 // The superseded updater one machine once ran is nothing a public installer should know about.
 test('the Windows installer names no updater from before the agent', () => {
   assert.doesNotMatch(installer, /update-nightly|T3Code|AppData\\Local/i);
