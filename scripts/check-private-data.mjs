@@ -6,7 +6,7 @@
 //
 // The repository is public, and each of these has reached it before: a path with a real user name
 // in it, a home network's addresses, the names of the people and machines it was written on. Every
-// file git tracks or would track is read, and the files' names as well, for three things:
+// file git tracks or would track is read, and each file's name as well, for three things:
 //
 // - A home directory whose user is not a placeholder: /home/<user>, /Users/<user>, or
 //   <drive>:\Users\<user> with \, \\ or / between the parts, and the same homes reached through a
@@ -111,8 +111,8 @@ function privateAddress(parts) {
   return false;
 }
 
-/** What one line of text gives away, as messages. */
-function lineFindings(line, terms) {
+/** What one line of text, or a file's name, gives away, as messages. */
+function lineFindings(line, terms, holds = 'holds') {
   const found = [];
   for (const match of line.matchAll(HOME)) {
     USER.lastIndex = match.index + match[0].length;
@@ -126,7 +126,7 @@ function lineFindings(line, terms) {
   }
   const lower = line.toLowerCase();
   for (const { term, source, entry } of terms) {
-    if (lower.includes(term)) found.push(`holds entry ${entry} of ${source}.`);
+    if (lower.includes(term)) found.push(`${holds} entry ${entry} of ${source}.`);
   }
   return found;
 }
@@ -140,10 +140,9 @@ export function checkPrivateData(root = repository, options = {}) {
   const findings = [];
   const files = checkoutFiles(root);
   for (const file of files) {
-    const lowerName = file.toLowerCase();
-    for (const { term, source, entry } of terms) {
-      if (lowerName.includes(term)) findings.push({ file, line: 0, message: `its name holds entry ${entry} of ${source}.` });
-    }
+    // A name is read as a line is: a fixture named for somebody's address or home gives it away
+    // as surely as one that holds it.
+    for (const message of lineFindings(file, terms, 'its name holds')) findings.push({ file, line: 0, message });
     let bytes;
     try { bytes = fs.readFileSync(path.join(root, file)); } catch { continue; }
     // A NUL in the first few kilobytes is how git tells a binary file, and an image or a keystore

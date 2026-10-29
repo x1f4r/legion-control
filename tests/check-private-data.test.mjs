@@ -94,6 +94,17 @@ test('a private address is refused outside the placeholder ranges, a site prefix
   assert.match(result.findings[0].message, /is on a private network; use an address from 192\.0\.2\.0\/24/);
 });
 
+test('a file\'s name is read as a line is, so a fixture named for an address gives it away too', (t) => {
+  const named = `contract/fixtures/wake-${address(192, 168, 77, 20)}.json`;
+  const { check } = checkout(t, {
+    [named]: '{}\n',
+    'contract/fixtures/wake-192.168.50.40.json': '{}\n',
+  });
+  const result = check();
+  assert.deepEqual(where(result), [`${named}:0`]);
+  assert.equal(result.findings[0].message.split(' ')[0], address(192, 168, 77, 20));
+});
+
 test('private terms come from the environment and the file outside the repository, and are never printed', (t) => {
   const { tree, terms, check, run } = checkout(t, {
     'docs/a.md': 'first line\nwritten on Zebulon\'s laptop\n',
