@@ -21,7 +21,8 @@ public class VectorTests
 
     /// The families this client runs. A family joins this list when its port lands here, and from
     /// then on the accounting test holds it to the index exactly.
-    private static readonly string[] Families = { "hash", "identifiers", "transport", "launch", "setup-acceptance", "setup-merge" };
+    private static readonly string[] Families =
+        { "hash", "identifiers", "transport", "launch", "setup-acceptance", "setup-reconcile", "setup-merge" };
 
     private static readonly IReadOnlyDictionary<string, Func<JsonNode, JsonNode>> Adapters =
         new Dictionary<string, Func<JsonNode, JsonNode>>(StringComparer.Ordinal)
@@ -115,6 +116,49 @@ public class VectorTests
                     ["assignsIdentity"] = verdict.AssignsIdentity,
                     ["keep"] = verdict.Keep,
                 };
+            },
+
+            ["setup-reconcile/decide"] = input =>
+            {
+                var local = input["local"] is JsonObject head
+                    ? new LocalHead(Text(head["hash"])!, Text(head["id"]), Strings(head["lineage"]))
+                    : null;
+                var status = input["status"] as JsonObject;
+                var contract = status?["contract"] is JsonValue written ? written.GetValue<int>() : (int?)null;
+                var decision = SetupSync.Decide(local, contract, Mark(status?["controller"]), Filed(input["metaByHash"]));
+                return new JsonObject { ["decision"] = decision.Kind.Wire(), ["reason"] = decision.Reason, ["expect"] = decision.Expect };
+            },
+            ["setup-reconcile/admit"] = input =>
+            {
+                var expected = input["expected"]!;
+                var fetched = input["fetched"]!;
+                var admission = SetupSync.Admit(Text(expected["localHash"])!, Text(expected["localId"])!, Text(expected["remoteHash"])!,
+                    Text(input["currentLocalHash"]), Text(fetched["hash"])!, Text(fetched["replyHash"])!, Text(fetched["id"]),
+                    Strings(fetched["lineage"]), input["accepted"]!.GetValue<bool>());
+                return new JsonObject { ["admission"] = admission.Wire() };
+            },
+            ["setup-reconcile/gate"] = input =>
+            {
+                var state = input["state"]!;
+                var verdict = SetupSync.Gate(
+                    Enum.Parse<SetupDecision>(Text(input["decision"])!, ignoreCase: true),
+                    Text(input["localHash"])!, Text(input["remoteHash"]), Text(input["agentVersion"]), input["now"]!.GetValue<long>(),
+                    new GateState(
+                        state["inFlight"]!.GetValue<bool>(),
+                        state["failedAt"]!.AsObject().ToDictionary(entry => entry.Key, entry => entry.Value!.GetValue<long>(), StringComparer.Ordinal),
+                        state["held"]!.AsObject().ToDictionary(entry => entry.Key, entry => entry.Value!.GetValue<string>(), StringComparer.Ordinal),
+                        state["localInvalid"]!.GetValue<bool>(),
+                        state["localMutation"]!.GetValue<bool>(),
+                        state["runningOperations"]!.GetValue<int>(),
+                        state["lockedAt"]?.GetValue<long>(),
+                        state["statusAt"]?.GetValue<long>(),
+                        Strings(state["settled"]).ToHashSet(StringComparer.Ordinal)));
+                return new JsonObject { ["action"] = verdict.Action.Wire(), ["reason"] = verdict.Reason };
+            },
+            ["setup-reconcile/pushReply"] = input =>
+            {
+                var reading = SetupSync.AfterPush(Value.Parse(input["reply"]?.ToJsonString() ?? "null"), Text(input["localHash"])!);
+                return new JsonObject { ["effect"] = reading.Effect.Wire(), ["metaHash"] = reading.MetaHash };
             },
 
             ["setup-merge/merges"] = input =>
@@ -254,6 +298,12 @@ public class VectorTests
 
     private static IReadOnlyList<string> Strings(JsonNode? node) =>
         node is JsonArray items ? items.Select(item => item!.GetValue<string>()).ToList() : Array.Empty<string>();
+
+    /// A status's `controller`, or a filed `config meta` answer, read the way the app reads one.
+    private static ControllerMark? Mark(JsonNode? node) => node is JsonObject ? ControllerMark.From(Value.Parse(node.ToJsonString())) : null;
+
+    private static IReadOnlyDictionary<string, ControllerMark> Filed(JsonNode? node) =>
+        (node as JsonObject ?? new JsonObject()).ToDictionary(entry => entry.Key, entry => Mark(entry.Value)!, StringComparer.Ordinal);
 
     private static string? Text(JsonNode? node) => node?.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() : null;
 

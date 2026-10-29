@@ -265,6 +265,10 @@ public static class Runner
             output.WriteLine($"{id,-16} {outcome.Sentence_}");
             if (outcome is ReconcileOutcome.NeedsDecision) worst = Math.Max(worst, Failed);
             if (outcome is ReconcileOutcome.Failed) worst = Math.Max(worst, Failed);
+            // A machine that refused the document as invalid will not take it until somebody
+            // fixes it. One that takes it only from an administrator key is waiting for a peer,
+            // which is how a restricted device is meant to work.
+            if (outcome is ReconcileOutcome.Withheld { Sharing: SetupSharing.Refused }) worst = Math.Max(worst, Failed);
         }
         if (app.Config.Document is { } document)
         {
@@ -306,19 +310,33 @@ public static class Runner
                 return Failed;
             }
             await machine.RefreshAsync(token);
+            // The decision acts on the document read now, verified, and only while the setup here
+            // is still the one it was compared with. --hash names the machine's document the
+            // person decided about, and nothing else is taken.
+            var (session, sessionProblem) = await app.Reconciler.PrepareMergeAsync(machine, token);
+            if (session is null)
+            {
+                output.WriteLine(sessionProblem);
+                return Failed;
+            }
+            if (line.Value("hash") is { } shown && shown != session.Theirs.Hash)
+            {
+                output.WriteLine($"{machine.Name} holds {session.Theirs.Hash} now, not {shown}. Nothing was changed; read it again with --command setup.");
+                return Failed;
+            }
             var problem = line switch
             {
-                _ when line.Has("take-theirs") => await app.Reconciler.TakeTheirsAsync(machine, token),
-                _ when line.Has("keep-mine") => await app.Reconciler.KeepMineAsync(machine, token),
-                _ when line.Has("merge") => await app.Reconciler.MergeAsync(machine, null, token),
-                _ => await app.Reconciler.ReplaceTheirsAsync(machine, token),
+                _ when line.Has("take-theirs") => await app.Reconciler.TakeTheirsAsync(machine, session, token),
+                _ when line.Has("keep-mine") => await app.Reconciler.KeepMineAsync(machine, session, token),
+                _ when line.Has("merge") => await app.Reconciler.MergeAsync(machine, session, null, token),
+                _ => await app.Reconciler.ReplaceTheirsAsync(machine, session, token),
             };
             if (problem is not null)
             {
                 output.WriteLine(problem);
                 return Failed;
             }
-            output.WriteLine($"Done. This device now holds revision {app.Config.Document?.Identity.RevisionNumber} ({app.Config.Document?.Hash[..12]}).");
+            output.WriteLine($"Done. This device now holds revision {app.Config.Document?.Identity.RevisionNumber} ({(app.Config.Document is { } held ? ReconcileOutcome.Short(held.Hash) : "nothing")}).");
             return Ok;
         }
 

@@ -50,38 +50,41 @@ internal static class Documents
     }
 }
 
-/// Ancestry, which is the only thing that can tell "you are behind" from "we both edited".
+/// Ancestry, which is the only thing that can tell "you are behind" from "we both edited", read
+/// through the rule every client shares (contract section 9.5). The shared vectors pin each rule;
+/// these walk real documents through it.
 public class LineageTests
 {
+    private static Decision Decide(ControllerDocument mine, ControllerDocument? theirs, params ControllerDocument[] filed) =>
+        SetupSync.Decide(LocalHead.Of(mine), 3,
+            theirs is null ? new ControllerMark() : new ControllerMark { Hash = theirs.Hash, Id = theirs.Identity.Id },
+            filed.ToDictionary(document => document.Hash,
+                document => new ControllerMark { Hash = document.Hash, Id = document.Identity.Id, Lineage = document.Identity.Lineage },
+                StringComparer.Ordinal));
+
     [Fact]
     public void TheSameBytesAreTheSameDocument()
     {
         var mine = Documents.Make("setup-a", 5, Array.Empty<string>());
-        Assert.Equal(Descent.Same, SetupLineage.Decide(mine.Hash, mine.Identity, mine.Hash, mine.Identity));
+        Assert.Equal(SetupDecision.InSync, Decide(mine, mine).Kind);
     }
 
     [Fact]
-    public void AMachineHoldingAnAncestorIsBehind()
+    public void AMachineHoldingAnAncestorIsBehindAndStatusAloneSaysSo()
     {
         var parent = Documents.Make("setup-a", 5, Array.Empty<string>());
         var child = Documents.Make("setup-a", 6, new[] { parent.Hash });
-        Assert.Equal(Descent.TheyAreBehind,
-            SetupLineage.Decide(child.Hash, child.Identity, parent.Hash, parent.Identity));
-        // And status alone is enough to say so, because the ancestor is in my own lineage.
-        Assert.Equal(Descent.TheyAreBehind,
-            SetupLineage.DecideFromStatus(child.Hash, child.Identity, parent.Hash));
+        Assert.Equal(new Decision(SetupDecision.Push, "machine-behind"), Decide(child, parent));
     }
 
     [Fact]
-    public void AMachineHoldingADescendantMeansThisDeviceIsBehind()
+    public void AMachineHoldingADescendantIsFetchedFromOnceItsLineageIsRead()
     {
         var parent = Documents.Make("setup-a", 5, Array.Empty<string>());
         var child = Documents.Make("setup-a", 6, new[] { parent.Hash });
-        Assert.Equal(Descent.IAmBehind,
-            SetupLineage.Decide(parent.Hash, parent.Identity, child.Hash, child.Identity));
-        // Status cannot say that on its own: my lineage does not mention the child.
-        Assert.Equal(Descent.Unknown,
-            SetupLineage.DecideFromStatus(parent.Hash, parent.Identity, child.Hash));
+        // Status cannot say that on its own: this device's lineage does not mention the child.
+        Assert.Equal(SetupDecision.ReadMeta, Decide(parent, child).Kind);
+        Assert.Equal(new Decision(SetupDecision.Fetch, Expect: child.Hash), Decide(parent, child, child));
     }
 
     [Fact]
@@ -92,26 +95,28 @@ public class LineageTests
         var mine = Documents.Make("setup-a", 6, new[] { parent.Hash }, "Beacon one");
         var theirs = Documents.Make("setup-a", 6, new[] { parent.Hash }, "Beacon two");
         Assert.NotEqual(mine.Hash, theirs.Hash);
-        Assert.Equal(6, mine.Identity.RevisionNumber);
-        Assert.Equal(6, theirs.Identity.RevisionNumber);
-        Assert.Equal(Descent.Diverged, SetupLineage.Decide(mine.Hash, mine.Identity, theirs.Hash, theirs.Identity));
+        Assert.Equal(SetupDecision.Diverged, Decide(mine, theirs, theirs).Kind);
     }
 
     [Fact]
-    public void TwoDifferentSetupsAreNeverOrdered()
+    public void TwoDifferentSetupsAreNeverOrderedEvenWhenOneHashIsAnAncestor()
     {
         var mine = Documents.Make("setup-a", 9, Array.Empty<string>());
         var theirs = Documents.Make("setup-b", 2, Array.Empty<string>());
-        Assert.Equal(Descent.DifferentSetup, SetupLineage.Decide(mine.Hash, mine.Identity, theirs.Hash, theirs.Identity));
+        Assert.Equal(SetupDecision.DifferentSetup, Decide(mine, theirs).Kind);
+        // Pushing over another setup would replace somebody else's fleet, whatever the lineage says.
+        var child = Documents.Make("setup-a", 10, new[] { theirs.Hash });
+        Assert.Equal(SetupDecision.DifferentSetup, Decide(child, theirs).Kind);
     }
 
     [Fact]
-    public void AMachineHoldingNothingOrALegacyCopyIsSafeToPublishTo()
+    public void AMachineHoldingNothingOrACopyNobodyClaimsIsPublishedTo()
     {
         var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
-        Assert.Equal(Descent.TheyHaveNothing, SetupLineage.Decide(mine.Hash, mine.Identity, null, null));
-        Assert.Equal(Descent.TheyHaveNothing,
-            SetupLineage.Decide(mine.Hash, mine.Identity, "0".PadLeft(64, '0'), new ControllerIdentity()));
+        Assert.Equal(new Decision(SetupDecision.Push, "machine-empty"), Decide(mine, null));
+        Assert.Equal(new Decision(SetupDecision.Push, "machine-unidentified"),
+            SetupSync.Decide(LocalHead.Of(mine), 3, new ControllerMark { Hash = "0".PadLeft(64, '0') },
+                new Dictionary<string, ControllerMark>()));
     }
 
     [Fact]
@@ -146,15 +151,14 @@ public class LineageTests
     {
         var mine = Documents.Make("setup-a", 6, new[] { "1".PadLeft(64, '1') });
         var theirs = Documents.Make("setup-a", 7, new[] { "2".PadLeft(64, '2') }, "other");
-        var merged = ControllerIdentity.Merged(mine.Identity, mine.Hash, theirs.Identity, theirs.Hash, "device");
-        Assert.Equal(8, merged.RevisionNumber);
-        Assert.Contains(mine.Hash, merged.Lineage);
-        Assert.Contains(theirs.Hash, merged.Lineage);
+        var lineage = SetupSync.MergedLineage(mine.Hash, theirs.Hash, mine.Identity.Lineage, theirs.Identity.Lineage);
+        Assert.Equal(new[] { mine.Hash, theirs.Hash, "1".PadLeft(64, '1'), "2".PadLeft(64, '2') }, lineage);
         // So both sides fast-forward to it rather than either being overwritten.
-        Assert.Equal(Descent.TheyAreBehind,
-            SetupLineage.Decide("merged", merged, mine.Hash, mine.Identity));
-        Assert.Equal(Descent.TheyAreBehind,
-            SetupLineage.Decide("merged", merged, theirs.Hash, theirs.Identity));
+        var merged = new LocalHead("merged", "setup-a", lineage);
+        Assert.Equal(new Decision(SetupDecision.Push, "machine-behind"),
+            SetupSync.Decide(merged, 3, new ControllerMark { Hash = mine.Hash, Id = "setup-a" }, new Dictionary<string, ControllerMark>()));
+        Assert.Equal(new Decision(SetupDecision.Push, "machine-behind"),
+            SetupSync.Decide(merged, 3, new ControllerMark { Hash = theirs.Hash, Id = "setup-a" }, new Dictionary<string, ControllerMark>()));
     }
 
     [Fact]
@@ -438,6 +442,7 @@ public class ConfigStoreTests
         Assert.True(store.IsPendingEdit);
         Assert.Equal(first.Hash, store.Document!.Hash);
         Assert.Contains("written twice", store.Problem);
+        Assert.IsType<ApplyResult.HeadMoved>(store.ApplyIfCurrent(Documents.Make("setup-a", 5, new[] { first.Hash }), first.Hash, "adopted"));
 
         // Fixed, it is an ordinary hand edit of the setup before it.
         File.WriteAllText(home.ConfigPath, first.Text.Replace("\"name\": \"Beacon\"", "\"name\": \"Other\""));
@@ -445,6 +450,29 @@ public class ConfigStoreTests
         Assert.False(store.IsPendingEdit);
         Assert.Equal(5, store.Document!.Identity.RevisionNumber);
         Assert.Equal(first.Hash, store.Document.Identity.Lineage[0]);
+    }
+
+    [Fact]
+    public void ApplyingIsACompareAndSwapAgainstTheFileItself()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        File.WriteAllBytes(home.ConfigPath, mine.Bytes);
+        using var store = new ConfigStore(home.ConfigPath, watch: false);
+        var theirs = Documents.Make("setup-a", 4, new[] { mine.Hash }, "Theirs");
+
+        // Chosen against another head, or bytes that are not the ones that were verified.
+        Assert.IsType<ApplyResult.HeadMoved>(store.ApplyIfCurrent(theirs, "0".PadLeft(64, '0'), "adopted"));
+        Assert.IsType<ApplyResult.Refused>(store.ApplyIfCurrent(theirs, mine.Hash, "adopted", expectedHash: mine.Hash));
+
+        // A file half way through being saved is an edit in progress, not the head to replace.
+        File.WriteAllText(home.ConfigPath, "{ \"version\": 1, \"machines\": [");
+        Assert.IsType<ApplyResult.HeadMoved>(store.ApplyIfCurrent(theirs, mine.Hash, "adopted"));
+        Assert.Equal("{ \"version\": 1, \"machines\": [", File.ReadAllText(home.ConfigPath));
+
+        File.WriteAllBytes(home.ConfigPath, mine.Bytes);
+        Assert.IsType<ApplyResult.Applied>(store.ApplyIfCurrent(theirs, mine.Hash, "adopted", expectedHash: theirs.Hash));
+        Assert.Equal(theirs.Bytes, File.ReadAllBytes(home.ConfigPath));
     }
 
     [Fact]

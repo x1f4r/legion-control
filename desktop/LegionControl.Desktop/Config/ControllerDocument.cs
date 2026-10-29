@@ -63,6 +63,13 @@ public abstract record SetupSharing
     public sealed record Diverged(string Sentence) : SetupSharing;
     /// A different setup altogether. Neither is an older copy of the other.
     public sealed record DifferentSetup(string Sentence) : SetupSharing;
+    /// The machine refused this revision because this device's key is restricted there and the
+    /// revision carries a launch value the machine does not hold. It is not sent again: an
+    /// unrestricted peer publishes it on its next reading, or a person asks once one has.
+    public sealed record AwaitingFullAccess(string Sentence) : SetupSharing;
+    /// The machine refused this revision as a document it will not store, in its own words. It is
+    /// not sent again until the setup here changes or a person asks.
+    public sealed record Refused(string Sentence) : SetupSharing;
     /// Nothing to say: not read yet, or nothing usable to share.
     public sealed record Unknown : SetupSharing;
 
@@ -71,6 +78,8 @@ public abstract record SetupSharing
         Failed failed => failed.Sentence,
         Diverged diverged => diverged.Sentence,
         DifferentSetup different => different.Sentence,
+        AwaitingFullAccess waiting => waiting.Sentence,
+        Refused refused => refused.Sentence,
         UpToDate => "up to date",
         JustShared => "sent, waiting for the next reading",
         Unsupported => "this agent cannot carry the setup",

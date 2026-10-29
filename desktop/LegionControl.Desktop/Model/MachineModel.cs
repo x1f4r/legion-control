@@ -694,23 +694,27 @@ public sealed class MachineModel
 
     // MARK: the setup
 
-    /// Where this machine stands against the document this device holds, from the status alone.
+    /// Where this machine stands against the document this device holds, from the status and
+    /// what is filed about the hash it reports (contract section 9.5).
     ///
-    /// Status carries a hash and no lineage, so this can only ever say three things for certain:
-    /// the same, the machine holds nothing, or the machine holds something this document descends
-    /// from. Anything else needs [ReadSetupMetaAsync], which costs a round trip and is only spent
-    /// when it is the only way to tell "behind" from "diverged".
+    /// Status carries a hash and no lineage, so without [SetupMeta] for that hash this can only say
+    /// the same, behind, or another setup; anything else is [SetupSharing.Unknown] until a
+    /// reconciliation has read the machine's lineage.
     public SetupSharing EvaluateSharing(ControllerDocument? document)
     {
-        if (Status is null || document is null) return new SetupSharing.Unknown();
-        if (!Capabilities.SupportsSetupLineage && Status.Controller is null) return new SetupSharing.Unsupported();
-
-        var mark = Status.Controller;
-        return SetupLineage.DecideFromStatus(document.Hash, document.Identity, mark?.Hash) switch
+        if (Status is not { } status || document is null) return new SetupSharing.Unknown();
+        var filed = SetupMeta is { Hash: { } hash } meta
+            ? new Dictionary<string, ControllerMark>(StringComparer.Ordinal) { [hash] = meta }
+            : new Dictionary<string, ControllerMark>(StringComparer.Ordinal);
+        var decision = SetupSync.Decide(LocalHead.Of(document), status.ContractVersion, status.Controller, filed);
+        return decision.Kind switch
         {
-            Descent.Same => new SetupSharing.UpToDate(),
-            Descent.TheyHaveNothing => new SetupSharing.Behind(),
-            Descent.TheyAreBehind => new SetupSharing.Behind(),
+            SetupDecision.Unsupported => new SetupSharing.Unsupported(),
+            SetupDecision.InSync => new SetupSharing.UpToDate(),
+            SetupDecision.Push => new SetupSharing.Behind(),
+            SetupDecision.Fetch => new SetupSharing.Ahead(),
+            SetupDecision.DifferentSetup => new SetupSharing.DifferentSetup($"{Name} holds a different setup."),
+            SetupDecision.Diverged => new SetupSharing.Diverged($"{Name} and this device have both changed the setup."),
             _ => new SetupSharing.Unknown(),
         };
     }
@@ -741,46 +745,29 @@ public sealed class MachineModel
         Changed?.Invoke();
     }
 
-    /// Hands this machine the document.
+    /// Hands this machine the document, and returns the reply exactly as it came; null when none
+    /// was read, with what went wrong. What the reply means is contract section 9.5's to say
+    /// ([SetupSync.AfterPush]), not this method's.
     ///
     /// `replace` is only ever true after a person answered the "different setup" question in front
     /// of a preview. Nothing in this app sends it on its own initiative.
-    public async Task<SetupSharing> PushSetupAsync(
+    public async Task<(ConfigReply? Reply, string? Problem)> PushSetupAsync(
         ControllerDocument document, bool replace = false, CancellationToken cancellationToken = default)
     {
         try
         {
             var reply = await NewAgent().WriteConfigAsync(document, replace, Capabilities, PreferredSystem(), null,
                 cancellationToken);
-            var result = reply.Value;
-            if (result.Envelope.Ok == false)
-            {
-                var code = result.Envelope.ReasonCode;
-                var sentence = result.Envelope.Sentence() ?? "The machine refused the document.";
-                Sharing = code switch
-                {
-                    // Behind: the machine holds something this document descends from the other way
-                    // round. The next poll fetches it.
-                    ReasonCode.StaleRevision => new SetupSharing.Ahead(),
-                    ReasonCode.ControllerConflict when result.Divergent => new SetupSharing.Diverged(sentence),
-                    ReasonCode.ControllerConflict => new SetupSharing.DifferentSetup(sentence),
-                    _ => new SetupSharing.Failed(sentence),
-                };
-                SetupMeta = result.Current ?? SetupMeta;
-                Changed?.Invoke();
-                return Sharing;
-            }
-            // `noop` means the machine already held exactly these bytes, which is what an
-            // idempotent retry after a cut link looks like. It is a success.
-            Sharing = result.Action == "noop" ? new SetupSharing.UpToDate() : new SetupSharing.JustShared();
-            Changed?.Invoke();
-            return Sharing;
+            if (reply.Value.Current is { } current) SetupMeta = current;
+            return (reply.Value, null);
         }
         catch (AgentFailure failure)
         {
-            Sharing = new SetupSharing.Failed(failure.Sentence(Name));
-            Changed?.Invoke();
-            return Sharing;
+            return (null, failure.Sentence(Name));
+        }
+        catch (CommandSurface.InvalidArgument refused)
+        {
+            return (null, refused.Message);
         }
     }
 

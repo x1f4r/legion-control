@@ -556,10 +556,11 @@ public class LaunchGateTests
             LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/srv/theirs/bin/launcher.mjs");
         });
         tower.Held = theirs;
-        await app.Machine("tower")!.RefreshAsync();
-        Assert.Null(await app.Reconciler.MergeAsync(app.Machine("tower")!, null));
-        Assert.Null(await app.Reconciler.KeepMineAsync(app.Machine("tower")!));
-        Assert.Null(await app.Reconciler.TakeTheirsAsync(app.Machine("tower")!));
+        var machine = app.Machine("tower")!;
+        await machine.RefreshAsync();
+        Assert.Null(await app.Reconciler.MergeAsync(machine, (await app.Reconciler.PrepareMergeAsync(machine)).Session!, null));
+        Assert.Null(await app.Reconciler.KeepMineAsync(machine, (await app.Reconciler.PrepareMergeAsync(machine)).Session!));
+        Assert.Null(await app.Reconciler.TakeTheirsAsync(machine, (await app.Reconciler.PrepareMergeAsync(machine)).Session!));
         Assert.Equal(theirs.Hash, app.Config.Document!.Hash);
         Assert.NotEqual(mine.Hash, theirs.Hash);
         Assert.Equal(afterEdit, Record(home, "laptop").ToJsonString());

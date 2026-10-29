@@ -581,6 +581,11 @@ public sealed class MainWindow : Window
                 _content.Children.Add(Ui.Actions(
                     Ui.Action("Sort this out", () => Diverged(machine, outcome))));
             }
+            if (outcome is ReconcileOutcome.Withheld)
+            {
+                _content.Children.Add(Ui.Actions(
+                    Ui.Action("Try again", () => TryAgain(machine))));
+            }
         }
     }
 
@@ -808,26 +813,33 @@ public sealed class MainWindow : Window
     private async void Diverged(MachineModel machine, ReconcileOutcome outcome)
     {
         if (outcome is not ReconcileOutcome.NeedsDecision decision) return;
-        var (differences, problem) = await _app.Reconciler.PrepareMergeAsync(machine);
-        if (problem is not null)
+        // The screen is built from the machine's verified document, and every answer acts on
+        // exactly what it showed, only while the setup here is still the one it was built from.
+        var (session, problem) = await _app.Reconciler.PrepareMergeAsync(machine);
+        if (session is null)
         {
-            Sheets.Text(this, "The setup", problem);
+            Sheets.Text(this, "The setup", problem ?? "The machine's setup could not be read.");
             return;
         }
-        var answer = await Sheets.DivergenceAsync(this, machine.Name,
-            decision.Sharing.Sentence_ ?? "The two copies differ.", differences, decision.Sharing is SetupSharing.DifferentSetup);
+        var answer = await Sheets.DivergenceAsync(this, machine.Name, decision.Sharing.Sentence_ ?? "The two copies differ.", session);
         if (answer is null) return;
 
         var result = answer.Choice switch
         {
-            "merge" => await _app.Reconciler.MergeAsync(machine, answer.PerEntry),
-            "keep-mine" => await _app.Reconciler.KeepMineAsync(machine),
-            "take-theirs" => await _app.Reconciler.TakeTheirsAsync(machine),
-            "replace-theirs" => await _app.Reconciler.ReplaceTheirsAsync(machine),
+            "merge" => await _app.Reconciler.MergeAsync(machine, session, answer.PerEntry),
+            "keep-mine" => await _app.Reconciler.KeepMineAsync(machine, session),
+            "take-theirs" => await _app.Reconciler.TakeTheirsAsync(machine, session),
+            "replace-theirs" => await _app.Reconciler.ReplaceTheirsAsync(machine, session),
             _ => "Nothing was done.",
         };
         if (result is not null) Sheets.Text(this, "The setup", result);
         await _app.RefreshAllAsync();
+    }
+
+    private async void TryAgain(MachineModel machine)
+    {
+        await _app.Reconciler.TryAgainAsync(machine);
+        Rebuild();
     }
 
     private async void CheckForUpdate()

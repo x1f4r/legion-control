@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using LegionControl.Desktop.Contract;
 
 namespace LegionControl.Desktop.Config;
@@ -317,20 +316,6 @@ public sealed class ConfigStore : IDisposable
         return block;
     }
 
-    /// The same block for an editor that works on a System.Text.Json tree.
-    internal static JsonObject IdentityJson(ControllerIdentity identity, JsonObject? original = null)
-    {
-        var block = original?.DeepClone() as JsonObject ?? new JsonObject();
-        block["id"] = identity.Id;
-        block["revision"] = identity.RevisionNumber;
-        block["updatedAt"] = identity.UpdatedAt ?? DateTimeOffset.UtcNow.ToString("o");
-        block["source"] = identity.Source ?? ControllerIdentity.ThisSource;
-        if (identity.Name is not null) block["name"] = identity.Name;
-        if (identity.Device is not null) block["device"] = identity.Device;
-        block["lineage"] = new JsonArray(identity.Lineage.Select(hash => (JsonNode)hash!).ToArray());
-        return block;
-    }
-
     /// Applies a document this device was handed by a machine, or the result of a merge.
     ///
     /// The document being replaced goes into the ledger first, because adopting is the one action
@@ -340,15 +325,59 @@ public sealed class ConfigStore : IDisposable
         lock (_gate) return ApplyCore(document, description);
     }
 
-    /// Refuses a fetched revision if an edit or another peer changed the local head while the
-    /// network request was in flight. The next poll compares the new branches from scratch.
-    public string? ApplyIfCurrent(ControllerDocument document, string expectedHash, string description)
+    /// Applies [document] only while the setup here is still [expectedHead], the document the
+    /// decision to apply it was made from (null for none): adopting is a compare-and-swap
+    /// (contract section 9.5). The head is read again from the file at the moment of writing, so an
+    /// edit saved while a peer was being read, or a file half way through being saved, is never
+    /// replaced by bytes that were chosen against the document before it. The next reading decides
+    /// from the new head.
+    ///
+    /// [expectedHash], when given, binds the write to the hash that was verified: the bytes stored
+    /// are exactly the ones that hash to it, canonicalised and never re-serialised.
+    public ApplyResult ApplyIfCurrent(ControllerDocument document, string? expectedHead, string description, string? expectedHash = null)
     {
         lock (_gate)
         {
-            ReloadIfChanged();
-            if (Document?.Hash != expectedHash) return "The local setup changed while reading the peer. Nothing was replaced; compare again.";
-            return ApplyCore(document, description);
+            if (expectedHash is not null && document.Hash != expectedHash)
+                return new ApplyResult.Refused($"These bytes hash to {document.Hash}, not to the {expectedHash} that was checked. Nothing was replaced ({description}).");
+            if (Signature(Path) != _lastSignature) LoadCore();
+            if (IsPendingEdit || DiskHash() != Document?.Hash || Document?.Hash != expectedHead)
+                return new ApplyResult.HeadMoved(Document?.Hash);
+            return ApplyCore(document, description) is { } problem
+                ? new ApplyResult.Refused(problem)
+                : new ApplyResult.Applied(document.Hash);
+        }
+    }
+
+    /// The applied hash read again from storage now: what a fetch decided against has to still be
+    /// the head when its bytes arrive (contract section 9.5, admission row a). Null while the file
+    /// holds anything other than the applied document, so an edit being saved always reads as a
+    /// head that moved.
+    public string? CurrentHead()
+    {
+        lock (_gate)
+        {
+            if (Signature(Path) != _lastSignature) LoadCore();
+            if (IsPendingEdit || Document is not { } document) return null;
+            return DiskHash() == document.Hash ? document.Hash : null;
+        }
+    }
+
+    /// Why a document was not applied over the setup it was chosen against.
+    public const string HeadMovedSentence =
+        "The setup here changed while this was being decided. Nothing was replaced; the next reading compares again.";
+
+    /// The hash of what the file holds now, read from the disk rather than from what this store
+    /// last loaded; null when there is no file or it is no document.
+    private string? DiskHash()
+    {
+        try
+        {
+            return File.Exists(Path) ? Canonical.Hash(File.ReadAllBytes(Path)) : null;
+        }
+        catch (Exception)
+        {
+            return null;
         }
     }
 
@@ -523,6 +552,26 @@ public sealed class ConfigStore : IDisposable
         _watcher?.Dispose();
         _watcher = null;
     }
+}
+
+/// What came of applying a document over the setup it was chosen against.
+public abstract record ApplyResult
+{
+    /// It is the setup here now.
+    public sealed record Applied(string Hash) : ApplyResult;
+    /// The setup here is no longer the one the document was chosen against, so nothing was
+    /// written. [Current] is the hash it holds now.
+    public sealed record HeadMoved(string? Current) : ApplyResult;
+    /// It could not be applied, in the words of what has to change.
+    public sealed record Refused(string Sentence) : ApplyResult;
+
+    /// What a person is told when it did not apply, or null when it did.
+    public string? Problem => this switch
+    {
+        HeadMoved => ConfigStore.HeadMovedSentence,
+        Refused refused => refused.Sentence,
+        _ => null,
+    };
 }
 
 /// What this device last applied. Remembered so that a file that changed underneath can be told

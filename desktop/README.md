@@ -79,9 +79,16 @@ when it descends from the one that machine already holds. So:
 
 `--command setup` shows where each machine stands. `--reconcile-once` does one pass.
 `--command setup --machine ID --merge | --keep-mine | --take-theirs | --replace-theirs` are the four
-answers, and none of them happens on its own. Merging keeps both sides: entries only one device
-changed are taken from that device, and entries both changed are the only ones anybody is asked
-about.
+answers, and none of them happens on its own. Each acts on the machine's document as it is read
+then, verified against its hash, and only while this device's setup is still the one it was compared
+with; `--hash HASH` adds that the machine's document is still the one you looked at. Merging keeps
+both sides: entries only one device changed are taken from that device, and entries both changed,
+or every differing entry when no shared revision is kept here, are the only ones anybody is asked
+about. From the command line those take the machine's side.
+
+A machine that refuses a revision because this device's key is restricted there, or because the
+document breaks one of its rules, is not sent that revision again until the setup here changes or a
+person presses Try again. A device with an administrator key publishes it on its next reading.
 
 A setup file with an error in it is still applied, with the error shown: nothing is published from
 here until it is fixed, and a machine the error is inside is neither reached nor run. A file that is

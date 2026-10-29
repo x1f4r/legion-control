@@ -303,6 +303,37 @@ public class ReconcilerTests
     }
 
     [Fact]
+    public async Task AnUnverifiableDocumentIsNeitherAdoptedNorReadAgainUntilTheAgentChanges()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 4, Array.Empty<string>());
+        var theirs = Unrebuildable(Documents.Make("setup-a", 5, new[] { mine.Hash }, "Beacon from elsewhere"));
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = theirs;
+        fake.SendsRaw = false;
+        fake.AgentVersion = "3.0.1";
+        var reconciler = new Reconciler(store, Bindings.Empty);
+
+        await model.RefreshAsync();
+        var failed = Assert.IsType<ReconcileOutcome.Failed>(await reconciler.ReconcileAsync(model));
+        Assert.Contains("updated", failed.Sentence);
+        Assert.Equal(mine.Hash, store.Document!.Hash);
+        Assert.Equal(1, fake.Reads);
+
+        // Remembered per agent: the same document is not read again on every poll ...
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Failed>(await reconciler.ReconcileAsync(model, now: DateTimeOffset.UtcNow.AddMinutes(5)));
+        Assert.Equal(1, fake.Reads);
+
+        // ... and read again once the agent is one that sends `raw`.
+        fake.AgentVersion = "3.1.0";
+        fake.SendsRaw = true;
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Adopted>(await reconciler.ReconcileAsync(model));
+        Assert.Equal(2, fake.Reads);
+    }
+
+    [Fact]
     public void TheSharedConfigReadFixtureIsAdoptedFromRaw()
     {
         // The reply a 3.1.0 agent sends, exactly as the shared corpus has it: the bytes adopted are
@@ -373,10 +404,17 @@ public class ReconcilerTests
         await model.RefreshAsync();
         await reconciler.ReconcileAsync(model);
 
-        Assert.Null(await reconciler.MergeAsync(model, null));
+        var (session, problem) = await reconciler.PrepareMergeAsync(model);
+        Assert.Null(problem);
+        Assert.Equal(shared.Hash, session!.Base!.Hash);
+        Assert.Null(await reconciler.MergeAsync(model, session, null));
         var merged = store.Document!;
         Assert.Contains(mine.Hash, merged.Identity.Lineage);
         Assert.Contains(theirs.Hash, merged.Identity.Lineage);
+        // Only this device changed `extra`, so it is kept; both changed the name, and theirs is the
+        // default.
+        Assert.Contains("\"extra\": \"mine\"", merged.Text);
+        Assert.Equal("Beacon from there", store.Config!.Machines[0].Name);
 
         await model.RefreshAsync();
         Assert.IsType<ReconcileOutcome.Published>(await reconciler.ReconcileAsync(model));
@@ -397,13 +435,44 @@ public class ReconcilerTests
         await model.RefreshAsync();
         await reconciler.ReconcileAsync(model);
 
-        Assert.Null(await reconciler.KeepMineAsync(model));
+        var (session, _) = await reconciler.PrepareMergeAsync(model);
+        Assert.Null(await reconciler.KeepMineAsync(model, session!));
         Assert.Contains(theirs.Hash, store.Document!.Identity.Lineage);
         Assert.Equal("Beacon from here", store.Config!.Machines[0].Name);
 
         await model.RefreshAsync();
         Assert.IsType<ReconcileOutcome.Published>(await reconciler.ReconcileAsync(model));
         Assert.False(fake.SawReplace);
+    }
+
+    [Fact]
+    public async Task ADecisionActsOnlyOnWhatTheScreenShowedAndOnlyOverTheSetupItWasBuiltFrom()
+    {
+        using var home = new TempHome();
+        var shared = Documents.Make("setup-a", 5, Array.Empty<string>());
+        var mine = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from here");
+        var theirs = Documents.Make("setup-a", 6, new[] { shared.Hash }, "Beacon from there");
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = theirs;
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        var (session, _) = await reconciler.PrepareMergeAsync(model);
+
+        // The machine moves on while the screen is open. Take theirs adopts what was shown, not
+        // what the machine holds now, and sends nothing.
+        fake.Held = Documents.Make("setup-a", 7, new[] { theirs.Hash }, "Beacon moved on");
+        var reads = fake.Reads;
+        Assert.Null(await reconciler.TakeTheirsAsync(model, session!));
+        Assert.Equal(theirs.Hash, store.Document!.Hash);
+        Assert.Equal(reads, fake.Reads);
+
+        // A screen built over a setup that has since changed acts on nothing.
+        var (stale, _) = await reconciler.PrepareMergeAsync(model);
+        store.ApplyEdit(store.Document.Text.Replace("Beacon from there", "Edited meanwhile"));
+        var edited = store.Document!.Hash;
+        Assert.Equal(ConfigStore.HeadMovedSentence, await reconciler.TakeTheirsAsync(model, stale!));
+        Assert.Equal(ConfigStore.HeadMovedSentence, await reconciler.MergeAsync(model, stale!, null));
+        Assert.Equal(edited, store.Document!.Hash);
     }
 
     [Fact]
@@ -421,12 +490,14 @@ public class ReconcilerTests
         Assert.IsType<SetupSharing.DifferentSetup>(decision.Sharing);
         Assert.False(fake.SawReplace);
 
-        // The preview is what a person reads before deciding.
-        var (preview, problem) = await reconciler.PreviewTheirsAsync(model);
+        // The preview is what a person reads before deciding, and a different setup is never merged.
+        var (session, problem) = await reconciler.PrepareMergeAsync(model);
         Assert.Null(problem);
-        Assert.NotNull(preview);
+        Assert.True(session!.DifferentSetup);
+        Assert.False(session.CanMerge);
+        Assert.Contains("Machines changed: pi", session.Preview.Lines());
 
-        Assert.Null(await reconciler.ReplaceTheirsAsync(model));
+        Assert.Null(await reconciler.ReplaceTheirsAsync(model, session));
         Assert.True(fake.SawReplace);
         Assert.Equal(mine.Hash, fake.Held!.Hash);
     }
@@ -443,6 +514,21 @@ public class ReconcilerTests
         await model.RefreshAsync();
         var held = Assert.IsType<ReconcileOutcome.Held>(await reconciler.ReconcileAsync(model));
         Assert.Contains("running", held.Reason);
+        Assert.Empty(fake.Pushes);
+    }
+
+    [Fact]
+    public async Task NothingIsPublishedWhileThisDeviceHasAnActionInFlightThere()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 2, Array.Empty<string>());
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        var (store, model, fake) = Build(home, mine, tracker);
+        tracker.Begin(CommandSurface.NewOperationId(), model.Id, null, new OperationIntent("update", Service: "t3"));
+        var reconciler = new Reconciler(store, Bindings.Empty);
+
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Held>(await reconciler.ReconcileAsync(model));
         Assert.Empty(fake.Pushes);
     }
 
@@ -476,7 +562,98 @@ public class ReconcilerTests
     }
 
     [Fact]
-    public async Task AHandEditDuringFetchCannotBeReplacedByTheFetchedBranch()
+    public async Task ALockedPushWaitsForALaterStatusRatherThanAMinute()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var (store, model, fake) = Build(home, mine);
+        fake.Refusals.Enqueue("config.set.locked");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Held>(await reconciler.ReconcileAsync(model));
+        // The status that was read before the refusal says nothing about after it.
+        Assert.IsType<ReconcileOutcome.Held>(await reconciler.ReconcileAsync(model));
+        Assert.Single(fake.Pushes);
+
+        await Task.Delay(5);
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Published>(await reconciler.ReconcileAsync(model));
+        Assert.Equal(2, fake.Pushes.Count);
+    }
+
+    [Fact]
+    public async Task ARestrictedRefusalIsHeldUntilTheSetupChangesOrAPersonAsks()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var (store, model, fake) = Build(home, mine);
+        for (var index = 0; index < 3; index += 1) fake.Refusals.Enqueue("config.set.restricted-launch");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+
+        await model.RefreshAsync();
+        var withheld = Assert.IsType<ReconcileOutcome.Withheld>(await reconciler.ReconcileAsync(model));
+        Assert.IsType<SetupSharing.AwaitingFullAccess>(withheld.Sharing);
+        Assert.Contains("not restricted", withheld.Sentence_);
+
+        // Not a failure to back off from and come back to: not sent again at all.
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Withheld>(await reconciler.ReconcileAsync(model, now: DateTimeOffset.UtcNow.AddMinutes(5)));
+        Assert.Single(fake.Pushes);
+
+        // A person asks.
+        Assert.IsType<ReconcileOutcome.Withheld>(await reconciler.TryAgainAsync(model));
+        Assert.Equal(2, fake.Pushes.Count);
+
+        // The setup here changes.
+        store.ApplyEdit(store.Document!.Text.Replace("Beacon", "Beacon renamed"));
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Withheld>(await reconciler.ReconcileAsync(model));
+        Assert.Equal(3, fake.Pushes.Count);
+        Assert.Equal(store.Document!.Hash, fake.Pushes[^1]);
+    }
+
+    [Fact]
+    public async Task AnInvalidRefusalIsHeldAndSaysWhatTheMachineFound()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var (store, model, fake) = Build(home, mine);
+        fake.Refusals.Enqueue("config.set.invalid-document");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+
+        await model.RefreshAsync();
+        var withheld = Assert.IsType<ReconcileOutcome.Withheld>(await reconciler.ReconcileAsync(model));
+        Assert.IsType<SetupSharing.Refused>(withheld.Sharing);
+        Assert.Contains("machines[0].endpoints[0].host", withheld.Sentence_);
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Withheld>(await reconciler.ReconcileAsync(model, now: DateTimeOffset.UtcNow.AddMinutes(5)));
+        Assert.Single(fake.Pushes);
+    }
+
+    [Fact]
+    public async Task ASetupWithAnErrorIsNotPublishedButStillFetches()
+    {
+        // The device applies the document with its error shown (applied intake) and publishes
+        // nothing until it is fixed, but it still takes what a peer fixed.
+        using var home = new TempHome();
+        var broken = ControllerDocument.FromText(Documents.Make("setup-a", 3, Array.Empty<string>()).Text
+            .Replace("\"source\": \"desktop\"", "\"source\": \"android\""));
+        var (store, model, fake) = Build(home, broken);
+        Assert.False(store.Acceptance!.Valid);
+        var reconciler = new Reconciler(store, Bindings.Empty);
+
+        await model.RefreshAsync();
+        Assert.Contains("errors", Assert.IsType<ReconcileOutcome.Held>(await reconciler.ReconcileAsync(model)).Reason);
+        Assert.Empty(fake.Pushes);
+
+        fake.Held = Documents.Make("setup-a", 4, new[] { broken.Hash }, "Beacon fixed there");
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Adopted>(await reconciler.ReconcileAsync(model));
+        Assert.True(store.Acceptance!.Valid);
+    }
+
+    [Fact]
+    public async Task AHandEditSavedDuringAFetchStaysAndTheMachineIsThenDivergent()
     {
         using var home = new TempHome();
         var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
@@ -485,9 +662,76 @@ public class ReconcilerTests
         fake.OnRead = () => File.WriteAllText(home.ConfigPath, mine.Text.Replace("Beacon", "Local offline edit"));
         var reconciler = new Reconciler(store, Bindings.Empty);
         await model.RefreshAsync();
-        Assert.IsType<ReconcileOutcome.Failed>(await reconciler.ReconcileAsync(model));
+
+        var decision = Assert.IsType<ReconcileOutcome.NeedsDecision>(await reconciler.ReconcileAsync(model));
+        Assert.IsType<SetupSharing.Diverged>(decision.Sharing);
         Assert.Equal("Local offline edit", store.Config!.Machines[0].Name);
         Assert.Contains(mine.Hash, store.Identity.Lineage);
+    }
+
+    [Fact]
+    public async Task TwoReadsCannotOverwriteANewHead()
+    {
+        // The window and the command line on one device, each fetching from a machine that holds
+        // its own descendant of the setup here. The command line adopts while the window is still
+        // reading; the window's bytes were chosen against the setup before, so they are not
+        // written, and the window decides again from the new head.
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var (window, model, fake) = Build(home, mine);
+        var commandLine = Store(home);
+        var adoptedThere = Documents.Make("setup-a", 4, new[] { mine.Hash }, "From the other machine");
+        fake.Held = Documents.Make("setup-a", 4, new[] { mine.Hash }, "From this machine");
+        fake.OnRead = () =>
+        {
+            fake.OnRead = null;
+            Assert.IsType<ApplyResult.Applied>(commandLine.ApplyIfCurrent(adoptedThere, mine.Hash, "adopted from nas", adoptedThere.Hash));
+        };
+        var reconciler = new Reconciler(window, Bindings.Empty);
+        await model.RefreshAsync();
+
+        var decision = Assert.IsType<ReconcileOutcome.NeedsDecision>(await reconciler.ReconcileAsync(model));
+        Assert.IsType<SetupSharing.Diverged>(decision.Sharing);
+        Assert.Equal(adoptedThere.Hash, window.Document!.Hash);
+        Assert.Equal(adoptedThere.Bytes, File.ReadAllBytes(home.ConfigPath));
+        // An adoption by another process here is no hand edit: it gets no revision of its own.
+        Assert.Equal(4, window.Document.Identity.RevisionNumber);
+    }
+
+    [Fact]
+    public async Task AMachineThatMovesBetweenMetaAndFetchIsDecidedAgain()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var (store, model, fake) = Build(home, mine);
+        var first = Documents.Make("setup-a", 4, new[] { mine.Hash }, "First");
+        var second = Documents.Make("setup-a", 5, new[] { first.Hash, mine.Hash }, "Second");
+        fake.Held = first;
+        fake.OnMeta = () => fake.Held = second;
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+
+        Assert.IsType<ReconcileOutcome.Held>(await reconciler.ReconcileAsync(model));
+        Assert.Equal(mine.Hash, store.Document!.Hash);
+
+        fake.OnMeta = null;
+        await model.RefreshAsync();
+        Assert.IsType<ReconcileOutcome.Adopted>(await reconciler.ReconcileAsync(model));
+        Assert.Equal(second.Hash, store.Document!.Hash);
+    }
+
+    [Fact]
+    public async Task TheOutcomesTheWindowReadsAreASnapshotThatNeverChangesUnderIt()
+    {
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
+        var (store, model, _) = Build(home, mine);
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        var before = reconciler.Outcomes;
+        await reconciler.ReconcileAsync(model);
+        Assert.Empty(before);
+        Assert.IsType<ReconcileOutcome.Published>(reconciler.Outcomes[model.Id]);
     }
 
     [Fact]
@@ -495,11 +739,13 @@ public class ReconcilerTests
     {
         using var home = new TempHome();
         var mine = Documents.Make("setup-a", 3, Array.Empty<string>());
-        var (store, model, fake) = Build(home, mine);
+        var (_, model, fake) = Build(home, mine);
         fake.Held = mine;
         await model.RefreshAsync();
-        var sharing = await model.PushSetupAsync(mine);
-        Assert.IsType<SetupSharing.UpToDate>(sharing);
+        var (reply, problem) = await model.PushSetupAsync(mine);
+        Assert.Null(problem);
+        Assert.Equal("noop", reply!.Action);
+        Assert.Equal(PushEffect.Clear, SetupSync.AfterPush(reply.Json, mine.Hash).Effect);
     }
 
     [Fact]

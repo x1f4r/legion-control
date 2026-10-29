@@ -199,8 +199,9 @@ public static class Sheets
     public sealed record DivergenceAnswer(string Choice, IReadOnlyDictionary<string, SetupChoice> PerEntry);
 
     public static async Task<DivergenceAnswer?> DivergenceAsync(
-        Window owner, string machineName, string sentence, IReadOnlyList<SetupDifference> differences, bool differentSetup = false)
+        Window owner, string machineName, string sentence, MergeSession session)
     {
+        var differentSetup = session.DifferentSetup;
         var dialog = new Window
         {
             Title = $"Two versions of the setup",
@@ -215,12 +216,16 @@ public static class Sheets
         body.Margin = new Thickness(20);
         body.Children.Add(Ui.Title(differentSetup ? $"{machineName} holds a different setup" : $"{machineName} and this device have both been edited"));
         body.Children.Add(Ui.Note(sentence));
+        // Both revisions and who wrote each, so nobody chooses between two hashes.
+        body.Children.Add(Ui.DetailRow("Here", Revision(session.Mine?.Identity)));
+        body.Children.Add(Ui.DetailRow(machineName, Revision(session.Theirs.Identity)));
         body.Children.Add(Ui.Note(differentSetup
             ? "Adopt the machine's setup here or explicitly replace its copy with this device's setup. Review the differences first."
-            : "Merging keeps both sides: every entry only one side changed is taken from that side. The entries below were changed on both, or nothing says which side changed them, so they need an answer."));
+            : session.MergeProblem ?? "Merging keeps both sides: every entry only one side changed is taken from that side. The entries below were changed on both, or nothing says which side changed them, so they need an answer."));
 
         body.Children.Add(Ui.SectionHeading("What differs"));
-        foreach (var difference in differences)
+        foreach (var line in session.Preview.Lines()) body.Children.Add(Ui.Note(line));
+        foreach (var difference in session.Differences)
         {
             var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,auto"), Margin = new Thickness(0, 2, 0, 2) };
             row.Children.Add(new TextBlock
@@ -260,17 +265,17 @@ public static class Sheets
 
         var buttons = new WrapPanel { Margin = new Thickness(0, 16, 0, 0) };
         buttons.Children.Add(Ui.Action("Leave it", () => dialog.Close()));
-        if (!differentSetup) buttons.Children.Add(Ui.Action("Merge", () =>
+        if (session.CanMerge) buttons.Children.Add(Ui.Action("Merge", () =>
         {
             answer = new DivergenceAnswer("merge", choices);
             dialog.Close();
         }));
-        if (!differentSetup) buttons.Children.Add(Ui.Action("Keep mine", () =>
+        if (session.CanMerge) buttons.Children.Add(Ui.Action("Keep mine", () =>
         {
             answer = new DivergenceAnswer("keep-mine", choices);
             dialog.Close();
         }, explanation: "Writes a new revision that descends from both, so the machine accepts it without being forced."));
-        if (differentSetup) buttons.Children.Add(Ui.Action("Replace the machine's copy with mine", () =>
+        if (differentSetup && session.Mine is not null) buttons.Children.Add(Ui.Action("Replace the machine's copy with mine", () =>
         {
             answer = new DivergenceAnswer("replace-theirs", choices);
             dialog.Close();
@@ -286,6 +291,12 @@ public static class Sheets
         await dialog.ShowDialog(owner);
         return answer;
     }
+
+    /// One revision and who wrote it, in one line, with nothing a peer wrote hidden in it.
+    private static string Revision(ControllerIdentity? identity) => identity is null
+        ? "no setup"
+        : $"revision {identity.RevisionNumber}, written by {LaunchGate.Show(identity.Device ?? "?")} ({LaunchGate.Show(identity.Source ?? "?")})"
+          + (identity.UpdatedAt is { } at ? $" at {LaunchGate.Show(at)}" : "");
 
     /// A plain "here is some text" window, for logs, bundles and doctor output.
     public static void Text(Window owner, string title, string text)
