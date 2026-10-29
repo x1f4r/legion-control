@@ -404,16 +404,13 @@ public static class SetupMerge
                 // has it, gone where theirs lacks it, appended where it is new.
                 var machine = MachineIn(result, place.Machine!)!;
                 var fields = (DocumentObject)theirs!;
-                var kept = machine.Members
-                    .Where(member => MachineParts.Contains(member.Key) || fields.Has(member.Key))
-                    .Select(member => MachineParts.Contains(member.Key)
-                        ? member
-                        : new KeyValuePair<string, DocumentValue>(member.Key, fields[member.Key]!.Clone()))
-                    .ToList();
-                machine.Members.Clear();
-                machine.Members.AddRange(kept);
+                foreach (var name in machine.Members.Select(member => member.Key).Where(name => !MachineParts.Contains(name)).ToList())
+                {
+                    if (fields[name] is { } value) machine.Set(name, value.Clone());
+                    else machine.Remove(name);
+                }
                 foreach (var (name, value) in fields.Members)
-                    if (!machine.Has(name)) machine.Members.Add(new(name, value.Clone()));
+                    if (!machine.Has(name)) machine.Set(name, value.Clone());
                 return;
             }
             case Scope.Wake:

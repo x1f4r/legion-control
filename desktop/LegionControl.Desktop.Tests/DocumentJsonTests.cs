@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
 using LegionControl.Desktop.Config;
@@ -37,6 +39,59 @@ public class DocumentJsonTests
         DocumentJson.Read(text, out var repeated);
         Assert.Equal(path, repeated);
         Assert.Throws<DocumentJson.Malformed>(() => DocumentJson.Parse(text));
+    }
+
+    [Fact]
+    public void ARepeatedNameKeepsItsFirstPlaceAndTakesItsLastValue()
+    {
+        // As JSON.parse reads it, which is what section 9.7 holds an applied document to.
+        var value = (DocumentObject)DocumentJson.Read("{\"a\": 1, \"b\": 2, \"a\": 3}", out var repeated);
+        Assert.Equal("a", repeated);
+        Assert.Equal(new[] { "a", "b" }, value.Members.Select(member => member.Key));
+        Assert.Equal("3", ((DocumentNumber)value["a"]!).Lexeme);
+    }
+
+    [Fact]
+    public void ReadsAMegabyteOfNamesInTimeThatGrowsWithTheText()
+    {
+        // Section 9.7 allows any number of names it has never heard of, so a peer can send a
+        // megabyte of them and the agent stores it. The reader looked for a repeated name through
+        // every member read so far: one check of this document took about half a minute, and the
+        // store, the editor and a merge each check a document more than once.
+        var text = Names(115_000);
+        Assert.True(Encoding.UTF8.GetByteCount(text) <= Canonical.MaxDocumentBytes);
+        var watch = Stopwatch.StartNew();
+        var verdict = DocumentAcceptance.Check(text, Intake.Peer);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"one check took {watch.Elapsed}");
+        Assert.True(verdict.Valid, verdict.Sentence);
+
+        // The repeat is still found, and reported where it is, however far into the text.
+        var repeated = text[..^1] + ",\"" + Name(114_999) + "\": 1}";
+        DocumentJson.Read(repeated, out var path);
+        Assert.Equal(Name(114_999), path);
+    }
+
+    /// A valid document with [count] members of its own besides `version` and `machines`, each a
+    /// short name nobody knows with the value 0.
+    internal static string Names(int count)
+    {
+        var text = new StringBuilder("{\"version\":1,\"machines\":[]");
+        for (var index = 0; index < count; index += 1) text.Append(",\"").Append(Name(index)).Append("\":0");
+        return text.Append('}').ToString();
+    }
+
+    /// The [index]th of the shortest names that begin with an underscore, which no name a document
+    /// knows does.
+    internal static string Name(int index)
+    {
+        const string digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        var name = new StringBuilder("_");
+        do
+        {
+            name.Insert(1, digits[index % digits.Length]);
+            index /= digits.Length;
+        } while (index > 0);
+        return name.ToString();
     }
 
     [Fact]

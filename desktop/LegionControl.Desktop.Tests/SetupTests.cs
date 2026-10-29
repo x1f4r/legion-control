@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -744,6 +745,34 @@ public class SetupMergeTests
         Assert.Contains(Canonical.Hash(Encoding.UTF8.GetBytes(theirs)), merged.Identity.Lineage);
         Assert.Equal(2, merged.Identity.RevisionNumber);
         Assert.True(DocumentAcceptance.Check(merged.Bytes, Intake.Peer).Valid);
+    }
+
+    [Fact]
+    public void MergesAMegabyteOfNamesInTimeThatGrowsWithThem()
+    {
+        // Every unknown top-level key is an entry of its own: looked up on three sides, compared,
+        // and taken one by one. Taking one looked through every member of the merged document
+        // before, so taking them all cost the square of their number.
+        const int count = 100_000;
+        var mine = DocumentJsonTests.Names(count).Replace("\"machines\":[]",
+            "\"controller\":{\"id\":\"setup-a\",\"revision\":1,\"lineage\":[]},\"machines\":[]");
+        var root = (DocumentObject)DocumentJson.Parse(mine);
+        for (var index = 0; index < count; index += 1)
+        {
+            if (index % 2 == 0) root.Remove(DocumentJsonTests.Name(index));
+            else root.Set(DocumentJsonTests.Name(index), new DocumentNumber("1"));
+        }
+        var theirs = DocumentJson.Print(root);
+
+        var watch = Stopwatch.StartNew();
+        var result = Merge(mine, theirs, baseText: mine);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5), $"the merge took {watch.Elapsed}");
+        Assert.Equal(count, result.Differences.Count);
+        Assert.All(result.Differences, difference => Assert.Equal(SetupChange.Theirs, difference.Kind));
+        var merged = (DocumentObject)DocumentJson.Parse(result.Text!);
+        Assert.False(merged.Has(DocumentJsonTests.Name(0)));
+        Assert.Equal("1", ((DocumentNumber)merged[DocumentJsonTests.Name(count - 1)]!).Lexeme);
+        Assert.Equal(3 + count / 2, merged.Members.Count);
     }
 
     [Fact]

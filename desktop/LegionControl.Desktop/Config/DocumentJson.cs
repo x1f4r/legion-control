@@ -19,43 +19,50 @@ public abstract class DocumentValue
 
 public sealed class DocumentObject : DocumentValue
 {
-    public List<KeyValuePair<string, DocumentValue>> Members { get; } = new();
+    // The members in the order they were written, and where each name stands. Looking one up,
+    // setting it and taking it out then cost the same in an object of three members as in one of a
+    // hundred thousand: section 9.7 allows any number of names it has never heard of, a peer can
+    // send a megabyte of them, and a merge looks every one of them up on three sides.
+    private readonly LinkedList<KeyValuePair<string, DocumentValue>> _members = new();
+    private readonly Dictionary<string, LinkedListNode<KeyValuePair<string, DocumentValue>>> _byName = new(StringComparer.Ordinal);
 
     public DocumentObject()
     {
     }
 
-    public DocumentObject(IEnumerable<KeyValuePair<string, DocumentValue>> members) => Members.AddRange(members);
-
-    /// The value of the member called [name], or null when there is none.
-    public DocumentValue? this[string name]
+    /// An object of [members] in their order. A name given twice keeps its first place and takes
+    /// its last value, which is how JSON.parse reads one.
+    public DocumentObject(IEnumerable<KeyValuePair<string, DocumentValue>> members)
     {
-        get
-        {
-            foreach (var (key, value) in Members)
-                if (key == name) return value;
-            return null;
-        }
+        foreach (var (name, value) in members) Set(name, value);
     }
 
-    public bool Has(string name) => Members.Any(member => member.Key == name);
+    /// The members in the order they were written.
+    public IReadOnlyCollection<KeyValuePair<string, DocumentValue>> Members => _members;
+
+    /// The value of the member called [name], or null when there is none.
+    public DocumentValue? this[string name] => _byName.TryGetValue(name, out var member) ? member.Value.Value : null;
+
+    public bool Has(string name) => _byName.ContainsKey(name);
 
     /// Sets a member where it stands, or appends it when the object has none of that name.
     public void Set(string name, DocumentValue value)
     {
-        var index = Members.FindIndex(member => member.Key == name);
-        if (index >= 0) Members[index] = new(name, value);
-        else Members.Add(new(name, value));
+        if (_byName.TryGetValue(name, out var member)) member.Value = new(name, value);
+        else _byName[name] = _members.AddLast(new KeyValuePair<string, DocumentValue>(name, value));
     }
 
     public void Remove(string name)
     {
-        var index = Members.FindIndex(member => member.Key == name);
-        if (index >= 0) Members.RemoveAt(index);
+        if (_byName.Remove(name, out var member)) _members.Remove(member);
     }
 
-    public override DocumentValue Clone() =>
-        new DocumentObject(Members.Select(member => new KeyValuePair<string, DocumentValue>(member.Key, member.Value.Clone())));
+    public override DocumentValue Clone()
+    {
+        var copy = new DocumentObject();
+        foreach (var (name, value) in _members) copy.Set(name, value.Clone());
+        return copy;
+    }
 }
 
 public sealed class DocumentArray : DocumentValue
@@ -239,11 +246,13 @@ public static class DocumentJson
                 return;
             case DocumentObject members:
                 output.Append("{\n");
-                for (var index = 0; index < members.Members.Count; index += 1)
+                var first = true;
+                foreach (var (name, member) in members.Members)
                 {
-                    if (index > 0) output.Append(",\n");
-                    output.Append(inner).Append(Quote(members.Members[index].Key)).Append(": ");
-                    PrintTo(output, members.Members[index].Value, inner);
+                    if (!first) output.Append(",\n");
+                    first = false;
+                    output.Append(inner).Append(Quote(name)).Append(": ");
+                    PrintTo(output, member, inner);
                 }
                 output.Append('\n').Append(indent).Append('}');
                 return;
@@ -277,6 +286,11 @@ public static class DocumentJson
     /// A recursive descent over the JSON grammar and nothing more: no comments, no trailing comma,
     /// no byte order mark, the four whitespace characters only. That is what the agent and the
     /// other clients parse, so a looser reader here would accept documents they refuse.
+    ///
+    /// It reads in time that grows with the text and nothing else, because what it reads comes from
+    /// peers: a repeated name is found through the object's own index of its names, never by
+    /// looking through the members read so far, and a path is spelled out only for the member it
+    /// is reported for.
     private sealed class Reader(string text)
     {
         private const string HexDigits = "0123456789abcdefABCDEF";
@@ -287,10 +301,34 @@ public static class DocumentJson
 
         public DocumentValue Document()
         {
-            var value = Value("", 1);
+            var value = Value(null, null, -1, 1);
             Space();
             if (_at != text.Length) throw Error("text after the JSON value");
             return value;
+        }
+
+        /// Where an object or an array stands, as the way back to the root: the member name it is
+        /// under, or its index in the array it is in. Spelling the path out for every value read
+        /// would cost the depth of the document once per value.
+        private sealed record Place(Place? Parent, string? Name, int Index)
+        {
+            /// The path of a member of this place, in the form contract section 9.7 reports it:
+            /// `machines[0].wake`.
+            public string PathOf(string member)
+            {
+                var steps = new Stack<Place>();
+                for (var place = this; place.Parent is not null; place = place.Parent) steps.Push(place);
+                var path = new StringBuilder();
+                foreach (var step in steps)
+                {
+                    if (step.Name is { } name) Join(path, name);
+                    else path.Append('[').Append(step.Index.ToString(CultureInfo.InvariantCulture)).Append(']');
+                }
+                return Join(path, member).ToString();
+            }
+
+            private static StringBuilder Join(StringBuilder path, string name) =>
+                (path.Length == 0 ? path : path.Append('.')).Append(name);
         }
 
         private Malformed Error(string what) => new($"{what} at offset {_at}");
@@ -300,14 +338,15 @@ public static class DocumentJson
             while (_at < text.Length && text[_at] is ' ' or '\t' or '\n' or '\r') _at += 1;
         }
 
-        private DocumentValue Value(string path, int depth)
+        /// One value, the member [name] or the item [index] of [parent]; the root has neither.
+        private DocumentValue Value(Place? parent, string? name, int index, int depth)
         {
             Space();
             if (_at >= text.Length) throw Error("a JSON value was expected");
             var character = text[_at];
             if (character is '{' or '[' && depth > MaxDepth) throw Error($"nesting deeper than {MaxDepth} levels");
-            if (character == '{') return Object(path, depth);
-            if (character == '[') return Array(path, depth);
+            if (character == '{') return Object(new Place(parent, name, index), depth);
+            if (character == '[') return Array(new Place(parent, name, index), depth);
             if (character == '"') return new DocumentString(String());
             if (Word("true")) return DocumentLiteral.True;
             if (Word("false")) return DocumentLiteral.False;
@@ -322,7 +361,7 @@ public static class DocumentJson
             return true;
         }
 
-        private DocumentObject Object(string path, int depth)
+        private DocumentObject Object(Place at, int depth)
         {
             _at += 1;
             var result = new DocumentObject();
@@ -340,14 +379,11 @@ public static class DocumentJson
                 Space();
                 if (_at >= text.Length || text[_at] != ':') throw Error("a colon was expected");
                 _at += 1;
-                var childPath = path.Length == 0 ? name : $"{path}.{name}";
                 // A repeat is noted where its name is read, before its value, so the first one in
-                // the text is the one reported even when the value holds another.
-                var index = result.Members.FindIndex(member => member.Key == name);
-                if (index >= 0) Repeated ??= childPath;
-                var value = Value(childPath, depth + 1);
-                if (index >= 0) result.Members[index] = new(name, value);
-                else result.Members.Add(new(name, value));
+                // the text is the one reported even when the value holds another. Setting it keeps
+                // its first place and takes its last value.
+                if (Repeated is null && result.Has(name)) Repeated = at.PathOf(name);
+                result.Set(name, Value(at, name, -1, depth + 1));
                 Space();
                 if (_at < text.Length && text[_at] == ',')
                 {
@@ -363,7 +399,7 @@ public static class DocumentJson
             }
         }
 
-        private DocumentArray Array(string path, int depth)
+        private DocumentArray Array(Place at, int depth)
         {
             _at += 1;
             var result = new DocumentArray();
@@ -375,7 +411,7 @@ public static class DocumentJson
             }
             while (true)
             {
-                result.Items.Add(Value($"{path}[{result.Items.Count}]", depth + 1));
+                result.Items.Add(Value(at, null, result.Items.Count, depth + 1));
                 Space();
                 if (_at < text.Length && text[_at] == ',')
                 {
