@@ -878,6 +878,6 @@ struct LaunchGateTests {
         #expect(CommandArguments.parse("[]") == nil)
         #expect(CommandArguments.parse(#"["node", "/a\u202Eb.mjs"]"#) == nil)
         #expect(CommandArguments.parse(#"["node", "/a\u200Bb.mjs"]"#) == nil)
-        #expect(CommandArguments.parse(#"["node", "/Users/My Name/b.mjs"]"#) == ["node", "/Users/My Name/b.mjs"])
+        #expect(CommandArguments.parse(#"["node", "/Users/me/My Tools/b.mjs"]"#) == ["node", "/Users/me/My Tools/b.mjs"])
     }
 }

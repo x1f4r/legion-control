@@ -82,7 +82,8 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         self.remembered = remembered
     }
 
-    /// For the tests: a model whose transport never launches a process.
+    /// A model with its transport handed in. The app passes the one its factory builds for the
+    /// machine; the tests pass one that never launches a process.
     init(machine: Machine, agent: RemoteAgent, remembered: RememberedSettings = .inMemory()) {
         self.machine = machine
         self.agent = agent

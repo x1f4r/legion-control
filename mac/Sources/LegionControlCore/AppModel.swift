@@ -355,7 +355,9 @@ final class AppModel {
     ///
     /// It approves nothing. Only the controller block changes, so no launch value changed, and a
     /// document without an id is not always this person's own: a peer's copy with lineage but no
-    /// id is fetched like any other, and giving it an id must not make what it runs approved.
+    /// id is fetched like any other, and giving it an id must not make what it runs approved. So a
+    /// first setup written by hand on a device that has approved nothing yet waits for review like
+    /// one that arrived, which is the safe side to be wrong on.
     @discardableResult
     func adoptOwnDocument() -> String? {
         guard let raw = config.rawBytes, config.config?.identity.id == nil else { return nil }
