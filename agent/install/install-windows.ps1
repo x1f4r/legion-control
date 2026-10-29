@@ -472,7 +472,7 @@ if ($Base -eq [IO.Path]::GetPathRoot($Base + '\').TrimEnd('\') -or
         (Join-Path $UserProfile '.legion-control') + ", and run this again. Nothing was changed.")
 }
 
-$nodeCmd =Get-Command 'node.exe' -ErrorAction SilentlyContinue
+$nodeCmd = Get-Command 'node.exe' -ErrorAction SilentlyContinue
 if (-not $nodeCmd) {
     $nodeCmd = Get-Command 'node' -ErrorAction SilentlyContinue
 }
