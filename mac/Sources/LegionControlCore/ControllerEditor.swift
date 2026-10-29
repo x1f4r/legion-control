@@ -10,7 +10,10 @@ import Foundation
 /// The document is edited as plain JSON rather than through `ControllerConfig`. A setup may
 /// legitimately carry keys this build has never heard of: a newer client wrote them, or only the
 /// phone reads them. Round-tripping through the typed model would delete every one of them, silently
-/// and on one device only.
+/// and on one device only. And the edited dictionary is written back onto the tree it was read from
+/// (`SetupJSON.rebased`), so member order and number spelling survive wherever the edit did not
+/// reach: `22.0` stays `22.0`, and an edit to one machine does not reorder another (C6). The
+/// controller block keeps every key it had as well; only the identity keys are written.
 enum ControllerEditor {
 
     struct EditFailure: Error, Sendable, Equatable {
@@ -39,43 +42,42 @@ enum ControllerEditor {
         newIdentifier: @Sendable () -> String = { "setup-" + UUID().uuidString.lowercased() },
         change: (inout [String: Any]) throws -> Void
     ) throws -> Edited {
-        guard var root = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else {
+        let original = try tree(raw, purpose: "edited from here")
+        guard var root = original.foundationValue as? [String: Any] else {
             throw EditFailure("The config file is not a JSON object, so it cannot be edited from here. Fix it in an editor first.")
         }
 
         try change(&root)
 
-        // The identity is stamped after the change rather than before, so a change that threw leaves
-        // the document and its lineage exactly as they were.
-        let existing = (root["controller"] as? [String: Any]) ?? [:]
-        var identity = parentIdentity
-
-        // A document that never had an identity gets one now, and only now: an id invented on every
-        // load would make two devices reading the same file believe they were on different setups.
-        if identity.id == nil {
-            identity.id = (existing["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? newIdentifier()
-        }
-        if identity.name == nil { identity.name = existing["name"] as? String }
-
-        let next = identity.next(parent: parentHash, device: deviceName, now: now)
-        root["controller"] = SetupMerge.encode(next)
-
-        let bytes: Data
+        var edited: SetupJSON
         do {
-            bytes = try JSONText.canonicalDocument(root)
+            edited = try SetupJSON.rebased(root, onto: original)
         } catch {
             throw EditFailure("The edited config could not be written back as JSON. \(error.localizedDescription)")
         }
 
-        return Edited(bytes: bytes, identity: next)
+        // The identity is stamped after the change rather than before, so a change that threw leaves
+        // the document and its lineage exactly as they were.
+        var identity = parentIdentity
+        let existing = edited["controller"]
+
+        // A document that never had an identity gets one now, and only now: an id invented on every
+        // load would make two devices reading the same file believe they were on different setups.
+        if identity.id == nil {
+            identity.id = existing?["id"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 } ?? newIdentifier()
+        }
+        var next = identity.next(parent: parentHash, device: deviceName, now: now)
+        next.name = existing?["name"]?.stringValue
+        edited.stamp(next)
+        return Edited(bytes: edited.documentData, identity: next)
     }
 
     /// Give a document that has never had one an identity, without otherwise touching it.
     ///
     /// This is what happens to a hand written file or a pasted example the first time the app reads
-    /// it: it becomes a setup of its own, with a fresh id, revision 1 and no ancestors. It is not a
-    /// claim about anybody else's setup, and if the machines turn out to hold another one the user
-    /// gets the ordinary "different setup" question.
+    /// it: it becomes a setup of its own, with a fresh id, revision 1 and no ancestors, and the rest
+    /// of its controller block as it was. It is not a claim about anybody else's setup, and if the
+    /// machines turn out to hold another one the user gets the ordinary "different setup" question.
     static func adopting(
         _ raw: Data,
         deviceName: String,
@@ -83,20 +85,40 @@ enum ControllerEditor {
         now: Date = Date(),
         newIdentifier: @Sendable () -> String = { "setup-" + UUID().uuidString.lowercased() }
     ) throws -> Edited {
-        guard var root = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else {
-            throw EditFailure("The config file is not a JSON object, so it cannot be given an identity.")
-        }
+        var root = try tree(raw, purpose: "given an identity")
         let identity = ControllerIdentity(
             id: newIdentifier(),
-            name: setupName ?? (root["controller"] as? [String: Any])?["name"] as? String,
+            name: setupName ?? root["controller"]?["name"]?.stringValue,
             revision: 1,
             updatedAt: ISO8601DateFormatter.lenient.string(from: now),
             source: ControllerIdentity.sourceKind,
             device: deviceName,
             lineage: []
         )
-        root["controller"] = SetupMerge.encode(identity)
-        return Edited(bytes: try JSONText.canonicalDocument(root), identity: identity)
+        if let setupName {
+            var block = root["controller"].flatMap { $0.isObject ? $0 : nil } ?? .object([])
+            block["name"] = .string(setupName)
+            root["controller"] = block
+        }
+        root.stamp(identity)
+        return Edited(bytes: root.documentData, identity: identity)
+    }
+
+    /// The document as a tree. A document that repeats a member name is not edited: which copy
+    /// counts depends on the program reading it, so a person settles it in an editor first.
+    private static func tree(_ raw: Data, purpose: String) throws -> SetupJSON {
+        let parsed: SetupJSON
+        do {
+            parsed = try SetupJSON.parse(try Canonical.bytes(raw))
+        } catch let error as SetupJSON.ParseError where error.message.contains("repeated") {
+            throw EditFailure("The config file writes one key twice in the same place (\(error.message)), so it cannot be \(purpose). Fix it in an editor first.")
+        } catch {
+            throw EditFailure("The config file is not valid JSON, so it cannot be \(purpose). Fix it in an editor first.")
+        }
+        guard parsed.isObject else {
+            throw EditFailure("The config file is not a JSON object, so it cannot be \(purpose). Fix it in an editor first.")
+        }
+        return parsed
     }
 
     // MARK: - The changes the app knows how to make
@@ -404,5 +426,22 @@ enum ControllerEditor {
             entries.append(entry)
         }
         machine[list] = entries
+    }
+}
+
+extension SetupJSON {
+    /// Write an identity into the document's controller block, keeping every other key the block
+    /// has where it is. The identity keys are written in place, or appended in this order when the
+    /// block lacks them; a document with no block gets one at the end.
+    mutating func stamp(_ identity: ControllerIdentity) {
+        var block = self["controller"].flatMap { $0.isObject ? $0 : nil } ?? .object([])
+        if let id = identity.id { block["id"] = .string(id) }
+        if block["name"] == nil, let name = identity.name { block["name"] = .string(name) }
+        block["revision"] = .number(String(identity.revisionNumber))
+        if let updatedAt = identity.updatedAt { block["updatedAt"] = .string(updatedAt) }
+        if let source = identity.source { block["source"] = .string(source) }
+        if let device = identity.device { block["device"] = .string(device) }
+        block["lineage"] = .array(identity.ancestors.map(SetupJSON.string))
+        self["controller"] = block
     }
 }

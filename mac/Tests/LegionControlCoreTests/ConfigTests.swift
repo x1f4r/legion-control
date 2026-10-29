@@ -254,6 +254,55 @@ struct ConfigTests {
         #expect(machines.first?["futureMachineKey"] as? String == "kept")
     }
 
+    @Test("an edit writes back untouched what it did not change: number spelling, member order, unknown controller keys")
+    func editKeepsSpellingAndOrder() throws {
+        // The Mac used to sort every key, write 22.0 as 22, and replace the controller block with its
+        // own, so a rename here changed a peer's spelling everywhere and dropped what it had added (C6).
+        let json = """
+        {
+          "version": 1,
+          "controller": { "id": "setup-home", "revision": 3, "policy": { "keep": true }, "lineage": [] },
+          "machines": [
+            { "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}], "id": "pi", "weight": 22.0,
+              "endpoints": [{"id":"e","host":"h","port":22.0}] },
+            { "id": "tower", "name": "Tower", "endpoints": [{"id":"e","host":"h2"}],
+              "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] }
+          ]
+        }
+        """
+        let (store, home) = try Self.store(json)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        #expect(store.applyEdit(describedAs: "renamed", deviceName: "MacBook") { root in
+            try ControllerEditor.upsertMachine(["id": "tower", "name": "Big Tower"], in: &root)
+        } == nil)
+
+        let text = String(decoding: try #require(store.rawBytes), as: UTF8.self)
+        #expect(text.contains(#""weight": 22.0"#))
+        #expect(text.contains(#""port": 22.0"#))
+        let tree = try SetupJSON.parse(try #require(store.rawBytes))
+        #expect(tree.members?.map(\.name) == ["version", "controller", "machines"])
+        #expect(tree["machines"]?.items?.first?.members?.map(\.name) == ["systems", "id", "weight", "endpoints"])
+        #expect(tree["machines"]?.items?.last?["name"] == .string("Big Tower"))
+        let block = try #require(tree["controller"])
+        #expect(block["policy"]?["keep"] == .bool(true))
+        #expect(block["revision"] == .number("4"))
+        #expect(block.members?.map(\.name) == ["id", "revision", "policy", "lineage", "updatedAt", "source", "device"])
+    }
+
+    @Test("renaming the setup keeps the new name")
+    func renameKeepsTheName() throws {
+        let (store, home) = try Self.store(Self.twoMachines)
+        defer { try? FileManager.default.removeItem(at: home) }
+        #expect(store.applyEdit(describedAs: "named", deviceName: "MacBook") { root in
+            try ControllerEditor.setSetupName("Home", in: &root)
+        } == nil)
+        #expect(store.applyEdit(describedAs: "renamed", deviceName: "MacBook") { root in
+            try ControllerEditor.setSetupName("Cabin", in: &root)
+        } == nil)
+        #expect(store.config?.identity.name == "Cabin")
+    }
+
     @Test("setting helpers writes the compatibility alias too")
     func helpersWriteTheAlias() throws {
         let (store, home) = try Self.store(Self.twoMachines)
