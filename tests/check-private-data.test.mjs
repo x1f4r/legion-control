@@ -138,6 +138,31 @@ test('private terms come from the environment and the file outside the repositor
   assert.doesNotMatch(printed.stdout + printed.stderr, /zebulon|albatross/i);
 });
 
+test('a term is let through in the public places its entry names, and refused everywhere else', (t) => {
+  // The account that owns the repository, which its web addresses and the Android package have to
+  // name, and which must not come back as the user of a fixture.
+  const { check, run } = checkout(t, {
+    'README.md': [
+      'git clone https://github.com/Nimbus/legion-control',
+      'ssh nimbus@workstation',
+      'see github.com/nimbus/legion-control, which nimbus wrote',
+    ].join('\n'),
+    'android/app/build.gradle.kts': 'namespace = "com.nimbus.legioncontrol"\n',
+    'android/app/src/main/java/com/nimbus/legioncontrol/Main.kt': 'package com.nimbus.legioncontrol\n',
+    'contract/tools/make-fixtures.mjs': "const device = { user: 'nimbus' };\n",
+    'docs/nimbus-notes.md': 'clean\n',
+  });
+  const env = { LEGION_PRIVATE_TERMS: 'nimbus ! github.com/nimbus/ ! com.nimbus. ! com/nimbus/ !' };
+  const result = check(env);
+  assert.deepEqual(where(result).sort(), ['README.md:2', 'README.md:3', 'contract/tools/make-fixtures.mjs:1', 'docs/nimbus-notes.md:0']);
+  assert.ok(result.findings.every(finding => /^(its name )?holds entry 1 of LEGION_PRIVATE_TERMS\.$/.test(finding.message)));
+
+  // A place that does not hold its term lets nothing through, and says so without the term.
+  const typo = run({ LEGION_PRIVATE_TERMS: 'longer-term\nnimbus ! github.com/nimbos/' });
+  assert.equal(typo.status, 2);
+  assert.equal(typo.stderr, 'entry 2 of LEGION_PRIVATE_TERMS lets its term through in a place that does not hold the term.\n');
+});
+
 test('without terms the check says so and still checks the rest; a term too short to mean anything is refused', (t) => {
   const { terms, run } = checkout(t, { 'a.txt': '/home/me is fine\n', 'b.txt': `${posixHome('home')}\n` });
   const result = run();

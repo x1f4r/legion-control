@@ -23,9 +23,17 @@
 //   maintainers, which a public check cannot spell out. They come from LEGION_PRIVATE_TERMS, which
 //   CI fills from a repository secret, and from ~/.legion-control/private/terms.txt, outside the
 //   repository, in the same format: one term per line or several separated by commas, # for a
-//   comment. A term matches in any letter case. Either source may be missing, and the check says
-//   which it read. It never prints a term: a finding gives the file, the line and the entry of the
-//   source it matched, so the log of a public CI run shows no more than the change itself does.
+//   comment. A term is three characters long at least and matches in any letter case. Either
+//   source may be missing, and the check says which it read. It never prints a term: a finding
+//   gives the file, the line and the entry of the source it matched, so the log of a public CI run
+//   shows no more than the change itself does.
+//
+//   A private name can be public in a few places as well: the account that owns the repository is
+//   in its web addresses and the Android package, and is often a user name on the machines too.
+//   Such a term lists those places after it, each after a !, as in
+//   `jdoe ! github.com/jdoe/ ! com.jdoe. ! com/jdoe/`. Each place holds the term; the term is let
+//   through where it is part of one of them and refused everywhere else, `user: 'jdoe'` included.
+//   A place cannot hold a comma, which would end the entry.
 //
 // scripts/check.sh runs it, and CI runs it once more with the secret.
 import fs from 'node:fs';
@@ -65,17 +73,37 @@ const USER = /[A-Za-z0-9_][\w.-]*/y;
 // is a version or a build number.
 const IPV4 = /(?<![\w.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\.(\d{1,3}))?(?!\w|\.\d)/g;
 
-/** The terms of one source's text, each with its entry number in that source. */
+/**
+ * The terms of one source's text, each with its entry number in that source and the places it is
+ * let through.
+ */
 function parseTerms(text, source) {
   // Comments first, so a comma in one does not make a term of what follows it.
   const entries = text.split('\n').filter(line => !line.trim().startsWith('#'))
     .flatMap(line => line.split(',')).map(entry => entry.trim()).filter(Boolean);
   return entries.map((entry, index) => {
+    const [term, ...after] = entry.split('!').map(part => part.trim().toLowerCase());
+    const places = after.filter(Boolean);
     // One letter or two would match nearly every file, and with the term never printed, a failure
     // that says nothing about why. A typo in the secret should say so.
-    if (entry.length < 3) throw new Error(`entry ${index + 1} of ${source} is shorter than three characters, which would match almost anything.`);
-    return { term: entry.toLowerCase(), source, entry: index + 1 };
+    if (term.length < 3) throw new Error(`entry ${index + 1} of ${source} is shorter than three characters, which would match almost anything.`);
+    // And a place without the term in it lets nothing through, which is a typo as well, and one
+    // that would leave the term refused where the maintainer meant it to pass.
+    if (places.some(place => !place.includes(term))) throw new Error(`entry ${index + 1} of ${source} lets its term through in a place that does not hold the term.`);
+    return { term, places, source, entry: index + 1 };
   });
+}
+
+/** Whether a lowercased line holds the term anywhere but inside one of its places. */
+function holdsTerm(lower, { term, places }) {
+  const through = [];
+  for (const place of places) {
+    for (let at = lower.indexOf(place); at >= 0; at = lower.indexOf(place, at + 1)) through.push([at, at + place.length]);
+  }
+  for (let at = lower.indexOf(term); at >= 0; at = lower.indexOf(term, at + 1)) {
+    if (!through.some(([start, end]) => start <= at && at + term.length <= end)) return true;
+  }
+  return false;
 }
 
 /**
@@ -125,8 +153,8 @@ function lineFindings(line, terms, holds = 'holds') {
     if (privateAddress(parts)) found.push(`${match[0]} is on a private network; use an address from 192.0.2.0/24, 198.51.100.0/24 or 10.0.0.0/24, or the 192.168.1, 192.168.10 and 192.168.50 networks.`);
   }
   const lower = line.toLowerCase();
-  for (const { term, source, entry } of terms) {
-    if (lower.includes(term)) found.push(`${holds} entry ${entry} of ${source}.`);
+  for (const term of terms) {
+    if (holdsTerm(lower, term)) found.push(`${holds} entry ${term.entry} of ${term.source}.`);
   }
   return found;
 }
