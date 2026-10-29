@@ -76,8 +76,13 @@ else
 	echo "No signed agent bundle in $DIST_DIR; the agent install action will be unavailable in this build."
 fi
 
-# Ad hoc signature: enough for a locally built app, and it keeps the local network prompt attached to a
-# stable identity instead of asking again after every rebuild.
+# Ad hoc signature: enough for macOS to run a locally built app and for codesign to vouch that the
+# bundle is whole, but it is not an identity. It names this one build by its own code hash, and
+# nothing of it carries over to the next build. Local network privacy keeps its answer against the
+# code signature, so macOS may ask again for local network access after a rebuild, and after every
+# self-update, which installs a release this script built the same way. Only a stable, Apple-issued
+# signing identity would keep the answer across builds. Releases are not signed with one, and that
+# repeated prompt is the trade-off.
 codesign --force --sign - --timestamp=none "$STAGE"
 codesign --verify --strict "$STAGE"
 echo "Built $STAGE"
