@@ -845,11 +845,12 @@ public static class Runner
                 return false;
             }
             if (!StillCurrent()) return Failed;
-            var (bytes, downloadProblem) = await new AppUpdates().DownloadAsync(ready, token);
-            if (!StillCurrent()) return Failed;
-            if (bytes is null) { output.WriteLine(downloadProblem); return Failed; }
             var installer = new AppInstaller();
-            var (staged, stageProblem) = installer.Stage(bytes, ready.Artifact.Name);
+            var archive = installer.DownloadPath(ready.Artifact.Name);
+            var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, token);
+            if (!StillCurrent()) return Failed;
+            if (downloadProblem is not null) { output.WriteLine(downloadProblem); return Failed; }
+            var (staged, stageProblem) = installer.Stage(archive, ready.Artifact.Name);
             if (staged is null) { output.WriteLine(stageProblem); return Failed; }
             if (!StillCurrent()) return Failed;
             var (started, failure) = installer.Apply();

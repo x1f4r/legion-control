@@ -957,11 +957,12 @@ public sealed class MainWindow : Window
         if (!StillCurrent()) return;
         if (!await Sheets.AskAsync(this, "App update available", ready.Sentence_, "Download and verify")) return;
         if (!StillCurrent()) return;
-        var (bytes, downloadProblem) = await new AppUpdates().DownloadAsync(ready, _updateLifetime.Token);
-        if (!StillCurrent()) return;
-        if (bytes is null) { Sheets.Text(this, "App update", downloadProblem ?? "Download failed."); return; }
         var installer = new AppInstaller();
-        var (staged, stageProblem) = installer.Stage(bytes, ready.Artifact.Name);
+        var archive = installer.DownloadPath(ready.Artifact.Name);
+        var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, _updateLifetime.Token);
+        if (!StillCurrent()) return;
+        if (downloadProblem is not null) { Sheets.Text(this, "App update", downloadProblem); return; }
+        var (staged, stageProblem) = installer.Stage(archive, ready.Artifact.Name);
         if (staged is null) { Sheets.Text(this, "App update", stageProblem ?? "Staging failed."); return; }
         if (!StillCurrent()) return;
         if (!await Sheets.AskAsync(this, "Verified update ready",

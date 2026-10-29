@@ -3,6 +3,7 @@ using System.Formats.Tar;
 using System.IO.Compression;
 using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
@@ -14,6 +15,10 @@ namespace LegionControl.Desktop.Updates;
 /// The release is read over plain HTTPS with no credentials. Nothing downloaded is trusted for
 /// being downloaded: the manifest is verified against the key compiled into this binary, every
 /// artifact is checked against the manifest by hash and size, and only then is anything unpacked.
+///
+/// Nor is anything read without a limit. The repository a peer's setup names is one this device
+/// approved, but whoever owns that repository decides what its release holds, and a release list,
+/// a manifest or an archive larger than any real one is read only as far as the limit and refused.
 public sealed class AppUpdates(HttpClient? http = null)
 {
     public const string ManifestAsset = "Legion-Control-manifest.json";
@@ -21,6 +26,13 @@ public sealed class AppUpdates(HttpClient? http = null)
     public const string LinuxAsset = "Legion-Control-linux-x64.tar.gz";
     public const string LinuxArm64Asset = "Legion-Control-linux-arm64.tar.gz";
     public const string WindowsAsset = "Legion-Control-windows-x64.zip";
+
+    /// The most of GitHub's description of a release that is read.
+    public const int ReleaseLimit = 1024 * 1024;
+    /// The most of a signed manifest that is read, the same limit the release tooling signs under.
+    public const int ManifestLimit = 256 * 1024;
+    /// The most of a detached signature that is read. A real one is 89 bytes.
+    public const int SignatureLimit = 4 * 1024;
 
     private static readonly HttpClient SharedClient = DefaultClient();
     private readonly HttpClient _http = http ?? SharedClient;
@@ -48,6 +60,14 @@ public sealed class AppUpdates(HttpClient? http = null)
 
     public async Task<UpdateAvailability> CheckAsync(string repo, string currentVersion, CancellationToken cancellationToken = default)
     {
+        // The repository goes into a URL, so it is held to the grammar GitHub names repositories
+        // by before it gets there: a value that is not one could point the request anywhere on
+        // the API, or somewhere else entirely.
+        if (!LaunchValues.IsRepo(repo))
+        {
+            return new UpdateAvailability.Unavailable(
+                $"{LaunchGate.Show(repo)} is not a GitHub repository written as owner/name, so no update is looked for there.");
+        }
         var wanted = AssetForThisPlatform();
         if (wanted is null)
             return new UpdateAvailability.Unavailable("There is no desktop app update for this operating system and architecture.");
@@ -60,8 +80,8 @@ public sealed class AppUpdates(HttpClient? http = null)
         Value release;
         try
         {
-            var text = await _http.GetStringAsync($"https://api.github.com/repos/{repo}/releases/latest", cancellationToken);
-            release = Value.Parse(text);
+            var bytes = await ReadAsync($"https://api.github.com/repos/{repo}/releases/latest", ReleaseLimit, cancellationToken);
+            release = Value.Parse(Encoding.UTF8.GetString(bytes));
         }
         catch (Exception error)
         {
@@ -85,8 +105,8 @@ public sealed class AppUpdates(HttpClient? http = null)
         string signature;
         try
         {
-            manifestBytes = await _http.GetByteArrayAsync(manifestUrl, cancellationToken);
-            signature = await _http.GetStringAsync(signatureUrl, cancellationToken);
+            manifestBytes = await ReadAsync(manifestUrl, ManifestLimit, cancellationToken);
+            signature = Encoding.UTF8.GetString(await ReadAsync(signatureUrl, SignatureLimit, cancellationToken));
         }
         catch (Exception error)
         {
@@ -109,23 +129,84 @@ public sealed class AppUpdates(HttpClient? http = null)
         return new UpdateAvailability.Ready(trusted.Manifest, artifact, assetUrl);
     }
 
-    /// Downloads the artifact and checks it against the signed manifest before anything is unpacked.
-    public async Task<(byte[]? Bytes, string? Problem)> DownloadAsync(
-        UpdateAvailability.Ready ready, CancellationToken cancellationToken = default)
+    /// Downloads the artifact to [destination] and checks it against the signed manifest before
+    /// anything is unpacked. Returns null once the file there is exactly the artifact the manifest
+    /// signed, or the reason there is none.
+    ///
+    /// It streams to a temporary file beside [destination] and stops as soon as more arrives than
+    /// the manifest's size: an archive is never held in memory, and one larger than the release
+    /// signed is never written out in full. The temporary file is gone whatever happens.
+    public async Task<string?> DownloadAsync(
+        UpdateAvailability.Ready ready, string destination, CancellationToken cancellationToken = default)
     {
+        var artifact = ready.Artifact;
+        if (artifact.Size <= 0)
+        {
+            return $"The signed manifest gives {artifact.Name} no size, so nothing was downloaded.";
+        }
+        var partial = $"{destination}.part-{Guid.NewGuid():N}";
         try
         {
-            var bytes = await _http.GetByteArrayAsync(ready.Url, cancellationToken);
-            if (!ReleaseManifest.Matches(ready.Artifact, bytes))
+            Directory.CreateDirectory(Path.GetDirectoryName(destination) ?? ".");
+            using var response = await _http.GetAsync(ready.Url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            if (response.Content.Headers.ContentLength is { } announced && announced > artifact.Size)
             {
-                return (null, $"{ready.Artifact.Name} does not match the signed manifest. Nothing was unpacked.");
+                return $"{artifact.Name} is {announced} bytes, more than the {artifact.Size} the signed manifest says. Nothing was downloaded.";
             }
-            return (bytes, null);
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            long written = 0;
+            await using (var body = await response.Content.ReadAsStreamAsync(cancellationToken))
+            await using (var file = new FileStream(partial, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                var buffer = new byte[81920];
+                int read;
+                while ((read = await body.ReadAsync(buffer, cancellationToken)) > 0)
+                {
+                    written += read;
+                    if (written > artifact.Size)
+                    {
+                        return $"{artifact.Name} is larger than the {artifact.Size} bytes the signed manifest says. Nothing was unpacked.";
+                    }
+                    hash.AppendData(buffer, 0, read);
+                    await file.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                }
+            }
+            if (written != artifact.Size
+                || !Convert.ToHexString(hash.GetHashAndReset()).Equals(artifact.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                return $"{artifact.Name} does not match the signed manifest. Nothing was unpacked.";
+            }
+            File.Move(partial, destination, overwrite: true);
+            return null;
         }
         catch (Exception error)
         {
-            return (null, $"{ready.Artifact.Name} could not be downloaded: {error.Message}");
+            return $"{artifact.Name} could not be downloaded: {error.Message}";
         }
+        finally
+        {
+            try { File.Delete(partial); } catch (Exception) { }
+        }
+    }
+
+    /// The body at [url], read only as far as [limit] bytes. An announced length over it is refused
+    /// before anything is read, and a body that runs past it is refused as soon as it does.
+    private async Task<byte[]> ReadAsync(string url, int limit, CancellationToken cancellationToken)
+    {
+        using var response = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength > limit) throw new IOException($"it is larger than {limit} bytes.");
+        await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var kept = new MemoryStream();
+        var buffer = new byte[16384];
+        int read;
+        while ((read = await body.ReadAsync(buffer, cancellationToken)) > 0)
+        {
+            if (kept.Length + read > limit) throw new IOException($"it is larger than {limit} bytes.");
+            kept.Write(buffer, 0, read);
+        }
+        return kept.ToArray();
     }
 
     /// Whether the version on offer is not worth taking. Compared piecewise rather than as text, so
@@ -185,9 +266,37 @@ public sealed class AppInstaller
     public string PreviousDirectory => Path.Combine(StagingRoot, "previous");
     public string MarkerPath => Path.Combine(StagingRoot, "launched-ok");
 
+    /// Where [AppUpdates.DownloadAsync] puts the archive called [assetName].
+    public string DownloadPath(string assetName) => Path.Combine(StagingRoot, Path.GetFileName(assetName));
+
     /// Unpacks the archive into a clean staging directory, refusing anything that would write
     /// outside it. An archive that names `../` is not a release; it is an attempt.
     public (string? Directory, string? Problem) Stage(byte[] archive, string assetName)
+    {
+        using var memory = new MemoryStream(archive);
+        return Stage(memory, assetName);
+    }
+
+    /// The same, from the file [AppUpdates.DownloadAsync] verified, which is deleted once it is
+    /// unpacked or refused: nothing reads it again.
+    public (string? Directory, string? Problem) Stage(string archivePath, string assetName)
+    {
+        try
+        {
+            using var file = File.OpenRead(archivePath);
+            return Stage(file, assetName);
+        }
+        catch (Exception error)
+        {
+            return (null, $"The archive could not be unpacked: {error.Message}");
+        }
+        finally
+        {
+            try { File.Delete(archivePath); } catch (Exception) { }
+        }
+    }
+
+    private (string? Directory, string? Problem) Stage(Stream archive, string assetName)
     {
         try
         {
@@ -196,8 +305,7 @@ public sealed class AppInstaller
 
             if (assetName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
             {
-                using var memory = new MemoryStream(archive);
-                using var zip = new ZipArchive(memory, ZipArchiveMode.Read);
+                using var zip = new ZipArchive(archive, ZipArchiveMode.Read, leaveOpen: true);
                 foreach (var entry in zip.Entries)
                 {
                     if (entry.FullName.EndsWith('/')) continue;
@@ -209,8 +317,7 @@ public sealed class AppInstaller
             }
             else
             {
-                using var memory = new MemoryStream(archive);
-                using var gzip = new GZipStream(memory, CompressionMode.Decompress);
+                using var gzip = new GZipStream(archive, CompressionMode.Decompress, leaveOpen: true);
                 using var tar = new TarReader(gzip);
                 while (tar.GetNextEntry() is { } entry)
                 {

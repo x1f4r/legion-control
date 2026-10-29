@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using LegionControl.Desktop.Contract;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Crypto.Signers;
@@ -105,10 +106,15 @@ public sealed record ReleaseManifest(
     IReadOnlyList<ReleaseArtifact> Artifacts,
     byte[] Bytes)
 {
+    /// The manifest these bytes hold, or null when they are not one this build understands. Only
+    /// schema 1 is: a later schema may mean something by the same keys that this build would
+    /// misread, so it is refused rather than read as the one before it.
     public static ReleaseManifest? Parse(byte[] bytes)
     {
         var json = Value.Parse(Encoding.UTF8.GetString(bytes));
         if (!json.IsObject) return null;
+        if (json["schema"].Raw.ValueKind != JsonValueKind.Number || !json["schema"].Raw.TryGetInt64(out var schema) || schema != 1)
+            return null;
         var version = json["version"].AsText();
         if (version is null) return null;
         var artifacts = new List<ReleaseArtifact>();
@@ -121,7 +127,7 @@ public sealed record ReleaseManifest(
             artifacts.Add(new ReleaseArtifact(name, sha.ToLowerInvariant(), size.Value));
         }
         return new ReleaseManifest(
-            json["schema"].AsInt() ?? 1,
+            1,
             version,
             json["agentVersion"].AsText(),
             artifacts,
