@@ -13,7 +13,10 @@ import com.x1f4r.legioncontrol.data.LaunchDocuments
 import com.x1f4r.legioncontrol.data.MemoryPreferences
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.withText
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -130,6 +133,35 @@ class ReplaceTheirSetupTest {
             isError = true,
             "may or may not have been replaced",
         )
+    }
+
+    @Test
+    fun `a second Replace while the first is out sends nothing, and the first one's reply is the one shown`() = runBlocking {
+        // Nothing stopped the second press: it sent a second `--replace`, and whichever reply came
+        // back last said what had happened, over the other.
+        val answer = CompletableDeferred<Result<ConfigSetReply>>()
+        val tower = object : MachineClient by Tower() {
+            val sent = mutableListOf<String>()
+            override suspend fun configSet(canonicalDocument: String, setupId: String, revision: Long, replace: Boolean): Result<ConfigSetReply> {
+                sent += canonicalDocument
+                return answer.await()
+            }
+        }
+        val clash = question()
+        val first = async { sync.replace(tower, clash, otherHash) }
+        yield()
+        assertEquals(1, tower.sent.size)
+
+        val second = sync.replace(tower, clash, otherHash)
+        assertTrue(second.toString(), second is SetupPeerSync.Replaced.NotDone)
+        assertFalse("waiting for an answer is not an error", second.isError)
+        assertTrue(second.line, second.line.contains("still out to Tower"))
+        assertEquals("nothing more was sent", 1, tower.sent.size)
+        assertEquals("the question is still the one being answered", clash, store.identityClash.value)
+
+        answer.complete(Result.success(ConfigSetReply(ok = true, action = "replaced", hash = mine.hash)))
+        assertEquals(SetupPeerSync.Replaced.Done("Tower now carries this setup."), first.await())
+        assertNull(store.identityClash.value)
     }
 
     @Test

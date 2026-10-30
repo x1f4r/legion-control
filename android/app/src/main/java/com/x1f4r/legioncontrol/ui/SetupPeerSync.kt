@@ -324,6 +324,15 @@ internal class SetupPeerSync(
             )
         }
         val state = state(client.machine.id)
+        // One setup request to a machine at a time (section 9.5), and a Replace is one: a second
+        // press while the first is out sent a second `--replace`, and whichever reply came back
+        // last was the one shown, over what the other had done.
+        if (state.inFlight) {
+            return Replaced.NotDone(
+                "A request about the setup is still out to $name, so nothing more was sent. Try again once it has answered.",
+                isError = false,
+            )
+        }
         state.inFlight = true
         val result = try {
             client.configSet(

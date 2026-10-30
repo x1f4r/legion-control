@@ -648,6 +648,13 @@ class AppModel(
     }
 
     /**
+     * Whether a Replace is out to a machine. The button waits for it: the reply to a second press
+     * could come back after the first one's and say the wrong thing about it.
+     */
+    var replacing: Boolean by mutableStateOf(false)
+        private set
+
+    /**
      * Replaces a machine's different setup with this one. The only place `--replace` is ever sent,
      * so it goes to the machine that served the copy on screen, found by its id: a name is free
      * text, and another machine may carry the same one.
@@ -658,6 +665,7 @@ class AppModel(
      */
     fun replaceTheirSetup() {
         val clash = identityClash ?: return
+        if (replacing) return
         val client = clients.firstOrNull { it.machine.id == clash.machineId } ?: return
         // Asked of the setup as it is now, not only when the page was drawn.
         replaceProblem?.let {
@@ -665,14 +673,19 @@ class AppModel(
             return
         }
         val latest = machines.firstOrNull { it.machine.id == clash.machineId }?.status?.controller?.hash
+        replacing = true
         scope.launch {
-            val replaced = sync.replace(client, clash, latest)
-            if (replaced.isError) {
-                configNote = null
-                configError = replaced.line
-            } else {
-                configError = null
-                configNote = replaced.line
+            try {
+                val replaced = sync.replace(client, clash, latest)
+                if (replaced.isError) {
+                    configNote = null
+                    configError = replaced.line
+                } else {
+                    configError = null
+                    configNote = replaced.line
+                }
+            } finally {
+                replacing = false
             }
         }
     }

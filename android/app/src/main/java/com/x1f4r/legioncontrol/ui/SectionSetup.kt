@@ -686,7 +686,7 @@ fun IdentityClashSection(app: AppModel) {
 
     SectionHeading("Settle it")
     Actions {
-        PlainAction("Replace ${clash.machineName}'s copy", enabled = app.replaceProblem == null, destructive = true) {
+        PlainAction("Replace ${clash.machineName}'s copy", enabled = app.replaceProblem == null && !app.replacing, destructive = true) {
             app.replaceTheirSetup()
         }
         PlainAction("Follow their setup instead", enabled = true) { app.adoptTheirSetup() }
