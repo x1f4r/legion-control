@@ -39,6 +39,13 @@ public sealed class AppUpdates(HttpClient? http = null)
     private static readonly HttpClient SharedClient = DefaultClient();
     private readonly HttpClient _http = http ?? SharedClient;
 
+    /// How long a body may go without a byte arriving before it is given up on. Once a body is
+    /// streamed, the client's own timeout covers only the wait for the headers, and a server or a
+    /// middlebox that stops part way would otherwise hold a check or a download, and every check
+    /// after it, until the window closed. Counted from the last chunk, so a slow link that keeps
+    /// delivering is never cut off.
+    public TimeSpan StallTimeout { get; init; } = TimeSpan.FromMinutes(1);
+
     private static HttpClient DefaultClient()
     {
         var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
@@ -157,13 +164,14 @@ public sealed class AppUpdates(HttpClient? http = null)
                 return $"{artifact.Name} is {announced} bytes, more than the {artifact.Size} the signed manifest says. Nothing was downloaded.";
             }
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using var stall = Stall(cancellationToken);
             long written = 0;
             await using (var body = await response.Content.ReadAsStreamAsync(cancellationToken))
             await using (var file = new FileStream(partial, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 var buffer = new byte[81920];
                 int read;
-                while ((read = await body.ReadAsync(buffer, cancellationToken)) > 0)
+                while ((read = await NextAsync(body, buffer, stall, cancellationToken)) > 0)
                 {
                     written += read;
                     if (written > artifact.Size)
@@ -199,16 +207,43 @@ public sealed class AppUpdates(HttpClient? http = null)
         using var response = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
         if (response.Content.Headers.ContentLength > limit) throw new IOException($"it is larger than {limit} bytes.");
+        using var stall = Stall(cancellationToken);
         await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var kept = new MemoryStream();
         var buffer = new byte[16384];
         int read;
-        while ((read = await body.ReadAsync(buffer, cancellationToken)) > 0)
+        while ((read = await NextAsync(body, buffer, stall, cancellationToken)) > 0)
         {
             if (kept.Length + read > limit) throw new IOException($"it is larger than {limit} bytes.");
             kept.Write(buffer, 0, read);
         }
         return kept.ToArray();
+    }
+
+    /// The token a body is read under: the caller's, and [StallTimeout] from now.
+    private CancellationTokenSource Stall(CancellationToken cancellationToken)
+    {
+        var stall = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        stall.CancelAfter(StallTimeout);
+        return stall;
+    }
+
+    /// The next chunk of [body], with [stall] put back to a whole [StallTimeout] once it arrives.
+    /// A body that sent nothing for that long is an IOException that says so; the caller's own
+    /// cancellation stays a cancellation.
+    private async Task<int> NextAsync(Stream body, byte[] buffer, CancellationTokenSource stall, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var read = await body.ReadAsync(buffer, stall.Token);
+            stall.CancelAfter(StallTimeout);
+            return read;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new IOException(string.Create(CultureInfo.InvariantCulture,
+                $"nothing more arrived for {StallTimeout.TotalSeconds:0.#} seconds."));
+        }
     }
 
     /// Whether the version on offer is not worth taking. Compared piecewise rather than as text, so

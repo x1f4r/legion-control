@@ -45,6 +45,48 @@ public class ReleaseDownloadTests
         }
     }
 
+    /// A body that sends its headers and then nothing, as a server or a middlebox that stalls
+    /// part way does.
+    private sealed class Stalling : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => Task.Delay(Timeout.Infinite);
+
+        protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new Silent());
+
+        protected override Task<Stream> CreateContentReadStreamAsync(CancellationToken cancellationToken) => CreateContentReadStreamAsync();
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+    }
+
+    /// A stream whose next read never comes, unless it is cancelled.
+    private sealed class Silent : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            return 0;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     private static byte[] Manifest() => File.ReadAllBytes(Path.Combine(Repo.TrustFixtures, "manifest.json"));
 
     private static byte[] Signature() => File.ReadAllBytes(Path.Combine(Repo.TrustFixtures, "manifest.json.sig"));
@@ -106,6 +148,27 @@ public class ReleaseDownloadTests
         Assert.Contains("The signed manifest could not be read: it is larger than 4096 bytes", signature);
         // At the limits themselves the release is read, and the fixture names no archive for here.
         Assert.Contains("has no", await Check(ARelease()));
+    }
+
+    [Fact]
+    public async Task ABodyThatStopsArrivingIsGivenUpOnRatherThanWaitedForUntilTheWindowCloses()
+    {
+        // However long the check would otherwise wait, the test does not wait past this.
+        using var bound = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        if (HasAnUpdate)
+        {
+            var updates = new AppUpdates(new HttpClient(ARelease(list: () => new Stalling()))) { StallTimeout = TimeSpan.FromMilliseconds(300) };
+            Assert.Contains("The release list could not be read: nothing more arrived for 0.3 seconds",
+                (await updates.CheckAsync(Repository, "1.0.0", bound.Token)).Sentence_);
+        }
+
+        using var home = new TempHome();
+        var destination = Path.Combine(home.Path, "updates", "fixture.bin");
+        var (_, ready, host) = Offer(() => new Stalling());
+        var download = new AppUpdates(new HttpClient(host)) { StallTimeout = TimeSpan.FromMilliseconds(300) };
+        Assert.Contains("could not be downloaded: nothing more arrived", await download.DownloadAsync(ready, destination, bound.Token));
+        Assert.Empty(Leftovers(Path.GetDirectoryName(destination)!));
+        Assert.False(bound.IsCancellationRequested, "given up on by the stall, not by the test");
     }
 
     [Fact]
