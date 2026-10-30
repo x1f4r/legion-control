@@ -821,6 +821,20 @@ test('boot and sleep conform without ever rebooting or suspending anything', asy
     assert.equal(cancelled.action, 'cancelled');
     assert.equal(cancelled.outcome, 'succeeded');
     assert.equal(cancelled.op.outcome, 'deferred', 'the request itself was dropped by design');
+
+    // Recovery finishes a reboot into another system and a suspend as
+    // interrupted, since neither can be judged from here (section 5.5), and
+    // asking again with the same id answers with what it found.
+    for (const [id, kind, phase, argv] of [
+      ['boot-left-for-another-system', 'boot', 'rebooting', ['boot', 'other']],
+      ['sleep-nobody-saw-end', 'sleep', 'suspending', ['sleep']],
+    ]) {
+      beginOperation({ id, kind, target: kind === 'boot' ? 'other' : null, systemId: 'test' });
+      updateOperation(id, { phase, pid: deadPid(), bootId: 'a-boot-before-this-one' });
+      invoke(home, ['cycle']);
+      const replayed = invoke(home, [...argv, '--op', id]);
+      assert.deepEqual([replayed.action, replayed.reasonCode, replayed.outcome, replayed.replayed], ['interrupted', 'interrupted', 'unknown', true], argv.join(' '));
+    }
     assert.equal(fs.existsSync(marker), false);
   });
 });

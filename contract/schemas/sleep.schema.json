@@ -24,6 +24,7 @@
         "queued",
         "failed",
         "conflict",
+        "interrupted",
         "cancelled",
         "expired",
         "already-running"

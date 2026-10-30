@@ -36,6 +36,10 @@ documents the 3.0 schema allowed are refused (see Changed).
 - `problems: [{path, message}]` on a `config-invalid` refusal of `config set`.
 - `config set` refusal codes `lock-held` and `internal`, which the agent
   already sent and the schema did not allow.
+- `interrupted` among the actions of `boot` and `sleep` (section 5.3), which
+  recovery already wrote on a record whose owner was gone, as section 5.5 says
+  of every kind, and a replay of that record answered with. A reboot judged
+  after a return from another system is now one too, rather than `failed`.
 - The guard grammars in `common.schema.json`: `sshHostGuard`, `sshUser`,
   `agentArgItem`, `githubRepo` and `launchPath`.
 - **`restricted` and `launchChanges` on `config set`.** A restricted session's
