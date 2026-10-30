@@ -5,6 +5,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+    <!-- As in the app: a warning fails the build, an advisory against a package does not. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
     <RootNamespace>LegionControl.Desktop.Tests</RootNamespace>
     <!-- The app is a WinExe; referencing it from a test project is fine, but the test host has to
          stay a console application. -->
