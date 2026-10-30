@@ -196,6 +196,15 @@ public sealed class UnixFactAttribute : FactAttribute
     }
 }
 
+/// A fact only Windows can observe. Reported as skipped elsewhere, with the reason.
+public sealed class WindowsFactAttribute : FactAttribute
+{
+    public WindowsFactAttribute(string reason)
+    {
+        if (!OperatingSystem.IsWindows()) Skip = reason;
+    }
+}
+
 /// A fact that starts node. Reported as skipped where node is not on PATH, saying so, rather than
 /// failing on a child that could not start, which reads like a fault in the runner.
 public sealed class NodeFactAttribute : FactAttribute

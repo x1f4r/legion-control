@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -126,12 +127,39 @@ public static class AtomicWrite
         File.WriteAllBytes(temporary, contents);
         try
         {
-            File.Move(temporary, path, overwrite: true);
+            Replace(temporary, path);
         }
         catch (Exception)
         {
             try { File.Delete(temporary); } catch (Exception) { }
             throw;
+        }
+    }
+
+    /// Windows refuses a rename over a file another process has open without delete sharing: the
+    /// other copy of this app reading it, the search indexer or an antivirus scanner looking at it
+    /// for a moment. Deleting the file first would leave a moment with no file at all, so the same
+    /// rename is tried again for up to three seconds, as the agent does with its own state. Anywhere
+    /// else the first error stands.
+    private static void Replace(string source, string destination)
+    {
+        var deadline = Stopwatch.GetTimestamp() + 3 * Stopwatch.Frequency;
+        var pause = 10;
+        while (true)
+        {
+            try
+            {
+                File.Move(source, destination, overwrite: true);
+                return;
+            }
+            catch (Exception error) when (OperatingSystem.IsWindows()
+                                          && error is UnauthorizedAccessException or IOException
+                                          && error is not FileNotFoundException and not DirectoryNotFoundException
+                                          && Stopwatch.GetTimestamp() < deadline)
+            {
+                Thread.Sleep(pause);
+                pause = Math.Min(pause * 2, 100);
+            }
         }
     }
 }
