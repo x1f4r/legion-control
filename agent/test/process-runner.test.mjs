@@ -16,9 +16,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { producedOutcome } from '../src/contract.mjs';
 import { withOperation } from '../src/operate.mjs';
 import { beginOperation, bootIdentity, readOperation, updateOperation, wireRecord } from '../src/operations.mjs';
-import { describeFailure, ledgerPath, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
+import { describeFailure, ledgerPath, powerShellLiteral, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
 import { parseProcessStart } from '../src/state.mjs';
 import { deadPid, withHome } from './helpers.mjs';
+import { CONTRACT } from './vectors.mjs';
 
 const posix = process.platform !== 'win32';
 const node = (source) => [process.execPath, '-e', source];
@@ -530,4 +531,13 @@ test('a command the ledger would not record once it had started is stopped, and 
     assert.equal(describeFailure(result), result.error);
     assert.deepEqual(ledger(), [], 'stopped and seen gone, so nothing is held');
   });
+});
+
+// The clients consume these lines, and the agent only the way each element is
+// quoted, so every line PowerShell is given there is rebuilt from it here.
+test('a PowerShell literal quotes every element as the contract\'s PowerShell command lines do', () => {
+  const vectors = JSON.parse(fs.readFileSync(path.join(CONTRACT, 'vectors', 'transport.json'), 'utf8'));
+  const lines = vectors.groups.commandLines.filter((entry) => entry.input.grammar === 'powershell' && entry.expect.line !== null);
+  assert.ok(lines.some((entry) => /[\u2018-\u201b]/.test(entry.input.argv.join(''))), 'the corpus covers the typographic quotes');
+  for (const entry of lines) assert.equal(`& ${entry.input.argv.map(powerShellLiteral).join(' ')}`, entry.expect.line, entry.name);
 });

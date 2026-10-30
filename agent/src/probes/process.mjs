@@ -16,14 +16,9 @@
 // none           nothing to start or stop.
 
 import { detectPlatform } from '../paths.mjs';
-import { deadline, describeFailure, runArgv, runCommand, runCommandAsync, runMutation, runMutationArgv } from '../process-runner.mjs';
+import { deadline, describeFailure, powerShellLiteral as psLiteral, runArgv, runCommand, runCommandAsync, runMutation, runMutationArgv } from '../process-runner.mjs';
 import * as appProvider from '../providers/app.mjs';
 import { packageRoot } from '../providers/npm.mjs';
-
-/** Single-quoted PowerShell literal; a literal quote is doubled. */
-function psLiteral(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
 
 function powerShellArgs(script) {
   return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script];

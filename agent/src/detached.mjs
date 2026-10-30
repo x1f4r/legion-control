@@ -1,7 +1,6 @@
 // Detached work must survive the SSH session and keep the same private state directory.
 import { spawn, spawnSync } from 'node:child_process';
-
-const psString = (value) => `'${String(value).replace(/'/g, "''")}'`;
+import { powerShellLiteral as psString } from './process-runner.mjs';
 
 // On Linux a worker started from an ssh session stays in that session's scope
 // however it is detached, and where logind runs with KillUserProcesses=yes it

@@ -63,6 +63,17 @@ export function commandLabel(file) {
 }
 
 /**
+ * A PowerShell single-quoted string that holds `value` exactly, for a script
+ * that names a path or a name. PowerShell ends such a string at any of U+2018
+ * to U+201B as well as at the ASCII quote, so each of them is written twice
+ * like it, or a profile such as C:\Users\O’Brien would end the string half
+ * way through. The clients quote the same way (contract section 15.2).
+ */
+export function powerShellLiteral(value) {
+  return `'${String(value).replace(/['\u2018\u2019\u201a\u201b]/g, (quote) => quote + quote)}'`;
+}
+
+/**
  * Shared process runner. Always an argv array, never a shell string, so a
  * Windows npm prefix or "C:\Program Files\nodejs" cannot break quoting.
  *

@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AGENT_VERSION, basePath, incomingDir } from './paths.mjs';
-import { runCommand } from './process-runner.mjs';
+import { powerShellLiteral, runCommand } from './process-runner.mjs';
 import { CONTRACT_VERSION, REASON } from './contract.mjs';
 import { isRestrictedSession } from './dispatch.mjs';
 import { stageFiles, verifyAgentArchive, verifyAgentTree, MAX_ARCHIVE_BYTES } from './archive.mjs';
@@ -245,7 +245,7 @@ function publishStableLauncher(files, base) {
   for (const name of ['install/launcher.mjs', wrapper, dispatcher]) {
     if (!Buffer.isBuffer(files.get(name))) throw new Error(`the signed bundle is missing the recovery helper ${name}`);
   }
-  const nodeLiteral = windows ? `'${process.execPath.replaceAll("'", "''")}'` : `'${process.execPath.replaceAll("'", "'\\''")}'`;
+  const nodeLiteral = windows ? powerShellLiteral(process.execPath) : `'${process.execPath.replaceAll("'", "'\\''")}'`;
   const marker = windows ? '@NODE_POWERSHELL@' : '@NODE_SHELL@';
   const wrapperText = files.get(wrapper).toString('utf8');
   if (!wrapperText.includes(marker)) throw new Error(`the signed recovery wrapper has no ${marker} placeholder`);
