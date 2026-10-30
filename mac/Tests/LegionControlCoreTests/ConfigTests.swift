@@ -788,7 +788,7 @@ struct ConfigTests {
     func stripPrivateKeys() throws {
         let json = """
         { "version": 1, "local": { "enabled": true, "name": "This Mac", "agent": "~/a.mjs" },
-          "machines": [ { "id": "pi", "ssh": { "host": "pi", "identityFile": "/Users/someone/.ssh/id" },
+          "machines": [ { "id": "pi", "ssh": { "host": "pi", "identityFile": "/Users/me/.ssh/id" },
             "endpoints": [{"id":"e","host":"h"}],
             "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
         """

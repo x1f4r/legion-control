@@ -80,15 +80,16 @@ public class SiteSenseTests
     [Fact]
     public void APrefixWithoutItsDotNeverTakesTheSubnetsItsTextBeginsLike()
     {
-        // "10.0.1" is the /24 10.0.1.0. Compared as text it also takes 10.0.10.x to 10.0.19.x, and
-        // a device two subnets away would believe it is on the machine's network.
+        // "192.168.1" is the /24 192.168.1.0. Compared as text it also takes 192.168.10.x to
+        // 192.168.19.x and 192.168.100.x to 192.168.199.x, and a device two subnets away would
+        // believe it is on the machine's network.
         var machine = MachineConfig.From(Value.Parse("""
-            { "id": "old-box", "wake": { "mac": "02:00:00:00:00:04", "lanPrefix": "10.0.1" } }
+            { "id": "old-box", "wake": { "mac": "02:00:00:00:00:04", "lanPrefix": "192.168.1" } }
             """));
         var config = new ControllerConfig { Machines = new[] { machine } };
-        Assert.True(SitePresence.Decide(config, Bindings.Empty, new[] { "10.0.1.12/24" }).IsOnNetworkOf(machine));
-        Assert.False(SitePresence.Decide(config, Bindings.Empty, new[] { "10.0.10.12/24" }).IsOnNetworkOf(machine));
-        Assert.False(SitePresence.Decide(config, Bindings.Empty, new[] { "10.0.19.12/24" }).IsOnNetworkOf(machine));
+        Assert.True(SitePresence.Decide(config, Bindings.Empty, new[] { "192.168.1.12/24" }).IsOnNetworkOf(machine));
+        Assert.False(SitePresence.Decide(config, Bindings.Empty, new[] { "192.168.10.12/24" }).IsOnNetworkOf(machine));
+        Assert.False(SitePresence.Decide(config, Bindings.Empty, new[] { "192.168.100.7/24" }).IsOnNetworkOf(machine));
 
         // A site's prefixes are parsed the same way.
         var sites = ControllerConfig.From(Value.Parse("""

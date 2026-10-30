@@ -31,8 +31,8 @@ class SiteDetectionTest {
     private val distinct = SiteConfig(
         id = "office",
         name = "Office",
-        lanPrefixes = listOf("10.4."),
-        broadcast = listOf("10.4.255.255"),
+        lanPrefixes = listOf("10.0.0."),
+        broadcast = listOf("10.0.0.255"),
     )
 
     private fun here(vararg addresses: String): List<LocalAddress> = addresses.map { LocalAddress(it, 24) }
@@ -100,15 +100,15 @@ class SiteDetectionTest {
         assertEquals(SiteMatch.Elsewhere, matchSite(listOf(home), here("192.168.100.7"), null))
         assertTrue(matchSite(listOf(home), here("192.168.1.7"), null) is SiteMatch.Confirmed)
 
-        val office = SiteConfig(id = "office", lanPrefixes = listOf("192.168.16.0/20"))
-        assertTrue(matchSite(listOf(office), here("192.168.31.4"), null) is SiteMatch.Confirmed)
-        assertEquals(SiteMatch.Elsewhere, matchSite(listOf(office), here("192.168.32.4"), null))
+        val office = SiteConfig(id = "office", lanPrefixes = listOf("10.0.0.0/25"))
+        assertTrue(matchSite(listOf(office), here("10.0.0.100"), null) is SiteMatch.Confirmed)
+        assertEquals(SiteMatch.Elsewhere, matchSite(listOf(office), here("10.0.0.200"), null))
     }
 
     @Test
     fun `a prefix that is not one matches nothing`() {
         val broken = SiteConfig(id = "broken", lanPrefixes = listOf("192.168.1.0", " 10.", "10.*"))
-        assertEquals(SiteMatch.Elsewhere, matchSite(listOf(broken), here("192.168.1.0", "10.1.2.3"), null))
+        assertEquals(SiteMatch.Elsewhere, matchSite(listOf(broken), here("192.168.1.0", "10.0.0.3"), null))
     }
 
     @Test
@@ -130,8 +130,8 @@ class SiteDetectionTest {
     fun `every attached interface is considered, not only the default route`() {
         // With a tunnel up the default network's only addresses are tunnel addresses, and asking it
         // alone would say "not at home" while the phone sits on the home Wi-Fi.
-        val match = matchSite(listOf(distinct), here("100.64.0.9", "10.4.1.7"), null)
+        val match = matchSite(listOf(distinct), here("100.64.0.9", "10.0.0.7"), null)
         assertTrue(match is SiteMatch.Confirmed)
-        assertEquals("10.4.1.7", (match as SiteMatch.Confirmed).address)
+        assertEquals("10.0.0.7", (match as SiteMatch.Confirmed).address)
     }
 }

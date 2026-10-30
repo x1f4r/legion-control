@@ -5,15 +5,15 @@ import Testing
 struct AgentBootstrapTests {
     @Test("legacy base inference accepts only recognized installed layouts")
     func layoutInference() throws {
-        #expect(try AgentBootstrap.layout(argv: ["/opt/node", "/home/My Name/base/agent/src/index.mjs"]).base == "/home/My Name/base")
-        let windows = try AgentBootstrap.layout(argv: ["C:\\Node\\node.exe", "C:\\Users\\My Name\\base\\bin\\launcher.mjs"])
-        #expect(windows.base == "C:\\Users\\My Name\\base")
-        #expect(windows.stableArgv.last == "C:\\Users\\My Name\\base\\bin\\launcher.mjs")
+        #expect(try AgentBootstrap.layout(argv: ["/opt/node", "/home/me/My Name/base/agent/src/index.mjs"]).base == "/home/me/My Name/base")
+        let windows = try AgentBootstrap.layout(argv: ["C:\\Node\\node.exe", "C:\\Users\\me\\My Name\\base\\bin\\launcher.mjs"])
+        #expect(windows.base == "C:\\Users\\me\\My Name\\base")
+        #expect(windows.stableArgv.last == "C:\\Users\\me\\My Name\\base\\bin\\launcher.mjs")
         #expect(throws: AgentBootstrap.Failure.self) { try AgentBootstrap.layout(argv: ["node", "/custom/control.mjs"]) }
         #expect(try AgentBootstrap.layout(argv: ["node", "/custom/control.mjs"], explicitBase: "/home/me/base").base == "/home/me/base")
         #expect(!AgentBootstrap.isAbsolute("~/base"))
         #expect(!AgentBootstrap.isAbsolute("/home/me/../other"))
-        #expect(try AgentBootstrap.sftpQuoted("/home/My Name/archive.tgz") == "\"/home/My Name/archive.tgz\"")
+        #expect(try AgentBootstrap.sftpQuoted("/home/me/My Name/archive.tgz") == "\"/home/me/My Name/archive.tgz\"")
     }
 
     @Test("only an authenticated actual legacy status permits bootstrap")

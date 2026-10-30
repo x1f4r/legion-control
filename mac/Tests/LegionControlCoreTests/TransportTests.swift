@@ -634,7 +634,7 @@ struct RouteBackoffTests {
 
     @Test("agent argument editing preserves spaces and rejects shell strings")
     func argumentArray() {
-        #expect(CommandArguments.parse(#"["/opt/node", "/Users/My Name/base/bin/launcher.mjs"]"#) == ["/opt/node", "/Users/My Name/base/bin/launcher.mjs"])
+        #expect(CommandArguments.parse(#"["/opt/node", "/Users/me/My Name/base/bin/launcher.mjs"]"#) == ["/opt/node", "/Users/me/My Name/base/bin/launcher.mjs"])
         #expect(CommandArguments.parse("node /agent.mjs") == nil)
         #expect(CommandArguments.parse(#"["node", ""]"#) == nil)
         #expect(!AgentToken.isValidID("service/path"))

@@ -63,9 +63,9 @@ class NetworkAddressBookTest {
     fun `addresses come out in address order, each once, with their prefix lengths`() {
         val book = NetworkAddressBook()
         book.put(wifi, null, listOf("192.168.10.7" to 24, "192.168.1.23" to 24))
-        book.put(ethernet, null, listOf("10.4.0.2" to 30, "192.168.1.23" to 24))
+        book.put(ethernet, null, listOf("10.0.0.2" to 30, "192.168.1.23" to 24))
         val snapshot = book.snapshot()
-        assertEquals(listOf("10.4.0.2", "192.168.1.23", "192.168.10.7"), snapshot.map { it.address })
+        assertEquals(listOf("10.0.0.2", "192.168.1.23", "192.168.10.7"), snapshot.map { it.address })
         assertEquals(listOf(30, 24, 24), snapshot.map { it.prefixLength })
     }
 }

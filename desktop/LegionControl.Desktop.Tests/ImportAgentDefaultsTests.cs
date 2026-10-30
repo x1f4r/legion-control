@@ -37,17 +37,17 @@ public class ImportAgentDefaultsTests
     [InlineData(RemoteShell.PowerShell)]
     public void WindowsUsesTheInstalledPowerShellWrapper(RemoteShell shell)
     {
-        var argv = ImportAgentDefaults.For(shell, "A user", false);
+        var argv = ImportAgentDefaults.For(shell, "me", false);
         Assert.Equal("powershell.exe", argv[0]);
         Assert.Contains("-File", argv);
-        Assert.Equal("C:/Users/A user/.legion-control/bin/legionctl.ps1", argv[^1]);
+        Assert.Equal("C:/Users/me/.legion-control/bin/legionctl.ps1", argv[^1]);
         Assert.DoesNotContain("node", argv);
     }
 
     [Fact]
     public void RestrictedKeysRetainTheDispatcherPrefixInsteadOfSendingAShellScript()
     {
-        Assert.Equal(new[] { "node", "/home/alice/.legion-control/agent/src/index.mjs" }, ImportAgentDefaults.For(RemoteShell.Posix, "alice", true));
-        Assert.Equal(new[] { "node", "C:/Users/alice/.legion-control/agent/src/index.mjs" }, ImportAgentDefaults.For(RemoteShell.Cmd, "alice", true));
+        Assert.Equal(new[] { "node", "/home/me/.legion-control/agent/src/index.mjs" }, ImportAgentDefaults.For(RemoteShell.Posix, "me", true));
+        Assert.Equal(new[] { "node", "C:/Users/me/.legion-control/agent/src/index.mjs" }, ImportAgentDefaults.For(RemoteShell.Cmd, "me", true));
     }
 }

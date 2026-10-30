@@ -57,14 +57,14 @@ class WakePlanTest {
     @Test
     fun `a prefix without its dot never places a machine for an address that merely starts with it`() {
         // The one case the shared plans cannot show: old-box's 10.0.0 ends in 0, where matching as
-        // text happens to agree. 10.0.1 does not: as text it takes 10.0.10.x to 10.0.19.x.
-        val box = machine("box", wake = wake(lanPrefix = "10.0.1"))
-        val away = plan(box, LocalAddress("10.0.10.12", 24))
+        // text happens to agree. 192.168.1 does not: as text it takes 192.168.10.x to 192.168.19.x.
+        val box = machine("box", wake = wake(lanPrefix = "192.168.1"))
+        val away = plan(box, LocalAddress("192.168.10.12", 24))
         assertTrue(away.steps.isEmpty())
         assertEquals(WakeSkip.Reason.ELSEWHERE, away.skipped.first().reason)
 
-        val home = plan(box, LocalAddress("10.0.1.12", 24))
-        assertEquals(listOf("10.0.1.255"), (home.steps.single() as WakeStep.Direct).broadcast)
+        val home = plan(box, LocalAddress("192.168.1.12", 24))
+        assertEquals(listOf("192.168.1.255"), (home.steps.single() as WakeStep.Direct).broadcast)
     }
 
     @Test
@@ -91,14 +91,14 @@ class WakePlanTest {
 
     @Test
     fun `with no broadcast anywhere the directed broadcast of the placing address is used, and then the limited one`() {
-        val bare = SiteConfig(id = "bare", lanPrefixes = listOf("192.168.16.0/20"))
+        val bare = SiteConfig(id = "bare", lanPrefixes = listOf("10.0.0.0/25"))
         val nas = machine("nas", site = "bare", wake = wake())
-        val directed = plan(nas, LocalAddress("192.168.20.4", 20), sites = listOf(bare)).steps.single() as WakeStep.Direct
-        assertEquals(listOf("192.168.31.255"), directed.broadcast)
+        val directed = plan(nas, LocalAddress("10.0.0.4", 25), sites = listOf(bare)).steps.single() as WakeStep.Direct
+        assertEquals(listOf("10.0.0.127"), directed.broadcast)
 
-        val unknownLength = plan(nas, LocalAddress("192.168.20.4", null), sites = listOf(bare)).steps.single() as WakeStep.Direct
+        val unknownLength = plan(nas, LocalAddress("10.0.0.4", null), sites = listOf(bare)).steps.single() as WakeStep.Direct
         assertEquals(listOf(LIMITED_BROADCAST), unknownLength.broadcast)
-        val pointToPoint = plan(nas, LocalAddress("192.168.20.4", 31), sites = listOf(bare)).steps.single() as WakeStep.Direct
+        val pointToPoint = plan(nas, LocalAddress("10.0.0.4", 31), sites = listOf(bare)).steps.single() as WakeStep.Direct
         assertEquals(listOf(LIMITED_BROADCAST), pointToPoint.broadcast)
     }
 

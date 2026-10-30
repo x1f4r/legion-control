@@ -106,11 +106,11 @@ struct WakeTests {
     func prefixesAreNotText() throws {
         // `192.168.1` used to take 192.168.10.7 because the address text starts with it, and a
         // device two subnets away believed it was at home (C8, A9).
-        let sites = [Site(id: "home", lanPrefixes: ["192.168.1"]), Site(id: "office", lanPrefixes: ["10.0.0.0/20"])]
+        let sites = [Site(id: "home", lanPrefixes: ["192.168.1"]), Site(id: "office", lanPrefixes: ["10.0.0.0/25"])]
         #expect(SiteAwareness.placement(sites: sites, addresses: [LocalAddress("192.168.10.7/24")!], confirmed: nil).matching.isEmpty)
         #expect(SiteAwareness.placement(sites: sites, addresses: [LocalAddress("192.168.1.7/24")!], confirmed: nil).matching == ["home"])
-        #expect(SiteAwareness.placement(sites: sites, addresses: [LocalAddress("10.0.10.7/24")!], confirmed: nil).matching == ["office"])
-        #expect(SiteAwareness.placement(sites: sites, addresses: [LocalAddress("10.0.16.7/24")!], confirmed: nil).matching.isEmpty)
+        #expect(SiteAwareness.placement(sites: sites, addresses: [LocalAddress("10.0.0.100/24")!], confirmed: nil).matching == ["office"])
+        #expect(SiteAwareness.placement(sites: sites, addresses: [LocalAddress("10.0.0.200/24")!], confirmed: nil).matching.isEmpty)
         // A prefix that is no prefix never matches anything.
         let broken = [Site(id: "x", lanPrefixes: ["192.168.1.5", "192.168.*"])]
         #expect(SiteAwareness.placement(sites: broken, addresses: [LocalAddress("192.168.1.5/24")!], confirmed: nil).matching.isEmpty)
@@ -124,7 +124,7 @@ struct WakeTests {
         #expect(LocalAddress("192.168.1.7/33") == nil)
         #expect(LocalAddress("192.168.1.7/024") == nil)
         #expect(LocalAddress("192.168.1.7/24")?.directedBroadcast == "192.168.1.255")
-        #expect(LocalAddress("10.0.16.9/20")?.directedBroadcast == "10.0.31.255")
+        #expect(LocalAddress("10.0.0.9/25")?.directedBroadcast == "10.0.0.127")
         // Without a length, or with too few host bits, there is nothing to derive.
         #expect(LocalAddress("192.168.1.7")?.directedBroadcast == nil)
         #expect(LocalAddress("192.168.1.7/31")?.directedBroadcast == nil)
@@ -299,7 +299,7 @@ struct WakeTests {
     func lanPrefixFallback() throws {
         let json = """
         { "version": 1, "machines": [ { "id": "x", "endpoints": [{"id":"e","host":"h","user":"me"}],
-          "wake": { "mac": "02:00:00:00:00:04", "lanPrefix": "10.0.1", "ports": [9] },
+          "wake": { "mac": "02:00:00:00:00:04", "lanPrefix": "192.168.1", "ports": [9] },
           "systems": [{"id":"l","platform":"linux","agent":["node","/a"]}] } ] }
         """
         let config = try ControllerConfig.accepted(Data(json.utf8))
@@ -308,11 +308,11 @@ struct WakeTests {
             WakePlan.plan(for: machine, in: config, placement: SiteAwareness.placement(
                 sites: [], addresses: [LocalAddress(address)!], confirmed: nil), helpers: [:], holds: [])
         }
-        #expect(plan("10.0.1.7/24").steps == [.direct(broadcasts: ["10.0.1.255"], ports: [9])])
-        // The text of 10.0.10.12 starts with "10.0.1", and the shared plans cannot show it: their
+        #expect(plan("192.168.1.7/24").steps == [.direct(broadcasts: ["192.168.1.255"], ports: [9])])
+        // The text of 192.168.10.12 starts with "192.168.1", and the shared plans cannot show it: their
         // only dot-less prefix ends in 0, where text happens to agree. The octet boundary decides.
-        #expect(plan("10.0.10.12/24").skipped.first?.reason == .elsewhere)
-        #expect(plan("10.0.10.12/24").steps.isEmpty)
+        #expect(plan("192.168.10.12/24").skipped.first?.reason == .elsewhere)
+        #expect(plan("192.168.10.12/24").steps.isEmpty)
     }
 
     @Test("readiness polls start at 5 s and back off by 8/5 to 20 s, for two minutes after a send")
@@ -326,9 +326,9 @@ struct WakeTests {
     @Test("an editor writes prefixes the way every client reads them, and refuses what is no prefix")
     func editorPrefixes() throws {
         let site = try ControllerEditor.siteEntry(id: "home", name: "Home",
-                                                  prefixes: ["192.168.1", "10.0.0.0/8", "10.20.0.0/16", "172.16.0.0/12", "192.168.1.5/32"],
+                                                  prefixes: ["192.168.1", "10.0.0.0/8", "172.16.0.0/16", "172.16.0.0/12", "192.168.1.5/32"],
                                                   broadcast: [])
-        #expect(site["lanPrefixes"] as? [String] == ["192.168.1.", "10.", "10.20.", "172.16.0.0/12", "192.168.1.5/32"])
+        #expect(site["lanPrefixes"] as? [String] == ["192.168.1.", "10.", "172.16.", "172.16.0.0/12", "192.168.1.5/32"])
         #expect(site["broadcast"] is NSNull)
         #expect(throws: ControllerEditor.EditFailure.self) {
             try ControllerEditor.siteEntry(id: "home", name: "Home", prefixes: ["192.168.1.5"], broadcast: [])
