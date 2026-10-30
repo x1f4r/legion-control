@@ -172,8 +172,10 @@ not, the agent now answers as they say.
   repository for `githubRepo`), or nothing, and a recorded value that could not
   run itself counts as none. Approve, a local edit, enrolment after a summary of
   every launch value, and the first start of a 1.4 client approve; replication
-  never does. The launcher migration under the same base and grammar is
-  accepted without asking.
+  never does. A setup file with no `controller` block written on a device that
+  applies no setup yet is a local edit of nothing and approves what it holds;
+  put over an applied setup it approves nothing. The launcher migration under
+  the same base and grammar is accepted without asking.
 - **Command lines and retry safety** (section 15). The grammar is `dispatch`
   when the system is restricted on the route, else its `shell`, else `posix`, or
   `cmd` on Windows; it is never inferred and a line is never retried in another
