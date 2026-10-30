@@ -884,10 +884,15 @@ $moduleTemporary = $LauncherModule + '.new.' + [Guid]::NewGuid().ToString('N')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'launcher.mjs') -Destination $moduleTemporary -Force
 Move-Item -LiteralPath $moduleTemporary -Destination $LauncherModule -Force
 
-$nodeLiteral = "'" + $NodeExe.Replace("'", "''") + "'"
+# PowerShell ends a single-quoted string at U+2018 to U+201B as well as at the
+# ASCII quote, so each of them is doubled, the rule agent/src/process-runner.mjs
+# powerShellLiteral follows. The wrapper is written with a byte order mark:
+# without one Windows PowerShell 5.1 reads a script in the ANSI code page, and a
+# node path that is not ASCII would come out as other characters.
+$nodeLiteral = "'" + ($NodeExe -replace "['\u2018-\u201B]", '$0$0') + "'"
 $launcherText = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'launcher.ps1') -Raw).Replace('@NODE_POWERSHELL@', $nodeLiteral)
 $launcherTemporary = $LauncherScript + '.new.' + [Guid]::NewGuid().ToString('N')
-[IO.File]::WriteAllText($launcherTemporary, $launcherText, (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($launcherTemporary, $launcherText, (New-Object Text.UTF8Encoding($true)))
 Move-Item -LiteralPath $launcherTemporary -Destination $LauncherScript -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'dispatch.ps1') -Destination (Join-Path $BinDir 'dispatch.ps1') -Force
 

@@ -6,6 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { checkoutFiles } from '../scripts/checkout-files.mjs';
+import { powerShellLiteral } from '../agent/src/process-runner.mjs';
 
 const repository = path.resolve(import.meta.dirname, '..');
 // Without carriage returns, so a checkout with Windows line endings reads the same.
@@ -255,6 +256,21 @@ test('what cannot be deleted once it is aside is named, and the next uninstall t
 
 // Windows PowerShell reads a script without a byte order mark in the ANSI code page, so anything
 // but ASCII in one is read as something else on a machine with another code page.
+test('the Windows installer quotes node into the wrapper as the agent does, and writes it with a byte order mark', () => {
+  // The class the installer doubles, read out of the installer and run here: .NET reads a class of
+  // a quote and a \u range the way JavaScript does.
+  const line = installer.match(/^\$nodeLiteral = "'" \+ \(\$NodeExe -replace "(\[[^"]+\])", '\$0\$0'\) \+ "'"$/m);
+  assert.ok(line, 'the node path is quoted with -replace');
+  const doubled = new RegExp(line[1], 'g');
+  const installerLiteral = (value) => `'${value.replace(doubled, (match) => match + match)}'`;
+  for (const node of ["C:\\Program Files\\nodejs\\node.exe", "C:\\Users\\me\\O'Brien\\node.exe",
+    ...[0x2018, 0x2019, 0x201a, 0x201b].map((point) => `C:\\Users\\me\\O${String.fromCodePoint(point)}Brien\\node.exe`)]) {
+    assert.equal(installerLiteral(node), powerShellLiteral(node), node);
+  }
+  // Windows PowerShell 5.1 reads a script without one in the ANSI code page.
+  assert.match(installer, /WriteAllText\(\$launcherTemporary, \$launcherText, \(New-Object Text\.UTF8Encoding\(\$true\)\)\)/);
+});
+
 test('every PowerShell script is ASCII, which Windows PowerShell reads the same everywhere', () => {
   const scripts = checkoutFiles(repository, ['*.ps1', '*.psm1', '*.psd1']);
   assert.ok(scripts.includes('agent/install/install-windows.ps1'), scripts.join('\n'));

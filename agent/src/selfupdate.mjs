@@ -237,6 +237,9 @@ function replayTarget(opId, variant) {
   return typeof existing.target === 'string' && existing.target.startsWith(`${variant}:`) ? existing.target : variant;
 }
 
+/** The UTF-8 byte order mark, which tells Windows PowerShell 5.1 how a script is encoded. */
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+
 /** Publish only authenticated recovery helpers, before the live tree can move. */
 function publishStableLauncher(files, base) {
   const windows = process.platform === 'win32';
@@ -249,8 +252,12 @@ function publishStableLauncher(files, base) {
   const marker = windows ? '@NODE_POWERSHELL@' : '@NODE_SHELL@';
   const wrapperText = files.get(wrapper).toString('utf8');
   if (!wrapperText.includes(marker)) throw new Error(`the signed recovery wrapper has no ${marker} placeholder`);
+  // The PowerShell wrapper opens with a byte order mark, as install-windows.ps1 writes it: without
+  // one Windows PowerShell 5.1 reads a script in the ANSI code page, and a node path that is not
+  // ASCII would come out as other characters.
+  const rendered = Buffer.from(wrapperText.replaceAll(marker, nodeLiteral));
   const outputs = [
-    [windows ? 'legionctl.ps1' : 'legionctl', Buffer.from(wrapperText.replaceAll(marker, nodeLiteral)), windows ? 0o644 : 0o755],
+    [windows ? 'legionctl.ps1' : 'legionctl', windows ? Buffer.concat([UTF8_BOM, rendered]) : rendered, windows ? 0o644 : 0o755],
     [windows ? 'dispatch.ps1' : 'dispatch.sh', files.get(dispatcher), windows ? 0o644 : 0o755],
     ['launcher.mjs', files.get('install/launcher.mjs'), 0o644],
   ];

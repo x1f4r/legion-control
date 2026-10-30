@@ -296,6 +296,8 @@ test('staged signed bootstrap installs the intended base, replays, and refuses i
     assert.equal(fs.readFileSync(path.join(base, 'bin', 'launcher.mjs'), 'utf8'), fs.readFileSync(path.join(incoming, 'install', 'launcher.mjs'), 'utf8'));
     const wrapper = path.join(base, 'bin', process.platform === 'win32' ? 'legionctl.ps1' : 'legionctl');
     assert.equal(fs.readFileSync(wrapper, 'utf8').includes('@NODE_'), false);
+    // Windows PowerShell 5.1 reads a script without a byte order mark in the ANSI code page.
+    if (process.platform === 'win32') assert.deepEqual([...fs.readFileSync(wrapper).subarray(0, 3)], [0xef, 0xbb, 0xbf]);
     assert.equal(JSON.parse(fs.readFileSync(path.join(base, 'agent.prev', 'package.json'))).version, '2.1.0');
 
     const replay = spawnSync(process.execPath, [entry, 'self-update', '--install', '--op', 'bootstrap-install-0001'], {
