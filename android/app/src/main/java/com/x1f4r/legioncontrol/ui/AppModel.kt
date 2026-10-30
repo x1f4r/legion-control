@@ -949,6 +949,15 @@ internal fun whyNotReplace(errors: List<DocumentProblem>): String? {
 }
 
 /**
+ * The line under Replace on the different-setup question, once nothing is out: what the last
+ * Replace on it came to, or the setup's latest note. While [problem] says why Replace is off, that
+ * goes before what an earlier press came to, which may say to try again when nothing can be tried
+ * until the error is fixed.
+ */
+internal fun replaceLine(outcome: SetupPeerSync.Replaced?, configError: String?, problem: String?): String? =
+    if (problem != null) configError ?: problem else outcome?.line ?: configError
+
+/**
  * The document [machineId]'s latest status says it holds, or null when it has none to go by. Found
  * by id, as Replace finds the machine it sends to: a name is free text, and another machine may
  * carry the same one.

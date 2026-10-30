@@ -693,11 +693,12 @@ fun IdentityClashSection(app: AppModel) {
         PlainAction("Leave it", enabled = true) { app.dismissIdentityClash() }
     }
     // What Replace came to is said here, where it was pressed, and so is a question it found out
-    // of date: that one stays, saying nothing was sent, until the machine's next check.
+    // of date: that one stays, saying nothing was sent, until the machine's next check. Once
+    // Replace is off for an error here, the line says which instead.
     val line = if (app.replacing) {
         "Sending this setup to ${clash.machineName}."
     } else {
-        app.replaceOutcome?.line ?: app.configError ?: app.replaceProblem
+        replaceLine(app.replaceOutcome, app.configError, app.replaceProblem)
     }
     line?.let { QuietText(it, Modifier.padding(top = 4.dp)) }
 }
