@@ -155,27 +155,56 @@ public class StateMergeTests
         var path = Path.Combine(home.Path, "operations.json");
         var window = new OperationTracker(path);
         var (first, _) = window.Begin("op-window-0001", "pi", "linux", new OperationIntent("update", "t3"));
+        // A request the window records, and forgets below because it was never sent.
+        window.Begin("op-window-0003", "pi", "linux", new OperationIntent("restart", "agent"));
         // The command line records an operation of its own while the window is open.
         new OperationTracker(path).Begin("op-command-0001", "pi", "linux", new OperationIntent("restart", "t3"));
 
-        // Something else holds the file open while the window changes the list twice.
+        // Something else holds the file open while the window changes the list three times.
         using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
         {
             window.Begin("op-window-0002", "pi", "linux", new OperationIntent("update", "agent"));
             window.Update(first with { Message = "still running" });
+            window.Forget("op-window-0003");
         }
         // Nothing was written over what the command line recorded.
         var meanwhile = new OperationTracker(path);
         Assert.NotNull(meanwhile.Find("op-command-0001"));
         Assert.Null(meanwhile.Find("op-window-0002"));
+        Assert.NotNull(meanwhile.Find("op-window-0003"));
         Assert.Empty(SetAside(path));
 
-        // What the window changed is written once the next check can read the file, beside it.
+        // What the window changed is written once the next check can read the file, beside it,
+        // and what it forgot is not taken back from the file that still held it.
         Assert.True(window.ReloadIfChanged());
+        Assert.Null(window.Find("op-window-0003"));
         var after = new OperationTracker(path);
         Assert.NotNull(after.Find("op-command-0001"));
         Assert.NotNull(after.Find("op-window-0002"));
+        Assert.Null(after.Find("op-window-0003"));
         Assert.Equal("still running", after.Find("op-window-0001")!.Message);
+    }
+
+    [Fact]
+    public void AChangeThatWaitedIsWrittenByTheNextCheckAfterAChangeThatHadNothingToWrite()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var window = new OperationTracker(path);
+        window.Begin("op-window-0001", "pi", "linux", new OperationIntent("restart", "agent"));
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            window.Forget("op-window-0001");
+        }
+        // Reads the file, now it opens, and finds no hold to release, so writes nothing.
+        window.ReleaseWakeHolds("pi", DateTimeOffset.UtcNow);
+        Assert.Null(window.Find("op-window-0001"));
+        Assert.NotNull(new OperationTracker(path).Find("op-window-0001"));
+
+        // The file is as the window last read it, and the forgotten request is written away all the same.
+        Assert.True(window.ReloadIfChanged());
+        Assert.Null(new OperationTracker(path).Find("op-window-0001"));
+        Assert.False(window.ReloadIfChanged());
     }
 
     [Fact]

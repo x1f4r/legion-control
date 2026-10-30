@@ -276,7 +276,9 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
-            if (Signature() == _signature) return false;
+            // A change still waiting is written by this check even when the file is as this side
+            // last read it, as it is after a change that opened the file and found nothing to do.
+            if (Signature() == _signature && !_unsaved) return false;
             // Read under the lock as well: a reader holding the file open can make another
             // process's rename over it fail on Windows, and that write would be lost.
             using var held = Lock();
@@ -366,10 +368,12 @@ public sealed class OperationTracker
     }
 
     /// Folds in what the other process wrote since this one last read or wrote the list. The side
-    /// that changed an entry later wins; an entry only the file has is taken; one the file held when
-    /// this side last read or wrote it and holds no more was forgotten or pruned there. A file that
-    /// is not there changes nothing here, and the next write puts this list back; one that could not
-    /// be opened changes nothing either, and nothing is written until it can be (see [Save]).
+    /// that changed an entry later wins; an entry only the file has is taken, unless the file held
+    /// it already when this side last read or wrote it, which makes it one this side forgot or
+    /// pruned since and has not written yet; one the file held then and holds no more was forgotten
+    /// or pruned there. A file that is not there changes nothing here, and the next write puts this
+    /// list back; one that could not be opened changes nothing either, and nothing is written until
+    /// it can be (see [Save]).
     private bool Merge()
     {
         // Taken before the read: a write that lands in between is then read again next time.
@@ -378,7 +382,10 @@ public sealed class OperationTracker
         _unreadable = null;
         foreach (var (id, theirs) in stored)
         {
-            if (!_operations.TryGetValue(id, out var ours) || theirs.UpdatedAt > ours.UpdatedAt) _operations[id] = theirs;
+            // A removal waiting to be written is a change like any other: a request forgotten
+            // because it was never sent would otherwise come back as one nobody knows the end of.
+            if (_operations.TryGetValue(id, out var ours) ? theirs.UpdatedAt > ours.UpdatedAt : !_onDisk.Contains(id))
+                _operations[id] = theirs;
         }
         foreach (var id in _onDisk.Where(id => !stored.ContainsKey(id))) _operations.Remove(id);
         _onDisk = stored.Keys.ToHashSet(StringComparer.Ordinal);
