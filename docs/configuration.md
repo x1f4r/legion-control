@@ -1113,8 +1113,9 @@ sent, after a preview of what it overwrites, and never from a device whose own s
 Every client sends nothing when the machine's latest status names another document than the one
 the preview was built from, or when its own setup changed since, and asks again instead: the
 override takes whatever the machine holds when it arrives. And every client decides on the reply's
-outcome: a refusal, a push the machine's lock held back and a write whose result is unknown each
-leave the question open.
+outcome, and counts the copy replaced only when that outcome is a success naming the document it
+sent: a refusal, a push the machine's lock held back, a write whose result is unknown and a success
+that names another document or none each leave the question open.
 
 Each device keeps the last thirty documents it has applied, filed by hash, which is what makes the
 three-way merge possible and what lets you look at what the setup used to be.

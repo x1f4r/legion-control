@@ -173,6 +173,14 @@ class ReplaceTheirSetupTest {
             isError = true,
             "may or may not have been replaced",
         )
+
+        // Nor does one that names none. The guardrails file it as a failure to back off from, as
+        // the desktop and the Mac read it, and it was taken here for a replacement all the same.
+        assertStays(
+            replace(Tower(Result.success(ConfigSetReply(ok = true, action = "replaced")))),
+            isError = true,
+            "may or may not have been replaced: its agent did not say which document it holds now.",
+        )
     }
 
     @Test

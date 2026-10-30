@@ -383,10 +383,17 @@ internal class SetupPeerSync(
         }
         val said = reply.message ?: reply.reason?.sentence
         return when (reply.effectiveOutcome) {
-            Outcome.SUCCEEDED -> if (reply.hash == null || reply.hash == document.hash) {
-                Replaced.Done("$name now carries this setup.")
-            } else {
-                Replaced.NotDone(
+            // Done is what every client counts as done, and what the line above recorded as one: a
+            // success naming the document sent. One naming none was filed there as a failure to
+            // back off from, and taken here for a replacement all the same.
+            Outcome.SUCCEEDED -> when (reply.hash) {
+                document.hash -> Replaced.Done("$name now carries this setup.")
+                null -> Replaced.NotDone(
+                    "The setup on $name may or may not have been replaced: its agent did not say which document it holds now.",
+                    isError = true,
+                )
+
+                else -> Replaced.NotDone(
                     "The setup on $name may or may not have been replaced: its agent answered with a document other than the one sent.",
                     isError = true,
                 )

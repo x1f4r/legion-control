@@ -490,6 +490,37 @@ struct MacModelTests {
         #expect(model.note == "The setup may or may not have been replaced: ENOSPC")
     }
 
+    @Test("a replacement is done only when the agent names the document sent, as every client reads it")
+    func setupReplacementNamesTheDocumentSent() async throws {
+        // Any success used to do, so a reply naming no document, which an automatic push of the
+        // same bytes reads as a failure, was taken for a replacement here and on Android.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced" }"#)
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced", "hash": "fedcba9876543210" }"#)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = Self.document
+        model.controllerConfig = { document }
+        await model.refresh()
+
+        model.replaceSetup(over: nil, from: document.hash)
+        await Self.settle(model)
+        let unnamed = try #require(store.newestFirst.first { $0.kind == .shareSetup })
+        #expect(unnamed.state == .unknown)
+        #expect(model.note == "The setup may or may not have been replaced: its agent did not say which document it holds now.")
+        #expect(model.noteIsError)
+
+        model.replaceSetup(over: nil, from: document.hash)
+        await Self.settle(model)
+        let other = try #require(store.newestFirst.first { $0.kind == .shareSetup })
+        #expect(other.id != unnamed.id)
+        #expect(other.state == .unknown)
+        #expect(model.note == "The setup may or may not have been replaced: its agent answered with a document other than the one sent.")
+    }
+
     @Test("a replacement goes only over the copy the question showed, from the setup it was asked over")
     func setupReplacementOverTheCopyShown() async throws {
         // The desktop's rule: `--replace` overwrites whatever the agent holds when it arrives, so a
@@ -590,7 +621,7 @@ struct MacModelTests {
     func localSetupReplacementWording() async throws {
         let runner = FakeRunner()
         runner.answer("status", json: Self.status)
-        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced" }"#)
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced", "hash": "0123456789abcdef" }"#)
         runner.answer("status", json: Self.status)
         let (model, _, directory) = try Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -244,8 +244,18 @@ extension AgentDevice {
                 // replaced the copy or not.
                 let said = result.error ?? result.message
                 switch Outcome.of(result) {
-                case .succeeded:
+                case .succeeded where result.hash == local.hash:
                     break
+                case .succeeded:
+                    // Done is what every client counts as done, and what an automatic push reads as
+                    // one: a success that names the document sent. One naming another, or none,
+                    // leaves the agent holding something nobody here can vouch for.
+                    let sentence = result.hash == nil
+                        ? "its agent did not say which document it holds now."
+                        : "its agent answered with a document other than the one sent."
+                    self.setStatus("The setup may or may not have been replaced: \(sentence)", isError: true)
+                    return .init(state: .unknown, summary: "The setup on \(self.setupHolder) may or may not have been replaced: \(sentence)",
+                                 refresh: true, unresolved: true)
                 case .deferred:
                     let sentence = said ?? result.reason?.sentence(subject: "the setup", message: nil) ?? "\(self.name) is busy."
                     self.setStatus("The setup was not replaced yet: \(sentence)")
