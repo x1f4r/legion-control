@@ -48,6 +48,14 @@ a change interrupted part way 1; nobody knows whether an interrupted change took
 An error the command line did not plan for still ends in one of the three: 1 for a command that
 only reads, 2 for one that may have changed something, with the details in the log.
 
+On Windows the app is a windowed program. A command-line run writes to the console of the cmd or
+PowerShell that started it, and output redirected to a file or a pipe goes there instead. Neither
+shell waits for a windowed program at its prompt, so the prompt can come back before the output
+does, and the exit code is there to read only when the shell waited: a batch file always does, cmd
+does with `start /wait legion-control --command status --machine pi` (then `echo %ERRORLEVEL%`), and
+PowerShell does when the output is piped, as in `legion-control --command status --machine pi |
+Out-Host` (then `$LASTEXITCODE`).
+
 `--smoke` changes nothing on disk: a setup with no controller block is not given one, a first
 start's approvals are evaluated without being recorded, no wake hold is released, and ssh's own log
 for each attempt goes to a directory of the run's own under the system's temporary one, removed
