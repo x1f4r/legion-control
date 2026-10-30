@@ -632,7 +632,7 @@ public class ReconcilerTests
         using var home = new TempHome();
         var (store, model, fake) = Build(home, Documents.Make("setup-a", 2, Array.Empty<string>()));
         var refused = JsonNode.Parse(Documents.Make("setup-b", 9, Array.Empty<string>()).Text)!.AsObject();
-        refused["machines"]![0]!["id"] = "pi‮exe.txt";
+        refused["machines"]![0]!["id"] = "pi\u202Eexe.txt";
         fake.Held = ControllerDocument.FromText(refused.ToJsonString());
         var reconciler = new Reconciler(store, Bindings.Empty);
         await model.RefreshAsync();
@@ -643,7 +643,7 @@ public class ReconcilerTests
         var lines = session.Preview.Lines().ToList();
         Assert.Contains("Machines added: \"pi\\u202Eexe.txt\"", lines);
         Assert.Contains("Machines removed: pi", lines);
-        Assert.DoesNotContain(lines, line => line.Contains('‮'));
+        Assert.DoesNotContain(lines, line => line.Contains('\u202E'));
     }
 
     [Fact]

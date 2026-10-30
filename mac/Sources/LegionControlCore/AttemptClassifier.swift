@@ -123,7 +123,7 @@ enum AttemptClassifier {
     /// The patterns are the contract's, written in lower case and matched against a line with only
     /// its ASCII letters lowered, which is exactly the contract's ASCII case-insensitivity. `\z`
     /// stands for its `$`, because an ICU `$` also matches before a final line terminator, and
-    /// `[^\r  ]` for its `.`, because ICU's dot also refuses a few characters that
+    /// `[^\r\u{2028}\u{2029}]` for its `.`, because ICU's dot also refuses a few characters that
     /// JavaScript's takes.
     private static let preDispatch: [(AgentFailure.Kind, [NSRegularExpression])] = {
         let any = "[^\\r\\u2028\\u2029]"

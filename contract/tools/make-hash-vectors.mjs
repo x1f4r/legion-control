@@ -125,7 +125,7 @@ const table = () => [
   vector(
     'surrounded-by-whitespace',
     'Whitespace of every kind in the trim set on both ends: tab, vertical tab, form feed, space, newline.',
-    ` \t\n${DOC}\n \t`,
+    `\v\f \t\n${DOC}\n \t\v\f`,
   ),
   vector(
     'non-ascii',

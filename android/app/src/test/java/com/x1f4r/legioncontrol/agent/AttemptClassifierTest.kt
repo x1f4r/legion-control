@@ -71,7 +71,7 @@ class AttemptClassifierTest {
             """{"a":1e999,"b":-0,"c":0.0e-0,"d":10,"e":2E5}""",
             "{ \"a\" :\t1\r\n,\n\"b\": [ ] , \"c\" : { } }",
             "{\"a\":\"line\\nbreak\\ttab\\u0000\"}",
-            "{\"a\":\"del\u007f and  \"}",
+            "{\"a\":\"del\u007f and \u2028\"}",
             """{"a":1,"a":2}""",
             """{"":"empty key"}""",
             "#< CLIXML\r\n{\"ok\":true}\r\n",

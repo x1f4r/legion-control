@@ -27,10 +27,10 @@ public class CanonicalTests
     [Fact]
     public void StripsOneLeadingByteOrderMarkAndNoOther()
     {
-        var once = Canonical.Bytes(Encoding.UTF8.GetBytes("﻿{}"));
-        var twice = Canonical.Bytes(Encoding.UTF8.GetBytes("﻿﻿{}"));
+        var once = Canonical.Bytes(Encoding.UTF8.GetBytes("\uFEFF{}"));
+        var twice = Canonical.Bytes(Encoding.UTF8.GetBytes("\uFEFF\uFEFF{}"));
         Assert.Equal("{}\n", Encoding.UTF8.GetString(once));
-        Assert.Equal("﻿{}\n", Encoding.UTF8.GetString(twice));
+        Assert.Equal("\uFEFF{}\n", Encoding.UTF8.GetString(twice));
     }
 
     [Fact]

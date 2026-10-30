@@ -44,7 +44,7 @@ class CanonicalSetupTest {
             "$document\n",
             "$document\n\n\n",
             document.replace("\n", "\r\n") + "\r\n",
-            "﻿$document",
+            "\uFEFF$document",
             "  \t\n$document\n \t ",
         )
         val hashes = variants.map { CanonicalSetup.hashOf(it) }.toSet()
