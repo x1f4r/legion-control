@@ -1362,6 +1362,46 @@ async function detachedRun(config, { kind, service = null, target = null, action
     ...shape, detached: true, op: wireRecord(readOperation(id)) });
 }
 
+/**
+ * Do the work an opened record asks for, in this process, exactly as the
+ * request would have done it: what a detached worker does, and what a detach
+ * that could not start one falls back to. `record` is the record, or the
+ * request it was opened for. Null for a kind that is never run detached.
+ *
+ * A service or action removed from the setup since the request was made can
+ * no longer be run, and whoever holds the record is the only one left to end
+ * it: a refusal of its own would leave it running for good.
+ */
+async function runOpened(config, record) {
+  const shared = { existingOpId: record.id, force: record.force === true, noReboot: record.noReboot === true, mode: record.mode ?? 'manual' };
+  if (record.kind === 'update' || record.kind === 'restart') {
+    const service = config.services.find((entry) => entry.id === record.service);
+    if (!service) {
+      return finishUnrunnable(record.id, {
+        ok: false,
+        action: 'failed',
+        reasonCode: REASON.unknownService,
+        message: `the ${record.kind} names ${record.service}, which this machine no longer has`,
+      });
+    }
+    return record.kind === 'update' ? runUpdate(config, service, shared) : runRestart(config, service, shared);
+  }
+  if (record.kind === 'run') {
+    if (!config.actions.some((action) => action.id === record.actionId)) {
+      return finishUnrunnable(record.id, {
+        ok: false,
+        action: 'failed',
+        reasonCode: REASON.unknownAction,
+        message: `the run names the action ${record.actionId}, which this machine no longer has`,
+      });
+    }
+    return runAction(config, record.actionId, shared);
+  }
+  if (record.kind === 'boot') return runBoot(config, record.target, shared);
+  if (record.kind === 'sleep') return runSleep(config, shared);
+  return null;
+}
+
 /** The detached worker. Never called by a client. */
 async function commandOpRun(config, positional) {
   const id = positional[0];
@@ -1369,36 +1409,8 @@ async function commandOpRun(config, positional) {
   const record = readOperation(id);
   if (!record) return badArgument(`there is no operation ${id}`, { command: 'op-run' });
 
-  const shared = { existingOpId: id, force: record.force === true, noReboot: record.noReboot === true, mode: record.mode ?? 'manual' };
-  let result;
-  if (record.kind === 'update' || record.kind === 'restart') {
-    const service = config.services.find((entry) => entry.id === record.service);
-    // Removed since the request was made: the worker is the only one left to
-    // end the record, and a refusal of its own would leave it running.
-    result = service
-      ? record.kind === 'update' ? await runUpdate(config, service, shared) : await runRestart(config, service, shared)
-      : finishUnrunnable(id, {
-        ok: false,
-        action: 'failed',
-        reasonCode: REASON.unknownService,
-        message: `the ${record.kind} names ${record.service}, which this machine no longer has`,
-      });
-  } else if (record.kind === 'run') {
-    result = config.actions.some((action) => action.id === record.actionId)
-      ? await runAction(config, record.actionId, shared)
-      : finishUnrunnable(id, {
-        ok: false,
-        action: 'failed',
-        reasonCode: REASON.unknownAction,
-        message: `the run names the action ${record.actionId}, which this machine no longer has`,
-      });
-  } else if (record.kind === 'boot') {
-    result = await runBoot(config, record.target, shared);
-  } else if (record.kind === 'sleep') {
-    result = await runSleep(config, shared);
-  } else {
-    return badArgument(`a ${record.kind} operation cannot be run detached`, { command: 'op-run' });
-  }
+  const result = await runOpened(config, record);
+  if (!result) return badArgument(`a ${record.kind} operation cannot be run detached`, { command: 'op-run' });
   return mutationReply(result, { op: wireRecord(readOperation(id)) });
 }
 
@@ -1584,14 +1596,7 @@ async function answer(command, positional, flags, options) {
   // the command's own shape, like every other answer to it.
   if (result.synchronous) {
     const fallback = result.synchronous;
-    const shared = { existingOpId: fallback.id, force: fallback.force, mode: fallback.mode };
-    let ran;
-    if (fallback.kind === 'update' || fallback.kind === 'restart') {
-      const service = loaded.config.services.find((entry) => entry.id === fallback.service);
-      ran = fallback.kind === 'update' ? await runUpdate(loaded.config, service, shared) : await runRestart(loaded.config, service, shared);
-    } else {
-      ran = await runAction(loaded.config, fallback.actionId, shared);
-    }
+    const ran = await runOpened(loaded.config, fallback);
     return mutationReply(ran, { ...commandShape(fallback.kind, fallback, ran), detached: false, op: wireRecord(readOperation(fallback.id)) });
   }
 

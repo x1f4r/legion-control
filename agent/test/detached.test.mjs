@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { windowsWorkerScript } from '../src/detached.mjs';
-import { cli, withHome, writeConfig } from './helpers.mjs';
+import { cli, commandService, fixtureConfig, fixtureData, readFixture, withHome, writeConfig } from './helpers.mjs';
 
 async function finish(home, id) {
   const deadline = Date.now() + 25000;
@@ -47,5 +48,27 @@ test('detached action survives the launching process, preserves isolation and re
     assert.equal(replay.payload.replayed, true);
     assert.equal(replay.payload.action, 'ran');
     assert.equal(fs.readFileSync(counter, 'utf8'), 'x');
+  });
+});
+
+test('a detach that cannot start its worker does the work in this session, in the command\'s own shape', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    writeConfig(home, fixtureConfig(dir, {
+      services: [commandService(dir)],
+      actions: [{ id: 'say', command: [process.execPath, '-e', 'console.log("said")'] }],
+    }));
+    const nodeArgs = ['--import', pathToFileURL(path.join(import.meta.dirname, 'no-detach.mjs')).href];
+
+    const ran = cli(['run', 'say', '--detach', '--op', 'no-worker-run-0001'], { home, nodeArgs });
+    assert.equal(ran.payload?.action, 'ran', ran.stdout + ran.stderr);
+    assert.deepEqual([ran.payload.id, ran.payload.exitCode, ran.payload.output.trim(), ran.payload.detached], ['say', 0, 'said', false]);
+    assert.equal(ran.payload.op.state, 'finished');
+
+    const updated = cli(['update', '--detach', '--op', 'no-worker-update-01'], { home, nodeArgs });
+    assert.equal(updated.payload?.action, 'updated', updated.stdout + updated.stderr);
+    assert.deepEqual([updated.payload.service, updated.payload.from, updated.payload.to, updated.payload.detached], ['demo', '1.0.0', '2.0.0', false]);
+    assert.equal(readFixture(dir, 'installed'), '2.0.0');
+    assert.equal(updated.payload.op.detached, false, 'the record says nobody detached it');
   });
 });
