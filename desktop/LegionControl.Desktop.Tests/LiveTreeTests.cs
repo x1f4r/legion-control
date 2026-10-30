@@ -199,6 +199,42 @@ public class LiveTreeTests
         window.Close();
     }
 
+    [AvaloniaFact]
+    public void TheLaunchReviewKeepsTheFocusAndWhatIsSelectedWhenTheModelChanges()
+    {
+        using var home = new TempHome();
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        var store = new ConfigStore(Path.Combine(home.Path, "config.json"), Path.Combine(home.Path, "setup-state.json"),
+            new SetupLedger(Path.Combine(home.Path, "revisions")), "laptop", watch: false);
+        File.WriteAllBytes(Path.Combine(home.Path, "config.json"), d0.Bytes);
+        using var app = new AppModel(store, FakeRunner.Replying(Repo.ReadFixture("status.full.json")),
+            new OperationTracker(Path.Combine(home.Path, "operations.json")), DesktopSettings.Default, new RecordingSink(), Bindings.Empty,
+            new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))),
+            new LaunchApprovals(Path.Combine(home.Path, "approved-launch.json")));
+        // Two commands waiting, so the sheet has a row each and Approve all.
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+        {
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/opt/elsewhere/launcher.mjs");
+            LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/opt/elsewhere/launcher.mjs");
+        });
+        Assert.Null(app.Config.Apply(d1, "adopted from tower"));
+        Assert.Equal(2, app.LaunchReview.Count);
+
+        var sheet = new LaunchReviewSheet(app);
+        sheet.Show();
+        Dispatcher.UIThread.RunJobs();
+        var approve = sheet.GetLogicalDescendants().OfType<Button>().First(button => button.Content as string == "Approve");
+        Assert.True(approve.Focus());
+        var before = Everything(sheet);
+
+        app.UpdateSettings(settings => settings);
+        Dispatcher.UIThread.RunJobs();
+
+        Assert.Same(approve, Focused(sheet));
+        Assert.Equal(before, Everything(sheet));
+        sheet.Close();
+    }
+
     private const string TraySetup = """
         {
           "version": 1,

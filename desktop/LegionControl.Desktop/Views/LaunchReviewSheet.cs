@@ -18,7 +18,11 @@ namespace LegionControl.Desktop.Views;
 public sealed class LaunchReviewSheet : Window
 {
     private readonly AppModel _app;
+    /// The entries, and the buttons under them. Each refresh builds both afresh and lays them over
+    /// these (see [LiveTree]), so a refresh while a person reads or tabs through them leaves the
+    /// focus, a screen reader's place and a selection where they were.
     private readonly StackPanel _body = Ui.Column(4);
+    private readonly StackPanel _actions = Ui.Column(0);
     private readonly TextBlock _problem = new() { Foreground = Ui.Bad, TextWrapping = TextWrapping.Wrap };
     private Button? _notNow;
     private bool _refreshQueued;
@@ -32,8 +36,12 @@ public sealed class LaunchReviewSheet : Window
         MinWidth = 420;
         FontFamily = Ui.NativeFont;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
-        _body.Margin = new Thickness(20);
-        Content = new ScrollViewer { Content = _body };
+        var page = Ui.Column(4);
+        page.Margin = new Thickness(20);
+        page.Children.Add(_body);
+        page.Children.Add(_problem);
+        page.Children.Add(_actions);
+        Content = new ScrollViewer { Content = page };
         app.Changed += QueueRefresh;
         Closed += (_, _) => app.Changed -= QueueRefresh;
         // Not now has the focus, so a stray Enter never approves anything.
@@ -60,26 +68,29 @@ public sealed class LaunchReviewSheet : Window
             Close();
             return;
         }
-        var focused = _notNow?.IsFocused ?? false;
-        _body.Children.Clear();
-        _body.Children.Add(Ui.Title(Title!));
-        _body.Children.Add(Ui.Note(LaunchGate.Provenance(_app.Config.Document?.Identity)));
-        _body.Children.Add(Ui.Note(Consequence));
+        var body = Ui.Column(4);
+        body.Children.Add(Ui.Keyed(Ui.Title(Title!), "title"));
+        body.Children.Add(Ui.Keyed(Ui.Note(LaunchGate.Provenance(_app.Config.Document?.Identity)), "provenance"));
+        body.Children.Add(Ui.Keyed(Ui.Note(Consequence), "consequence"));
 
         var config = _app.Config.Config;
         foreach (var group in entries.GroupBy(entry => entry.MachineId))
         {
-            _body.Children.Add(Ui.SectionHeading(group.Key is { } machine ? LaunchGate.Show(config?.Machine(machine)?.Name ?? machine) : "This device"));
-            foreach (var entry in group) _body.Children.Add(Row(entry));
+            body.Children.Add(Ui.Keyed(Ui.SectionHeading(group.Key is { } machine ? LaunchGate.Show(config?.Machine(machine)?.Name ?? machine) : "This device"),
+                "machine:" + group.Key));
+            foreach (var entry in group) body.Children.Add(Ui.Keyed(Row(entry), "entry:" + entry.Path));
         }
+        LiveTree.Update(_body, body);
 
-        _body.Children.Add(_problem);
-        _notNow = Ui.Action("Not now", Close);
+        var actions = Ui.Column(0);
+        var notNow = Ui.Action("Not now", Close);
         var approvable = entries.Where(entry => entry.Approvable).ToList();
-        _body.Children.Add(Ui.Actions(
+        actions.Children.Add(Ui.Keyed(Ui.Actions(
             entries.Count > 1 && approvable.Count > 0 ? Ui.Action("Approve all", () => Approve(approvable)) : null,
-            _notNow));
-        if (focused) _notNow.Focus();
+            notNow), "actions"));
+        LiveTree.Update(_actions, actions);
+        // The first build's Not now is the one shown from then on.
+        _notNow ??= notNow;
     }
 
     private Control Row(LaunchReviewEntry entry)

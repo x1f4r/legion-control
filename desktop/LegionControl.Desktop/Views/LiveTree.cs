@@ -32,8 +32,8 @@ public static class LiveTree
         Layoutable.MinWidthProperty, Layoutable.MinHeightProperty, Layoutable.MaxWidthProperty, Layoutable.MaxHeightProperty,
         Layoutable.HorizontalAlignmentProperty, Layoutable.VerticalAlignmentProperty,
         Visual.IsVisibleProperty, InputElement.IsEnabledProperty,
-        TextBlock.TextProperty, TextBlock.FontSizeProperty, TextBlock.FontWeightProperty, TextBlock.ForegroundProperty,
-        TextBlock.TextWrappingProperty,
+        TextBlock.TextProperty, TextBlock.FontSizeProperty, TextBlock.FontWeightProperty, TextBlock.FontFamilyProperty,
+        TextBlock.ForegroundProperty, TextBlock.TextWrappingProperty,
         TemplatedControl.PaddingProperty,
         StackPanel.OrientationProperty, StackPanel.SpacingProperty, Panel.BackgroundProperty,
         Border.BorderBrushProperty, Border.BorderThicknessProperty, Border.BackgroundProperty,
@@ -67,14 +67,15 @@ public static class LiveTree
     private static Control?[] Align(IReadOnlyList<Control> shown, IReadOnlyList<Control> fresh)
     {
         var kept = new Control?[fresh.Count];
+        var (shownIdentities, freshIdentities) = (shown.Select(Identity).ToArray(), fresh.Select(Identity).ToArray());
+        var (shownKinds, freshKinds) = (shown.Select(Kind).ToArray(), fresh.Select(Kind).ToArray());
         var anchors = new List<(int Fresh, int Shown)>();
         var from = 0;
         for (var index = 0; index < fresh.Count; index++)
         {
-            var identity = Identity(fresh[index]);
             for (var candidate = from; candidate < shown.Count; candidate++)
             {
-                if (Identity(shown[candidate]) != identity) continue;
+                if (shownIdentities[candidate] != freshIdentities[index]) continue;
                 kept[index] = shown[candidate];
                 anchors.Add((index, candidate));
                 from = candidate + 1;
@@ -89,10 +90,9 @@ public static class LiveTree
             var next = shownStart;
             for (var index = freshStart; index < freshEnd; index++)
             {
-                var kind = Kind(fresh[index]);
                 for (var candidate = next; candidate < shownEnd; candidate++)
                 {
-                    if (Kind(shown[candidate]) != kind) continue;
+                    if (shownKinds[candidate] != freshKinds[index]) continue;
                     kept[index] = shown[candidate];
                     next = candidate + 1;
                     break;
