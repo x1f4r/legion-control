@@ -13,6 +13,8 @@ if [[ "$component" == all || "$component" == agent ]]; then
   npm --prefix agent run check
   # The agent's own check parses the modules it ships; this parses every other script as well.
   node scripts/check-syntax.mjs
+  # And no file anywhere in the checkout holds a character that reads differently from what it is.
+  node scripts/check-invisible.mjs
   node scripts/check-versions.mjs
   npm --prefix agent test
   node --test tests/*.test.mjs
