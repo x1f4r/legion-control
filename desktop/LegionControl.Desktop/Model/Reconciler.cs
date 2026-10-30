@@ -490,6 +490,12 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
                 return null;
             }
             if (reading.Effect == PushEffect.Hold) Publish(machine.Id, Withheld(machine, state, mine.Hash));
+            // A success that names no document, or another one, is not done, and the agent's own
+            // message on it says the copy was replaced, which nobody here can vouch for.
+            if (reply is not null && Contract.Outcomes.Of(reply.Json) == OperationOutcome.Succeeded && reply.Hash != mine.Hash)
+                return $"The setup on {machine.Name} may or may not have been replaced: " + (reply.Hash is null
+                    ? "its agent did not say which document it holds now."
+                    : "its agent answered with a document other than the one sent.");
             return problem ?? reply?.Envelope.Sentence() ?? $"{machine.Name} did not take the setup.";
         }
         finally { _reconcileGate.Release(); }

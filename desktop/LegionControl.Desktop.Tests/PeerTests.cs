@@ -27,6 +27,9 @@ internal sealed class FakeMachine
     public bool Running { get; set; }
     /// Fixtures the next pushes are refused with, one per push, before the descent rule is asked.
     public Queue<string> Refusals { get; } = new();
+    /// Changes made to the replies of the next pushes the machine stores, one per push: what an
+    /// agent that stored the document and then said something else about it would print.
+    public Queue<Action<JsonObject>> Misreported { get; } = new();
     public int MetaReads { get; private set; }
     public int Reads { get; private set; }
     public Action? OnRead { get; set; }
@@ -156,6 +159,7 @@ internal sealed class FakeMachine
             reply["revision"] = pushed.Identity.RevisionNumber;
             reply["source"] = pushed.Identity.Source;
             reply["lineage"] = new JsonArray(pushed.Identity.Lineage.Select(hash => (JsonNode)hash!).ToArray());
+            if (Misreported.TryDequeue(out var change)) change(reply);
         }
         if (Refusals.TryDequeue(out var refusal)) return Reply(refusal, Pushed);
 
@@ -643,6 +647,34 @@ public class ReconcilerTests
         Assert.Contains("Machines added: \"pi\\u202Eexe.txt\"", lines);
         Assert.Contains("Machines removed: pi", lines);
         Assert.DoesNotContain(lines, line => line.Contains('\u202E'));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ASuccessThatNamesNoDocumentOrAnotherLeavesItOpenWhetherTheCopyWasReplaced(bool namesAnother)
+    {
+        // Done is what every client counts as done: a success that names the document sent. On any
+        // other success the sheet showed the agent's own message, which says the copy was replaced.
+        using var home = new TempHome();
+        var mine = Documents.Make("setup-a", 2, Array.Empty<string>());
+        var (store, model, fake) = Build(home, mine);
+        fake.Held = Documents.Make("setup-b", 9, Array.Empty<string>(), "somebody else's");
+        var reconciler = new Reconciler(store, Bindings.Empty);
+        await model.RefreshAsync();
+        var (session, _) = await reconciler.PrepareMergeAsync(model);
+
+        fake.Misreported.Enqueue(reply =>
+        {
+            if (namesAnother) reply["hash"] = new string('0', 64);
+            else reply.Remove("hash");
+        });
+        var said = await reconciler.ReplaceTheirsAsync(model, session!);
+        Assert.True(fake.SawReplace);
+        Assert.Equal($"The setup on {model.Name} may or may not have been replaced: " + (namesAnother
+            ? "its agent answered with a document other than the one sent."
+            : "its agent did not say which document it holds now."), said);
+        Assert.False(reconciler.Outcomes.TryGetValue(model.Id, out var outcome) && outcome is ReconcileOutcome.Published);
     }
 
     [Fact]
