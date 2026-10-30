@@ -412,15 +412,15 @@ export function isRunning(service) {
   return processEvidence(service).state !== 'stopped';
 }
 
+/** How long a start or a stop command gets. */
+export const PROCESS_COMMAND_MS = 60000;
+
 /**
  * Start and stop go through the mutation runner, which answers only once the
  * command has ended or its whole tree has been stopped. A start command is done
  * when it exits, and the daemon it leaves running is the whole point of it, so
  * it is never stopped for outliving the command that started it.
  */
-/** How long a start or a stop command gets. */
-export const PROCESS_COMMAND_MS = 60000;
-
 export async function startProcess(service) {
   const type = service.process?.type;
   if (type === 'systemd-user' || type === 'systemd-system') {
