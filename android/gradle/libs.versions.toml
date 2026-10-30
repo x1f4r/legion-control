@@ -2,16 +2,16 @@
 # The toolchain is pinned on purpose and the pieces are not independent. AGP 8.13 calls into a Gradle
 # internal that Gradle 9.6 removed, so the wrapper stays on the 9.5 line; the Kotlin plugin has to be
 # a 2.3 release because that is the first line that supports Gradle 9. See android/README.md.
-agp = "8.13.0"
-kotlin = "2.3.21"
+agp = "9.5.0"
+kotlin = "2.4.21"
 
-coreKtx = "1.17.0"
+coreKtx = "1.19.1"
 lifecycle = "2.9.4"
 activityCompose = "1.13.0"
-composeBom = "2026.06.01"
+composeBom = "2026.09.00"
 
 coroutines = "1.11.0"
-serialization = "1.11.0"
+serialization = "1.12.0"
 
 # sshj 0.39 is the last release that still depends on net.i2p.crypto:eddsa. That matters: the i2p
 # implementation of ed25519 is pure Java and needs no JCE provider, whereas 0.40 moved ed25519 onto
@@ -21,8 +21,8 @@ eddsa = "0.3.0"
 # Bouncy Castle checks release signatures (data/Trust.kt) with its own Ed25519 signer. sshj already
 # depends on it; it is named here because this app now calls it directly, and at the version sshj
 # resolves so that naming it changes nothing that ships.
-bouncycastle = "1.78.1"
-slf4jAndroid = "2.0.17-0"
+bouncycastle = "1.86"
+slf4jAndroid = "2.0.20-0"
 
 desugar = "2.1.5"
 junit = "4.13.2"
