@@ -1546,7 +1546,9 @@ public class LaunchGateTests
             // Read out from the setup as it is now and named by its hash, the same rename applies.
             Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--out", exported }, new StringWriter()));
             Strip();
-            Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "edit", "--in", exported, "--hash", reverted.Hash }, new StringWriter()));
+            var named = new StringWriter();
+            var code = await Runner.RunAsync(new[] { "--command", "edit", "--in", exported, "--hash", reverted.Hash }, named);
+            Assert.True(code == Runner.Ok, $"edit --in exited {code}: {named}");
             var applied = ControllerDocument.FromRaw(File.ReadAllBytes(home.ConfigPath));
             Assert.Equal("Pi upstairs", applied.Decoded.Machine("pi")!.Name);
             Assert.Equal(LaunchDocuments.Tower, LaunchProjection.Of(applied).TupleAt("tower", "linux")!.Agent);
