@@ -228,14 +228,16 @@ export function readJsonStore(file) {
 const sharingWait = new Int32Array(new SharedArrayBuffer(4));
 
 /**
- * Run a file operation again, for up to a second, while Windows refuses it
- * with EPERM, EACCES or EBUSY. A reader, the search indexer or an antivirus
+ * Run a file operation again, for up to three seconds, while Windows refuses
+ * it with EPERM, EACCES or EBUSY. A reader, the search indexer or an antivirus
  * scanner holding the destination open for a moment makes a rename over it
  * fail until it lets go, and deleting the destination first would leave a
- * moment with no file at all. So the same atomic operation is tried again.
- * Anywhere else those errors mean what they say, the first time.
+ * moment with no file at all. So the same atomic operation is tried again. A
+ * second was too short on a busy machine, where the reader that holds the
+ * file waits for the processor like everything else. Anywhere else those
+ * errors mean what they say, the first time.
  */
-export function retryWindowsSharing(operation, { platform = process.platform, waitMs = 1000 } = {}) {
+export function retryWindowsSharing(operation, { platform = process.platform, waitMs = 3000 } = {}) {
   const deadline = performance.now() + waitMs;
   let pauseMs = 10;
   for (;;) {
