@@ -856,12 +856,13 @@ answers, when the helper leaves the setup, or when a person chooses to go past i
 of the app, a network change or an unreachable helper never release it, and each device keeps its
 own holds.
 
-Going past a hold differs between the clients for now. The Mac and Android offer **Try the other
-helpers anyway**, which releases every hold and walks the whole plan again, the held helper
-included. The desktop offers **Try the other helpers** (`--try-other-helpers`), which releases the
-holds and asks only the others; when no other helper could be asked it offers **Run <helper>'s
-command again** (`--run-held-again`) instead, after a warning that the command may then run twice.
-None of them retries a boot or a sleep without reading its operation first.
+Going past a hold is the same on every client. While another helper could be asked, each offers
+**Try the other helpers** (`--try-other-helpers` on the desktop's command line), which asks after
+confirming, releases the holds and asks only the others: the held command is not run again in that
+walk, and the next wake asks every helper. When no other helper could be asked it offers **Run
+<helper>'s command again** (`--run-held-again`) instead, after a warning that the command may then
+run twice beside the first. None of them retries a boot or a sleep without reading its operation
+first.
 
 `machine.alwaysOn` changes nothing except what the apps say. A wake path whose only helpers are not
 marked always-on gets told, in the editor and in the failure message, that there is no always-on

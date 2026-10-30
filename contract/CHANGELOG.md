@@ -246,6 +246,11 @@ not, the agent now answers as they say.
   is released only by a finished record, an answer that the operation is
   unknown, the target answering, the helper leaving the setup, or a person
   choosing to try the other helpers.
+- **Going past a hold** has two forms, the same on every client. Try the other
+  helpers asks only the helpers the holds kept back, never a held command again,
+  and is offered only while one of them could be asked. With none, Run the held
+  command again is offered instead, after a warning that the command may then
+  run twice beside the first.
 - **Helpers are never woken automatically.** "Wake it first" is offered only for
   a helper skipped as asleep that has a wake block of its own.
 - **Android** tracks every network that is not a VPN, with an address book per
