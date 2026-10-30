@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
@@ -19,13 +20,15 @@ public sealed class ImportSetup : Window
         body.Children.Add(Ui.Title(Title));
         TextBox Field(string name, string value = "")
         {
-            body.Children.Add(Ui.Note(name)); var box = new TextBox { Text = value }; body.Children.Add(box); return box;
+            body.Children.Add(Ui.Note(name)); var box = new TextBox { Text = value }; body.Children.Add(box);
+            AutomationProperties.SetName(box, name); return box;
         }
         var host = Field("Host or SSH alias"); var port = Field("Port", "22"); var user = Field("SSH user (blank uses SSH configuration)");
         var identity = Field("Private SSH key path (optional)", app.Bindings.IdentityFile ?? "");
         var systemId = Field("Operating-system id", "linux");
         body.Children.Add(Ui.Note("Remote shell"));
         var shell = new ComboBox { ItemsSource = new[] { "posix", "powershell", "cmd" }, SelectedIndex = 0 }; body.Children.Add(shell);
+        AutomationProperties.SetName(shell, "Remote shell");
         var restricted = new CheckBox { Content = "This key uses the restricted agent dispatcher" }; body.Children.Add(restricted);
         var suggestedAgent = JsonSerializer.Serialize(ImportAgentDefaults.For(RemoteShell.Posix, user.Text, false));
         var argv = Field("Agent argv as a JSON array", suggestedAgent);
@@ -46,6 +49,7 @@ public sealed class ImportSetup : Window
         restricted.IsCheckedChanged += (_, _) => SuggestAgent();
         body.Children.Add(Ui.Note("Uses the installed launcher. For Windows or a restricted key, check the suggested account path; custom install locations need their exact argv."));
         var preview = new TextBox { AcceptsReturn = true, IsReadOnly = true, MinHeight = 100, MaxHeight = 200 };
+        AutomationProperties.SetName(preview, "What the machine holds");
         var problem = new TextBlock { Foreground = Ui.Bad, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
         ControllerDocument? fetched = null;
         MachineModel Build()

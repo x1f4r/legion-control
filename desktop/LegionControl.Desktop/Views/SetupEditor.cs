@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -43,6 +44,7 @@ public sealed class SetupEditor : Window
             Text = opened?.Text ?? SetupTemplates.Example,
             MinHeight = 320,
         };
+        AutomationProperties.SetName(_text, "The setup document");
 
         var body = Ui.Column(4);
         body.Margin = new Thickness(20);
@@ -144,6 +146,7 @@ public sealed class SetupEditor : Window
         {
             body.Children.Add(new TextBlock { Text = field.Label, Foreground = Ui.Muted, FontSize = 12 });
             var box = new TextBox { Text = field.Default ?? "" };
+            AutomationProperties.SetName(box, field.Label);
             boxes[field.Key] = box;
             body.Children.Add(box);
         }
@@ -345,6 +348,7 @@ public sealed class BindingsEditor : Window
     {
         body.Children.Add(new TextBlock { Text = label, Foreground = Ui.Muted, FontSize = 12 });
         var box = new TextBox { Text = value };
+        AutomationProperties.SetName(box, label);
         body.Children.Add(box);
         return box;
     }

@@ -85,6 +85,10 @@ public sealed class MainWindow : Window
         var heading = Ui.SectionHeading("Devices"); heading.Margin = new Thickness(8, 8, 0, 8);
         DockPanel.SetDock(heading, Dock.Top); navigationContent.Children.Add(heading);
         navigationContent.Children.Add(_machineList);
+        // Neither has text of its own to be read out: the list sits under a heading, and the
+        // picker that stands in for it in a narrow window has none at all.
+        Avalonia.Automation.AutomationProperties.SetName(_machineList, "Devices");
+        Avalonia.Automation.AutomationProperties.SetName(_devicePicker, "Device");
         _navigation.Child = navigationContent; _navigation.BorderBrush = Ui.Hairline;
         _navigation.BorderThickness = new Thickness(0, 0, 1, 0);
         _panes.Children.Add(_navigation);

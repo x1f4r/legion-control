@@ -1,4 +1,5 @@
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using LegionControl.Desktop.Model;
@@ -20,6 +21,7 @@ public static class Sheets
             WindowStartupLocation = WindowStartupLocation.CenterOwner };
         var body = Ui.Column(8); body.Margin = new Thickness(20);
         body.Children.Add(Ui.Note(description)); var field = new TextBox(); body.Children.Add(field);
+        AutomationProperties.SetName(field, title);
         string? answer = null;
         body.Children.Add(Ui.Actions(Ui.Action("Cancel", dialog.Close), Ui.Action("Use this path", () =>
         { answer = string.IsNullOrWhiteSpace(field.Text) ? null : field.Text.Trim(); dialog.Close(); })));
@@ -63,6 +65,7 @@ public static class Sheets
         }
         body.Children.Add(Ui.Note("The new fingerprints belong to:"));
         var select = new ComboBox { ItemsSource = groups.Select(g => g.Id).ToList(), SelectedIndex = 0 };
+        AutomationProperties.SetName(select, "The new fingerprints belong to");
         body.Children.Add(select);
         var assignments = new List<(HostPublicKey Key, ComboBox Select)>();
         for (var i = 0; i < offer.ExistingKeys.Count; i++)
@@ -70,6 +73,7 @@ public static class Sheets
             body.Children.Add(Ui.Note($"Existing pin: {offer.ExistingFingerprints[i]}"));
             var assignment = new ComboBox { ItemsSource = groups.Select(g => g.Id).ToList(), SelectedIndex = -1,
                 PlaceholderText = "Assign this existing pin to an OS" };
+            AutomationProperties.SetName(assignment, $"Operating system of the existing pin {offer.ExistingFingerprints[i]}");
             body.Children.Add(assignment); assignments.Add((offer.ExistingKeys[i], assignment));
         }
         HostApproval? answer = null;
@@ -243,6 +247,7 @@ public static class Sheets
                     MinWidth = 90,
                 };
                 var key = difference.Entry;
+                AutomationProperties.SetName(picker, $"Whose {key} to keep");
                 choices[key] = SetupChoice.Theirs;
                 picker.SelectionChanged += (_, _) =>
                     choices[key] = picker.SelectedIndex == 1 ? SetupChoice.Mine : SetupChoice.Theirs;

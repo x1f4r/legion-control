@@ -4,6 +4,7 @@ using Avalonia.Headless.XUnit;
 using Avalonia.LogicalTree;
 using Avalonia.Threading;
 using LegionControl.Desktop.Config;
+using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Model;
 using LegionControl.Desktop.Updates;
 using LegionControl.Desktop.Views;
@@ -12,7 +13,7 @@ using Xunit;
 namespace LegionControl.Desktop.Tests;
 
 /// What a person who cannot see the pointer, or cannot hover, gets from the window: every control
-/// that cannot be used says why, in text.
+/// says what it is, and every control that cannot be used says why, in text.
 public class AccessibilityTests
 {
     private const string Setup = """
@@ -55,6 +56,49 @@ public class AccessibilityTests
         (items ?? Array.Empty<object>()).OfType<MenuItem>().SelectMany(item => Items(item.ItemsSource?.Cast<object>()).Prepend(item));
 
     private static bool SaysSomething(string? text) => text is not null && text.Any(char.IsLetter);
+
+    [AvaloniaTheory]
+    [InlineData("status.full.json")]
+    [InlineData("legacy-2x.status.json")]
+    public async Task EveryControlInTheWindowSaysWhatItIs(string fixture)
+    {
+        using var home = new TempHome();
+        var (window, app) = await Window(home, Repo.ReadFixture(fixture));
+        using var _ = app;
+        var controls = window.GetLogicalDescendants().OfType<Control>().ToList();
+
+        foreach (var button in controls.OfType<Button>())
+            Assert.True(SaysSomething(button.Content as string) || SaysSomething(AutomationProperties.GetName(button)),
+                $"a button that says only \"{button.Content}\" has a name");
+        foreach (var input in controls.Where(control => control is ComboBox or ListBox or TextBox))
+            Assert.True(SaysSomething(AutomationProperties.GetName(input)), $"the {input.GetType().Name} has a name");
+        var menus = controls.Select(control => control.ContextMenu).OfType<ContextMenu>().ToList();
+        Assert.NotEmpty(menus);
+        foreach (var item in menus.SelectMany(menu => Items(menu.ItemsSource?.Cast<object>())))
+            Assert.True(SaysSomething(item.Header as string) || SaysSomething(AutomationProperties.GetName(item)), "a menu item has a name");
+        window.Close();
+    }
+
+    [AvaloniaFact]
+    public async Task EveryFieldTheSheetsAskForSaysWhatItIs()
+    {
+        using var home = new TempHome();
+        var (window, app) = await Window(home, Repo.ReadFixture("status.full.json"));
+        using var _ = app;
+        var policy = PolicyReply.From(Value.Parse(Repo.ReadFixture("policy.service.json")));
+        foreach (Window sheet in new Window[]
+                 {
+                     new ImportSetup(app), new SetupEditor(app), new BindingsEditor(app),
+                     new PolicyEditor(app.Machine("pi")!, "t3", policy),
+                 })
+        {
+            var inputs = sheet.GetLogicalDescendants().OfType<Control>().Where(control => control is ComboBox or ListBox or TextBox).ToList();
+            Assert.NotEmpty(inputs);
+            foreach (var input in inputs)
+                Assert.True(SaysSomething(AutomationProperties.GetName(input)), $"a {input.GetType().Name} in {sheet.Title} has a name");
+        }
+        window.Close();
+    }
 
     [AvaloniaFact]
     public async Task WhatAnOlderAgentCannotDoSaysSoInTheMenuItself()

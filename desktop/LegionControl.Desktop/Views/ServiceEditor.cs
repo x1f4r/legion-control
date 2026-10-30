@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Model;
@@ -25,15 +26,18 @@ public sealed class ServiceEditor : Window
         body.Children.Add(Ui.Note("This is the machine's service configuration. Validate to review the changes, then save explicitly. Existing fields are preserved by editing the complete JSON document."));
         var templates = snapshot["templates"].AsArray().ToList();
         var selected = new ComboBox { ItemsSource = templates.Select(t => t["name"].AsText() ?? t["id"].AsText()).ToList(), SelectedIndex = templates.Count > 0 ? 0 : -1 };
+        AutomationProperties.SetName(selected, "Service template");
         var editor = new TextBox { AcceptsReturn = true, AcceptsTab = true, TextWrapping = Avalonia.Media.TextWrapping.NoWrap,
             FontFamily = new Avalonia.Media.FontFamily("monospace"), MinHeight = 300,
             Text = snapshot["document"].Raw.GetRawText() };
+        AutomationProperties.SetName(editor, "The service configuration");
         var notes = new TextBlock { TextWrapping = Avalonia.Media.TextWrapping.Wrap };
         var profiles = snapshot["profiles"].AsArray().ToList();
         if (profiles.Count > 0)
         {
             body.Children.Add(Ui.SectionHeading("Add AI tool"));
             var profileChoice = new ComboBox { ItemsSource = profiles.Select(profile => profile["name"].AsText() ?? profile["id"].AsText()).ToList(), SelectedIndex = 0 };
+            AutomationProperties.SetName(profileChoice, "AI tool");
             var profileNote = new TextBlock { TextWrapping = Avalonia.Media.TextWrapping.Wrap, Foreground = Ui.Muted };
             var add = Ui.Action("Add AI tool", () =>
             {
