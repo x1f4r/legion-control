@@ -664,14 +664,13 @@ public sealed class AppInstaller
               sleep 0.5
             done
 
-            # Then every other copy: each holds the lock shared while it runs.
+            # Then every other copy: each holds the lock shared while it runs. One that outlasts the
+            # wait is most often a command line, and the window that asked for the update has
+            # closed by now, so it is started again. Were a window open after all, the second one
+            # would only bring it forward.
             if command -v flock >/dev/null 2>&1 && (: >>"$lock") 2>/dev/null; then
               exec 9>>"$lock"
-              if ! flock -x -w "$patience" 9; then
-                say "another copy of the app still runs after ${patience}s"
-                say "finished: nothing changed"
-                exit 1
-              fi
+              flock -x -w "$patience" 9 || give_up "another copy of the app still runs after ${patience}s"
             fi
 
             if [ "$mode" = update ]; then
@@ -844,16 +843,15 @@ public sealed class AppInstaller
                 exit 1
             }
 
-            # Then every other copy: each holds the lock shared while it runs.
+            # Then every other copy: each holds the lock shared while it runs. One that outlasts
+            # the wait is most often a command line, and the window that asked for the update has
+            # closed by now, so it is started again. Were a window open after all, the second one
+            # would only bring it forward.
             $until = (Get-Date).AddSeconds($patience)
             while ($null -eq $held) {
                 try { $held = [System.IO.File]::Open($lock, 'OpenOrCreate', 'ReadWrite', 'None') }
                 catch {
-                    if ((Get-Date) -gt $until) {
-                        Say "another copy of the app still runs after ${patience}s"
-                        Say 'finished: nothing changed'
-                        exit 1
-                    }
+                    if ((Get-Date) -gt $until) { GiveUp "another copy of the app still runs after ${patience}s" }
                     Start-Sleep -Milliseconds 500
                 }
             }

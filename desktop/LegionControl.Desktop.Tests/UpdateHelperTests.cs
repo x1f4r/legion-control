@@ -291,21 +291,26 @@ public class UpdateHelperTests
         : new ProcessStartInfo("/bin/sh", "-c \"sleep 60\""))!;
 
     [InstanceLockFact]
-    public void NothingIsMovedWhileAnotherCopyOfTheAppHoldsTheInstanceLock()
+    public void NothingIsMovedWhileAnotherCopyOfTheAppHoldsTheInstanceLockAndTheAppIsStartedAgain()
     {
         using var rig = new Rig();
         var installer = rig.Installer(patience: TimeSpan.FromSeconds(2));
         rig.Build(rig.Install, "1.4.0", "healthy");
         ARelease(rig, installer, "1.4.1", "healthy");
 
+        // A command line still running: the window that asked for the update has closed already.
         using (InstanceLock.Share(TimeSpan.Zero, rig.Lock))
         {
             Assert.True(installer.Apply().Started);
             Assert.Equal(1, Finish(installer));
         }
         Assert.Equal("1.4.0", rig.Version(rig.Install));
-        Assert.Empty(rig.StartsWhen(0));
-        Assert.Contains("another copy of the app still runs after 2s", rig.Log(installer));
+        Assert.False(Directory.Exists(installer.PreviousDirectory));
+        // So the build that is installed is started again, as a person would start it.
+        Assert.Equal(new[] { "1.4.0" }, rig.StartsWhen(1));
+        var log = rig.Log(installer);
+        Assert.Contains("another copy of the app still runs after 2s", log);
+        Assert.Contains("finished: nothing changed", log);
     }
 
     [UnixFact("a directory this account cannot write is made with a POSIX mode")]

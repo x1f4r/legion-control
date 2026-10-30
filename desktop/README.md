@@ -275,10 +275,12 @@ release repository must be a GitHub `owner/name`. **Install and restart** explic
 replacement helper. Checks do not download or install an app automatically.
 
 The helper waits until every copy of the app has exited, the window and any command line run
-alike, and changes nothing if one is still running after two minutes. It then copies the new build
-beside the installation and swaps the two directories by renaming them, so the installation is
-always one whole build and a file a release dropped goes with the old one. The build it replaced is
-kept beside it as `<installation>.previous`. The new build has a minute to draw its window
+alike. If one is still running after two minutes it changes nothing: a window that never closed is
+left open, and otherwise the installed build is started again, so the window that asked for the
+update comes back. Once none runs, it copies the new build beside the installation and swaps the
+two directories by renaming them, so the installation is always one whole build and a file a
+release dropped goes with the old one. The build it replaced is kept beside it as
+`<installation>.previous`. The new build has a minute to draw its window
 (`updateHealthSeconds` in `desktop-settings.json`, 10 to 600); if it does not, it is stopped, and
 once it has gone the previous build is renamed back and started. Every way out that leaves the app
 closed starts it again.
