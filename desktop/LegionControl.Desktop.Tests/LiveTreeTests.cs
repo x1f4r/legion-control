@@ -1,5 +1,7 @@
+using System.Text.Json.Nodes;
 using Avalonia.Automation;
 using Avalonia.Controls;
+using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Input;
 using Avalonia.Interactivity;
@@ -199,40 +201,102 @@ public class LiveTreeTests
         window.Close();
     }
 
+    /// A device whose setup offers two commands nobody here approved: tower's, as d0 had it until
+    /// [d1] changed it, and pi's. The approval record was seeded from d0 when the app started.
+    private static (AppModel App, ControllerDocument D1) Review(TempHome home, Action<JsonObject>? alsoChange = null)
+    {
+        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
+        File.WriteAllBytes(Path.Combine(home.Path, "config.json"), d0.Bytes);
+        var store = new ConfigStore(Path.Combine(home.Path, "config.json"), Path.Combine(home.Path, "setup-state.json"),
+            new SetupLedger(Path.Combine(home.Path, "revisions")), "laptop", watch: false);
+        var app = new AppModel(store, FakeRunner.Replying(Repo.ReadFixture("status.full.json")),
+            new OperationTracker(Path.Combine(home.Path, "operations.json")), DesktopSettings.Default, new RecordingSink(), Bindings.Empty,
+            new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))),
+            new LaunchApprovals(Path.Combine(home.Path, "approved-launch.json")));
+        var d1 = LaunchDocuments.Descendant(d0, root =>
+        {
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/opt/first/launcher.mjs");
+            LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/opt/elsewhere/launcher.mjs");
+            alsoChange?.Invoke(root);
+        });
+        Assert.Null(app.Config.Apply(d1, "adopted from tower"));
+        Assert.Equal(2, app.LaunchReview.Count);
+        return (app, d1);
+    }
+
+    private static List<Button> Buttons(Control root, string text) =>
+        root.GetLogicalDescendants().OfType<Button>().Where(button => button.Content as string == text).ToList();
+
     [AvaloniaFact]
     public void TheLaunchReviewKeepsTheFocusAndWhatIsSelectedWhenTheModelChanges()
     {
         using var home = new TempHome();
-        var d0 = LaunchDocuments.Of(LaunchDocuments.Root());
-        var store = new ConfigStore(Path.Combine(home.Path, "config.json"), Path.Combine(home.Path, "setup-state.json"),
-            new SetupLedger(Path.Combine(home.Path, "revisions")), "laptop", watch: false);
-        File.WriteAllBytes(Path.Combine(home.Path, "config.json"), d0.Bytes);
-        using var app = new AppModel(store, FakeRunner.Replying(Repo.ReadFixture("status.full.json")),
-            new OperationTracker(Path.Combine(home.Path, "operations.json")), DesktopSettings.Default, new RecordingSink(), Bindings.Empty,
-            new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))),
-            new LaunchApprovals(Path.Combine(home.Path, "approved-launch.json")));
-        // Two commands waiting, so the sheet has a row each and Approve all.
-        var d1 = LaunchDocuments.Descendant(d0, root =>
-        {
-            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/opt/elsewhere/launcher.mjs");
-            LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/opt/elsewhere/launcher.mjs");
-        });
-        Assert.Null(app.Config.Apply(d1, "adopted from tower"));
-        Assert.Equal(2, app.LaunchReview.Count);
-
+        var (app, _) = Review(home);
+        using var _app = app;
         var sheet = new LaunchReviewSheet(app);
         sheet.Show();
         Dispatcher.UIThread.RunJobs();
-        var approve = sheet.GetLogicalDescendants().OfType<Button>().First(button => button.Content as string == "Approve");
-        Assert.True(approve.Focus());
+        // Part of the command on offer selected, as a person copying it does.
+        var offered = sheet.GetLogicalDescendants().OfType<SelectableTextBlock>().First(text => text.Text!.Contains("/opt/first/launcher.mjs"));
+        Assert.True(offered.Focus());
+        offered.SelectionStart = 0;
+        offered.SelectionEnd = 8;
         var before = Everything(sheet);
 
         app.UpdateSettings(settings => settings);
         Dispatcher.UIThread.RunJobs();
 
+        Assert.Equal(before, Everything(sheet));
+        Assert.Same(offered, Focused(sheet));
+        Assert.Equal((0, 8), (offered.SelectionStart, offered.SelectionEnd));
+
+        // A button with the focus keeps it too, while what it approves stays what it was.
+        var approve = Buttons(sheet, "Approve").First();
+        Assert.True(approve.Focus());
+        app.UpdateSettings(settings => settings);
+        Dispatcher.UIThread.RunJobs();
         Assert.Same(approve, Focused(sheet));
         Assert.Equal(before, Everything(sheet));
         sheet.Close();
+    }
+
+    [AvaloniaFact]
+    public void ACommandThatChangesUnderTheFocusIsANewRowAndTheFocusGoesToNotNow()
+    {
+        using var home = new TempHome();
+        var (app, d1) = Review(home);
+        using var _app = app;
+        var sheet = new LaunchReviewSheet(app);
+        sheet.Show();
+        Dispatcher.UIThread.RunJobs();
+        var approve = Buttons(sheet, "Approve").First();
+        var approveAll = Assert.Single(Buttons(sheet, "Approve all"));
+        Assert.True(approve.Focus());
+
+        // The same place offers another command, while a person is about to press Enter on the
+        // Approve under the one they read.
+        var d2 = LaunchDocuments.Descendant(d1, root =>
+            LaunchDocuments.System(root, "tower", "linux")["agent"] = LaunchDocuments.Argv("/usr/bin/node", "/opt/second/launcher.mjs"));
+        Assert.Null(app.Config.Apply(d2, "adopted from tower"));
+        Dispatcher.UIThread.RunJobs();
+
+        var commands = sheet.GetLogicalDescendants().OfType<SelectableTextBlock>().Select(text => text.Text!).ToList();
+        Assert.Contains(commands, text => text.Contains("/opt/second/launcher.mjs"));
+        Assert.DoesNotContain(commands, text => text.Contains("/opt/first/launcher.mjs"));
+        // The old Approve, and the Approve all that covered it, are gone with what they approved.
+        Assert.Null(TopLevel.GetTopLevel(approve));
+        Assert.Null(TopLevel.GetTopLevel(approveAll));
+        var notNow = Assert.Single(Buttons(sheet, "Not now"));
+        Assert.Same(notNow, Focused(sheet));
+
+        // So the Enter does what Not now says, and approves nothing.
+        sheet.KeyPressQwerty(PhysicalKey.Enter, RawInputModifiers.None);
+        Dispatcher.UIThread.RunJobs();
+        Assert.False(sheet.IsVisible);
+        Assert.Equal(2, app.LaunchReview.Count);
+        var tower = Assert.Single(app.LaunchReview, entry => entry.MachineId == "tower");
+        Assert.Contains("/opt/second/launcher.mjs", tower.Offered.ToJsonString());
+        Assert.Contains(LaunchDocuments.TowerLauncher, tower.Approved!.ToJsonString());
     }
 
     private const string TraySetup = """

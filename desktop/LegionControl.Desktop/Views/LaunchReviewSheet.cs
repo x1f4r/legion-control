@@ -78,20 +78,34 @@ public sealed class LaunchReviewSheet : Window
         {
             body.Children.Add(Ui.Keyed(Ui.SectionHeading(group.Key is { } machine ? LaunchGate.Show(config?.Machine(machine)?.Name ?? machine) : "This device"),
                 "machine:" + group.Key));
-            foreach (var entry in group) body.Children.Add(Ui.Keyed(Row(entry), "entry:" + entry.Path));
+            foreach (var entry in group) body.Children.Add(Ui.Keyed(Row(entry), Key(entry)));
         }
+        // The focus is the whole app's: only one on a control of this sheet is this sheet's to move.
+        var focused = FocusManager?.GetFocusedElement() is Visual element && TopLevel.GetTopLevel(element) == this ? element : null;
         LiveTree.Update(_body, body);
 
         var actions = Ui.Column(0);
         var notNow = Ui.Action("Not now", Close);
         var approvable = entries.Where(entry => entry.Approvable).ToList();
         actions.Children.Add(Ui.Keyed(Ui.Actions(
-            entries.Count > 1 && approvable.Count > 0 ? Ui.Action("Approve all", () => Approve(approvable)) : null,
+            entries.Count > 1 && approvable.Count > 0
+                ? Ui.Keyed(Ui.Action("Approve all", () => Approve(approvable)), string.Join('\n', approvable.Select(Key)))
+                : null,
             notNow), "actions"));
         LiveTree.Update(_actions, actions);
         // The first build's Not now is the one shown from then on.
         _notNow ??= notNow;
+        // A button that went took the focus with it. It goes to Not now, never to a button that
+        // approves something, so the Enter meant for the old one does nothing it did not say.
+        if (focused is not null && TopLevel.GetTopLevel(focused) != this) _notNow.Focus();
     }
+
+    /// What tells one row from another: its place, and the values it shows there. An offer that
+    /// changes while this is open, or an approval another process here recorded, is a new row with
+    /// buttons of its own, so focus on the old Approve is never focus on one that approves what
+    /// nobody has read yet. Approve all is keyed by every row it approves, for the same reason.
+    private static string Key(LaunchReviewEntry entry) => string.Join('\u001f',
+        "entry:" + entry.Path, entry.Kind, entry.Approved?.ToJsonString() ?? "", entry.Offered.ToJsonString());
 
     private Control Row(LaunchReviewEntry entry)
     {
