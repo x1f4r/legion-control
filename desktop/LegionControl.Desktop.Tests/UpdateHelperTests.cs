@@ -458,6 +458,17 @@ public class UpdateHelperTests
         Assert.False(InstanceLock.IsHeldElsewhere(new FileNotFoundException()));
     }
 
+    [Fact]
+    public async Task ASecondStartAsksTheOpenWindowToComeForward()
+    {
+        using var home = new TempHome();
+        var asked = new TaskCompletionSource();
+        using var watching = InstanceLock.WhenAskedToShow(() => asked.TrySetResult());
+        Assert.NotNull(watching);
+        InstanceLock.AskWindowToShow();
+        Assert.Same(asked.Task, await Task.WhenAny(asked.Task, Task.Delay(TimeSpan.FromSeconds(10))));
+    }
+
     private static void SetMode(string path, UnixFileMode mode)
     {
         if (OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();

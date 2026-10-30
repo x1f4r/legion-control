@@ -17,6 +17,7 @@ public partial class App : Application
     private MainWindow? _window;
     private TrayIcon? _tray;
     private Action? _trayChanged;
+    private IDisposable? _showRequests;
     private DateTimeOffset _failureShown = DateTimeOffset.MinValue;
 
     public override void Initialize() => AvaloniaXamlLoader.Load(this);
@@ -46,6 +47,9 @@ public partial class App : Application
             // while being removed; leaving them until ShutdownStarted is too late on Linux.
             desktop.Exit += (_, _) => ReleaseApplicationResources();
             SetUpTray(desktop);
+            // A second start of the app finds this window open and asks for it, rather than
+            // opening another (see [InstanceLock]).
+            _showRequests = InstanceLock.WhenAskedToShow(() => Dispatcher.UIThread.Post(ShowWindow));
             var args = desktop.Args ?? Array.Empty<string>();
             HandleUpdateMarker(_window, args);
             HandleDebugFlags(desktop, args);
@@ -57,6 +61,8 @@ public partial class App : Application
     {
         try
         {
+            _showRequests?.Dispose();
+            _showRequests = null;
             if (_model is not null && _trayChanged is not null) _model.Changed -= _trayChanged;
             TrayIcon.SetIcons(this, null);
             _tray = null;
@@ -134,6 +140,7 @@ public partial class App : Application
     {
         if (_window is null) return;
         _window.Show();
+        if (_window.WindowState == WindowState.Minimized) _window.WindowState = WindowState.Normal;
         _window.Activate();
     }
 

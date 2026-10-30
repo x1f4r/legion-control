@@ -20,7 +20,8 @@ namespace LegionControl.Desktop.Updates;
 ///
 /// The window also holds `window.lock` in the state directory, so a second window does not open
 /// over the first: two windows would each poll every machine, and either could start an update
-/// the other would then be swapped out from under. Neither file is ever deleted, so two processes
+/// the other would then be swapped out from under. A second start asks the first window to come
+/// forward instead, through `window.show`. None of these files is ever deleted, so two processes
 /// can never each lock a different file of the same name.
 public static class InstanceLock
 {
@@ -31,6 +32,8 @@ public static class InstanceLock
         installation.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + ".lock";
 
     public static string WindowPath => Path.Combine(AppPaths.Home, "window.lock");
+
+    public static string ShowPath => Path.Combine(AppPaths.Home, "window.show");
 
     /// The shared lock, for the life of the process, or null when it could not be had within
     /// [patience]. That is an update helper in the middle of a swap, which takes seconds, or a
@@ -111,4 +114,43 @@ public static class InstanceLock
         ? error.HResult is unchecked((int)0x80070020) or unchecked((int)0x80070021)
         // EWOULDBLOCK from the flock .NET takes for a FileShare, which it gives as the error.
         : error.HResult == (OperatingSystem.IsLinux() ? 11 : 35);
+
+    /// Asks the window open on this state directory to come forward, for a second start that
+    /// found it open. Started again from a menu, the app would otherwise seem to do nothing while
+    /// its window sits minimised or behind another; a Windows build has no console to say so in.
+    public static void AskWindowToShow(string? path = null)
+    {
+        try
+        {
+            File.WriteAllText(path ?? ShowPath, DateTimeOffset.UtcNow.ToString("o"));
+        }
+        catch (Exception)
+        {
+            // The window stays where it is, and the log says a second start came and went.
+        }
+    }
+
+    /// Calls [show] whenever a second start asks, until it is disposed, or null when the state
+    /// directory cannot be watched. [show] runs on a thread of the watcher's.
+    public static IDisposable? WhenAskedToShow(Action show, string? path = null)
+    {
+        path ??= ShowPath;
+        try
+        {
+            var directory = Path.GetDirectoryName(path) ?? ".";
+            Directory.CreateDirectory(directory);
+            var watcher = new FileSystemWatcher(directory, Path.GetFileName(path))
+            {
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+            };
+            watcher.Changed += (_, _) => show();
+            watcher.Created += (_, _) => show();
+            watcher.EnableRaisingEvents = true;
+            return watcher;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
 }

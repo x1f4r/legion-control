@@ -72,10 +72,10 @@ The window and the command line both write these files. Each change takes the fi
 reads it again and applies only that change, so neither writes back what the other changed since
 it started. A file that is there but cannot be read is moved aside to `<name>.corrupt-<unix time>`
 before anything is written in its place, and the log says so. Only one window opens on a state
-directory (`window.lock`); a second start of the window says it is already open and exits. Every
-copy of the app, the window and the command line alike, also holds `<installation>.lock` beside the
-installation directory while it runs, so an update never renames the installation while anything
-runs from it, whichever state directory that uses.
+directory (`window.lock`); a second start of the window brings the open one forward (`window.show`)
+and exits. Every copy of the app, the window and the command line alike, also holds
+`<installation>.lock` beside the installation directory while it runs, so an update never renames
+the installation while anything runs from it, whichever state directory that uses.
 
 Three environment variables move all of it, which is how a test run touches nothing that matters:
 
