@@ -5,6 +5,7 @@ import com.x1f4r.legioncontrol.agent.AgentStatus
 import com.x1f4r.legioncontrol.agent.ConfigSetReply
 import com.x1f4r.legioncontrol.agent.ControllerFetch
 import com.x1f4r.legioncontrol.agent.ControllerMark
+import com.x1f4r.legioncontrol.agent.Outcome
 import com.x1f4r.legioncontrol.agent.ReasonCode
 import com.x1f4r.legioncontrol.agent.SetupAdmission
 import com.x1f4r.legioncontrol.agent.SetupDecision
@@ -25,6 +26,7 @@ import com.x1f4r.legioncontrol.agent.settledKey
 import com.x1f4r.legioncontrol.data.CanonicalSetup
 import com.x1f4r.legioncontrol.data.DocumentAcceptance
 import com.x1f4r.legioncontrol.data.Intake
+import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupJson
 import com.x1f4r.legioncontrol.data.SetupOutcome
 
@@ -262,6 +264,131 @@ internal class SetupPeerSync(
             }
         }
     }
+
+    /** What Replace on the different-setup question came to, and the line to show for it. */
+    sealed interface Replaced {
+        val line: String
+        val isError: Boolean
+
+        /** The machine holds this device's document now, and the question is closed. */
+        data class Done(override val line: String) : Replaced {
+            override val isError: Boolean get() = false
+        }
+
+        /**
+         * Nothing was sent, because the question on screen is no longer the one either side would
+         * ask. It is closed, and the next status asks again from what both hold then.
+         */
+        data class Stale(override val line: String) : Replaced {
+            override val isError: Boolean get() = false
+        }
+
+        /**
+         * Not replaced, or not known to be, so the question stays open. Not an error for a push the
+         * machine's lock held back, which is a later attempt rather than a refusal.
+         */
+        data class NotDone(override val line: String, override val isError: Boolean) : Replaced
+    }
+
+    /**
+     * Sends this device's document over [clash]'s machine with `--replace`, the one command that
+     * overwrites a different setup, and only while the question still stands: the document in force
+     * is the one the question was built against, and [latestHash], the hash the machine's latest
+     * status names, is still the document it showed. `--replace` takes whatever the machine holds by
+     * the time it arrives, so a newer copy nobody here has seen is never overwritten on a question
+     * about an older one.
+     *
+     * Decided on the reply's outcome (contract section 5.6), never on its being a reply: a refusal,
+     * a push the lock held back and a write the agent failed part way through all come back as
+     * replies, and only the first of them replaced nothing for certain.
+     */
+    suspend fun replace(client: MachineClient, clash: SetupIdentityClash, latestHash: String?): Replaced =
+        sendReplace(client, clash, latestHash).also { replaced ->
+            // Closed only if it is still the question on screen: another may have come up while
+            // the request was out.
+            if (replaced !is Replaced.NotDone && services.identityClash.value == clash) services.clearIdentityClash()
+        }
+
+    private suspend fun sendReplace(client: MachineClient, clash: SetupIdentityClash, latestHash: String?): Replaced {
+        val name = clash.machineName
+        val document = services.document.value?.takeIf { it.hash == clash.mineProvenance?.hash }
+            ?: return Replaced.Stale("The setup here changed while this was open; comparing again.")
+        val identity = document.identity ?: return Replaced.NotDone("This device's setup has no identity to send yet.", isError = true)
+        if (latestHash != null && latestHash != clash.theirProvenance.hash) {
+            return Replaced.Stale(
+                if (latestHash == document.hash) {
+                    "$name carries this setup already."
+                } else {
+                    "$name holds another document now, not the one shown. Nothing was sent; it is compared again at its next check."
+                },
+            )
+        }
+        val state = state(client.machine.id)
+        state.inFlight = true
+        val result = try {
+            client.configSet(
+                canonicalDocument = document.canonicalText,
+                setupId = identity.id,
+                revision = identity.revision,
+                replace = true,
+            )
+        } finally {
+            state.inFlight = false
+        }
+        val reply = result.getOrNull()
+        // Kept as a push's reply is, so the guardrails see it: a refusal no retry can cure holds
+        // this hash for that machine, and a request that did not go through backs off.
+        state.record(afterPush(reply, document.hash), reply, document.hash, clock())
+
+        if (reply == null) {
+            val failure = result.exceptionOrNull()
+            val sentence = failure?.sentence ?: "$name did not answer."
+            return if (failure?.dispatchStage?.mayHaveRun != false) {
+                Replaced.NotDone("The setup on $name may or may not have been replaced: $sentence", isError = true)
+            } else {
+                Replaced.NotDone("The setup on $name was not replaced: $sentence", isError = true)
+            }
+        }
+        val said = reply.message ?: reply.reason?.sentence
+        return when (reply.effectiveOutcome) {
+            Outcome.SUCCEEDED -> if (reply.hash == null || reply.hash == document.hash) {
+                Replaced.Done("$name now carries this setup.")
+            } else {
+                Replaced.NotDone(
+                    "The setup on $name may or may not have been replaced: its agent answered with a document other than the one sent.",
+                    isError = true,
+                )
+            }
+
+            Outcome.DEFERRED -> Replaced.NotDone(
+                "The setup on $name was not replaced yet: ${ending(said ?: "it was busy with a change")} Try again once that has finished.",
+                isError = false,
+            )
+
+            Outcome.FAILED -> Replaced.NotDone("The setup on $name was not replaced: ${refusal(reply)}", isError = true)
+
+            Outcome.UNKNOWN, Outcome.PENDING -> Replaced.NotDone(
+                "The setup on $name may or may not have been replaced: ${ending(said ?: "its agent could not say")}",
+                isError = true,
+            )
+        }
+    }
+
+    /** Why a machine refused a document, as the end of a sentence. */
+    private fun refusal(reply: ConfigSetReply): String {
+        val problem = reply.problems?.firstOrNull()?.let { listOfNotNull(it.path, it.message).joinToString(": ") }
+        val why = when {
+            reply.reasonCode == ReasonCode.RESTRICTED.wire ->
+                "this device's key is restricted there, and a restricted key may not publish commands that machine does not hold" +
+                    (reply.launchChanges?.takeIf { it.isNotEmpty() }?.let { ": ${it.take(3).joinToString(", ")}" } ?: "")
+            problem != null -> problem
+            else -> reply.message ?: reply.reason?.sentence ?: "it refused the document"
+        }
+        return ending(why)
+    }
+
+    /** [text] closed as a sentence. */
+    private fun ending(text: String): String = if (text.endsWith(".") || text.endsWith("!") || text.endsWith("?")) text else "$text."
 
     /**
      * Another setup, or a branch of this one: a person decides, from the machine's own bytes, so

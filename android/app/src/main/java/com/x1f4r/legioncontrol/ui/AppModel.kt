@@ -651,6 +651,10 @@ class AppModel(
      * Replaces a machine's different setup with this one. The only place `--replace` is ever sent,
      * so it goes to the machine that served the copy on screen, found by its id: a name is free
      * text, and another machine may carry the same one.
+     *
+     * The question closes only when the machine says it took the document, or when it is out of
+     * date and the next status asks again. A refusal, a push the lock held back and a reply that
+     * leaves it open whether the copy was replaced all keep it on screen.
      */
     fun replaceTheirSetup() {
         val clash = identityClash ?: return
@@ -660,21 +664,16 @@ class AppModel(
             configError = it
             return
         }
-        val document = services.document.value ?: return
-        val identity = document.identity ?: return
+        val latest = machines.firstOrNull { it.machine.id == clash.machineId }?.status?.controller?.hash
         scope.launch {
-            client.configSet(
-                canonicalDocument = document.canonicalText,
-                setupId = identity.id,
-                revision = identity.revision,
-                replace = true,
-            ).fold(
-                onSuccess = {
-                    configNote = "${clash.machineName} now carries this setup."
-                    services.clearIdentityClash()
-                },
-                onFailure = { configError = it.sentence },
-            )
+            val replaced = sync.replace(client, clash, latest)
+            if (replaced.isError) {
+                configNote = null
+                configError = replaced.line
+            } else {
+                configError = null
+                configNote = replaced.line
+            }
         }
     }
 
