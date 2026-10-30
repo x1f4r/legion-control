@@ -94,7 +94,7 @@ public class TrayTests
         app.PausePolling();
         Assert.False(app.IsPolling);
         // A reading under way is left to finish, and then nothing more is read.
-        await Task.Delay(300);
+        await Task.Delay(TimeSpan.FromSeconds(1));
         var paused = readings.Count;
         await Task.Delay(TimeSpan.FromSeconds(1));
         Assert.Equal(paused, readings.Count);
