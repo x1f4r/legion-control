@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.Versioning;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Transport;
@@ -8,10 +9,10 @@ namespace LegionControl.Desktop.Tests;
 
 public class ImportAgentDefaultsTests
 {
-    [Fact]
+    [UnixFact("The command line is run by /bin/sh, as a POSIX machine's sshd would run it.")]
+    [UnsupportedOSPlatform("windows")]
     public async Task PosixImportUsesTheRemoteHomeLauncherWithoutNodeOnPathAndForwardsTheConfigRequest()
     {
-        if (OperatingSystem.IsWindows()) return;
         using var temporary = new TempHome();
         var home = Path.Combine(temporary.Path, "home with ' quotes");
         var bin = Path.Combine(home, ".legion-control", "bin");
