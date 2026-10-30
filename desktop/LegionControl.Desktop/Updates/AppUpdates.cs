@@ -285,8 +285,9 @@ public sealed class AppInstaller
     /// The process the helper waits for first: this one, which exits once the helper is started.
     public int ProcessId { get; init; } = Environment.ProcessId;
 
-    /// The lock every copy of the app holds shared while it runs (see [InstanceLock]).
-    public string InstanceLockPath { get; init; } = InstanceLock.SharedPath;
+    /// The lock every copy of the app run from this installation holds shared while it runs (see
+    /// [InstanceLock]).
+    public string InstanceLockPath => InstanceLock.PathFor(InstallDirectory);
 
     public string StagedDirectory => Path.Combine(StagingRoot, "staged");
     /// The build that is not running: the one the last update replaced, or the one the last

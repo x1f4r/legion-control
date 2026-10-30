@@ -10,22 +10,32 @@ namespace LegionControl.Desktop.Updates;
 /// the process that started the update is not enough, because that is never the only copy that
 /// can run: a window can be open while a scheduled command line runs.
 ///
-/// So every copy, the window and the command line alike, holds `instance.lock` shared from its
-/// start to its exit, and the update helper takes it exclusively before it moves anything. The
-/// window also holds `window.lock` on its own, so a second window does not open over the first:
-/// two windows would each poll every machine, and either could start an update the other would
-/// then be swapped out from under. Both files sit in the state directory and are never deleted, so
-/// two processes can never each lock a different file of the same name.
+/// So every copy, the window and the command line alike, holds `<installation>.lock` shared from
+/// its start to its exit, and the update helper takes it exclusively before it moves anything. It
+/// sits beside the installation rather than in the state directory, because the installation is
+/// what it guards: a copy started with `LEGION_CONTROL_HOME` pointing at a second setup runs from
+/// the same files as the first. That directory is the one an update renames in, so wherever an
+/// update can happen at all, the lock can be had; where this account cannot write it, the app
+/// runs without one and no update is started either.
+///
+/// The window also holds `window.lock` in the state directory, so a second window does not open
+/// over the first: two windows would each poll every machine, and either could start an update
+/// the other would then be swapped out from under. Neither file is ever deleted, so two processes
+/// can never each lock a different file of the same name.
 public static class InstanceLock
 {
-    public static string SharedPath => Path.Combine(AppPaths.Home, "instance.lock");
+    public static string SharedPath => PathFor(AppContext.BaseDirectory);
+
+    /// The lock of the installation in [installation]: a file beside it, named after it.
+    public static string PathFor(string installation) =>
+        installation.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + ".lock";
 
     public static string WindowPath => Path.Combine(AppPaths.Home, "window.lock");
 
     /// The shared lock, for the life of the process, or null when it could not be had within
     /// [patience]. That is an update helper in the middle of a swap, which takes seconds, or a
-    /// state directory this account cannot write. Either way the app runs without it: refusing to
-    /// start over a lock is worse than an update that waits a little less for this copy.
+    /// directory this account cannot write. Either way the app runs without it: refusing to start
+    /// over a lock is worse than an update that waits a little less for this copy.
     public static FileStream? Share(TimeSpan patience, string? path = null)
     {
         path ??= SharedPath;
@@ -34,7 +44,6 @@ public static class InstanceLock
         {
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
                 return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
             }
             catch (IOException error) when (IsHeldElsewhere(error) && DateTimeOffset.UtcNow < until)

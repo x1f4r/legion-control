@@ -28,7 +28,8 @@ public class UpdateHelperTests
         public string Staging => Path.Combine(Root, "updates");
         public string Starts => Path.Combine(Root, "starts.txt");
         public string Pids => Path.Combine(Root, "pids.txt");
-        public string Lock => Path.Combine(Root, "instance.lock");
+        /// Beside the installation, where every copy run from it holds its lock.
+        public string Lock => InstanceLock.PathFor(Install);
 
         public AppInstaller Installer(TimeSpan? health = null, int? waitFor = null, TimeSpan? patience = null) => new()
         {
@@ -38,7 +39,6 @@ public class UpdateHelperTests
             HealthWindow = health ?? TimeSpan.FromSeconds(20),
             ExitWindow = patience ?? TimeSpan.FromSeconds(20),
             ProcessId = waitFor ?? GoneProcess(),
-            InstanceLockPath = Lock,
         };
 
         /// A build called [version] in [directory]. [behaviour] is what it does when the helper
@@ -398,13 +398,27 @@ public class UpdateHelperTests
     public void EveryCopySharesTheLockTheHelperTakesAlone()
     {
         using var home = new TempHome();
-        using var window = InstanceLock.Share(TimeSpan.Zero);
-        using var commandLine = InstanceLock.Share(TimeSpan.Zero);
+        var path = Path.Combine(home.Path, "legion-control.lock");
+        using var window = InstanceLock.Share(TimeSpan.Zero, path);
+        using var commandLine = InstanceLock.Share(TimeSpan.Zero, path);
         Assert.NotNull(window);
         Assert.NotNull(commandLine);
         // What the update helper asks for, and cannot have while either runs.
-        var refused = Assert.ThrowsAny<IOException>(() => new FileStream(InstanceLock.SharedPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
+        var refused = Assert.ThrowsAny<IOException>(() => new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
         Assert.True(InstanceLock.IsHeldElsewhere(refused));
+    }
+
+    [Fact]
+    public void TheLockIsKeptBesideTheInstallationWhateverStateDirectoryARunUses()
+    {
+        // Two setups run from one installation are one installation to rename.
+        using var home = new TempHome();
+        var installation = Path.Combine(home.Path, "apps", "legion-control");
+        Assert.Equal(Path.Combine(home.Path, "apps", "legion-control.lock"), InstanceLock.PathFor(installation));
+        Assert.Equal(InstanceLock.PathFor(installation), InstanceLock.PathFor(installation + Path.DirectorySeparatorChar));
+        Assert.Equal(InstanceLock.PathFor(installation), new AppInstaller { InstallDirectory = installation }.InstanceLockPath);
+        Assert.Equal(InstanceLock.PathFor(AppContext.BaseDirectory), InstanceLock.SharedPath);
+        Assert.DoesNotContain(AppPaths.Home, InstanceLock.SharedPath);
     }
 
     [Fact]
