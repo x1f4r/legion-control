@@ -1,3 +1,6 @@
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Threading;
 using Tmds.DBus.Protocol;
 
 namespace LegionControl.Desktop.Views;
@@ -13,6 +16,28 @@ namespace LegionControl.Desktop.Views;
 public static class TrayHost
 {
     private const string Watcher = "org.kde.StatusNotifierWatcher";
+
+    /// Keeps [window] in the tray from now on. A person closing it hides it there while
+    /// [trayShown] says a tray is drawn, and ends the app with [quit] while none is; a close the
+    /// app asks for, and the end of the session, still close it.
+    public static void KeepInTray(IClassicDesktopStyleApplicationLifetime desktop, Window window, Func<Task<bool>> trayShown, Action quit)
+    {
+        // Hidden, the window is still the app's main window: the app ends when it really closes,
+        // as when the session ends, and not when the last sheet open beside it does.
+        desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
+        window.Closing += (_, closing) =>
+        {
+            if (!MainWindow.HidesInsteadOfClosing(closing.CloseReason, closing.IsProgrammatic)) return;
+            closing.Cancel = true;
+            // Once the close has been turned down, rather than from inside it: where the tray
+            // answers at once, as on Windows, the platform would still be handling the close.
+            Dispatcher.UIThread.Post(() => Ui.Run(window, "Closing the window", async () =>
+            {
+                if (await trayShown()) window.Hide();
+                else quit();
+            }));
+        };
+    }
 
     /// [sessionBus] is the bus to ask, or null for this session's own.
     public static async Task<bool> IsShownAsync(string? sessionBus = null)

@@ -109,20 +109,7 @@ public partial class App : Application
             _trayMenu = null;
             return;
         }
-        // Hidden, the window is still the app's main window: the app ends when it really closes, as
-        // when the session ends, and not when the last sheet open beside it does.
-        desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
-        window.Closing += (_, closing) =>
-        {
-            if (!MainWindow.HidesInsteadOfClosing(closing.CloseReason, closing.IsProgrammatic)) return;
-            closing.Cancel = true;
-            // Once the close has been turned down, rather than from inside it.
-            Dispatcher.UIThread.Post(() => Ui.Run(window, "Closing the window", async () =>
-            {
-                if (await TrayHost.IsShownAsync()) window.Hide();
-                else desktop.Shutdown();
-            }));
-        };
+        TrayHost.KeepInTray(desktop, window, () => TrayHost.IsShownAsync(), () => desktop.Shutdown());
     }
 
     private void ShowWindow()

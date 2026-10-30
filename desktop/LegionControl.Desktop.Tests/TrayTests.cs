@@ -1,5 +1,8 @@
 using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Headless.XUnit;
+using Avalonia.Platform;
+using Avalonia.Threading;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Model;
 using LegionControl.Desktop.Transport;
@@ -69,6 +72,65 @@ public class TrayTests
         Assert.False(MainWindow.HidesInsteadOfClosing(WindowCloseReason.WindowClosing, isProgrammatic: true));
         Assert.False(MainWindow.HidesInsteadOfClosing(WindowCloseReason.ApplicationShutdown, isProgrammatic: true));
         Assert.False(MainWindow.HidesInsteadOfClosing(WindowCloseReason.OSShutdown, isProgrammatic: false));
+    }
+
+    /// What the platform calls when a person closes [window], or the session ending closes it, with
+    /// the reason; true turns the close down. Avalonia keeps that callback out of the API it
+    /// publishes for apps, so the test reaches it where the platform does, on the window's
+    /// implementation.
+    private static bool PlatformCloses(Window window, WindowCloseReason reason)
+    {
+        var implementation = window.PlatformImpl!;
+        var closing = (Func<WindowCloseReason, bool>)typeof(IWindowImpl).GetProperty("Closing")!.GetValue(implementation)!;
+        return closing(reason);
+    }
+
+    [AvaloniaFact]
+    public void ClosingTheWindowHidesItOnceTheCloseIsTurnedDownAndQuitsWhereThereIsNoTray()
+    {
+        using var lifetime = new ClassicDesktopStyleApplicationLifetime();
+        var tray = true;
+        var quits = 0;
+        var window = new Window();
+        var closed = false;
+        window.Closed += (_, _) => closed = true;
+        TrayHost.KeepInTray(lifetime, window, () => Task.FromResult(tray), () => quits++);
+        // Hidden, the window still decides when the app ends, rather than the last sheet beside it.
+        Assert.Equal(ShutdownMode.OnMainWindowClose, lifetime.ShutdownMode);
+        window.Show();
+
+        // What the platform asks when a person closes the window. True turns the close down.
+        Assert.True(PlatformCloses(window, WindowCloseReason.WindowClosing));
+        // The window is hidden just after the close, not from inside it.
+        Assert.True(window.IsVisible);
+        Dispatcher.UIThread.RunJobs();
+        Assert.False(window.IsVisible);
+        Assert.False(closed);
+        Assert.Equal(0, quits);
+
+        // With no tray to bring it back from, the same close ends the app.
+        window.Show();
+        tray = false;
+        Assert.True(PlatformCloses(window, WindowCloseReason.WindowClosing));
+        Dispatcher.UIThread.RunJobs();
+        Assert.Equal(1, quits);
+
+        // The end of the session closes it for real.
+        Assert.False(PlatformCloses(window, WindowCloseReason.OSShutdown));
+        Dispatcher.UIThread.RunJobs();
+        Assert.True(closed);
+        Assert.Equal(1, quits);
+
+        // And so does a close the app asks for, as Quit does.
+        var other = new Window();
+        var otherClosed = false;
+        other.Closed += (_, _) => otherClosed = true;
+        TrayHost.KeepInTray(lifetime, other, () => Task.FromResult(true), () => quits++);
+        other.Show();
+        other.Close();
+        Dispatcher.UIThread.RunJobs();
+        Assert.True(otherClosed);
+        Assert.Equal(1, quits);
     }
 
     [Fact]
