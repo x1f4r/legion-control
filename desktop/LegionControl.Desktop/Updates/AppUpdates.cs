@@ -347,6 +347,13 @@ public sealed class AppInstaller
     /// Where [AppUpdates.DownloadAsync] puts the archive called [assetName].
     public string DownloadPath(string assetName) => Path.Combine(StagingRoot, Path.GetFileName(assetName));
 
+    /// Deletes the archive called [assetName], for an update that stops before [Stage] would have
+    /// deleted it: a hundred megabytes that nothing will unpack.
+    public void Discard(string assetName)
+    {
+        try { File.Delete(DownloadPath(assetName)); } catch (Exception) { }
+    }
+
     /// Unpacks the archive into a clean staging directory, refusing anything that would write
     /// outside it. An archive that names `../` is not a release; it is an attempt.
     public (string? Directory, string? Problem) Stage(byte[] archive, string assetName)

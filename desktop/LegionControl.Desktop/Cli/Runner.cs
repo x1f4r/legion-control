@@ -910,8 +910,9 @@ public static class Runner
             var installer = new AppInstaller { HealthWindow = app.Settings.UpdateHealthWindow };
             var archive = installer.DownloadPath(ready.Artifact.Name);
             var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, token);
-            if (!StillCurrent()) return Failed;
-            if (downloadProblem is not null) { output.WriteLine(downloadProblem); return Failed; }
+            // Staging is what deletes the archive, so an update that ends before it deletes it here.
+            if (!StillCurrent()) { installer.Discard(ready.Artifact.Name); return Failed; }
+            if (downloadProblem is not null) { installer.Discard(ready.Artifact.Name); output.WriteLine(downloadProblem); return Failed; }
             var (staged, stageProblem) = installer.Stage(archive, ready.Artifact.Name);
             if (staged is null) { output.WriteLine(stageProblem); return Failed; }
             if (!StillCurrent()) return Failed;

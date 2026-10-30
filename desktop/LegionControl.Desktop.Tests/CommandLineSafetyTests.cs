@@ -1,3 +1,6 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json.Nodes;
 using LegionControl.Desktop.Cli;
 using LegionControl.Desktop.Config;
@@ -143,11 +146,12 @@ public class CommandLineSafetyTests
         Assert.Contains("the disk went away", File.ReadAllText(AppPaths.LogFile));
     }
 
-    /// An app whose update check offers a verified release, with nothing to download it from.
-    private static AppModel Offering(TempHome home)
+    /// An app whose update check offers a verified release, to be downloaded from [url], which by
+    /// default serves nothing.
+    private static AppModel Offering(TempHome home, string url = "https://example.invalid/app")
     {
         var manifest = ReleaseManifest.Parse(File.ReadAllBytes(Path.Combine(Repo.TrustFixtures, "manifest.json")))!;
-        var ready = new UpdateAvailability.Ready(manifest with { Version = "9.0.0" }, manifest.Artifact("fixture.bin")!, "https://example.invalid/app");
+        var ready = new UpdateAvailability.Ready(manifest with { Version = "9.0.0" }, manifest.Artifact("fixture.bin")!, url);
         File.WriteAllBytes(home.ConfigPath, Documents.Make("setup-a", 1, Array.Empty<string>()).Bytes);
         return new AppModel(new ConfigStore(home.ConfigPath, watch: false), FakeRunner.Replying("{}"),
             new OperationTracker(Path.Combine(home.Path, "operations.json")), DesktopSettings.Default, new RecordingSink(), Bindings.Empty,
@@ -183,6 +187,75 @@ public class CommandLineSafetyTests
         {
             Environment.SetEnvironmentVariable("DISPLAY", display);
             Environment.SetEnvironmentVariable("WAYLAND_DISPLAY", wayland);
+        }
+    }
+
+    /// Serves one request on loopback: [before] runs once it has arrived, and then [response]
+    /// goes back whole. Returns the address and the task that finishes once it has.
+    private static (string Url, Task Served) ServeOnce(Func<byte[]> response, Action before)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var url = $"http://127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}/fixture.bin";
+        var served = Task.Run(async () =>
+        {
+            try
+            {
+                using var client = await listener.AcceptTcpClientAsync();
+                var stream = client.GetStream();
+                var request = new List<byte>();
+                var buffer = new byte[4096];
+                while (!Encoding.ASCII.GetString(request.ToArray()).Contains("\r\n\r\n"))
+                {
+                    var read = await stream.ReadAsync(buffer);
+                    if (read == 0) return;
+                    request.AddRange(buffer.Take(read));
+                }
+                before();
+                await stream.WriteAsync(response());
+            }
+            finally
+            {
+                listener.Stop();
+            }
+        });
+        return (url, served);
+    }
+
+    private static byte[] Http(string status, byte[] body) =>
+        Encoding.ASCII.GetBytes($"HTTP/1.1 {status}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n").Concat(body).ToArray();
+
+    [UnixFact("whether a window can be drawn is read from DISPLAY and WAYLAND_DISPLAY off Windows; Windows goes by its session, checked on its own")]
+    public async Task AnUpdateThatStopsBeforeItsArchiveIsUnpackedLeavesNoArchiveBehind()
+    {
+        using var home = new TempHome();
+        var display = Environment.GetEnvironmentVariable("DISPLAY");
+        Environment.SetEnvironmentVariable("DISPLAY", ":99");
+        try
+        {
+            // The release repository changes while the archive, a verified one, is on its way.
+            AppModel? app = null;
+            var (url, served) = ServeOnce(() => Http("200 OK", "abc"u8.ToArray()),
+                () => app!.UpdateSuggestions.SelectRepository("someone/else"));
+            var output = new StringWriter();
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "app-update", "--yes" }, output, () => app = Offering(home, url)));
+            await served;
+            Assert.Contains("The release repository changed", output.ToString());
+            Assert.Empty(Directory.EnumerateFiles(AppPaths.UpdatesDirectory));
+
+            // A download that fails takes with it an archive an earlier one left.
+            var installer = new AppInstaller();
+            File.WriteAllText(installer.DownloadPath("fixture.bin"), "abc");
+            (url, served) = ServeOnce(() => Http("500 Internal Server Error", Array.Empty<byte>()), () => { });
+            output = new StringWriter();
+            Assert.Equal(Runner.Failed, await Runner.RunAsync(new[] { "--command", "app-update", "--yes" }, output, () => Offering(home, url)));
+            await served;
+            Assert.Contains("could not be downloaded", output.ToString());
+            Assert.Empty(Directory.EnumerateFiles(AppPaths.UpdatesDirectory));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DISPLAY", display);
         }
     }
 }

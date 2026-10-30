@@ -963,8 +963,9 @@ public sealed class MainWindow : Window
         var installer = new AppInstaller { HealthWindow = _app.Settings.UpdateHealthWindow };
         var archive = installer.DownloadPath(ready.Artifact.Name);
         var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, _updateLifetime.Token);
-        if (!StillCurrent()) return;
-        if (downloadProblem is not null) { Sheets.Text(this, "App update", downloadProblem); return; }
+        // Staging is what deletes the archive, so a review that ends before it deletes it here.
+        if (!StillCurrent()) { installer.Discard(ready.Artifact.Name); return; }
+        if (downloadProblem is not null) { installer.Discard(ready.Artifact.Name); Sheets.Text(this, "App update", downloadProblem); return; }
         // A hundred megabytes unpacked: off the window's thread, or the window stops drawing.
         var (staged, stageProblem) = await Task.Run(() => installer.Stage(archive, ready.Artifact.Name));
         if (staged is null) { Sheets.Text(this, "App update", stageProblem ?? "Staging failed."); return; }
