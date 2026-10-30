@@ -1081,28 +1081,37 @@ export function servicesNeedingRecovery(records) {
 // Retention
 // ---------------------------------------------------------------------------
 
-/** How a scheduled update ends when it left the service as it was: nothing new, or not now. */
-const ROUTINE_ACTIONS = new Set(['noop', 'deferred']);
+/**
+ * Whether an ending left everything as it was: nothing new, or not now.
+ *
+ * Not now is told by the outcome rather than by the action's name, so a
+ * conflict counts as much as a deferral: a watchdog holding a service's lock,
+ * or a command an earlier run left unsettled, makes every tick end the same
+ * way for as long as it lasts.
+ */
+function changedNothing(ending) {
+  return ending?.action === 'noop' || producedOutcome(ending ?? {}) === 'deferred';
+}
 
 /**
  * What a record says again, or null when it is news.
  *
  * A quarter-hourly cycle writes a record of its own and one for every service
  * it looks at, and most of them say what the one before said: nothing was new,
- * the machine was busy, the registry did not answer. Only what the scheduler
- * did can repeat; what a person asked for is news however often they ask. Of
- * that, only a record that changed nothing or failed is a repeat, told by how
- * it ended: the kind, the service, the action, the reason and the versions.
- * An update that installed something never repeats, and neither does a cycle
- * that ran one.
+ * the machine was busy, something else held the lock, the registry did not
+ * answer. Only what the scheduler did can repeat; what a person asked for is
+ * news however often they ask. Of that, only a record that changed nothing
+ * (changedNothing) or failed is a repeat, told by how it ended: the kind, the
+ * service, the action, the reason and the versions. An update that installed
+ * something never repeats, and neither does a cycle that ran one.
  */
 function repeatOf(record) {
   if (record.mode !== 'scheduled') return null;
   const result = record.result ?? {};
   const routine =
     record.kind === 'cycle'
-      ? result.action === 'cycled' && Array.isArray(record.children) && record.children.every((child) => ROUTINE_ACTIONS.has(child?.action))
-      : record.kind === 'update' && ROUTINE_ACTIONS.has(result.action);
+      ? changedNothing(result) || (result.action === 'cycled' && Array.isArray(record.children) && record.children.every(changedNothing))
+      : record.kind === 'update' && changedNothing(result);
   if (!routine && !['failed', 'unknown'].includes(recordOutcome(record))) return null;
   return JSON.stringify([record.kind, record.service ?? null, result.action ?? null, result.reasonCode ?? null, record.from ?? null, record.to ?? null]);
 }

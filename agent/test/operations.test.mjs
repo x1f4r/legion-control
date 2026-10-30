@@ -740,6 +740,49 @@ test('what a cycle only says again is let go, so history lists a failure from da
   });
 });
 
+test('a conflict that lasts is let go as it repeats, whether a child or the cycle itself meets it', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const shape = template(ops);
+    const scheduled = (id, kind, result, daysAgo, extra = {}) =>
+      plant(ops, shape, id, { kind, service: kind === 'cycle' ? null : 'demo', mode: 'scheduled', result, from: null, to: null, ...extra }, daysAgo);
+
+    const failure = scheduled('fa11ed00-3333-4333-8333-333333333333', 'update', { ...offline, reasonCode: 'apply-failed', message: 'the install failed' }, 2.5, { from: '1.0.0', to: '2.0.0' });
+    // Two days of a watchdog holding the service's lock, and now and then a
+    // command an earlier run left unsettled, which stops the whole cycle.
+    // Every tick ends the same way, a conflict, which is not now and nothing
+    // more, however its action is named.
+    const held = { ok: false, action: 'conflict', reasonCode: 'lock-held', message: 'the watchdog holds the lock of Demo', outcome: 'deferred' };
+    const unsettled = { ok: false, action: 'conflict', reasonCode: 'operation-in-progress', message: 'a command an earlier run started is still running', outcome: 'deferred' };
+    const ticks = 2 * 24 * 4;
+    const children = [];
+    const cycles = [];
+    const stopped = [];
+    for (let tick = 0; tick < ticks; tick += 1) {
+      const daysAgo = (ticks - tick) / (24 * 4);
+      const id = String(tick).padStart(8, '0');
+      if (tick % 4 === 0) {
+        stopped.push(scheduled(`${id}-6666-4666-8666-666666666666`, 'cycle', unsettled, daysAgo, { children: [] }));
+        continue;
+      }
+      const child = scheduled(`${id}-4444-4444-8444-444444444444`, 'update', held, daysAgo, { from: '1.0.0', to: '1.0.0' });
+      children.push(child);
+      cycles.push(scheduled(`${id}-5555-4555-8555-555555555555`, 'cycle', { ...cycled, message: '0 updated, 1 left alone, 0 failed' }, daysAgo - 0.001, {
+        children: [{ opId: child, service: 'demo', action: 'conflict', reasonCode: 'lock-held' }],
+      }));
+    }
+    assert.ok(!ops.listOperations({ limit: 200 }).some((record) => record.id === failure), 'behind them, the failure was out of sight');
+
+    ops.pruneOperations();
+    const kept = (ids) => [ids[0], ...ids.slice(-ops.REPEAT_LIMIT)];
+    const left = [failure, ...kept(children), ...kept(cycles), ...kept(stopped)];
+    assert.deepEqual(ops.listOperations({ limit: 200 }).map((record) => record.id).sort(), left.sort());
+    const history = cli(['history', '--limit', '200'], { home }).payload;
+    assert.ok(history.operations.some((entry) => entry.id === failure), 'history lists the failure');
+    assert.equal(history.retained, left.length);
+  });
+});
+
 test('a failure that only repeats keeps its first and newest records, and one that differs stays a week beside it', async () => {
   await withHome(async (home) => {
     const ops = await fresh('operations.mjs');
