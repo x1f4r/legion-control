@@ -66,6 +66,9 @@ public sealed class MainWindow : Window
             Ui.MenuAction("Site details", () => Sheets.Text(this, "Site", _app.Presence.Sentence)),
             Ui.MenuAction("Check for app updates", CheckForUpdate),
             Ui.MenuAction("About", () => Sheets.Text(this, "Legion Control", $"Version {AgentContract.ClientVersion}")),
+            // Closing the window only hides it while there is a tray to bring it back from, so the
+            // window says how to end the app as well.
+            Ui.MenuAction("Quit", Quit),
         }, "Application menu");
         var toolbarActions = Ui.Actions(Ui.Action("Refresh", () => Run("Refreshing", () => _app.RefreshAllAsync())), appMenu);
         toolbarActions.Margin = new Thickness(8, 0, 0, 0);
@@ -124,6 +127,11 @@ public sealed class MainWindow : Window
         };
     }
 
+    /// Whether a close is a person closing the window, which hides it in the tray. Closing for the
+    /// app or the session shutting down, and a close this app asked for, really close it.
+    public static bool HidesInsteadOfClosing(WindowCloseReason reason, bool isProgrammatic) =>
+        reason == WindowCloseReason.WindowClosing && !isProgrammatic;
+
     /// Polls only while somebody can see the window: never while it is hidden in the tray or
     /// minimised. Shown again, it reads every machine at once.
     private void FollowVisibility()
@@ -131,6 +139,13 @@ public sealed class MainWindow : Window
         if (_closed) return;
         if (IsVisible && WindowState != WindowState.Minimized) _app.StartPolling();
         else _app.PausePolling();
+    }
+
+    private void Quit()
+    {
+        if (Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime lifetime)
+            lifetime.Shutdown();
+        else Close();
     }
 
     private void QueueRebuild()

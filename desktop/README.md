@@ -14,6 +14,11 @@ the models the window draws, so a check that passes over ssh is a check of the t
 
 A bare invocation opens the window. Command flags run without a window and exit.
 
+Closing the window hides it in the tray, and **Quit**, in the tray's menu or the window's **App**
+menu, ends the app. Nothing is read from any machine while the window is hidden or minimised, and
+showing it again reads every machine at once. On a Linux desktop that draws no tray icons (GNOME
+without the AppIndicator extension), closing the window quits, since nothing could bring it back.
+
 Choose `Legion-Control-linux-x64.tar.gz`, `Legion-Control-linux-arm64.tar.gz`, or
 `Legion-Control-windows-x64.zip` from [the latest release](https://github.com/x1f4r/legion-control/releases/latest).
 The ARM64 build supports a Raspberry Pi running a 64-bit Linux OS. Its headless commands do not
@@ -268,7 +273,7 @@ bootstrap is limited to recognized layouts or an explicitly supplied `--base` di
 
 The window checks at startup and when it becomes active, with a fifteen-minute throttle. A timer
 also checks every six hours while the window is active; an unfocused window catches up when
-activated. Closing the window stops this timer. The local `checkForAppUpdates` preference in
+activated, and one hidden in the tray checks nothing until it is shown. Quitting stops this timer. The local `checkForAppUpdates` preference in
 `desktop-settings.json` defaults to `true`; a manual check is always available in **This device**.
 
 An available release appears above machine navigation as **Review update**, so it remains reachable

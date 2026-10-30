@@ -9,7 +9,8 @@ using Xunit;
 
 namespace LegionControl.Desktop.Tests;
 
-/// The window kept in the tray: nothing is read while nobody can see it.
+/// The window kept in the tray: closing hides it, nothing is read while nobody can see it, and the
+/// tray's menu changes only when what it says does.
 public class TrayTests
 {
     private const string Setup = """
@@ -58,6 +59,24 @@ public class TrayTests
             new RecordingSink(), Bindings.Empty,
             new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))),
             new LaunchApprovals(Path.Combine(home.Path, "approved-launch.json")), pollInterval: pollInterval);
+    }
+
+    [Fact]
+    public void OnlyAPersonClosingTheWindowHidesIt()
+    {
+        Assert.True(MainWindow.HidesInsteadOfClosing(WindowCloseReason.WindowClosing, isProgrammatic: false));
+        // Quit, an update and the end of the session close it for real.
+        Assert.False(MainWindow.HidesInsteadOfClosing(WindowCloseReason.WindowClosing, isProgrammatic: true));
+        Assert.False(MainWindow.HidesInsteadOfClosing(WindowCloseReason.ApplicationShutdown, isProgrammatic: true));
+        Assert.False(MainWindow.HidesInsteadOfClosing(WindowCloseReason.OSShutdown, isProgrammatic: false));
+    }
+
+    [Fact]
+    public async Task ALinuxDesktopWhoseSessionBusCannotBeReachedHasNoTrayToHideIn()
+    {
+        // So closing the window there quits, rather than hiding it where nothing can bring it back.
+        var shown = await TrayHost.IsShownAsync("unix:path=/nonexistent/legion-control-test/bus");
+        Assert.Equal(!OperatingSystem.IsLinux(), shown);
     }
 
     [Fact]
@@ -113,5 +132,30 @@ public class TrayTests
 
         window.Close();
         Assert.False(app.IsPolling);
+    }
+
+    [AvaloniaFact]
+    public async Task TheTrayMenuIsReplacedOnlyWhenWhatItSaysChanged()
+    {
+        using var home = new TempHome();
+        using var app = Device(home, new Readings().Runner, TimeSpan.FromHours(1));
+        var tray = new TrayMenu(app, new MainWindow(app), () => { }, () => { });
+
+        Assert.True(tray.Update());
+        var items = tray.Menu.Items.ToList();
+        Assert.Contains(items, item => item is NativeMenuItem { Header: "Pi — Not checked" });
+        Assert.False(tray.Update());
+        Assert.Equal(items, tray.Menu.Items);
+
+        await app.RefreshAllAsync();
+        Assert.True(tray.Update());
+        var machine = Assert.Single(tray.Menu.Items.OfType<NativeMenuItem>(), item => item.Header == "Pi — Raspberry Pi OS");
+        Assert.Contains(machine.Menu!.Items, item => item is NativeMenuItem { Header: "Sleep" });
+
+        // The same reading again: the menu a person may have open stays as it is.
+        items = tray.Menu.Items.ToList();
+        await app.RefreshAllAsync();
+        Assert.False(tray.Update());
+        Assert.Equal(items, tray.Menu.Items);
     }
 }

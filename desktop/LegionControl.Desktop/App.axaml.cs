@@ -16,7 +16,7 @@ public partial class App : Application
     private AppModel? _model;
     private MainWindow? _window;
     private TrayIcon? _tray;
-    private Action? _trayChanged;
+    private TrayMenu? _trayMenu;
     private IDisposable? _showRequests;
     private DateTimeOffset _failureShown = DateTimeOffset.MinValue;
 
@@ -72,7 +72,7 @@ public partial class App : Application
         {
             _showRequests?.Dispose();
             _showRequests = null;
-            if (_model is not null && _trayChanged is not null) _model.Changed -= _trayChanged;
+            if (_model is not null && _trayMenu is not null) _model.Changed -= _trayMenu.Queue;
             TrayIcon.SetIcons(this, null);
             _tray = null;
         }
@@ -85,64 +85,43 @@ public partial class App : Application
 
     /// A tray entry, so the window can be closed without losing the app.
     ///
-    /// Nothing is polled while the window is shut: a poll nobody is looking at is a machine woken
-    /// for nothing, and the whole point of the wake rules is not keeping machines awake by accident.
+    /// Closing the window hides it there, and Quit, in the tray's menu or the window's App menu,
+    /// ends the app. Nothing is polled while the window is hidden: a poll nobody is looking at is a
+    /// machine woken for nothing, and the whole point of the wake rules is not keeping machines
+    /// awake by accident. On a desktop that draws no tray icons, closing the window quits instead.
     private void SetUpTray(IClassicDesktopStyleApplicationLifetime desktop)
     {
+        if (_model is not { } model || _window is not { } window) return;
         try
         {
-            _tray = new TrayIcon { Icon = AppIcon.Icon(64), ToolTipText = "Legion Control", Menu = BuildTrayMenu(desktop), IsVisible = true };
+            _trayMenu = new TrayMenu(model, window, ShowWindow, () => desktop.Shutdown());
+            _trayMenu.Update();
+            _tray = new TrayIcon { Icon = AppIcon.Icon(64), ToolTipText = "Legion Control", Menu = _trayMenu.Menu, IsVisible = true };
             _tray.Clicked += (_, _) => ShowWindow();
             TrayIcon.SetIcons(this, new TrayIcons { _tray });
-            _trayChanged = () => Dispatcher.UIThread.Post(() =>
+            model.Changed += _trayMenu.Queue;
+        }
+        catch (Exception error)
+        {
+            // A desktop with no tray is a desktop with no tray. The window still works, closing it
+            // quits as it always did, and a missing tray icon is not worth refusing to start over.
+            AppLog.Write("setting up the tray icon", error);
+            _trayMenu = null;
+            return;
+        }
+        // Hidden, the window is still the app's main window: the app ends when it really closes, as
+        // when the session ends, and not when the last sheet open beside it does.
+        desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
+        window.Closing += (_, closing) =>
+        {
+            if (!MainWindow.HidesInsteadOfClosing(closing.CloseReason, closing.IsProgrammatic)) return;
+            closing.Cancel = true;
+            Ui.Run(window, "Closing the window", async () =>
             {
-                if (_tray?.Menu is not { } menu) return;
-                var replacement = BuildTrayMenu(desktop);
-                menu.Items.Clear();
-                foreach (var item in replacement.Items.ToArray())
-                { replacement.Items.Remove(item); menu.Items.Add(item); }
+                if (await TrayHost.IsShownAsync()) window.Hide();
+                else desktop.Shutdown();
             });
-            if (_model is not null) _model.Changed += _trayChanged;
-        }
-        catch (Exception)
-        {
-            // A desktop with no tray is a desktop with no tray. The window still works, and a
-            // missing tray icon is not worth refusing to start over.
-        }
-    }
-
-    private NativeMenu BuildTrayMenu(IClassicDesktopStyleApplicationLifetime desktop)
-    {
-        static NativeMenuItem Item(string label, Action action)
-        { var item = new NativeMenuItem(label); item.Click += (_, _) => action(); return item; }
-        var menu = new NativeMenu();
-        menu.Add(Item("Refresh", () =>
-        {
-            if (_model is { } model && _window is { } window) Ui.Run(window, "Refreshing", () => model.RefreshAllAsync());
-        }));
-        foreach (var machine in _model?.Machines ?? Array.Empty<MachineModel>())
-        {
-            var details = new NativeMenu();
-            details.Add(Item("Open device", () => _window?.OpenMachine(machine.Id)));
-            if (machine.Machine.Wake is not null)
-                details.Add(Item("Wake", () => _window?.OpenMachine(machine.Id, wake: true)));
-            if (machine.Status is { } status && machine.Failure is null)
-            {
-                details.Add(Item("Sleep", () => _window?.OpenMachine(machine.Id, new MachineRequest { Kind = RequestKind.Sleep })));
-                foreach (var target in status.BootTargets.Where(target => target.Id is not null))
-                    details.Add(Item("Boot into " + target.DisplayName, () => _window?.OpenMachine(machine.Id, new MachineRequest { Kind = RequestKind.Boot, Target = target.Id })));
-            }
-            var state = machine.Failure is not null ? "Offline / needs attention"
-                : machine.Status?.SystemName ?? machine.Status?.SystemId ?? "Not checked";
-            menu.Add(new NativeMenuItem(machine.Name + " — " + state) { Menu = details });
-        }
-        menu.Add(new NativeMenuItemSeparator());
-        if (_model?.AppUpdate is UpdateAvailability.Ready ready)
-            menu.Add(Item("Legion Control " + ready.Manifest.Version + " available", ShowWindow));
-        menu.Add(Item("Open app", ShowWindow));
-        menu.Add(Item("Settings", () => _window?.OpenSettings()));
-        menu.Add(Item("Quit", () => desktop.Shutdown()));
-        return menu;
+        };
     }
 
     private void ShowWindow()
