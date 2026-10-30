@@ -175,15 +175,24 @@ test('an operation whose process is gone is finished as interrupted', async () =
  * A process that stays up until it is killed, started now, for a record to
  * name whose pid is plainly alive. With `lock`, it also takes the machine lock
  * for that operation id, as an operation's own process would.
+ *
+ * The hold is kept on globalThis because nothing else in the child refers to
+ * it once it is taken: a handle the collector can no longer reach is
+ * finalized, its connection closes, and SQLite gives the lock up with it while
+ * the process lives on. The child collects once before it says it is ready,
+ * so a hold that would not outlast a collection is lost every time, not only
+ * on the runs where the collector happens to get to it first.
  */
 async function liveProcess(home, { lock = null } = {}) {
   const source = lock
     ? `import { acquireOperationLock } from ${JSON.stringify(pathToFileURL(path.join(SRC, 'lock.mjs')).href)};
        const held = acquireOperationLock({ kind: 'update', opId: ${JSON.stringify(lock)}, service: 'demo', waitMs: 5000 });
-       process.stdout.write(held.ok ? 'ready\\n' : 'failed: ' + held.message + '\\n');
+       globalThis.held = held;
+       const said = held.ok ? 'ready\\n' : 'failed: ' + held.message + '\\n';
+       setTimeout(() => { gc(); process.stdout.write(said); }, 0);
        setInterval(() => {}, 1000);`
     : `process.stdout.write('ready\\n'); setInterval(() => {}, 1000);`;
-  const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+  const child = spawn(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], {
     env: { ...process.env, LEGIONCTL_HOME: home },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
@@ -263,11 +272,14 @@ test('this process is not the owner of a record an earlier process with its pid 
 test('a record that took the machine lock lives exactly as long as that hold', async () => {
   await withHome(async (home) => {
     const ops = await fresh('operations.mjs');
-    const { acquireOperationLock } = await import('../src/lock.mjs');
+    const { acquireOperationLock, probeOperationLock } = await import('../src/lock.mjs');
     const id = '17171717-1111-4111-8111-111111111111';
     const holder = await liveProcess(home, { lock: id });
     const bystander = await liveProcess(home);
     try {
+      // Every judgement below rests on this, so a hold lost underneath the test
+      // fails here by name rather than as a record judged finished.
+      assert.equal(probeOperationLock().state, 'held', 'the holder has the machine lock');
       ops.beginOperation({ id, ...base });
       ops.updateOperation(id, { pid: holder.pid, ownerStartedAt: new Date().toISOString(), lockOwner: id });
       assert.equal(ops.deriveState(ops.readOperation(id)).state, 'running', 'the lock is held for it, by its own process');

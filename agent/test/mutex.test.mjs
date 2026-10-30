@@ -13,16 +13,31 @@ import { AGENT_VERSION, SRC, withHome } from './helpers.mjs';
 
 const isWindows = process.platform === 'win32';
 
-/** A child that takes the mutex, says so, and then waits to be killed. */
+/**
+ * A child that takes the mutex, says so, and then waits to be killed.
+ *
+ * The hold is kept on globalThis because nothing else refers to it once it is
+ * taken: a handle the collector can no longer reach is finalized, its
+ * connection closes and SQLite gives the lock up, so the lock would last only
+ * until the child's first collection rather than as long as the child. The
+ * child collects once before it reports, so a hold that would not outlast one
+ * is lost on every run rather than on some.
+ */
 function holdInChild(db) {
   const source = `
     import { acquireMutex } from ${JSON.stringify(pathToFileURL(path.join(SRC, 'mutex.mjs')).href)};
     const held = acquireMutex(${JSON.stringify(db)}, { waitMs: 2000 });
-    process.stdout.write(held.ok ? 'held\\n' : 'failed: ' + held.error + '\\n');
-    if (!held.ok) process.exit(1);
+    globalThis.held = held;
+    const ok = held.ok;
+    const said = ok ? 'held\\n' : 'failed: ' + held.error + '\\n';
+    setTimeout(() => {
+      gc();
+      process.stdout.write(said);
+      if (!ok) process.exit(1);
+    }, 0);
     setInterval(() => {}, 1000);
   `;
-  const child = spawn(process.execPath, ['--input-type=module', '-e', source], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { stdio: ['ignore', 'pipe', 'pipe'] });
   return new Promise((resolve, reject) => {
     let out = '';
     child.stdout.on('data', (chunk) => {
