@@ -807,6 +807,45 @@ function policyReply(config, serviceId, { message = null, changed = [] } = {}) {
   });
 }
 
+/**
+ * Write a patch of the update policy into config.json, where the policy
+ * lives, the pause included. `policy set` and `auto-update` both write
+ * through this, so they cannot come to mean different things by the same
+ * setting. A service's policy is in its own updates block, where a null
+ * removes the key so the machine's value is inherited again. The machine's is
+ * in the top-level one, where there is nothing to inherit from, so a null
+ * clears the setting instead.
+ */
+function saveUpdatesPatch(serviceId, patch) {
+  return saveConfig((stored) => {
+    const next = { ...stored };
+    if (serviceId) {
+      const services = Array.isArray(next.services) ? next.services.map((entry) => ({ ...entry })) : [];
+      const index = services.findIndex((entry) => entry.id === serviceId);
+      if (index === -1) return next;
+      const updates = { ...(services[index].updates ?? {}) };
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === null) delete updates[key];
+        else updates[key] = value;
+      }
+      services[index] = { ...services[index], updates };
+      next.services = services;
+      return next;
+    }
+    const updates = { ...(next.updates ?? {}) };
+    for (const [key, value] of Object.entries(patch)) {
+      if (key === 'pauseUntil' && value === null) updates.pauseUntil = null;
+      else if (key === 'maintenanceWindows' && value === null) updates.maintenanceWindows = [];
+      else updates[key] = value;
+    }
+    next.updates = updates;
+    // The 2.x spelling is kept in step so an older client reading the file sees
+    // the same answer.
+    if ('automatic' in patch) next.autoUpdate = patch.automatic;
+    return next;
+  });
+}
+
 async function commandPolicy(config, positional, options) {
   const serviceId = options.get('service') ?? null;
   if (serviceId && !config.services.some((service) => service.id === serviceId)) return missingService(config, serviceId);
@@ -847,39 +886,7 @@ async function commandPolicy(config, positional, options) {
   const changed = Object.keys(patch);
   if (changed.length === 0) return policyReply(config, serviceId, { message: 'nothing in the patch changed anything' });
 
-  // The policy lives in config.json, the pause included: a service's in its own
-  // updates block, where a null removes the key so the machine's value is
-  // inherited again, and the machine's in the top-level one.
-  const saved = saveConfig((stored) => {
-    const next = { ...stored };
-    if (serviceId) {
-      const services = Array.isArray(next.services) ? next.services.map((entry) => ({ ...entry })) : [];
-      const index = services.findIndex((entry) => entry.id === serviceId);
-      if (index === -1) return next;
-      const updates = { ...(services[index].updates ?? {}) };
-      for (const [key, value] of Object.entries(patch)) {
-        if (value === null) delete updates[key];
-        else updates[key] = value;
-      }
-      services[index] = { ...services[index], updates };
-      next.services = services;
-      return next;
-    }
-    const updates = { ...(next.updates ?? {}) };
-    for (const [key, value] of Object.entries(patch)) {
-      // At the machine level there is nothing to inherit from, so a null clears
-      // the setting rather than meaning "inherit".
-      if (key === 'pauseUntil' && value === null) updates.pauseUntil = null;
-      else if (key === 'maintenanceWindows' && value === null) updates.maintenanceWindows = [];
-      else updates[key] = value;
-    }
-    next.updates = updates;
-    // The 2.x spelling is kept in step so an older client reading the file sees
-    // the same answer.
-    if ('automatic' in patch) next.autoUpdate = patch.automatic;
-    return next;
-  });
-
+  const saved = saveUpdatesPatch(serviceId, patch);
   if (!saved.ok) {
     return refuse(REASON.configInvalid, saved.error ?? 'the policy could not be written', {
       command: 'policy',
@@ -908,20 +915,7 @@ function commandAutoUpdate(config, positional, options) {
   if (serviceId && !config.services.some((service) => service.id === serviceId)) return missingService(config, serviceId);
 
   const apply = (patch, message) => {
-    const saved = saveConfig((stored) => {
-      const next = { ...stored };
-      if (serviceId) {
-        const services = Array.isArray(next.services) ? next.services.map((entry) => ({ ...entry })) : [];
-        const index = services.findIndex((entry) => entry.id === serviceId);
-        if (index === -1) return next;
-        services[index] = { ...services[index], updates: { ...(services[index].updates ?? {}), ...patch } };
-        next.services = services;
-        return next;
-      }
-      next.updates = { ...(next.updates ?? {}), ...patch };
-      if ('automatic' in patch) next.autoUpdate = patch.automatic;
-      return next;
-    });
+    const saved = saveUpdatesPatch(serviceId, patch);
     if (!saved.ok) {
       return refuse(REASON.configInvalid, saved.error ?? 'config.json could not be written', {
         command: 'auto-update',

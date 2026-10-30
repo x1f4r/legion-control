@@ -512,6 +512,17 @@ test('auto-update pause and resume are the same setting the policy reports', asy
     const resumed = cli(['auto-update', 'resume'], { home });
     assert.equal(resumed.payload.updates.pauseUntil, null);
     assert.equal(cli(['auto-update', 'nonsense'], { home }).payload.reasonCode, 'bad-argument');
+
+    // For one service, resuming hands the setting back to the machine, exactly
+    // as a null in "policy set" does, and config.json says so the same way.
+    const stored = () => JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8')).services[0].updates ?? {};
+    assert.ok(cli(['auto-update', 'pause', '4h', '--service', 'demo'], { home }).payload.updates.pauseUntil);
+    const handedBack = cli(['auto-update', 'resume', '--service', 'demo'], { home }).payload.updates;
+    assert.deepEqual([handedBack.pauseUntil, handedBack.inheritedKeys.pauseUntil], [null, true]);
+    assert.equal(Object.hasOwn(stored(), 'pauseUntil'), false);
+    cli(['auto-update', 'pause', '4h', '--service', 'demo'], { home });
+    cli(['policy', 'set', '--service', 'demo'], { home, stdin: '{"pauseUntil":null}' });
+    assert.equal(Object.hasOwn(stored(), 'pauseUntil'), false);
   });
 });
 
