@@ -394,6 +394,24 @@ test('every argument that arrives over ssh is validated', async () => {
   });
 });
 
+test('a command is only ever one the command table names', async () => {
+  await withService(async ({ home }) => {
+    // Every object has these as properties of its own prototype. Read straight
+    // off the table, `toString --force` used to get as far as the flag check
+    // and die there with a TypeError, answered as an internal failure.
+    for (const args of [['toString', '--force'], ['constructor', '--op=abcdefgh'], ['__proto__'], ['hasOwnProperty']]) {
+      const { payload, exitCode } = cli(args, { home });
+      assert.equal(exitCode, 1);
+      assert.equal(payload.reasonCode, 'bad-argument', `${args.join(' ')}: ${payload.message}`);
+      assert.equal(payload.message, `unknown command: ${args[0]}`);
+      assert.ok(payload.accepts.includes('status'));
+    }
+    // The refusal and help read the one table, so they offer the same commands.
+    const help = cli(['help'], { home }).payload;
+    assert.deepEqual(cli(['nonsense'], { home }).payload.accepts, help.commands.map(({ name }) => name));
+  });
+});
+
 test('an unknown service, action and boot target each say what does exist', async () => {
   await withService(async ({ home }) => {
     const service = cli(['update', '--service', 'nope'], { home });

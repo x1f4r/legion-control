@@ -73,66 +73,166 @@ import { runRestart, runUpdate } from './update.mjs';
 import { authorize, isRestrictedSession, parseCommandLine } from './dispatch.mjs';
 import { PATH_OPTIONS, parseArgs } from './args.mjs';
 
+/** For a command every invocation of which asks for a change. */
+const always = () => true;
+
 /**
- * The command table. `flags` stand alone, `options` take a value, `positional`
- * documents what a bare argument means. Anything outside it is refused, which is
- * what stops a typo from being read as a different command's flag.
+ * The command table, and the only place a command is wired to what answers
+ * it: help, the refusal of an unknown command and dispatch all read it, so a
+ * command cannot be listed without being answered or answered without being
+ * listed. `flags` stand alone, `options` take a value, and anything outside
+ * them is refused, which is what stops a typo from being read as a different
+ * command's flag.
+ *
+ * `mutates` says whether the command can change the machine at all, which is
+ * what a broken config.json refuses. `changes` says whether one invocation
+ * asks for a change, and so states an outcome (contract section 5.6): a dry
+ * run, a bundle check and a read of a mutating command's setting do not.
+ * `run` answers a validated invocation, given the loaded configuration.
  */
 const COMMANDS = {
-  status: { flags: [], options: ['budget-ms'], mutates: false, summary: 'bounded snapshot of the machine, its services and its operations' },
-  busy: { flags: [], options: ['budget-ms'], mutates: false, summary: 'the aggregated busy state, with per-service evidence' },
+  status: {
+    flags: [], options: ['budget-ms'], mutates: false, summary: 'bounded snapshot of the machine, its services and its operations',
+    run: ({ loaded, options }) => commandStatus(loaded, options),
+  },
+  busy: {
+    flags: [], options: ['budget-ms'], mutates: false, summary: 'the aggregated busy state, with per-service evidence',
+    run: ({ config, options }) => commandBusy(config, options),
+  },
   update: {
     flags: ['force', 'detach', 'when-idle'],
     options: ['service', 'op', 'expires'],
     mutates: true,
+    changes: always,
     summary: 'update one service; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, flags, options }) => commandUpdate(config, flags, options),
   },
   restart: {
     flags: ['force', 'detach', 'when-idle'],
     options: ['service', 'op', 'expires'],
     mutates: true,
+    changes: always,
     summary: 'restart one service; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, flags, options }) => commandRestart(config, flags, options),
   },
   boot: {
     flags: ['force', 'no-reboot', 'when-idle'],
     options: ['op', 'expires'],
     mutates: true,
+    changes: always,
     summary: 'arm a boot target and reboot into it; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, positional, flags, options }) => commandBoot(config, positional, flags, options),
   },
-  sleep: { flags: ['force', 'when-idle'], options: ['op', 'expires'], mutates: true, summary: 'suspend this machine; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force' },
+  sleep: {
+    flags: ['force', 'when-idle'],
+    options: ['op', 'expires'],
+    mutates: true,
+    changes: always,
+    summary: 'suspend this machine; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, flags, options }) => commandSleep(config, flags, options),
+  },
   run: {
     flags: ['force', 'detach', 'when-idle'],
     options: ['op', 'expires'],
     mutates: true,
+    changes: always,
     summary: 'run a configured action; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, positional, flags, options }) => commandRun(config, positional, flags, options),
   },
-  cycle: { flags: ['dry-run', 'force'], options: ['op'], mutates: true, summary: 'the scheduled maintenance cycle over every eligible service' },
-  'auto-update': { flags: [], options: ['service'], mutates: true, summary: 'on, off, pause <duration> or resume' },
-  policy: { flags: [], options: ['service'], mutates: true, summary: 'read the update policy; "policy set" reads a JSON patch from stdin' },
-  'service-config': { flags: ['stdin'], options: [], mutates: true, summary: 'administrative service configuration: get, validate --stdin, or set --stdin' },
-  op: { flags: [], options: ['wait'], mutates: false, summary: 'one operation record; --wait long-polls until it finishes' },
-  cancel: { flags: [], options: [], mutates: true, summary: 'cancel a queued operation' },
-  history: { flags: [], options: ['limit', 'service', 'kind'], mutates: false, summary: 'recent operations, newest first' },
-  logs: { flags: [], options: ['lines', 'op'], mutates: false, summary: 'the tail of the agent log, or one operation\'s log' },
-  doctor: { flags: ['deep'], options: ['service'], mutates: false, summary: 'check everything that can be wrong with this machine' },
-  bundle: { flags: [], options: [], mutates: false, summary: 'a diagnostic bundle with secrets removed' },
+  cycle: {
+    flags: ['dry-run', 'force'], options: ['op'], mutates: true, summary: 'the scheduled maintenance cycle over every eligible service',
+    changes: (positional, flags) => !flags.has('dry-run'),
+    run: ({ config, flags, options }) => commandCycle(config, flags, options),
+  },
+  'auto-update': {
+    flags: [], options: ['service'], mutates: true, summary: 'on, off, pause <duration> or resume',
+    changes: always,
+    run: ({ config, positional, options }) => commandAutoUpdate(config, positional, options),
+  },
+  policy: {
+    flags: [], options: ['service'], mutates: true, summary: 'read the update policy; "policy set" reads a JSON patch from stdin',
+    changes: (positional) => positional[0] === 'set',
+    run: ({ config, positional, options }) => commandPolicy(config, positional, options),
+  },
+  'service-config': {
+    flags: ['stdin'], options: [], mutates: true, summary: 'administrative service configuration: get, validate --stdin, or set --stdin',
+    changes: (positional) => positional[0] === 'set',
+    // Administrative documents can contain private command arguments. This
+    // command refuses a restricted session before config loading or input
+    // reads, and owns its read-only validation and locked compare-and-swap
+    // itself, so it is answered before the config is loaded at all.
+    beforeConfig: true,
+    run: async ({ positional, flags }) => {
+      const result = await commandServiceConfig(positional, flags);
+      return { payload: wrap(result), exitCode: result.ok ? 0 : 1 };
+    },
+  },
+  op: {
+    flags: [], options: ['wait'], mutates: false, summary: 'one operation record; --wait long-polls until it finishes',
+    run: ({ config, positional, options }) => commandOp(config, positional, options),
+  },
+  cancel: {
+    flags: [], options: [], mutates: true, summary: 'cancel a queued operation',
+    changes: always,
+    run: ({ positional }) => commandCancel(positional),
+  },
+  history: {
+    flags: [], options: ['limit', 'service', 'kind'], mutates: false, summary: 'recent operations, newest first',
+    run: ({ config, options }) => commandHistory(config, options),
+  },
+  logs: {
+    flags: [], options: ['lines', 'op'], mutates: false, summary: 'the tail of the agent log, or one operation\'s log',
+    run: ({ options }) => commandLogs(options),
+  },
+  doctor: {
+    flags: ['deep'], options: ['service'], mutates: false, summary: 'check everything that can be wrong with this machine',
+    run: ({ loaded, flags, options }) => commandDoctor(loaded, flags, options),
+  },
+  bundle: {
+    flags: [], options: [], mutates: false, summary: 'a diagnostic bundle with secrets removed',
+    run: ({ loaded }) => commandBundle(loaded),
+  },
   config: {
     flags: ['replace'],
     options: ['controller-id', 'revision'],
     mutates: true,
+    changes: (positional) => positional[0] === 'set',
     summary: 'the stored setup document; "config set" replaces it from stdin, "config meta" reads its identity',
+    run: ({ positional, flags, options }) => commandConfig(positional, flags, options),
   },
   'self-update': {
     flags: ['stdin', 'install', 'rollback', 'check', 'allow-downgrade'],
     options: ['from', 'op'],
     mutates: true,
+    changes: (positional, flags) => !flags.has('check'),
     summary: 'replace this agent from a signed bundle',
+    run: ({ config, flags, options }) => commandSelfUpdate(config, flags, options),
   },
-  dispatch: { flags: [], options: [], mutates: true, summary: 'run one allowed command from SSH_ORIGINAL_COMMAND (restricted keys)' },
-  'op-run': { flags: [], options: [], mutates: true, internal: true, summary: 'the detached worker for one operation' },
-  version: { flags: ['check'], options: [], mutates: false, summary: 'the agent version, and with --check a self-test' },
-  help: { flags: [], options: [], mutates: false, summary: 'print this list' },
+  // main() runs it before anything is parsed: the command it carries is in
+  // SSH_ORIGINAL_COMMAND, and is parsed and loaded like any other.
+  dispatch: {
+    flags: [], options: [], mutates: true, summary: 'run one allowed command from SSH_ORIGINAL_COMMAND (restricted keys)',
+    run: () => commandDispatch(),
+  },
+  'op-run': {
+    flags: [], options: [], mutates: true, internal: true, summary: 'the detached worker for one operation',
+    run: ({ config, positional }) => commandOpRun(config, positional),
+  },
+  // These two answer on any platform: neither touches the machine.
+  version: {
+    flags: ['check'], options: [], mutates: false, anyPlatform: true, summary: 'the agent version, and with --check a self-test',
+    run: ({ loaded, flags }) => commandVersion(flags, loaded),
+  },
+  help: {
+    flags: [], options: [], mutates: false, anyPlatform: true, summary: 'print this list',
+    run: () => ({ payload: wrap(helpPayload(null)), exitCode: 0 }),
+  },
 };
+
+/** The command an invocation names, or null when it names none this agent has. */
+function commandNamed(name) {
+  return typeof name === 'string' && Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : null;
+}
 
 /**
  * Write the one reply. A restricted key reads it redacted (contract section
@@ -1395,59 +1495,13 @@ async function commandVersion(flags, loaded) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-async function dispatch(command, positional, flags, options, loaded) {
-  const config = loaded.config;
-  switch (command) {
-    case 'status':
-      return commandStatus(loaded, options);
-    case 'busy':
-      return commandBusy(config, options);
-    case 'update':
-      return commandUpdate(config, flags, options);
-    case 'restart':
-      return commandRestart(config, flags, options);
-    case 'boot':
-      return commandBoot(config, positional, flags, options);
-    case 'sleep':
-      return commandSleep(config, flags, options);
-    case 'run':
-      return commandRun(config, positional, flags, options);
-    case 'cycle':
-      return commandCycle(config, flags, options);
-    case 'auto-update':
-      return commandAutoUpdate(config, positional, options);
-    case 'policy':
-      return commandPolicy(config, positional, options);
-    case 'op':
-      return commandOp(config, positional, options);
-    case 'cancel':
-      return commandCancel(positional);
-    case 'history':
-      return commandHistory(config, options);
-    case 'logs':
-      return commandLogs(options);
-    case 'doctor':
-      return commandDoctor(loaded, flags, options);
-    case 'bundle':
-      return commandBundle(loaded);
-    case 'config':
-      return commandConfig(positional, flags, options);
-    case 'self-update':
-      return commandSelfUpdate(config, flags, options);
-    case 'op-run':
-      return commandOpRun(config, positional);
-    case 'version':
-      return commandVersion(flags, loaded);
-    case 'help':
-      return { payload: wrap(helpPayload(null)), exitCode: 0 };
-    default:
-      return refuse(REASON.badArgument, `unknown command: ${command}`, {
-        command,
-        argument: command,
-        accepts: Object.keys(COMMANDS).filter((name) => !COMMANDS[name].internal),
-        error: `unknown command: ${command}`,
-      });
-  }
+function unknownCommand(command) {
+  return refuse(REASON.badArgument, `unknown command: ${command}`, {
+    command,
+    argument: command,
+    accepts: Object.keys(COMMANDS).filter((name) => !COMMANDS[name].internal),
+    error: `unknown command: ${command}`,
+  });
 }
 
 /**
@@ -1458,11 +1512,7 @@ async function dispatch(command, positional, flags, options, loaded) {
  */
 function mutatingInvocation(command, positional, flags) {
   if (flags.has('help')) return false;
-  if (['update', 'restart', 'boot', 'sleep', 'run', 'cancel', 'auto-update'].includes(command)) return true;
-  if (command === 'cycle') return !flags.has('dry-run');
-  if (command === 'self-update') return !flags.has('check');
-  if (['config', 'policy', 'service-config'].includes(command)) return positional[0] === 'set';
-  return false;
+  return commandNamed(command)?.changes?.(positional, flags) === true;
 }
 
 /** Whether the reply being built answers a mutating invocation, for the last-resort handler in main(). */
@@ -1492,15 +1542,8 @@ async function answer(command, positional, flags, options) {
     return { payload: wrap(helpPayload(command ? null : 'no command given')), exitCode: command ? 0 : 1 };
   }
 
-  const meta = COMMANDS[command];
-  if (!meta) {
-    return refuse(REASON.badArgument, `unknown command: ${command}`, {
-      command,
-      argument: command,
-      accepts: Object.keys(COMMANDS).filter((name) => !COMMANDS[name].internal),
-      error: `unknown command: ${command}`,
-    });
-  }
+  const meta = commandNamed(command);
+  if (!meta) return unknownCommand(command);
 
   const unknownFlag = [...flags].find((flag) => flag !== 'help' && !meta.flags.includes(flag));
   const unknownOption = [...options.keys()].find((option) => !meta.options.includes(option));
@@ -1516,13 +1559,7 @@ async function answer(command, positional, flags, options) {
   const invalid = validateArguments(command, positional, options);
   if (invalid) return invalid;
 
-  // Administrative documents can contain private command arguments. This path
-  // enforces restricted-session refusal before config loading or input reads,
-  // and owns its read-only validation and locked compare-and-swap itself.
-  if (command === 'service-config') {
-    const result = await commandServiceConfig(positional, flags);
-    return { payload: wrap(result), exitCode: result.ok ? 0 : 1 };
-  }
+  if (meta.beforeConfig) return meta.run({ positional, flags, options });
 
   const bootstrapInstall = command === 'self-update' && flags.has('install');
   if (bootstrapInstall) {
@@ -1533,7 +1570,7 @@ async function answer(command, positional, flags, options) {
 
   // Everything except version and help touches a real machine, so refuse early
   // and clearly on a platform this agent was never written for.
-  if (!isSupportedPlatform() && command !== 'version' && command !== 'help') {
+  if (!isSupportedPlatform() && !meta.anyPlatform) {
     return refuse(
       REASON.unsupportedPlatform,
       `legionctl runs on linux, windows and mac only; this host reports ${JSON.stringify(process.platform)}`,
@@ -1572,7 +1609,7 @@ async function answer(command, positional, flags, options) {
     );
   }
 
-  const result = await dispatch(command, positional, flags, options, loaded);
+  const result = await meta.run({ config: loaded.config, loaded, positional, flags, options });
 
   // A detach that could not spawn falls back to doing the work here, so the
   // caller gets a real answer rather than a promise nobody will keep. It keeps
