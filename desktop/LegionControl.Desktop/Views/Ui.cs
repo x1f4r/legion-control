@@ -206,6 +206,10 @@ public static class UiTask
         }
     }
 
+    /// What stopped, for an error the window's own thread met outside every [Ui.Run], where
+    /// nothing a person started can be named.
+    public const string Window = "The window";
+
     public static string Sentence(string what, Exception error) =>
         $"{what} stopped on an error this app did not expect: {error.Message}\n\nThe details are in {AppLog.Path}.";
 }

@@ -31,11 +31,11 @@ public partial class App : Application
         // logged every time.
         Dispatcher.UIThread.UnhandledException += (_, unhandled) =>
         {
-            AppLog.Write("the window", unhandled.Exception);
+            AppLog.Write(UiTask.Window, unhandled.Exception);
             unhandled.Handled = true;
             if (_window is not { IsVisible: true } window || DateTimeOffset.UtcNow - _failureShown < TimeSpan.FromMinutes(1)) return;
             _failureShown = DateTimeOffset.UtcNow;
-            Ui.Failed(window, "Something went wrong", unhandled.Exception);
+            Ui.Failed(window, UiTask.Window, unhandled.Exception);
         };
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {

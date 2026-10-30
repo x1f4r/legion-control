@@ -32,6 +32,10 @@ public class CrashContainmentTests
         var reported = false;
         await UiTask.RunAsync("Refreshing", () => Task.CompletedTask, _ => reported = true);
         Assert.False(reported);
+
+        // What the window's own thread throws outside every action reads as a sentence too.
+        Assert.StartsWith("The window stopped on an error this app did not expect: layout",
+            UiTask.Sentence(UiTask.Window, new InvalidOperationException("layout")));
     }
 
     [Fact]
