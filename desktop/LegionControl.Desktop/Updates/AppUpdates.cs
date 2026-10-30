@@ -752,12 +752,16 @@ public sealed class AppInstaller
             child=$!
             i=0
             while [ "$i" -lt $((health*2)) ]; do
+              # Whether it has exited is asked before the marker is looked for: a build that drew
+              # its window and quit in between would otherwise be taken for one that never drew it.
+              gone=0
+              exited "$child" && gone=1
               if [ -f "$marker" ]; then
                 say "it drew its window"
                 say "finished: changed"
                 exit 0
               fi
-              if exited "$child"; then
+              if [ "$gone" = 1 ]; then
                 say "it exited before drawing its window"
                 break
               fi
@@ -952,12 +956,16 @@ public sealed class AppInstaller
             if ($null -ne $child) {
                 $until = (Get-Date).AddSeconds($health)
                 while ((Get-Date) -lt $until) {
+                    # Whether it has exited is asked before the marker is looked for: a build that
+                    # drew its window and quit in between would otherwise be taken for one that
+                    # never drew it.
+                    $gone = $child.HasExited
                     if (Test-Path -LiteralPath $marker) {
                         Say 'it drew its window'
                         Say 'finished: changed'
                         exit 0
                     }
-                    if ($child.HasExited) { Say 'it exited before drawing its window'; break }
+                    if ($gone) { Say 'it exited before drawing its window'; break }
                     Start-Sleep -Milliseconds 500
                 }
                 if (-not $child.HasExited) { Say "it did not draw its window within ${health}s" }
