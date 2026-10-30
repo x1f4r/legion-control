@@ -25,8 +25,10 @@ namespace LegionControl.Desktop.Views;
 public static class LiveTree
 {
     /// What a kept control takes from the new build: everything the screens set on a control, and
-    /// nothing a control keeps for itself while it is shown.
-    private static readonly AvaloniaProperty[] Synced =
+    /// nothing a control keeps for itself while it is shown. A property a screen sets that is not
+    /// here would keep its first value on a kept control for good, so a test builds every screen
+    /// and fails on any it sets that this does not list.
+    public static readonly IReadOnlyList<AvaloniaProperty> Synced = new AvaloniaProperty[]
     {
         Layoutable.MarginProperty, Layoutable.WidthProperty, Layoutable.HeightProperty,
         Layoutable.MinWidthProperty, Layoutable.MinHeightProperty, Layoutable.MaxWidthProperty, Layoutable.MaxHeightProperty,

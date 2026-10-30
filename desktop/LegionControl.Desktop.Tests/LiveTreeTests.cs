@@ -1,6 +1,12 @@
+using System.Collections;
+using System.Reflection;
 using System.Text.Json.Nodes;
+using Avalonia;
 using Avalonia.Automation;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
+using Avalonia.Data;
+using Avalonia.Diagnostics;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Input;
@@ -9,6 +15,7 @@ using Avalonia.LogicalTree;
 using Avalonia.Threading;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Model;
+using LegionControl.Desktop.Transport;
 using LegionControl.Desktop.Updates;
 using LegionControl.Desktop.Views;
 using Xunit;
@@ -297,6 +304,142 @@ public class LiveTreeTests
         var tower = Assert.Single(app.LaunchReview, entry => entry.MachineId == "tower");
         Assert.Contains("/opt/second/launcher.mjs", tower.Offered.ToJsonString());
         Assert.Contains(LaunchDocuments.TowerLauncher, tower.Approved!.ToJsonString());
+    }
+
+    /// The window's page, the part of it each rebuild is laid over.
+    private static Control Page(MainWindow window) =>
+        (Control)window.GetLogicalDescendants().OfType<ScrollViewer>().Single().Content!;
+
+    private static void Choose(MainWindow window, string menu, string item)
+    {
+        var items = window.GetLogicalDescendants().OfType<Button>().Single(button => AutomationProperties.GetName(button) == menu)
+            .ContextMenu!.ItemsSource!.OfType<MenuItem>();
+        items.Single(candidate => candidate.Header as string == item).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        Dispatcher.UIThread.RunJobs();
+    }
+
+    /// Every property a value can be set on, styled or attached: each is a public static field of
+    /// the class that registers it. Direct properties are left out, since they hold no value of
+    /// their own for [LiveTree] to carry over.
+    private static readonly Lazy<IReadOnlyList<AvaloniaProperty>> Properties = new(() => AppDomain.CurrentDomain.GetAssemblies()
+        .Where(assembly => !assembly.IsDynamic
+            && assembly.GetName().Name is { } name && (name.StartsWith("Avalonia") || name == typeof(Ui).Assembly.GetName().Name))
+        .SelectMany(assembly => assembly.GetExportedTypes())
+        .Where(type => !type.ContainsGenericParameters)
+        .SelectMany(type => type.GetFields(BindingFlags.Public | BindingFlags.Static))
+        .Where(field => typeof(AvaloniaProperty).IsAssignableFrom(field.FieldType))
+        .Select(field => field.GetValue(null)).OfType<AvaloniaProperty>()
+        .Where(property => !property.IsDirect)
+        .Distinct().ToList());
+
+    /// Every property set on a control under [root], or on an item of a menu it holds, with what it
+    /// is set on.
+    private static IEnumerable<(AvaloniaProperty Property, AvaloniaObject Target)> SetUnder(Control root)
+    {
+        IEnumerable<AvaloniaObject> Items(IEnumerable? items) =>
+            (items?.Cast<object>() ?? Enumerable.Empty<object>()).OfType<MenuItem>().SelectMany(item => Items(item.ItemsSource).Prepend(item));
+        var controls = root.GetLogicalDescendants().OfType<Control>().ToList();
+        var menus = controls.Select(control => control.ContextMenu).OfType<ContextMenu>().ToList();
+        var everything = controls.Cast<AvaloniaObject>()
+            .Concat(menus)
+            .Concat(menus.SelectMany(menu => menu.GetLogicalDescendants().OfType<AvaloniaObject>()))
+            .Concat(menus.SelectMany(menu => Items(menu.ItemsSource)))
+            .Distinct();
+        foreach (var target in everything)
+            foreach (var property in Properties.Value)
+                if (target.GetDiagnostic(property).Priority == BindingPriority.LocalValue)
+                    yield return (property, target);
+    }
+
+    [AvaloniaFact]
+    public async Task EveryPropertyAScreenSetsIsOneAKeptControlTakesFromTheNextBuild()
+    {
+        // What a kept control takes from the next build, and what [LiveTree] matches controls by or
+        // carries over by itself.
+        var handled = LiveTree.Synced.Concat(new AvaloniaProperty[]
+        {
+            Ui.KeyProperty, ContentControl.ContentProperty, Decorator.ChildProperty, Control.ContextMenuProperty,
+            ItemsControl.ItemsSourceProperty, HeaderedSelectingItemsControl.HeaderProperty,
+        }).ToHashSet();
+        var seen = new HashSet<AvaloniaProperty>();
+        var unsynced = new SortedSet<string>();
+        void Check(Control root)
+        {
+            foreach (var (property, target) in SetUnder(root))
+            {
+                seen.Add(property);
+                if (!handled.Contains(property)) unsynced.Add($"{property.OwnerType.Name}.{property.Name} on a {target.GetType().Name}");
+            }
+        }
+
+        // Every page of the window, wide and narrow, over a full reading, an older agent's, and a
+        // machine that does not answer.
+        var readings = new (Func<FakeRunner> Runner, double Width)[]
+        {
+            (() => FakeRunner.Replying(Repo.ReadFixture("status.full.json")), 1000),
+            (() => FakeRunner.Replying(Repo.ReadFixture("status.full.json")), 520),
+            (() => FakeRunner.Replying(Repo.ReadFixture("legacy-2x.status.json")), 1000),
+            (() => new FakeRunner(_ => FakeRunner.SshFailure("ssh: connect to host pi.example port 22: Connection refused")), 1000),
+        };
+        foreach (var (runner, width) in readings)
+        {
+            using var home = new TempHome();
+            File.WriteAllBytes(Path.Combine(home.Path, "config.json"), ControllerDocument.FromText(TraySetup).Bytes);
+            using var app = Device(home, runner());
+            var window = new MainWindow(app) { Width = width, Height = 700 };
+            window.Show();
+            await app.RefreshAllAsync();
+            Dispatcher.UIThread.RunJobs();
+            Check(Page(window));
+            Choose(window, "Application menu", "This device");
+            Check(Page(window));
+            Choose(window, "Application menu", "Setup");
+            Check(Page(window));
+            window.Close();
+        }
+
+        // The page for a device with no setup at all.
+        using (var home = new TempHome())
+        {
+            using var app = Device(home, FakeRunner.Replying(Repo.ReadFixture("status.full.json")));
+            var window = new MainWindow(app) { Width = 1000, Height = 700 };
+            window.Show();
+            Dispatcher.UIThread.RunJobs();
+            Check(Page(window));
+            window.Close();
+        }
+
+        // The launch review, with a command that can be approved and reverted beside one that
+        // cannot be approved at all.
+        using (var home = new TempHome())
+        {
+            var (app, _) = Review(home, root =>
+                LaunchDocuments.System(root, "pi", "linux")["agent"] = LaunchDocuments.Argv("node", "/opt/else\u200bwhere/launcher.mjs"));
+            using var _app = app;
+            var sheet = new LaunchReviewSheet(app);
+            sheet.Show();
+            Dispatcher.UIThread.RunJobs();
+            Assert.NotEmpty(Buttons(sheet, "Revert"));
+            Assert.Contains(sheet.GetLogicalDescendants().OfType<TextBlock>(), text => text.Text!.StartsWith("This cannot be approved"));
+            Check((Control)sheet.GetLogicalDescendants().OfType<ScrollViewer>().Single().Content!);
+            sheet.Close();
+        }
+
+        // The check sees what the screens set, menus included.
+        Assert.Contains(TextBlock.TextProperty, seen);
+        Assert.Contains(AutomationProperties.HelpTextProperty, seen);
+        Assert.Contains(Ui.HandlerProperty, seen);
+        Assert.Empty(unsynced);
+    }
+
+    private static AppModel Device(TempHome home, IProcessRunner runner)
+    {
+        var store = new ConfigStore(Path.Combine(home.Path, "config.json"), Path.Combine(home.Path, "setup-state.json"),
+            new SetupLedger(Path.Combine(home.Path, "revisions")), "laptop", watch: false);
+        return new AppModel(store, runner, new OperationTracker(Path.Combine(home.Path, "operations.json")), DesktopSettings.Default,
+            new RecordingSink(), Bindings.Empty,
+            new AppUpdateSuggestions((_, _) => Task.FromResult<UpdateAvailability>(new UpdateAvailability.Unavailable("offline"))),
+            new LaunchApprovals(Path.Combine(home.Path, "approved-launch.json")), pollInterval: TimeSpan.FromHours(1));
     }
 
     private const string TraySetup = """
