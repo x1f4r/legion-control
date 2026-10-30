@@ -71,7 +71,7 @@ test('a detached worker on a host with a user manager runs outside the session\'
 }, async () => {
   await withHome(async (home) => {
     const seen = path.join(home, 'cgroup');
-    const action = [process.execPath, '-e', `require('node:fs').copyFileSync('/proc/self/cgroup', ${JSON.stringify(seen)})`];
+    const action = [process.execPath, '-e', `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(seen)}, fs.readFileSync('/proc/self/cgroup'))`];
     writeConfig(home, { system: { id: 'test' }, updates: { automatic: false }, services: [], actions: [{ id: 'where', command: action }], boot: { targets: {} } });
     const id = 'detached-scope-0001';
     const accepted = cli(['run', 'where', '--detach', '--op', id], { home });
