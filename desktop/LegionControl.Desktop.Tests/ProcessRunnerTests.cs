@@ -3,9 +3,11 @@ using Xunit;
 
 namespace LegionControl.Desktop.Tests;
 
+/// The runner against real children. Every child here is `node -e`, so each test says it needs
+/// node on PATH, and is reported as skipped with that reason where there is none.
 public class ProcessRunnerTests
 {
-    [Fact]
+    [NodeFact]
     public async Task AgentReplyCompletesAfterAFullNewlineTerminatedObjectEvenWhenChildKeepsPipesOpen()
     {
         // The child never exits, so only the framing can end this run before the deadline does.
@@ -17,7 +19,7 @@ public class ProcessRunnerTests
         Assert.Equal(12000, json.RootElement.GetProperty("data").GetString()!.Length);
     }
 
-    [Theory]
+    [NodeTheory]
     [InlineData("{\"ok\":true}")]
     [InlineData("{\"ok\":true,\n")]
     [InlineData("{\"progress\":true}\n")]
@@ -29,7 +31,7 @@ public class ProcessRunnerTests
         Assert.True(result.TimedOut);
     }
 
-    [Theory]
+    [NodeTheory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task AnEmptyInputClosesStdinBeforeWaitingForTheChild(bool explicitEmptyInput)
@@ -45,7 +47,7 @@ public class ProcessRunnerTests
         Assert.Contains("reading stdin v", result.StandardError);
     }
 
-    [Fact]
+    [NodeFact]
     public async Task ARealChildTimeoutRetainsItsPartialOutput()
     {
         var script = "process.stdout.write('{\\\"ok\\\":true}\\n');process.stderr.write('still running');setInterval(()=>{},1000);";
@@ -55,7 +57,7 @@ public class ProcessRunnerTests
         Assert.Contains("still running", result.StandardError);
     }
 
-    [Fact]
+    [NodeFact]
     public async Task ACallerCancellationIsReportedAsARunThisAppEndedNotAsAnOrdinaryResult()
     {
         // The kill leaves an exit status behind, and handing that back as a normal result made a
@@ -91,7 +93,7 @@ public class ProcessRunnerTests
         }
     }
 
-    [Fact]
+    [NodeFact]
     public async Task ACommandCancelledBeforeItStartsIsNeverStarted()
     {
         var marker = Path.Combine(Path.GetTempPath(), $"legion-never-started-{Guid.NewGuid():N}");
@@ -103,7 +105,7 @@ public class ProcessRunnerTests
         Assert.False(File.Exists(marker));
     }
 
-    [Fact]
+    [NodeFact]
     public async Task OutputPastTheCapIsDiscardedRatherThanKeptWithoutLimit()
     {
         var script = "process.stdout.write('{\"ok\":true}');process.stdout.write('x'.repeat(17*1024*1024));";
@@ -115,7 +117,7 @@ public class ProcessRunnerTests
         Assert.False(AttemptClassifier.Classify(result).IsReply);
     }
 
-    [Fact]
+    [NodeFact]
     public async Task TheCapCountsTheBytesThePipeDeliveredNotTheCharactersTheyDecodeTo()
     {
         // Every other client counts bytes. Nine Mi two-byte characters are 18 MiB, so they are cut
@@ -129,7 +131,7 @@ public class ProcessRunnerTests
         if (!OperatingSystem.IsWindows()) Assert.Equal(8 * 1024 * 1024, result.StandardOutput.Length);
     }
 
-    [Fact]
+    [NodeFact]
     public async Task AReplyInTwoByteTextIsFramedAcrossReadsThatSplitItsCharacters()
     {
         // 4096-byte reads of an odd-length prefix and two-byte characters split one of them on every
@@ -145,7 +147,7 @@ public class ProcessRunnerTests
     // The grandchild's EPIPE is how this test sees this side's end of the pipe close. Windows
     // reports a write to a closed pipe differently, so there it is reported as skipped rather than
     // passing without having looked. The rule is the same code path on both.
-    [UnixFact("The closed pipe is observed through a POSIX EPIPE in a grandchild, which Windows does not report the same way.")]
+    [UnixFact("The closed pipe is observed through a POSIX EPIPE in a grandchild, which Windows does not report the same way.", needsNode: true)]
     public async Task ThePipesAreClosedEvenWhenAGrandchildStillHoldsThem()
     {
         var marker = Path.Combine(Path.GetTempPath(), $"legion-pipe-closed-{Guid.NewGuid():N}");
@@ -172,7 +174,7 @@ public class ProcessRunnerTests
         }
     }
 
-    [Fact]
+    [NodeFact]
     public async Task LargeInputAndBothOutputsDrainWithoutADeadlock()
     {
         var script = "let n=0;process.stdin.on('data',x=>{n+=x.length;process.stdout.write('x'.repeat(8192));process.stderr.write('y'.repeat(8192));});process.stdin.on('end',()=>process.stdout.write('bytes='+n));";
@@ -184,11 +186,43 @@ public class ProcessRunnerTests
 }
 
 /// A fact only Unix can observe. Reported as skipped on Windows, with the reason, rather than
-/// counted as a pass there.
+/// counted as a pass there. [needsNode] adds what [NodeFactAttribute] says.
 public sealed class UnixFactAttribute : FactAttribute
 {
-    public UnixFactAttribute(string reason)
+    public UnixFactAttribute(string reason, bool needsNode = false)
     {
         if (OperatingSystem.IsWindows()) Skip = reason;
+        else if (needsNode) Skip = Node.Missing;
+    }
+}
+
+/// A fact that starts node. Reported as skipped where node is not on PATH, saying so, rather than
+/// failing on a child that could not start, which reads like a fault in the runner.
+public sealed class NodeFactAttribute : FactAttribute
+{
+    public NodeFactAttribute() => Skip = Node.Missing;
+}
+
+/// A theory that starts node, reported the same way.
+public sealed class NodeTheoryAttribute : TheoryAttribute
+{
+    public NodeTheoryAttribute() => Skip = Node.Missing;
+}
+
+/// Whether this machine has node on PATH, as a child started by name finds it.
+public static class Node
+{
+    /// Why a test that starts node cannot run here, or null when it can.
+    public static string? Missing { get; } = Find() is null
+        ? "This test starts node, which is not on PATH here. Install Node.js to run it."
+        : null;
+
+    private static string? Find()
+    {
+        var name = OperatingSystem.IsWindows() ? "node.exe" : "node";
+        return (Environment.GetEnvironmentVariable("PATH") ?? "")
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(directory => Path.Combine(directory, name))
+            .FirstOrDefault(File.Exists);
     }
 }
