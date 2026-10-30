@@ -515,6 +515,9 @@ test('the Windows installer refuses a base that is a profile, installing or unin
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion windows profile base '));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const home = path.join(root, 'home');
+  // A profile has its AppData, where Windows PowerShell, started with USERPROFILE pointing here,
+  // keeps its caches.
+  fs.mkdirSync(path.join(home, 'AppData'), { recursive: true });
   fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
   fs.writeFileSync(path.join(home, 'bin', 'tool.cmd'), '@echo mine\r\n');
   const before = accessOf(home);
@@ -525,7 +528,7 @@ test('the Windows installer refuses a base that is a profile, installing or unin
     assertSays(refused, 'LEGIONCTL_HOME is ', ", which is not a folder of the agent's own. Point it at one", 'Nothing was changed.');
   }
   assert.deepEqual(accessOf(home), before);
-  assert.deepEqual(fs.readdirSync(home), ['bin']);
+  assert.deepEqual(fs.readdirSync(home), ['AppData', 'bin']);
   assert.equal(fs.readFileSync(path.join(home, 'bin', 'tool.cmd'), 'utf8'), '@echo mine\r\n');
 });
 
@@ -555,7 +558,9 @@ test('the Windows installer registers the task as the installing user with the c
   assert.equal(task.sid, access.user);
   assert.equal(task.limit, 'PT30M');
   assert.ok(sameFile(task.execute, process.execPath), task.execute);
-  assert.equal(task.arguments, `"${path.join(base, 'bin', 'launcher.mjs')}" cycle`);
+  // Windows PowerShell's GetFullPath expands a short name, such as the runner's temporary folder
+  // has, so the task names the base by its long name.
+  assert.equal(task.arguments, `"${path.join(fs.realpathSync.native(base), 'bin', 'launcher.mjs')}" cycle`);
   assert.deepEqual(access.holders, [access.user]);
   // So that no cycle starts while the test runs. A disabled task stays disabled when rewritten.
   assert.equal(spawnSync('schtasks.exe', ['/Change', '/TN', name, '/DISABLE'], { encoding: 'utf8' }).status, 0);
