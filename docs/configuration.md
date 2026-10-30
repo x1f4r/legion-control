@@ -540,7 +540,7 @@ An action has **either** a `command` or a `wol` block, never both.
     "id": "wake-tower",
     "name": "Wake the tower",
     "wol": {
-      "mac": "AA:BB:CC:DD:EE:FF",
+      "mac": "02:00:00:00:00:01",
       // Where to send it. Usually the broadcast address of the LAN this machine is on.
       "broadcast": ["192.168.50.255"],
       // Default [9, 7].
@@ -664,7 +664,7 @@ below for where your key paths and ssh aliases go instead.
 
       // Wake on LAN. Leave the block out for a machine that cannot be woken.
       "wake": {
-        "mac": "AA:BB:CC:DD:EE:FF",
+        "mac": "02:00:00:00:00:01",
         "broadcast": ["192.168.50.255"],
         "ports": [9, 7],
         // Polled after the packet, to tell when the machine is back.
@@ -672,11 +672,11 @@ below for where your key paths and ssh aliases go instead.
         // Machines that can send the packet when you cannot, tried in order.
         // See "Waking from somewhere else".
         "helpers": [
-          { "machine": "pi-flat",     "action": "wake-tower" },
-          { "machine": "router-flat", "action": "wake-tower" }
+          { "machine": "pi",  "action": "wake-tower" },
+          { "machine": "nas", "action": "wake-tower" }
         ],
         // Compatibility: the same as helpers[0], written by editors so a 1.2 client still works.
-        "helper": { "machine": "pi-flat", "action": "wake-tower" }
+        "helper": { "machine": "pi", "action": "wake-tower" }
       },
 
       // Every system installed on the machine. "id" must match the agent's system.id on that
@@ -686,9 +686,9 @@ below for where your key paths and ssh aliases go instead.
           // The key for this system is restricted to the dispatcher: see security.md. Clients send
           // a plain argv list rather than a line for a shell to parse. Default false.
           "restricted": true,
-          "agent": ["/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs"] },
+          "agent": ["/usr/bin/node", "/home/me/.legion-control/bin/launcher.mjs"] },
         { "id": "windows", "name": "Windows 11", "platform": "windows", "shell": "powershell",
-          "agent": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"] }
+          "agent": ["C:\\Program Files\\nodejs\\node.exe", "C:\\Users\\me\\.legion-control\\bin\\launcher.mjs"] }
       ]
     }
   ],
@@ -781,12 +781,12 @@ the packet, and point the sleeper's `wake` block at it:
 
 ```jsonc
 "wake": {
-  "mac": "AA:BB:CC:DD:EE:FF",
+  "mac": "02:00:00:00:00:01",
   "helpers": [
-    { "machine": "pi-flat",     "action": "wake-tower" },
-    { "machine": "router-flat", "action": "wake-tower" }
+    { "machine": "pi",  "action": "wake-tower" },
+    { "machine": "nas", "action": "wake-tower" }
   ],
-  "helper": { "machine": "pi-flat", "action": "wake-tower" }
+  "helper": { "machine": "pi", "action": "wake-tower" }
 }
 ```
 
@@ -795,7 +795,7 @@ with, in the helper's own agent config, a native wake action — no third-party 
 ```jsonc
 "actions": [
   { "id": "wake-tower", "name": "Wake the tower",
-    "wol": { "mac": "AA:BB:CC:DD:EE:FF", "broadcast": ["192.168.50.255"] } }
+    "wol": { "mac": "02:00:00:00:00:01", "broadcast": ["192.168.50.255"] } }
 ]
 ```
 
@@ -908,7 +908,7 @@ your real ssh setup.
 
   // How to run the agent here without ssh. The argv is spawned directly — no shell is involved,
   // so there is nothing to quote and no "shell" key to set.
-  "localAgent": { "argv": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"] },
+  "localAgent": { "argv": ["C:\\Program Files\\nodejs\\node.exe", "C:\\Users\\me\\.legion-control\\bin\\launcher.mjs"] },
 
   // Which site you are actually on, when the addresses cannot tell. See below.
   "currentSite": "flat",
@@ -923,7 +923,7 @@ your real ssh setup.
 
   // Per machine overrides. "sshAlias" names an entry in THIS device's ~/.ssh/config.
   "machines": {
-    "attic-box": { "identityFile": "~/.ssh/id_attic", "sshAlias": "attic-box-lan" }
+    "laptop": { "identityFile": "~/.ssh/id_attic", "sshAlias": "laptop-lan" }
   }
 }
 ```
