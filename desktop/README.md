@@ -283,8 +283,9 @@ two directories by renaming them, so the installation is always one whole build 
 release dropped goes with the old one. The build it replaced is kept beside it as
 `<installation>.previous`. The new build has a minute to draw its window
 (`updateHealthSeconds` in `desktop-settings.json`, 10 to 600); if it does not, it is stopped, and
-once it has gone the previous build is renamed back and started. Every way out that leaves the app
-closed starts it again.
+once it and any copy started from it meanwhile have gone the previous build is renamed back and
+started. A copy still running after two minutes keeps the new build installed, with the previous
+one left at `<installation>.previous`. Every way out that leaves the app closed starts it again.
 
 Because the whole directory is swapped, the installation directory must hold the app and nothing
 else, in a directory this account can write. Anything else there, or a directory it cannot write,

@@ -294,10 +294,10 @@ public abstract record UpdateAvailability
 /// build beside the installation, and swaps the two directories by renaming them, so the
 /// installation is always one whole build and never a mix of two, and a file the new release
 /// dropped goes with the old one. It then starts the new build with a marker path. When the marker
-/// does not appear in time, it stops that build, waits until it has gone, and renames the old one
-/// back: an update that will not start is an update that undoes itself rather than one that leaves
-/// somebody with nothing. Every way out that leaves the app closed starts it again, and every step
-/// goes into the helper's log.
+/// does not appear in time, it stops that build, waits until it and any copy started from it
+/// meanwhile have gone, and renames the old one back: an update that will not start is an update
+/// that undoes itself rather than one that leaves somebody with nothing. Every way out that leaves
+/// the app closed starts it again, and every step goes into the helper's log.
 ///
 /// The build it replaced stays beside the installation as `<installation>.previous`, which is what
 /// [Rollback] swaps back in.
@@ -691,6 +691,15 @@ public sealed class AppInstaller
               kill "$killer" 2>/dev/null
             }
 
+            # Takes the lock every copy of the app holds shared while it runs, and fails when one
+            # still runs after $patience. Without flock, or where the lock cannot be made, there is
+            # nothing to wait on.
+            hold() {
+              command -v flock >/dev/null 2>&1 && (: >>"$lock") 2>/dev/null || return 0
+              exec 9>>"$lock"
+              flock -x -w "$patience" 9
+            }
+
             say "$mode $install from $incoming"
             if ps -o stat= -p $$ >/dev/null 2>&1; then can_ps=1; else can_ps=0; fi
 
@@ -710,10 +719,7 @@ public sealed class AppInstaller
             # wait is most often a command line, and the window that asked for the update has
             # closed by now, so it is started again. Were a window open after all, the second one
             # would only bring it forward.
-            if command -v flock >/dev/null 2>&1 && (: >>"$lock") 2>/dev/null; then
-              exec 9>>"$lock"
-              flock -x -w "$patience" 9 || give_up "another copy of the app still runs after ${patience}s"
-            fi
+            hold || give_up "another copy of the app still runs after ${patience}s"
 
             if [ "$mode" = update ]; then
               # The new build goes beside the installation first, where the build kept from before
@@ -737,6 +743,7 @@ public sealed class AppInstaller
               [ "$mode" = update ] && rm -rf "$kept"
               give_up "could not swap $install for $kept"
             fi
+            # Let go for the new build, which takes it shared like every copy.
             exec 9>&-
 
             say "swapped; waiting up to ${health}s for $install/$exe to draw its window"
@@ -759,14 +766,25 @@ public sealed class AppInstaller
             done
             [ "$i" -ge $((health*2)) ] && say "it did not draw its window within ${health}s"
 
-            # It did not. It is stopped, and waited for, before the build before it goes back.
+            # It did not. It is stopped, and waited for, before the build before it goes back, and
+            # so is every copy started from it meanwhile, as a scheduled command line can be: the
+            # lock is taken again for that. A copy that outlasts the wait would have its files
+            # renamed and deleted under it, so the new build then stays, with the one before kept.
             stop "$child"
+            if ! hold; then
+              say "another copy of the app still runs after ${patience}s, so the build that did not draw its window stays installed; the build before is at $kept"
+              exec 9>&-
+              relaunch
+              say "finished: changed"
+              exit 1
+            fi
             if swap; then
               [ "$mode" = update ] && rm -rf "$kept"
               say "put the build before back"
             else
               say "could not put the build before back; it is at $kept"
             fi
+            exec 9>&-
             relaunch
             say "finished: nothing changed"
             exit 1
@@ -811,6 +829,20 @@ public sealed class AppInstaller
         function Say([string] $text) {
             $line = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') + ' ' + $text
             try { Add-Content -LiteralPath $log -Value $line -Encoding UTF8 } catch { }
+        }
+
+        # Takes the lock every copy of the app holds shared while it runs, and fails when one still
+        # runs after $patience.
+        function Hold {
+            $until = (Get-Date).AddSeconds($patience)
+            while ($null -eq $script:held) {
+                try { $script:held = [System.IO.File]::Open($lock, 'OpenOrCreate', 'ReadWrite', 'None') }
+                catch {
+                    if ((Get-Date) -gt $until) { return $false }
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+            return $true
         }
 
         function Release {
@@ -889,14 +921,7 @@ public sealed class AppInstaller
             # the wait is most often a command line, and the window that asked for the update has
             # closed by now, so it is started again. Were a window open after all, the second one
             # would only bring it forward.
-            $until = (Get-Date).AddSeconds($patience)
-            while ($null -eq $held) {
-                try { $held = [System.IO.File]::Open($lock, 'OpenOrCreate', 'ReadWrite', 'None') }
-                catch {
-                    if ((Get-Date) -gt $until) { GiveUp "another copy of the app still runs after ${patience}s" }
-                    Start-Sleep -Milliseconds 500
-                }
-            }
+            if (-not (Hold)) { GiveUp "another copy of the app still runs after ${patience}s" }
 
             if ($mode -eq 'update') {
                 # The new build goes beside the installation first, where the build kept from
@@ -915,6 +940,7 @@ public sealed class AppInstaller
                 if ($mode -eq 'update') { Remove $kept | Out-Null }
                 GiveUp "could not swap $install for $kept"
             }
+            # Let go for the new build, which takes it shared like every copy.
             Release
 
             $path = Join-Path $install $exe
@@ -939,10 +965,21 @@ public sealed class AppInstaller
                 try { Stop-Process -Id $child.Id -Force -ErrorAction Stop } catch { }
                 try { $child.WaitForExit(30000) | Out-Null } catch { }
             }
+            # Every copy started from it meanwhile, as a scheduled command line can be, is waited
+            # for too: the lock is taken again for that. The installation cannot be renamed while
+            # one runs from it, so a copy that outlasts the wait leaves the new build installed,
+            # with the one before kept.
+            if (-not (Hold)) {
+                Say "another copy of the app still runs after ${patience}s, so the build that did not draw its window stays installed; the build before is at $kept"
+                Relaunch
+                Say 'finished: changed'
+                exit 1
+            }
             if (Swap) {
                 if ($mode -eq 'update') { Remove $kept | Out-Null }
                 Say 'put the build before back'
             } else { Say "could not put the build before back; it is at $kept" }
+            Release
             Relaunch
             Say 'finished: nothing changed'
             exit 1

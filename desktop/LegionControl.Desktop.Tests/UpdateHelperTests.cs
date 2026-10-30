@@ -105,6 +105,20 @@ public class UpdateHelperTests
 
         public string Log(AppInstaller installer) => File.Exists(installer.LogPath) ? File.ReadAllText(installer.LogPath) : "";
 
+        /// The log, waiting until it says [text], for a helper that is still running.
+        public string LogWhen(AppInstaller installer, string text)
+        {
+            var until = DateTime.UtcNow.AddSeconds(30);
+            while (true)
+            {
+                var log = "";
+                // The helper may be writing a line the moment it is read.
+                try { log = Log(installer); } catch (IOException) { }
+                if (log.Contains(text) || DateTime.UtcNow > until) return log;
+                Thread.Sleep(100);
+            }
+        }
+
         public void Dispose()
         {
             foreach (var pid in File.Exists(Pids) ? File.ReadAllLines(Pids) : Array.Empty<string>())
@@ -194,6 +208,65 @@ public class UpdateHelperTests
         Assert.Contains("did not draw its window within 3s", log);
         Assert.Contains("put the build before back", log);
         Assert.Contains("finished: nothing changed", log);
+    }
+
+    [InstanceLockFact]
+    public void ABuildThatNeverDrawsItsWindowGoesBackOnlyOnceEveryCopyStartedFromItHasExited()
+    {
+        using var rig = new Rig();
+        var installer = rig.Installer(health: TimeSpan.FromSeconds(5));
+        rig.Build(rig.Install, "1.4.0", "healthy");
+        ARelease(rig, installer, "1.4.1", "hangs");
+
+        Assert.True(installer.Apply().Started);
+        Assert.Single(rig.StartsWhen(1));
+        // A command line started from the new build while it has its chance to draw its window,
+        // as a scheduled one can be.
+        using (var commandLine = InstanceLock.Share(TimeSpan.Zero, rig.Lock))
+        {
+            Assert.NotNull(commandLine);
+            Assert.Contains("did not draw its window within 5s", rig.LogWhen(installer, "did not draw its window"));
+            // The build that hung is stopped, and nothing is renamed under the command line.
+            Thread.Sleep(TimeSpan.FromSeconds(2));
+            Assert.False(installer.Helper!.HasExited, "the helper waits for the command line");
+            Assert.Equal("1.4.1", rig.Version(rig.Install));
+            Assert.DoesNotContain("put the build before back", rig.Log(installer));
+        }
+        Assert.Equal(1, Finish(installer));
+
+        Assert.Equal("1.4.0", rig.Version(rig.Install));
+        Assert.False(Directory.Exists(installer.PreviousDirectory));
+        Assert.Equal("1.4.0", rig.StartsWhen(2)[1]);
+        var log = rig.Log(installer);
+        Assert.Contains("put the build before back", log);
+        Assert.Contains("finished: nothing changed", log);
+    }
+
+    [InstanceLockFact]
+    public void ABuildThatNeverDrawsItsWindowStaysWhileACopyStartedFromItOutlastsTheWaitWithTheOneBeforeKept()
+    {
+        using var rig = new Rig();
+        var installer = rig.Installer(health: TimeSpan.FromSeconds(3), patience: TimeSpan.FromSeconds(2));
+        rig.Build(rig.Install, "1.4.0", "healthy");
+        ARelease(rig, installer, "1.4.1", "hangs");
+
+        Assert.True(installer.Apply().Started);
+        Assert.Single(rig.StartsWhen(1));
+        using (var commandLine = InstanceLock.Share(TimeSpan.Zero, rig.Lock))
+        {
+            Assert.NotNull(commandLine);
+            Assert.Equal(1, Finish(installer));
+        }
+
+        // Renamed and deleted, the new build would have gone from under the copy still running it.
+        Assert.Equal("1.4.1", rig.Version(rig.Install));
+        Assert.Equal("1.4.0", rig.Version(installer.PreviousDirectory));
+        Assert.False(Directory.Exists(installer.AsideDirectory));
+        // And the app is started again, as on every way out that leaves it closed.
+        Assert.Equal("1.4.1", rig.StartsWhen(2)[1]);
+        var log = rig.Log(installer);
+        Assert.Contains("another copy of the app still runs after 2s, so the build that did not draw its window stays installed", log);
+        Assert.Contains("finished: changed", log);
     }
 
     [Fact]
