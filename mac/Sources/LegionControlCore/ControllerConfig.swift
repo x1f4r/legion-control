@@ -791,6 +791,11 @@ final class ConfigStore {
 
     @ObservationIgnored private var appliedHash: String?
     @ObservationIgnored private var expectedWriteHash: String?
+    /// A document with no identity that somebody put in the setup file of a device that applied no
+    /// setup before, by its hash: that device's first setup, written there and not handed over. It
+    /// approves what it holds (section 9.9 of the contract), which `takeFirstSetupWrittenHere` hands
+    /// over once, before the launch gate reads it.
+    @ObservationIgnored private var firstSetupWrittenHere: (hash: String, bytes: Data)?
 
     @ObservationIgnored private var watcher: DispatchSourceFileSystemObject?
     @ObservationIgnored private var watchedDescriptor: CInt = -1
@@ -955,6 +960,10 @@ final class ConfigStore {
         }
         guard let appliedHash else {
             hasPendingExternalEdit = false
+            // This app wrote everything that came through the branch above, and approved what it
+            // had to there. A file with no identity reaching this one was put there by somebody
+            // using this device, as the first setup it applies.
+            if document.identity.id == nil { firstSetupWrittenHere = (document.hash, document.bytes) }
             markApplied(document.bytes, hash: document.hash)
             return
         }
@@ -973,6 +982,17 @@ final class ConfigStore {
             hasPendingExternalEdit = false
             markApplied(document.bytes, hash: document.hash)
         }
+    }
+
+    /// The first setup somebody wrote into this device's setup file, with no identity, while it
+    /// applied none, once, and only while that is still the document applied here. Whoever takes it
+    /// records it as an edit made on this device to nothing, which approves every launch value it
+    /// holds: the same text pasted into the editor would have. One put over an applied setup is a
+    /// setup of its own and never comes through here, and what it changed waits for review.
+    func takeFirstSetupWrittenHere() -> Data? {
+        guard let first = firstSetupWrittenHere else { return nil }
+        firstSetupWrittenHere = nil
+        return first.hash == hash && !hasPendingExternalEdit ? first.bytes : nil
     }
 
     /// Turn a hand edit into a proper child revision by changing only its controller block.

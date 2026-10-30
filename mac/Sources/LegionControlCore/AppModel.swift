@@ -209,6 +209,9 @@ final class AppModel {
     /// decides. The record is read again first if it changed on disk.
     private func applyLaunchGate() {
         approvals.reloadIfChanged(seedingFrom: config.rawBytes)
+        // Before the gate reads the record: a first setup written here by hand is this device's own,
+        // and must not come up for review as if it had arrived (section 9.9).
+        if let first = config.takeFirstSetupWrittenHere() { approvals.recordLocalEdit(before: nil, after: first) }
         guard let applied = config.config else {
             effectiveSetup = nil
             launchReview = []
@@ -379,11 +382,12 @@ final class AppModel {
 
     /// Give a hand written or pasted document an identity, so it can take part in reconciliation.
     ///
-    /// It approves nothing. Only the controller block changes, so no launch value changed, and a
-    /// document without an id is not always this person's own: a peer's copy with lineage but no
-    /// id is fetched like any other, and giving it an id must not make what it runs approved. So a
-    /// first setup written by hand on a device that has approved nothing yet waits for review like
-    /// one that arrived, which is the safe side to be wrong on.
+    /// It approves nothing itself. Only the controller block changes, so no launch value changed,
+    /// and a document without an id is not always this person's own: a peer's copy with lineage but
+    /// no id is fetched like any other, and giving it an id must not make what it runs approved.
+    /// What a file with no identity runs was settled when it was applied (section 9.9): as the
+    /// first setup a device applies it was approved then, because it was written there, and put
+    /// over an applied setup it is a setup of its own whose changes wait for review.
     @discardableResult
     func adoptOwnDocument() -> String? {
         guard let raw = config.rawBytes, config.config?.identity.id == nil else { return nil }

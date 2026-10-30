@@ -294,13 +294,18 @@ struct AppModelTests {
         app.divergence = nil
         #expect(app.sidebarRow(for: .setup)?.summary == "revision 1")
 
-        // A record this device cannot read approves nothing, so every command waits for a person.
+        // A record this device cannot read approves nothing, so every command of a setup that came
+        // with an identity waits for a person. (One with none, written here as the first setup, is
+        // this device's own edit, which approves what it holds and sets the unreadable record aside.)
         let other = try Self.home()
         defer { try? FileManager.default.removeItem(at: other) }
         let state = other.appending(path: "state")
         try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
         try Data("not a record".utf8).write(to: state.appending(path: "approved-launch.json"))
-        let waiting = try Self.app(Self.twoMachines, in: other)
+        let identified = Self.twoMachines.replacingOccurrences(
+            of: #""version": 1,"#,
+            with: #""version": 1, "controller": { "id": "setup-3f9c2a71-8d04-4e6b-9a53-7c21b0e5d846", "revision": 1, "lineage": [] },"#)
+        let waiting = try Self.app(identified, in: other)
         #expect(!waiting.launchReview.isEmpty)
         #expect(waiting.sidebarRow(for: .setup)?.summary == "commands waiting for approval")
     }

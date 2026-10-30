@@ -669,6 +669,46 @@ struct LaunchGateTests {
         #expect(app.machine(id: "tower")?.machine.system(id: "linux")?.agent == edited)
     }
 
+    @Test("a file with no identity approves what it holds only as the first setup applied here, as on the desktop")
+    func firstSetupWrittenByHand() throws {
+        // Section 9.9: the same text pasted into the editor approves what it holds, and so does the
+        // file a person writes on a device that applies no setup yet. The desktop has always taken
+        // it so; the Mac used to leave every command in it waiting for review.
+        let home = try Self.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try Self.app(nil, in: home)
+        #expect(app.approvals.record.seededFrom == "none")
+        let first = try Self.held { $0.removeValue(forKey: "controller") }
+        try first.write(to: home.appending(path: "config.json"))
+        app.config.reloadIfChanged()
+        #expect(app.config.config?.identity.id == nil)
+        #expect(app.launchReview.isEmpty)
+        #expect(app.approvals.record.value(at: .system(machine: "tower", system: "linux"))
+                == .tuple(LaunchTuple(agent: Self.launcher, grammar: "posix")))
+        #expect(app.machine(id: "tower")?.machine.system(id: "linux")?.agent == Self.launcher)
+        // Giving it an identity changes nothing it runs, and approves nothing more.
+        let record = Self.file(app.config.approvalsURL)
+        #expect(app.adoptOwnDocument() == nil)
+        #expect(app.config.config?.identity.id != nil)
+        #expect(app.launchReview.isEmpty)
+        #expect(Self.file(app.config.approvalsURL) == record)
+
+        // Put over a setup that is applied, such a file is a setup of its own, and what it changed waits.
+        let other = try Self.home()
+        defer { try? FileManager.default.removeItem(at: other) }
+        let desk = try Self.app(try Self.held(), in: other)
+        let written = ["/usr/bin/node", "/srv/written/bin/launcher.mjs"]
+        let anonymous = try Self.held { root in
+            root.removeValue(forKey: "controller")
+            Self.system("tower", "linux", in: &root) { $0["agent"] = written }
+        }
+        try anonymous.write(to: other.appending(path: "config.json"))
+        desk.config.reloadIfChanged()
+        #expect(desk.config.hash == (try Canonical.hash(anonymous)))
+        #expect(desk.launchReview.map(\.path) == ["machines[tower].systems[linux]"])
+        #expect(desk.machine(id: "tower")?.machine.system(id: "linux")?.agent == Self.launcher)
+    }
+
     @Test("the example this app writes when asked runs without asking")
     func exampleIsApproved() throws {
         let home = try Self.home()
