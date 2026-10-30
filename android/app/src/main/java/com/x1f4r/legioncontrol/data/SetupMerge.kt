@@ -222,8 +222,10 @@ object SetupMerge {
 
     /**
      * The base of a merge: the first hash of mine's lineage, newest first, that is also in theirs'
-     * lineage and whose kept bytes still hash to it; null when there is none. The heads themselves
-     * are never a base: a merge whose base was one side would only ever take the other side.
+     * lineage, whose kept bytes still hash to it and which peer intake accepts; null when there is
+     * none. A kept revision this build refuses, kept by an older one, is skipped like one that is
+     * not kept (section 9.8). The heads themselves are never a base: a merge whose base was one side
+     * would only ever take the other side.
      */
     fun commonBase(
         mineHash: String?,
@@ -235,7 +237,7 @@ object SetupMerge {
         for (hash in mineLineage) {
             if (hash == mineHash || hash == theirsHash || hash !in theirsLineage) continue
             val text = kept(hash) ?: continue
-            if (CanonicalSetup.hashOf(text) == hash) return hash
+            if (CanonicalSetup.hashOf(text) == hash && DocumentAcceptance.check(text, Intake.PEER).errors.isEmpty()) return hash
         }
         return null
     }

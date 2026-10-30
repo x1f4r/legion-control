@@ -202,7 +202,11 @@ not, the agent now answers as they say.
   that begins with `"`, `controller.`, `sites[` or `machines[` is an entry
   written inside double quotes, so a difference's `entry` may be quoted. A
   device whose applied document breaks only `unknown-site` or a `helper-` rule
-  still merges, and only a result section 9.7 accepts is written.
+  still merges, and only a result section 9.7 accepts is written. The base is
+  the newest revision both lineages share whose kept bytes hash to it and which
+  peer intake accepts; a kept revision peer intake refuses is skipped like one
+  that is not kept, and with no base every difference is asked about. A device
+  whose applied document has a section 9.7 error never sends `--replace`.
 - **A client older than its agent** keeps using the highest contract it
   implements and says so once (section 1, rule 9). Nothing on the wire changes.
 - **Sites and wake are normative** (sections 10.1 and 10.2), with one

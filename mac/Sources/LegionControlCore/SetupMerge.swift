@@ -173,12 +173,15 @@ enum SetupMerge {
     // MARK: - Bases and lineage
 
     /// The base of a merge: the first hash of mine's lineage, newest first, that is also in theirs'
-    /// lineage and whose kept bytes still hash to it, or nil. A head is never a base: a head is not
-    /// in its own lineage, and a merge whose base was one side would only ever take the other side.
+    /// lineage, whose kept bytes still hash to it and which peer intake accepts, or nil. A kept
+    /// revision this build refuses, kept by an older one, is skipped like one that is not kept
+    /// (section 9.8). A head is never a base: a head is not in its own lineage, and a merge whose
+    /// base was one side would only ever take the other side.
     static func commonBase(mineHash: String, theirsHash: String, mineLineage: [String], theirsLineage: [String],
                            kept: (String) -> Data?) -> String? {
         for hash in mineLineage where hash != mineHash && hash != theirsHash && theirsLineage.contains(hash) {
-            if let bytes = kept(hash), (try? Canonical.hash(bytes)) == hash { return hash }
+            if let bytes = kept(hash), (try? Canonical.hash(bytes)) == hash,
+               DocumentAcceptance.check(bytes, intake: .peer).errors.isEmpty { return hash }
         }
         return nil
     }

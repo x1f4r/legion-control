@@ -392,14 +392,12 @@ public sealed class Reconciler(ConfigStore config, Bindings bindings)
                     DifferentSetup: true, MergeProblem: null, takeProblem, WhyNotReplace(machine)), null);
 
             // A kept revision is held to peer intake like anything else a merge reads. One this
-            // build refuses, kept by an older one, is skipped exactly like one that is not kept:
-            // the next revision both sides descend from is the base, and with none every
-            // difference is asked about, which fails toward a question rather than toward a merge
-            // that cannot start. Section 9.8 has not settled this yet, and the reference merge
-            // refuses such a base instead, so Merge and Keep mine wait there where they are
-            // offered here.
+            // build refuses, kept by an older one, is skipped exactly like one that is not kept
+            // (section 9.8): the next revision both sides descend from is the base, and with none
+            // every difference is asked about, which fails toward a question rather than toward a
+            // merge that cannot start.
             var baseHash = SetupSync.CommonBase(mine.Hash, theirs.Hash, mine.Identity.Lineage, theirs.Identity.Lineage,
-                hash => _config.Ledger.Read(hash) is { } kept && SetupMerge.WhyTheirsCannotMerge(kept.Text) is null ? kept.Text : null);
+                hash => _config.Ledger.Read(hash)?.Text);
             var baseDocument = baseHash is null ? null : _config.Ledger.Read(baseHash);
             var mergeProblem = SetupMerge.WhyMineCannotMerge(mine.Text);
             var differences = mergeProblem is null

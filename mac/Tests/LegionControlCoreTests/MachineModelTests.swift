@@ -1636,8 +1636,8 @@ struct MachineModelTests {
         #expect(try Data(contentsOf: store.url) == unfinished)
     }
 
-    @Test("a kept base that peer intake refuses is said on the divergence sheet, not drawn as nothing to merge")
-    func divergenceSheetSaysTheBaseCannotBeUsed() async throws {
+    @Test("a kept base that peer intake refuses is skipped like one that is not kept, so every difference is asked about")
+    func divergenceSheetSkipsARefusedBase() async throws {
         let home = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-setup-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: home) }
@@ -1686,17 +1686,15 @@ struct MachineModelTests {
         model.openSetupDivergence()
         await Self.eventually { raised != nil }
 
-        // The base is found and kept, but nothing can be built on it: the sheet says so, and Merge and
-        // Keep mine wait with that reason rather than failing on it after the sheet said the two
-        // differ only in how they are written.
+        // The only revision both sides descend from is one peer intake refuses (section 9.8), so the
+        // merge has no base: nothing waits on it, and every entry the two sides differ in is asked
+        // about rather than decided from a document this build would not accept.
         let divergence = try #require(raised)
-        #expect(divergence.baseBytes == base.bytes)
-        #expect(divergence.differences.isEmpty)
-        let blocker = try #require(divergence.mergeBlocker)
-        #expect(blocker.contains("common ancestor"))
-        #expect(blocker.contains("ghost"))
-        // The row above it says the ancestor was found and no more, not that it narrows anything down.
-        #expect(divergence.ancestorNote == "found")
+        #expect(divergence.baseBytes == nil)
+        #expect(divergence.mergeBlocker == nil)
+        #expect(!divergence.differences.isEmpty)
+        #expect(divergence.differences.allSatisfy { $0.kind == .noBase })
+        #expect(divergence.ancestorNote == "not kept on this device, so every difference needs a decision")
     }
 
     @Test("a different setup is compared, never merged, and the sheet says so when this device's setup has an error")

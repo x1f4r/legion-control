@@ -457,10 +457,9 @@ public class ReconcilerTests
     public async Task AKeptBaseThisDeviceRefusesIsSkippedLikeOneThatIsNotKept(bool keepsAnOlderOne)
     {
         // The newest revision both sides descend from, kept here, is one peer intake refuses: an
-        // older client could publish it through an agent before 3.1.0. Section 9.8 does not say yet
-        // whether such a base stops the merge, as the reference's does, or is skipped like one
-        // that is not kept. Here it is skipped: an older shared revision this device accepts is
-        // the base, and with none every difference is asked about. Either way the merge writes.
+        // older client could publish it through an agent before 3.1.0. Section 9.8 skips it like
+        // one that is not kept: an older shared revision this device accepts is the base, and with
+        // none every difference is asked about. Either way the merge writes.
         using var home = new TempHome();
         var older = Documents.Make("setup-a", 4, Array.Empty<string>());
         var refused = JsonNode.Parse(Documents.Make("setup-a", 5, new[] { older.Hash }).Text)!.AsObject();

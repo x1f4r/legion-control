@@ -632,7 +632,10 @@ export function commonBase({ mineHash, theirsHash, mineLineage, theirsLineage, k
   for (const hash of mineLineage) {
     if (hash === mineHash || hash === theirsHash || !theirsLineage.includes(hash)) continue;
     const text = own(kept, hash);
-    if (typeof text === 'string' && canonicalHash(text) === hash) return hash;
+    // A kept revision is read like anything else a merge reads, under peer
+    // intake: one this build refuses, kept by an older one, is skipped exactly
+    // like one that is not kept (section 9.8).
+    if (typeof text === 'string' && canonicalHash(text) === hash && checkDocument(text, { intake: 'peer' }).errors.length === 0) return hash;
   }
   return null;
 }

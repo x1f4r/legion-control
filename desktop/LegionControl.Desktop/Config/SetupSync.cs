@@ -294,9 +294,10 @@ public static class SetupSync
     }
 
     /// The base of a merge (contract section 9.8): the first hash of mine's lineage, newest first,
-    /// that is also in theirs' lineage and whose kept bytes still hash to it; null when there is
-    /// none. The heads themselves are never a base: a merge whose base was one side would only
-    /// ever take the other side.
+    /// that is also in theirs' lineage, whose kept bytes still hash to it and which peer intake
+    /// accepts; null when there is none. A kept revision this build refuses, kept by an older one,
+    /// is skipped like one that is not kept. The heads themselves are never a base: a merge whose
+    /// base was one side would only ever take the other side.
     public static string? CommonBase(
         string mineHash, string theirsHash, IReadOnlyList<string> mineLineage, IReadOnlyList<string> theirsLineage,
         Func<string, string?> kept)
@@ -304,7 +305,8 @@ public static class SetupSync
         foreach (var hash in mineLineage)
         {
             if (hash == mineHash || hash == theirsHash || !theirsLineage.Contains(hash, StringComparer.Ordinal)) continue;
-            if (kept(hash) is { } text && Canonical.Hash(Encoding.UTF8.GetBytes(text)) == hash) return hash;
+            if (kept(hash) is { } text && Canonical.Hash(Encoding.UTF8.GetBytes(text)) == hash
+                && DocumentAcceptance.Check(text, Intake.Peer).Errors.Count == 0) return hash;
         }
         return null;
     }
