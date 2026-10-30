@@ -314,7 +314,7 @@ public class UpdateHelperTests
     }
 
     [UnixFact("a directory this account cannot write is made with a POSIX mode")]
-    public void AnInstallationTheHelperCannotRenameIsLeftAsItWasAndStartedAgain()
+    public void AnUpdateWhoseCopyCannotBeMadeLeavesTheInstallationAsItWasAndStartsItAgain()
     {
         using var rig = new Rig();
         // The helper waits for this until the directory around the installation is read-only,
@@ -346,6 +346,50 @@ public class UpdateHelperTests
             SetMode(parent, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             try { app.Kill(); } catch (Exception) { }
         }
+    }
+
+    [UnixFact("the POSIX helper's renames are made to fail through the mv it finds on PATH")]
+    public void ASwapWhoseSecondRenameFailsPutsTheInstallationBackAndStartsItAgain()
+    {
+        using var rig = new Rig();
+        var installer = rig.Installer();
+        rig.Build(rig.Install, "1.4.0", "healthy");
+        ARelease(rig, installer, "1.4.1", "healthy");
+
+        // An mv that will not move the new build into place, and moves anything else: the first
+        // rename of the swap goes through, the second does not.
+        var tools = Path.Combine(rig.Root, "tools");
+        Directory.CreateDirectory(tools);
+        var realMv = new[] { "/usr/bin/mv", "/bin/mv" }.First(File.Exists);
+        var mv = Path.Combine(tools, "mv");
+        File.WriteAllText(mv, $$"""
+            #!/bin/sh
+            case "$1" in *.previous) echo "mv: refused for the test" >&2; exit 1 ;; esac
+            exec {{realMv}} "$@"
+            """);
+        SetMode(mv, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var path = Environment.GetEnvironmentVariable("PATH");
+        Environment.SetEnvironmentVariable("PATH", tools + Path.PathSeparator + path);
+        try
+        {
+            Assert.True(installer.Apply().Started);
+        }
+        finally
+        {
+            // The helper has its environment by now, and nothing else here should find that mv.
+            Environment.SetEnvironmentVariable("PATH", path);
+        }
+        Assert.Equal(1, Finish(installer));
+
+        // The installation was moved aside and moved back, whole, and started again.
+        Assert.Equal("1.4.0", rig.Version(rig.Install));
+        Assert.False(Directory.Exists(installer.AsideDirectory));
+        Assert.False(Directory.Exists(installer.PreviousDirectory));
+        Assert.Equal(new[] { "1.4.0" }, rig.StartsWhen(1));
+        var log = rig.Log(installer);
+        Assert.Contains("refused for the test", log);
+        Assert.Contains($"could not swap {rig.Install} for {installer.PreviousDirectory}", log);
+        Assert.Contains("finished: nothing changed", log);
     }
 
     [UnixFact("a directory this account cannot write is made with a POSIX mode")]
