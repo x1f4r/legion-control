@@ -22,17 +22,8 @@
 import { spawnDetached } from './detached.mjs';
 import { fileURLToPath } from 'node:url';
 import { checkWorkerModules } from './selftest-modules.mjs';
-import {
-  AGENT_METADATA_PROBLEM,
-  AGENT_VERSION,
-  basePath,
-  configPath,
-  isSupportedPlatform,
-  loadConfig,
-  platformName,
-  readJsonDocument,
-  saveConfig,
-} from './config.mjs';
+import { loadConfig, readJsonDocument, saveConfig } from './config-store.mjs';
+import { AGENT_METADATA_PROBLEM, AGENT_VERSION, basePath, configPath, isSupportedPlatform, platformName } from './paths.mjs';
 import {
   CONTRACT_VERSION,
   DURATION_PATTERN,
@@ -1383,9 +1374,10 @@ async function commandVersion(flags, loaded) {
     // still in place — which is why self-update runs it on the staged tree
     // before swapping anything.
     const modules = [
-      'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'args.mjs', 'boot.mjs', 'config.mjs', 'contract.mjs', 'controller.mjs',
+      'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'args.mjs', 'boot.mjs', 'config-schema.mjs', 'config-store.mjs', 'config.mjs',
+      'contract.mjs', 'controller.mjs',
       'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'launch.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
-      'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
+      'operate.mjs', 'operations.mjs', 'paths.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
       'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs', 'process-runner.mjs',
       'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'redact.mjs', 'scheduler.mjs',
       'selfupdate.mjs', 'service.mjs', 'setup-document.mjs', 'state.mjs', 'status.mjs', 'trust.mjs', 'update.mjs',

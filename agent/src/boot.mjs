@@ -14,8 +14,8 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { describeFailure, detectPlatform, runArgv, runCommand, sleep } from './config.mjs';
-import { runMutation, runMutationArgv } from './process-runner.mjs';
+import { detectPlatform } from './paths.mjs';
+import { describeFailure, runArgv, runCommand, runMutation, runMutationArgv, sleep } from './process-runner.mjs';
 
 /**
  * How long a configured arm command gets, and its verify; a command that

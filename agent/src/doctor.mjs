@@ -11,21 +11,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { lastGoodInfo, readJsonDocument } from './config-store.mjs';
 import {
   AGENT_TREE,
   AGENT_VERSION,
   basePath,
   configPath,
-  describeFailure,
   detectPlatform,
   lastGoodConfigPath,
-  lastGoodInfo,
   operationsDir,
-  readJsonDocument,
-  runCommand,
   stateDir,
   userHome,
-} from './config.mjs';
+} from './paths.mjs';
+import { describeFailure, runCommand } from './process-runner.mjs';
 import { CONTRACT_VERSION } from './contract.mjs';
 import { carriesSignedManifest } from './archive.mjs';
 import { selectSleepCommand } from './boot.mjs';

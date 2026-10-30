@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { loadConfig } from '../src/config.mjs';
+import { loadConfig } from '../src/config-store.mjs';
 import { beginOperation, queueOperation, readOperation, updateOperation } from '../src/operations.mjs';
 import { WARM_ATTEMPT_MS, WARM_ATTEMPTS } from '../src/providers/npm.mjs';
 import { CYCLE_BUDGET_MS, cycleBudget, runCycle, SCHEDULER_LIMIT_MS } from '../src/scheduler.mjs';

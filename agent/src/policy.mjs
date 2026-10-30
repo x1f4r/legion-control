@@ -21,7 +21,7 @@
 // Everything the scheduler declines is declined with a reasonCode, so a client
 // can say "paused until Tuesday" rather than "nothing happened".
 
-import { WEEKDAYS } from './config.mjs';
+import { WEEKDAYS } from './config-schema.mjs';
 import { CLOCK_TIME_PATTERN, REASON } from './contract.mjs';
 
 function minutesOfDay(hhmm) {

@@ -23,8 +23,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath, operationsDir, runCommand, stateDir } from './config.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
+import { basePath, operationsDir, stateDir } from './paths.mjs';
+import { runCommand } from './process-runner.mjs';
 
 /** How long we are willing to wait for another process to finish its write. */
 const LOCK_WAIT_MS = 10000;

@@ -7,15 +7,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import {
-  compilePattern,
-  DEFAULT_VERSION_PATTERN,
-  defaultNpmPrefix,
-  describeFailure,
-  globalModulesDir,
-  runCommand,
-} from '../config.mjs';
-import { runMutation } from '../process-runner.mjs';
+import { compilePattern, DEFAULT_VERSION_PATTERN } from '../config-schema.mjs';
+import { defaultNpmPrefix, globalModulesDir } from '../paths.mjs';
+import { describeFailure, runCommand, runMutation } from '../process-runner.mjs';
 import { loadCache, saveCache } from '../state.mjs';
 
 const LATEST_CACHE_MS = 10 * 60 * 1000;

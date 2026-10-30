@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describeFailure, runCommandAsync } from './config.mjs';
+import { describeFailure, runCommandAsync } from './process-runner.mjs';
 import { checkServiceBusy, unreadable } from './probes/busy.mjs';
 
 const worker = fileURLToPath(new URL('./status-probe-worker.mjs', import.meta.url));

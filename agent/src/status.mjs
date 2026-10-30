@@ -23,18 +23,9 @@
 
 import os from 'node:os';
 import path from 'node:path';
-import {
-  AGENT_TREE,
-  AGENT_VERSION,
-  basePath,
-  compilePattern,
-  deadline as makeDeadline,
-  describeFailure,
-  mapWithLimit,
-  platformName,
-  runArgvAsync,
-  runCommandAsync,
-} from './config.mjs';
+import { compilePattern } from './config-schema.mjs';
+import { AGENT_TREE, AGENT_VERSION, basePath, platformName } from './paths.mjs';
+import { deadline as makeDeadline, describeFailure, mapWithLimit, runArgvAsync, runCommandAsync } from './process-runner.mjs';
 import { CONTRACT_VERSION } from './contract.mjs';
 import { listActions } from './actions.mjs';
 import { carriesSignedManifest } from './archive.mjs';

@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeConfig } from '../src/config.mjs';
+import { normalizeConfig } from '../src/config-schema.mjs';
 import {
   describeServiceUpdates,
   effectivePolicy,

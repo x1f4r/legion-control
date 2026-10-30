@@ -30,9 +30,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath, jsonParseProblem } from './config.mjs';
+import { jsonParseProblem } from './config-store.mjs';
 import { REASON, SETUP_ID_PATTERN } from './contract.mjs';
 import { approvalsFrom, launchProjection, launchReview } from './launch.mjs';
+import { basePath } from './paths.mjs';
 import { findRepeatedMember, validateSetupDocument } from './setup-document.mjs';
 import { ensurePrivateDir, retryWindowsSharing } from './state.mjs';
 

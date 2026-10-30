@@ -25,8 +25,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { swapPaths } from './agent-swap.mjs';
-import { AGENT_TREE, AGENT_VERSION, basePath } from './config.mjs';
 import { REASON } from './contract.mjs';
+import { AGENT_TREE, AGENT_VERSION, basePath } from './paths.mjs';
 import { writePrivateAtomic } from './state.mjs';
 
 /** A floor, recorded or declared, is exactly x.y.z. */

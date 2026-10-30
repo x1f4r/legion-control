@@ -12,7 +12,7 @@ import dgram from 'node:dgram';
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'legionctl-actions-'));
 process.env.LEGIONCTL_HOME = HOME;
 
-const { normalizeConfig } = await import('../src/config.mjs');
+const { normalizeConfig } = await import('../src/config-schema.mjs');
 const { listActions, runAction, shapeOutput, magicPacket, sendMagicPacket } = await import('../src/actions.mjs');
 
 test.after(() => fs.rmSync(HOME, { recursive: true, force: true }));

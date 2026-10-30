@@ -25,8 +25,8 @@
 import fs from 'node:fs';
 import https from 'node:https';
 import path from 'node:path';
-import { compilePattern, describeFailure, runCommand, sleep, LEGACY_DEFAULTS } from '../config.mjs';
-import { runMutation } from '../process-runner.mjs';
+import { compilePattern, LEGACY_DEFAULTS } from '../config-schema.mjs';
+import { describeFailure, runCommand, runMutation, sleep } from '../process-runner.mjs';
 import { cachedLookup, channelCacheKey } from './npm.mjs';
 
 // How long we are willing to wait for a polite quit before giving up. An app

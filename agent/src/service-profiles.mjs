@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { detectPlatform } from './config.mjs';
+import { detectPlatform } from './paths.mjs';
 import { resolveClaudeUpdatePolicy, compareProfileVersions, nativeClaudeVersionAt } from './service-profile-claude.mjs';
 import { readDesktopMetadata } from './service-profile-desktop.mjs';
 

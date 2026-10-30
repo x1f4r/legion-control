@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { armNextBoot, bootTargets, entryDescription, matchEfiEntry, parseEfiBootManager, selectSleepCommand, suspendAccepted } from '../src/boot.mjs';
-import { normalizeConfig } from '../src/config.mjs';
+import { normalizeConfig } from '../src/config-schema.mjs';
 import { withHome } from './helpers.mjs';
 
 // Portable stand-ins for true and false: /bin/true does not exist everywhere.

@@ -12,7 +12,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { checkReply, schemaForCommand } from '../../contract/validate.mjs';
-import { commandLabel, describeFailure, jsonParseProblem, runCommand } from '../src/config.mjs';
+import { jsonParseProblem } from '../src/config-store.mjs';
+import { commandLabel, describeFailure, runCommand } from '../src/process-runner.mjs';
 import { REDACTED, redactReply, valueRedactor } from '../src/redact.mjs';
 import { ENTRY, cli, commandService, fixtureConfig, fixtureData, withHome, writeConfig } from './helpers.mjs';
 

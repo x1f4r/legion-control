@@ -4,7 +4,7 @@
 // stdout: stdout carries exactly one JSON object per invocation.
 
 import fs from 'node:fs';
-import { basePath, logPath } from './config.mjs';
+import { basePath, logPath } from './paths.mjs';
 import { ensurePrivateDir } from './state.mjs';
 
 const MAX_BYTES = 1024 * 1024;

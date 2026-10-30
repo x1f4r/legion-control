@@ -6,8 +6,8 @@
 // the service reports upToDate: null and the apps say the version was not
 // checked; without update the service can only be restarted.
 
-import { compilePattern, describeFailure, runArgv } from '../config.mjs';
-import { runMutationArgv } from '../process-runner.mjs';
+import { compilePattern } from '../config-schema.mjs';
+import { describeFailure, runArgv, runMutationArgv } from '../process-runner.mjs';
 import { cachedLookup, channelCacheKey } from './npm.mjs';
 
 /** First line of stdout, trimmed. Anything else is not a version. */

@@ -13,11 +13,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { describeFailure } from '../src/config.mjs';
 import { producedOutcome } from '../src/contract.mjs';
 import { withOperation } from '../src/operate.mjs';
 import { beginOperation, bootIdentity, readOperation, updateOperation, wireRecord } from '../src/operations.mjs';
-import { ledgerPath, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
+import { describeFailure, ledgerPath, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
 import { parseProcessStart } from '../src/state.mjs';
 import { deadPid, withHome } from './helpers.mjs';
 

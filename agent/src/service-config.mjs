@@ -3,7 +3,9 @@
 // Validation and saving configure existing adapters; neither runs commands.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { configPath, normalizeConfig, readJsonDocument, saveConfig } from './config.mjs';
+import { normalizeConfig } from './config-schema.mjs';
+import { readJsonDocument, saveConfig } from './config-store.mjs';
+import { configPath } from './paths.mjs';
 import { acquireOperationLock } from './lock.mjs';
 import { REASON } from './contract.mjs';
 import { isRestrictedSession } from './dispatch.mjs';

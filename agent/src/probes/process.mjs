@@ -15,8 +15,8 @@
 // command        three argv arrays.
 // none           nothing to start or stop.
 
-import { deadline, describeFailure, detectPlatform, runArgv, runCommand, runCommandAsync } from '../config.mjs';
-import { runMutation, runMutationArgv } from '../process-runner.mjs';
+import { detectPlatform } from '../paths.mjs';
+import { deadline, describeFailure, runArgv, runCommand, runCommandAsync, runMutation, runMutationArgv } from '../process-runner.mjs';
 import * as appProvider from '../providers/app.mjs';
 import { packageRoot } from '../providers/npm.mjs';
 

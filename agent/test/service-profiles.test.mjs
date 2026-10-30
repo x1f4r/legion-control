@@ -6,7 +6,7 @@ import test from 'node:test';
 import { discoverServiceProfiles } from '../src/service-profiles.mjs';
 import { inspectProfileProcesses, processExitVerdict, latestClaudeVersion, readProfileVersion, runNativeClaudeProbe } from '../src/service-profile-probe.mjs';
 import { resolveClaudeUpdatePolicy, claudeTargetAllowed, readClaudeRemotePolicy } from '../src/service-profile-claude.mjs';
-import { normalizeConfig } from '../src/config.mjs';
+import { normalizeConfig } from '../src/config-schema.mjs';
 import { readDesktopMetadata } from '../src/service-profile-desktop.mjs';
 
 // These fixtures describe a simulated POSIX host even when tests run on

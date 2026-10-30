@@ -23,11 +23,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AGENT_VERSION, operationsDir, runArgv } from './config.mjs';
 import { CONTRACT_VERSION, DISRUPTED_PHASES, OPERATION_ID_PATTERN, outcomeOf, PHASES, producedOutcome, REASON } from './contract.mjs';
 import { holdsOperationLock, probeOperationLock } from './lock.mjs';
 import { log } from './log.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
+import { AGENT_VERSION, operationsDir } from './paths.mjs';
+import { runArgv } from './process-runner.mjs';
 import { ownStartTime, processIsAlive, processStartTicks, writeJsonAtomic } from './state.mjs';
 
 /**

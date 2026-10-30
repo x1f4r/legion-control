@@ -19,7 +19,8 @@
 // only in a command's own output is not something this file can know about,
 // and the contract says so.
 
-import { configPath, lastGoodConfigPath, readJsonDocument } from './config.mjs';
+import { readJsonDocument } from './config-store.mjs';
+import { configPath, lastGoodConfigPath } from './paths.mjs';
 
 export const REDACTED = '<redacted>';
 

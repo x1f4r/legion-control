@@ -40,11 +40,10 @@
 // lazily starts failing on files that changed under it. Deferring costs a delay;
 // installing under a live turn costs the user's work.
 
-import { describeFailure } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { appendLog, listOperations, recordPhase, updateOperation, whenStarted } from './operations.mjs';
-import { mutationWorstCaseMs, runMutationArgv, unsettledWork } from './process-runner.mjs';
+import { describeFailure, mutationWorstCaseMs, runMutationArgv, unsettledWork } from './process-runner.mjs';
 import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
 import { PROCESS_COMMAND_MS } from './probes/process.mjs';

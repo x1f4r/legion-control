@@ -4,8 +4,8 @@
 // Everything here takes a normalized service object. Nothing in this file knows
 // which product it is looking after.
 
-import { describeFailure, detectPlatform, sleep } from './config.mjs';
-import { runMutationArgv } from './process-runner.mjs';
+import { detectPlatform } from './paths.mjs';
+import { describeFailure, runMutationArgv, sleep } from './process-runner.mjs';
 import { checkHealth, describeHealth, healthPort } from './probes/health.mjs';
 import { isRunning, probeProcess, processEvidence, processStartedAt, startProcess, stopProcess, systemctlMutation } from './probes/process.mjs';
 import { NO_RELAY, probeRelay } from './probes/relay.mjs';

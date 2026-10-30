@@ -16,7 +16,7 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { deadline } from '../src/config.mjs';
+import { deadline } from '../src/process-runner.mjs';
 import { checkT3Sqlite } from '../src/probes/t3-sqlite.mjs';
 import { isRunning, probeProcess, probeProcessAsync, readTaskProbe } from '../src/probes/process.mjs';
 import { livenessOf } from '../src/service.mjs';

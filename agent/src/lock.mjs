@@ -34,9 +34,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { acquireMutex, mutexPath, probeMutex } from './mutex.mjs';
+import { basePath } from './paths.mjs';
 import { processIsAlive } from './state.mjs';
 
 /**

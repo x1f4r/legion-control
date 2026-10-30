@@ -4,7 +4,7 @@ import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
 import { linuxSchedulerCommand, runDoctor, schedulerTimeLimitCheck, schedulerTimeLimitMs } from '../src/doctor.mjs';
-import { loadConfig } from '../src/config.mjs';
+import { loadConfig } from '../src/config-store.mjs';
 import { withHome, writeConfig } from './helpers.mjs';
 
 const base = '/home/me/.legion-control';

@@ -1,7 +1,7 @@
 // Only explicitly configured, read-only numeric probes run during status.
 // Measurements are ephemeral; history is a separate client preference.
 
-import { describeFailure, mapWithLimit, runArgvAsync } from '../config.mjs';
+import { describeFailure, mapWithLimit, runArgvAsync } from '../process-runner.mjs';
 
 export async function collectTelemetry(probes, clock, { runner = runArgvAsync } = {}) {
   return mapWithLimit(probes, 2, async (probe) => {

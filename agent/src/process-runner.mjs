@@ -1,4 +1,11 @@
-// Running a command that changes the machine, and knowing when it has stopped.
+// Running commands: the runners every probe reads the machine with, and the
+// one a command that changes the machine goes through, which has to know when
+// that command has stopped.
+//
+// Reading is the simpler half. runCommand and runCommandAsync take an argv,
+// never a shell string, and a reading that runs out of time says nothing,
+// whatever the command exited with. What a probe leaves behind changes
+// nothing, so they do not wait to see it gone.
 //
 // Until 3.1.0 every mutation went through spawnSync, and its timeout was wrong
 // in both directions. It signalled the command and nothing else, so whatever the
@@ -28,18 +35,327 @@
 //   that ledger while it runs, so an agent killed in the middle of one leaves
 //   the same guard behind.
 //
-// Reading the machine is not this file's business. Probes keep runCommand and
-// runCommandAsync, because whatever a probe leaves behind changes nothing.
+// A probe never goes through runMutation: what it leaves behind changes
+// nothing, and holding the machine for it would only make status slower.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { commandLabel, runCommandAsync, sleep, stateDir } from './config.mjs';
 import { OPERATION_ID_PATTERN, OPERATION_KINDS, PHASES } from './contract.mjs';
 import { log } from './log.mjs';
 import { bootIdentity, readOperation } from './operations.mjs';
+import { stateDir } from './paths.mjs';
 import { parseProcessStart, processIsAlive, readJsonStore, SAME_PROCESS_SLACK_MS, withStore } from './state.mjs';
+
+// ---------------------------------------------------------------------------
+// Reading the machine
+// ---------------------------------------------------------------------------
+
+/**
+ * How a message names a command: by its executable, never its arguments.
+ * Arguments are configuration a person chose, a token or a private path among
+ * them, and every failure message used to carry the first 160 characters of
+ * the command line to whoever read the reply (contract section 13).
+ */
+export function commandLabel(file) {
+  return path.basename(String(file));
+}
+
+/**
+ * Shared process runner. Always an argv array, never a shell string, so a
+ * Windows npm prefix or "C:\Program Files\nodejs" cannot break quoting.
+ *
+ * For reading the machine only. Its timeout stops the command and nothing the
+ * command started, which a probe can live with and a mutation cannot: every
+ * command that changes the machine goes through runMutation, below, instead.
+ */
+export function runCommand(file, args = [], options = {}) {
+  const result = spawnSync(file, args, {
+    encoding: 'utf8',
+    timeout: options.timeoutMs ?? 30000,
+    windowsHide: true,
+    maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024,
+    cwd: options.cwd,
+    env: options.env ?? process.env,
+    shell: options.shell === true,
+  });
+
+  const stdout = typeof result.stdout === 'string' ? result.stdout : '';
+  const stderr = typeof result.stderr === 'string' ? result.stderr : '';
+  const timedOut = result.error?.code === 'ETIMEDOUT' || result.signal === 'SIGTERM';
+
+  const command = commandLabel(file);
+
+  return {
+    // A reading that ran out of time says nothing, whatever the command exited
+    // with. spawnSync waits for the output pipes as well as the command, so a
+    // command that exited 0 while something it started still held stdout came
+    // back with status 0 and a timeout, and a health check, a version or the
+    // staged self-test read that as a pass.
+    ok: result.status === 0 && !timedOut,
+    code: result.status,
+    signal: result.signal ?? null,
+    stdout,
+    stderr,
+    timedOut,
+    error: result.error ? String(result.error.message || result.error) : null,
+    command,
+  };
+}
+
+/** Run a configured argv array through the shared runner. */
+export function runArgv(command, options = {}) {
+  return runCommand(command[0], command.slice(1), options);
+}
+
+/**
+ * The same runner, without blocking the event loop.
+ *
+ * spawnSync is the right tool almost everywhere in the agent: the work is
+ * sequential and the code reads better for it. It is the wrong tool for status,
+ * where several independent probes each have their own timeout and running them
+ * one after another made a healthy machine look unreachable — two probes with a
+ * sixteen second budget added up to a thirty-two second reply, past both clients'
+ * command budgets. Anything that has to fit inside a shared deadline uses this.
+ */
+const activeCommandGroups = new Set();
+let commandExitCleanupInstalled = false;
+
+export function runCommandAsync(file, args = [], options = {}) {
+  return new Promise((resolve) => {
+    const timeoutMs = options.timeoutMs ?? 30000;
+    const maxBuffer = options.maxBuffer ?? 16 * 1024 * 1024;
+    const command = commandLabel(file);
+
+    let child;
+    try {
+      child = spawn(file, args, {
+        windowsHide: true,
+        // A timeout must terminate descendants too, including a child whose
+        // parent exited while it still holds one of our output pipes open.
+        detached: process.platform !== 'win32',
+        cwd: options.cwd,
+        env: options.env ?? process.env,
+        shell: options.shell === true,
+      });
+    } catch (err) {
+      resolve({
+        ok: false,
+        code: null,
+        signal: null,
+        stdout: '',
+        stderr: '',
+        timedOut: false,
+        error: String(err.message || err),
+        command,
+      });
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let settled = false;
+    // Internal disposable workers can release parent-owned scratch only after
+    // Windows confirms the process has released its native file handles.
+    if (typeof options.onExit === 'function') child.once('exit', options.onExit);
+    const closePipes = () => {
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
+    const killPosixGroup = () => {
+      if (!child.pid) return false;
+      try { process.kill(-child.pid, 'SIGKILL'); return true; } catch (error) {
+        if (error.code === 'ESRCH') return true;
+        try { child.kill('SIGKILL'); } catch { /* cancellation could not be confirmed */ }
+        return false;
+      }
+    };
+    if (process.platform !== 'win32' && child.pid) {
+      activeCommandGroups.add(child.pid);
+      if (!commandExitCleanupInstalled) {
+        commandExitCleanupInstalled = true;
+        process.once('exit', () => {
+          for (const pid of activeCommandGroups) {
+            try { process.kill(-pid, 'SIGKILL'); } catch { /* the group may already be gone */ }
+          }
+        });
+      }
+    }
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      activeCommandGroups.delete(child.pid);
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      let cancellationRequested = false;
+      const timeoutResult = (terminationConfirmed = false) => ({
+        ok: false, code: null, signal: null, stdout, stderr, timedOut: true, terminationConfirmed,
+        error: terminationConfirmed
+          ? 'command deadline expired; the process exited and the command outcome is unknown'
+          : cancellationRequested
+            ? 'command deadline expired; process-tree termination was requested and the command outcome is unknown'
+            : 'command deadline expired; process-tree termination could not be confirmed and the command outcome is unknown',
+        command,
+      });
+      if (process.platform !== 'win32') {
+        cancellationRequested = killPosixGroup();
+      } else if (child.pid && options.terminateTree === false) {
+        // Disposable workers that cannot spawn children need no taskkill tree
+        // traversal. Terminate their owned handle directly, then await the exit
+        // notification: Windows keeps SQLite files locked until that happens.
+        // Only trusted internal workers may opt out of process-tree cleanup.
+        closePipes();
+        let terminationWait;
+        const exited = () => {
+          clearTimeout(terminationWait);
+          child.unref();
+          finish(timeoutResult(true));
+        };
+        child.once('exit', exited);
+        try { cancellationRequested = child.kill('SIGKILL'); } catch { /* return an unconfirmed timeout */ }
+        if (child.exitCode !== null || child.signalCode !== null) exited();
+        else terminationWait = setTimeout(() => {
+          child.removeListener('exit', exited);
+          child.unref();
+          finish(timeoutResult(false));
+        }, 500);
+        return;
+      } else if (child.pid) {
+        // Windows has no POSIX process group signal. Ask its tree-aware tool to
+        // terminate the command and descendants, without waiting on its pipes.
+        // The result below remains unknown even if taskkill later succeeds.
+        try {
+          const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+          // Do not abort traversal after an arbitrary 250 ms: on a loaded
+          // machine that can leave the command alive. The cleanup helper has
+          // no inherited pipes and may finish independently of this deadline.
+          killer.once('error', () => {});
+          killer.unref();
+          cancellationRequested = true;
+        } catch { /* report unconfirmed cancellation below */ }
+      }
+      // Resolving only from `close` is unsafe: grandchildren can keep these
+      // pipes open indefinitely, even after their immediate parent is killed.
+      closePipes();
+      child.unref();
+      finish(timeoutResult());
+    }, timeoutMs);
+
+    const collect = (stream, append) => {
+      if (!stream) return;
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk) => append(chunk));
+      stream.on('error', () => {
+        /* a closed pipe is not an outcome the caller can act on */
+      });
+    };
+    collect(child.stdout, (chunk) => {
+      if (stdout.length < maxBuffer) stdout += chunk.slice(0, maxBuffer - stdout.length);
+    });
+    collect(child.stderr, (chunk) => {
+      if (stderr.length < maxBuffer) stderr += chunk.slice(0, maxBuffer - stderr.length);
+    });
+
+    child.on('error', (err) => {
+      closePipes();
+      finish({ ok: false, code: null, signal: null, stdout, stderr, timedOut, error: String(err.message || err), command });
+    });
+    child.on('close', (code, signal) => {
+      if (timedOut) return;
+      finish({
+        ok: code === 0 && !timedOut,
+        code: timedOut ? null : code,
+        signal: signal ?? null,
+        stdout,
+        stderr,
+        timedOut,
+        error: null,
+        command,
+      });
+    });
+  });
+}
+
+export function runArgvAsync(command, options = {}) {
+  return runCommandAsync(command[0], command.slice(1), options);
+}
+
+/**
+ * Run tasks with a ceiling on how many are in flight at once.
+ *
+ * Unbounded parallelism across a dozen services would start a dozen PowerShell
+ * processes on a machine that is already busy, which is its own kind of
+ * disruption. Four at a time keeps a wide machine inside its status budget
+ * without becoming the reason it is slow.
+ */
+export async function mapWithLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const runners = new Array(Math.max(1, Math.min(limit, items.length))).fill(null).map(async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+/** One-line failure description for a runCommand or runMutation result. */
+export function describeFailure(result) {
+  // A command the mutation runner refused to start, because an earlier one may
+  // still be running, never ran: it did not fail, and has no exit code to give.
+  if (result.refused) return `${result.command} was ${result.error}`;
+  if (result.timedOut && result.terminated === false) return `${result.command} timed out and could not be confirmed stopped`;
+  if (result.timedOut) return `${result.command} timed out`;
+  // Stopped by the mutation runner for a reason other than its deadline, which
+  // its message gives, along with the command's name.
+  if (typeof result.terminated === 'boolean') return result.error;
+  const output = (result.stderr || result.stdout || '').trim().split('\n').slice(0, 3).join(' ');
+  const reason = output || result.error || '';
+  const code = result.code === null || result.code === undefined ? 'no exit code' : `exit ${result.code}`;
+  return reason ? `${result.command} failed (${code}): ${reason}` : `${result.command} failed (${code})`;
+}
+
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A deadline that several probes can share. Everything that runs under a status
+ * budget asks this how much time is left rather than assuming it has its own
+ * full allowance, which is what stopped two sixteen-second probes from adding up
+ * to a thirty-two-second status reply.
+ */
+export function deadline(totalMs) {
+  const at = Date.now() + totalMs;
+  return {
+    at,
+    remaining() {
+      return Math.max(0, at - Date.now());
+    },
+    expired() {
+      return Date.now() >= at;
+    },
+    /** At most `want` ms, and never more than is left. */
+    slice(want) {
+      return Math.max(0, Math.min(want, at - Date.now()));
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Changing the machine
+// ---------------------------------------------------------------------------
 
 const IS_WINDOWS = process.platform === 'win32';
 
