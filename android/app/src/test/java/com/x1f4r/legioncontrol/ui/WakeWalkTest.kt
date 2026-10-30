@@ -11,10 +11,12 @@ import com.x1f4r.legioncontrol.agent.InterruptRequest
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.OpRecord
 import com.x1f4r.legioncontrol.agent.OpResult
+import com.x1f4r.legioncontrol.agent.SetupPeerState
 import com.x1f4r.legioncontrol.agent.SignedTarball
 import com.x1f4r.legioncontrol.agent.WakeHelper
 import com.x1f4r.legioncontrol.agent.WakeTarget
 import com.x1f4r.legioncontrol.agent.readinessSchedule
+import com.x1f4r.legioncontrol.data.MemoryPreferences
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.SiteConfig
 import com.x1f4r.legioncontrol.net.LocalAddress
@@ -27,6 +29,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -287,6 +290,47 @@ class WakeWalkTest {
         walk(center()).run()
         assertEquals(listOf("pi", "nas"), fleet.reads)
         assertEquals("still unknown after its read, it is of no use", emptyList<String>(), pi.runs)
+    }
+
+    // MARK: - The way past a hold the page offers
+
+    /** Tower's page, as the app builds it over [operations]. */
+    private fun page(operations: OperationCenter) = MachineModel(
+        client = target,
+        settings = RememberedSettings(MemoryPreferences()),
+        scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined).also { scopes += it },
+        operations = operations,
+        setup = object : SetupSync by unusable<SetupSync>("the way past a hold") {
+            override fun state(machineId: String) = SetupPeerState()
+        },
+        fleet = fleet,
+    )
+
+    @Test
+    fun `the page offers the other helpers while one could be asked, and the held command again only when none could`() = runBlocking {
+        // Which of the two the page shows is what decides whether a held command can run twice, and
+        // nothing pinned it: only the walk each of them starts was tested.
+        val operations = center()
+        val tower = page(operations)
+        assertNull("nothing is held, so there is nothing to go past", tower.wakeHoldOffer)
+
+        pi.answer = { Result.failure(AgentFailure.Unreachable("Pi", "connection reset", stage = DispatchStage.AMBIGUOUS)) }
+        walk(operations).run()
+        assertEquals("the nas could be asked instead", MachineModel.WakeHoldOffer.OtherHelpers, tower.wakeHoldOffer)
+
+        fleet.states["nas"] = HelperState(HelperState.Kind.ASLEEP)
+        assertEquals(
+            MachineModel.WakeHoldOffer.RunAgain(runAgainLabel(listOf("Pi")), runAgainWarning(listOf("Pi"), "Tower")),
+            tower.wakeHoldOffer,
+        )
+
+        // With the held helper out of reach too, neither way would ask anybody, so neither is offered.
+        fleet.states["pi"] = HelperState(HelperState.Kind.ASLEEP)
+        assertNull(tower.wakeHoldOffer)
+
+        fleet.states["pi"] = command
+        operations.releaseWakeHolds("tower", before = Long.MAX_VALUE, reason = "Tower answered.")
+        assertNull("a released hold offers nothing", tower.wakeHoldOffer)
     }
 
     // MARK: - Readiness
