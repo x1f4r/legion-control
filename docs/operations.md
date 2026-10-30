@@ -9,7 +9,9 @@ of all three config files; `security.md` covers keys, signing and privileges.
 Paths below use `<base>` for the agent's install base: `~/.legion-control` on Linux and macOS,
 `C:\Users\<user>\.legion-control` on Windows. `legionctl` stands for the launcher the installers
 put in `<base>/bin`, which is not on `PATH`: `<base>/bin/legionctl` on Linux and macOS, and
-`powershell -NoProfile -File <base>\bin\legionctl.ps1` on Windows.
+`powershell -NoProfile -ExecutionPolicy Bypass -File <base>\bin\legionctl.ps1` on Windows. The
+bypass is needed because Windows client editions refuse to run scripts by default, and the
+installer changes no execution policy.
 
 ## Operations
 
@@ -732,7 +734,7 @@ clearly labelled with when it was read. Nothing depends on them being right.
 
     ssh <host> '~/.legion-control/bin/legionctl status'
     ssh <host> /usr/bin/node /home/<user>/.legion-control/bin/launcher.mjs status
-    ssh <host> "powershell -NoProfile -File C:\Users\<user>\.legion-control\bin\legionctl.ps1 status"
+    ssh <host> "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\<user>\.legion-control\bin\legionctl.ps1 status"
     ~/.legion-control/bin/legionctl status
 
 A key forced through the restricted dispatcher (`<base>/bin/dispatch.sh`, or `dispatch.ps1` on
