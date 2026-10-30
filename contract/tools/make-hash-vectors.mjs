@@ -28,7 +28,7 @@ const DOC = [
   '    {',
   '      "id": "beacon",',
   '      "name": "Beacon",',
-  '      "endpoints": [{ "host": "100.113.65.2", "user": "me", "port": 22 }]',
+  '      "endpoints": [{ "host": "100.64.10.20", "user": "me", "port": 22 }]',
   '    }',
   '  ]',
   '}',
