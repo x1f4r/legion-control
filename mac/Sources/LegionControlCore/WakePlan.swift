@@ -131,6 +131,9 @@ enum WakePlan {
 
         var isEmpty: Bool { steps.isEmpty }
 
+        /// Whether a wake hold is what keeps a helper from running.
+        var isHeld: Bool { skipped.contains { $0.reason == .held } }
+
         /// The sentence shown when there is nothing to try.
         var nothingToTry: String {
             guard steps.isEmpty else { return "" }
@@ -260,6 +263,99 @@ enum WakePlan {
             why = ""
         }
         return Skip(kind: .helper, machine: entry.machine, action: entry.action, reason: reason, what: name, why: why)
+    }
+
+    // MARK: - Going past a hold
+
+    /// What a person chose to do about the wake holds on a target. Only a person ever chooses
+    /// anything but `stand`: a hold is what keeps a command from running twice, and every other
+    /// release is evidence (section 10.2).
+    enum HoldChoice: Sendable, Equatable {
+        /// The holds stand, and the wake walks around them.
+        case stand
+        /// Ask the helpers a hold keeps back other than the held ones. The held commands are not
+        /// run again in that walk, but their holds are released, so the next wake asks every helper.
+        case otherHelpers
+        /// With no other helper to ask, run the held commands again, knowing the first run may still
+        /// be going. A helper that keeps no records would otherwise hold until the target answers.
+        case runAgain
+    }
+
+    /// `plan` without the helper steps `holds` are on: what a person asking for the other helpers
+    /// walks. Releasing a hold is not a reason to run its own command a second time while the first
+    /// run may still be going.
+    static func without(_ plan: Plan, holds: [Hold], target: Machine) -> Plan {
+        guard !holds.isEmpty else { return plan }
+        var result = plan
+        result.steps = []
+        for step in plan.steps {
+            if case .helper(let helper, let name, _) = step, holds.contains(Hold(helper: helper.machine, action: helper.action)) {
+                result.skipped.append(Skip(kind: .helper, machine: helper.machine, action: helper.action, reason: .held, what: name,
+                                           why: "its \(helper.action) was run to wake \(target.name) earlier and may still be going, so only the other helpers are asked."))
+            } else {
+                result.steps.append(step)
+            }
+        }
+        return result
+    }
+
+    /// What trying the other helpers walks: `unheld`, the plan as if nothing were held, without the
+    /// helper steps of `holds`. Nil unless that asks a helper `held`, the plan as it stands, skips
+    /// for a hold. With the held helper the only one, going past its hold would ask nobody new, and
+    /// the next ordinary press would run the held command a second time.
+    static func otherHelpers(held: Plan, unheld: Plan, holds: [Hold], target: Machine) -> Plan? {
+        guard !holds.isEmpty else { return nil }
+        let others = without(unheld, holds: holds, target: target)
+        let heldBack = held.skipped.filter { $0.reason == .held }.map { Hold(helper: $0.machine ?? "", action: $0.action ?? "") }
+        let asksOne = others.steps.contains { step in
+            guard case .helper(let helper, _, _) = step else { return false }
+            return heldBack.contains(Hold(helper: helper.machine, action: helper.action))
+        }
+        return asksOne ? others : nil
+    }
+
+    /// What running the held commands again walks: `unheld`, the plan as if nothing were held. Nil
+    /// unless `held` skips a helper for a hold and no other helper could be asked instead: with one,
+    /// asking it is the way past, and that frees the held command for the next press without
+    /// running it twice now.
+    static func runAgain(held: Plan, unheld: Plan, holds: [Hold], target: Machine) -> Plan? {
+        guard held.isHeld, otherHelpers(held: held, unheld: unheld, holds: holds, target: target) == nil else { return nil }
+        return unheld
+    }
+
+    /// The helpers whose command `plan` runs a second time while the first run may still be going,
+    /// in plan order.
+    static func runsAgain(_ plan: Plan, holds: [Hold]) -> [String] {
+        var names: [String] = []
+        for case .helper(let helper, let name, _) in plan.steps
+        where holds.contains(Hold(helper: helper.machine, action: helper.action)) && !names.contains(name) {
+            names.append(name)
+        }
+        return names
+    }
+
+    /// What to say when a person asks for the other helpers and there is none to ask.
+    static func noOtherHelper(_ targetName: String) -> String {
+        "No other helper could be asked to wake \(targetName). The helper command run for it earlier may still be going, so it is not run again, and its hold stands."
+    }
+
+    /// What to say when a person asks to run a held command again while another helper could be
+    /// asked instead.
+    static func otherHelperFirst(_ targetName: String) -> String {
+        "Another helper could be asked to wake \(targetName), so the command held for it is not run again. Trying the other helpers releases its hold, and the next wake asks every helper."
+    }
+
+    /// What running the held commands of a plan is called where a person chooses it.
+    static func runAgainLabel(_ helpers: [String]) -> String {
+        helpers.count == 1 ? "Run \(helpers[0])'s command again" : "Run the held commands again"
+    }
+
+    /// What a person is told before running the held commands again: that a run may still be going,
+    /// and that this can make it two.
+    static func runAgainWarning(_ helpers: [String], target targetName: String) -> String {
+        helpers.count == 1
+            ? "\(helpers[0])'s command to wake \(targetName) has not reported how it ended, so it may still be running, and no other helper could be asked instead. Running it again can run it a second time beside the first."
+            : "The commands run to wake \(targetName) have not reported how they ended, so they may still be running, and no other helper could be asked instead. Running them again can run each a second time beside the first."
     }
 
     /// Where direct wake sends: the dotted entries of `wake.broadcast`; else those of the machine's

@@ -943,12 +943,88 @@ struct MachineModelTests {
         await rig.tower.refresh(userInitiated: false)
         #expect(store.wakeHolds(target: "tower").isEmpty)
 
-        // And so does a person, who has looked and decided to try the others anyway.
+        // And so does a person, who has looked and decided to try the others anyway. The NAS is
+        // the other one; the Pi's command is not run a second time.
         store.begin(OperationRecord(machineId: "pi", machineName: "Pi", kind: .action, subject: "wake-tower",
                                     summary: "Asking", agentTracked: false, wakeTarget: "tower"))
+        #expect(rig.tower.wakeHoldOffer == .otherHelpers)
         rig.runners["pi"]?.answer("run", json: #"{"ok":true,"contract":2,"action":"ran"}"#)
         rig.tower.tryOtherHelpers()
         await Self.settle(rig.tower, timeout: 10)
+        #expect(store.wakeHolds(target: "tower").isEmpty)
+        #expect(Self.runs(rig.runners["pi"]) == 0)
+    }
+
+    static let ran = #"{"ok":true,"contract":3,"action":"ran"}"#
+
+    @Test("trying the other helpers asks only the others, after a question, and does not run the held command again")
+    func tryingTheOtherHelpersAsksOnlyTheOthers() async throws {
+        // The label said the other helpers, and the Mac used to release every hold and walk the
+        // whole plan, so the held helper's command ran again beside the first: with a command that
+        // toggles a smart plug, the second run undoes the first.
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-wake-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        let rig = try Self.wakeRig(store: store, logs: directory, setup: try Self.wakeSetup())
+        store.begin(OperationRecord(machineId: "pi", machineName: "Pi", kind: .action, subject: "wake-tower",
+                                    summary: "Asking", agentTracked: false, wakeTarget: "tower"))
+        rig.runners["pi"]?.answer("status", json: Self.helperStatus("command"))
+        rig.runners["nas"]?.answer("status", json: Self.helperStatus("command"))
+        await rig.pi.refresh(userInitiated: false)
+        await rig.nas.refresh(userInitiated: false)
+        #expect(rig.tower.wakeHoldOffer == .otherHelpers)
+
+        var asked: PendingDialog?
+        rig.tower.ask = { asked = $0 }
+        rig.tower.requestTryOtherHelpers()
+        let question = try #require(asked)
+        #expect(question.title == "Try the other helpers for Tower?")
+        #expect(question.message.contains("does not run that one again"))
+        #expect(store.wakeHolds(target: "tower").count == 1, "asking releases nothing")
+
+        rig.runners["pi"]?.answer("run", json: Self.ran)
+        rig.runners["nas"]?.answer("run", json: Self.ran)
+        question.perform()
+        await Self.settle(rig.tower, timeout: 10)
+        #expect(Self.runs(rig.runners["pi"]) == 0)
+        #expect(Self.runs(rig.runners["nas"]) == 1)
+        #expect(store.wakeHolds(target: "tower").isEmpty, "the next wake asks every helper")
+        #expect(rig.tower.statusDetail?.contains("Pi: its wake-tower was run to wake Tower earlier and may still be going") == true,
+                "\(rig.tower.statusDetail ?? "")")
+    }
+
+    @Test("with no other helper the hold stands, and only running the held command again after a warning goes past it")
+    func runningTheHeldCommandAgain() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appending(path: "legion-wake-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = OperationStore(url: directory.appending(path: "operations.json"))
+        let onlyPi = Data(String(decoding: Self.wakeDocument, as: UTF8.self)
+            .replacingOccurrences(of: #", { "machine": "nas", "action": "wake-tower" }"#, with: "").utf8)
+        let rig = try Self.wakeRig(store: store, logs: directory, setup: try Self.wakeSetup(onlyPi))
+        store.begin(OperationRecord(machineId: "pi", machineName: "Pi", kind: .action, subject: "wake-tower",
+                                    summary: "Asking", agentTracked: false, wakeTarget: "tower"))
+        rig.runners["pi"]?.answer("status", json: Self.helperStatus("command"))
+        await rig.pi.refresh(userInitiated: false)
+        #expect(rig.tower.wakeHoldOffer == .runAgain(label: "Run Pi's command again",
+                                                     warning: WakePlan.runAgainWarning(["Pi"], target: "Tower")))
+
+        // The other helpers, asked for anyway: there is nobody new, so nothing is released.
+        rig.tower.tryOtherHelpers()
+        await Self.settle(rig.tower, timeout: 10)
+        #expect(rig.tower.statusLine == WakePlan.noOtherHelper("Tower"))
+        #expect(store.wakeHolds(target: "tower").count == 1)
+        #expect(Self.runs(rig.runners["pi"]) == 0)
+
+        var asked: PendingDialog?
+        rig.tower.ask = { asked = $0 }
+        rig.tower.requestRunHeldAgain()
+        let question = try #require(asked)
+        #expect(question.title == "Run Pi's command again for Tower?")
+        #expect(question.message.contains("can run it a second time beside the first"))
+        rig.runners["pi"]?.answer("run", json: Self.ran)
+        question.perform()
+        await Self.settle(rig.tower, timeout: 10)
+        #expect(Self.runs(rig.runners["pi"]) == 1)
         #expect(store.wakeHolds(target: "tower").isEmpty)
     }
 

@@ -615,12 +615,21 @@ struct MachineSection: View {
                     }
                 }
 
-                if !model.wakeHolds.isEmpty {
-                    // A hold is released by evidence, or by a person who has looked and decided.
-                    Button("Try the other helpers anyway") { model.tryOtherHelpers() }
+                // A hold is released by evidence, or by a person who has looked and decided. With
+                // another helper to ask, the way past is asking it; with none, it is running the held
+                // command again, after a question that says it may then run twice.
+                switch model.wakeHoldOffer {
+                case .otherHelpers:
+                    Button("Try the other helpers") { model.requestTryOtherHelpers() }
                         .controlSize(.small)
                         .disabled(model.isWorking)
-                        .help("A helper may still be running its command for \(model.name). Trying the others can run a second one.")
+                        .help("A helper may still be running its command for \(model.name). The others are asked, and that one is not run again.")
+                case .runAgain(let label, _):
+                    Button(label) { model.requestRunHeldAgain() }
+                        .controlSize(.small)
+                        .disabled(model.isWorking)
+                case nil:
+                    EmptyView()
                 }
             }
             .padding(.top, 10)

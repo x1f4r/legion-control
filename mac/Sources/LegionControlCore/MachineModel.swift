@@ -587,13 +587,47 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     /// reads again before it plans, which may well leave a step.
     var canTryWaking: Bool { !wakePlan.isEmpty || !wakeHolds.isEmpty }
 
-    private func plan(from here: SiteAwareness.Placement) -> WakePlan.Plan {
+    /// The plan from `here` with `holds`, or with the holds recorded now when that is nil.
+    private func plan(from here: SiteAwareness.Placement, holds: [WakePlan.Hold]? = nil) -> WakePlan.Plan {
         guard let setup = setup?() else { return .empty(here) }
         var states: [String: WakePlan.HelperState] = [:]
         for helper in machine.wake?.orderedHelpers ?? [] {
             states[helper.machine] = helperState(helper.machine)
         }
-        return WakePlan.plan(for: machine, in: setup, placement: here, helpers: states, holds: wakeHolds)
+        return WakePlan.plan(for: machine, in: setup, placement: here, helpers: states, holds: holds ?? wakeHolds)
+    }
+
+    /// The way past the wake holds a person is offered, the same one the desktop offers: with
+    /// another helper to ask, asking it; with none, running the held command again after a warning
+    /// that it may then run twice (section 10.2).
+    enum WakeHoldOffer: Equatable {
+        case otherHelpers
+        case runAgain(label: String, warning: String)
+    }
+
+    /// What a person may do about the holds that keep a helper back now, or nil when none does, or
+    /// when no way past them would ask anybody.
+    var wakeHoldOffer: WakeHoldOffer? {
+        let here = placement?() ?? .nowhere
+        guard plan(from: here).isHeld else { return nil }
+        if pastHolds(.otherHelpers, from: here) != nil { return .otherHelpers }
+        guard let again = pastHolds(.runAgain, from: here) else { return nil }
+        let helpers = WakePlan.runsAgain(again, holds: wakeHolds)
+        return .runAgain(label: WakePlan.runAgainLabel(helpers), warning: WakePlan.runAgainWarning(helpers, target: machine.name))
+    }
+
+    /// What going past the holds the way `choice` says would walk from `here`, or nil when that way
+    /// asks nobody.
+    private func pastHolds(_ choice: WakePlan.HoldChoice, from here: SiteAwareness.Placement) -> WakePlan.Plan? {
+        let holds = wakeHolds
+        guard !holds.isEmpty else { return nil }
+        let held = plan(from: here, holds: holds)
+        let unheld = plan(from: here, holds: [])
+        switch choice {
+        case .stand: return nil
+        case .otherHelpers: return WakePlan.otherHelpers(held: held, unheld: unheld, holds: holds, target: machine)
+        case .runAgain: return WakePlan.runAgain(held: held, unheld: unheld, holds: holds, target: machine)
+        }
     }
 
     /// A helper's state, from whichever model drives it here. A machine this device has no model
@@ -632,7 +666,9 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     /// A helper's command whose run may still be going leaves a wake hold, and while one stands only
     /// a declared `wol` action runs: before planning, each held helper that keeps records is asked
     /// about it once, and a hold that appears during the walk takes every later command out of it.
-    func wake() {
+    /// `choice` is a person's decision about the holds still standing after that, and nothing else
+    /// ever makes one on their behalf.
+    func wake(choice: WakePlan.HoldChoice = .stand) {
         guard machine.wake != nil else {
             wakeThenBoot = nil
             return
@@ -648,7 +684,7 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
 
         let started = perform("Waking \(machine.name)", kind: .wake, subject: machine.name) { operation in
             defer { self.isWaking = false }
-            let resolution = await self.walkWakePlan(operation: operation)
+            let resolution = await self.walkWakePlan(operation: operation, choice: choice)
             // Only a machine seen answering goes on into the system it was asked to wake into. Every
             // other ending lets the request go, so a later wake that does work never boots into a
             // target nobody asked for this time (M13).
@@ -664,16 +700,58 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         if started { isWaking = true } else { wakeThenBoot = nil }
     }
 
-    /// Release every hold for this machine because a person chose to, then wake it.
-    func tryOtherHelpers() {
-        operations?.releaseWakeHolds(target: machine.id, before: .distantFuture,
-                                     reason: "you chose to try the other helpers anyway")
-        wake()
+    /// Asks before trying the other helpers, because nothing but a person ever releases a hold.
+    func requestTryOtherHelpers() {
+        ask?(PendingDialog(
+            id: "try-other-helpers-\(machine.id)",
+            title: "Try the other helpers for \(machine.name)?",
+            message: "A helper command run earlier to wake \(machine.name) has not reported how it ended, so it may still be running. Trying the other helpers runs their commands, and does not run that one again.",
+            confirmTitle: "Try them",
+            perform: { [weak self] in self?.tryOtherHelpers() }
+        ))
     }
 
-    private func walkWakePlan(operation: String) async -> ActionResolution {
+    /// Wake this machine through the helpers the holds keep back, other than the held ones, because
+    /// a person chose to. The holds are released, and the held commands are not run again.
+    func tryOtherHelpers() {
+        wake(choice: .otherHelpers)
+    }
+
+    /// Asks before running a held command again, with what that can cost.
+    func requestRunHeldAgain() {
+        guard case .runAgain(let label, let warning) = wakeHoldOffer else { return }
+        ask?(PendingDialog(
+            id: "run-held-again-\(machine.id)",
+            title: "\(label) for \(machine.name)?",
+            message: warning,
+            confirmTitle: "Run it again",
+            perform: { [weak self] in self?.runHeldAgain() }
+        ))
+    }
+
+    /// Run the held commands again because a person chose to, knowing the first run may still be
+    /// going. Only ever when no other helper could be asked instead.
+    func runHeldAgain() {
+        wake(choice: .runAgain)
+    }
+
+    private func walkWakePlan(operation: String, choice: WakePlan.HoldChoice) async -> ActionResolution {
         await settleWakeHolds()
-        let plan = self.plan(from: freshPlacement?() ?? placement?() ?? .nowhere)
+        let here = freshPlacement?() ?? placement?() ?? .nowhere
+        var plan = self.plan(from: here)
+        // A way past that asks nobody new leaves the holds where they are: releasing them would only
+        // leave the held command free to run again on the next press without anyone choosing that.
+        if choice != .stand, plan.isHeld {
+            guard let past = pastHolds(choice, from: here) else {
+                let sentence = choice == .runAgain ? WakePlan.otherHelperFirst(machine.name) : WakePlan.noOtherHelper(machine.name)
+                setStatus(sentence, isError: true)
+                return .init(state: .failed, summary: sentence)
+            }
+            operations?.releaseWakeHolds(target: machine.id, before: .distantFuture,
+                                         reason: choice == .runAgain ? "you chose to run the held command again"
+                                                                     : "you chose to try the other helpers")
+            plan = past
+        }
         guard !plan.isEmpty else {
             setStatus(plan.nothingToTry, isError: true)
             return .init(state: .failed, summary: plan.nothingToTry)
