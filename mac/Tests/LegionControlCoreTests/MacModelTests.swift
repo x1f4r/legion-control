@@ -565,6 +565,13 @@ struct MacModelTests {
         model.replaceSetup(over: shown, from: document.hash)
         #expect(model.note?.hasPrefix("The setup here changed since that was shown") == true)
 
+        // Nor while a hand edit of the file waits for its revision, which leaves no document here
+        // at all. That returned without a word.
+        model.controllerConfig = { nil }
+        model.replaceSetup(over: shown, from: document.hash)
+        #expect(model.note == "The setup here changed since that was shown, so nothing was sent.")
+        #expect(model.noteIsError)
+
         await Self.settle(model)
         #expect(!runner.sent.contains { $0.contains("--replace") })
         #expect(!store.newestFirst.contains { $0.kind == .shareSetup })

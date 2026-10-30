@@ -215,7 +215,12 @@ extension AgentDevice {
     /// is sent once either has moved on: `--replace` overwrites whatever the agent holds when it
     /// arrives, and a newer copy nobody here has seen must not go on a decision about an older one.
     func replaceSetup(over theirs: String?, from mine: String) {
-        guard let local = controllerConfig?() else { return }
+        // A hand edit of the file that waits for its revision leaves no document here to send, and
+        // returning without a word, once the question was answered, looked like a Replace that went.
+        guard let local = controllerConfig?() else {
+            setStatus("The setup here changed since that was shown, so nothing was sent.", isError: true)
+            return
+        }
         // Asked of the setup as it is now, not only of the one a sheet was built over.
         if let problem = local.replaceBlocker {
             setStatus(problem, isError: true)
