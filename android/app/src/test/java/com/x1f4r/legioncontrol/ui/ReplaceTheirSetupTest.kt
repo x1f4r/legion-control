@@ -102,10 +102,13 @@ class ReplaceTheirSetupTest {
     fun `a refusal no retry can cure holds this hash for the machine, said with Try again as a push's is`() {
         // The hold was recorded and its sentence was not, so the push of this hash that the hold
         // stops afterwards was stopped without a word, and nothing on the page offered Try again.
+        // Nor does it say a device with full access sends it on its next check, as a push's does:
+        // `--replace` goes only when a person asks for it.
         assertNull(sync.hold("tower"))
         replace(Tower(fixture("config.set.restricted-launch.json")))
         assertEquals(
-            "Tower takes this revision only from a device whose key is not restricted. A device with full access sends it there on its next check.",
+            "Tower takes this revision only from a device whose key is not restricted. Its copy is of a different setup, " +
+                "which a device with full access replaces only when a person asks it to.",
             sync.hold("tower"),
         )
         sync.retry("tower")

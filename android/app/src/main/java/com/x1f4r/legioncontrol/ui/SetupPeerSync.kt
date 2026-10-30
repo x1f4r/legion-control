@@ -367,10 +367,13 @@ internal class SetupPeerSync(
         // Kept as a push's reply is, so the guardrails see it: a refusal no retry can cure holds
         // this hash for that machine, and a request that did not go through backs off. A hold is
         // said as a push's is, with Try again beside it: the automatic push of this hash that the
-        // hold now stops would otherwise be stopped without a word.
+        // hold now stops would otherwise be stopped without a word. It is worded for a Replace,
+        // though: no device with full access sends one on its own either.
         val effect = afterPush(reply, document.hash)
         state.record(effect, reply, document.hash, clock())
-        if (effect.effect == SetupPushEffect.Effect.HOLD) holds[client.machine.id] = document.hash to held(name, reply!!)
+        if (effect.effect == SetupPushEffect.Effect.HOLD) {
+            holds[client.machine.id] = document.hash to held(name, reply!!, replace = true)
+        }
 
         if (reply == null) {
             val failure = result.exceptionOrNull()
@@ -559,11 +562,18 @@ internal class SetupPeerSync(
         )
     }
 
-    /** Why a push was held, as the person reads it (contract section 9.5). */
-    private fun held(name: String, reply: ConfigSetReply): String = when (reply.reasonCode) {
+    /**
+     * Why a push was held, as the person reads it (contract section 9.5). [replace] is whether the
+     * push held was a Replace, which no device sends on its next check: `--replace` goes only when
+     * a person asks for it.
+     */
+    private fun held(name: String, reply: ConfigSetReply, replace: Boolean = false): String = when (reply.reasonCode) {
         ReasonCode.RESTRICTED.wire ->
-            "$name takes this revision only from a device whose key is not restricted. A device with full " +
-                "access sends it there on its next check."
+            "$name takes this revision only from a device whose key is not restricted. " + if (replace) {
+                "Its copy is of a different setup, which a device with full access replaces only when a person asks it to."
+            } else {
+                "A device with full access sends it there on its next check."
+            }
 
         else -> {
             val problem = reply.problems?.firstOrNull()?.let { listOfNotNull(it.path, it.message).joinToString(": ") }
