@@ -149,6 +149,36 @@ public class StateMergeTests
     }
 
     [Fact]
+    public void AChangeMadeWhileTheOperationsListCannotBeOpenedWaitsRatherThanWriteAwayTheOtherProcesses()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var window = new OperationTracker(path);
+        var (first, _) = window.Begin("op-window-0001", "pi", "linux", new OperationIntent("update", "t3"));
+        // The command line records an operation of its own while the window is open.
+        new OperationTracker(path).Begin("op-command-0001", "pi", "linux", new OperationIntent("restart", "t3"));
+
+        // Something else holds the file open while the window changes the list twice.
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            window.Begin("op-window-0002", "pi", "linux", new OperationIntent("update", "agent"));
+            window.Update(first with { Message = "still running" });
+        }
+        // Nothing was written over what the command line recorded.
+        var meanwhile = new OperationTracker(path);
+        Assert.NotNull(meanwhile.Find("op-command-0001"));
+        Assert.Null(meanwhile.Find("op-window-0002"));
+        Assert.Empty(SetAside(path));
+
+        // What the window changed is written once the next check can read the file, beside it.
+        Assert.True(window.ReloadIfChanged());
+        var after = new OperationTracker(path);
+        Assert.NotNull(after.Find("op-command-0001"));
+        Assert.NotNull(after.Find("op-window-0002"));
+        Assert.Equal("still running", after.Find("op-window-0001")!.Message);
+    }
+
+    [Fact]
     public void ApprovalsThatCouldNotBeOpenedOnceAreReadAgainAndNeverSetAside()
     {
         using var home = new TempHome();

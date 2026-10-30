@@ -105,7 +105,10 @@ public sealed record TrackedOperation
 /// are read again whenever the file changed, so a wake planned here sees one recorded there.
 ///
 /// A file that is there but is not a list is moved aside before the next change is written over it,
-/// so the operations it held can still be read by a person, and the log says where it went.
+/// so the operations it held can still be read by a person, and the log says where it went. One
+/// that could not be opened for a change, as when a virus scanner holds it, is not written over at
+/// all: what the other process wrote there is not in this list, so the change waits here and is
+/// written with the next change, or check, that can read the file.
 public sealed class OperationTracker
 {
     private readonly string _path;
@@ -117,6 +120,11 @@ public sealed class OperationTracker
     private HashSet<string> _onDisk = new(StringComparer.Ordinal);
     /// Why the file could not be read when this tracker last tried, or null.
     private string? _unreadable;
+    /// True when the last read could not open the file at all, which says nothing about what it
+    /// holds.
+    private bool _unread;
+    /// True while a change made when the file could not be opened has not been written.
+    private bool _unsaved;
 
     /// [readOnly] is for a run that changes nothing on disk, as a smoke run does: changes are made
     /// to the list in memory, and nothing is written or locked.
@@ -272,7 +280,10 @@ public sealed class OperationTracker
             // Read under the lock as well: a reader holding the file open can make another
             // process's rename over it fail on Windows, and that write would be lost.
             using var held = Lock();
-            return Merge();
+            var read = Merge();
+            // A change that waited for the file to open is written once it does.
+            if (_unsaved && !_unread) Save();
+            return read;
         }
     }
 
@@ -357,7 +368,8 @@ public sealed class OperationTracker
     /// Folds in what the other process wrote since this one last read or wrote the list. The side
     /// that changed an entry later wins; an entry only the file has is taken; one the file held when
     /// this side last read or wrote it and holds no more was forgotten or pruned there. A file that
-    /// is not there or cannot be read changes nothing here, and the next write puts this list back.
+    /// is not there changes nothing here, and the next write puts this list back; one that could not
+    /// be opened changes nothing either, and nothing is written until it can be (see [Save]).
     private bool Merge()
     {
         // Taken before the read: a write that lands in between is then read again next time.
@@ -417,6 +429,7 @@ public sealed class OperationTracker
     /// that is there and holds no list is noted in [_unreadable], so the next write sets it aside.
     private Dictionary<string, TrackedOperation>? Read()
     {
+        _unread = false;
         try
         {
             if (!File.Exists(_path)) return null;
@@ -460,12 +473,16 @@ public sealed class OperationTracker
             }
             return stored;
         }
-        catch (Exception)
+        catch (Exception error)
         {
             // A list that cannot be read this time is read again on the next check, not taken for
             // read until the file changes. Nothing here is worth refusing to start over, and the
-            // machines are asked about what they are running on the next status anyway.
+            // machines are asked about what they are running on the next status anyway. One that
+            // could not be opened is not written over meanwhile (see [Save]); one that opened and
+            // could still not be read as a list is set aside like any other that is not one.
             _signature = null;
+            if (error is IOException or UnauthorizedAccessException) _unread = true;
+            else _unreadable = $"it could not be read as a list ({error.Message})";
             return null;
         }
     }
@@ -487,6 +504,15 @@ public sealed class OperationTracker
     private void Save()
     {
         if (_readOnly) return;
+        // The file could not be opened for this change, so whatever the other process wrote there
+        // since this one last read it is not in this list, and writing the list would write it
+        // away. The change stays here until a read succeeds.
+        if (_unread)
+        {
+            if (!_unsaved) AppLog.Write($"{_path} could not be opened, so a change to it waits until it can be read again");
+            _unsaved = true;
+            return;
+        }
         try
         {
             if (_unreadable is { } why && File.Exists(_path))
@@ -527,6 +553,7 @@ public sealed class OperationTracker
             AtomicWrite.Text(_path, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
             _signature = Signature();
             _onDisk = _operations.Keys.ToHashSet(StringComparer.Ordinal);
+            _unsaved = false;
         }
         catch (Exception)
         {
