@@ -588,7 +588,7 @@ test('an update whose drain runs out of time answers only once the drain is gone
     const dir = oneService(home, { initial: { latest: '2.0.0' }, service: { drain: { command: lateWriter(late, 3000), timeoutSeconds: 1 } } });
     const failed = invoke(home, ['update']);
     assert.equal(failed.action, 'failed');
-    assert.match(failed.message, /the drain command failed: node timed out/);
+    assert.match(failed.message, /the drain command failed: node(\.exe)? timed out/);
     assert.equal(readFixture(dir, 'stop-runs'), '', 'a drain that did not finish is never followed by a stop');
     await delay(3000);
     assert.equal(fs.existsSync(late), false);

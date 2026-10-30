@@ -527,7 +527,7 @@ test('a command the ledger would not record once it had started is stopped, and 
     assert.equal(result.refused, undefined);
     assert.equal(result.timedOut, false);
     assert.equal(result.terminated, true, result.error);
-    assert.match(result.error, /^node was stopped as it started, because the command ledger would not record it$/);
+    assert.match(result.error, /^node(\.exe)? was stopped as it started, because the command ledger would not record it$/);
     assert.equal(describeFailure(result), result.error);
     assert.deepEqual(ledger(), [], 'stopped and seen gone, so nothing is held');
   });
