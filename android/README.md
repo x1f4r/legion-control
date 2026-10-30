@@ -261,12 +261,15 @@ reach, and travels on the next poll of each one. Behind that:
   whichever side actually changed each one; a deletion against an edit is asked about. Merging
   (section 9.8) starts from this phone's copy, keeps its order and every number as it was
   written, and writes a revision descending from both, which every machine then accepts as an
-  ordinary fast-forward, so nothing is replaced.
+  ordinary fast-forward, so nothing is replaced. The base it compares against is the newest
+  revision both copies descend from that the phone kept and still accepts; one it would refuse is
+  skipped like one it never kept, and with none every difference is asked about.
 - A document already in force that this build would refuse stays in force with its errors
   shown: nothing is published from it, and a machine an error is inside is not driven until the
   editor fixes it.
 - A machine carrying an entirely different setup cannot be merged with, and is the one place the
-  app ever sends `--replace`, after an explicit decision.
+  app ever sends `--replace`, after an explicit decision, and never from a copy with an error in
+  it: **Replace** stays off, with the error to fix beside it.
 
 **Commands wait for approval on each device** (contract section 9.9). Lineage shows that a
 document claims an ancestor, not who wrote it, and any key that may publish the setup, a

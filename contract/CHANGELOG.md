@@ -115,6 +115,11 @@ not, the agent now answers as they say.
 - A lock `conflict` answers `ok: true`.
 - A finished record's `result.ok` is true exactly when its `reasonCode` is
   null. A failed cycle carries the code of its first failed service.
+- A cycle that ran a service whose ending is unknown (an interrupted update, one
+  that ran out of time, or one that may have changed the machine before it
+  failed) states `outcome: "unknown"` and takes that service's reason code,
+  rather than `cycled` or a `failed` that reads as a known state. Its message
+  counts such services apart from the ones that failed.
 - A queued request the agent cancelled because it could not safely replace the
   one before it (`cancelled` with `internal`) reduces to `unknown`, not
   `succeeded`: section 5.6 reads `cancelled` by its reason code, with null
