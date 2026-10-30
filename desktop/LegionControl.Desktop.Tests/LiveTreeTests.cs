@@ -166,6 +166,34 @@ public class LiveTreeTests
     }
 
     [AvaloniaFact]
+    public void AKeptMenuItemShowsTheHeaderOfTheNewestBuild()
+    {
+        // Two builds of an item that say the same, label, state and explanation, under headers
+        // that do not.
+        static StackPanel Build(string line)
+        {
+            var item = Ui.MenuAction("Restart", () => { }, enabled: false, explanation: "The agent is too old");
+            ((Panel)item.Header!).Children.Add(new TextBlock { Text = line });
+            var page = Ui.Column(0);
+            page.Children.Add(Ui.MenuButton("⋯", new[] { item }, "t3 actions"));
+            return page;
+        }
+        MenuItem Item(Panel shown) => Assert.Single(shown.Children.OfType<Button>().Single().ContextMenu!.ItemsSource!.OfType<MenuItem>());
+        var (_, shown) = Shown(Build("Tried at 10:00"));
+        var item = Item(shown);
+        var header = (Panel)item.Header!;
+        var line = header.Children.OfType<TextBlock>().Last();
+
+        LiveTree.Update(shown, Build("Tried at 10:05"));
+
+        // The same item, with the header it had, saying what the newer build says.
+        Assert.Same(item, Item(shown));
+        Assert.Same(header, item.Header);
+        Assert.Same(line, header.Children.OfType<TextBlock>().Last());
+        Assert.Equal("Tried at 10:05", line.Text);
+    }
+
+    [AvaloniaFact]
     public async Task APollLeavesTheFocusOnTheControlItWasOn()
     {
         using var home = new TempHome();

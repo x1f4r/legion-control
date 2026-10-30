@@ -158,20 +158,24 @@ public static class LiveTree
                 }
                 break;
             case (ContentControl content, ContentControl built):
-                if (built.Content is Control || content.Content is Control)
-                {
-                    if (built.Content is Control next && content.Content is Control current && Kind(current) == Kind(next)) Merge(current, next);
-                    else
-                    {
-                        var value = built.Content;
-                        built.Content = null;
-                        content.Content = value;
-                    }
-                }
-                else if (!Equals(content.Content, built.Content)) content.Content = built.Content;
+                MergeHeld(content, built, ContentControl.ContentProperty);
                 break;
         }
         MergeMenu(shown, fresh);
+    }
+
+    /// Lays what [fresh] holds in [property], a control or a plain value such as a label, over what
+    /// [shown] holds there: a control of the same kind is merged, anything else taken as it is.
+    private static void MergeHeld(AvaloniaObject shown, AvaloniaObject fresh, AvaloniaProperty property)
+    {
+        var (current, next) = (shown.GetValue(property), fresh.GetValue(property));
+        if (current is Control inside && next is Control child && Kind(inside) == Kind(child)) Merge(inside, child);
+        else if (!Equals(current, next))
+        {
+            // A control has one parent, so the new build lets go of it first.
+            fresh.SetValue(property, null);
+            shown.SetValue(property, next);
+        }
     }
 
     private static void Sync(AvaloniaObject shown, AvaloniaObject fresh)
@@ -194,8 +198,8 @@ public static class LiveTree
     };
 
     /// A button's menu stays the one shown, so a menu open while a poll arrives stays open. Its
-    /// items are kept, with the new build's handlers, while they say what they said; otherwise
-    /// they are replaced by the new build's.
+    /// items are kept, with the new build's handlers and headers, while they say what they said;
+    /// otherwise they are replaced by the new build's.
     private static void MergeMenu(Control shown, Control fresh)
     {
         if (fresh.ContextMenu is not { } built)
@@ -226,6 +230,9 @@ public static class LiveTree
         foreach (var (item, next) in items.Zip(built))
         {
             Sync(item, next);
+            // [Ui.MenuAction] builds a header only from what [Says] reads. It is merged all the
+            // same, so that what a header says never depends on that staying so.
+            MergeHeld(item, next, HeaderedSelectingItemsControl.HeaderProperty);
             MergeItems(item, next);
         }
     }
