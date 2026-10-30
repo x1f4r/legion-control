@@ -378,14 +378,6 @@ export function previewCycle(config) {
 }
 
 /**
- * The whole cycle. This is what the systemd timer, the Windows task and the
- * launchd job run.
- *
- * Returns a per-service outcome list, not one aggregate answer: "the cycle
- * succeeded" is meaningless on a machine where one service updated, one was
- * paused and one is behind because its registry is unreachable.
- */
-/**
  * How a cycle that walked its services ends, from what it did to each of them,
  * and `owed`, the messages of the services its recovery could not put back.
  *
@@ -420,6 +412,14 @@ export function concludeCycle(children, owed = []) {
   };
 }
 
+/**
+ * The whole cycle. This is what the systemd timer, the Windows task and the
+ * launchd job run.
+ *
+ * Returns a per-service outcome list, not one aggregate answer: "the cycle
+ * succeeded" is meaningless on a machine where one service updated, one was
+ * paused and one is behind because its registry is unreachable.
+ */
 export async function runCycle(config, options = {}) {
   const { force = false, services = null, dryRun = false, opId: requestedId = null, budgetMs = CYCLE_BUDGET_MS } = options;
   if (dryRun) return previewCycle(config);
