@@ -14,6 +14,24 @@ namespace LegionControl.Desktop.Views;
 /// hundred pixels of chrome per machine and say nothing at all.
 public static class Ui
 {
+    /// What tells a control apart from others of its shape when the window lays a new build over
+    /// the one shown (see [LiveTree]): a service's row from another's, one notice from the next.
+    public static readonly AttachedProperty<string?> KeyProperty =
+        AvaloniaProperty.RegisterAttached<Control, string?>("Key", typeof(Ui));
+
+    /// What a button or a menu item does when pressed. Kept as a value of the control, rather than
+    /// in its Click event, so that a control kept on screen across a rebuild does what the latest
+    /// build says and never what an older reading did.
+    public static readonly AttachedProperty<Action?> HandlerProperty =
+        AvaloniaProperty.RegisterAttached<Control, Action?>("Handler", typeof(Ui));
+
+    /// [control], keyed.
+    public static T Keyed<T>(T control, string key) where T : Control
+    {
+        control.SetValue(KeyProperty, key);
+        return control;
+    }
+
     public static FontFamily NativeFont => new(OperatingSystem.IsWindows() ? "Segoe UI"
         : OperatingSystem.IsMacOS() ? ".AppleSystemUIFont" : "sans-serif");
     private static IBrush Brush(string key, string fallback) =>
@@ -100,7 +118,8 @@ public static class Ui
         };
         if (primary && enabled) button.Classes.Add("primary");
         if (explanation is not null) ToolTip.SetTip(button, explanation);
-        button.Click += (_, _) => handler();
+        button.SetValue(HandlerProperty, handler);
+        button.Click += (_, _) => button.GetValue(HandlerProperty)?.Invoke();
         return button;
     }
 
@@ -123,17 +142,20 @@ public static class Ui
     public static MenuItem MenuAction(string text, Action handler, bool enabled = true, string? explanation = null)
     {
         var item = new MenuItem { Header = text, IsEnabled = enabled };
-        item.Click += (_, _) => handler();
+        item.SetValue(HandlerProperty, handler);
+        item.Click += (_, _) => item.GetValue(HandlerProperty)?.Invoke();
         if (explanation is not null) ToolTip.SetTip(item, explanation);
         return item;
     }
 
+    /// A button that opens a menu. Its own text is a symbol or a word, so [accessibleName] says
+    /// what the menu is for, to a screen reader and in a tooltip.
     public static Button MenuButton(string text, IEnumerable<MenuItem> items, string accessibleName)
     {
-        var menu = new ContextMenu { ItemsSource = items.ToArray() };
         var button = Action(text, () => { });
-        button.ContextMenu = menu;
-        button.Click += (_, _) => menu.Open(button);
+        button.ContextMenu = new ContextMenu { ItemsSource = items.ToArray() };
+        // The menu the button holds when pressed, which a rebuild may have brought up to date.
+        button.Click += (_, _) => button.ContextMenu?.Open(button);
         Avalonia.Automation.AutomationProperties.SetName(button, accessibleName);
         ToolTip.SetTip(button, accessibleName);
         return button;

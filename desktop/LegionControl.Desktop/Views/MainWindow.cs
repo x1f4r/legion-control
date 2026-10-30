@@ -13,11 +13,16 @@ namespace LegionControl.Desktop.Views;
 /// The window.
 ///
 /// A native machine list keeps fleet navigation separate from the selected machine's controls.
-/// Polling refreshes the reading while retaining machine selection and disclosure choices.
+/// Polling refreshes the reading while retaining machine selection and disclosure choices, and
+/// every control that is still there: each change builds the page afresh into [_content], and
+/// [LiveTree] lays that over [_shown], so focus and a screen reader's place survive a poll.
 public sealed class MainWindow : Window
 {
     private readonly AppModel _app;
-    private readonly StackPanel _content = Ui.Column(0);
+    /// The page as this rebuild draws it, before it is laid over [_shown].
+    private StackPanel _content = Ui.Column(0);
+    /// The page in the window.
+    private readonly StackPanel _shown = Ui.Column(0);
     private readonly ListBox _machineList = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly FleetSelection _selection = new();
     private string[] _machineIds = Array.Empty<string>();
@@ -49,7 +54,7 @@ public sealed class MainWindow : Window
         FontFamily = Ui.NativeFont;
         if (Application.Current is { } application) application.Resources["NativeFontFamily"] = Ui.NativeFont;
 
-        _content.Margin = new Thickness(16, 8, 16, 16);
+        _shown.Margin = new Thickness(16, 8, 16, 16);
         var root = new DockPanel();
         var toolbar = new Grid { ColumnDefinitions = new ColumnDefinitions("auto,*,auto"), Margin = new Thickness(12, 8, 12, 0) };
         var devices = Ui.Action("Devices", () =>
@@ -83,7 +88,7 @@ public sealed class MainWindow : Window
         _navigation.Child = navigationContent; _navigation.BorderBrush = Ui.Hairline;
         _navigation.BorderThickness = new Thickness(0, 0, 1, 0);
         _panes.Children.Add(_navigation);
-        var scroll = new ScrollViewer { Content = _content, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+        var scroll = new ScrollViewer { Content = _shown, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
         Grid.SetColumn(scroll, 1); _panes.Children.Add(scroll);
         root.Children.Add(_panes);
         _devicePicker.SelectionChanged += (_, _) =>
@@ -161,26 +166,28 @@ public sealed class MainWindow : Window
 
     private void Rebuild()
     {
-        _updateNotice.Children.Clear();
+        var notice = Ui.Column(0);
         if (_app.AppUpdate is UpdateAvailability.Ready ready)
-            _updateNotice.Children.Add(Ui.Actions(
+            notice.Children.Add(Ui.Keyed(Ui.Actions(
                 Ui.Note($"Legion Control {ready.Manifest.Version} available"),
-                Ui.Action("Review update", () => ReviewAvailableUpdate(ready))));
+                Ui.Action("Review update", () => ReviewAvailableUpdate(ready))), "app-update"));
+        LiveTree.Update(_updateNotice, notice);
         var showNavigation = CompactPresentation.ShowNavigation(Bounds.Width, _navigationExpanded);
         _navigation.IsVisible = showNavigation;
         _panes.ColumnDefinitions = new ColumnDefinitions(showNavigation ? $"{CompactPresentation.NavigationWidth},*" : "0,*");
         _devicePicker.IsVisible = !showNavigation;
         UpdateNavigation();
-        _content.Children.Clear();
+        _content = Ui.Column(0);
         BuildHeader();
         if (_page == "setup")
         {
             BuildSetup();
-            _content.Children.Add(Ui.Actions(Ui.Action("Edit the setup", () => new SetupEditor(_app).Show(this))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Edit the setup", () => new SetupEditor(_app).Show(this))), "setup:edit"));
         }
         else if (_page == "device") BuildDiagnostics();
         else if (_selection.SelectedId is { } id && _app.Machine(id) is { } selected) BuildMachine(selected);
         else BuildEmpty();
+        LiveTree.Update(_shown, _content);
         // Commands nobody here approved open their review once per revision. Not now keeps it
         // shut for that revision; the notice above stays.
         if (IsVisible && _launchReview is null && _app.LaunchReview.Count > 0 && !_app.IsLaunchReviewDeferred) OpenLaunchReview();
@@ -226,36 +233,36 @@ public sealed class MainWindow : Window
     private void BuildHeader()
     {
         if (_app.Config.Problem is { } problem)
-            _content.Children.Add(Ui.Actions(Ui.Note("Setup needs attention", Ui.Bad),
-                Ui.Action("Details", () => Sheets.Text(this, "Setup", problem))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Note("Setup needs attention", Ui.Bad),
+                Ui.Action("Details", () => Sheets.Text(this, "Setup", problem))), "notice:setup"));
         if (_app.Approvals.Problem is { } launchProblem)
-            _content.Children.Add(Ui.Actions(Ui.Note("Approved commands need attention", Ui.Bad),
-                Ui.Action("Details", () => Sheets.Text(this, "Approved commands", launchProblem))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Note("Approved commands need attention", Ui.Bad),
+                Ui.Action("Details", () => Sheets.Text(this, "Approved commands", launchProblem))), "notice:approvals"));
         if (_app.Config.Warnings.Count > 0)
-            _content.Children.Add(Ui.Actions(Ui.Action("Setup warnings", () => Sheets.Text(this, "Setup", string.Join("\n", _app.Config.Warnings)))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Setup warnings", () => Sheets.Text(this, "Setup", string.Join("\n", _app.Config.Warnings)))), "notice:warnings"));
         var unresolved = _app.Reconciler.Outcomes.Count(entry => entry.Value is ReconcileOutcome.NeedsDecision);
         if (unresolved > 0 && _page != "setup")
-            _content.Children.Add(Ui.Actions(Ui.Note("Setup changes need review", Ui.Unknown),
-                Ui.Action("Review", () => { _page = "setup"; Rebuild(); })));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Note("Setup changes need review", Ui.Unknown),
+                Ui.Action("Review", () => { _page = "setup"; Rebuild(); })), "notice:setup-changes"));
         if (_app.LaunchReview.Count > 0 && _page != "setup")
-            _content.Children.Add(Ui.Actions(Ui.Note("Commands from the shared setup need approval", Ui.Unknown),
-                Ui.Action("Review", OpenLaunchReview)));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Note("Commands from the shared setup need approval", Ui.Unknown),
+                Ui.Action("Review", OpenLaunchReview)), "notice:commands"));
     }
 
     private void BuildEmpty()
     {
-        _content.Children.Add(Ui.Rule());
-        _content.Children.Add(Ui.SectionHeading("Nothing configured"));
-        _content.Children.Add(Ui.Note(
+        _content.Children.Add(Ui.Keyed(Ui.Rule(), "empty:rule"));
+        _content.Children.Add(Ui.Keyed(Ui.SectionHeading("Nothing configured"), "empty:heading"));
+        _content.Children.Add(Ui.Keyed(Ui.Note(
             _app.Config.IsMissing
                 ? $"There is no setup document at {_app.Config.Path}. One example machine can be written there to start from, or a document can be fetched from a machine that already has one."
-                : "The setup document lists no machines."));
-        _content.Children.Add(Ui.Actions(
+                : "The setup document lists no machines."), "empty:note"));
+        _content.Children.Add(Ui.Keyed(Ui.Actions(
             Ui.Action("Write an example there", () =>
             {
                 var problem = _app.Config.WriteExample();
                 if (problem is not null) Sheets.Text(this, "Could not write it", problem);
-            }, _app.Config.IsMissing)));
+            }, _app.Config.IsMissing)), "empty:actions"));
     }
 
     private void BuildMachine(MachineModel machine)
@@ -278,11 +285,11 @@ public sealed class MainWindow : Window
         var controls = BuildMachineActions(machine);
         if (ContentWidth < 650) { Grid.SetRow(controls, 1); Grid.SetColumnSpan(controls, 2); }
         else Grid.SetColumn(controls, 1);
-        heading.Children.Add(controls); _content.Children.Add(heading);
+        heading.Children.Add(controls); _content.Children.Add(Ui.Keyed(heading, $"machine:{machine.Id}"));
         if (machine.Failure?.Kind is FailureKind.HostKeyUnknown or FailureKind.HostKeyChanged)
-            _content.Children.Add(Ui.Actions(Ui.Action("Review host key", () => TrustAsync(machine))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Review host key", () => TrustAsync(machine))), $"machine:{machine.Id}:host-key"));
         else if (machine.Failure is not null || machine.Status?.Config?.BlocksMutations == true)
-            _content.Children.Add(Ui.Actions(Ui.Action("Details", () => ShowMachineDetails(machine))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Details", () => ShowMachineDetails(machine))), $"machine:{machine.Id}:details"));
         BuildOperations(machine);
         BuildServices(machine);
     }
@@ -392,7 +399,7 @@ public sealed class MainWindow : Window
             var labels = new Grid { ColumnDefinitions = new ColumnDefinitions("*,140,190,140"), Margin = new Thickness(0, 4, 0, 6) };
             foreach (var pair in new[] { (0, "Service"), (1, "State"), (2, "Version") })
             { var text = Ui.Note(pair.Item2); Grid.SetColumn(text, pair.Item1); labels.Children.Add(text); }
-            _content.Children.Add(labels);
+            _content.Children.Add(Ui.Keyed(labels, $"machine:{machine.Id}:service-columns"));
         }
         foreach (var service in status.Services)
         {
@@ -424,7 +431,8 @@ public sealed class MainWindow : Window
                 CompactPresentation.HasUpdate(service) ? Ui.Action("Update", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id }), primary: true) : null,
                 Ui.MenuButton("⋯", items, service.DisplayName + " actions"));
             actions.Margin = new Thickness(0); Grid.SetColumn(actions, wide ? 3 : 1); row.Children.Add(actions);
-            _content.Children.Add(new Border { Child = row, BorderBrush = Ui.Hairline, BorderThickness = new Thickness(0, 1, 0, 0) });
+            _content.Children.Add(Ui.Keyed(new Border { Child = row, BorderBrush = Ui.Hairline, BorderThickness = new Thickness(0, 1, 0, 0) },
+                $"machine:{machine.Id}:service:{service.Id}"));
         }
     }
 
@@ -506,7 +514,7 @@ public sealed class MainWindow : Window
                 queued ? Ui.Action("Cancel", () => Cancel(machine, id!), id is not null) : null,
                 Ui.Action("Details", () => OperationDetails(machine, id!), id is not null));
             actions.Margin = new Thickness(8, 0, 0, 0); Grid.SetColumn(actions, 1); row.Children.Add(actions);
-            rows.Children.Add(row);
+            rows.Children.Add(Ui.Keyed(row, $"operation:{id ?? title}"));
         }
         foreach (var operation in machine.Status?.Operations.Running ?? Array.Empty<OperationSummary>())
             Add(operation.Id, operation.Describe(), operation.Phase ?? "In progress", false);
@@ -517,7 +525,7 @@ public sealed class MainWindow : Window
                 operation.OutcomeUnknown || operation.Outcome == OperationOutcome.Unknown ? "Outcome unknown"
                     : operation.State == OperationState.Queued ? "Waiting until idle" : "In progress",
                 operation.State == OperationState.Queued);
-        if (rows.Children.Count > 0) target.Children.Add(rows);
+        if (rows.Children.Count > 0) target.Children.Add(Ui.Keyed(rows, $"machine:{machine.Id}:operations"));
         if (!includeRecent) return;
         target.Children.Add(Ui.SectionHeading("Recent changes"));
         rows = Ui.Column(2);
@@ -616,15 +624,15 @@ public sealed class MainWindow : Window
 
     private void BuildSetup()
     {
-        _content.Children.Add(Ui.Rule());
-        _content.Children.Add(Ui.SectionHeading("The setup"));
-        _content.Children.Add(Ui.Actions(Ui.Action("Setup details", SetupDetails)));
+        _content.Children.Add(Ui.Keyed(Ui.Rule(), "setup:rule"));
+        _content.Children.Add(Ui.Keyed(Ui.SectionHeading("The setup"), "setup:heading"));
+        _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Setup details", SetupDetails)), "setup:details"));
         if (_app.LaunchReview.Count > 0)
         {
-            _content.Children.Add(Ui.DetailRow("Commands",
+            _content.Children.Add(Ui.Keyed(Ui.DetailRow("Commands",
                 _app.LaunchReview.Count == 1 ? "1 waits for approval on this device" : $"{_app.LaunchReview.Count} wait for approval on this device",
-                Ui.Unknown));
-            _content.Children.Add(Ui.Actions(Ui.Action("Review commands", OpenLaunchReview)));
+                Ui.Unknown), "setup:commands"));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Review commands", OpenLaunchReview)), "setup:review-commands"));
         }
         foreach (var machine in _app.Machines)
         {
@@ -635,16 +643,16 @@ public sealed class MainWindow : Window
                 ReconcileOutcome.Failed => Ui.Bad,
                 _ => null,
             };
-            _content.Children.Add(Ui.DetailRow(machine.Name, outcome.Sentence_, colour));
+            _content.Children.Add(Ui.Keyed(Ui.DetailRow(machine.Name, outcome.Sentence_, colour), $"setup:{machine.Id}"));
             if (outcome is ReconcileOutcome.NeedsDecision)
             {
-                _content.Children.Add(Ui.Actions(
-                    Ui.Action("Sort this out", () => Diverged(machine, outcome))));
+                _content.Children.Add(Ui.Keyed(Ui.Actions(
+                    Ui.Action("Sort this out", () => Diverged(machine, outcome))), $"setup:{machine.Id}:decide"));
             }
             if (outcome is ReconcileOutcome.Withheld)
             {
-                _content.Children.Add(Ui.Actions(
-                    Ui.Action("Try again", () => TryAgain(machine))));
+                _content.Children.Add(Ui.Keyed(Ui.Actions(
+                    Ui.Action("Try again", () => TryAgain(machine))), $"setup:{machine.Id}:try-again"));
             }
         }
     }
@@ -658,22 +666,22 @@ public sealed class MainWindow : Window
 
     private void BuildDiagnostics()
     {
-        _content.Children.Add(Ui.Rule());
-        _content.Children.Add(Ui.SectionHeading("This device"));
-        _content.Children.Add(Ui.DetailRow("Notifications",
+        _content.Children.Add(Ui.Keyed(Ui.Rule(), "device:rule"));
+        _content.Children.Add(Ui.Keyed(Ui.SectionHeading("This device"), "device:heading"));
+        _content.Children.Add(Ui.Keyed(Ui.DetailRow("Notifications",
             _app.Settings.NotifyOnOperationFinished
                 ? _app.Notifications.IsAvailable ? "on" : "on, but " + _app.Notifications.Describe()
-                : "off"));
+                : "off"), "device:notifications"));
         // What the button says it does, whatever another process wrote to the file since.
         var announce = !_app.Settings.NotifyOnOperationFinished;
-        _content.Children.Add(Ui.Actions(
+        _content.Children.Add(Ui.Keyed(Ui.Actions(
             Ui.Action("Edit the setup", () => new SetupEditor(_app).Show(this)),
             Ui.Action("This device's own settings", () => new BindingsEditor(_app).Show(this)),
             Ui.Action(announce ? "Announce finished operations" : "Stop announcing operations",
                 () => _app.UpdateSettings(settings => settings with { NotifyOnOperationFinished = announce })),
-            Ui.Action("Check for an update to this app", CheckForUpdate)));
+            Ui.Action("Check for an update to this app", CheckForUpdate)), "device:actions"));
         if (_app.UpdateSuggestions.LastResult is { } updateResult)
-            _content.Children.Add(Ui.Note(updateResult.Sentence_));
+            _content.Children.Add(Ui.Keyed(Ui.Note(updateResult.Sentence_), "device:update-result"));
     }
 
     // MARK: the things the buttons do
