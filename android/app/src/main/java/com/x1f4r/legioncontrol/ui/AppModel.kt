@@ -686,6 +686,9 @@ class AppModel(
                 }
             } finally {
                 replacing = false
+                // A refusal no retry can cure holds this hash for the machine, as a push's does, and
+                // its page says so with Try again.
+                noteHold(client.machine.id)
             }
         }
     }

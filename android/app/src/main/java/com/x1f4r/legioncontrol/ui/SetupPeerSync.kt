@@ -346,8 +346,12 @@ internal class SetupPeerSync(
         }
         val reply = result.getOrNull()
         // Kept as a push's reply is, so the guardrails see it: a refusal no retry can cure holds
-        // this hash for that machine, and a request that did not go through backs off.
-        state.record(afterPush(reply, document.hash), reply, document.hash, clock())
+        // this hash for that machine, and a request that did not go through backs off. A hold is
+        // said as a push's is, with Try again beside it: the automatic push of this hash that the
+        // hold now stops would otherwise be stopped without a word.
+        val effect = afterPush(reply, document.hash)
+        state.record(effect, reply, document.hash, clock())
+        if (effect.effect == SetupPushEffect.Effect.HOLD) holds[client.machine.id] = document.hash to held(name, reply!!)
 
         if (reply == null) {
             val failure = result.exceptionOrNull()

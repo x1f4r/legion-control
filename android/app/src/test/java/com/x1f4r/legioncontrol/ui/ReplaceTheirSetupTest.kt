@@ -87,6 +87,34 @@ class ReplaceTheirSetupTest {
     }
 
     @Test
+    fun `a refusal no retry can cure holds this hash for the machine, said with Try again as a push's is`() {
+        // The hold was recorded and its sentence was not, so the push of this hash that the hold
+        // stops afterwards was stopped without a word, and nothing on the page offered Try again.
+        assertNull(sync.hold("tower"))
+        replace(Tower(fixture("config.set.restricted-launch.json")))
+        assertEquals(
+            "Tower takes this revision only from a device whose key is not restricted. A device with full access sends it there on its next check.",
+            sync.hold("tower"),
+        )
+        sync.retry("tower")
+        assertNull(sync.hold("tower"))
+        assertTrue("Try again lets the push go once more", sync.state("tower").held.isEmpty())
+
+        val invalid = ConfigSetReply(
+            ok = false,
+            reasonCode = "config-invalid",
+            problems = listOf(ConfigProblem(path = "machines[0].wake.helpers[0]", message = "the helper names no machine")),
+        )
+        replace(Tower(Result.success(invalid)))
+        assertEquals("Tower refused this revision of the setup: machines[0].wake.helpers[0]: the helper names no machine.", sync.hold("tower"))
+
+        // A refusal a retry can cure holds nothing.
+        sync.retry("tower")
+        replace(Tower(fixture("config.set.bad-argument.json")))
+        assertNull(sync.hold("tower"))
+    }
+
+    @Test
     fun `a push the lock held back says it was not replaced yet, whether ok is true or false`() {
         assertStays(
             replace(Tower(reply("""{"ok":true,"contract":3,"action":"conflict","reasonCode":"operation-in-progress","message":"an update holds the lock"}"""))),
