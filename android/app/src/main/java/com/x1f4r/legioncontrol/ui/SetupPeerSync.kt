@@ -63,6 +63,12 @@ internal class SetupPeerSync(
      */
     private val left = HashSet<String>()
 
+    /**
+     * The question a Replace found out of date, left where it was pressed and saying why nothing was
+     * sent, until its machine's next status closes it and asks again from what both hold then.
+     */
+    private var outdated: SetupIdentityClash? = null
+
     fun state(machineId: String): SetupPeerState = states.getOrPut(machineId) { SetupPeerState() }
 
     /**
@@ -102,6 +108,12 @@ internal class SetupPeerSync(
         state.statusAt = clock()
         state.runningOperations = status.operations?.running?.size ?: 0
         state.localMutation = localMutation
+        // The status a question Replace found out of date was waiting for: it closes, and what
+        // follows decides again from what both hold now.
+        outdated?.takeIf { it.machineId == client.machine.id }?.let { stale ->
+            outdated = null
+            if (services.identityClash.value == stale) services.clearIdentityClash()
+        }
         var mark = status.controller
         // Deciding again at once happens after a meta read, a filed refusal and a moved head, and
         // never more than this many times on one status: each of those learns something, and a
@@ -277,7 +289,8 @@ internal class SetupPeerSync(
 
         /**
          * Nothing was sent, because the question on screen is no longer the one either side would
-         * ask. It is closed, and the next status asks again from what both hold then.
+         * ask. It stays where Replace was pressed, saying so, until the machine's next status
+         * closes it and asks again from what both hold then.
          */
         data class Stale(override val line: String) : Replaced {
             override val isError: Boolean get() = false
@@ -304,9 +317,15 @@ internal class SetupPeerSync(
      */
     suspend fun replace(client: MachineClient, clash: SetupIdentityClash, latestHash: String?): Replaced =
         sendReplace(client, clash, latestHash).also { replaced ->
-            // Closed only if it is still the question on screen: another may have come up while
-            // the request was out.
-            if (replaced !is Replaced.NotDone && services.identityClash.value == clash) services.clearIdentityClash()
+            // Only if it is still the question on screen: another may have come up while the
+            // request was out.
+            if (services.identityClash.value != clash) return@also
+            when (replaced) {
+                is Replaced.Done -> services.clearIdentityClash()
+                // Closing it at once took the page away with the sentence saying nothing was sent.
+                is Replaced.Stale -> outdated = clash
+                is Replaced.NotDone -> Unit
+            }
         }
 
     private suspend fun sendReplace(client: MachineClient, clash: SetupIdentityClash, latestHash: String?): Replaced {

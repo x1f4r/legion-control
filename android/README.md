@@ -271,9 +271,10 @@ reach, and travels on the next poll of each one. Behind that:
   app ever sends `--replace`, after an explicit decision, and never from a copy with an error in
   it: **Replace** stays off, with the error to fix beside it. Nothing is sent when the machine's
   latest status names another document than the one shown, or when this phone's setup changed
-  since the question was asked; the question is asked again instead. The question closes only
-  when the machine says it stored this phone's copy: a refusal, a push its lock held back and a
-  reply that leaves it open whether the copy was replaced each say so and keep it.
+  since the question was asked: the question says so where Replace was pressed, and the machine's
+  next status closes it and asks again. Otherwise it closes only when the machine says it stored
+  this phone's copy: a refusal, a push its lock held back and a reply that leaves it open whether
+  the copy was replaced each say so on the question and keep it.
 
 **Commands wait for approval on each device** (contract section 9.9). Lineage shows that a
 document claims an ancestor, not who wrote it, and any key that may publish the setup, a

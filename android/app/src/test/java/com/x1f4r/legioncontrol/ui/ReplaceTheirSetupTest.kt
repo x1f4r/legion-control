@@ -1,27 +1,39 @@
 package com.x1f4r.legioncontrol.ui
 
+import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.AgentJson
+import com.x1f4r.legioncontrol.agent.AgentStatus
 import com.x1f4r.legioncontrol.agent.ConfigProblem
 import com.x1f4r.legioncontrol.agent.ConfigSetReply
+import com.x1f4r.legioncontrol.agent.ControllerMark
 import com.x1f4r.legioncontrol.agent.DispatchStage
 import com.x1f4r.legioncontrol.agent.Machine
+import com.x1f4r.legioncontrol.agent.SetupPeerState
 import com.x1f4r.legioncontrol.contract.ContractCorpus
 import com.x1f4r.legioncontrol.data.ConfigStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.LaunchDocuments
 import com.x1f4r.legioncontrol.data.MemoryPreferences
+import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.withText
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.yield
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.nio.file.Files
 
 /**
  * Replace on the different-setup question (contract sections 5.6 and 9.5), against a real store and
@@ -196,16 +208,31 @@ class ReplaceTheirSetupTest {
     fun `a machine that moved on since the question was asked is not overwritten`() = runBlocking {
         val tower = Tower()
         val newer = "0".repeat(64)
-        val moved = sync.replace(tower, question(), newer)
+        val clash = question()
+        val moved = sync.replace(tower, clash, newer)
         assertEquals(
             SetupPeerSync.Replaced.Stale("Tower holds another document now, not the one shown. Nothing was sent; it is compared again at its next check."),
             moved,
         )
         assertTrue("nothing was sent", tower.sent.isEmpty())
-        assertNull("the next status asks again, about what it holds then", store.identityClash.value)
+        // Closing it at once took the page Replace was pressed on away with that sentence.
+        assertEquals("the question stays, saying so", clash, store.identityClash.value)
 
-        assertEquals(SetupPeerSync.Replaced.Stale("Tower carries this setup already."), sync.replace(tower, question(), mine.hash))
+        val already = question()
+        assertEquals(SetupPeerSync.Replaced.Stale("Tower carries this setup already."), sync.replace(tower, already, mine.hash))
         assertTrue(tower.sent.isEmpty())
+        assertEquals(already, store.identityClash.value)
+
+        // Another machine's status is not the one it waits for.
+        val pi = object : MachineClient by unusable<MachineClient>("Replace") {
+            override val machine = Machine(id = "pi", name = "Pi", endpoints = emptyList(), systems = emptyList(), wake = null)
+        }
+        assertNull(sync.reconcile(pi, holding(mine.hash), localMutation = false, state = sync.state("pi")))
+        assertEquals(already, store.identityClash.value)
+
+        // Tower's is: the question closes, and the status decides again from what both hold now.
+        assertNull(sync.reconcile(tower, holding(mine.hash), localMutation = false, state = sync.state("tower")))
+        assertNull(store.identityClash.value)
     }
 
     @Test
@@ -215,5 +242,66 @@ class ReplaceTheirSetupTest {
         assertNull(store.applyEdit(mine.editMachine("tower") { it.withText("name", "Edited meanwhile") }, "Test phone"))
         assertEquals(SetupPeerSync.Replaced.Stale("The setup here changed while this was open; comparing again."), sync.replace(tower, clash, otherHash))
         assertTrue(tower.sent.isEmpty())
+        assertEquals("the question stays, saying so, until Tower's next status", clash, store.identityClash.value)
+    }
+
+    // MARK: - What Replace is checked against
+
+    private val directory: File = Files.createTempDirectory("replace").toFile()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+    private val operations = OperationCenter(OperationStore(File(directory, "operations.json")), scope, SilentNotifier, clock = { 0L })
+
+    @After
+    fun tearDown() {
+        scope.cancel()
+        directory.deleteRecursively()
+    }
+
+    /** A status of a machine holding [hash], of this setup's id when it is this setup's document. */
+    private fun holding(hash: String?) = AgentStatus(
+        ok = true,
+        contract = 3,
+        agentVersion = "3.1.0",
+        controller = ControllerMark(hash = hash, id = if (hash == mine.hash) mine.setupId else "setup-0b4f6a12-3c5d-4e7f-8a9b-0c1d2e3f4a5b"),
+    )
+
+    /** The page of a machine whose every status says it holds [holds], read as the app reads it. */
+    private inner class Shown(id: String) {
+        var holds: String? = null
+        private val client = object : MachineClient by unusable<MachineClient>("reading a status") {
+            override val machine = Machine(id = id, name = id.replaceFirstChar { it.uppercase() }, endpoints = emptyList(), systems = emptyList(), wake = null)
+            override val abilities = AgentAbilities(contract = 3)
+            override val route: Route? get() = null
+            override suspend fun status(): Result<AgentStatus> = Result.success(holding(holds))
+        }
+        private val setup = object : SetupSync by unusable<SetupSync>("reading a status") {
+            override fun state(machineId: String) = SetupPeerState()
+            override suspend fun reconcile(client: MachineClient, reply: AgentStatus, localMutation: Boolean, state: SetupPeerState): String? = null
+        }
+        val model = MachineModel(client, RememberedSettings(MemoryPreferences()), scope, operations, setup, unusable("reading a status"))
+    }
+
+    @Test
+    fun `Replace is checked against the latest status of the machine the question came from, found by id`() = runBlocking {
+        val pi = Shown("pi").apply { holds = mine.hash }
+        val tower = Shown("tower").apply { holds = otherHash }
+        val machines = listOf(pi.model, tower.model)
+        assertNull("no status read yet says nothing", machines.heldBy("tower"))
+
+        machines.forEach { it.refreshNow() }
+        assertEquals("Tower's own status, not the first machine's", otherHash, machines.heldBy("tower"))
+        val sending = Tower(Result.success(ConfigSetReply(ok = true, action = "replaced", hash = mine.hash)))
+        assertEquals(SetupPeerSync.Replaced.Done("Tower now carries this setup."), sync.replace(sending, question(), machines.heldBy("tower")))
+        assertEquals("what it named is the copy shown, so --replace went", 1, sending.sent.size)
+
+        // Its next status names a copy nobody here has seen, and that is what Replace goes by.
+        val newer = "0".repeat(64)
+        tower.holds = newer
+        tower.model.refreshNow()
+        assertEquals(newer, machines.heldBy("tower"))
+        val waiting = Tower()
+        val outdated = sync.replace(waiting, question(), machines.heldBy("tower"))
+        assertTrue(outdated.toString(), outdated is SetupPeerSync.Replaced.Stale)
+        assertTrue(waiting.sent.isEmpty())
     }
 }

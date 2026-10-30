@@ -686,11 +686,18 @@ fun IdentityClashSection(app: AppModel) {
 
     SectionHeading("Settle it")
     Actions {
-        PlainAction("Replace ${clash.machineName}'s copy", enabled = app.replaceProblem == null && !app.replacing, destructive = true) {
+        PlainAction("Replace ${clash.machineName}'s copy", enabled = app.canReplace, destructive = true) {
             app.replaceTheirSetup()
         }
         PlainAction("Follow their setup instead", enabled = true) { app.adoptTheirSetup() }
         PlainAction("Leave it", enabled = true) { app.dismissIdentityClash() }
     }
-    (app.configError ?: app.replaceProblem)?.let { QuietText(it, Modifier.padding(top = 4.dp)) }
+    // What Replace came to is said here, where it was pressed, and so is a question it found out
+    // of date: that one stays, saying nothing was sent, until the machine's next check.
+    val line = if (app.replacing) {
+        "Sending this setup to ${clash.machineName}."
+    } else {
+        app.replaceOutcome?.line ?: app.configError ?: app.replaceProblem
+    }
+    line?.let { QuietText(it, Modifier.padding(top = 4.dp)) }
 }

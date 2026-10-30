@@ -25,6 +25,7 @@ import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.agent.SetupChangePreview
 import com.x1f4r.legioncontrol.data.SetupMerge
 import com.x1f4r.legioncontrol.data.SetupDivergence
+import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.endpointCount
 import com.x1f4r.legioncontrol.data.machineIds
@@ -655,13 +656,33 @@ class AppModel(
         private set
 
     /**
+     * What the last Replace came to, with the question it was pressed on. It is drawn on that
+     * question's page, where it was pressed, for as long as that question is the one open: the
+     * Device page, where the setup's other notes go, is not where anybody pressing it is looking.
+     */
+    private var replaced: Pair<SetupIdentityClash, SetupPeerSync.Replaced>? by mutableStateOf(null)
+
+    /** What Replace came to on the question on screen, or null when it was not pressed there. */
+    internal val replaceOutcome: SetupPeerSync.Replaced?
+        get() = replaced?.takeIf { it.first == identityClash }?.second
+
+    /**
+     * Whether Replace can be pressed on the question on screen: not while one is out, and not again
+     * on a question it already found out of date, where all it could do is say so again.
+     */
+    val canReplace: Boolean
+        get() = replaceProblem == null && !replacing && replaceOutcome !is SetupPeerSync.Replaced.Stale
+
+    /**
      * Replaces a machine's different setup with this one. The only place `--replace` is ever sent,
      * so it goes to the machine that served the copy on screen, found by its id: a name is free
-     * text, and another machine may carry the same one.
+     * text, and another machine may carry the same one. It is checked against what that machine's
+     * latest status says it holds, which [heldBy] finds the same way.
      *
-     * The question closes only when the machine says it took the document, or when it is out of
-     * date and the next status asks again. A refusal, a push the lock held back and a reply that
-     * leaves it open whether the copy was replaced all keep it on screen.
+     * The question closes only when the machine says it took the document, or, when it is out of
+     * date, at the machine's next status, which asks again; until then it says why nothing was
+     * sent. A refusal, a push the lock held back and a reply that leaves it open whether the copy
+     * was replaced all keep it on screen, saying so.
      */
     fun replaceTheirSetup() {
         val clash = identityClash ?: return
@@ -672,18 +693,16 @@ class AppModel(
             configError = it
             return
         }
-        val latest = machines.firstOrNull { it.machine.id == clash.machineId }?.status?.controller?.hash
+        val latest = machines.heldBy(clash.machineId)
         replacing = true
+        replaced = null
+        configError = null
         scope.launch {
             try {
-                val replaced = sync.replace(client, clash, latest)
-                if (replaced.isError) {
-                    configNote = null
-                    configError = replaced.line
-                } else {
-                    configError = null
-                    configNote = replaced.line
-                }
+                val outcome = sync.replace(client, clash, latest)
+                replaced = clash to outcome
+                // The question and its page are gone, so the line goes with the setup's others.
+                if (outcome is SetupPeerSync.Replaced.Done) configNote = outcome.line
             } finally {
                 replacing = false
                 // A refusal no retry can cure holds this hash for the machine, as a push's does, and
@@ -696,6 +715,7 @@ class AppModel(
     /** Adopts the other setup entirely, dropping this device's. */
     fun adoptTheirSetup() {
         val clash = identityClash ?: return
+        replaced = null
         settled(services.adoptOtherSetup(clash)) { "This device now follows the setup from ${clash.machineName}." }
     }
 
@@ -927,3 +947,11 @@ internal fun whyNotReplace(errors: List<DocumentProblem>): String? {
     val first = errors.firstOrNull() ?: return null
     return "This device's setup has an error to fix in the editor before it can replace another copy: ${first.message}"
 }
+
+/**
+ * The document [machineId]'s latest status says it holds, or null when it has none to go by. Found
+ * by id, as Replace finds the machine it sends to: a name is free text, and another machine may
+ * carry the same one.
+ */
+internal fun List<MachineModel>.heldBy(machineId: String): String? =
+    firstOrNull { it.machine.id == machineId }?.status?.controller?.hash
