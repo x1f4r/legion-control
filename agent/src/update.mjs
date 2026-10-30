@@ -415,7 +415,7 @@ async function rollBack(service, previous, prefix, enter) {
  * Shared by the npm and command cycles, which reach it the same way. Runs inside
  * the held lock, so it restarts directly rather than re-entering runRestart.
  */
-async function alreadyOnTarget(config, service, from, to, { force, opId }) {
+async function alreadyOnTarget(config, service, from, to, { force, opId, budget }) {
   const health = await serviceHealth(service);
   if (health.ok) {
     if (serviceState(service).pendingRestart) {
@@ -440,6 +440,21 @@ async function alreadyOnTarget(config, service, from, to, { force, opId }) {
       busy,
       message: `already on ${to} but unhealthy; the machine is busy (${busy.reason}), so the restart was deferred`,
     });
+  }
+
+  // A restart the scheduler ends half way leaves the service stopped, so in a
+  // cycle it waits for one with the time, as an update does at its drain.
+  const late = budget?.refuses(restartWorstCaseMs(service), `the restart of ${service.name}`);
+  if (late) {
+    return {
+      ok: true,
+      action: 'deferred',
+      reasonCode: REASON.timedOut,
+      from,
+      to,
+      message: `already on ${to} but unhealthy; ${late}`,
+      service: service.id,
+    };
   }
 
   const restart = await performRestart(service, { opId });
@@ -482,7 +497,7 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
   // going from and to, and the prefix it installs into (contract section 5.5).
   updateOperation(opId, { from, to, npmPrefix: prefix });
 
-  if (from === to) return alreadyOnTarget(config, service, from, to, { force, opId });
+  if (from === to) return alreadyOnTarget(config, service, from, to, { force, opId, budget });
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
@@ -495,14 +510,24 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
     return deferred({ service, from, to, busy, message });
   }
 
+  // The download leaves nothing down, but against a slow registry its tries
+  // can take nine minutes of a cycle that has none to spare, so it waits for
+  // a cycle that could still install what it fetches. It is shorter than the
+  // install the update's worst case counts, so one begun here is over before
+  // the cycle has to end, however long it takes.
+  const what = `the update of ${service.name} to ${to}`;
+  const short = budget?.refuses(updateWorstCaseMs(service), what);
+  if (short) return outOfTime({ service, from, to, message: short });
+
   lock.phase('warming');
   recordPhase(opId, 'warming', { note: `${service.package}@${to}` });
   const warmed = npmProvider.warmCache(service, to);
   if (!warmed.ok) log(`npm cache add did not succeed after ${warmed.attempts} attempts: ${warmed.message}`, 'update');
 
   // The drain is the first step that can leave the service down, so it is
-  // where a scheduled cycle decides whether it still has the time.
-  const late = budget?.refuses(updateWorstCaseMs(service), `the update of ${service.name} to ${to}`);
+  // where a scheduled cycle decides, with what the download took spent,
+  // whether it still has the time.
+  const late = budget?.refuses(updateWorstCaseMs(service), what);
   if (late) return outOfTime({ service, from, to, message: late });
 
   note(`updating ${service.name} ${from ?? 'nothing'} -> ${to}`, 'update');
@@ -915,7 +940,7 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
   // What recovery reads if this run dies part way through (contract section 5.5).
   updateOperation(opId, { from, to });
 
-  if (to && from === to) return alreadyOnTarget(config, service, from, to, { force, opId });
+  if (to && from === to) return alreadyOnTarget(config, service, from, to, { force, opId, budget });
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');

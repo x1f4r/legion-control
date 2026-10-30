@@ -23,6 +23,9 @@ const PREFIX_PROBE_INTERVAL_MS = 10 * 60 * 1000;
 /** How long an install gets, and the version check in front of one that allowlists scripts. */
 export const NPM_INSTALL_MS = 600000;
 export const NPM_VERSION_MS = 20000;
+/** The download ahead of the stop: this many tries, each this long at most. */
+export const WARM_ATTEMPTS = 3;
+export const WARM_ATTEMPT_MS = 180000;
 
 function packageJsonPath(service, prefix) {
   return path.join(globalModulesDir(prefix), service.package, 'package.json');
@@ -250,11 +253,11 @@ export function cachedLatestVersion(service, { timeoutMs = 4000, maxAgeMs = LATE
 }
 
 /** Pre-warm the npm cache so the window with the service stopped stays short. */
-export function warmCache(service, version, attempts = 3) {
+export function warmCache(service, version, attempts = WARM_ATTEMPTS) {
   let last = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     last = runNpm(['cache', 'add', `${service.package}@${version}`], {
-      timeoutMs: 180000,
+      timeoutMs: WARM_ATTEMPT_MS,
       prefix: service.npmPrefix,
     });
     if (last.ok) return { ok: true, attempts: attempt, message: null };

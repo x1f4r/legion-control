@@ -507,15 +507,19 @@ export async function runCycle(config, options = {}) {
         });
         continue;
       }
-      // Whether the cycle still has the time is the update's to decide, at its
-      // drain (update.mjs), and not here before it has looked: a service that
-      // is already current needs none, and deferring it would report it as
-      // waiting when there is nothing to wait for. What it costs is a version
-      // lookup, which leaves nothing down if the scheduler ends the cycle in
-      // the middle of it. The services keep their order whatever an earlier
-      // cycle ran out of time for: `after` is a dependency, and an update that
-      // fails slowly ahead of another, cycle after cycle, says so in its own
-      // record, where a person can see it and update the other by hand.
+      // Whether the cycle still has the time is the update's to decide, once
+      // it knows what there is to do (update.mjs), and not here before it has
+      // looked: a service that is already current needs none, and deferring it
+      // would report it as waiting when there is nothing to wait for. What the
+      // update runs before it decides leaves nothing down if the scheduler
+      // ends the cycle in the middle of it: the start of a service it finds
+      // down and the wait for it to answer, which only put it back; the
+      // version lookup; and the busy check. npm's download, the restart of a
+      // current service that is not answering and the drain all wait for that
+      // decision. The services keep their order whatever an earlier cycle ran
+      // out of time for: `after` is a dependency, and an update that fails
+      // slowly ahead of another, cycle after cycle, says so in its own record,
+      // where a person can see it and update the other by hand.
       lock.phase(`services:${service.id}`);
       const result = await runUpdate(config, service, {
         mode: 'scheduled',
