@@ -131,15 +131,20 @@ public static class Ui
         return button;
     }
 
-    /// A row of buttons, each disabled one followed by why, where it has a reason to give.
+    /// A row of buttons, and why those that are disabled cannot be pressed, where they have a reason
+    /// to give. Buttons that share a reason, as everything an older agent cannot do does, are
+    /// followed by it once, after the last of them; a screen reader is given it on each.
     public static Panel Actions(params Control?[] controls)
     {
         var panel = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
-        foreach (var control in controls)
+        var shown = controls.OfType<Control>().ToList();
+        var last = new Dictionary<string, Control>();
+        foreach (var control in shown)
+            if (Reason(control) is { } reason) last[reason] = control;
+        foreach (var control in shown)
         {
-            if (control is null) continue;
             panel.Children.Add(control);
-            if (control is Button { IsEnabled: false } button && AutomationProperties.GetHelpText(button) is { Length: > 0 } reason)
+            if (Reason(control) is { } reason && last[reason] == control)
             {
                 var note = Note(reason);
                 note.VerticalAlignment = VerticalAlignment.Center;
@@ -150,6 +155,11 @@ public static class Ui
         return panel;
     }
 
+    /// Why a disabled button or menu item cannot be used, when it says.
+    private static string? Reason(Control control) =>
+        control is Button or MenuItem && !control.IsEnabled && AutomationProperties.GetHelpText(control) is { Length: > 0 } reason
+            ? reason : null;
+
     public static StackPanel Column(double spacing = 0) => new()
     {
         Orientation = Orientation.Vertical,
@@ -157,7 +167,8 @@ public static class Ui
     };
 
     /// A menu item. [explanation] is a tooltip while it can be chosen; while it cannot, it is a
-    /// second line of the item, since a disabled item shows no tooltip either.
+    /// second line of the item, since a disabled item shows no tooltip either. [MenuButton] keeps
+    /// that line only under the last of the items in a row that give the same one.
     public static MenuItem MenuAction(string text, Action handler, bool enabled = true, string? explanation = null)
     {
         var item = new MenuItem { Header = text, IsEnabled = enabled };
@@ -186,12 +197,29 @@ public static class Ui
     public static Button MenuButton(string text, IEnumerable<MenuItem> items, string accessibleName)
     {
         var button = Action(text, () => { });
-        button.ContextMenu = new ContextMenu { ItemsSource = items.ToArray() };
+        var shown = items.ToArray();
+        ShareReasons(shown);
+        button.ContextMenu = new ContextMenu { ItemsSource = shown };
         // The menu the button holds when pressed, which a rebuild may have brought up to date.
         button.Click += (_, _) => button.ContextMenu?.Open(button);
         AutomationProperties.SetName(button, accessibleName);
         ToolTip.SetTip(button, accessibleName);
         return button;
+    }
+
+    /// Items next to each other that are disabled for the same reason say it once, under the last
+    /// of them, in this menu and every submenu. Each keeps it for a screen reader.
+    private static void ShareReasons(IEnumerable<object> items)
+    {
+        var list = items.ToList();
+        for (var index = 0; index < list.Count; index++)
+        {
+            if (list[index] is not MenuItem item) continue;
+            if (item.ItemsSource is { } inside) ShareReasons(inside.Cast<object>());
+            if (Reason(item) is { } reason && index + 1 < list.Count && list[index + 1] is MenuItem next && Reason(next) == reason
+                && item.Header is Panel && AutomationProperties.GetName(item) is { } label)
+                item.Header = label;
+        }
     }
 
     /// Runs one thing a person started, to its end, from the window's thread.
