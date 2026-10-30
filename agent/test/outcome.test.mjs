@@ -10,8 +10,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { MUTATING_PHASES, OUTCOMES, producedOutcome } from '../src/contract.mjs';
-import { cli, commandService, fixtureConfig, fixtureData, fresh, withHome, writeConfig } from './helpers.mjs';
+import { ACTIONS, MUTATING_PHASES, OUTCOMES, producedOutcome } from '../src/contract.mjs';
+import { cli, commandService, fixtureConfig, fixtureData, fresh, REPO, withHome, writeConfig } from './helpers.mjs';
 
 test('a producer may lower failed to unknown, and nothing else', () => {
   const failed = { ok: false, action: 'failed', reasonCode: 'internal' };
@@ -166,4 +166,13 @@ test('the reducer copy here and the reference have the same tables', async () =>
   const { OK_REPLY_ACTIONS } = await import('../src/contract.mjs');
   assert.deepEqual(OUTCOMES, [...reference.OUTCOMES]);
   assert.deepEqual([...OK_REPLY_ACTIONS].sort(), [...reference.OK_REPLY_ACTIONS].sort());
+});
+
+test('each kind may report exactly the actions its schema allows', () => {
+  // The table mirrors the schemas, and a value one gains, as boot and sleep
+  // gained interrupted, has to reach both.
+  for (const [kind, actions] of Object.entries(ACTIONS)) {
+    const schema = JSON.parse(fs.readFileSync(path.join(REPO, 'contract', 'schemas', `${kind}.schema.json`), 'utf8'));
+    assert.deepEqual([...actions].sort(), [...schema.properties.action.enum].sort(), kind);
+  }
 });
