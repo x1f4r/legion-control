@@ -99,6 +99,22 @@ object Contract {
         return value
     }
 
+    /**
+     * The same check for a setup id, which has its own grammar: what `--controller-id` takes, at
+     * most 64 characters and no `@`, `/` or `\`. The generic token grammar is wider, and an id that
+     * passes it and not this one is one the agent refuses with `bad-argument` after it was sent.
+     */
+    fun requireSetupId(value: String): String {
+        if (!isSetupId(value)) {
+            throw AgentFailure.BadRequest(
+                "This app will not send that request.",
+                "The setup id \"$value\" is not a valid setup id. Letters, digits and . _ : - only, " +
+                    "starting with a letter or a digit, at most 64 characters.",
+            )
+        }
+        return value
+    }
+
     /** A duration in seconds as the `DUR` form the agent takes, rounded up to whole minutes. */
     fun durationOf(seconds: Long): String = when {
         seconds <= 0L -> "1m"
@@ -321,15 +337,17 @@ enum class OpAction(val wire: String) {
     ;
 
     /**
-     * Whether this action is the end of the story.
+     * Whether this action is the end of the story: whether section 5.6 reduces it to anything but
+     * pending, which is the one outcome a client keeps following.
      *
      * `accepted` and `queued` are not: the work is still to come. `rebooting` and `sleeping` are not
      * either, and that is the correction that matters most here: the machine was told, and being
      * told is not the same as having done it. Only `rebooted` and `slept`, or an observation of the
-     * machine in that state, close a boot or a sleep.
+     * machine in that state, close a boot or a sleep. Read off [Outcome.reduce] rather than kept as
+     * a list of its own, so the two can never disagree about which actions are still running.
      */
     val isSettled: Boolean
-        get() = this !in setOf(ACCEPTED, QUEUED, REBOOTING, SLEEPING, ALREADY_RUNNING)
+        get() = Outcome.reduce(action = wire).isTerminal
 
     /** Whether it ended well. Only meaningful once [isSettled]. */
     val isSuccess: Boolean

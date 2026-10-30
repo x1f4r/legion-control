@@ -1,8 +1,9 @@
 package com.x1f4r.legioncontrol.data
 
 import android.content.Context
-import com.x1f4r.legioncontrol.agent.TrackedState
+import com.x1f4r.legioncontrol.agent.OperationLogLine
 import com.x1f4r.legioncontrol.agent.OperationRecord
+import com.x1f4r.legioncontrol.agent.TrackedState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,8 +22,9 @@ import java.io.File
  * The history is capped. It exists to answer "what happened to the thing I pressed", not to be an
  * audit log, and a phone that has been used for a year should not be carrying a year of it.
  */
-class OperationStore(context: Context) {
-    private val file = File(File(context.applicationContext.filesDir, "operations"), "operations.json")
+class OperationStore(private val file: File) {
+    constructor(context: Context) : this(File(File(context.applicationContext.filesDir, "operations"), "operations.json"))
+
     private val lock = Any()
 
     private val _records = MutableStateFlow(read())
@@ -59,6 +61,40 @@ class OperationStore(context: Context) {
     fun update(id: String, change: (OperationRecord) -> OperationRecord): OperationRecord? {
         val existing = get(id) ?: return null
         return put(change(existing))
+    }
+
+    /**
+     * The unresolved wake holds for [target], oldest first: helper actions run to wake it that were
+     * not a declared `wol` and whose records have not been read finished (contract section 10.2).
+     *
+     * Kept on disk with every other record and never published, so a hold survives the app being
+     * closed and never travels to another device. A machine that leaves the setup takes its records
+     * with it in [retainOnly], which is how a helper leaving releases what it held.
+     */
+    fun wakeHolds(target: String): List<OperationRecord> =
+        _records.value.filter { it.wakeTarget == target && it.holdsWake }.sortedBy { it.startedAt }
+
+    /**
+     * Releases the holds for [target] recorded before [before], with [reason] on each record's log.
+     * Each record keeps its state and is still followed: only the hold goes.
+     */
+    fun releaseWakeHolds(target: String, before: Long, reason: String) = synchronized(lock) {
+        val now = System.currentTimeMillis()
+        var changed = false
+        val updated = _records.value.map { record ->
+            if (record.wakeTarget != target || !record.holdsWake || record.startedAt >= before) {
+                record
+            } else {
+                changed = true
+                record.copy(
+                    wakeReleased = true,
+                    log = (record.log + OperationLogLine(now, reason)).takeLast(MAX_LOG_LINES),
+                )
+            }
+        }
+        if (!changed) return@synchronized
+        _records.value = updated
+        write(updated)
     }
 
     fun clearHistory() = synchronized(lock) {
@@ -109,7 +145,7 @@ class OperationStore(context: Context) {
                 // being sent again, which is the whole point of writing these down. Disconnection
                 // never proves a transition, and neither does the app being killed.
                 if (record.state == TrackedState.DISPATCHED || record.state == TrackedState.REQUESTED) {
-                    record.copy(state = TrackedState.OUTCOME_UNKNOWN, retryable = record.trackable)
+                    record.copy(state = TrackedState.OUTCOME_UNKNOWN, retryable = false)
                 } else {
                     record
                 }
@@ -130,6 +166,9 @@ class OperationStore(context: Context) {
 
     private companion object {
         const val MAX_RECORDS = 80
+
+        /** As many log lines as a record keeps of its own. */
+        const val MAX_LOG_LINES = 200
 
         val Compact = Json { encodeDefaults = true }
 

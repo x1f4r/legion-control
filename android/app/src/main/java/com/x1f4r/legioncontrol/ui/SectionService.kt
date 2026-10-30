@@ -1,6 +1,5 @@
 package com.x1f4r.legioncontrol.ui
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.foundation.layout.Column
@@ -11,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.triStateToggleable
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -21,6 +21,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.agent.BusyStatus
@@ -71,6 +75,7 @@ private fun compactServiceState(model: MachineModel, service: ServiceStatus?): S
     model.currentSystem == null || service == null -> "Unavailable"
     compactActivityState(service.busy) != null -> compactActivityState(service.busy)!!
     service.healthy == false -> "Needs attention"
+    service.process?.isUnknown == true -> "Process unknown"
     service.running == false -> "Stopped"
     service.running == true || service.healthy == true -> "Running"
     else -> "Status unknown"
@@ -395,6 +400,13 @@ private fun RunningVerdict(service: ServiceStatus) {
     val process = service.process
     val health = service.health
     when {
+        // A process probe that failed says nothing about the process (contract section 6), so it is
+        // never drawn as stopped. Whether the service answers is still a fact of its own.
+        process?.isUnknown == true -> StatusLine(
+            Mark.Unknown,
+            if (health?.ok == true) "Answering, but its process could not be read" else "Process could not be read",
+        )
+
         process != null && health != null -> when {
             process.running != true -> StatusLine(Mark.Bad, "Stopped")
             health.ok == true -> StatusLine(Mark.Good, port?.let { "Healthy on port $it" } ?: "Healthy")
@@ -433,7 +445,7 @@ private fun ActivityVerdict(busy: BusyStatus?) {
             "Cannot tell: " + (busy.error ?: "the agent could not read the probe"),
         )
 
-        busy.monitored == false || busy.evidence == "unmonitored" -> StatusLine(Mark.Unknown, "Not monitored")
+        busy.isUnmonitored -> StatusLine(Mark.Unknown, "Not monitored")
 
         busy.isBusy -> StatusLine(Mark.Busy, busy.summary)
         else -> StatusLine(Mark.Idle, "Idle")
@@ -481,22 +493,32 @@ private fun LastUpdateText(last: LastUpdate) {
     }
 }
 
+/**
+ * One system's automatic updates, as one switch.
+ *
+ * The whole row is the control, the name and the line under it included, so a screen reader meets
+ * one element that says what it is, whether it is on, and that it is a switch. The row used to be
+ * pressable and to hold a switch of its own as well: two targets for one decision, the switch
+ * announced without its name and the row without its state.
+ */
 @Composable
 private fun AutoUpdateRow(model: MachineModel, system: MachineSystem, serviceId: String?) {
     val haptics = rememberHaptics()
     val isLive = model.currentSystem?.id == system.id
     val value = model.autoUpdateValue(system)
     val enabled = isLive && !model.isWorking
-
-    fun toggle(to: Boolean) {
-        haptics.tick()
-        model.setAutoUpdate(to, system, serviceId)
-    }
+    val state = autoUpdateState(value)
 
     val row = Modifier
         .fillMaxWidth()
         .defaultMinSize(minHeight = 60.dp)
-        .let { base -> if (enabled) base.clickable { toggle(!(value ?: false)) } else base }
+        .triStateToggleable(state = state, enabled = enabled, role = Role.Switch) {
+            haptics.tick()
+            // Not known turns it on, as a press on the drawn switch, which is off, would.
+            model.setAutoUpdate(state != ToggleableState.On, system, serviceId)
+        }
+        // Said in words, because Android's own word for the third state is about check boxes.
+        .semantics { if (state == ToggleableState.Indeterminate) stateDescription = "Not known" }
         .padding(vertical = 8.dp)
 
     Row(row, verticalAlignment = Alignment.CenterVertically) {
@@ -513,9 +535,18 @@ private fun AutoUpdateRow(model: MachineModel, system: MachineSystem, serviceId:
             QuietText(autoUpdateNote(model, system, isLive, value), Modifier.padding(top = 2.dp))
         }
         Spacer(Modifier.width(12.dp))
-        Switch(checked = value == true, onCheckedChange = { toggle(it) }, enabled = enabled)
+        // Drawn, not pressed: the row takes the press and says the state.
+        Switch(checked = value == true, onCheckedChange = null, enabled = enabled)
     }
 }
+
+/**
+ * What the automatic-update row tells a screen reader its switch is. A setting the machine has not
+ * reported is neither: the drawn switch has no third position and shows off, but announced as off
+ * it would state a value nobody knows.
+ */
+internal fun autoUpdateState(value: Boolean?): ToggleableState =
+    if (value == null) ToggleableState.Indeterminate else ToggleableState(value)
 
 private fun autoUpdateNote(
     model: MachineModel,

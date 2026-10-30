@@ -38,6 +38,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { parseArgs } from './args.mjs';
 import { REASON, TOKEN_PATTERN } from './contract.mjs';
 
 export const MAX_COMMAND_BYTES = 16 * 1024;
@@ -108,11 +109,28 @@ export function parseCommandLine(line) {
   return { ok: true, tokens, error: null };
 }
 
+/**
+ * A path as the file system names it: through symlinks and, on Windows, with
+ * every 8.3 short name (PROGRA~1 for Program Files) written out in full. Node's portable
+ * realpath leaves short names as they are, so the same file reached through a
+ * short name and a long one would compare unequal, and a forced command whose
+ * client sent the other spelling would be refused. The native call asks the
+ * file system for the final name; a drive that cannot answer it gets the
+ * portable one. Either way it throws for a path that does not exist.
+ */
+function realPath(value) {
+  try {
+    return fs.realpathSync.native(value);
+  } catch {
+    return fs.realpathSync(value);
+  }
+}
+
 /** This agent's own entry point, resolved through symlinks. */
 export function ownEntry() {
   const entry = fileURLToPath(new URL('./index.mjs', import.meta.url));
   try {
-    return fs.realpathSync(entry);
+    return realPath(entry);
   } catch {
     return entry;
   }
@@ -121,15 +139,24 @@ export function ownEntry() {
 /** The stable launcher is an alias for routing, never a requested executable. */
 function stableEntryAlias(entry) {
   try {
-    const resolvedEntry = fs.realpathSync(entry);
+    const resolvedEntry = realPath(entry);
     const agent = path.dirname(path.dirname(resolvedEntry));
     if (path.basename(agent) !== 'agent' || path.basename(path.dirname(resolvedEntry)) !== 'src' || path.basename(resolvedEntry) !== 'index.mjs') return null;
     const base = path.dirname(agent);
     const launcher = path.join(base, 'bin', 'launcher.mjs');
     if (!fs.lstatSync(launcher).isFile()) return null;
-    const resolved = fs.realpathSync(launcher);
+    const resolved = realPath(launcher);
     return path.dirname(resolved) === path.join(base, 'bin') ? resolved : null;
   } catch { return null; }
+}
+
+/**
+ * Whether this process answers a restricted key. The forced command sets it,
+ * and `dispatch` sets it again before running what it authorized, so every
+ * module asks here rather than reading the environment its own way.
+ */
+export function isRestrictedSession() {
+  return process.env.LEGIONCTL_RESTRICTED === '1';
 }
 
 /**
@@ -144,6 +171,10 @@ function stableEntryAlias(entry) {
  * whose provenance is a path this same session chose. So is `--allow-downgrade`:
  * a restricted key only ever moves the agent forward, or back to a signed agent
  * at or above the version floor (contract section 13).
+ *
+ * `config set` is further limited in controller.mjs: a restricted session
+ * cannot publish a launch value the machine does not hold, or replace a copy
+ * it cannot read. The dispatcher never sees stdin.
  */
 export const RESTRICTED_COMMANDS = new Set([
   'status',
@@ -168,20 +199,23 @@ export const RESTRICTED_COMMANDS = new Set([
   'help',
 ]);
 
-/** What a restricted session may never do, whatever the flags say. */
-function refuseRestrictedShape(command, rest) {
+/**
+ * What a restricted session may never do, whatever the flags say.
+ *
+ * `parsed` is the argv after the command, read by the CLI's own parser, so
+ * this judges exactly what the CLI will act on: `--install`, `--install=1`
+ * and `--install=` are all the same request to it, and so they are here.
+ */
+function refuseRestrictedShape(command, parsed) {
+  const has = (name) => parsed.flags.has(name) || parsed.options.has(name);
   if (command === 'dispatch') return 'dispatch cannot dispatch itself';
   if (command === 'self-update') {
-    if (rest.includes('--install')) return 'self-update --install runs a tree this session provided, so it is not available to a restricted key';
-    if (rest.some((token) => token === '--from' || token.startsWith('--from='))) {
-      return 'self-update --from runs a tree from a path this session chose; a restricted key uploads with --stdin instead';
-    }
-    if (rest.some((token) => token === '--allow-downgrade' || token.startsWith('--allow-downgrade='))) {
+    if (has('install')) return 'self-update --install runs a tree this session provided, so it is not available to a restricted key';
+    if (has('from')) return 'self-update --from runs a tree from a path this session chose; a restricted key uploads with --stdin instead';
+    if (has('allow-downgrade')) {
       return 'self-update --allow-downgrade takes the agent below the installed one or the version floor, which only an unrestricted session may decide';
     }
-    if (!rest.includes('--stdin') && !rest.includes('--check') && !rest.includes('--rollback')) {
-      return 'self-update from a restricted key needs --stdin, --check or --rollback';
-    }
+    if (!has('stdin') && !has('check') && !has('rollback')) return 'self-update from a restricted key needs --stdin, --check or --rollback';
   }
   return null;
 }
@@ -238,7 +272,7 @@ export function authorize(commandLine, { entry = ownEntry() } = {}) {
   const interpreter = tokens[0];
   const resolve = (value) => {
     try {
-      return fs.realpathSync(value);
+      return realPath(value);
     } catch {
       return path.resolve(value);
     }
@@ -256,11 +290,19 @@ export function authorize(commandLine, { entry = ownEntry() } = {}) {
   // prefix is validated and discarded; it is never imported or executed.
   let requested;
   try {
-    requested = fs.realpathSync(tokens[1]);
+    requested = realPath(tokens[1]);
   } catch {
     requested = path.resolve(tokens[1]);
   }
-  if (requested !== entry && requested !== stableEntryAlias(entry)) {
+  // The entry it is compared with is named the same way, whatever spelling the
+  // caller handed in.
+  let named;
+  try {
+    named = realPath(entry);
+  } catch {
+    named = entry;
+  }
+  if (requested !== named && requested !== stableEntryAlias(entry)) {
     return refuse(`this key may only run ${entry}, and ${JSON.stringify(tokens[1])} is not it`, tokens[1]);
   }
 
@@ -272,8 +314,7 @@ export function authorize(commandLine, { entry = ownEntry() } = {}) {
     );
   }
 
-  const rest = tokens.slice(3);
-  const shapeProblem = refuseRestrictedShape(command, rest);
+  const shapeProblem = refuseRestrictedShape(command, parseArgs(tokens.slice(3)));
   if (shapeProblem) return refuse(shapeProblem, command);
 
   return { ok: true, argv: tokens.slice(2), command, reasonCode: null, message: null };

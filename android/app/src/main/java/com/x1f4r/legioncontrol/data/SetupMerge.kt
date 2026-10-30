@@ -4,284 +4,531 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
 
 /**
- * Taking two versions of a setup apart into pieces somebody can choose between.
+ * Taking two versions of a setup apart into pieces somebody can choose between, and putting one
+ * document back together from the choices (contract section 9.8).
  *
  * The diff is per machine, per address, per system, per wake block and per site rather than per
- * line. That granularity is the point: a JSON diff would show
- * a person forty changed lines when what actually happened is "they renamed the tower and I added an
- * address to the Pi", and those two edits do not conflict at all.
+ * line. That granularity is the point: a JSON diff would show a person forty changed lines when what
+ * actually happened is "they renamed the tower and I added an address to the Pi", and those two
+ * edits do not conflict at all.
  *
- * Everything here works on the raw tree, so a key this build has never heard of travels with the
- * entry it belongs to instead of being dropped.
+ * This used to lose things. A deletion beat an edit without a question, an endpoint without an id
+ * vanished, an unknown key at the top of the document was kept from this side only, and every merged
+ * list was rebuilt in a new order (C6). Now a deletion against an edit is a question like any other
+ * change both sides made, the id-less endpoints are one entry, every unknown key is an entry of its
+ * own or travels with the part that holds it, and the result starts from this device's document and
+ * changes only what was taken from the other side, in place, with every number spelled as it was.
+ *
+ * A port of `entries`, `differences`, `merge`, `commonBase` and `mergedLineage` in
+ * `contract/tools/setup-sync.mjs`, held to `contract/vectors/setup-merge.json`.
  */
 object SetupMerge {
 
-    /** One thing that can be chosen independently of the others. */
-    data class Entry(
-        val path: String,
-        /** What to call it on screen. */
-        val label: String,
-        val value: JsonElement?,
-    )
+    /** The longest lineage a document carries (section 9.3). */
+    private const val LINEAGE_CAP = MAX_LINEAGE
 
-    /** How one entry differs between two documents. */
-    data class Difference(
-        val path: String,
-        val label: String,
-        val mine: JsonElement?,
-        val theirs: JsonElement?,
-        val base: JsonElement?,
-        /**
-         * Whether there is a common ancestor to compare against at all.
-         *
-         * Kept apart from `base != null`, because those are two different facts: a base document
-         * that simply does not contain this entry is exactly the case of an entry one side added,
-         * and treating it as "no base" would turn every addition into a question.
-         */
-        val hasBase: Boolean,
-    ) {
-        val onlyIChanged: Boolean get() = hasBase && theirs == base && mine != base
-        val onlyTheyChanged: Boolean get() = hasBase && mine == base && theirs != base
+    /** Which side changed an entry the two disagree about. */
+    enum class Kind(val wire: String) {
+        /** There is a base and theirs still has it as the base had it: take mine. */
+        MINE("mine"),
 
-        /** Both sides moved it, so nobody but a person can say which is right. */
-        val bothChanged: Boolean get() = !onlyIChanged && !onlyTheyChanged
+        /** There is a base and mine still has it as the base had it: take theirs. */
+        THEIRS("theirs"),
 
-        val summary: String
-            get() = when {
-                mine == null -> "only on the other side"
-                theirs == null -> "only here"
-                onlyIChanged -> "changed here"
-                onlyTheyChanged -> "changed on the other side"
-                else -> "changed on both sides"
-            }
+        /** Both changed it since the base, a deletion against an edit included. */
+        BOTH("both"),
+
+        /** There is no base, so nothing says who changed what. */
+        NO_BASE("noBase"),
     }
 
     /** Which side to take for one entry. */
     enum class Choice { MINE, THEIRS }
 
+    /** One entry the two sides disagree about, with both values, absent being null. */
+    data class Difference(
+        /** The entry's key, `machines[tower].endpoints[lan]`, which is also what a choice names. */
+        val entry: String,
+        val kind: Kind,
+        val mine: SetupJson?,
+        val theirs: SetupJson?,
+        /** What to call it on screen. */
+        val label: String,
+    ) {
+        /** Answered without a question: only one side touched it. */
+        val settles: Boolean get() = kind == Kind.MINE || kind == Kind.THEIRS
+
+        /** The side taken when nobody chooses: `both` and `noBase` are preselected theirs and shown. */
+        val defaultChoice: Choice get() = if (kind == Kind.MINE) Choice.MINE else Choice.THEIRS
+
+        val summary: String
+            get() = when {
+                mine == null && kind == Kind.BOTH -> "removed here and changed on the other side"
+                theirs == null && kind == Kind.BOTH -> "changed here and removed on the other side"
+                mine == null -> "only on the other side"
+                theirs == null -> "only here"
+                kind == Kind.MINE -> "changed here"
+                kind == Kind.THEIRS -> "changed on the other side"
+                kind == Kind.BOTH -> "changed on both sides"
+                else -> "different on the two sides"
+            }
+    }
+
+    /** Who writes the merged revision: their `source`, `device` and the time, as `updatedAt`. */
+    data class Writer(val source: String, val device: String, val now: String)
+
     /**
-     * The pieces of one document, keyed by a stable path.
-     *
-     * `machines[x].info` is the machine's own scalar fields with its three lists taken out, so
-     * renaming a machine and adding an address to it are two separate decisions.
+     * What a merge made: every difference, and the merged text, or the first rule of section 9.7 the
+     * result breaks, in which case nothing is to be written.
      */
-    fun entriesOf(root: JsonObject): Map<String, Entry> = buildMap {
-        (root["appUpdates"] as? JsonObject)?.let {
-            put("appUpdates", Entry("appUpdates", "App updates", it))
-        }
-        for (site in root.objects("sites")) {
-            val id = site.text("id") ?: continue
-            val name = site.text("name") ?: id
-            put("sites[$id]", Entry("sites[$id]", "Site $name", site))
-        }
-        for (machine in root.objects("machines")) {
-            val id = machine.text("id") ?: continue
-            val name = machine.text("name") ?: id
-            val info = JsonObject(machine - "endpoints" - "systems" - "wake")
-            put("machines[$id].info", Entry("machines[$id].info", "$name", info))
-            (machine["wake"] as? JsonObject)?.let {
-                put("machines[$id].wake", Entry("machines[$id].wake", "$name, waking", it))
-            }
-            for (endpoint in machine.objects("endpoints")) {
-                val eid = endpoint.text("id") ?: continue
-                val label = endpoint.text("label") ?: eid
-                put(
-                    "machines[$id].endpoints[$eid]",
-                    Entry("machines[$id].endpoints[$eid]", "$name, address $label", endpoint),
-                )
-            }
-            for (system in machine.objects("systems")) {
-                val sid = system.text("id") ?: continue
-                val label = system.text("name") ?: sid
-                put(
-                    "machines[$id].systems[$sid]",
-                    Entry("machines[$id].systems[$sid]", "$name, system $label", system),
-                )
-            }
-        }
+    data class Outcome(val differences: List<Difference>, val resultText: String?, val error: String?)
+
+    /**
+     * A side that cannot be merged: theirs or the base fails peer intake, or mine has an error that
+     * leaves its entries undefined. Take theirs still works; Merge and Keep mine wait until it is
+     * fixed.
+     */
+    class Unmergeable(message: String) : IllegalArgumentException(message)
+
+    /**
+     * The section 9.7 errors mine may carry into a merge. Each is about how parts that are well
+     * formed on their own refer to each other, a site or a helper that names nothing, a helper that
+     * is its own, a loop, an alias that disagrees, and the result is checked like any other, so
+     * taking theirs' side of the part at fault repairs it. Every other error leaves no single answer
+     * to what the document's entries are.
+     */
+    val MERGEABLE_ERRORS: Set<String> = setOf("unknown-site", "helper-self", "helper-unknown", "helper-alias", "helper-cycle")
+
+    /** The controller keys that are identity, which a merge writes itself and never offers as entries. */
+    private val IDENTITY_KEYS = setOf("id", "revision", "updatedAt", "source", "device", "lineage")
+
+    /** The top-level keys whose contents are entries of their own. */
+    private val STRUCTURE_KEYS = setOf("controller", "machines", "sites")
+
+    /** The members of a machine that are entries of their own when both sides have the machine. */
+    private val MACHINE_PARTS = setOf("endpoints", "systems", "wake")
+
+    /** How the keys of the other entries begin, and the quote that marks a top-level key written in quotes. */
+    private val QUOTED_BEGINNINGS = listOf("\"", "controller.", "sites[", "machines[")
+
+    /**
+     * The entry key of a top-level member: its name, unless it begins the way another entry's key
+     * does. Then it is written inside double quotes with nothing escaped, and so is a name that
+     * already begins with a quote, which keeps the quoting reversible. Without it, a peer document
+     * with a member called `sites[home]` beside a site `home` would give one key to two entries.
+     */
+    fun topLevelKey(name: String): String =
+        if (QUOTED_BEGINNINGS.any { name.startsWith(it) }) "\"$name\"" else name
+
+    /**
+     * Whether mine can take part in Merge or Keep mine at all: null when it can, or why not. A text
+     * that only breaks the rules [MERGEABLE_ERRORS] names still merges.
+     */
+    fun mineBlocks(mineText: String): String? = try {
+        intake(mineText, Side.MINE)
+        null
+    } catch (refused: Unmergeable) {
+        refused.message
+    }
+
+    /** Every difference between mine and theirs, in code-point order of the key. */
+    fun differences(mineText: String, theirsText: String, baseText: String?): List<Difference> {
+        val mine = intake(mineText, Side.MINE)
+        val theirs = intake(theirsText, Side.THEIRS)
+        val base = baseText?.let { intake(it, Side.BASE) }
+        return differing(mine, theirs, base).map { it.difference }
     }
 
     /**
-     * Every entry the two sides disagree about.
-     *
-     * [base] is the newest common ancestor when one is available, which is what turns "both
-     * documents differ" into "they changed this and I changed that". Without it every difference is
-     * a two-way choice, which is worse but still correct.
+     * What an edit in progress changed, entry by entry, as differences of [after] (mine) from
+     * [before] (theirs) with no base. Neither is held to section 9.7, because an edit is checked
+     * when it is applied; a document whose entries are not well defined yet lists nothing.
      */
-    fun differences(mine: JsonObject, theirs: JsonObject, base: JsonObject?): List<Difference> {
-        val a = entriesOf(mine)
-        val b = entriesOf(theirs)
-        val c = base?.let { entriesOf(it) }
-        return (a.keys + b.keys).sorted().mapNotNull { path ->
-            val left = a[path]?.value
-            val right = b[path]?.value
-            if (left == right) return@mapNotNull null
-            Difference(
-                path = path,
-                label = a[path]?.label ?: b[path]?.label ?: path,
-                mine = left,
-                theirs = right,
-                // Absent from the base is a real answer: it means whoever has it now added it.
-                base = c?.get(path)?.value,
-                hasBase = c != null,
-            )
-        }
+    fun changesBetween(before: JsonObject, after: JsonObject): List<Difference> = try {
+        differing(SetupJson.of(after) as SetupJson.Object, SetupJson.of(before) as SetupJson.Object, null).map { it.difference }
+    } catch (_: IllegalStateException) {
+        emptyList()
     }
 
     /**
-     * The default answer for each difference.
+     * Merges two documents.
      *
-     * An entry only one side touched takes that side, which is the whole reason a base is worth
-     * having: two people editing different machines merge with nothing to decide. An entry both
-     * sides touched defaults to theirs and is listed for a choice.
-     */
-    fun defaults(differences: List<Difference>): Map<String, Choice> =
-        differences.associate { difference ->
-            difference.path to when {
-                difference.onlyIChanged -> Choice.MINE
-                else -> Choice.THEIRS
-            }
-        }
-
-    /** Whether a difference needs somebody to look at it, or merges on its own. */
-    fun needsDecision(differences: List<Difference>): List<Difference> =
-        differences.filter { it.bothChanged }
-
-    /**
-     * One document out of two, plus a decision per differing entry.
+     * [choices] maps an entry key to a side. An entry it does not name takes the side its kind says,
+     * so `both` and `noBase` are theirs; Keep mine is every entry answered [Choice.MINE]. The result
+     * starts from mine: every entry taken from theirs is removed where theirs lacks it and replaced in
+     * place where both have it, then theirs' arrays are walked to insert what theirs adds. The
+     * identity is mine's id, one more than the higher revision, the merged lineage, and the writer's
+     * `updatedAt`, `source` and `device`. The result is held to section 9.7 under peer intake, and one
+     * it refuses is not written: [Outcome.error] is the first of its error codes in code-point order.
      *
-     * Built by starting from [mine] and applying only the entries chosen from [theirs], so every key
-     * this build does not understand survives on whichever side it came from.
+     * Throws [Unmergeable] when a side cannot be merged at all.
      */
     fun merge(
-        mine: JsonObject,
-        theirs: JsonObject,
-        choices: Map<String, Choice>,
-    ): JsonObject {
-        val theirEntries = entriesOf(theirs)
-        val myEntries = entriesOf(mine)
-        var result = mine
-
-        // Top-level pieces first.
-        choices.forEach { (path, choice) ->
-            if (path == "appUpdates") {
-                val value = if (choice == Choice.THEIRS) theirEntries[path]?.value else myEntries[path]?.value
-                result = if (value == null) JsonObject(result - "appUpdates") else JsonObject(result + ("appUpdates" to value))
-            }
+        baseText: String?,
+        mineText: String,
+        theirsText: String,
+        mineHash: String,
+        theirsHash: String,
+        writer: Writer,
+        choices: Map<String, Choice> = emptyMap(),
+    ): Outcome {
+        val mine = intake(mineText, Side.MINE)
+        val theirs = intake(theirsText, Side.THEIRS)
+        val base = baseText?.let { intake(it, Side.BASE) }
+        if ((mine.obj("controller")?.get("id")) !is SetupJson.Text) {
+            throw Unmergeable("This device's setup has no setup id yet; it gets one before it takes part in a merge.")
         }
 
-        result = mergeList(
-            root = result,
-            key = "sites",
-            mine = mine,
-            theirs = theirs,
-            choices = choices,
-            pathOf = { id -> "sites[$id]" },
+        val found = differing(mine, theirs, base)
+        val taken = found
+            .filter { (choices[it.difference.entry] ?: it.difference.defaultChoice) == Choice.THEIRS }
+            .map { it.difference.entry }
+            .toSet()
+
+        val result = mine.copy() as SetupJson.Object
+        for (difference in found) if (difference.difference.entry in taken) takeTheirs(result, difference)
+
+        walkTheirs(result, "sites", theirs["sites"], { id -> "sites[$id]" }, taken)
+        walkTheirs(result, "machines", theirs["machines"], { id -> "machines[$id]" }, taken)
+        val paired = pairedMachines(mine, theirs)
+        for (machine in objectsOf(theirs["machines"])) {
+            val id = idOf(machine) ?: continue
+            if (id !in paired) continue
+            val at = "machines[$id]"
+            val holder = machineIn(result, id) ?: continue
+            walkTheirs(holder, "systems", machine["systems"], { system -> "$at.systems[$system]" }, taken)
+            walkTheirs(holder, "endpoints", machine["endpoints"], { endpoint -> "$at.endpoints[${endpoint.orEmpty()}]" }, taken)
+        }
+
+        // The identity. Mine's id stays where it is; the rest is written in place, or appended in
+        // this order when mine's block lacks it.
+        val block = result.obj("controller")!!
+        val higher = maxOf(revisionOf(mine), revisionOf(theirs))
+        block["revision"] = SetupJson.Number((higher + java.math.BigInteger.ONE).toString())
+        block["updatedAt"] = SetupJson.Text(writer.now)
+        block["source"] = SetupJson.Text(writer.source)
+        block["device"] = SetupJson.Text(writer.device)
+        block["lineage"] = SetupJson.Array(
+            mergedLineage(mineHash, theirsHash, lineageOf(mine), lineageOf(theirs)).mapTo(mutableListOf()) { SetupJson.Text(it) },
         )
 
-        result = mergeMachines(result, mine, theirs, choices)
-        return result
-    }
-
-    private fun mergeList(
-        root: JsonObject,
-        key: String,
-        mine: JsonObject,
-        theirs: JsonObject,
-        choices: Map<String, Choice>,
-        pathOf: (String) -> String,
-    ): JsonObject {
-        val myById = mine.objects(key).mapNotNull { obj -> obj.text("id")?.let { it to obj } }.toMap()
-        val theirById = theirs.objects(key).mapNotNull { obj -> obj.text("id")?.let { it to obj } }.toMap()
-        val order = (mine.objects(key).mapNotNull { it.text("id") } +
-            theirs.objects(key).mapNotNull { it.text("id") }).distinct()
-
-        val merged = order.mapNotNull { id ->
-            when (choices[pathOf(id)]) {
-                Choice.THEIRS -> theirById[id]
-                Choice.MINE -> myById[id]
-                null -> myById[id] ?: theirById[id]
-            }
-        }
-        if (merged.isEmpty() && root[key] == null) return root
-        return JsonObject(root + (key to JsonArray(merged)))
-    }
-
-    private fun mergeMachines(
-        root: JsonObject,
-        mine: JsonObject,
-        theirs: JsonObject,
-        choices: Map<String, Choice>,
-    ): JsonObject {
-        val myById = mine.objects("machines").mapNotNull { obj -> obj.text("id")?.let { it to obj } }.toMap()
-        val theirById = theirs.objects("machines").mapNotNull { obj -> obj.text("id")?.let { it to obj } }.toMap()
-        val order = (mine.objects("machines").mapNotNull { it.text("id") } +
-            theirs.objects("machines").mapNotNull { it.text("id") }).distinct()
-
-        val merged = order.mapNotNull { id ->
-            val a = myById[id]
-            val b = theirById[id]
-
-            // The machine's own fields decide whether the machine exists at all: a machine only one
-            // side has is an added or a removed machine, and the choice for its info entry is the
-            // choice about the machine.
-            val info = when (choices["machines[$id].info"]) {
-                Choice.THEIRS -> b?.let { JsonObject(it - "endpoints" - "systems" - "wake") }
-                Choice.MINE -> a?.let { JsonObject(it - "endpoints" - "systems" - "wake") }
-                null -> (a ?: b)?.let { JsonObject(it - "endpoints" - "systems" - "wake") }
-            } ?: return@mapNotNull null
-
-            val wake = when (choices["machines[$id].wake"]) {
-                Choice.THEIRS -> b?.get("wake")
-                Choice.MINE -> a?.get("wake")
-                null -> a?.get("wake") ?: b?.get("wake")
-            }
-
-            val endpoints = mergeChildren(a, b, "endpoints", choices) { eid -> "machines[$id].endpoints[$eid]" }
-            val systems = mergeChildren(a, b, "systems", choices) { sid -> "machines[$id].systems[$sid]" }
-
-            buildJsonObject {
-                info.forEach { (key, value) -> put(key, value) }
-                put("endpoints", JsonArray(endpoints))
-                put("systems", JsonArray(systems))
-                if (wake != null) put("wake", wake)
-            }
-        }
-        return JsonObject(root + ("machines" to JsonArray(merged)))
-    }
-
-    private fun mergeChildren(
-        mine: JsonObject?,
-        theirs: JsonObject?,
-        key: String,
-        choices: Map<String, Choice>,
-        pathOf: (String) -> String,
-    ): List<JsonObject> {
-        val myById = mine?.objects(key).orEmpty().mapNotNull { obj -> obj.text("id")?.let { it to obj } }.toMap()
-        val theirById = theirs?.objects(key).orEmpty().mapNotNull { obj -> obj.text("id")?.let { it to obj } }.toMap()
-        val order = (mine?.objects(key).orEmpty().mapNotNull { it.text("id") } +
-            theirs?.objects(key).orEmpty().mapNotNull { it.text("id") }).distinct()
-        return order.mapNotNull { id ->
-            when (choices[pathOf(id)]) {
-                Choice.THEIRS -> theirById[id]
-                Choice.MINE -> myById[id]
-                null -> myById[id] ?: theirById[id]
-            }
-        }
+        val text = result.print()
+        val verdict = DocumentAcceptance.check(text, Intake.PEER)
+        val error = verdict.errors.map { it.code }.distinct().sortedWith(::compareCodePoints).firstOrNull()
+        return Outcome(found.map { it.difference }, if (verdict.valid) text else null, error)
     }
 
     /**
-     * The newest hash both sides descend from, or null.
-     *
-     * Newest first in my own ancestry, so the first of mine that they also know is the closest
-     * common point and therefore the most useful base.
+     * The base of a merge: the first hash of mine's lineage, newest first, that is also in theirs'
+     * lineage, whose kept bytes still hash to it and which peer intake accepts; null when there is
+     * none. A kept revision this build refuses, kept by an older one, is skipped like one that is
+     * not kept (section 9.8). The heads themselves are never a base: a merge whose base was one side
+     * would only ever take the other side.
      */
-    fun commonBase(myLineage: List<String>, theirLineage: List<String>): String? {
-        val theirs = theirLineage.toSet()
-        return myLineage.firstOrNull { it in theirs }
+    fun commonBase(
+        mineHash: String?,
+        theirsHash: String?,
+        mineLineage: List<String>,
+        theirsLineage: List<String>,
+        kept: (String) -> String?,
+    ): String? {
+        for (hash in mineLineage) {
+            if (hash == mineHash || hash == theirsHash || hash !in theirsLineage) continue
+            val text = kept(hash) ?: continue
+            if (CanonicalSetup.hashOf(text) == hash && DocumentAcceptance.check(text, Intake.PEER).errors.isEmpty()) return hash
+        }
+        return null
+    }
+
+    /**
+     * The lineage of a merge result: mine's hash, theirs' hash, then the two lineages interleaved,
+     * mine first, each hash once, cut at 32. Both heads are in it, so both branches fast-forward onto
+     * the result.
+     */
+    fun mergedLineage(mineHash: String?, theirsHash: String?, mineLineage: List<String>, theirsLineage: List<String>): List<String> {
+        val lineage = mutableListOf<String>()
+        fun add(hash: String?) {
+            if (hash != null && hash !in lineage) lineage += hash
+        }
+        add(mineHash)
+        add(theirsHash)
+        for (index in 0 until maxOf(mineLineage.size, theirsLineage.size)) {
+            if (index < mineLineage.size) add(mineLineage[index])
+            if (index < theirsLineage.size) add(theirsLineage[index])
+        }
+        return lineage.take(LINEAGE_CAP)
+    }
+
+    /**
+     * Strings in code-point order. Kotlin's own string order compares UTF-16 units, which puts
+     * U+FFFD after U+1F600; differences are listed in the same order on every platform.
+     */
+    fun compareCodePoints(a: String, b: String): Int {
+        var i = 0
+        var j = 0
+        while (i < a.length && j < b.length) {
+            val x = a.codePointAt(i)
+            val y = b.codePointAt(j)
+            if (x != y) return x.compareTo(y)
+            i += Character.charCount(x)
+            j += Character.charCount(y)
+        }
+        return a.codePointCount(i, a.length) - b.codePointCount(j, b.length)
+    }
+
+    // MARK: - Sides
+
+    private enum class Side { MINE, THEIRS, BASE }
+
+    /**
+     * One side, parsed. Theirs and the base are held to peer intake, as everything read from a
+     * machine or kept is. Mine is the applied document, held to applied intake, and may only break
+     * the rules [MERGEABLE_ERRORS] names.
+     */
+    private fun intake(text: String, side: Side): SetupJson.Object {
+        val verdict = DocumentAcceptance.check(text, if (side == Side.MINE) Intake.APPLIED else Intake.PEER)
+        val blocking = verdict.errors.filter { side != Side.MINE || it.code !in MERGEABLE_ERRORS }
+        if (blocking.isNotEmpty() || verdict.document == null) {
+            val first = blocking.firstOrNull()?.message ?: "it is not a setup"
+            throw Unmergeable(
+                when (side) {
+                    Side.MINE -> "This device's setup has an error that has to be fixed in the editor before it can be merged: $first"
+                    Side.THEIRS -> "The other copy breaks a rule every client holds a setup to, so it cannot be merged: $first"
+                    Side.BASE -> "The revision both were made from breaks a rule every client holds a setup to: $first"
+                },
+            )
+        }
+        return SetupJsonParser.parse(CanonicalSetup.canonicalText(text)) as SetupJson.Object
+    }
+
+    // MARK: - Entries
+
+    /** Where an entry lives in a document, so it can be taken from theirs. */
+    private sealed interface Place {
+        data class Top(val name: String) : Place
+        data class Controller(val name: String) : Place
+        data class Site(val id: String) : Place
+        data class Machine(val id: String) : Place
+        data class Fields(val machine: String) : Place
+        data class Wake(val machine: String) : Place
+        data class System(val machine: String, val id: String) : Place
+        data class Endpoint(val machine: String, val id: String) : Place
+        data class Idless(val machine: String) : Place
+    }
+
+    private class Entry(val place: Place, val value: SetupJson, val label: String)
+
+    private class Found(val difference: Difference, val place: Place)
+
+    /**
+     * One document's entries by key. Keys are unique in every document a merge takes: section 9.7
+     * refuses two machines, two sites, or two systems or endpoints of one machine with one id, and
+     * [topLevelKey] keeps unknown names apart from the rest. So a second entry under one key is a
+     * bug, and it throws rather than merge one of the two.
+     */
+    private fun entryMap(document: SetupJson.Object, paired: Set<String>): Map<String, Entry> {
+        val map = linkedMapOf<String, Entry>()
+        fun add(key: String, entry: Entry) {
+            check(key !in map) { "two entries of one document are both called $key" }
+            map[key] = entry
+        }
+        for ((name, value) in document.members) {
+            if (name !in STRUCTURE_KEYS) add(topLevelKey(name), Entry(Place.Top(name), value, labelForTop(name)))
+        }
+        document.obj("controller")?.let { controller ->
+            for ((name, value) in controller.members) {
+                if (name !in IDENTITY_KEYS) add("controller.$name", Entry(Place.Controller(name), value, "The setup's $name"))
+            }
+        }
+        for (site in objectsOf(document["sites"])) {
+            val id = idOf(site) ?: continue
+            add("sites[$id]", Entry(Place.Site(id), site, "Site ${nameOf(site) ?: id}"))
+        }
+        for (machine in objectsOf(document["machines"])) {
+            val id = idOf(machine) ?: continue
+            val name = nameOf(machine) ?: id
+            val at = "machines[$id]"
+            if (id !in paired) {
+                add(at, Entry(Place.Machine(id), machine, name))
+                continue
+            }
+            val fields = SetupJson.Object(machine.members.filterTo(mutableListOf()) { it.first !in MACHINE_PARTS })
+            add("$at.fields", Entry(Place.Fields(id), fields, name))
+            machine["wake"]?.let { add("$at.wake", Entry(Place.Wake(id), it, "$name, waking")) }
+            for (system in objectsOf(machine["systems"])) {
+                val systemId = idOf(system) ?: continue
+                add("$at.systems[$systemId]", Entry(Place.System(id, systemId), system, "$name, system ${nameOf(system) ?: systemId}"))
+            }
+            // Endpoints without an id cannot be told apart, so together, in order, they are one
+            // entry. None at all is absent.
+            val idless = mutableListOf<SetupJson>()
+            for (endpoint in objectsOf(machine["endpoints"])) {
+                val endpointId = idOf(endpoint)
+                if (endpointId == null) {
+                    idless += endpoint
+                } else {
+                    val label = (endpoint["label"] as? SetupJson.Text)?.value ?: endpointId
+                    add("$at.endpoints[$endpointId]", Entry(Place.Endpoint(id, endpointId), endpoint, "$name, address $label"))
+                }
+            }
+            if (idless.isNotEmpty()) {
+                add("$at.endpoints[]", Entry(Place.Idless(id), SetupJson.Array(idless), "$name, addresses without an id"))
+            }
+        }
+        return map
+    }
+
+    private fun machineIds(document: SetupJson.Object): Set<String> = objectsOf(document["machines"]).mapNotNull(::idOf).toSet()
+
+    /** The ids of the machines both documents have, which merge part by part. */
+    private fun pairedMachines(mine: SetupJson.Object, theirs: SetupJson.Object): Set<String> =
+        machineIds(mine) intersect machineIds(theirs)
+
+    /**
+     * Every entry where mine and theirs differ, in code-point order of its key, with its kind: with a
+     * base, the side that left the entry as the base had it did not change it, so the other side's
+     * value is taken; when both changed it, a deletion against an edit included, it is `both`.
+     */
+    private fun differing(mine: SetupJson.Object, theirs: SetupJson.Object, base: SetupJson.Object?): List<Found> {
+        val paired = pairedMachines(mine, theirs)
+        val ofMine = entryMap(mine, paired)
+        val ofTheirs = entryMap(theirs, paired)
+        val ofBase = base?.let { entryMap(it, paired) }.orEmpty()
+        val keys = (ofMine.keys + ofTheirs.keys).distinct().sortedWith(::compareCodePoints)
+        return keys.mapNotNull { key ->
+            val left = ofMine[key]
+            val right = ofTheirs[key]
+            if (JsonEquality.equal(left?.value, right?.value)) return@mapNotNull null
+            val baseValue = ofBase[key]?.value
+            val kind = when {
+                base == null -> Kind.NO_BASE
+                JsonEquality.equal(right?.value, baseValue) -> Kind.MINE
+                JsonEquality.equal(left?.value, baseValue) -> Kind.THEIRS
+                else -> Kind.BOTH
+            }
+            val entry = left ?: right!!
+            Found(Difference(key, kind, left?.value, right?.value, entry.label), entry.place)
+        }
+    }
+
+    // MARK: - Building the result
+
+    /** Take one entry from theirs: remove what theirs lacks, replace in place what both have. Insertions come later. */
+    private fun takeTheirs(result: SetupJson.Object, found: Found) {
+        val theirs = found.difference.theirs
+        fun setOrRemove(holder: SetupJson.Object?, name: String) {
+            if (holder == null) return
+            if (theirs == null) holder.remove(name) else holder[name] = theirs.copy()
+        }
+        when (val place = found.place) {
+            is Place.Top -> setOrRemove(result, place.name)
+            is Place.Controller -> setOrRemove(result.obj("controller"), place.name)
+            is Place.Site -> replaceById(result["sites"], place.id, theirs)
+            is Place.Machine -> replaceById(result["machines"], place.id, theirs)
+            is Place.Fields -> {
+                // The machine's own members, other than its parts, become theirs: each where mine has
+                // it, gone where theirs lacks it, appended where it is new.
+                val machine = machineIn(result, place.machine) ?: return
+                val fields = theirs as SetupJson.Object
+                val kept = machine.members
+                    .filter { (name, _) -> name in MACHINE_PARTS || fields.has(name) }
+                    .map { (name, value) -> if (name in MACHINE_PARTS) name to value else name to fields[name]!!.copy() }
+                machine.members.clear()
+                machine.members += kept
+                for ((name, value) in fields.members) if (!machine.has(name)) machine.members += name to value.copy()
+            }
+
+            is Place.Wake -> setOrRemove(machineIn(result, place.machine), "wake")
+            is Place.System -> replaceById(machineIn(result, place.machine)?.get("systems"), place.id, theirs)
+            is Place.Endpoint -> replaceById(machineIn(result, place.machine)?.get("endpoints"), place.id, theirs)
+            is Place.Idless -> {
+                val endpoints = machineIn(result, place.machine)?.get("endpoints") as? SetupJson.Array
+                endpoints?.items?.removeAll { idOf(it) == null }
+            }
+        }
+    }
+
+    /** In an array of objects keyed by id: remove the element (value null) or replace it where it stands. */
+    private fun replaceById(array: SetupJson?, id: String, value: SetupJson?) {
+        val items = (array as? SetupJson.Array)?.items ?: return
+        val index = items.indexOfFirst { idOf(it) == id }
+        if (index < 0) return
+        if (value == null) items.removeAt(index) else items[index] = value.copy()
+    }
+
+    /**
+     * Walk one of theirs' arrays in order with a cursor. An element whose key is in the result moves
+     * the cursor to it; an element taken from theirs that is not in the result is inserted after the
+     * cursor, first when there is none, and becomes the cursor. Anything else is passed over. So an
+     * element theirs added lands after its predecessor in theirs, and everything else keeps mine's
+     * order.
+     *
+     * An element without an id has no key of its own. When the id-less entry is taken from theirs,
+     * mine's id-less elements are already gone and each of theirs' is inserted; otherwise theirs' n-th
+     * id-less element stands for the result's n-th, and only moves the cursor.
+     */
+    private fun walkTheirs(
+        holder: SetupJson.Object,
+        name: String,
+        theirsArray: SetupJson?,
+        entryOf: (String?) -> String,
+        taken: Set<String>,
+    ) {
+        var array = holder[name] as? SetupJson.Array
+        var cursor = -1
+        var idless = 0
+        for (element in objectsOf(theirsArray)) {
+            val id = idOf(element)
+            val entry = entryOf(id)
+            val items = array?.items.orEmpty()
+            val index = when {
+                id != null -> items.indexOfFirst { idOf(it) == id }
+                entry in taken -> -1
+                else -> {
+                    val positions = items.indices.filter { items[it] is SetupJson.Object && idOf(items[it]) == null }
+                    (if (idless < positions.size) positions[idless] else -1).also { idless += 1 }
+                }
+            }
+            if (index >= 0) {
+                cursor = index
+                continue
+            }
+            if (entry !in taken) continue
+            // An array mine never had is created only for something that goes in it.
+            val target = array ?: SetupJson.Array().also {
+                array = it
+                holder[name] = it
+            }
+            cursor += 1
+            target.items.add(cursor, element.copy())
+        }
+    }
+
+    // MARK: - Small readers
+
+    private fun SetupJson.Object.obj(name: String): SetupJson.Object? = this[name] as? SetupJson.Object
+
+    private fun objectsOf(node: SetupJson?): List<SetupJson.Object> =
+        (node as? SetupJson.Array)?.items?.filterIsInstance<SetupJson.Object>().orEmpty()
+
+    private fun idOf(node: SetupJson?): String? = ((node as? SetupJson.Object)?.get("id") as? SetupJson.Text)?.value
+
+    private fun nameOf(node: SetupJson.Object): String? = (node["name"] as? SetupJson.Text)?.value?.takeIf { it.isNotBlank() }
+
+    private fun machineIn(result: SetupJson.Object, id: String): SetupJson.Object? =
+        objectsOf(result["machines"]).firstOrNull { idOf(it) == id }
+
+    private fun revisionOf(document: SetupJson.Object): java.math.BigInteger =
+        JsonEquality.integerOf(document.obj("controller")?.get("revision")) ?: java.math.BigInteger.ZERO
+
+    private fun lineageOf(document: SetupJson.Object): List<String> =
+        (document.obj("controller")?.get("lineage") as? SetupJson.Array)?.items?.mapNotNull { (it as? SetupJson.Text)?.value }.orEmpty()
+
+    private fun labelForTop(name: String): String = when (name) {
+        "appUpdates" -> "App updates"
+        else -> "The setup's $name"
     }
 }
 
@@ -303,7 +550,7 @@ internal fun JsonObject.machineLabel(id: String): String =
 internal fun sameMachine(a: JsonObject, b: JsonObject, id: String): Boolean {
     val left = a.objects("machines").firstOrNull { it.text("id") == id }
     val right = b.objects("machines").firstOrNull { it.text("id") == id }
-    return left == right
+    return JsonEquality.equal(left?.let(SetupJson::of), right?.let(SetupJson::of))
 }
 
 /** A primitive as text, for building small preview lines. */

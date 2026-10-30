@@ -23,18 +23,9 @@
 
 import os from 'node:os';
 import path from 'node:path';
-import {
-  AGENT_TREE,
-  AGENT_VERSION,
-  basePath,
-  compilePattern,
-  deadline as makeDeadline,
-  describeFailure,
-  mapWithLimit,
-  platformName,
-  runArgvAsync,
-  runCommandAsync,
-} from './config.mjs';
+import { compilePattern } from './config-schema.mjs';
+import { AGENT_TREE, AGENT_VERSION, basePath, platformName } from './paths.mjs';
+import { deadline as makeDeadline, describeFailure, mapWithLimit, runArgvAsync, runCommandAsync } from './process-runner.mjs';
 import { CONTRACT_VERSION } from './contract.mjs';
 import { listActions } from './actions.mjs';
 import { carriesSignedManifest } from './archive.mjs';
@@ -44,6 +35,7 @@ import { reportedFloor } from './floor.mjs';
 import { checkHealth, healthPort } from './probes/health.mjs';
 import { probeProcessAsync } from './probes/process.mjs';
 import { collectTelemetry } from './probes/telemetry.mjs';
+import { isRestrictedSession } from './dispatch.mjs';
 import { deriveState, listOperations, summarize } from './operations.mjs';
 import { describeServiceUpdates, describeSystemUpdates } from './policy.mjs';
 import { canDrain, canRestart } from './service.mjs';
@@ -220,7 +212,7 @@ async function describeService(config, service, { isFirst, clock, notes, operati
     // the thing people press twenty times a day into an Internet round trip.
     // `doctor --deep` is where that question is actually asked.
     endpoint: { configured: Boolean(service.endpoint), reachable: null },
-    updates: statusUpdates(describeServiceUpdates(config, service, { state, busy })),
+    updates: statusUpdates(describeServiceUpdates(config, service, { busy })),
     pendingVersion: state.pendingVersion ?? null,
     drain: canDrain(service),
     lastOperation: last
@@ -250,7 +242,7 @@ export async function buildStatus(loaded, { budgetMs = DEFAULT_STATUS_BUDGET_MS 
     contract: CONTRACT_VERSION,
     base: basePath(),
     node: process.versions.node,
-    restrictedSession: process.env.LEGIONCTL_RESTRICTED === '1',
+    restrictedSession: isRestrictedSession(),
     capabilities: ['setup-lineage', 'wol-action', 'configured-telemetry', 'service-config-admin'],
     // The oldest agent this machine may be replaced by, and whether the tree
     // answering is a signed release at all (contract section 13). A client

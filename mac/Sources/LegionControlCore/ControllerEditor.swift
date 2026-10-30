@@ -10,7 +10,10 @@ import Foundation
 /// The document is edited as plain JSON rather than through `ControllerConfig`. A setup may
 /// legitimately carry keys this build has never heard of: a newer client wrote them, or only the
 /// phone reads them. Round-tripping through the typed model would delete every one of them, silently
-/// and on one device only.
+/// and on one device only. And the edited dictionary is written back onto the tree it was read from
+/// (`SetupJSON.rebased`), so member order and number spelling survive wherever the edit did not
+/// reach: `22.0` stays `22.0`, and an edit to one machine does not reorder another (C6). The
+/// controller block keeps every key it had as well; only the identity keys are written.
 enum ControllerEditor {
 
     struct EditFailure: Error, Sendable, Equatable {
@@ -39,43 +42,42 @@ enum ControllerEditor {
         newIdentifier: @Sendable () -> String = { "setup-" + UUID().uuidString.lowercased() },
         change: (inout [String: Any]) throws -> Void
     ) throws -> Edited {
-        guard var root = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else {
+        let original = try tree(raw, purpose: "edited from here")
+        guard var root = original.foundationValue as? [String: Any] else {
             throw EditFailure("The config file is not a JSON object, so it cannot be edited from here. Fix it in an editor first.")
         }
 
         try change(&root)
 
-        // The identity is stamped after the change rather than before, so a change that threw leaves
-        // the document and its lineage exactly as they were.
-        let existing = (root["controller"] as? [String: Any]) ?? [:]
-        var identity = parentIdentity
-
-        // A document that never had an identity gets one now, and only now: an id invented on every
-        // load would make two devices reading the same file believe they were on different setups.
-        if identity.id == nil {
-            identity.id = (existing["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? newIdentifier()
-        }
-        if identity.name == nil { identity.name = existing["name"] as? String }
-
-        let next = identity.next(parent: parentHash, device: deviceName, now: now)
-        root["controller"] = SetupMerge.encode(next)
-
-        let bytes: Data
+        var edited: SetupJSON
         do {
-            bytes = try JSONText.canonicalDocument(root)
+            edited = try SetupJSON.rebased(root, onto: original)
         } catch {
             throw EditFailure("The edited config could not be written back as JSON. \(error.localizedDescription)")
         }
 
-        return Edited(bytes: bytes, identity: next)
+        // The identity is stamped after the change rather than before, so a change that threw leaves
+        // the document and its lineage exactly as they were.
+        var identity = parentIdentity
+        let existing = edited["controller"]
+
+        // A document that never had an identity gets one now, and only now: an id invented on every
+        // load would make two devices reading the same file believe they were on different setups.
+        if identity.id == nil {
+            identity.id = existing?["id"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 } ?? newIdentifier()
+        }
+        var next = identity.next(parent: parentHash, device: deviceName, now: now)
+        next.name = existing?["name"]?.stringValue
+        edited.stamp(next)
+        return Edited(bytes: edited.documentData, identity: next)
     }
 
     /// Give a document that has never had one an identity, without otherwise touching it.
     ///
     /// This is what happens to a hand written file or a pasted example the first time the app reads
-    /// it: it becomes a setup of its own, with a fresh id, revision 1 and no ancestors. It is not a
-    /// claim about anybody else's setup, and if the machines turn out to hold another one the user
-    /// gets the ordinary "different setup" question.
+    /// it: it becomes a setup of its own, with a fresh id, revision 1 and no ancestors, and the rest
+    /// of its controller block as it was. It is not a claim about anybody else's setup, and if the
+    /// machines turn out to hold another one the user gets the ordinary "different setup" question.
     static func adopting(
         _ raw: Data,
         deviceName: String,
@@ -83,20 +85,40 @@ enum ControllerEditor {
         now: Date = Date(),
         newIdentifier: @Sendable () -> String = { "setup-" + UUID().uuidString.lowercased() }
     ) throws -> Edited {
-        guard var root = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else {
-            throw EditFailure("The config file is not a JSON object, so it cannot be given an identity.")
-        }
+        var root = try tree(raw, purpose: "given an identity")
         let identity = ControllerIdentity(
             id: newIdentifier(),
-            name: setupName ?? (root["controller"] as? [String: Any])?["name"] as? String,
+            name: setupName ?? root["controller"]?["name"]?.stringValue,
             revision: 1,
             updatedAt: ISO8601DateFormatter.lenient.string(from: now),
             source: ControllerIdentity.sourceKind,
             device: deviceName,
             lineage: []
         )
-        root["controller"] = SetupMerge.encode(identity)
-        return Edited(bytes: try JSONText.canonicalDocument(root), identity: identity)
+        if let setupName {
+            var block = root["controller"].flatMap { $0.isObject ? $0 : nil } ?? .object([])
+            block["name"] = .string(setupName)
+            root["controller"] = block
+        }
+        root.stamp(identity)
+        return Edited(bytes: root.documentData, identity: identity)
+    }
+
+    /// The document as a tree. A document that repeats a member name is not edited: which copy
+    /// counts depends on the program reading it, so a person settles it in an editor first.
+    private static func tree(_ raw: Data, purpose: String) throws -> SetupJSON {
+        let parsed: SetupJSON
+        do {
+            parsed = try SetupJSON.parse(try Canonical.bytes(raw))
+        } catch let error as SetupJSON.ParseError where error.message.contains("repeated") {
+            throw EditFailure("The config file writes one key twice in the same place (\(error.message)), so it cannot be \(purpose). Fix it in an editor first.")
+        } catch {
+            throw EditFailure("The config file is not valid JSON, so it cannot be \(purpose). Fix it in an editor first.")
+        }
+        guard parsed.isObject else {
+            throw EditFailure("The config file is not a JSON object, so it cannot be \(purpose). Fix it in an editor first.")
+        }
+        return parsed
     }
 
     // MARK: - The changes the app knows how to make
@@ -111,6 +133,7 @@ enum ControllerEditor {
         }
         if let ssh = machine["ssh"] as? [String: Any] { try requireDialable(ssh) }
         for endpoint in (machine["endpoints"] as? [[String: Any]]) ?? [] { try requireDialable(endpoint) }
+        for system in (machine["systems"] as? [[String: Any]]) ?? [] { try requireRunnable(system) }
         var machines = (root["machines"] as? [[String: Any]]) ?? []
         if let index = machines.firstIndex(where: { $0["id"] as? String == id }) {
             var merged = machines[index]
@@ -143,6 +166,11 @@ enum ControllerEditor {
     static func upsertSystem(_ system: [String: Any], onMachine machineId: String, in root: inout [String: Any]) throws {
         try mutateMachine(machineId, in: &root) { machine in
             try upsertKeyed(system, in: &machine, list: "systems", what: "system")
+            // Checked as it ends up, after the merge: an entry that only renames a system keeps the
+            // command it had.
+            if let saved = (machine["systems"] as? [[String: Any]])?.first(where: { $0["id"] as? String == system["id"] as? String }) {
+                try requireRunnable(saved)
+            }
             guard var systems = machine["systems"] as? [[String: Any]],
                   let index = systems.firstIndex(where: { $0["id"] as? String == system["id"] as? String }),
                   systems[index]["platform"] as? String == "windows",
@@ -215,7 +243,7 @@ enum ControllerEditor {
         }
     }
 
-    /// Add or replace one site.
+    /// Add or replace one site. A null value takes the key away, and is never written.
     static func upsertSite(_ site: [String: Any], in root: inout [String: Any]) throws {
         guard let id = site["id"] as? String, !id.isEmpty else {
             throw EditFailure("A site needs an id.")
@@ -228,9 +256,33 @@ enum ControllerEditor {
             }
             sites[index] = merged
         } else {
-            sites.append(site)
+            sites.append(site.filter { !($0.value is NSNull) })
         }
         root["sites"] = sites
+    }
+
+    /// A site as an editor writes it (section 10.1).
+    ///
+    /// Every prefix is written the way every client reads one: an octet-aligned prefix as dotted
+    /// octets with the trailing dot, because a client that predates the section matches prefixes as
+    /// text and is right only when one ends in a dot, and any other length as CIDR. A value that is
+    /// neither — a full address without a length, host bits set, a wildcard — would never match
+    /// anything, so it is refused here rather than saved. An empty `lanPrefixes` or `broadcast` is
+    /// never written: the schema refuses an empty prefix list, and a site with no prefixes is simply
+    /// one the person names as where they are.
+    static func siteEntry(id: String, name: String, prefixes: [String], broadcast: [String]) throws -> [String: Any] {
+        let written = try prefixes.map { text in
+            guard let prefix = LanPrefix(text) else {
+                throw EditFailure("\"\(text)\" is not a network prefix. Write one to three octets, like 192.168.1., or a network and its length, like 192.168.16.0/20.")
+            }
+            return prefix.normalised
+        }
+        return [
+            "id": id,
+            "name": name,
+            "lanPrefixes": written.isEmpty ? NSNull() : written,
+            "broadcast": broadcast.isEmpty ? NSNull() : broadcast,
+        ]
     }
 
     static func removeSite(id: String, in root: inout [String: Any]) throws {
@@ -259,6 +311,53 @@ enum ControllerEditor {
         var updates = (root["appUpdates"] as? [String: Any]) ?? [:]
         updates["githubRepo"] = repo
         root["appUpdates"] = updates
+    }
+
+    /// Put back a launch value this device approved, over the one waiting at that place: what a
+    /// review's Revert writes, as an ordinary edit that replicates (section 9.9 of the contract).
+    ///
+    /// A system's approval holds the grammar, not the fields it is worked out from, so the argv is
+    /// written back as it was and `restricted` and `shell` are moved only as far as it takes for
+    /// section 15.1 to give the approved grammar again.
+    static func restoreLaunchValue(_ value: LaunchValue, at location: LaunchLocation, in root: inout [String: Any]) throws {
+        switch (location, value) {
+        case (.system(let machineId, let systemId), .tuple(let tuple)):
+            try mutateMachine(machineId, in: &root) { machine in
+                var systems = (machine["systems"] as? [[String: Any]]) ?? []
+                guard let index = systems.firstIndex(where: { $0["id"] as? String == systemId }) else {
+                    throw EditFailure("\(machineId) no longer has the system \"\(systemId)\".")
+                }
+                var system = systems[index]
+                system["agent"] = tuple.agent
+                func grammarMatches() -> Bool {
+                    LaunchValues.tuple(of: system).map { LaunchValues.same($0.grammar, tuple.grammar) } ?? false
+                }
+                if !grammarMatches(), let grammar = tuple.commandGrammar {
+                    if grammar == .dispatch {
+                        system["restricted"] = true
+                    } else {
+                        system.removeValue(forKey: "restricted")
+                        if !grammarMatches() { system["shell"] = grammar.rawValue }
+                    }
+                }
+                systems[index] = system
+                machine["systems"] = systems
+            }
+        case (.identityFile(let machineId), .text(let path)):
+            try mutateMachine(machineId, in: &root) { machine in
+                var ssh = (machine["ssh"] as? [String: Any]) ?? [:]
+                ssh["identityFile"] = path
+                machine["ssh"] = ssh
+            }
+        case (.repo, .text(let repo)):
+            try setUpdateRepo(repo, in: &root)
+        case (.local, .local(let agent)):
+            var local = (root["local"] as? [String: Any]) ?? [:]
+            if let agent { local["agent"] = agent } else { local.removeValue(forKey: "agent") }
+            root["local"] = local
+        default:
+            throw EditFailure("That value does not belong at \(location.path).")
+        }
     }
 
     /// Take this device's private settings out of the shared document.
@@ -295,6 +394,21 @@ enum ControllerEditor {
         let target = SSHTarget(host: host, user: entry["user"] as? String, port: entry["port"] as? Int, identityFile: nil)
         if let part = Addresses.undialablePart(of: target) {
             throw EditFailure("\(target.display) cannot be saved: \(part) is not one this app dials, scans or pins.")
+        }
+    }
+
+    /// Refuses a system whose command could not be run or approved (section 9.9 of the contract):
+    /// no argv at all, an empty word, a control character, or an invisible or direction-changing
+    /// character that would make the command a person reads differ from the one that runs.
+    ///
+    /// A peer's copy may carry any of these, and this app keeps it and does not drive that system.
+    /// An editor is where a person is typing one, so it is refused there instead. An empty argv
+    /// matters beyond this device too: a 1.3 Mac refuses a whole document that holds one.
+    private static func requireRunnable(_ system: [String: Any]) throws {
+        let id = system["id"] as? String ?? "this system"
+        guard let argv = system["agent"] as? [String], !argv.isEmpty,
+              argv.allSatisfy({ SetupGuard.isAgentArg($0) && LaunchValues.isLaunchText($0) }) else {
+            throw EditFailure("\(id) needs an agent command of at least one argument, none of them empty or holding a control, invisible or direction-changing character.")
         }
     }
 
@@ -336,5 +450,22 @@ enum ControllerEditor {
             entries.append(entry)
         }
         machine[list] = entries
+    }
+}
+
+extension SetupJSON {
+    /// Write an identity into the document's controller block, keeping every other key the block
+    /// has where it is. The identity keys are written in place, or appended in this order when the
+    /// block lacks them; a document with no block gets one at the end.
+    mutating func stamp(_ identity: ControllerIdentity) {
+        var block = self["controller"].flatMap { $0.isObject ? $0 : nil } ?? .object([])
+        if let id = identity.id { block["id"] = .string(id) }
+        if block["name"] == nil, let name = identity.name { block["name"] = .string(name) }
+        block["revision"] = .number(String(identity.revisionNumber))
+        if let updatedAt = identity.updatedAt { block["updatedAt"] = .string(updatedAt) }
+        if let source = identity.source { block["source"] = .string(source) }
+        if let device = identity.device { block["device"] = .string(device) }
+        block["lineage"] = .array(identity.ancestors.map(SetupJSON.string))
+        self["controller"] = block
     }
 }

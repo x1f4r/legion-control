@@ -3,7 +3,9 @@ package com.x1f4r.legioncontrol.ui
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -17,21 +19,25 @@ import com.x1f4r.legioncontrol.agent.OperationRecord
  * Only for changes a person explicitly asked for, and only for the ones that actually did or failed
  * to do something: a no-op update posts nothing, because "there was nothing to install" is not news
  * worth a buzz. Polling never notifies. This is the one thing in the app that speaks while the
- * screen is away, and it earns that by being rare.
+ * screen is away, and it earns that by being rare. Nor does it speak while the screen is not away:
+ * the page already says how the change ended, in front of the person reading it.
  *
  * Opt in, in both directions. Android will not deliver these without the runtime permission, and the
  * app will not ask for it until the user turns the setting on, because a permission prompt on first
  * launch for a feature nobody has asked for is how people learn to say no to everything.
+ *
+ * A tap opens the machine the change was on, which is where its outcome and its details are.
  */
 class AndroidOperationNotifier(
     context: Context,
     private val enabled: () -> Boolean,
+    /** Whether the app is in front of the person right now, in which case the page says it. */
+    private val inFront: () -> Boolean,
 ) : OperationNotifier {
     private val app = context.applicationContext
 
     override fun finished(record: OperationRecord) {
-        if (!enabled()) return
-        if (!record.isNoteworthyEnding) return
+        if (!announces(record, enabled = enabled(), inFront = inFront())) return
 
         // Checked here rather than through the helper below, because this is the check the tooling
         // can see: a permission test one call away is a permission test the compiler cannot connect
@@ -43,10 +49,11 @@ class AndroidOperationNotifier(
         }
 
         ensureChannel()
-        val title = when (record.succeeded) {
-            true -> "${record.kind.label} finished"
-            false -> "${record.kind.label} failed"
-            null -> "${record.kind.label}: outcome not known"
+        val title = when {
+            record.succeeded == true -> "${record.kind.label} finished"
+            record.succeeded == false -> "${record.kind.label} failed"
+            record.outcome == com.x1f4r.legioncontrol.agent.Outcome.DEFERRED -> "${record.kind.label} did not run"
+            else -> "${record.kind.label}: outcome not known"
         }
         val notification = NotificationCompat.Builder(app, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
@@ -54,6 +61,7 @@ class AndroidOperationNotifier(
             .setContentText(record.summary)
             .setStyle(NotificationCompat.BigTextStyle().bigText(record.summary))
             .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .setContentIntent(opening(record))
             .setOnlyAlertOnce(true)
             .setAutoCancel(true)
             .build()
@@ -65,10 +73,31 @@ class AndroidOperationNotifier(
         }
     }
 
+    /**
+     * Whether Android lets this app post at all. Below Android 13 there is no runtime permission and
+     * androidx answers from whether the user left this app's notifications on, which is the same
+     * question asked the only way those versions can be asked it.
+     */
     fun permitted(): Boolean = ContextCompat.checkSelfPermission(
         app,
         Manifest.permission.POST_NOTIFICATIONS,
     ) == PackageManager.PERMISSION_GRANTED
+
+    /**
+     * The tap: this app, on the page of the machine the change was on.
+     *
+     * One pending intent per change, keyed like the notification itself, because Android tells
+     * pending intents apart by request code and not by their extras: with one code for all of them,
+     * every notification would open whichever machine was announced last.
+     */
+    private fun opening(record: OperationRecord): PendingIntent = PendingIntent.getActivity(
+        app,
+        record.id.hashCode(),
+        Intent(app, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            .putExtra(EXTRA_MACHINE, record.machineId),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
 
     private fun ensureChannel() {
         val manager = app.getSystemService<NotificationManager>() ?: return
@@ -86,7 +115,17 @@ class AndroidOperationNotifier(
         )
     }
 
-    private companion object {
-        const val CHANNEL = "legion-operations"
+    companion object {
+        private const val CHANNEL = "legion-operations"
+
+        /** The machine id a tapped notification asks the app to show. */
+        const val EXTRA_MACHINE = "com.x1f4r.legioncontrol.MACHINE"
     }
 }
+
+/**
+ * Whether [record] ending is announced: a change that did or failed to do something, with the
+ * setting on, while the app is not in front of the person who asked for it.
+ */
+internal fun announces(record: OperationRecord, enabled: Boolean, inFront: Boolean): Boolean =
+    enabled && !inFront && record.isNoteworthyEnding

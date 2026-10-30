@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
@@ -19,13 +20,15 @@ public sealed class ImportSetup : Window
         body.Children.Add(Ui.Title(Title));
         TextBox Field(string name, string value = "")
         {
-            body.Children.Add(Ui.Note(name)); var box = new TextBox { Text = value }; body.Children.Add(box); return box;
+            body.Children.Add(Ui.Note(name)); var box = new TextBox { Text = value }; body.Children.Add(box);
+            AutomationProperties.SetName(box, name); return box;
         }
         var host = Field("Host or SSH alias"); var port = Field("Port", "22"); var user = Field("SSH user (blank uses SSH configuration)");
         var identity = Field("Private SSH key path (optional)", app.Bindings.IdentityFile ?? "");
         var systemId = Field("Operating-system id", "linux");
         body.Children.Add(Ui.Note("Remote shell"));
         var shell = new ComboBox { ItemsSource = new[] { "posix", "powershell", "cmd" }, SelectedIndex = 0 }; body.Children.Add(shell);
+        AutomationProperties.SetName(shell, "Remote shell");
         var restricted = new CheckBox { Content = "This key uses the restricted agent dispatcher" }; body.Children.Add(restricted);
         var suggestedAgent = JsonSerializer.Serialize(ImportAgentDefaults.For(RemoteShell.Posix, user.Text, false));
         var argv = Field("Agent argv as a JSON array", suggestedAgent);
@@ -46,6 +49,7 @@ public sealed class ImportSetup : Window
         restricted.IsCheckedChanged += (_, _) => SuggestAgent();
         body.Children.Add(Ui.Note("Uses the installed launcher. For Windows or a restricted key, check the suggested account path; custom install locations need their exact argv."));
         var preview = new TextBox { AcceptsReturn = true, IsReadOnly = true, MinHeight = 100, MaxHeight = 200 };
+        AutomationProperties.SetName(preview, "What the machine holds");
         var problem = new TextBlock { Foreground = Ui.Bad, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
         ControllerDocument? fetched = null;
         MachineModel Build()
@@ -68,7 +72,7 @@ public sealed class ImportSetup : Window
                 IdentityFile = string.IsNullOrWhiteSpace(identity.Text) ? app.Bindings.IdentityFile : identity.Text,
             });
         }
-        body.Children.Add(Ui.Actions(Ui.Action("Inspect / approve host identity", async () =>
+        body.Children.Add(Ui.Actions(Ui.Action("Inspect / approve host identity", () => Ui.Run(this, "Checking the host key", async () =>
         {
             try
             {
@@ -85,28 +89,67 @@ public sealed class ImportSetup : Window
                 };
             }
             catch (Exception error) { problem.Text = error.Message; }
-        }), Ui.Action("Fetch and preview", async () =>
+        })), Ui.Action("Fetch and preview", () => Ui.Run(this, "Fetching the setup", async () =>
         {
             try
             {
                 fetched = null;
                 var machine = Build(); var (document, failure) = await machine.FetchSetupAsync();
                 if (document is null) { problem.Text = failure; return; }
-                var errors = document.Decoded.Problems();
-                if (errors.Count > 0) { problem.Text = string.Join(" ", errors); return; }
+                // Read from a machine, so held to section 9.7 under peer intake like any other.
+                if (DocumentAcceptance.Check(document.Bytes, Intake.Peer) is { Valid: false } refused) { problem.Text = refused.Sentence; return; }
                 fetched = document; preview.Text = document.Text;
                 problem.Text = string.Join("\n", SetupConflictPreview.Between(app.Config.Config, document.Decoded).Lines());
             }
             catch (Exception error) { problem.Text = error.Message; }
-        })));
+        }))));
         body.Children.Add(preview); body.Children.Add(problem);
-        body.Children.Add(Ui.Actions(Ui.Action("Cancel", Close), Ui.Action("Adopt this exact setup here", () =>
+        body.Children.Add(Ui.Actions(Ui.Action("Cancel", Close), Ui.Action("Adopt this exact setup here", () => Ui.Run(this, "Adopting the setup", async () =>
         {
             if (fetched is null) { problem.Text = "Fetch and review a setup first."; return; }
-            var failure = app.Config.Apply(fetched, "imported from a machine");
-            if (failure is not null) { problem.Text = failure; return; }
-            Close();
-        })));
+            try
+            {
+                // Enrolment approves every command in the setup, so all of them are shown first
+                // and Cancel applies nothing. A device that already applies a setup approves
+                // nothing by adopting another one: what it has not approved waits for review.
+                var document = fetched;
+                var enrolment = app.IsEnrolment;
+                if (enrolment && !await ConfirmEnrolmentAsync(document)) return;
+                var failure = app.AdoptImported(document, enrolmentConfirmed: enrolment);
+                if (failure is not null) { problem.Text = failure; return; }
+                Close();
+            }
+            catch (Exception error) { problem.Text = error.Message; }
+        }))));
         Content = new ScrollViewer { Content = body };
+    }
+
+    /// Every launch value of the setup, for a person to confirm before this device approves them all.
+    private async Task<bool> ConfirmEnrolmentAsync(ControllerDocument document)
+    {
+        var dialog = new Window
+        {
+            Title = "Approve this setup's commands", Width = 640, Height = 560,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+        };
+        var body = Ui.Column(8); body.Margin = new Thickness(20);
+        body.Children.Add(Ui.Title(dialog.Title));
+        body.Children.Add(Ui.Note(
+            "This device holds no setup yet. Adopting this one approves every command in it: this device will run them over ssh with its own key. A command a peer changes later waits for approval here."));
+        body.Children.Add(new ScrollViewer
+        {
+            MaxHeight = 340,
+            Content = new SelectableTextBlock
+            {
+                Text = string.Join("\n", LaunchGate.Summary(document)),
+                FontFamily = new Avalonia.Media.FontFamily("monospace"),
+                TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+            },
+        });
+        var confirmed = false;
+        body.Children.Add(Ui.Actions(Ui.Action("Cancel", dialog.Close), Ui.Action("Confirm", () => { confirmed = true; dialog.Close(); })));
+        dialog.Content = body;
+        await dialog.ShowDialog(this);
+        return confirmed;
     }
 }

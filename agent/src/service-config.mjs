@@ -3,9 +3,12 @@
 // Validation and saving configure existing adapters; neither runs commands.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { configPath, normalizeConfig, readJsonDocument, saveConfig } from './config.mjs';
+import { normalizeConfig } from './config-schema.mjs';
+import { readJsonDocument, saveConfig } from './config-store.mjs';
+import { configPath } from './paths.mjs';
 import { acquireOperationLock } from './lock.mjs';
 import { REASON } from './contract.mjs';
+import { isRestrictedSession } from './dispatch.mjs';
 import { discoverServiceProfiles } from './service-profiles.mjs';
 
 export const MAX_SERVICE_CONFIG_BYTES = 1024 * 1024;
@@ -109,7 +112,7 @@ function validateRequest(request, before) {
 
 /** Read only for an unrestricted administrative session. */
 export function getServiceConfig() {
-  if (process.env.LEGIONCTL_RESTRICTED === '1') return fail(REASON.restricted, 'Service provisioning requires an unrestricted administrative session.');
+  if (isRestrictedSession()) return fail(REASON.restricted, 'Service provisioning requires an unrestricted administrative session.');
   const stored = currentDocument();
   if (!stored) return fail(REASON.configInvalid, 'Agent configuration cannot be read as a bounded JSON object; repair the file before using the editor.');
   return {
@@ -120,14 +123,14 @@ export function getServiceConfig() {
 }
 
 export function validateServiceConfig(request) {
-  if (process.env.LEGIONCTL_RESTRICTED === '1') return fail(REASON.restricted, 'Service provisioning requires an unrestricted administrative session.');
+  if (isRestrictedSession()) return fail(REASON.restricted, 'Service provisioning requires an unrestricted administrative session.');
   const before = currentDocument();
   if (!before) return fail(REASON.configInvalid, 'Agent configuration cannot be read; nothing was saved.');
   return validateRequest(request, before);
 }
 
 export function setServiceConfig(request) {
-  if (process.env.LEGIONCTL_RESTRICTED === '1') return fail(REASON.restricted, 'Service provisioning requires an unrestricted administrative session.');
+  if (isRestrictedSession()) return fail(REASON.restricted, 'Service provisioning requires an unrestricted administrative session.');
   const first = validateServiceConfig(request);
   if (!first.ok) return first;
   const taken = acquireOperationLock({ kind: 'service-config', waitMs: 250 });
@@ -181,7 +184,7 @@ export function readServiceConfigInput(stream = process.stdin, { idleMs = 5000, 
 }
 
 export async function commandServiceConfig(positional, flags) {
-  if (process.env.LEGIONCTL_RESTRICTED === '1') return fail(REASON.restricted, 'Service provisioning requires an unrestricted administrative session.');
+  if (isRestrictedSession()) return fail(REASON.restricted, 'Service provisioning requires an unrestricted administrative session.');
   const verb = positional[0];
   if (positional.length !== 1 || !['get', 'validate', 'set'].includes(verb) || (verb === 'get' ? flags.size !== 0 : !flags.has('stdin') || flags.size !== 1)) {
     return fail(REASON.badArgument, 'Use service-config get, service-config validate --stdin, or service-config set --stdin.');

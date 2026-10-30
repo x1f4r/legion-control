@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deadline, normalizeConfig } from '../src/config.mjs';
+import { normalizeConfig } from '../src/config-schema.mjs';
+import { deadline } from '../src/process-runner.mjs';
 import { collectTelemetry } from '../src/probes/telemetry.mjs';
 import { buildStatus } from '../src/status.mjs';
 import { withHome } from './helpers.mjs';

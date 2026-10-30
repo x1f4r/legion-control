@@ -4,7 +4,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { saveConfig, configPath, lastGoodConfigPath } from '../src/config.mjs';
+import { saveConfig } from '../src/config-store.mjs';
+import { configPath, lastGoodConfigPath } from '../src/paths.mjs';
 import { acquireFileLock, stateLockPath } from '../src/state.mjs';
 import { SRC, withHome, writeConfig } from './helpers.mjs';
 

@@ -1,3 +1,6 @@
+using System.Text.Json;
+using LegionControl.Desktop.Config;
+
 namespace LegionControl.Desktop.Contract;
 
 // What the agent says, as this client reads it.
@@ -30,7 +33,9 @@ public sealed record AgentEnvelope
         ContractVersion = json["contract", "contractVersion"].AsInt(),
         AgentVersion = json["agentVersion", "version"].AsText(),
         System = SystemInfo.From(json["system"]),
-        ReasonCode = json["reasonCode", "reason"].AsText(),
+        // Only `reasonCode`. A busy reply's `reason` is a sentence for a person ("1 turn running"),
+        // and read as a code it gave every busy answer a reason code no agent ever sent.
+        ReasonCode = json["reasonCode"].AsText(),
         Message = json["message"].AsText(),
         Error = json["error"].AsText(),
         Notes = json["notes"].AsStringList(),
@@ -62,7 +67,8 @@ public sealed record BusyState
 {
     public bool Busy { get; init; }
     public bool Unknown { get; init; }
-    /// Null on an agent that predates the idea. Treated as unmonitored only when the agent says so.
+    /// Null on an agent that predates the idea. Kept as sent; whether anything watches the service
+    /// is [IsUnmonitored]'s to say, from the evidence.
     public bool? Monitored { get; init; }
     public string? Reason { get; init; }
     /// t3-sqlite | command | http | none | unmonitored | probe-error | timed-out
@@ -108,9 +114,14 @@ public sealed record BusyState
         };
     }
 
-    /// Whether the busy state is unwatched: the agent said so, or it reported an evidence of
-    /// "unmonitored". Missing configuration is unmonitored, and unmonitored is not idle.
-    public bool IsUnmonitored => Monitored == false || Evidence == "unmonitored";
+    /// Whether the busy state is unwatched: the agent reported an evidence of "unmonitored", which
+    /// is what missing configuration reads as, and unmonitored is not idle.
+    ///
+    /// Only the evidence says so. A service configured `busy.type: "none"` is declared never busy,
+    /// which is an answer rather than a gap (contract section 6), and an agent before 3.1.0 sends
+    /// it, and a machine with no services, with `monitored: false` beside `evidence: "none"`.
+    /// Reading that as unwatched would warn about, and ask to force past, a setting somebody chose.
+    public bool IsUnmonitored => Evidence == "unmonitored";
 
     /// Whether a disruptive change may go ahead without the user being asked to force it.
     ///
@@ -525,7 +536,13 @@ public sealed record StatusTiming(long? BudgetMs, long? ElapsedMs, bool Partial)
     }
 }
 
-public sealed record AgentInfo(string? Version, int? ContractVersion, string? Base, string? Node, bool? RestrictedSession)
+/// The agent block of a status. [Floor] is the version floor from agent 3.1.0 on: the oldest agent
+/// this machine may be replaced by (contract section 13). It is null both when the agent states
+/// none, its floor file being unreadable, and when it predates the idea; [ReportsFloor] tells the
+/// two apart, because only an agent that reports a floor knows `--allow-downgrade` at all.
+public sealed record AgentInfo(
+    string? Version, int? ContractVersion, string? Base, string? Node, bool? RestrictedSession,
+    string? Floor = null, bool ReportsFloor = false)
 {
     public static AgentInfo? From(Value json)
     {
@@ -535,7 +552,9 @@ public sealed record AgentInfo(string? Version, int? ContractVersion, string? Ba
             json["contract"].AsInt(),
             json["base"].AsText(),
             json["node"].AsText(),
-            json["restrictedSession"].AsBool());
+            json["restrictedSession"].AsBool(),
+            json["floor"].AsText(),
+            json.Has("floor"));
     }
 }
 
@@ -605,6 +624,9 @@ public sealed record AgentStatus
     public IReadOnlyList<string> Incomplete { get; init; } = Array.Empty<string>();
     /// Whether the reply named a services array at all. Decides whether `--service` may be sent.
     public bool ReportsServices { get; init; }
+    /// Whether the reply listed its actions at all. Only a list says a helper has no such action;
+    /// a status that names none says nothing either way.
+    public bool ReportsActions { get; init; }
     public bool ReportsPolicies { get; init; }
 
     public string? SystemId => Envelope.System?.Id ?? OsName;
@@ -660,6 +682,7 @@ public sealed record AgentStatus
             Partial = timing?.Partial ?? json["partial"].AsBool() ?? false,
             Incomplete = json["incomplete"].AsStringList(),
             ReportsServices = services.IsArray,
+            ReportsActions = json["actions"].IsArray,
             ReportsPolicies = policies.IsArray || decoded.Any(service => service.Updates is not null),
         };
     }
@@ -743,31 +766,6 @@ public enum OperationState
     Queued,
     Running,
     Finished,
-}
-
-/// What became of an operation. Deliberately not a boolean: "we do not know" is a state the whole
-/// design exists to be able to say, and it must never collapse into either of the other two.
-public enum OperationOutcome
-{
-    /// Still going, or waiting.
-    Pending,
-    Succeeded,
-    /// The agent said it failed.
-    Failed,
-    /// The agent deliberately did nothing and said why.
-    Deferred,
-    Queued,
-    Cancelled,
-    Expired,
-    /// Cut off mid-flight. Whatever it left behind is on the machine.
-    Interrupted,
-    /// Nothing needed doing.
-    Noop,
-    /// Refused because something else holds the machine.
-    Conflict,
-    /// The record is finished and does not say how it went, or the reply never arrived. Never
-    /// rendered as either of the two that matter.
-    Unresolved,
 }
 
 public sealed record OperationProgress(int? Step, int? Of, string? Note)
@@ -878,6 +876,8 @@ public sealed record OperationRecord
     /// Set when a queued request of the same shape was displaced by this one.
     public string? Replaced { get; init; }
     public OperationConflict? Conflict { get; init; }
+    /// What became of it, as the record states it or as section 5.6 reduces it.
+    public OperationOutcome Outcome { get; init; } = OperationOutcome.Unknown;
 
     public static OperationRecord? From(Value json)
     {
@@ -919,6 +919,9 @@ public sealed record OperationRecord
             Replayed = json["replayed"].AsBool() ?? false,
             Replaced = json["replaced"].AsText(),
             Conflict = OperationConflict.From(json["conflict"]),
+            // A record carries `result`, null until it finishes; a summary carries the result's
+            // fields flattened beside its own and is reduced from those.
+            Outcome = json.Has("result") ? Outcomes.OfRecord(json) : Outcomes.Of(json),
         };
     }
 
@@ -975,52 +978,6 @@ public sealed record OperationRecord
     };
 
     public bool IsFinished => State == OperationState.Finished;
-
-    /// What became of it. The rule that matters: a finished record whose outcome cannot be read is
-    /// [OperationOutcome.Unresolved], never success. Nothing in this client turns an absent
-    /// postcondition into a good result, whatever was forced.
-    public OperationOutcome Outcome
-    {
-        get
-        {
-            var word = (Result?.Action ?? RawState)?.Trim().ToLowerInvariant();
-            switch (word)
-            {
-                case "updated" or "restarted" or "ran" or "rebooted" or "slept" or "cycled" or "succeeded" or "success" or "armed":
-                    return OperationOutcome.Succeeded;
-                case "noop" or "current" or "skipped" or "already-on-target":
-                    return OperationOutcome.Noop;
-                case "failed" or "rolled-back":
-                    return OperationOutcome.Failed;
-                case "deferred":
-                    return OperationOutcome.Deferred;
-                case "queued":
-                    return OperationOutcome.Queued;
-                case "cancelled" or "canceled":
-                    return OperationOutcome.Cancelled;
-                case "expired":
-                    return OperationOutcome.Expired;
-                case "interrupted":
-                    return OperationOutcome.Interrupted;
-                case "conflict":
-                    return OperationOutcome.Conflict;
-                case "rebooting" or "sleeping" or "accepted" or "running" or "started" or "already-running":
-                    return OperationOutcome.Pending;
-                case "installed":
-                    return OperationOutcome.Succeeded;
-            }
-            if (State is OperationState.Running or OperationState.Queued) return OperationOutcome.Pending;
-            if (State == OperationState.Finished)
-            {
-                // A finished record with an explicit ok is readable; one with neither an action nor
-                // an ok is not, and saying so is the whole point of this branch.
-                if (Result?.Ok == true) return OperationOutcome.Succeeded;
-                if (Result?.Ok == false) return OperationOutcome.Failed;
-                return OperationOutcome.Unresolved;
-            }
-            return OperationOutcome.Unresolved;
-        }
-    }
 
     public OperationSummary ToSummary() => new()
     {
@@ -1088,7 +1045,7 @@ public sealed record OperationSummary
     public DateTimeOffset? RequestedAt { get; init; }
     public DateTimeOffset? UpdatedAt { get; init; }
     public DateTimeOffset? ExpiresAt { get; init; }
-    public OperationOutcome Outcome { get; init; } = OperationOutcome.Unresolved;
+    public OperationOutcome Outcome { get; init; } = OperationOutcome.Unknown;
 
     public static OperationSummary? From(Value json)
     {
@@ -1113,19 +1070,20 @@ public sealed record OperationSummary
         _ => kind,
     };
 
+    /// The outcome in a few words, with the action saying which kind of each it was.
     public string OutcomeText => Outcome switch
     {
-        OperationOutcome.Succeeded => Action ?? "done",
-        OperationOutcome.Noop => "nothing to do",
+        OperationOutcome.Pending => State == OperationState.Queued ? "queued" : Phase ?? "running",
+        OperationOutcome.Succeeded => Action == "noop" ? "nothing to do" : Action ?? "done",
         OperationOutcome.Failed => "failed",
-        OperationOutcome.Deferred => "deferred",
-        OperationOutcome.Queued => "queued",
-        OperationOutcome.Cancelled => "cancelled",
-        OperationOutcome.Expired => "expired",
-        OperationOutcome.Interrupted => "interrupted",
-        OperationOutcome.Conflict => "refused, something else was running",
-        OperationOutcome.Pending => Phase ?? "running",
-        _ => "outcome not known",
+        OperationOutcome.Deferred => Action switch
+        {
+            "conflict" => "refused, something else was running",
+            "cancelled" => "cancelled",
+            "expired" => "expired",
+            _ => "deferred",
+        },
+        _ => Action == "interrupted" ? "interrupted, outcome not known" : "outcome not known",
     };
 }
 
@@ -1175,68 +1133,28 @@ public sealed record ActionResult
             Replayed = (json["replayed"].AsBool() ?? false) || (operation?.Replayed ?? false),
             Operation = operation,
             Conflict = OperationConflict.From(json["conflict"]) ?? operation?.Conflict,
+            Outcome = Outcomes.Of(json),
         };
     }
 
-    /// Whether the agent took the work away and left this client to poll for it.
-    public bool IsAccepted => string.Equals(Action, "accepted", StringComparison.OrdinalIgnoreCase);
+    /// Whether the agent took the work away and left this client to poll for it. A replay of a
+    /// request that is still running says `already-running` rather than `accepted`, and is followed
+    /// exactly the same way (contract section 5.5).
+    public bool IsAccepted => Action is "accepted" or "already-running";
 
-    public bool IsCommandRefusal => Envelope.Ok == false && Operation is null
+    /// The agent refused the command itself before anything was started: a restricted key, or an
+    /// argument it does not take.
+    public bool IsCommandRefusal => Outcome == OperationOutcome.Failed && Envelope.Ok == false && Operation is null
         && Envelope.ReasonCode is ReasonCode.Restricted or ReasonCode.BadArgument;
 
-    public bool IsQueued => string.Equals(Action, "queued", StringComparison.OrdinalIgnoreCase);
+    public bool IsQueued => Action == "queued";
 
-    public bool IsConflict => string.Equals(Action, "conflict", StringComparison.OrdinalIgnoreCase)
-        || Envelope.ReasonCode == Contract.ReasonCode.OperationInProgress;
+    public bool IsConflict => Action == "conflict" || Envelope.ReasonCode == Contract.ReasonCode.OperationInProgress;
 
-    /// What this reply says happened, read through the same rules as an operation record so that a
-    /// synchronous agent and a detaching one produce the same outcome above this line.
-    public OperationOutcome Outcome
-    {
-        get
-        {
-            if (IsCommandRefusal) return OperationOutcome.Failed;
-            if (IsAccepted) return OperationOutcome.Pending;
-            if (IsQueued) return OperationOutcome.Queued;
-            if (IsConflict) return OperationOutcome.Conflict;
-            if (Operation is { } operation && operation.IsFinished) return operation.Outcome;
-            var word = Action?.Trim().ToLowerInvariant();
-            switch (word)
-            {
-                case "updated" or "restarted" or "ran" or "cycled" or "armed":
-                    return OperationOutcome.Succeeded;
-                case "noop" or "current" or "skipped" or "already-on-target":
-                    return OperationOutcome.Noop;
-                case "failed" or "rolled-back":
-                    return OperationOutcome.Failed;
-                case "deferred":
-                    return OperationOutcome.Deferred;
-                case "cancelled" or "canceled":
-                    return OperationOutcome.Cancelled;
-                case "expired":
-                    return OperationOutcome.Expired;
-                case "interrupted":
-                    return OperationOutcome.Interrupted;
-                // A machine that is going down has acknowledged and not yet arrived. It is pending
-                // until something observes the other side of the transition, and never before.
-                case "rebooting" or "sleeping":
-                    return OperationOutcome.Pending;
-                case "rebooted" or "slept" or "installed" or "rolled-back-agent":
-                    return OperationOutcome.Succeeded;
-                // The agent found the id already running and started nothing twice. What happened
-                // is whatever that operation does, which is not known yet.
-                case "already-running":
-                    return OperationOutcome.Pending;
-            }
-            // A reply that carries a reason code is by definition not the happy path, so an action
-            // word this build has never heard of must not be read as one. Saying "we do not know"
-            // about a word nobody wrote a case for is the only honest answer.
-            if (Envelope.ReasonCode is not null) return OperationOutcome.Unresolved;
-            if (Envelope.Ok == true && word is not null) return OperationOutcome.Succeeded;
-            if (Envelope.Ok == false) return OperationOutcome.Failed;
-            return OperationOutcome.Unresolved;
-        }
-    }
+    /// What this reply says happened: the agent's own `outcome`, or section 5.6's reduction of the
+    /// reply when an agent before 3.1.0 sent none. The reply's own fields decide, never the record
+    /// beside it: a replay carries the first request's record, and a conflict someone else's.
+    public OperationOutcome Outcome { get; init; } = OperationOutcome.Unknown;
 
     /// Whether this reply, on its own, says the machine is on its way down. Only an acknowledged
     /// reply ever does; a dropped link never does, wherever it dropped.
@@ -1278,6 +1196,21 @@ public sealed record DoctorReport(AgentEnvelope Envelope, IReadOnlyList<DoctorCh
     public int Warnings => Checks.Count(check => check.Verdict == DoctorVerdict.Warning);
 }
 
+/// The reply to `op ID`.
+///
+/// Three different answers. A record says what became of the operation. A present `"op": null`
+/// says there is no such operation on the machine: it never arrived there, or was pruned long since.
+/// Agent 3.1.0 sends that with `not-configured` and 3.0.x with `bad-argument`, and the code is not
+/// what decides (contract section 4). Anything else, a refusal with no `op` at all for one, says
+/// nothing about the operation and is no more evidence than a poll that never came back.
+public sealed record OperationReply(AgentEnvelope Envelope, OperationRecord? Record, bool NoRecord)
+{
+    public static OperationReply From(Value json) => new(
+        AgentEnvelope.From(json),
+        OperationRecord.From(json["op", "operation"]),
+        json.Has("op") && !json["op"].Exists);
+}
+
 public sealed record HistoryReply(AgentEnvelope Envelope, IReadOnlyList<OperationSummary> Operations)
 {
     public static HistoryReply From(Value json)
@@ -1308,20 +1241,33 @@ public sealed record LogsReply(AgentEnvelope Envelope, IReadOnlyList<string> Lin
 public sealed record ConfigReply
 {
     public AgentEnvelope Envelope { get; init; } = new();
+    /// The reply exactly as it came, for the readings contract section 9.5 makes without coercing
+    /// anything: `ok` is true only when it is the JSON value true.
+    public Value Json { get; init; }
     public string? Hash { get; init; }
     public long? Bytes { get; init; }
     /// What the machine holds now, when it says: id, revision, lineage, who wrote it.
     public ControllerMark? Meta { get; init; }
-    /// The document itself, on a `config` read. The agent sends it as the parsed object, so it is
-    /// re-serialised here only to be canonicalised and hashed again on this side; the hash is
-    /// compared against the reported one before anything is adopted.
+    /// The stored document as text, on a `config` read from agent 3.1.0: exactly the canonical
+    /// bytes `hash` covers. These are what is hashed and adopted.
+    public string? Raw { get; init; }
+    /// The document to hash and adopt from a `config` read: `raw` when the agent sent it. An agent
+    /// before 3.1.0 sends only the parsed `controller`, and the reply's own spacing of it is not
+    /// what it stored, so it is rebuilt the way `JSON.stringify(controller, null, 2)` writes it,
+    /// in the order received (contract section 9.5). That reproduces every document a client
+    /// wrote in that form, and the hash check before adoption declines any other.
     public string? Document { get; init; }
+    /// On a `config-invalid` refusal: what the document breaks, first problem first.
+    public IReadOnlyList<ConfigProblem> Problems { get; init; } = Array.Empty<ConfigProblem>();
     /// stored | noop | replaced, on a `config set`.
     public string? Action { get; init; }
     /// Set on a refusal that is a real divergence rather than merely being behind.
     public bool Divergent { get; init; }
     /// On a refusal: what the machine holds instead.
     public ControllerMark? Current { get; init; }
+    /// On a `restricted` refusal from agent 3.1.0: the paths of the launch values the machine
+    /// would not take from a restricted key, in document order, and never the values themselves.
+    public IReadOnlyList<string> LaunchChanges { get; init; } = Array.Empty<string>();
 
     public static ConfigReply From(Value json)
     {
@@ -1340,17 +1286,36 @@ public sealed record ConfigReply
                 Lineage = json["lineage"].AsStringList(),
             };
         }
+        var raw = json["raw"].Raw.ValueKind == JsonValueKind.String ? json["raw"].Raw.GetString() : null;
         return new ConfigReply
         {
             Envelope = AgentEnvelope.From(json),
+            Json = json,
             Hash = json["hash"].AsText(),
             Bytes = json["bytes"].AsLong(),
             Meta = meta,
-            Document = controller.IsObject ? controller.RawText() : controller.AsText(),
+            Raw = raw,
+            Document = raw ?? Rebuilt(controller),
             Action = json["action"].AsText(),
             Divergent = json["divergent"].AsBool() ?? false,
             Current = ControllerMark.From(json["current"]),
+            LaunchChanges = json["launchChanges"].AsStringList(),
+            Problems = json["problems"].Map(ConfigProblem.From),
         };
+    }
+
+    private static string? Rebuilt(Value controller)
+    {
+        if (controller.Raw.ValueKind == JsonValueKind.String) return controller.Raw.GetString();
+        if (!controller.IsObject) return null;
+        try
+        {
+            return DocumentJson.Print(DocumentJson.Read(controller.RawText(), out _));
+        }
+        catch (DocumentJson.Malformed)
+        {
+            return null;
+        }
     }
 
     /// Whether the machine stored the document, took it as already held, or replaced what it had.

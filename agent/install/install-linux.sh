@@ -20,7 +20,16 @@
 # after logout and come up on boot without anyone signing in:
 #   sudo loginctl enable-linger "$(id -un)"
 #
+# --uninstall takes the timer, its units, the launchers and the agent trees
+# away again, and leaves what the agent was configured with and what it
+# recorded. --uninstall --purge removes those as well.
+#
 set -euo pipefail
+
+# Everything written from here on is this user's alone. The base holds every
+# command the agent was configured with, the setup and the record of every
+# operation, and the units and launchers say where all of that lives.
+umask 077
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -56,6 +65,9 @@ SRC_AGENT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 
 MIN_NODE_MAJOR=24
 SKIP_SCHEDULER=0
+T3_ASKED=0
+UNINSTALL=0
+PURGE=0
 
 # Collected for the summary at the end.
 SUMMARY=()
@@ -65,17 +77,33 @@ die()  { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
 
 for arg in "$@"; do
   case "$arg" in
-    --with-t3) WITH_T3=1 ;;
+    --with-t3) WITH_T3=1; T3_ASKED=1 ;;
     --skip-scheduler) SKIP_SCHEDULER=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --purge) PURGE=1 ;;
     -h|--help)
-      printf 'usage: install-linux.sh [--with-t3] [--skip-scheduler]\n\n' >&2
+      printf 'usage: install-linux.sh [--with-t3] [--skip-scheduler]\n' >&2
+      printf '       install-linux.sh --uninstall [--purge]\n\n' >&2
       printf '  --with-t3   also install the reference example service (T3 Code)\n' >&2
       printf '  --skip-scheduler   install and verify files without changing systemd\n' >&2
+      printf '  --uninstall   remove the timer, its units, the launchers and the agent,\n' >&2
+      printf '                and keep its config and records\n' >&2
+      printf '  --purge       with --uninstall, remove the config and records too\n' >&2
       exit 0
       ;;
     *) die "unknown argument: $arg" ;;
   esac
 done
+if [ "$UNINSTALL" -eq 1 ]; then
+  if [ "$T3_ASKED" -eq 1 ] || [ "$SKIP_SCHEDULER" -eq 1 ]; then
+    die "--uninstall takes --purge and nothing else."
+  fi
+  # The reference service is not part of the agent, and uninstalling leaves it
+  # alone, so nothing it needs is checked for either.
+  WITH_T3=0
+elif [ "$PURGE" -eq 1 ]; then
+  die "--purge only goes with --uninstall."
+fi
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -94,6 +122,23 @@ esac
 case "$BASE$NPM_PREFIX$UNIT_DIR" in
   *$'\n'*|*$'\r'*) die "install paths containing a line break are unsupported." ;;
 esac
+# The base is a folder of the agent's own. Installing makes it and everything
+# in it this user's alone, and uninstalling takes out what it knows by name, so
+# the home directory, or a folder that holds it, would lose its bin and every
+# other account's access to it. Refused before either.
+if [ -d "$BASE" ]; then
+  REAL_BASE="$(cd -- "$BASE" && pwd -P)"
+  REAL_HOME="$(cd -- "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
+  case "$REAL_HOME/" in
+    "${REAL_BASE%/}/"*) die "LEGIONCTL_HOME is $BASE, which is not a folder of the agent's own but holds the home directory. Point it at one, such as \$HOME/.legion-control. Nothing was changed." ;;
+  esac
+fi
+# The units take the port as a bare word, which is only safe for a number.
+if [ "$WITH_T3" -eq 1 ]; then
+  case "$PORT" in
+    ''|*[!0-9]*) die "LEGION_T3_PORT must be a port number, got '$PORT'." ;;
+  esac
+fi
 
 # Pin the explicitly selected Node, or the executable available in this setup
 # session. The scheduler later uses that absolute path without searching PATH.
@@ -132,6 +177,160 @@ fi
 
 if [ "$SKIP_SCHEDULER" -ne 1 ] && ! systemctl --user show-environment >/dev/null 2>&1; then
   die "no systemd user manager for this session. Check 'loginctl show-user $(id -un) -p Linger'."
+fi
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+# Remove the agent's own entries from the base. "code" is the launchers, every
+# agent tree, the swap journal and the inventory of a local baseline; "purge"
+# adds what the agent was configured with and what it recorded. Nothing else in
+# the base is touched: it is not the agent's, so it is named instead.
+#
+# It runs under the operation lock every mutating agent command takes, the way
+# an install promotes a tree, so an operation under way keeps its code and the
+# uninstall stops before anything is gone. Everything it removes is moved
+# aside first, all of it or none, and only then deleted, so an entry that
+# cannot be moved stops it with nothing gone either. The lock goes last, once
+# released. install-windows.ps1 runs the same code. Prints what it did, one
+# line each.
+remove_agent_files() {
+  "$NODE_BIN" --input-type=module - "$BASE" "$1" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+const [base, scope] = process.argv.slice(2);
+const CODE = /^(?:bin|agent|agent\..+|agent-swap\.json|agent-baseline\.json)$/;
+const DATA = /^(?:config\..+|controller\..+|agent-floor\.json.*|state|state\.json.*|ops|incoming|legionctl\.log.*|launchd\.log|update\.lock.*|op\.lock.*)$/;
+const say = (line) => process.stdout.write(`${line}\n`);
+
+// Moves all of `names` into one folder in the base, or none of them, and
+// returns that folder. On Windows a file in use, or a folder a process works
+// in, cannot be moved, and deleting one entry after another would stop there
+// with the job still running what is left. The folder is named like an agent
+// tree, so the next uninstall takes it if it outlives this one.
+function moveAside(names) {
+  const aside = path.join(base, `agent.removed.${process.pid}.${Date.now()}`);
+  fs.mkdirSync(aside);
+  const moved = [];
+  try {
+    for (const name of names) {
+      fs.renameSync(path.join(base, name), path.join(aside, name));
+      moved.push(name);
+    }
+  } catch (error) {
+    const stuck = moved.reverse().filter((name) => {
+      try { fs.renameSync(path.join(aside, name), path.join(base, name)); return false; }
+      catch { return true; }
+    });
+    if (stuck.length > 0) throw new Error(`${error.message}; ${stuck.join(', ')} could not be put back from ${aside}`);
+    fs.rmdirSync(aside);
+    throw new Error(`${error.message}; nothing was removed`);
+  }
+  return aside;
+}
+
+function remove() {
+  if (!fs.existsSync(base)) return;
+  const db = new DatabaseSync(path.join(base, 'op.lock.sqlite'));
+  try {
+    db.exec('PRAGMA busy_timeout = 250');
+    try { db.exec('BEGIN IMMEDIATE'); }
+    catch (error) {
+      if (error?.errcode === 5) throw new Error('another operation is running; nothing was removed');
+      throw error;
+    }
+    const doomed = fs.readdirSync(base).filter((name) => (CODE.test(name) || (scope === 'purge' && DATA.test(name))) && !name.startsWith('op.lock')).sort();
+    if (doomed.length > 0) {
+      const aside = moveAside(doomed);
+      for (const name of doomed) say(`removed ${path.join(base, name)}`);
+      try { fs.rmSync(aside, { recursive: true, force: true }); }
+      catch (error) { say(`could not delete all of ${aside} yet, and the next uninstall does: ${error.message}`); }
+    }
+  } finally {
+    try { db.exec('ROLLBACK'); } catch { /* no transaction if acquisition failed */ }
+    db.close();
+  }
+  if (scope !== 'purge') return;
+  for (const name of fs.readdirSync(base).filter((each) => each.startsWith('op.lock'))) {
+    try { fs.rmSync(path.join(base, name), { recursive: true, force: true }); }
+    catch (error) { say(`could not remove ${path.join(base, name)}: ${error.message}`); }
+  }
+  const left = fs.readdirSync(base).sort();
+  if (left.length === 0) {
+    fs.rmdirSync(base);
+    say(`removed ${base}`);
+  }
+  for (const name of left.filter((each) => !CODE.test(each) && !DATA.test(each))) say(`kept ${path.join(base, name)}, which is not the agent's`);
+}
+
+try { remove(); }
+catch (error) {
+  process.stderr.write(`${error.message}\n`);
+  process.exitCode = 1;
+}
+NODE
+}
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  step "Uninstall"
+  # The summary is of what was removed; what the preflight found was said above.
+  SUMMARY=()
+
+  # A cycle the timer started is left to finish. Stopped part way it can leave
+  # a service down, and with the timer gone nothing comes back to recover it.
+  case "$(systemctl --user is-active legion-control-update.service 2>/dev/null || true)" in
+    active|activating|deactivating|reloading)
+      die "an update cycle is running right now. It finishes within 30 minutes; run this again then. Nothing was changed. Watch it with: journalctl --user -u legion-control-update.service -f"
+      ;;
+  esac
+
+  # The files first, so an operation holding the lock stops the uninstall
+  # before anything has changed. A timer that fires in the moment before its
+  # units go finds no launcher and fails, which does no harm.
+  SCOPE=code
+  if [ "$PURGE" -eq 1 ]; then SCOPE=purge; fi
+  if ! REMOVED="$(remove_agent_files "$SCOPE")"; then
+    die "uninstalling stopped there. The timer and its units were left as they were."
+  fi
+  while IFS= read -r line; do
+    [ -z "$line" ] || note "$line"
+  done <<< "$REMOVED"
+
+  for unit in legion-control-update.timer legion-control-update.service "${OLD_UNITS[@]}"; do
+    if [ -f "$UNIT_DIR/$unit" ]; then
+      systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
+      rm -f "$UNIT_DIR/$unit"
+      note "removed $unit"
+    fi
+  done
+  systemctl --user daemon-reload
+
+  # This copy of the installer may have been the installed agent's and gone with
+  # it, and then it is run again from a copy of the repository.
+  AGAIN='bash agent/install/install-linux.sh'
+  if [ -f "$SCRIPT_DIR/install-linux.sh" ]; then AGAIN="bash $(printf '%q' "$SCRIPT_DIR/install-linux.sh")"; fi
+
+  printf '\n== Legion Control, Linux side removed\n\n'
+  for line in "${SUMMARY[@]}"; do printf '  %s\n' "$line"; done
+  if [ "$PURGE" -ne 1 ] && [ -d "$BASE" ]; then
+    printf '\n  What the agent was configured with and what it recorded were left in:\n'
+    printf '    %s\n' "$BASE"
+    printf '\n  Remove those too:\n'
+    printf '    %s --uninstall --purge\n' "$AGAIN"
+  fi
+  if grep -qs 'dispatch\.sh' "$HOME/.ssh/authorized_keys"; then
+    printf '\n  A key in %s runs dispatch.sh, which is gone, so it is refused from now on.\n' "$HOME/.ssh/authorized_keys"
+    printf '  Take its line out.\n'
+  fi
+  if [ -f "$UNIT_DIR/t3-code.service" ]; then
+    printf '\n  t3-code.service is a service the agent looked after, not part of it, and was left as it is.\n'
+  fi
+  printf '\n  Put the agent back:\n'
+  printf '    %s\n\n' "$AGAIN"
+  exit 0
 fi
 
 # ---------------------------------------------------------------------------
@@ -185,6 +384,9 @@ fi
 step "Agent"
 
 mkdir -p "$BASE" "$BIN_DIR"
+# Closed before anything goes in, also when an older installer left it open:
+# the umask covers only what is created from now on.
+chmod 700 "$BASE"
 
 verify_tree() {
   LEGIONCTL_HOME="$BASE" LEGIONCTL_LAUNCHER_LIBRARY=1 "$NODE_BIN" --input-type=module - "$SCRIPT_DIR/launcher.mjs" "$1" <<'NODE'
@@ -224,10 +426,10 @@ const [template, output, node] = process.argv.slice(2);
 const literal = "'" + node.replace(/'/g, "'\\''") + "'";
 fs.writeFileSync(output, fs.readFileSync(template, 'utf8').replace('@NODE_SHELL@', () => literal));
 NODE
-chmod 755 "$LAUNCHER.new.$$"
+chmod 700 "$LAUNCHER.new.$$"
 mv "$LAUNCHER.new.$$" "$LAUNCHER"
 cp -p "$SCRIPT_DIR/dispatch.sh" "$BIN_DIR/dispatch.sh.new.$$"
-chmod 755 "$BIN_DIR/dispatch.sh.new.$$"
+chmod 700 "$BIN_DIR/dispatch.sh.new.$$"
 mv "$BIN_DIR/dispatch.sh.new.$$" "$BIN_DIR/dispatch.sh"
 
 
@@ -264,6 +466,13 @@ if ! "$LAUNCHER" version --check >/dev/null; then
 fi
 note "stable launcher installed at $LAUNCHER and passed version --check"
 
+# Nothing in the base is anyone else's. The copies above keep the modes of the
+# source, and the agent narrows a file an older version wrote only when it next
+# writes it, so everything is narrowed here once.
+if ! chmod -R go-rwx "$BASE" 2>/dev/null; then
+  note "WARNING: some files under $BASE could not be made private. Another user owns them: find $(printf '%q' "$BASE") ! -user $(id -un)"
+fi
+
 # config.json and state.json are deliberately NOT written here. The agent falls
 # back to its own defaults when they are absent, and an installer that stamped a
 # fresh config over the top would silently flip auto update back on every time
@@ -296,17 +505,29 @@ render_unit() {
 
   [ -f "$src" ] || die "missing unit template $src."
 
-  local launcher_unit
-  launcher_unit="$("$NODE_BIN" -e 'process.stdout.write(process.argv[1].replace(/\\/g,"\\\\").replace(/"/g,"\\\"").replace(/%/g,"%%"))' "$LAUNCHER")"
-  sed \
-    -e "s|@NPM_BIN@|$NPM_BIN|g" \
-    -e "s|@LAUNCHER@|$(printf '%s' "$launcher_unit" | sed 's/[&|]/\\&/g')|g" \
-    -e "s|@PORT@|$PORT|g" \
-    -e "s|@UID@|$(id -u)|g" \
-    "$src" > "$tmp"
+  # Node fills the placeholders in, not sed: a home directory can hold any
+  # character, and a sed replacement reads & | and \ as its own syntax. Every
+  # path in the templates is written inside double quotes, where systemd reads \
+  # and " as escapes and % as the start of a specifier, and on an Exec line it
+  # expands $ as well (systemd.syntax(7), systemd.service(5)). Each value is
+  # escaped for exactly that. The port and the uid are digits and need nothing.
+  "$NODE_BIN" --input-type=module - "$src" "$tmp" "$NPM_BIN" "$LAUNCHER" "$PORT" "$(id -u)" <<'NODE' || die "could not render $name."
+import fs from 'node:fs';
+const [source, output, npmBin, launcher, port, uid] = process.argv.slice(2);
+const values = { NPM_BIN: npmBin, LAUNCHER: launcher, PORT: port, UID: uid };
+const escape = (value, exec) => {
+  const quoted = value.replace(/[\\"]/g, (character) => `\\${character}`).replace(/%/g, () => '%%');
+  return exec ? quoted.replace(/\$/g, () => '$$') : quoted;
+};
+const lines = fs.readFileSync(source, 'utf8').split('\n').map((line) => {
+  const exec = /^\s*Exec[A-Za-z]*=/.test(line);
+  return line.replace(/@([A-Z_]+)@/g, (token, name) => (Object.hasOwn(values, name) ? escape(values[name], exec) : token));
+});
+fs.writeFileSync(output, lines.join('\n'));
+NODE
 
-  # Catch a placeholder that was added to a template but never added to the sed
-  # list above, which would otherwise install a unit with a literal token in it.
+  # Catch a placeholder that was added to a template but not to the values
+  # above, which would otherwise install a unit with a literal token in it.
   # Comment lines are skipped: the templates talk about placeholders in prose.
   if grep -v '^[[:space:]]*#' "$tmp" | grep -Eq '@[A-Z_]+@'; then
     rm -f "$tmp"

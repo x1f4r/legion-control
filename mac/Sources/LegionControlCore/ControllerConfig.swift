@@ -303,9 +303,17 @@ struct Endpoint: Decodable, Sendable, Equatable, Identifiable {
 
 /// Wake on LAN. A machine without this block simply has no Wake button.
 struct WakeConfig: Decodable, Sendable, Equatable {
-    var mac: String
+    /// The hardware address a magic packet carries. A block without one is woken only through its
+    /// helpers: the schema allows it, and section 9.7 makes it a warning rather than a refusal.
+    var mac: String?
+    /// The broadcast addresses as the setup lists them, none when it lists none. Which of them a
+    /// packet goes to, and what it falls back to, is the plan's to decide (section 10.2): the site's
+    /// own broadcast comes before 255.255.255.255, and this used to default to the latter here,
+    /// where the plan could no longer tell "none" from "255.255.255.255".
     var broadcast: [String]
+    /// The ports as the setup lists them; the plan falls back to 9 and 7.
     var ports: [UInt16]
+    /// Not used: readiness is an authenticated status poll, never a TCP probe. Kept for 1.2 setups.
     var probe: Probe?
     /// A machine that names no site falls back to this prefix. Advisory, exactly as a site's
     /// prefixes are.
@@ -334,16 +342,16 @@ struct WakeConfig: Decodable, Sendable, Equatable {
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        mac = try container.decode(String.self, forKey: .mac)
-        broadcast = try container.decodeIfPresent([String].self, forKey: .broadcast) ?? ["255.255.255.255"]
-        ports = try container.decodeIfPresent([UInt16].self, forKey: .ports) ?? [9, 7]
+        mac = try container.decodeIfPresent(String.self, forKey: .mac)
+        broadcast = try container.decodeIfPresent([String].self, forKey: .broadcast) ?? []
+        ports = try container.decodeIfPresent([UInt16].self, forKey: .ports) ?? []
         probe = try container.decodeIfPresent(Probe.self, forKey: .probe)
         lanPrefix = try container.decodeIfPresent(String.self, forKey: .lanPrefix)
         helpers = try container.decodeIfPresent([WakeHelper].self, forKey: .helpers)
         helper = try container.decodeIfPresent(WakeHelper.self, forKey: .helper)
     }
 
-    init(mac: String, broadcast: [String] = ["255.255.255.255"], ports: [UInt16] = [9, 7],
+    init(mac: String?, broadcast: [String] = [], ports: [UInt16] = [],
          probe: Probe? = nil, lanPrefix: String? = nil, helpers: [WakeHelper]? = nil,
          helper: WakeHelper? = nil) {
         self.mac = mac
@@ -361,10 +369,11 @@ struct WakeConfig: Decodable, Sendable, Equatable {
         return helper.map { [$0] } ?? []
     }
 
-    /// The six bytes of the hardware address, or nil when it is not one. Validation refuses a config
-    /// that gets this far with nil, so nothing downstream has to explain a wake that silently did
-    /// nothing.
+    /// The six bytes of the hardware address, or nil when there is none or it is not one. The schema
+    /// refuses a malformed one, so nil here means the block names no address and only its helpers
+    /// can wake the machine.
     var macBytes: [UInt8]? {
+        guard let mac else { return nil }
         let parts = mac.components(separatedBy: CharacterSet(charactersIn: ":-"))
         let bytes = parts.compactMap { UInt8($0, radix: 16) }
         guard parts.count == 6, bytes.count == 6 else { return nil }
@@ -425,7 +434,15 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
     /// why it has none, worked out from `platform`, `shell` and `restricted` as the document has
     /// them. A route whose last status reported a restricted session can still move it to the
     /// dispatcher's grammar at run time; nothing moves it anywhere else.
+    ///
+    /// On a model the app runs, this and `agent` are the launch gate's (LaunchGate.swift): the tuple
+    /// this device approved, whatever the document says now.
     var grammar: Result<CommandGrammar, CommandLineRefusal>
+    /// Whether this device runs this system's command, and which one. Never read from a document:
+    /// a decoded system starts not driven, so the launch gate is the only thing that makes one
+    /// runnable, and a transport built from the document as it arrived rather than the gated model
+    /// sends nothing. A system built in code rather than decoded is taken as approved.
+    var launchState: LaunchState = .approved
 
     private enum CodingKeys: String, CodingKey {
         case id, name, platform, agent, symbol, shell, restricted
@@ -442,6 +459,7 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
         restricted = try container.decodeIfPresent(Bool.self, forKey: .restricted)
         grammar = CommandGrammar.resolve(platform: platform, shell: shell, restricted: restricted,
                                          restrictedSession: false, agentLength: agent.count)
+        launchState = .notDriven
     }
 
     /// Used by the tests and by the guided setup, which build systems rather than decode them.
@@ -460,7 +478,11 @@ struct SystemConfig: Decodable, Sendable, Equatable, Identifiable {
 
     var symbolName: String { symbol ?? platform.symbolName }
 
-    var isRestricted: Bool { restricted == true }
+    /// True when this system's lines are written in the dispatcher's grammar, because its key is
+    /// restricted to a forced command. Read from the grammar rather than from `restricted`: on a
+    /// gated model that is the approved tuple's grammar (section 13 of the contract), and a peer
+    /// clearing `restricted` in the document does not make this device treat the key as a full one.
+    var isRestricted: Bool { grammar == .success(.dispatch) }
 }
 
 enum Platform: String, Decodable, Sendable, Equatable, CaseIterable {
@@ -528,201 +550,37 @@ struct ConfigProblem: Error, Sendable {
 }
 
 extension ControllerConfig {
-    /// Read on load. A config that fails this is not half-applied: the previous one stays and the
-    /// window says why, because a machine with no systems or an unparseable hardware address has no
-    /// sensible default to fall back to.
-    func validated() throws -> ControllerConfig {
-        if let controller {
-            if let id = controller.id, !AgentToken.isValidSetupID(id) {
-                throw ConfigProblem("The setup id must start with a letter or digit, use only letters, digits, . _ : -, and contain at most 64 characters.")
-            }
-            guard controller.revisionNumber >= 0 else {
-                throw ConfigProblem("The controller revision is negative.")
-            }
-            guard controller.lineageIsValid else {
-                throw ConfigProblem("The controller lineage has to be at most \(ControllerIdentity.lineageLimit) distinct lower case sha256 hashes.")
-            }
-        }
-
-        var seenSites = Set<String>()
-        for site in sites ?? [] {
-            guard !site.id.isEmpty else { throw ConfigProblem("A site has an empty id.") }
-            guard seenSites.insert(site.id).inserted else {
-                throw ConfigProblem("Two sites share the id \"\(site.id)\". Ids have to be unique.")
-            }
-        }
-
-        var seenMachines = Set<String>()
-        for machine in machines {
-            guard !machine.id.isEmpty else {
-                throw ConfigProblem("A machine has an empty id.")
-            }
-            guard seenMachines.insert(machine.id).inserted else {
-                throw ConfigProblem("Two machines share the id \"\(machine.id)\". Ids have to be unique.")
-            }
-            // Addresses and login names arrive from peers and reach ssh, ssh-keyscan and known_hosts,
-            // which read commas, stars, leading hyphens and shell syntax as instructions. The shared
-            // schema's guard grammar is what every client and the agent hold a document to.
-            for (host, user) in machine.endpoints.map({ ($0.host, $0.user) })
-                + (machine.ssh.map { [($0.host, $0.user)] } ?? []) {
-                guard SetupGuard.isHost(host) else {
-                    throw ConfigProblem("Machine \"\(machine.id)\" has the address \(SetupGuard.describe(host)), which is not a host name or IP address.")
-                }
-                if let user, !SetupGuard.isUser(user) {
-                    throw ConfigProblem("Machine \"\(machine.id)\" has the login name \(SetupGuard.describe(user)), which is not one ssh can be given safely.")
-                }
-            }
-
-            // A machine with no systems, or with no address, is not a broken document: the shared
-            // schema allows both, and refusing one would mean this device could not carry a setup
-            // another peer considers perfectly valid. Such a machine is drawn as one nothing can be
-            // done to, and `warnings()` says why.
-
-            var seenSystems = Set<String>()
-            for system in machine.systems {
-                guard !system.id.isEmpty else {
-                    throw ConfigProblem("A system on machine \"\(machine.id)\" has an empty id.")
-                }
-                guard seenSystems.insert(system.id).inserted else {
-                    throw ConfigProblem("Machine \"\(machine.id)\" has two systems with the id \"\(system.id)\".")
-                }
-                guard !system.agent.isEmpty else {
-                    throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" has no \"agent\" command. It has to be the argv to run over ssh.")
-                }
-                // The argv is run over ssh word by word, so an empty word or a control character in
-                // one is never something a person meant. The agent refuses the same items.
-                for item in system.agent where !SetupGuard.isAgentArg(item) {
-                    throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" has an \"agent\" word that is empty, too long or holds a control character (\(SetupGuard.describe(item))).")
-                }
-                // The shared schema allows exactly these three. Any other spelling used to stop the
-                // document decoding at all, and it is still refused, now with a sentence that says
-                // which system and why.
-                if let shell = system.shell, !["posix", "cmd", "powershell"].contains(shell) {
-                    throw ConfigProblem("System \"\(system.id)\" on machine \"\(machine.id)\" names the shell \"\(shell)\". Use posix, cmd or powershell.")
-                }
-            }
-
-            if let site = machine.site, !site.isEmpty, !seenSites.contains(site) {
-                throw ConfigProblem("Machine \"\(machine.id)\" names the site \"\(site)\", which is not in the sites list.")
-            }
-
-            if let wake = machine.wake {
-                if wake.macBytes == nil {
-                    throw ConfigProblem("The wake address \"\(wake.mac)\" on machine \"\(machine.id)\" is not a six byte hardware address.")
-                }
-                // The singular key is what a 1.2 client reads, so it has to be the first of the
-                // list rather than some other machine: a document where they disagree would wake
-                // different things depending on which app was open.
-                if let helper = wake.helper, let first = wake.helpers?.first, helper != first {
-                    throw ConfigProblem("Machine \"\(machine.id)\" lists \(first.machine) as its first wake helper but \(helper.machine) in the compatibility \"helper\" key. They have to be the same.")
-                }
-                if wake.helper != nil, wake.helpers?.isEmpty == true {
-                    throw ConfigProblem("Machine \"\(machine.id)\" has an empty wake helper list beside a \"helper\" entry. Remove one of them.")
-                }
-
-                for helper in wake.orderedHelpers {
-                    guard helper.machine != machine.id else {
-                        throw ConfigProblem("Machine \"\(machine.id)\" lists itself as its own wake helper. A machine that is asleep cannot wake itself.")
-                    }
-                    guard machines.contains(where: { $0.id == helper.machine }) else {
-                        throw ConfigProblem("The wake helper \"\(helper.machine)\" for machine \"\(machine.id)\" is not a machine in this setup.")
-                    }
-                    guard AgentToken.isValid(helper.action) else {
-                        throw ConfigProblem("The wake helper action \"\(helper.action)\" for machine \"\(machine.id)\" is not a valid action id.")
-                    }
-                }
-            }
-        }
-
-        // A cycle would have the app walk helpers forever, and it means the setup describes a wake
-        // path that cannot start anywhere.
-        if let cycle = wakeHelperCycle() {
-            throw ConfigProblem("The wake helpers form a loop: \(cycle.joined(separator: " → ")). One of them has to be a machine that is already awake.")
-        }
-        // The release repository decides where this app downloads itself from, so it is held to
-        // the way GitHub spells owner/name rather than pasted into a URL as it came.
-        if let repo = appUpdates?.githubRepo, !repo.isEmpty, !SetupGuard.isRepository(repo) {
-            throw ConfigProblem("The update repository \(SetupGuard.describe(repo)) is not a GitHub owner/name.")
-        }
-        return self
-    }
-
-    /// The first cycle in the helper graph, or nil when there is none.
-    func wakeHelperCycle() -> [String]? {
-        var colour: [String: Int] = [:]   // 0 unvisited, 1 on the stack, 2 done
-        var stack: [String] = []
-
-        func visit(_ id: String) -> [String]? {
-            switch colour[id] ?? 0 {
-            case 1:
-                if let start = stack.firstIndex(of: id) { return Array(stack[start...]) + [id] }
-                return [id, id]
-            case 2:
-                return nil
-            default:
-                break
-            }
-            colour[id] = 1
-            stack.append(id)
-            defer {
-                stack.removeLast()
-                colour[id] = 2
-            }
-            for helper in machine(id: id)?.wake?.orderedHelpers ?? [] {
-                if let found = visit(helper.machine) { return found }
-            }
-            return nil
-        }
-
-        for machine in machines {
-            if let found = visit(machine.id) { return found }
-        }
-        return nil
-    }
-
-    /// Things worth saying about a setup that are not reasons to refuse it.
+    /// The typed model of a document this device applies, errors and all.
     ///
-    /// A wake path that cannot work from anywhere is not an invalid document; it is a document whose
-    /// Wake button will always say no, and the person editing it should be told that while they are
-    /// editing rather than the first time they need it.
-    func warnings() -> [String] {
-        var out: [String] = []
-        for machine in machines {
-            if machine.systems.isEmpty {
-                out.append("\(machine.name) lists no systems, so nothing can be run on it from here. Add one with the agent command for that machine.")
-            }
-            if machine.routes.isEmpty {
-                out.append("\(machine.name) has no address and no ssh alias, so there is no way to reach it.")
-            }
-            for route in machine.routes {
-                if let part = Addresses.undialablePart(of: route.target) {
-                    out.append("\(machine.name) lists \(route.target.display), which this app never dials, scans or pins: \(part) is not one it accepts.")
-                }
-            }
-            for system in machine.systems {
-                if case .failure(let refusal) = system.grammar {
-                    out.append("\(system.name) on \(machine.name) is never sent anything. \(refusal.message)")
-                }
-            }
-            guard let wake = machine.wake else { continue }
-            let helpers = wake.orderedHelpers
-            let placed = machine.site != nil || wake.lanPrefix != nil
+    /// Section 9.7 keeps the applied document whatever it breaks, as long as section 12 accepts its
+    /// bytes, and a machine an error is inside is not driven. So that machine is left out of the
+    /// model: nothing dials it and nothing runs on it, and the rest of the setup works as before. An
+    /// error outside the machines that stops the model being read at all, a site list that is not
+    /// a list, takes the part it is in out of the model too.
+    static func applied(_ canonical: Data, errors: [DocumentAcceptance.Problem]) throws -> ControllerConfig {
+        var tree = try SetupJSON.parse(canonical, repeats: .lastWins)
+        let broken = Set(errors.compactMap(\.machineIndex))
+        if !broken.isEmpty, let machines = tree["machines"]?.items {
+            tree["machines"] = .array(machines.indices.filter { !broken.contains($0) }.map { machines[$0] })
+        }
+        let decoder = JSONDecoder()
+        if let config = try? decoder.decode(ControllerConfig.self, from: tree.documentData) { return config }
+        for problem in errors {
+            let key = String(problem.path.prefix { $0 != "." && $0 != "[" })
+            if !key.isEmpty, key != "machines", key != "version" { tree[key] = nil }
+        }
+        return try decoder.decode(ControllerConfig.self, from: tree.documentData)
+    }
 
-            if helpers.isEmpty, !placed {
-                out.append("\(machine.name) can only be woken by a device that is already on its network: it names no site, no LAN prefix and no helper.")
-            }
-            for helper in helpers {
-                guard let host = self.machine(id: helper.machine) else { continue }
-                if let helperSite = host.site, let targetSite = machine.site, helperSite != targetSite {
-                    out.append("\(host.name) is listed as a wake helper for \(machine.name) but they are at different sites. That only works if the action reaches \(machine.name)'s network another way, through a router or a tunnel.")
-                }
-            }
-            if !helpers.isEmpty, helpers.allSatisfy({ self.machine(id: $0.machine)?.alwaysOn != true }) {
-                let where_ = machine.site.flatMap { site(id: $0)?.name } ?? "that network"
-                out.append("None of the wake helpers for \(machine.name) is marked as always on, so waking it from elsewhere depends on something at \(where_) happening to be awake.")
+    /// What section 9.7 does not cover but this app cannot use either: a system with a command and
+    /// no grammar to write it in (section 15.1), which is never sent anything.
+    func commandWarnings() -> [String] {
+        machines.flatMap { machine in
+            machine.systems.compactMap { system -> String? in
+                guard !system.agent.isEmpty, case .failure(let refusal) = system.grammar else { return nil }
+                return "\(system.name) on \(machine.name) is never sent anything. \(refusal.message)"
             }
         }
-        return out
     }
 }
 
@@ -801,33 +659,6 @@ struct ControllerIdentity: Codable, Sendable, Equatable {
         )
     }
 
-    /// The identity for a merge of two branches.
-    func merged(with other: ControllerIdentity, mineHash: String, theirsHash: String,
-                device: String, now: Date = Date()) -> ControllerIdentity {
-        // Both parents first, then the two histories interleaved so neither branch is dropped
-        // wholesale when the cap bites.
-        var chain = [mineHash, theirsHash]
-        var mine = ancestors.makeIterator()
-        var theirs = other.ancestors.makeIterator()
-        while chain.count < Self.lineageLimit {
-            let a = mine.next()
-            let b = theirs.next()
-            if a == nil, b == nil { break }
-            if let a, !chain.contains(a) { chain.append(a) }
-            if chain.count >= Self.lineageLimit { break }
-            if let b, !chain.contains(b) { chain.append(b) }
-        }
-        return ControllerIdentity(
-            id: id ?? other.id,
-            name: name ?? other.name,
-            revision: max(revisionNumber, other.revisionNumber) + 1,
-            updatedAt: ISO8601DateFormatter.lenient.string(from: now),
-            source: Self.sourceKind,
-            device: device,
-            lineage: Array(chain.prefix(Self.lineageLimit))
-        )
-    }
-
     /// Who wrote it, in words, for the divergence sheet.
     var authorDescription: String {
         let who = [device, source].compactMap { $0 }.first ?? "an unknown device"
@@ -849,47 +680,16 @@ struct ControllerDocument: Sendable, Equatable {
     /// The sha256 of exactly those bytes, lower case hex.
     var hash: String
     var identity: ControllerIdentity
+    /// What section 9.7 refuses about it. The applied document is kept with its errors, and a
+    /// document with any is not published until they are fixed (section 9.5).
+    var errors: [DocumentAcceptance.Problem] = []
 
-    init(bytes: Data, hash: String, identity: ControllerIdentity = ControllerIdentity()) {
+    init(bytes: Data, hash: String, identity: ControllerIdentity = ControllerIdentity(),
+         errors: [DocumentAcceptance.Problem] = []) {
         self.bytes = bytes
         self.hash = hash
         self.identity = identity
-    }
-
-    /// How this document stands against what a machine is holding.
-    ///
-    /// This replaces comparing revision numbers, which cannot tell "newer" from "different" once
-    /// more than one device may write. Descent can.
-    func standing(against remote: ControllerIdentity, remoteHash: String?) -> Standing {
-        guard let remoteId = remote.id, let mine = identity.id else {
-            // One side carries no identity at all: a hand written file, or a copy pushed by a client
-            // from before any of this. There is nothing to compare, and the push rules treat an
-            // unidentified copy as replaceable.
-            return remote.id == nil ? .remoteHasNoIdentity : .differentSetup
-        }
-        guard mine == remoteId else { return .differentSetup }
-        guard let remoteHash else { return .cannotTell }
-        if remoteHash == hash { return .same }
-        if identity.descends(from: remoteHash) { return .weAreAhead }
-        if remote.descends(from: hash) { return .weAreBehind }
-        return .diverged
-    }
-
-    enum Standing: Sendable, Equatable {
-        /// The machine holds exactly this document.
-        case same
-        /// The machine holds an ancestor of this one: safe to push.
-        case weAreAhead
-        /// This document is an ancestor of the machine's: safe to fetch.
-        case weAreBehind
-        /// Same setup, neither descends from the other. A person has to decide.
-        case diverged
-        /// A different setup id. A person has to decide.
-        case differentSetup
-        /// The machine holds something with no identity, so anything may be written over it.
-        case remoteHasNoIdentity
-        /// Not enough information yet: the machine's hash is not known.
-        case cannotTell
+        self.errors = errors
     }
 
     /// Build one from whatever was read off disk. Throws for bytes that are not valid UTF-8, which
@@ -932,6 +732,9 @@ enum SetupSharing: Sendable, Equatable {
     /// The machine is behind and is being given this document. Automatic: it descends from what
     /// they hold, so nothing of theirs is lost.
     case publishing
+    /// A push the machine refused for a reason trying again cannot fix, kept back until the setup
+    /// changes or a person asks. The sentence says why.
+    case held(String)
     /// Nothing to say: the machine has not been read, or this Mac has no usable config to share.
     case unknown
 }
@@ -960,11 +763,23 @@ final class ConfigStore {
     private(set) var hash: String?
     /// The raw file, kept for the editor, which has to start from what is actually on disk.
     private(set) var rawBytes: Data?
+    /// What section 9.7 refuses about the applied document. It is applied all the same, with every
+    /// machine an error is inside left out, and it is not published until these are gone.
+    private(set) var errors: [DocumentAcceptance.Problem] = []
+    /// What section 9.7 says this app cannot use, for a document with no errors.
+    private(set) var warnings: [DocumentAcceptance.Problem] = []
 
     /// True while the bytes on disk differ from the last document this app applied but still carry
     /// that document's controller block. Until the controller block is advanced, `document` stays
     /// nil so the unrevisioned edit cannot be published to another machine.
     private(set) var hasPendingExternalEdit = false
+
+    /// True while there is a file at the path that is not a setup document: unreadable, refused by
+    /// section 12, or not a setup this app can read. The app goes on running on the one it read
+    /// before, but that one is no longer what storage holds. A half-saved edit is the person's all
+    /// the same, so `document` is nil until the file is a document again and nothing is adopted
+    /// over it (M16).
+    private(set) var hasBrokenFile = false
 
     let url: URL
     private let revisionsURL: URL
@@ -976,13 +791,33 @@ final class ConfigStore {
 
     @ObservationIgnored private var appliedHash: String?
     @ObservationIgnored private var expectedWriteHash: String?
+    /// A document with no identity that somebody put in the setup file of a device that applied no
+    /// setup before, by its hash: that device's first setup, written there and not handed over. It
+    /// approves what it holds (section 9.9 of the contract), which `takeFirstSetupWrittenHere` hands
+    /// over once, before the launch gate reads it.
+    @ObservationIgnored private var firstSetupWrittenHere: (hash: String, bytes: Data)?
 
     @ObservationIgnored private var watcher: DispatchSourceFileSystemObject?
     @ObservationIgnored private var watchedDescriptor: CInt = -1
     @ObservationIgnored private var lastSignature: String?
+    /// The bytes the last load read, nil when it could read none. An adoption holds storage to these
+    /// rather than to the signature, which a save can leave as it was.
+    @ObservationIgnored private var lastRead: Data?
 
     /// Called after a load that actually changed something, so the app can rebuild its machines.
     var onChange: (@MainActor () -> Void)?
+
+    /// Called with the document an edit made on this device started from, nil when there was none,
+    /// and the document it produced, just before that one is written. This is how a local edit
+    /// approves the launch values it changed (section 9.9 of the contract), before they can flash up
+    /// for review. Nothing that arrives from a peer passes through here.
+    var onLocalEdit: (@MainActor (_ before: Data?, _ after: Data) -> Void)?
+
+    /// This device's record of approved launch values: beside the applied-setup state, so it moves
+    /// with `LEGION_CONTROL_HOME` exactly as that does.
+    var approvalsURL: URL {
+        appliedStateURL.deletingLastPathComponent().appending(path: "approved-launch.json")
+    }
 
     init(url: URL? = nil, revisionsDirectory: URL? = nil, appliedStateURL: URL? = nil) {
         let resolvedURL = url ?? Self.defaultURL
@@ -1026,12 +861,14 @@ final class ConfigStore {
     /// Whether the window has anything at all to show besides the setup page.
     var hasAnything: Bool { !machines.isEmpty || local != nil }
 
-    /// What there is to share, or nil while nothing usable has been read. A file that was edited
-    /// into something broken leaves the previous document here, which is the same rule the machines
-    /// list follows: the last thing that made sense is what the app is running on.
+    /// What there is to share, and what an adoption is swapped against: nil while nothing usable has
+    /// been read, while a hand edit waits for its revision, and while the file is not a document at
+    /// all. A file that was edited into something broken leaves the previous config in force, the
+    /// last thing that made sense, but storage no longer holds that document, and section 9.5 has a
+    /// device holding only an unrevisioned hand edit decide nothing until it is one.
     var document: ControllerDocument? {
-        guard !hasPendingExternalEdit, let config, let bytes, let hash else { return nil }
-        return ControllerDocument(bytes: bytes, hash: hash, identity: config.identity)
+        guard !hasPendingExternalEdit, !hasBrokenFile, let config, let bytes, let hash else { return nil }
+        return ControllerDocument(bytes: bytes, hash: hash, identity: config.identity, errors: errors)
     }
 
     // MARK: - Reading
@@ -1049,12 +886,15 @@ final class ConfigStore {
         lastSignature = Self.signature(of: url)
 
         guard let data = try? Data(contentsOf: url) else {
+            lastRead = nil
             isMissing = true
             // Not an error worth showing: no file is the state a fresh install is in, and the setup
             // page says what to do about it. An earlier config is kept, so a file that is being
-            // rewritten in place does not blank the window on its way past zero bytes.
+            // rewritten in place does not blank the window on its way past zero bytes. A file that
+            // is there and cannot be read is still somebody's, and nothing is written over it.
             problem = nil
-            if config != nil, FileManager.default.fileExists(atPath: path) { return }
+            hasBrokenFile = FileManager.default.fileExists(atPath: path)
+            if config != nil, hasBrokenFile { return }
             if config != nil {
                 config = nil
                 bytes = nil
@@ -1065,28 +905,44 @@ final class ConfigStore {
             return
         }
 
+        lastRead = data
         isMissing = false
+        // Section 12 first: bytes it refuses are no document at all, and not even the document this
+        // device applies is kept on them. The one read before stays in force.
+        if let refusal = Canonical.rejection(data) {
+            hasBrokenFile = true
+            problem = "The setup file is not a setup document: \(refusal.sentence) This app keeps using the one it read before."
+            return
+        }
+        // Everything else is applied intake (section 9.7): a hand edit, or this device's own file at
+        // start, is kept with whatever it breaks. Its errors are shown and stop it being published,
+        // and a machine one is inside is not driven, but the rest of the setup goes on working.
+        let verdict = DocumentAcceptance.check(data, intake: .applied)
         do {
-            let decoded = try JSONDecoder().decode(ControllerConfig.self, from: data)
-            let checked = try decoded.validated()
+            let canonical = try Canonical.bytes(data)
+            let checked = try ControllerConfig.applied(canonical, errors: verdict.errors)
             problem = nil
+            hasBrokenFile = false
             // Before the equality check below: a file that was reformatted without changing anything
             // this app reads is still a different document to the machines, and they compare bytes.
-            let document = try ControllerDocument(raw: data, identity: checked.identity)
+            let document = ControllerDocument(bytes: canonical, hash: Canonical.sha256(canonical),
+                                              identity: checked.identity, errors: verdict.errors)
             let previousHash = hash
             rawBytes = data
             bytes = document.bytes
             hash = document.hash
+            errors = verdict.errors
+            warnings = verdict.warnings
             let changed = checked != config || previousHash != document.hash
             config = checked
             updateAppliedState(for: document)
             if changed { onChange?() }
-        } catch let problem as ConfigProblem {
-            self.problem = problem.message
         } catch let error as DecodingError {
-            problem = Self.describe(error)
+            hasBrokenFile = true
+            problem = "The setup file could not be read, so this app keeps using the one it read before. \(Self.describe(error))"
         } catch {
-            problem = error.localizedDescription
+            hasBrokenFile = true
+            problem = "The setup file could not be read, so this app keeps using the one it read before. \(error.localizedDescription)"
         }
     }
 
@@ -1104,6 +960,10 @@ final class ConfigStore {
         }
         guard let appliedHash else {
             hasPendingExternalEdit = false
+            // This app wrote everything that came through the branch above, and approved what it
+            // had to there. A file with no identity reaching this one was put there by somebody
+            // using this device, as the first setup it applies.
+            if document.identity.id == nil { firstSetupWrittenHere = (document.hash, document.bytes) }
             markApplied(document.bytes, hash: document.hash)
             return
         }
@@ -1122,6 +982,17 @@ final class ConfigStore {
             hasPendingExternalEdit = false
             markApplied(document.bytes, hash: document.hash)
         }
+    }
+
+    /// The first setup somebody wrote into this device's setup file, with no identity, while it
+    /// applied none, once, and only while that is still the document applied here. Whoever takes it
+    /// records it as an edit made on this device to nothing, which approves every launch value it
+    /// holds: the same text pasted into the editor would have. One put over an applied setup is a
+    /// setup of its own and never comes through here, and what it changed waits for review.
+    func takeFirstSetupWrittenHere() -> Data? {
+        guard let first = firstSetupWrittenHere else { return nil }
+        firstSetupWrittenHere = nil
+        return first.hash == hash && !hasPendingExternalEdit ? first.bytes : nil
     }
 
     /// Turn a hand edit into a proper child revision by changing only its controller block.
@@ -1145,8 +1016,15 @@ final class ConfigStore {
                 parentIdentity: parentConfig.identity,
                 deviceName: deviceName
             ) { _ in }
-            let decoded = try JSONDecoder().decode(ControllerConfig.self, from: edited.bytes)
-            _ = try decoded.validated()
+            // A hand edit that breaks a rule stays applied, errors shown, but is not recorded as a
+            // revision: writing the identity into a file a person is in the middle of editing is
+            // only worth doing once it is a setup every device would accept.
+            if let error = DocumentAcceptance.check(edited.bytes, intake: .peer).errors.first {
+                throw ConfigProblem("The hand edit was not recorded as a new revision, so it is not shared: \(error.message)")
+            }
+            // A hand edit that kept the controller block is an edit made on this device, so it
+            // approves the launch values it changed since the revision it was made to.
+            onLocalEdit?(previous, edited.bytes)
             expectedWriteHash = Canonical.sha256(edited.bytes)
             try AtomicFile.write(edited.bytes, to: url)
             load()
@@ -1162,11 +1040,13 @@ final class ConfigStore {
         return problem
     }
 
+    /// Whether two documents carry the same controller block, as JSON values: a reformatted block,
+    /// or `22.0` written as `22`, is the same block.
     private static func sameControllerBlock(_ lhs: Data, _ rhs: Data) -> Bool {
-        func block(_ data: Data) -> Any? {
-            ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["controller"]
+        func block(_ data: Data) -> SetupJSON? {
+            (try? SetupJSON.parse(try Canonical.bytes(data), repeats: .lastWins))?["controller"]
         }
-        return SetupMerge.equal(block(lhs), block(rhs))
+        return SetupJSON.equal(block(lhs), block(rhs))
     }
 
     private func markApplied(_ bytes: Data, hash: String) {
@@ -1216,7 +1096,7 @@ final class ConfigStore {
     /// Read through `FileManager` rather than `URL.resourceValues`, which caches on the URL object:
     /// the store holds one URL for its whole life, so the cached values would be answered forever and
     /// an edit made while the app was open would never be noticed.
-    private static func signature(of url: URL) -> String? {
+    static func signature(of url: URL) -> String? {
         let path = url.path(percentEncoded: false)
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
               let modified = attributes[.modificationDate] as? Date
@@ -1304,13 +1184,13 @@ final class ConfigStore {
         try? Data(contentsOf: revisionsDirectory.appending(path: "\(hash).json"))
     }
 
-    /// The newest document both lineages remember, which is the base a merge needs.
-    func commonAncestor(mine: ControllerIdentity, theirs: ControllerIdentity) -> Data? {
-        let theirSet = Set(theirs.ancestors)
-        for hash in mine.ancestors where theirSet.contains(hash) {
-            if let bytes = revisionBytes(hash: hash) { return bytes }
-        }
-        return nil
+    /// The base a merge needs (section 9.8): the newest document both lineages remember whose kept
+    /// bytes still hash to the name they are kept under. A revision file that was changed on disk is
+    /// not the document it is named after, and a merge built on it would take the wrong side.
+    func commonAncestor(mineHash: String, mineLineage: [String], theirsHash: String, theirsLineage: [String]) -> Data? {
+        let base = SetupMerge.commonBase(mineHash: mineHash, theirsHash: theirsHash, mineLineage: mineLineage,
+                                         theirsLineage: theirsLineage, kept: revisionBytes(hash:))
+        return base.flatMap(revisionBytes(hash:))
     }
 
     /// Keep a copy of a document under its own hash.
@@ -1343,10 +1223,15 @@ final class ConfigStore {
     /// The edit takes effect here immediately — an offline edit is a first-class edit — and reaches
     /// the machines on the next poll, as a fast-forward from whatever they are holding. Returns nil
     /// on success or a sentence to show.
+    ///
+    /// An edit approves the launch values it changed, unless `approvesLaunchChanges` is false:
+    /// putting a kept revision back is an edit too, but what it restores was written by whoever
+    /// wrote that revision, not by the person pressing the button.
     @discardableResult
     func applyEdit(
         describedAs description: String,
         deviceName: String,
+        approvesLaunchChanges: Bool = true,
         change: (inout [String: Any]) throws -> Void
     ) -> String? {
         guard let raw = rawBytes ?? (try? Data(contentsOf: url)) else {
@@ -1361,12 +1246,19 @@ final class ConfigStore {
                 deviceName: deviceName,
                 change: change
             )
-            // Check the result before it replaces anything. An edit that produces a document this
-            // app would refuse to load is an edit that must not reach the disk: the app would come
-            // back up on the previous config with a red line under it and no way to say why.
-            let decoded = try JSONDecoder().decode(ControllerConfig.self, from: edited.bytes)
-            _ = try decoded.validated()
+            // Check the result before it replaces anything. An edit must not be what breaks a rule
+            // every device holds a setup to: the result would be applied here and published nowhere.
+            // One the document broke already does not stop an edit elsewhere, or the one that fixes
+            // it. A fault is known by the machine or site it is in rather than by its place in the
+            // list, because removing one machine moves every later one's place.
+            let tree = { (data: Data) in try? SetupJSON.parse(Canonical.bytes(data), repeats: .lastWins) }
+            let before = Set(errors.map { $0.identity(in: tree(raw)) })
+            let after = tree(edited.bytes)
+            if let added = DocumentAcceptance.check(edited.bytes, intake: .peer).errors.first(where: { !before.contains($0.identity(in: after)) }) {
+                throw ConfigProblem(added.message)
+            }
 
+            if approvesLaunchChanges { onLocalEdit?(raw, edited.bytes) }
             keepRevision(try Canonical.bytes(raw))
             expectedWriteHash = Canonical.sha256(edited.bytes)
             try AtomicFile.write(edited.bytes, to: url)
@@ -1377,37 +1269,98 @@ final class ConfigStore {
             return failure.message
         } catch let problem as ConfigProblem {
             return "That change would leave the file invalid, so nothing was written. \(problem.message)"
-        } catch let error as DecodingError {
-            return "That change would leave the file unreadable, so nothing was written. \(Self.describe(error))"
         } catch {
             return "The config could not be written to \(path). \(error.localizedDescription)"
         }
     }
 
-    /// Adopt a document read off a machine, or produced by a merge.
+    /// What became of an adoption.
+    enum AdoptOutcome: Sendable, Equatable {
+        /// The document is applied here, under this hash.
+        case adopted(hash: String)
+        /// The applied document is no longer the one the adoption was decided against, so nothing
+        /// was written. What is applied now, if anything, is `current`.
+        case headMoved(current: String?)
+        /// Nothing was written, and this says why.
+        case refused(String)
+    }
+
+    /// Adopt a document read off a machine, or produced by a merge, in place of the one applied.
     ///
-    /// The bytes are written exactly as they are: this device is not the author, and re-serialising
-    /// them would change the hash and turn a fast-forward into a divergence.
+    /// A compare-and-swap (section 9.5). The decision to adopt was made against the document
+    /// applied then, `expectedHead`, nil when there was none; reading the bytes took a round trip,
+    /// and a person may have saved an edit meanwhile. So the file is read again first, and when what
+    /// it holds is not the document expected, a hand edit is waiting to be recorded, or it is no
+    /// setup document at all, nothing is written: the edit stays, and the next status decides from
+    /// it (M16). With nothing expected, a file that is not a document is refused outright rather
+    /// than replaced. Take theirs, Keep mine and Merge come through here as well, expecting the
+    /// document the divergence sheet was built from.
+    ///
+    /// The bytes are written exactly as they are, canonicalised and never re-serialised: this device
+    /// is not their author, and writing them any other way would change the hash and turn a
+    /// fast-forward into a divergence. They are held to section 9.7 under peer intake first.
+    /// Adopting approves no launch value: what the document asks this device to run waits for a
+    /// person.
+    func adopt(_ bytes: Data, describedAs description: String, replacing expectedHead: String?) -> AdoptOutcome {
+        adopt(bytes, describedAs: description, replacing: expectedHead, enrolling: false)
+    }
+
+    /// Adopt a document as this device's first setup, approving every launch value in it.
+    ///
+    /// Only for enrolment: a device that applies no setup yet, taking one a person chose after every
+    /// launch value in it was shown to them and they confirmed. The approvals are recorded before
+    /// the file is written, so nothing it runs flashes up for review. A setup applied meanwhile
+    /// makes this a moved head like any other.
     @discardableResult
-    func adopt(_ bytes: Data, describedAs description: String) -> String? {
+    func enrol(_ bytes: Data, describedAs description: String) -> AdoptOutcome {
+        adopt(bytes, describedAs: description, replacing: nil, enrolling: true)
+    }
+
+    private func adopt(_ bytes: Data, describedAs description: String, replacing expectedHead: String?,
+                       enrolling: Bool) -> AdoptOutcome {
+        reloadIfChanged()
+        // The swap is against what storage holds now, not against the last document read cleanly.
+        // The signature the poll compares is the modification time and the size, and a save can
+        // leave both as they were, so the file is read again and loaded again when it is not what
+        // the last load read. Loaded, not only compared: when nothing is written, the next status
+        // decides from what is applied here, and from a document storage no longer holds it would
+        // only fetch the same bytes and find the head moved, round after round, until the file's
+        // signature changed.
+        if (try? Data(contentsOf: url)) != lastRead { load() }
+        // A half-saved file is kept out of `config`, but it is the person's all the same, and a hand
+        // edit not yet recorded as a revision is an edit made after whatever the adoption was
+        // decided against. Neither is written over.
+        if hasBrokenFile {
+            guard expectedHead != nil else {
+                return .refused("The file at \(path) is not a setup document, so nothing was written over it: it may be an edit somebody is in the middle of. Fix it in an editor or move it away first.")
+            }
+            return .headMoved(current: nil)
+        }
+        if isMissing {
+            guard expectedHead == nil else { return .headMoved(current: nil) }
+        } else {
+            guard !hasPendingExternalEdit, hash == expectedHead else { return .headMoved(current: hash) }
+        }
+        if let refusal = Canonical.rejection(bytes) {
+            return .refused("That setup could not be adopted: \(refusal.sentence)")
+        }
+        if let error = DocumentAcceptance.check(bytes, intake: .peer).errors.first {
+            return .refused("That setup could not be adopted: \(error.message)")
+        }
         do {
             let canonical = try Canonical.bytes(bytes)
-            let decoded = try JSONDecoder().decode(ControllerConfig.self, from: canonical)
-            _ = try decoded.validated()
+            if enrolling { onLocalEdit?(nil, canonical) }
             if let raw = rawBytes ?? (try? Data(contentsOf: url)) {
                 keepRevision(try Canonical.bytes(raw))
             }
-            expectedWriteHash = Canonical.sha256(canonical)
+            let adopted = Canonical.sha256(canonical)
+            expectedWriteHash = adopted
             try AtomicFile.write(canonical, to: url)
             lastEditDescription = description
             load()
-            return nil
-        } catch let problem as ConfigProblem {
-            return "That setup could not be adopted: \(problem.message)"
-        } catch let error as DecodingError {
-            return "That setup could not be read, so nothing was changed. \(Self.describe(error))"
+            return .adopted(hash: adopted)
         } catch {
-            return "That setup could not be written to \(path). \(error.localizedDescription)"
+            return .refused("That setup could not be written to \(path). \(error.localizedDescription)")
         }
     }
 
@@ -1426,7 +1379,8 @@ final class ConfigStore {
         else {
             return "The kept revision \(revision.shortHash) could not be read."
         }
-        return applyEdit(describedAs: "restored \(revision.name)", deviceName: deviceName) { root in
+        return applyEdit(describedAs: "restored \(revision.name)", deviceName: deviceName,
+                         approvesLaunchChanges: false) { root in
             // Everything is replaced except the identity, which carries on counting up and keeps its
             // lineage, so the machines see an ordinary new revision rather than a rollback.
             let identity = root["controller"]
@@ -1440,7 +1394,7 @@ final class ConfigStore {
     /// Puts the documented example at the path, and refuses to write over anything. Returns nil on
     /// success or a sentence to show.
     @discardableResult
-    func writeExample() -> String? {
+    func writeExample(deviceName exampleDeviceName: String = "This Mac") -> String? {
         if FileManager.default.fileExists(atPath: path) {
             return "There is already a file at \(path). Open it instead."
         }
@@ -1449,8 +1403,13 @@ final class ConfigStore {
                 at: url.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            let data = Data(Self.exampleConfig.utf8)
+            // The example is written here, so it is local intake: it gets its setup id now rather
+            // than opening as a document with a controller block and no identity.
+            let data = try ControllerEditor.adopting(Data(Self.exampleConfig.utf8), deviceName: exampleDeviceName).bytes
             expectedWriteHash = try Canonical.hash(data)
+            // The example is this app's own, written because a person asked for it, so what it runs
+            // is approved like any other edit made here.
+            onLocalEdit?(nil, data)
             try data.write(to: url, options: .atomic)
             load()
             return nil

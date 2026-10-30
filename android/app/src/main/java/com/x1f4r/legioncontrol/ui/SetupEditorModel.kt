@@ -6,20 +6,25 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.Contract
-import com.x1f4r.legioncontrol.data.BindingsStore
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
+import com.x1f4r.legioncontrol.data.LaunchScope
+import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.data.SetupMerge
 import com.x1f4r.legioncontrol.data.WakeHelperConfig
 import com.x1f4r.legioncontrol.data.withList
 import com.x1f4r.legioncontrol.data.withText
 import com.x1f4r.legioncontrol.data.text
+import com.x1f4r.legioncontrol.data.withStrings
 import com.x1f4r.legioncontrol.data.withWake
-import com.x1f4r.legioncontrol.data.advisories
-import com.x1f4r.legioncontrol.data.readControllerConfig
+import com.x1f4r.legioncontrol.net.LanPrefix
+import com.x1f4r.legioncontrol.data.AcceptedConfig
+import com.x1f4r.legioncontrol.data.acceptControllerConfig
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 
@@ -35,11 +40,15 @@ import kotlinx.serialization.json.buildJsonObject
  * The edit is kept apart from what is in force until Apply. An edit is a real edit the moment it is
  * applied, offline or not, and it is published on the next poll of each machine; but a half-typed
  * hostname is not an edit and must not become one.
+ *
+ * Applying an edit approves every command it changes on this device (contract section 9.9). So the
+ * command, shell and restricted key of a system whose command waits for approval cannot be edited
+ * here at all: changing its shell would otherwise approve the unapproved argv sitting beside it. It
+ * is approved or reverted as it stands, and an editor never saves an empty or unshowable argv.
  */
 @Stable
 class SetupEditorModel(
     private val services: ControlServices,
-    private val bindings: BindingsStore,
 ) {
     /** The document being edited. Null until there is something to edit. */
     var working: ControllerDocument? by mutableStateOf(null)
@@ -59,20 +68,61 @@ class SetupEditorModel(
     val hasChanges: Boolean
         get() = working != null && working?.canonicalText != base?.canonicalText
 
-    /** Everything the validator says, so Apply can be refused with a reason rather than silently. */
-    val validation: Result<ControllerConfig>?
-        get() = working?.let { readControllerConfig(it.canonicalText) }
+    /** The last document checked and what was said of it, so a recomposition does not check it again. */
+    private var checked: Pair<ControllerDocument, Result<AcceptedConfig>>? = null
 
-    val isValid: Boolean get() = validation?.isSuccess == true
+    /**
+     * Everything contract section 9.7 says of the edit, so Apply can be refused with a reason rather
+     * than silently, and its warnings shown beside it.
+     */
+    val validation: Result<AcceptedConfig>?
+        get() {
+            val document = working ?: return null
+            checked?.takeIf { it.first === document }?.let { return it.second }
+            return acceptControllerConfig(document.canonicalText).also { checked = document to it }
+        }
+
+    val isValid: Boolean get() = validation?.isSuccess == true && commandProblem == null
 
     val problem: String?
-        get() = validation?.exceptionOrNull()?.message
+        get() = validation?.exceptionOrNull()?.message ?: commandProblem
+
+    /**
+     * Why a command this edit writes cannot be saved, or null.
+     *
+     * Only the systems whose command the edit changes or adds are looked at: a command that came in
+     * from a peer is the review's to settle, and refusing every other edit because of it would leave
+     * nothing but the raw field to work in.
+     */
+    val commandProblem: String?
+        get() {
+            val edited = working?.root ?: return null
+            val before = LaunchValues.projection(base?.root)
+            for (machine in LaunchValues.projection(edited).machines) {
+                for (system in machine.systems) {
+                    if (before.machine(machine.id)?.system(system.id)?.tuple == system.tuple) continue
+                    val argv = commandOf(edited, machine.id, system.id) ?: emptyList()
+                    agentProblem(argv)?.let { return "${system.id} on ${machine.id}: $it" }
+                }
+            }
+            return null
+        }
+
+    /**
+     * The command of [systemId] on [machineId] waiting for this device's approval, or null.
+     *
+     * While one waits, the system's launch inputs are read-only and offer Approve and Revert.
+     */
+    fun pendingCommand(machineId: String, systemId: String): LaunchReviewEntry? =
+        services.launch.value.review.firstOrNull {
+            it.scope == LaunchScope.SYSTEM && it.machineId == machineId && it.systemId == systemId
+        }
 
     /** Warnings, which never block Apply. */
     val advisories: List<String>
-        get() = validation?.getOrNull()?.advisories().orEmpty()
+        get() = validation?.getOrNull()?.advisories.orEmpty()
 
-    val typed: ControllerConfig? get() = validation?.getOrNull()
+    val typed: ControllerConfig? get() = validation?.getOrNull()?.config
 
     fun reset(document: ControllerDocument?) {
         base = document
@@ -165,9 +215,22 @@ class SetupEditorModel(
 
     // MARK: - Systems
 
-    fun addSystem(machineId: String, systemId: String, name: String, platform: String): String? {
+    /**
+     * Adds a system with the command that runs its agent.
+     *
+     * The command is part of adding it: a system without one is never driven, and a document an
+     * older client reads with an empty `agent` in it is one that client refuses.
+     */
+    fun addSystem(
+        machineId: String,
+        systemId: String,
+        name: String,
+        platform: String,
+        agent: List<String>,
+    ): String? {
         val trimmed = systemId.trim()
         if (!Contract.isToken(trimmed)) return "A system id has to be a plain identifier."
+        agentProblem(agent)?.let { return it }
         change {
             it.editMachine(machineId) { machine ->
                 machine.withList("systems") { existing ->
@@ -175,7 +238,7 @@ class SetupEditorModel(
                         put("id", JsonPrimitive(trimmed))
                         put("name", JsonPrimitive(name.trim().ifBlank { trimmed }))
                         put("platform", JsonPrimitive(platform))
-                        put("agent", JsonArray(emptyList()))
+                        put("agent", JsonArray(agent.map(::JsonPrimitive)))
                     }.withWindowsShell()
                 }
             }
@@ -201,32 +264,49 @@ class SetupEditorModel(
         }
     }
 
-    /**
-     * The argv the agent is run with, as a whitespace-separated line.
-     *
-     * Whitespace separated because that is how somebody writes a command, and quoting is handled by
-     * the transport rather than by the person: a path with a space in it is written normally here
-     * and quoted correctly for whichever shell the system says it uses.
-     */
+    /** The argv the agent is run with, as a whitespace-separated line (see [argvOf]). */
     fun setSystemAgent(machineId: String, systemId: String, line: String) =
-        editSystem(machineId, systemId) { system ->
-            JsonObject(
-                system + (
-                    "agent" to buildJsonArray {
-                        line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-                            .forEach { add(JsonPrimitive(it)) }
-                    }
-                    ),
-            ).withWindowsShell()
+        editLaunch(machineId, systemId) { system ->
+            JsonObject(system + ("agent" to buildJsonArray { argvOf(line).forEach { add(JsonPrimitive(it)) } }))
+                .withWindowsShell()
         }
 
     fun setSystemShell(machineId: String, systemId: String, shell: String?) =
-        editSystem(machineId, systemId) { it.withShell(shell) }
+        editLaunch(machineId, systemId) { it.withShell(shell) }
 
     fun setSystemRestricted(machineId: String, systemId: String, restricted: Boolean) =
-        editSystem(machineId, systemId) { system ->
+        editLaunch(machineId, systemId) { system ->
             JsonObject(system + ("restricted" to JsonPrimitive(restricted))).withWindowsShell()
         }
+
+    /** An edit of what a system runs, which a system whose command waits for approval does not take. */
+    private fun editLaunch(machineId: String, systemId: String, transform: (JsonObject) -> JsonObject) {
+        if (pendingCommand(machineId, systemId) != null) return
+        editSystem(machineId, systemId, transform)
+    }
+
+    /**
+     * Why Revert cannot be pressed right now, or null when it can.
+     *
+     * Revert is an edit of what is in force, applied at once, and the editor starts again from every
+     * document put in force. Pressed with an edit in progress here, it would throw that edit away
+     * without a word, so it waits until the edit is applied or discarded.
+     */
+    val revertWaits: String?
+        get() = if (hasChanges) "Apply or discard your changes first: Revert is applied at once." else null
+
+    /**
+     * Revert (contract section 9.9): an ordinary edit made here that puts back the value this device
+     * approved at [entry]'s place. It is published like any other edit, so the peer that changed it
+     * sees it changed back. Returns what happened, for the page.
+     */
+    fun revertLaunch(entry: LaunchReviewEntry): String {
+        revertWaits?.let { return it }
+        val reverted = services.document.value?.let { LaunchValues.reverted(it.root, entry) }
+            ?: return "There is no approved value to put back here."
+        return services.applyEdit(ControllerDocument.of(reverted), services.deviceName())
+            ?: "Put back the approved value. It is sent to every machine on its next check."
+    }
 
     // MARK: - Waking
 
@@ -238,15 +318,7 @@ class SetupEditorModel(
 
     fun setWakeBroadcasts(machineId: String, addresses: List<String>) = change {
         it.editMachine(machineId) { machine ->
-            machine.withWake { wake ->
-                JsonObject(
-                    wake + (
-                        "broadcast" to buildJsonArray {
-                            addresses.filter { a -> a.isNotBlank() }.forEach { a -> add(JsonPrimitive(a)) }
-                        }
-                        ),
-                )
-            }
+            machine.withWake { wake -> wake.withStrings("broadcast", addresses.filter { a -> a.isNotBlank() }) }
         }
     }
 
@@ -264,8 +336,10 @@ class SetupEditorModel(
         if (helperMachineId == machineId) {
             return "A machine cannot wake itself. One that is asleep cannot send its own packet."
         }
-        if (!Contract.isToken(actionId.trim())) {
-            return "A wake action id has to be a plain identifier."
+        // The configured-id grammar, which is what the helper's agent names its actions with: a
+        // token with a colon in it would be saved here and refused by every peer.
+        if (!Contract.isConfiguredId(actionId.trim())) {
+            return "A wake action id is letters, digits and . _ -, starting with a letter or a digit."
         }
         val existing = typed?.machines?.firstOrNull { it.id == machineId }
             ?.wake?.effectiveHelpers.orEmpty()
@@ -305,27 +379,11 @@ class SetupEditorModel(
     fun removeSite(id: String) = change { it.removeSite(id) }
 
     fun setSitePrefixes(id: String, prefixes: List<String>) = change {
-        it.editSite(id) { site ->
-            JsonObject(
-                site + (
-                    "lanPrefixes" to buildJsonArray {
-                        prefixes.filter { p -> p.isNotBlank() }.forEach { p -> add(JsonPrimitive(p)) }
-                    }
-                    ),
-            )
-        }
+        it.editSite(id) { site -> site.withStrings("lanPrefixes", prefixes.filter { p -> p.isNotBlank() }) }
     }
 
     fun setSiteBroadcasts(id: String, addresses: List<String>) = change {
-        it.editSite(id) { site ->
-            JsonObject(
-                site + (
-                    "broadcast" to buildJsonArray {
-                        addresses.filter { a -> a.isNotBlank() }.forEach { a -> add(JsonPrimitive(a)) }
-                    }
-                    ),
-            )
-        }
+        it.editSite(id) { site -> site.withStrings("broadcast", addresses.filter { a -> a.isNotBlank() }) }
     }
 
     // MARK: - Applying
@@ -336,9 +394,21 @@ class SetupEditorModel(
      * It becomes this device's document at once and is published on the next poll of every machine
      * that will take it. Nothing is sent from here: publishing is reconciliation's job, and doing it
      * here would mean an edit made with no machine in reach was not an edit.
+     *
+     * A command this edit writes that [agentProblem] refuses is refused here too, and not only by a
+     * button that is off: the store's own checks let an invisible character through, and applying
+     * the edit would approve it on this device.
      */
     fun apply(): Boolean {
-        val document = working ?: return false
+        val edited = working ?: return false
+        commandProblem?.let { problem ->
+            error = problem
+            return false
+        }
+        val document = normalisePrefixes(edited, base).getOrElse { problem ->
+            error = problem.message
+            return false
+        }
         val failure = services.applyEdit(document, services.deviceName())
         if (failure != null) {
             error = failure
@@ -360,9 +430,83 @@ class SetupEditorModel(
     fun changes(): List<SetupMerge.Difference> {
         val from = base?.root ?: return emptyList()
         val to = working?.root ?: return emptyList()
-        return SetupMerge.differences(mine = to, theirs = from, base = null)
+        return SetupMerge.changesBetween(before = from, after = to)
     }
 }
+
+/**
+ * [edited] with every network prefix the edit changed written as contract section 10.1 says an
+ * editor writes one, or the first that is not a prefix at all.
+ *
+ * Octet-aligned prefixes become dotted octets with the trailing dot, because a client that predates
+ * the section matches prefixes as text and is right only when one ends in a dot; any other length
+ * stays CIDR. A value that is neither, a full address without a length, host bits set, a wildcard,
+ * would never match anything, so it is refused here rather than saved. Only the prefixes the edit
+ * changed are looked at: one that came in from a peer is shown as a warning, and is the peer's to
+ * fix.
+ */
+internal fun normalisePrefixes(edited: ControllerDocument, before: ControllerDocument?): Result<ControllerDocument> {
+    fun normalised(text: String): String? = LanPrefix.parse(text)?.normalised
+    fun refusal(text: String) = IllegalArgumentException(
+        "\"$text\" is not a network prefix. Write one to three octets, like 192.168.1., or a network " +
+            "and its length, like 192.168.16.0/20.",
+    )
+
+    val beforeSites = (before?.root?.get("sites") as? JsonArray).orEmpty().filterIsInstance<JsonObject>()
+    val beforeMachines = (before?.root?.get("machines") as? JsonArray).orEmpty().filterIsInstance<JsonObject>()
+    var document = edited
+    for (site in (edited.root["sites"] as? JsonArray).orEmpty().filterIsInstance<JsonObject>()) {
+        val id = site.text("id") ?: continue
+        val prefixes = (site["lanPrefixes"] as? JsonArray)?.map { (it as? JsonPrimitive)?.contentOrNull } ?: continue
+        if (beforeSites.firstOrNull { it.text("id") == id }?.get("lanPrefixes") == site["lanPrefixes"]) continue
+        val written = prefixes.map { text -> text?.let(::normalised) ?: return Result.failure(refusal(text.orEmpty())) }
+        document = document.editSite(id) { it.withStrings("lanPrefixes", written) }
+    }
+    for (machine in (edited.root["machines"] as? JsonArray).orEmpty().filterIsInstance<JsonObject>()) {
+        val id = machine.text("id") ?: continue
+        val prefix = (machine["wake"] as? JsonObject)?.text("lanPrefix") ?: continue
+        val previous = (beforeMachines.firstOrNull { it.text("id") == id }?.get("wake") as? JsonObject)?.text("lanPrefix")
+        if (prefix == previous) continue
+        val written = normalised(prefix) ?: return Result.failure(refusal(prefix))
+        document = document.editMachine(id) { it.withWake { wake -> wake.withText("lanPrefix", written) } }
+    }
+    return Result.success(document)
+}
+
+/**
+ * A command as somebody writes it, one argument per whitespace-separated word.
+ *
+ * Whitespace separated because that is how somebody writes a command. Quoting is the transport's
+ * business rather than the person's: each word is written for whichever shell the system says it
+ * uses.
+ */
+internal fun argvOf(line: String): List<String> = line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+
+/**
+ * Why an editor will not save [agent] as a system's command, or null.
+ *
+ * Never an empty argv, and never an argument a person could not check by reading it: one holding a
+ * control, invisible or bidirectional formatting character, or longer than the agent takes (contract
+ * section 9.9). Such a command could only ever be reverted, so it is not written in the first place.
+ */
+internal fun agentProblem(agent: List<String>): String? = when {
+    agent.isEmpty() ->
+        "It needs the command that runs its agent, for example " +
+            "/usr/bin/node /home/me/.legion-control/bin/launcher.mjs."
+
+    agent.any { !LaunchValues.isLaunchText(it) } ->
+        "An argument holds a control, invisible or bidirectional formatting character, or is longer " +
+            "than 4096 bytes, so what it says cannot be checked by reading it."
+
+    else -> null
+}
+
+/** The `agent` strings of one system in [document], or null when it has none to speak of. */
+private fun commandOf(document: JsonObject, machineId: String, systemId: String): List<String>? =
+    (document["machines"] as? JsonArray)?.filterIsInstance<JsonObject>()?.firstOrNull { it.text("id") == machineId }
+        ?.let { machine -> (machine["systems"] as? JsonArray)?.filterIsInstance<JsonObject>() }
+        ?.firstOrNull { it.text("id") == systemId }
+        ?.let { system -> (system["agent"] as? JsonArray)?.map { (it as? JsonPrimitive)?.content.orEmpty() } }
 
 /**
  * Contract section 15.1: an editor writes `shell` for every Windows system it creates or changes.

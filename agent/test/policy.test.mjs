@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeConfig } from '../src/config.mjs';
+import { normalizeConfig } from '../src/config-schema.mjs';
 import {
   describeServiceUpdates,
   effectivePolicy,
@@ -106,6 +106,20 @@ test('a pause and a window each decline with their own reason', async () => {
     assert.equal(declined.reasonCode, 'outside-window');
     assert.ok(declined.nextWindow);
     assert.equal(scheduledEligibility(windowed, windowed.services[0], { now: insideWindow }).eligible, true);
+  });
+});
+
+test('a pause is the setup\'s, and service state cannot add one', async () => {
+  await withHome(async () => {
+    const { saveServiceState } = await import('../src/state.mjs');
+    const config = build({ updates: { automatic: true }, services: [service('a')] });
+    // Nothing ever wrote a pause to service state, and one found there is not
+    // a pause anybody asked for: the policy is what config.json says.
+    saveServiceState(config.services[0], { pauseUntil: '2030-01-01T00:00:00.000Z' });
+    assert.equal(effectivePolicy(config, config.services[0]).pauseUntil, null);
+    assert.equal(scheduledEligibility(config, config.services[0]).eligible, true);
+    const paused = build({ updates: { automatic: true, pauseUntil: '2030-01-01T00:00:00Z' }, services: [service('a', { pauseUntil: '2029-01-01T00:00:00Z' })] });
+    assert.equal(effectivePolicy(paused, paused.services[0]).pauseSource, 'system', 'the longer of the two wins');
   });
 });
 

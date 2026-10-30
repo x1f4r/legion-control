@@ -25,6 +25,9 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
   const result = spawnSync('bash', args, { encoding: 'utf8', env });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.readFileSync(path.join(base, 'config.json'), 'utf8'), config);
+  // Only this user may enter the base, and the config in it is this user's alone.
+  assert.equal(fs.statSync(base).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(base, 'config.json')).mode & 0o077, 0);
   assert.equal(fs.existsSync(path.join(home, 'Library', 'LaunchAgents')), false);
   const version = spawnSync(path.join(base, 'bin', 'legionctl'), ['version', '--check'], { encoding: 'utf8', env });
   assert.equal(version.status, 0, version.stderr);
@@ -49,6 +52,8 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
   const plist = fs.readFileSync(path.join(repository, 'mac', 'install', 'com.x1f4r.legion-control.update.plist'), 'utf8');
   assert.match(plist, /<string>@LAUNCHER@<\/string>/);
   assert.doesNotMatch(plist, /src\/index\.mjs/);
+  // What a cycle writes is this user's alone, as the Linux unit's UMask=0077 has it: 63 is 0o77.
+  assert.match(plist, /<key>Umask<\/key>\s*<integer>63<\/integer>/);
 
   if (process.platform === 'darwin') {
     // Render and parse the real plist while every launchctl command goes only
@@ -63,5 +68,73 @@ test('Mac installer stages safely, retains config and uses a stable launchd entr
     const extracted = spawnSync('/usr/bin/plutil', ['-extract', 'ProgramArguments', 'json', '-o', '-', renderedPath], { encoding: 'utf8' });
     assert.equal(extracted.status, 0, extracted.stderr);
     assert.deepEqual(JSON.parse(extracted.stdout), [process.execPath, path.join(base, 'bin', 'launcher.mjs'), 'cycle']);
+    const umask = spawnSync('/usr/bin/plutil', ['-extract', 'Umask', 'raw', '-o', '-', renderedPath], { encoding: 'utf8' });
+    assert.equal(umask.status, 0, umask.stderr);
+    assert.equal(Number(umask.stdout.trim()), 0o77);
+    // The plist says where the agent and its records live, and is this user's alone as well.
+    assert.equal(fs.statSync(renderedPath).mode & 0o077, 0);
   }
+});
+
+test('Mac uninstaller names what else removing the agent home would delete', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion mac uninstall '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const base = path.join(home, '.legion-control');
+  fs.mkdirSync(path.join(base, 'agent'), { recursive: true });
+  // Every launchctl command goes to a stub that has nothing loaded, so no launchd job on the test
+  // machine is asked about or unloaded.
+  const commands = path.join(root, 'commands');
+  fs.mkdirSync(commands);
+  fs.writeFileSync(path.join(commands, 'launchctl'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const env = { ...process.env, HOME: home, LEGIONCTL_HOME: base, PATH: `${commands}:${process.env.PATH}` };
+  const uninstall = () => spawnSync('bash', [path.join(repository, 'mac', 'install', 'install-mac-agent.sh'), '--uninstall'], { encoding: 'utf8', env });
+
+  const agentOnly = uninstall();
+  assert.equal(agentOnly.status, 0, agentOnly.stderr);
+  const hint = /Remove those too, if that is what you want:\n {4}(rm -rf .+)\n\n {2}Put the job back:\n/.exec(agentOnly.stdout);
+  assert.ok(hint, agentOnly.stdout);
+  assert.doesNotMatch(agentOnly.stdout, /not the agent's/);
+  // Pasted into a shell, the hint removes the agent home and nothing else, spaces and all. The
+  // shell only splits it into words here; nothing runs it.
+  const words = spawnSync('bash', ['-c', `set -- ${hint[1]}; printf '%s\\0' "$@"`], { encoding: 'utf8' });
+  assert.deepEqual(words.stdout.split('\0').slice(0, -1), ['rm', '-rf', base]);
+
+  // A Mac releases are cut on: its keys and the private terms live in the same directory.
+  fs.writeFileSync(path.join(base, 'release-signing.key'), 'key\n');
+  fs.writeFileSync(path.join(base, 'android-release.jks'), 'keystore\n');
+  fs.mkdirSync(path.join(base, 'private'));
+  fs.writeFileSync(path.join(base, 'private', 'terms.txt'), 'terms\n');
+  const releasing = uninstall();
+  assert.equal(releasing.status, 0, releasing.stderr);
+  const named = /rm -rf .+\n\n {2}That also deletes these, which are not the agent's\. Move them out first:\n((?: {4}.+\n)+)/.exec(releasing.stdout);
+  assert.ok(named, releasing.stdout);
+  assert.deepEqual(named[1].trimEnd().split('\n').map(line => line.trim()), [
+    path.join(base, 'release-signing.key'),
+    path.join(base, 'android-release.jks'),
+    path.join(base, 'private'),
+  ]);
+  assert.equal(fs.readFileSync(path.join(base, 'private', 'terms.txt'), 'utf8'), 'terms\n');
+});
+
+// Uninstalling would otherwise suggest an rm -rf of the home directory, and installing would make it
+// this user's alone.
+test('Mac installer refuses a base that holds the home directory', { skip: process.platform === 'win32' }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion mac home base '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
+  const commands = path.join(root, 'commands');
+  fs.mkdirSync(commands);
+  fs.writeFileSync(path.join(commands, 'launchctl'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  for (const args of [['--skip-scheduler'], ['--uninstall']]) {
+    const result = spawnSync('bash', [path.join(repository, 'mac', 'install', 'install-mac-agent.sh'), ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home, LEGIONCTL_HOME: home, LEGION_NODE_BIN: process.execPath, PATH: `${commands}:${process.env.PATH}` },
+    });
+    assert.equal(result.status, 1, `${args.join(' ')}\n${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /which is not a folder of the agent's own but holds the home directory\. .* Nothing was changed\./);
+    assert.doesNotMatch(result.stdout, /rm -rf/);
+  }
+  assert.deepEqual(fs.readdirSync(home), ['bin']);
 });

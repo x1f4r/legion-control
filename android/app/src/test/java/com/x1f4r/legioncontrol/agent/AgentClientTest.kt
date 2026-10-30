@@ -280,6 +280,47 @@ class AgentClientTest {
     }
 
     @Test
+    fun `only the commands the agent tracks by id are sent one`() = runBlocking {
+        // The agent's command table (agent/src/index.mjs COMMANDS, contract section 4): update,
+        // restart, boot, sleep, run, cycle and self-update take --op. auto-update and policy take
+        // only --service, cancel names its operation as its argument, and an agent refuses a flag a
+        // command does not take with bad-argument, so a pause sent with an id is a pause refused.
+        val transport = FakeTransport { sent -> if (sent.line.contains(" status")) v3Status else accepted }
+        val (agent, _) = client(machine(endpoints = listOf(endpoint("first"))), transport)
+        agent.status()
+        val id = "tracked-0001"
+        fun last() = transport.sent.last().line
+
+        val tracked = listOf<Pair<String, suspend () -> Unit>>(
+            "update" to { agent.update(UpdateRequest(serviceId = "t3"), id) },
+            "restart" to { agent.restart("t3", operationId = id) },
+            "boot" to { agent.boot("windows", operationId = id) },
+            "sleep" to { agent.sleep(operationId = id) },
+            "run" to { agent.run("wake", operationId = id) },
+            "cycle" to { agent.cycle(operationId = id) },
+            "self-update" to { agent.selfUpdateFromStdin(File.createTempFile("agent", ".tgz").apply { deleteOnExit() }, id) },
+        )
+        for ((verb, send) in tracked) {
+            send()
+            assertTrue("$verb: ${last()}", last().contains(" $verb"))
+            assertTrue("$verb takes --op: ${last()}", last().contains(" --op $id"))
+        }
+
+        val untracked = listOf<Pair<String, suspend () -> Unit>>(
+            "policy set" to { agent.writePolicy(PolicyPatch(maintenanceWindows = emptyList()), "t3") },
+            "auto-update on" to { agent.setAutoUpdate(true, "t3") },
+            "auto-update pause" to { agent.pauseUpdates("4h", "t3") },
+            "auto-update resume" to { agent.resumeUpdates("t3") },
+            "cancel" to { agent.cancel(id) },
+        )
+        for ((verb, send) in untracked) {
+            send()
+            assertTrue("$verb: ${last()}", last().contains(" $verb"))
+            assertFalse("$verb takes no --op: ${last()}", last().contains("--op"))
+        }
+    }
+
+    @Test
     fun `a value that is not a token is a refused request, and nothing is sent`() = runBlocking {
         // A5. These used to be IllegalArgumentExceptions, which nothing between the client and the
         // screen caught, on a scope with no handler.
@@ -295,6 +336,20 @@ class AgentClientTest {
         agent.status()
         failsWith<AgentFailure.BadRequest> { agent.restart("t3", operationId = "NOT-LOWERCASE-ID") }
         assertEquals(1, transport.sent.size)
+    }
+
+    /**
+     * C10: a setup id has its own grammar, narrower than a token. One the token grammar allows and
+     * the agent's `--controller-id` does not used to be sent and turned away with `bad-argument`.
+     */
+    @Test
+    fun `a setup id the agent would refuse is never sent`() = runBlocking {
+        val transport = FakeTransport { accepted }
+        val (agent, _) = client(machine(), transport)
+        for (id in listOf("me@tower", "a/b", "a".repeat(65))) {
+            failsWith<AgentFailure.BadRequest> { agent.configSet("{}\n", id, 1L) }
+        }
+        assertTrue(transport.sent.isEmpty())
     }
 
     @Test

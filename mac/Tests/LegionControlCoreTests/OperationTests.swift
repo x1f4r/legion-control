@@ -121,6 +121,57 @@ struct OperationTests {
         #expect(store.unresolved.isEmpty)
     }
 
+    @Test("a finished cycle is read again with its services, exactly as its reply was decided")
+    func cycleReconcilesWithItsServices() throws {
+        let (store, directory) = try Self.store()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        func cycle(_ children: [AgentOperation.Child], result: AgentOperation.Result) -> AgentOperation {
+            var operation = AgentOperation()
+            operation.kind = "cycle"
+            operation.state = "finished"
+            operation.phase = "done"
+            operation.result = result
+            operation.children = children
+            return operation
+        }
+        let cycled = AgentOperation.Result(ok: true, action: "cycled", reasonCode: nil, message: "0 updated, 1 left alone, 0 failed")
+
+        // Filed unknown for an interrupted service, and read again: the record says `cycled`, and
+        // that is no evidence about the service.
+        let interrupted = Self.record(kind: .updateAll)
+        store.begin(interrupted)
+        store.finish(interrupted.id, state: .unknown, summary: "Maintenance cycle on Pi: 1 may or may not have updated.")
+        store.reconcile(interrupted.id, with: cycle([.init(service: "edge", action: "interrupted")], result: cycled))
+        let unknown = try #require(store.record(id: interrupted.id))
+        #expect(unknown.state == .unknown)
+        #expect(unknown.summary == "Maintenance cycle on Pi: 1 may or may not have updated.")
+        #expect(unknown.detail == "edge: interrupted")
+        #expect(!unknown.needsReconciliation)
+
+        // One this app stopped watching, settled by its record: a failed service fails it, and a
+        // service that updated fine is counted beside it.
+        let watched = Self.record(kind: .updateAll)
+        store.begin(watched)
+        store.finish(watched.id, state: .running, summary: "still running", forceUnresolved: true)
+        store.reconcile(watched.id, with: cycle(
+            [.init(service: "t3", action: "updated"), .init(service: "demo", action: "failed", reasonCode: "apply-failed")],
+            result: .init(ok: false, action: "failed", reasonCode: "apply-failed", message: "1 updated, 0 left alone, 1 failed")))
+        let failed = try #require(store.record(id: watched.id))
+        #expect(failed.state == .failed)
+        #expect(failed.summary == "Maintenance cycle on Pi: 1 updated, 1 failed.")
+        #expect(store.unresolved.isEmpty)
+
+        // A cycle that failed of itself says why, in the agent's words.
+        let own = Self.record(kind: .updateAll)
+        store.begin(own)
+        store.finish(own.id, state: .running, summary: "still running", forceUnresolved: true)
+        store.reconcile(own.id, with: cycle([], result: .init(ok: false, action: "failed", reasonCode: "internal",
+                                                              message: "the lock file could not be read")))
+        #expect(store.record(id: own.id)?.state == .failed)
+        #expect(store.record(id: own.id)?.summary == "Maintenance cycle on Pi failed: the lock file could not be read")
+    }
+
     @Test("an agent with no record of the id means it never started")
     func neverStarted() throws {
         let (store, directory) = try Self.store()
@@ -158,13 +209,14 @@ struct OperationTests {
         #expect(reopened.record(id: record.id)?.state == .queued)
     }
 
-    @Test("the agent's reply decides the state, including the ones that are not failures")
+    @Test("the outcome decides the state, and the action only says which kind of it each one is")
     func outcomeMapping() {
-        func state(_ action: String?, reason: String? = nil, ok: Bool? = nil) -> OperationState {
+        func state(_ action: String?, reason: String? = nil, ok: Bool? = nil, outcome: String? = nil) -> OperationState {
             var result = AgentActionResult()
             result.action = action
             result.reasonCode = reason
             result.ok = ok
+            result.outcome = outcome
             return OperationOutcome.state(for: result, stillRunning: false)
         }
         #expect(state("updated") == .succeeded)
@@ -173,19 +225,34 @@ struct OperationTests {
         #expect(state("queued") == .queued)
         #expect(state("conflict") == .conflict)
         #expect(state("expired") == .expired)
-        #expect(state("cancelled") == .cancelled)
-        #expect(state("rolled-back") == .failed)
-        // Interrupted is the agent saying it does not know either.
+        #expect(state("cancelled", reason: "cancelled") == .cancelled)
+        // A cancel that worked is a success of its own, not a cancelled request.
+        #expect(state("cancelled") == .succeeded)
+        #expect(state("rolled-back", reason: "rolled-back") == .failed)
+        #expect(state("rolled-back") == .succeeded)
+        // Interrupted is the agent saying it does not know either, and so is a command it stopped.
         #expect(state("interrupted") == .unknown)
-        // An action from a newer agent, with ok:false, is a failure and not a quiet success.
-        #expect(state("something-new", ok: false) == .failed)
+        #expect(state("failed", reason: "timed-out") == .unknown)
+        #expect(state("failed", reason: "apply-failed") == .failed)
+        // A refusal that names its reason is a known failure, and a lock is a hold.
+        #expect(state(nil, reason: "unknown-service", ok: false) == .failed)
+        #expect(state(nil, reason: "lock-held", ok: false) == .deferred)
+        // An action from a newer agent is no evidence either way, whatever ok says beside it: it
+        // was a failure here, a success on the desktop and a failure on the phone (C5).
+        #expect(state("something-new", ok: false) == .unknown)
+        #expect(state("something-new", ok: true) == .unknown)
         #expect(state(nil) == .unknown)
+        // The agent's own word comes first, and a word this build does not know is unknown.
+        #expect(state("failed", reason: "apply-failed", ok: false, outcome: "unknown") == .unknown)
+        #expect(state("updated", ok: true, outcome: "partial") == .unknown)
+        #expect(state("accepted") == .running)
+        #expect(state("already-running", reason: "already-running") == .running)
         #expect(OperationOutcome.state(for: AgentActionResult(), stillRunning: true) == .running)
     }
 
     @Test("signed agent installation and intentional rollback use the actual contract outcomes")
     func signedAgentOutcomes() throws {
-        let reply = try JSONDecoder().decode(AgentActionResult.self, from: FixtureTests.bytes("self-update.installed.json"))
+        let reply = try JSONDecoder().decode(AgentActionResult.self, from: ContractCorpus.data("fixtures/self-update.installed.json"))
         #expect(reply.didInstallAgent)
         #expect(OperationOutcome.state(for: reply, stillRunning: false) == .succeeded)
         let installedOperation = try #require(reply.op)
@@ -200,17 +267,192 @@ struct OperationTests {
         store.reconcile(record.id, with: installedOperation)
         #expect(store.record(id: record.id)?.state == .succeeded)
 
-        var rollback = try JSONDecoder().decode(AgentActionResult.self, from: FixtureTests.bytes("self-update.rolled-back.json"))
+        // Back on the kept agent and nothing went wrong: a success, whichever way it was asked for.
+        let rollback = try JSONDecoder().decode(AgentActionResult.self, from: ContractCorpus.data("fixtures/self-update.rolled-back.json"))
         #expect(!rollback.didInstallAgent)
         #expect(OperationOutcome.state(for: rollback, stillRunning: false) == .succeeded)
-        rollback.op?.target = "install:abc"
-        #expect(OperationOutcome.state(for: rollback, stillRunning: false) == .failed)
+        // An install that was put back reads as the failure its reason code says it was.
+        var putBack = rollback
+        putBack.outcome = nil
+        putBack.reasonCode = "rolled-back"
+        #expect(OperationOutcome.state(for: putBack, stillRunning: false) == .failed)
+        // And a stated outcome wins over the action beside it.
         var invalid = reply
         invalid.ok = false
+        invalid.outcome = "failed"
         #expect(!invalid.didInstallAgent)
         #expect(OperationOutcome.state(for: invalid, stillRunning: false) == .failed)
         invalid.ok = true; invalid.action = "checked"
         #expect(!invalid.didInstallAgent)
+    }
+
+    // MARK: - Following an operation
+
+    static func reply(_ json: String) throws -> AgentActionResult {
+        try JSONDecoder().decode(AgentActionResult.self, from: Data(json.utf8))
+    }
+
+    static func poll(_ json: String) throws -> AgentOperationResult {
+        try JSONDecoder().decode(AgentOperationResult.self, from: Data(json.utf8))
+    }
+
+    static let opId = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+
+    static let accepted = """
+    { "ok": true, "contract": 3, "action": "accepted", "detached": true,
+      "op": { "id": "\(opId)", "kind": "update", "service": "demo", "state": "running", "phase": "installing" } }
+    """
+
+    static let finished = """
+    { "ok": true, "contract": 3,
+      "op": { "id": "\(opId)", "kind": "update", "service": "demo", "state": "finished", "phase": "done",
+              "result": { "ok": true, "action": "updated", "from": "1", "to": "2" } } }
+    """
+
+    @Test("a poll that does not get through keeps the operation running, and the next one finishes it")
+    func failedPollKeepsTheLastState() async throws {
+        // One failed reconnect used to be thrown back as the failure of the whole update, and a read
+        // that never left this device reads as "never sent", so an update running perfectly well
+        // over there was filed here as one that did not happen (C5).
+        var polls = 0
+        var pauses = 0
+        var driver = OperationDriver(send: { _ in try Self.reply(Self.accepted) }, readOperation: { _ in
+            polls += 1
+            if polls == 1 { throw AgentFailure(.hostUnreachable, dispatch: .never) }
+            return try Self.poll(Self.finished)
+        })
+        driver.pause = { _ in pauses += 1 }
+        let request = try AgentRequest.update(service: "demo", intent: .init(detach: true, operationId: Self.opId), dialect: .v3)
+        let conclusion = try await driver.perform(request, operationId: Self.opId, dialect: .v3)
+        #expect(!conclusion.stillRunning)
+        #expect(conclusion.result.action == "updated")
+        #expect(Outcome.of(conclusion.result) == .succeeded)
+        #expect(polls == 2)
+        #expect(pauses == 1)
+    }
+
+    @Test("a link that stays down leaves the operation pending, never failed")
+    func pollsThatKeepFailingLeaveItPending() async throws {
+        var polls = 0
+        var driver = OperationDriver(send: { _ in try Self.reply(Self.accepted) }, readOperation: { _ in
+            polls += 1
+            throw AgentFailure(.noRoute, dispatch: .never)
+        })
+        driver.pause = { _ in }
+        let request = try AgentRequest.update(service: "demo", intent: .init(detach: true, operationId: Self.opId), dialect: .v3)
+        let conclusion = try await driver.perform(request, operationId: Self.opId, dialect: .v3)
+        #expect(conclusion.stillRunning)
+        #expect(OperationOutcome.state(for: conclusion.result, stillRunning: conclusion.stillRunning) == .running)
+        #expect(conclusion.operation?.phase == "installing")
+        #expect(polls == OperationDriver.pollTries)
+    }
+
+    @Test("every poll tried again is told first, so the address it failed on is dialled again")
+    func retriedPollsRedial() async throws {
+        // A machine holds an address that did not answer back for a minute, so the second and
+        // third polls, five seconds apart, failed at once without dialling anything.
+        var events: [String] = []
+        var driver = OperationDriver(send: { _ in try Self.reply(Self.accepted) }, readOperation: { _ in
+            events.append("poll")
+            throw AgentFailure(.hostUnreachable, dispatch: .never)
+        })
+        driver.pause = { _ in events.append("pause") }
+        driver.beforeRetry = { events.append("redial") }
+        let request = try AgentRequest.update(service: "demo", intent: .init(detach: true, operationId: Self.opId), dialect: .v3)
+        let conclusion = try await driver.perform(request, operationId: Self.opId, dialect: .v3)
+        #expect(conclusion.stillRunning)
+        #expect(events == ["poll", "pause", "redial", "poll", "pause", "redial", "poll"])
+    }
+
+    @Test("a finished record with no result is read by its own reduction, never by the accepted reply's ok")
+    func finishedWithoutAResultIsUnknown() async throws {
+        // A record from before 3.1.0 that finished and kept no result. Reduced on its own it is
+        // unknown, which ended the polling, but the final reply was then read again from the `ok`
+        // it inherited from the accepted one, and the update was filed as a success.
+        let bare = """
+        { "ok": true, "contract": 3,
+          "op": { "id": "\(Self.opId)", "kind": "update", "service": "demo", "state": "finished", "phase": "done", "result": null } }
+        """
+        let driver = OperationDriver(send: { _ in try Self.reply(Self.accepted) }, readOperation: { _ in try Self.poll(bare) })
+        let request = try AgentRequest.update(service: "demo", intent: .init(detach: true, operationId: Self.opId), dialect: .v3)
+        let conclusion = try await driver.perform(request, operationId: Self.opId, dialect: .v3)
+        let operation = try #require(conclusion.operation)
+        #expect(!conclusion.stillRunning)
+        #expect(Outcome.of(operation) == .unknown)
+        #expect(Outcome.of(conclusion.result) == .unknown)
+        #expect(OperationOutcome.state(for: conclusion.result, stillRunning: false) == .unknown)
+
+        // And the history files the same record the same way when it is read back later.
+        let (store, directory) = try Self.store()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var record = Self.record()
+        record.id = Self.opId
+        store.begin(record)
+        store.finish(record.id, state: .unknown, summary: "The update may or may not have happened.")
+        store.reconcile(record.id, with: operation)
+        #expect(store.record(id: record.id)?.state == .unknown)
+
+        // A record that states its outcome, or whose result does, is read by that as before.
+        var stated = operation
+        stated.result = AgentOperation.Result(ok: true, action: "updated", reasonCode: nil)
+        #expect(Outcome.of(OperationDriver.finalResult(from: stated, accepted: try Self.reply(Self.accepted))) == .succeeded)
+        stated.outcome = "unknown"
+        #expect(Outcome.of(OperationDriver.finalResult(from: stated, accepted: try Self.reply(Self.accepted))) == .unknown)
+    }
+
+    @Test("a replay of a request still running is followed by its id like an accepted one")
+    func replayStillRunningIsFollowed() async throws {
+        let replay = try String(decoding: ContractCorpus.data("fixtures/update.replayed.json"), as: UTF8.self)
+        let id = "6f1c2a84-3b7d-4e19-9a52-0c8f4d61b7a3"
+        var asked: [[String]] = []
+        let driver = OperationDriver(send: { _ in try Self.reply(replay) }, readOperation: { request in
+            asked.append(request.arguments)
+            return try Self.poll(Self.finished.replacingOccurrences(of: Self.opId, with: id))
+        })
+        let request = try AgentRequest.update(service: "t3", intent: .init(detach: true, operationId: id), dialect: .v3)
+        let conclusion = try await driver.perform(request, operationId: id, dialect: .v3)
+        #expect(asked == [["op", id, "--wait", "20"]])
+        #expect(conclusion.replayed)
+        #expect(conclusion.result.action == "updated")
+        #expect(!conclusion.stillRunning)
+    }
+
+    @Test("pending work that is not the agent's to report on yet is not polled")
+    func queuedAndTransitionsAreNotPolled() async throws {
+        for fixture in ["update.queued.json", "boot.rebooting.json", "sleep.sleeping.json"] {
+            let text = try String(decoding: ContractCorpus.data("fixtures/\(fixture)"), as: UTF8.self)
+            var polls = 0
+            let driver = OperationDriver(send: { _ in try Self.reply(text) }, readOperation: { _ in
+                polls += 1
+                return try Self.poll(Self.finished)
+            })
+            let request = try AgentRequest.update(service: "demo", intent: .init(operationId: Self.opId), dialect: .v3)
+            let conclusion = try await driver.perform(request, operationId: Self.opId, dialect: .v3)
+            #expect(Outcome.of(conclusion.result) == .pending, "\(fixture)")
+            #expect(!conclusion.stillRunning, "\(fixture)")
+            #expect(polls == 0, "\(fixture)")
+        }
+    }
+
+    @Test("an agent that took a request and then has no record of it leaves the outcome unknown")
+    func lostRecordIsUnknown() async throws {
+        let driver = OperationDriver(send: { _ in try Self.reply(Self.accepted) }, readOperation: { _ in
+            try Self.poll(#"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#)
+        })
+        let request = try AgentRequest.update(service: "demo", intent: .init(detach: true, operationId: Self.opId), dialect: .v3)
+        let conclusion = try await driver.perform(request, operationId: Self.opId, dialect: .v3)
+        #expect(!conclusion.stillRunning)
+        #expect(OperationOutcome.state(for: conclusion.result, stillRunning: false) == .unknown)
+    }
+
+    @Test("only a present op null is the agent saying it has no record, whatever the code")
+    func unknownOperation() throws {
+        // Agent 3.1.0 answers not-configured, 3.0.x answered bad-argument, and both mean the same.
+        #expect(try Self.poll(#"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#).isUnknownOperation)
+        #expect(try Self.poll(#"{"ok":false,"contract":3,"reasonCode":"bad-argument","command":"op","op":null}"#).isUnknownOperation)
+        // A refusal in the error shape carries no op at all, and says nothing about the record.
+        #expect(!(try Self.poll(#"{"ok":false,"contract":3,"reasonCode":"restricted","command":"op","error":"denied"}"#).isUnknownOperation))
+        #expect(!(try Self.poll(Self.finished).isUnknownOperation))
     }
 
     @Test("the history exports as text with the detail and the output in it")

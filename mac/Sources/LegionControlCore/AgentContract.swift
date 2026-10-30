@@ -242,12 +242,16 @@ struct AgentOperation: Decodable, Sendable, Equatable, Identifiable {
     /// The action name, when a summary carries it flat rather than inside `result`.
     var action: String?
     var reasonCode: String?
+    /// What became of it, as agent 3.1.0 states it: `pending` while queued or running, one of the
+    /// four terminal outcomes once finished (section 5.6). Read through `Outcome.of`, which reduces
+    /// it from the result when an older agent did not say.
+    var outcome: String?
 
     private enum CodingKeys: String, CodingKey {
         case rawId = "id"
         case kind, service, target, actionId, mode, initiator, state, phase, progress
         case requestedAt, startedAt, updatedAt, finishedAt, expiresAt, pid, detached
-        case from, to, result, log, agentVersion, systemId, replayed, children, action, reasonCode
+        case from, to, result, log, agentVersion, systemId, replayed, children, action, reasonCode, outcome
     }
 
     struct Initiator: Decodable, Sendable, Equatable {
@@ -284,6 +288,10 @@ struct AgentOperation: Decodable, Sendable, Equatable, Identifiable {
         var to: String?
         var exitCode: Int?
         var output: String?
+        /// The finished result's own outcome, from agent 3.1.0 on. The record's `outcome` comes
+        /// first when the two differ: a producer that knows a failure may have changed the machine
+        /// says `unknown` there.
+        var outcome: String?
     }
 
     struct LogLine: Decodable, Sendable, Equatable, Identifiable {
@@ -297,6 +305,7 @@ struct AgentOperation: Decodable, Sendable, Equatable, Identifiable {
         var service: String?
         var action: String?
         var reasonCode: String?
+        var outcome: String?
         var id: String { opId ?? service ?? UUID().uuidString }
     }
 
@@ -462,6 +471,11 @@ struct AgentProcessInfo: Decodable, Sendable, Equatable {
     var state: String?
     var startedAt: String?
     var error: String?
+
+    /// Whether the probe failed, so nobody knows whether the process runs. A failed probe answers
+    /// `running: false` beside its error, and drawn from that flag it read as a service that had
+    /// stopped (G13): it is shown as unknown exactly when there is an error.
+    var isUnknown: Bool { error != nil }
 }
 
 struct AgentHealthInfo: Decodable, Sendable, Equatable {
@@ -505,6 +519,71 @@ struct AgentInfo: Decodable, Sendable, Equatable {
     var node: String?
     /// True when this app is talking through the restricted dispatcher rather than a full shell.
     var restrictedSession: Bool?
+    /// The version floor, from agent 3.1.0 on: the oldest agent this machine may be replaced by
+    /// (section 13). Null both when the agent could not read its floor file and when it predates the
+    /// idea; `reportsFloor` tells the two apart, because only an agent that reports a floor knows
+    /// `--allow-downgrade` at all.
+    var floor: String?
+    var reportsFloor = false
+
+    private enum CodingKeys: String, CodingKey {
+        case version, contract, base, node, restrictedSession, floor
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(String.self, forKey: .version)
+        contract = try container.decodeIfPresent(Int.self, forKey: .contract)
+        base = try container.decodeIfPresent(String.self, forKey: .base)
+        node = try container.decodeIfPresent(String.self, forKey: .node)
+        restrictedSession = try container.decodeIfPresent(Bool.self, forKey: .restrictedSession)
+        floor = try container.decodeIfPresent(String.self, forKey: .floor)
+        reportsFloor = container.contains(.floor)
+    }
+}
+
+/// Agent versions, compared the way the version floor compares them (section 13): the three
+/// leading numbers, numerically, and whatever follows them ignored. A version that does not start
+/// with three numbers compares with nothing, and is never taken for an older one.
+enum AgentVersion {
+    /// `.orderedAscending` when `left` is the older, nil when either is not a version.
+    static func compare(_ left: String?, _ right: String?) -> ComparisonResult? {
+        guard let a = leading(left), let b = leading(right) else { return nil }
+        for (x, y) in zip(a, b) where x != y {
+            // Digits without their leading zeros: the longer is the larger, and of two as long the
+            // first that differs decides, so no number is too long to compare.
+            if x.count != y.count { return x.count < y.count ? .orderedAscending : .orderedDescending }
+            return x < y ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
+    }
+
+    /// Whether `version` is known to be older than `other`. Not knowing is not older.
+    static func isOlder(_ version: String?, than other: String?) -> Bool {
+        compare(version, other) == .orderedAscending
+    }
+
+    /// The three leading numbers, each without its leading zeros, or nil.
+    private static func leading(_ version: String?) -> [String]? {
+        guard let version else { return nil }
+        var numbers: [String] = []
+        var digits = ""
+        for scalar in version.unicodeScalars {
+            if ("0"..."9").contains(scalar) {
+                digits.unicodeScalars.append(scalar)
+                continue
+            }
+            guard !digits.isEmpty, numbers.count < 2, scalar == "." else { break }
+            numbers.append(digits)
+            digits = ""
+        }
+        guard numbers.count == 2, !digits.isEmpty else { return nil }
+        numbers.append(digits)
+        return numbers.map { number in
+            let trimmed = number.drop { $0 == "0" }
+            return trimmed.isEmpty ? "0" : String(trimmed)
+        }
+    }
 }
 
 /// Whether the agent could read its own configuration. `ok: false` blocks every mutation on the far
@@ -588,6 +667,8 @@ struct AgentDoctorResult: Decodable, Sendable {
     var reasonCode: String?
     var notes: [String]?
     var checks: [AgentCheck]?
+    /// How many checks came out `ok`, `warn` and `fail`, as the agent counted them.
+    var counts: [String: Int]?
 }
 
 // MARK: - History, logs, policy, bundle
@@ -656,6 +737,8 @@ struct AgentPolicyResult: Decodable, Sendable {
     var autoUpdate: Bool?
     /// Which keys a `policy set` actually changed.
     var changed: [String]?
+    /// What became of a `policy set`, as agent 3.1.0 states it (section 5.6).
+    var outcome: String?
 
     struct ServicePolicy: Decodable, Sendable, Equatable, Identifiable {
         var id: String
@@ -679,39 +762,60 @@ struct AgentBundleResult: Sendable {
 ///
 /// The exact bytes matter here in a way they do not anywhere else. The hash both sides compare is a
 /// hash of the canonical bytes, and re-serialising a decoded JSON object does not reproduce them:
-/// key order, spacing and number formatting are all free. So the raw text is preferred wherever the
-/// agent sends it, and a re-encoded object is only ever used when its hash matches what the machine
-/// reports — which is checked at the call site before anything is adopted.
-struct RemoteControllerDocument: Decodable, Sendable {
+/// key order, spacing and number spelling are all free. So the stored text is taken from `raw`,
+/// which agent 3.1 sends, and adopted exactly as it is (C1).
+struct RemoteControllerDocument: Decodable, Sendable, ReadsReplyText {
     var ok: Bool?
     var contract: Int?
     var message: String?
     var reasonCode: String?
     var hash: String?
     var meta: ControllerCopy?
-    /// The document as text, when the agent sends it that way.
+    /// The document exactly as the agent stored it.
     var raw: String?
-    /// The document as an object, when it does not.
-    var controller: JSONAny?
+    /// The reply's `controller` object, which is all an agent before 3.1 sends, written out again as
+    /// `JSON.stringify(controller, null, 2)` would, in the order its members arrived. Read from the
+    /// reply text, because a decoded object has no order left; nil when there is no object.
+    var receivedControllerText: String?
 
     private enum CodingKeys: String, CodingKey {
-        case ok, contract, message, reasonCode, hash, meta, raw, controller
+        case ok, contract, message, reasonCode, hash, meta, raw
     }
 
     var reason: AgentReason? { AgentReason(code: reasonCode) }
 
     /// The bytes to hash and adopt, or nil when the reply carried no document.
     ///
-    /// A `raw` field, when the agent sends one, is the document exactly as it is stored and needs no
-    /// reconstruction. Without it the object is written out again with the shared writer, which
-    /// reproduces the stored bytes for any document written by a client that sorts its keys. The
-    /// caller checks the result against the hash the machine reports and refuses to adopt anything
-    /// that does not match, so a document written some other way is a visible message rather than a
-    /// silent divergence.
+    /// `raw` is the stored document and needs no reconstruction. An agent before 3.1 sends only the
+    /// parsed object, which can be written out again only in the order it was received: a JSON
+    /// object has no other order, and sorting the keys, as this app once did, reproduced only
+    /// documents a Mac had written. The caller checks the result against the hash the agent reports
+    /// and adopts nothing that does not match, so a document the rebuild cannot reproduce is said
+    /// to need a newer agent rather than diverging from everybody on the next poll.
     var documentBytes: Data? {
         if let raw, !raw.isEmpty { return Data(raw.utf8) }
-        guard let object = controller?.value as? [String: Any] else { return nil }
-        return try? JSONText.canonicalDocument(object)
+        return receivedControllerText.map { Data($0.utf8) }
+    }
+
+    mutating func read(replyText: Data) {
+        guard let controller = (try? SetupJSON.parse(replyText, repeats: .lastWins))?["controller"],
+              controller.isObject else { return }
+        receivedControllerText = controller.documentText
+    }
+}
+
+/// A reply that needs the text it arrived as, not only the values in it.
+protocol ReadsReplyText {
+    mutating func read(replyText: Data)
+}
+
+/// Decoding an agent's reply, the one way both transports do it.
+enum AgentReplyDecoder {
+    static func decode<Value: Decodable>(_ type: Value.Type, from json: Data) throws -> Value {
+        let value = try JSONDecoder().decode(Value.self, from: json)
+        guard var textual = value as? any ReadsReplyText else { return value }
+        textual.read(replyText: json)
+        return (textual as? Value) ?? value
     }
 }
 
@@ -733,6 +837,9 @@ struct AgentBusyResult: Decodable, Sendable {
     var reason: String?
     var monitoredServices: Int?
     var unmonitoredServices: Int?
+    /// The one-service shape, and a machine with none, put the busy record at the top level.
+    var monitored: Bool?
+    var evidence: String?
     var services: [Service]?
 
     struct Service: Decodable, Sendable, Equatable, Identifiable {
@@ -755,11 +862,11 @@ struct AgentBusyResult: Decodable, Sendable {
         var threadsTruncated: Int?
 
         /// The same three-way verdict the status path uses, so the two cannot disagree about what
-        /// "not busy" means.
+        /// "not busy" means, and the same evidence for whether anything watches the service.
         var verdict: BusyStatus.Verdict {
             if busy == true { return .busy }
             if unknown == true { return .unknown }
-            if monitored == false { return .unmonitored }
+            if evidence == "unmonitored" { return .unmonitored }
             return .idle
         }
     }

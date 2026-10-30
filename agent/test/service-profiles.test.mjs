@@ -6,7 +6,7 @@ import test from 'node:test';
 import { discoverServiceProfiles } from '../src/service-profiles.mjs';
 import { inspectProfileProcesses, processExitVerdict, latestClaudeVersion, readProfileVersion, runNativeClaudeProbe } from '../src/service-profile-probe.mjs';
 import { resolveClaudeUpdatePolicy, claudeTargetAllowed, readClaudeRemotePolicy } from '../src/service-profile-claude.mjs';
-import { normalizeConfig } from '../src/config.mjs';
+import { normalizeConfig } from '../src/config-schema.mjs';
 import { readDesktopMetadata } from '../src/service-profile-desktop.mjs';
 
 // These fixtures describe a simulated POSIX host even when tests run on
@@ -28,11 +28,11 @@ function mockFiles(files = {}) {
     readdirSync(directory) { directory = fixturePath(directory); return [...new Set(Object.keys(files).filter((file) => file.startsWith(`${directory}/`)).map((file) => file.slice(directory.length + 1).split('/')[0]))]; },
   };
 }
-const policyOptions = (files = {}, env = {}) => ({ home: '/home/test', platform: 'linux', executable: '/mock/claude', inspectRemote: () => 'not-eligible', env: { ANTHROPIC_BASE_URL: 'https://custom-provider.example', ...env }, io: mockFiles(files) });
+const policyOptions = (files = {}, env = {}) => ({ home: '/home/me', platform: 'linux', executable: '/mock/claude', inspectRemote: () => 'not-eligible', env: { ANTHROPIC_BASE_URL: 'https://custom-provider.example', ...env }, io: mockFiles(files) });
 
 test('native policy resolves local/managed precedence and blocks unsupported or disabled updates', () => {
-  const user = '/home/test/.claude/settings.json';
-  const local = '/home/test/.claude/settings.local.json';
+  const user = '/home/me/.claude/settings.json';
+  const local = '/home/me/.claude/settings.local.json';
   const managed = '/etc/claude-code/managed-settings.json';
   const files = { [user]: JSON.stringify({ autoUpdatesChannel: 'stable', env: { DISABLE_UPDATES: 'false', SECRET: 'never-return' } }), [local]: JSON.stringify({ autoUpdatesChannel: 'latest' }) };
   const resolved = resolveClaudeUpdatePolicy(policyOptions(files, { DISABLE_UPDATES: 'TRUE' }));
@@ -49,7 +49,7 @@ test('native policy resolves local/managed precedence and blocks unsupported or 
 });
 
 test('native policy refuses unknown remote approval, registry policy and detected mac preference policy', () => {
-  assert.equal(resolveClaudeUpdatePolicy(policyOptions({ '/home/test/.claude/remote-settings.json': '{"autoUpdatesChannel":"stable"}' }, { ANTHROPIC_BASE_URL: '' })).ok, false);
+  assert.equal(resolveClaudeUpdatePolicy(policyOptions({ '/home/me/.claude/remote-settings.json': '{"autoUpdatesChannel":"stable"}' }, { ANTHROPIC_BASE_URL: '' })).ok, false);
   assert.equal(resolveClaudeUpdatePolicy({ ...policyOptions(), inspectRemote: () => null }).ok, false);
   assert.equal(resolveClaudeUpdatePolicy({ ...policyOptions(), platform: 'win32' }).ok, false);
   assert.equal(resolveClaudeUpdatePolicy(policyOptions({ '/proc/version': 'Linux Microsoft WSL2' })).ok, false);
@@ -57,7 +57,7 @@ test('native policy refuses unknown remote approval, registry policy and detecte
   assert.equal(resolveClaudeUpdatePolicy({ ...policyOptions(), username: 'different-account', platform: 'darwin', io: mockFiles({ '/Library/Managed Preferences/different-account/com.anthropic.claudecode.plist': 'policy' }) }).ok, false);
   const bounds = resolveClaudeUpdatePolicy(policyOptions({ '/etc/claude-code/managed-settings.json': '{"requiredMinimumVersion":"2.1.200","requiredMaximumVersion":"2.1.250"}' }));
   assert.equal(claudeTargetAllowed(bounds, '2.1.199'), false); assert.equal(claudeTargetAllowed(bounds, '2.1.251'), false);
-  const ignored = resolveClaudeUpdatePolicy(policyOptions({ '/home/test/.claude/settings.json': '{"requiredMinimumVersion":"invalid","requiredMaximumVersion":"1.0.0"}' }));
+  const ignored = resolveClaudeUpdatePolicy(policyOptions({ '/home/me/.claude/settings.json': '{"requiredMinimumVersion":"invalid","requiredMaximumVersion":"1.0.0"}' }));
   assert.equal(ignored.ok, true); assert.equal(ignored.requiredMaximumVersion, null);
   assert.equal(claudeTargetAllowed(bounds, '2.1.240', 'unknown'), false);
 });
@@ -73,8 +73,8 @@ test('publisher latest data is bounded, validated and never guessed from version
 });
 
 test('native remote inspection returns only an explicit no-policy diagnostic', () => {
-  const inspect = (stdout) => readClaudeRemotePolicy('/mock/claude', { home: '/home/test', run: (executable, argv, options) => {
-    assert.equal(executable, '/mock/claude'); assert.deepEqual(argv, ['doctor']); assert.equal(options.cwd, '/home/test');
+  const inspect = (stdout) => readClaudeRemotePolicy('/mock/claude', { home: '/home/me', run: (executable, argv, options) => {
+    assert.equal(executable, '/mock/claude'); assert.deepEqual(argv, ['doctor']); assert.equal(options.cwd, '/home/me');
     return { status: 0, stdout };
   } });
   assert.equal(inspect('Private account details\nManaged settings (remote): not fetched — requires an Enterprise or Team subscription\n'), 'not-eligible');
@@ -86,13 +86,13 @@ test('native remote inspection returns only an explicit no-policy diagnostic', (
 test('native update rechecks policy, fixes cwd to home and never exposes updater output', async () => {
   const policy = resolveClaudeUpdatePolicy(policyOptions());
   let calls = 0;
-  const options = { executable: '/mock/claude', home: '/home/test', expectedPolicy: policy.hash };
+  const options = { executable: '/mock/claude', home: '/home/me', expectedPolicy: policy.hash };
   for (const owned of [null, '2.1.240']) {
     const unsupported = await runNativeClaudeProbe('native-update', options, { nativeVersion: () => owned, run: () => { throw new Error('must not execute'); }, resolvePolicy: () => { throw new Error('must not inspect an unsupported product'); } });
     assert.equal(unsupported.ok, false);
   }
   const run = (executable, args, options) => {
-    calls += 1; assert.equal(executable, '/mock/claude'); assert.equal(options.cwd, '/home/test');
+    calls += 1; assert.equal(executable, '/mock/claude'); assert.equal(options.cwd, '/home/me');
     if (args[0] === '--version') return { status: 0, stdout: '2.1.261 (Claude Code)' };
     assert.deepEqual(args, ['update']); return { status: 0, stdout: 'private-output', stderr: 'private-output' };
   };
@@ -146,7 +146,7 @@ test('desktop monitoring reads metadata through fixed OS tools and never starts 
   } });
   assert.deepEqual(windows, { version: '1.2.3', identity: 'Claude' });
   const desktopIo = { ...io, statSync: (file) => fixturePath(file) === location ? { isDirectory: () => true } : io.statSync(file) };
-  const profiles = discoverServiceProfiles({ platform: 'mac', home: '/home/test', env: {}, io: desktopIo, readDesktop: (file, options) => readDesktopMetadata(file, { ...options, run }) });
+  const profiles = discoverServiceProfiles({ platform: 'mac', home: '/home/me', env: {}, io: desktopIo, readDesktop: (file, options) => readDesktopMetadata(file, { ...options, run }) });
   const profile = profiles.find((entry) => entry.id === 'claude-desktop');
   assert.equal(profile.availability, 'manual'); assert.equal(profile.service.updates.automatic, false);
   assert.equal(profile.service.update, undefined); assert.equal(profile.service.latestVersion, undefined);

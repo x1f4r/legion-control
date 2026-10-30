@@ -29,13 +29,19 @@ enum ReleaseTrust {
     /// There are exactly two seams in this trust boundary and both are narrow. The first is the
     /// `key` parameter on `verifiedManifest`, which the tests pass so they can show the verifier
     /// accepting a good signature as well as refusing a bad one. The second is an environment
-    /// variable the shipping app never sets, for an end-to-end run against a test release. Neither
-    /// can switch verification off: the only thing either substitutes is another Ed25519 public key.
-    static func verificationKey() throws -> Curve25519.Signing.PublicKey {
-        if let override = ProcessInfo.processInfo.environment["LEGION_CONTROL_TEST_RELEASE_KEY"],
-           !override.isEmpty {
+    /// variable for an end-to-end run against a test release, and it exists only in a debug build.
+    /// A release build does not contain the name at all, so nothing that can set an environment
+    /// variable for the shipping app, a launch agent or a wrapper script, can change the key it
+    /// trusts. Neither seam can switch verification off: the only thing either substitutes is
+    /// another Ed25519 public key.
+    static func verificationKey(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> Curve25519.Signing.PublicKey {
+        #if DEBUG
+        if let override = environment["LEGION_CONTROL_TEST_RELEASE_KEY"], !override.isEmpty {
             return try publicKey(fromPEM: override)
         }
+        #endif
         return try publicKey(fromPEM: publicKeyPEM)
     }
 

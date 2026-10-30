@@ -21,9 +21,8 @@
 // Everything the scheduler declines is declined with a reasonCode, so a client
 // can say "paused until Tuesday" rather than "nothing happened".
 
-import { WEEKDAYS } from './config.mjs';
-import { REASON } from './contract.mjs';
-import { serviceState } from './state.mjs';
+import { WEEKDAYS } from './config-schema.mjs';
+import { CLOCK_TIME_PATTERN, REASON } from './contract.mjs';
 
 function minutesOfDay(hhmm) {
   const [hours, minutes] = String(hhmm).split(':').map((part) => Number.parseInt(part, 10));
@@ -78,22 +77,21 @@ export function nextWindowStart(windows, now = new Date()) {
 
 /**
  * The policy actually in force for one service, with every inherited value
- * resolved and the runtime pause folded in.
+ * resolved.
  *
- * A pause can come from the config file or from `auto-update pause`, which
- * writes to the service's state rather than rewriting the config. Whichever
- * lasts longer wins: a person who paused for four hours and then edited the
- * config to pause for a day meant the day.
+ * A pause can be the service's own or the machine's, and `auto-update pause`
+ * and `policy set` write either into config.json. Whichever lasts longer wins:
+ * a machine paused for a day pauses a service paused for four hours for the
+ * day.
  */
-export function effectivePolicy(config, service, { state = null } = {}) {
+export function effectivePolicy(config, service) {
   const system = config.updates ?? { automatic: true, pauseUntil: null, maintenanceWindows: [] };
   const own = service?.updates ?? {};
-  const stored = state ?? (service ? serviceState(service) : {});
 
   const automatic = own.automatic === null || own.automatic === undefined ? system.automatic === true : own.automatic === true;
   const inherited = own.automatic === null || own.automatic === undefined;
 
-  const pauses = [own.pauseUntil, stored.pauseUntil, system.pauseUntil].filter(
+  const pauses = [own.pauseUntil, system.pauseUntil].filter(
     (value) => typeof value === 'string' && !Number.isNaN(Date.parse(value)),
   );
   const pauseUntil = pauses.length > 0 ? pauses.sort((a, b) => Date.parse(b) - Date.parse(a))[0] : null;
@@ -108,7 +106,7 @@ export function effectivePolicy(config, service, { state = null } = {}) {
     inherited,
     pauseUntil,
     // Which side the pause came from matters to a UI offering "resume".
-    pauseSource: pauses.length === 0 ? null : pauseUntil === stored.pauseUntil ? 'runtime' : pauseUntil === own.pauseUntil ? 'service' : 'system',
+    pauseSource: pauses.length === 0 ? null : pauseUntil === own.pauseUntil ? 'service' : 'system',
     maintenanceWindows,
     windowsInherited: own.maintenanceWindows === null || own.maintenanceWindows === undefined,
     order: own.order ?? 0,
@@ -129,7 +127,7 @@ export function hasUpdatePath(service) {
  * request. The busy gate is not asked here: it is asked later, by the cycle,
  * because it costs a probe and this answer often makes it unnecessary.
  */
-export function scheduledEligibility(config, service, { now = new Date(), state = null } = {}) {
+export function scheduledEligibility(config, service, { now = new Date() } = {}) {
   if (!hasUpdatePath(service)) {
     return {
       eligible: false,
@@ -138,7 +136,7 @@ export function scheduledEligibility(config, service, { now = new Date(), state 
     };
   }
 
-  const policy = effectivePolicy(config, service, { state });
+  const policy = effectivePolicy(config, service);
 
   // The system switch is a master stop for the scheduler. A service that turns
   // its own automatic on cannot re-enable a schedule the machine has turned off,
@@ -242,9 +240,9 @@ export function describeSystemUpdates(config, { now = new Date(), lastCycle = nu
 }
 
 /** The per-service `updates` block as status reports it. */
-export function describeServiceUpdates(config, service, { now = new Date(), state = null, busy = null } = {}) {
-  const eligibility = scheduledEligibility(config, service, { now, state });
-  const policy = eligibility.policy ?? effectivePolicy(config, service, { state });
+export function describeServiceUpdates(config, service, { now = new Date(), busy = null } = {}) {
+  const eligibility = scheduledEligibility(config, service, { now });
+  const policy = eligibility.policy ?? effectivePolicy(config, service);
 
   // The busy gate is the last thing a cycle checks, so a service that is
   // otherwise eligible is only "eligible now" when it is also not busy.
@@ -333,7 +331,7 @@ export function validatePolicyPatch(raw, { perService }) {
         if (unknown) errors.push({ path: `${where}.days`, message: `unknown day ${JSON.stringify(unknown)}; one of ${WEEKDAYS.join(', ')}` });
         for (const key of ['from', 'to']) {
           if (entry[key] === undefined || entry[key] === null) continue;
-          if (typeof entry[key] !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(entry[key])) {
+          if (typeof entry[key] !== 'string' || !CLOCK_TIME_PATTERN.test(entry[key])) {
             errors.push({ path: `${where}.${key}`, message: `expected a 24-hour local time like "02:30", got ${JSON.stringify(entry[key])}` });
           }
         }

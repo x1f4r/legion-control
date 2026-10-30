@@ -61,8 +61,14 @@ export function reduceOutcome(x) {
   if (PENDING_ACTIONS.has(action)) return 'pending';
   if (SUCCESS_ACTIONS.has(action)) return 'succeeded';
   if (DEFERRED_ACTIONS.has(action)) return 'deferred';
-  // A cancelled request was itself deferred; a cancel that worked succeeded.
-  if (action === 'cancelled') return reasonCode === 'cancelled' ? 'deferred' : 'succeeded';
+  // A cancelled request was itself deferred, and a cancel that worked succeeded.
+  // A request the agent cancelled because it could not safely replace the one
+  // before it (internal) may have left that one replaced or not.
+  if (action === 'cancelled') {
+    if (reasonCode == null) return 'succeeded';
+    if (reasonCode === 'cancelled') return 'deferred';
+    return reasonCode === 'internal' ? 'unknown' : 'failed';
+  }
   // The old version is back and running: success only when nothing went wrong.
   if (action === 'rolled-back') return reasonCode == null ? 'succeeded' : 'failed';
   if (action === 'interrupted') return 'unknown';

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -20,6 +21,9 @@ public sealed class SetupEditor : Window
     private readonly AppModel _app;
     private readonly TextBox _text;
     private readonly StackPanel _report = Ui.Column(2);
+    /// The hash of the document the text was read from, null for none. Apply saves the text only
+    /// over that document: over a later one it would put back what this one held and approve it.
+    private string? _base;
 
     public SetupEditor(AppModel app)
     {
@@ -29,15 +33,18 @@ public sealed class SetupEditor : Window
         Height = 720;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
 
+        var opened = app.Config.Document;
+        _base = opened?.Hash;
         _text = new TextBox
         {
             AcceptsReturn = true,
             AcceptsTab = true,
             TextWrapping = TextWrapping.NoWrap,
             FontFamily = new FontFamily("monospace"),
-            Text = app.Config.Document?.Text ?? SetupTemplates.Example,
+            Text = opened?.Text ?? SetupTemplates.Example,
             MinHeight = 320,
         };
+        AutomationProperties.SetName(_text, "The setup document");
 
         var body = Ui.Column(4);
         body.Margin = new Thickness(20);
@@ -82,7 +89,7 @@ public sealed class SetupEditor : Window
     ///
     /// The fields are asked for rather than guessed: a machine id and an ssh host are the two things
     /// nobody else can know, and a template with a hole left in it is not inserted at all.
-    private async void Insert(SetupTemplate template)
+    private void Insert(SetupTemplate template) => Ui.Run(this, $"Inserting {template.Name}", async () =>
     {
         var values = await AskFor(template);
         if (values is null) return;
@@ -110,7 +117,7 @@ public sealed class SetupEditor : Window
         }
         _text.Text = plan.Text;
         Report(plan.Problems, plan.Preview.Lines().ToList());
-    }
+    });
 
     /// One small sheet per template, with a field for each thing it needs.
     private async Task<Dictionary<string, string>?> AskFor(SetupTemplate template)
@@ -139,6 +146,7 @@ public sealed class SetupEditor : Window
         {
             body.Children.Add(new TextBlock { Text = field.Label, Foreground = Ui.Muted, FontSize = 12 });
             var box = new TextBox { Text = field.Default ?? "" };
+            AutomationProperties.SetName(box, field.Label);
             boxes[field.Key] = box;
             body.Children.Add(box);
         }
@@ -161,39 +169,113 @@ public sealed class SetupEditor : Window
     private void Check()
     {
         var plan = ControllerEditor.Plan(_text.Text ?? "", _app.Config.Config, "check", _ => { });
-        var decoded = ControllerConfig.From(Contract.Value.Parse(plan.Text));
-        Report(plan.Problems, plan.Preview.Lines().Concat(decoded.Warnings()).ToList());
+        Report(plan.Problems, plan.Preview.Lines().Concat(plan.Warnings ?? Array.Empty<string>()).ToList(), _app.LaunchEditProblems(_text.Text ?? "", _base));
     }
 
     private void Apply()
     {
-        var (document, problem) = _app.Config.ApplyEdit(_text.Text ?? "", "edited here");
+        // Saving here approves every command it changes, so a command waiting for approval is
+        // approved or reverted on its own first, never carried along by an edit to its shell, and
+        // text read from an earlier setup is never saved over a later one.
+        var (document, problem, refused) = _app.ApplyEdit(_text.Text ?? "", _base, "edited here");
+        if (refused.Count > 0)
+        {
+            Report(Array.Empty<string>(), Array.Empty<string>(), refused);
+            return;
+        }
         if (problem is not null)
         {
             Report(new[] { problem }, Array.Empty<string>());
             return;
         }
-        _text.Text = document!.Text;
+        ReadFrom(document!);
         Report(Array.Empty<string>(), new[]
         {
-            $"Applied as revision {document.Identity.RevisionNumber}.",
+            $"Applied as revision {document!.Identity.RevisionNumber}.",
             "Every machine that holds an earlier version of this setup will be given it on the next reading.",
         });
     }
 
-    private async void Import()
+    private void Import() => Ui.Run(this, "Importing a setup", async () =>
     {
         await new ImportSetup(_app).ShowDialog(this);
-        _text.Text = _app.Config.Document?.Text ?? _text.Text;
+        if (_app.Config.Document is { } document) ReadFrom(document);
+        Check();
+    });
+
+    /// Puts the setup as it is now in the editor, in place of whatever was typed.
+    private void StartAgain()
+    {
+        if (_app.Config.Document is { } document) ReadFrom(document);
+        else
+        {
+            _text.Text = SetupTemplates.Example;
+            _base = null;
+        }
         Check();
     }
 
-    private void Report(IReadOnlyList<string> problems, IReadOnlyList<string> notes)
+    private void ReadFrom(ControllerDocument document)
     {
+        _text.Text = document.Text;
+        _base = document.Hash;
+    }
+
+    private void Report(IReadOnlyList<string> problems, IReadOnlyList<string> notes,
+        IReadOnlyList<LaunchGate.EditProblem>? launch = null)
+    {
+        launch ??= Array.Empty<LaunchGate.EditProblem>();
         _report.Children.Clear();
-        _report.Children.Add(Ui.SectionHeading(problems.Count == 0 ? "Ready" : "Not yet"));
+        _report.Children.Add(Ui.SectionHeading(problems.Count == 0 && launch.Count == 0 ? "Ready" : "Not yet"));
         foreach (var problem in problems) _report.Children.Add(Ui.Note(problem, Ui.Bad));
+        if (_app.Config.Document?.Hash != _base)
+        {
+            _report.Children.Add(Ui.Actions(Ui.Action("Start again from the current setup", StartAgain,
+                explanation: "Replaces the document below with the setup as it is now. Copy anything you typed that you want to keep first.")));
+        }
+        // Approve here records the waiting value itself, which the document below may no longer
+        // show, so it is shown beside the button as the review shows it.
+        if (launch.Any(problem => problem.Waiting is not null))
+        {
+            _report.Children.Add(Ui.Note(LaunchGate.Provenance(_app.Config.Document?.Identity)));
+            _report.Children.Add(Ui.Note(LaunchReviewSheet.Consequence));
+        }
+        foreach (var problem in launch)
+        {
+            _report.Children.Add(Ui.Note(problem.Sentence, Ui.Bad));
+            if (problem.Waiting is not { } entry) continue;
+            _report.Children.Add(LaunchReviewSheet.Comparison(entry, _app.Config.Config));
+            _report.Children.Add(Ui.Actions(
+                entry.Approvable ? Ui.Action("Approve", () => ApproveWaiting(entry)) : null,
+                entry.CanRevert ? Ui.Action("Revert", () => RevertWaiting(entry),
+                    explanation: "Puts the command this device approved back into the document below. Apply saves it.") : null));
+        }
         foreach (var note in notes) _report.Children.Add(Ui.Note(note));
+    }
+
+    /// Approves exactly the waiting value that was shown, then checks the document again.
+    private void ApproveWaiting(LaunchReviewEntry entry)
+    {
+        if (_app.ApproveLaunch(new[] { entry }) is { } problem)
+        {
+            Report(new[] { problem }, Array.Empty<string>());
+            return;
+        }
+        Check();
+    }
+
+    /// Puts the approved value back in the document being edited, keeping every other change in
+    /// it, so that Apply saves the revert together with them.
+    private void RevertWaiting(LaunchReviewEntry entry)
+    {
+        var (text, problem) = LaunchGate.Reverted(ControllerDocument.FromText(_text.Text ?? ""), entry);
+        if (text is null)
+        {
+            Report(new[] { problem ?? "The approved value could not be put back." }, Array.Empty<string>());
+            return;
+        }
+        _text.Text = text;
+        Check();
     }
 }
 
@@ -229,20 +311,26 @@ public sealed class BindingsEditor : Window
         var problems = Ui.Column(2);
         var buttons = new WrapPanel { Margin = new Thickness(0, 12, 0, 0) };
         buttons.Children.Add(Ui.Action("Cancel", Close));
+        // The bindings as the fields say, from the argv [localAgent] parses to.
+        Bindings Typed(IReadOnlyList<string> argv) => bindings with
+        {
+            DeviceName = Blank(name.Text),
+            Self = Blank(self.Text) is { } machine ? new SelfBinding(machine, Blank(system.Text)) : null,
+            LocalAgent = argv,
+            IdentityFile = Blank(identity.Text),
+            CurrentSite = Blank(site.Text),
+        };
+        // Save changes only the fields a person changed, on the bindings as the file holds them
+        // then: the command line may have set an alias or a site while this was open, and saving
+        // the rest as they were shown would put back what it replaced.
+        var opened = Typed(bindings.LocalAgent);
         buttons.Children.Add(Ui.Action("Save", () =>
         {
             IReadOnlyList<string> argv;
             try { argv = JsonSerializer.Deserialize<string[]>(localAgent.Text ?? "[]") ?? Array.Empty<string>(); }
             catch (JsonException error) { problems.Children.Clear(); problems.Children.Add(Ui.Note(error.Message, Ui.Bad)); return; }
-            var updated = bindings with
-            {
-                DeviceName = Blank(name.Text),
-                Self = Blank(self.Text) is { } machine ? new SelfBinding(machine, Blank(system.Text)) : null,
-                LocalAgent = argv,
-                IdentityFile = Blank(identity.Text),
-                CurrentSite = Blank(site.Text),
-            };
-            var problem = app.UpdateBindings(updated);
+            var saved = Typed(argv);
+            var problem = app.UpdateBindings(current => current.WithChanges(opened, saved));
             if (problem is null)
             {
                 Close();
@@ -260,6 +348,7 @@ public sealed class BindingsEditor : Window
     {
         body.Children.Add(new TextBlock { Text = label, Foreground = Ui.Muted, FontSize = 12 });
         var box = new TextBox { Text = value };
+        AutomationProperties.SetName(box, label);
         body.Children.Add(box);
         return box;
     }

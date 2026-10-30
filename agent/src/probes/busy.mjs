@@ -26,9 +26,9 @@
 // A configuration mistake — unknown type, command with no argv, http with no
 // port — never reaches here at all: config loading refuses it.
 
-import { deadline as makeDeadline, describeFailure, mapWithLimit, runArgvAsync } from '../config.mjs';
 import { REASON } from '../contract.mjs';
 import { httpGet } from '../http.mjs';
+import { deadline as makeDeadline, describeFailure, mapWithLimit, runArgvAsync } from '../process-runner.mjs';
 import { checkT3Sqlite } from './t3-sqlite.mjs';
 
 /** How many probes may be in flight at once. */

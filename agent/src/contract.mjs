@@ -101,9 +101,11 @@ export const PHASES = {
  * The phases during which an interrupted operation can have left a service down.
  * Recovery only acts on these: a run that died while resolving a version never
  * touched anything, and starting a service somebody stopped on purpose would be
- * damage of its own.
+ * damage of its own. A restart is one of them: for a command, a scheduled task
+ * or an app it is a stop and then a start, and a run that dies between the two
+ * leaves the service stopped like any update.
  */
-export const DISRUPTED_PHASES = new Set(['stopping', 'installing', 'verifying', 'starting', 'rolling-back']);
+export const DISRUPTED_PHASES = new Set(['stopping', 'installing', 'verifying', 'starting', 'rolling-back', 'restarting']);
 
 /**
  * The phases in which a run may already have changed the machine, whether or
@@ -114,7 +116,6 @@ export const DISRUPTED_PHASES = new Set(['stopping', 'installing', 'verifying', 
  */
 export const MUTATING_PHASES = new Set([
   ...DISRUPTED_PHASES,
-  'restarting',
   'arming',
   'rebooting',
   'preparing',
@@ -140,8 +141,8 @@ export const ACTIONS = {
     'already-running',
   ],
   restart: ['restarted', 'deferred', 'queued', 'failed', 'accepted', 'conflict', 'interrupted', 'cancelled', 'expired', 'already-running'],
-  boot: ['rebooting', 'rebooted', 'armed', 'noop', 'deferred', 'queued', 'failed', 'conflict', 'cancelled', 'expired', 'already-running'],
-  sleep: ['sleeping', 'slept', 'deferred', 'queued', 'failed', 'conflict', 'cancelled', 'expired', 'already-running'],
+  boot: ['rebooting', 'rebooted', 'armed', 'noop', 'deferred', 'queued', 'failed', 'conflict', 'interrupted', 'cancelled', 'expired', 'already-running'],
+  sleep: ['sleeping', 'slept', 'deferred', 'queued', 'failed', 'conflict', 'interrupted', 'cancelled', 'expired', 'already-running'],
   run: ['ran', 'deferred', 'queued', 'failed', 'accepted', 'conflict', 'interrupted', 'cancelled', 'expired', 'already-running'],
   cycle: ['cycled', 'skipped', 'failed', 'conflict', 'already-running'],
   'self-update': ['installed', 'rolled-back', 'noop', 'checked', 'failed', 'conflict', 'accepted', 'already-running'],
@@ -196,7 +197,11 @@ export function outcomeOf(x) {
   if (PENDING_ACTIONS.has(action)) return 'pending';
   if (SUCCESS_ACTIONS.has(action)) return 'succeeded';
   if (DEFERRED_ACTIONS.has(action)) return 'deferred';
-  if (action === 'cancelled') return reasonCode === REASON.cancelled ? 'deferred' : 'succeeded';
+  if (action === 'cancelled') {
+    if (reasonCode == null) return 'succeeded';
+    if (reasonCode === REASON.cancelled) return 'deferred';
+    return reasonCode === REASON.internal ? 'unknown' : 'failed';
+  }
   if (action === 'rolled-back') return reasonCode == null ? 'succeeded' : 'failed';
   if (action === 'interrupted') return 'unknown';
   if (action === 'failed') return reasonCode === REASON.timedOut || reasonCode === REASON.interrupted ? 'unknown' : 'failed';
@@ -238,6 +243,18 @@ export const OPERATION_ID_PATTERN = /^[a-z0-9-]{8,64}$/;
 
 /** Durations a client may write for an expiry or a pause: 30m, 4h, 2d. */
 export const DURATION_PATTERN = /^\d+(m|h|d)$/;
+
+/**
+ * Service, action and boot target ids, and the action a wake helper runs.
+ * They travel over ssh as bare tokens, so they are a narrower token.
+ */
+export const CONFIGURED_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** The shared setup's identity: one to 64 characters, and never a path. */
+export const SETUP_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+
+/** A local time of day in a maintenance window: 00:00 to 23:59. */
+export const CLOCK_TIME_PATTERN = /^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/;
 
 const DURATION_UNITS = { m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 };
 

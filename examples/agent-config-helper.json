@@ -9,17 +9,17 @@
       "id": "wake-tower",
       "name": "Wake the tower",
       "wol": {
-        "mac": "AA:BB:CC:DD:EE:FF",
+        "mac": "02:00:00:00:00:01",
         "broadcast": ["192.168.50.255"],
         "ports": [9, 7],
         "repeats": 3
       }
     },
     {
-      "id": "wake-attic-box",
+      "id": "wake-laptop",
       "name": "Wake the attic laptop",
       "wol": {
-        "mac": "11:22:33:44:55:66",
+        "mac": "02:00:00:00:00:02",
         "broadcast": ["192.168.50.255"]
       }
     }

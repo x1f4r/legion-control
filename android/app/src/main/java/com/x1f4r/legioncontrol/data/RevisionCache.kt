@@ -13,8 +13,8 @@ import java.io.File
  * Without it a divergence still merges, but every differing entry becomes a two-way choice instead of
  * only the ones both sides actually touched. That is a worse afternoon, not a wrong answer.
  */
-class RevisionCache(context: Context) {
-    private val directory = File(context.applicationContext.filesDir, "revisions")
+class RevisionCache(private val directory: File) {
+    constructor(context: Context) : this(File(context.applicationContext.filesDir, "revisions"))
 
     /** Writes [text] under its hash. Doing it twice costs nothing. */
     fun remember(hash: String, text: String) {

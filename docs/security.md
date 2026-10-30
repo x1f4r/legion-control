@@ -102,6 +102,14 @@ What the shared document deliberately cannot do:
   cannot.
 - **Normal replication requires lineage.** Divergent or stale documents are refused and surfaced.
   Explicit replacement is a separate reviewed action and can bypass that lineage requirement.
+- **It cannot change what another device runs.** Lineage proves a document claims an ancestor, not
+  who wrote it, and a restricted key may publish the setup too. So each system's agent command and
+  its grammar, a machine's `ssh.identityFile`, the update repository and the Mac's `local` agent
+  are applied with the document but run on a device only after that device approved them; until
+  then it runs what it approved before, or drives nothing there. Nothing that arrives by
+  replication approves anything, and the record of what a device approved never leaves it. Agent
+  3.1.0 also refuses, on a restricted session, a push carrying such a value its own copy would not
+  accept. `configuration.md` describes the review on each client.
 
 Private bindings — identity-file paths, SSH aliases, and which machine this device is — are never
 published and never leave the device. That is not only tidiness: an identity file path is a hint about a
@@ -141,6 +149,14 @@ monitoring without an unattended updater.
 The agent runs as your user. Boot and power operations, and some configured system services, may
 need elevation. Grant the specific commands required by your configuration rather than a shell.
 
+What the agent keeps is that user's alone, because the base holds every configured command, the
+setup and the record of every operation, and whoever can change the launchers in it runs code as
+that user. On Linux and macOS the installers work under `umask 077`, the base is `0700` and its
+files `0600`, and the scheduled cycle runs with the same mask (`UMask=0077` in the systemd unit,
+`Umask` 63 in the launchd job). On Windows the installer gives the base to the installing account
+alone, with inherited permissions removed. `doctor`'s `files.private` check says when that no
+longer holds and how to put it back.
+
 ### Linux
 
     # boot switching, only if you use efi-bootnext
@@ -175,6 +191,21 @@ A helper is only an improvement if it takes no arguments it then passes on. A he
 command to run is the shell rule again.
 
 ### Windows
+
+The scheduled task runs the agent as the account that installs it, the one whose base holds the
+launcher, the agent and `config.json`. A task running as anybody else would hand that account's
+rights to whoever can write those files, and one running as SYSTEM out of a profile would hand them
+the machine, so the installer refuses an existing task with any other principal, a group included,
+before it changes anything. `-AllowSystemPrincipal` keeps a task that runs as SYSTEM on narrow
+terms only: from an elevated session, with node installed for all users and the base outside every
+profile (for example `C:\ProgramData\legion-control`), with nobody but Administrators, SYSTEM,
+TrustedInstaller and the installing account able to change node, the base or a folder above them,
+and with a base that does not exist yet, which the installer then makes, with any missing folder
+above it, for Administrators and SYSTEM alone. A base somebody else made first is refused rather
+than taken over, since what they put in it would run as SYSTEM. On a re-run, entries the installing
+account owns are accepted and handed back to Administrators. Windows clients make the creator of a
+file its owner by default and Windows Server does not, which is why the installing account counts as
+trusted there. Remember that whatever the config has the agent run then runs as SYSTEM too.
 
 Boot switching with `bcdedit` requires elevated rights. Treat an administrator SSH session as
 administrative access, even when a particular key is forced through the dispatcher. The standard
@@ -273,6 +304,18 @@ machine does not need a download at all. The install action:
 5. publishes stable launch helpers under `<base>/bin`, then swaps the trees under the operation
    mutex using a recovery journal, retaining the previous tree.
 
+**The version floor.** Every signed agent declares the oldest agent that may replace it, as
+`legionControl.agentFloor` in its signed `package.json`, and the machine keeps the highest floor it
+has installed in `<base>/agent-floor.json`, outside the replaceable tree. `status` reports it as
+`agent.floor`. A restricted session may install only a bundle at or above both the running version
+and the floor, and roll back only to a kept tree at or above the floor; anything else is refused as
+`restricted`. An unrestricted session needs `self-update --allow-downgrade` to install below the
+running version, or to install or roll back below the floor, and then lowers the floor to that
+target first. The dispatcher refuses the flag, and a client sends it only after a person decided to
+go back, and only to an agent that reports a floor. The stable launcher refuses to run a signed
+tree below the floor, so a key that can only push old signed bundles cannot bring back an agent
+with a bug that was fixed. `doctor`'s `agent.floor` says which floor is in effect.
+
 The archive verifier rejects unsafe or ambiguous paths, links, duplicate entries, and files whose
 inventory, size or hash differs from the signed manifest. Stdin uploads are bounded before the
 operation mutex is acquired. Existing custom launcher argv are preserved; migrating a legacy
@@ -305,9 +348,20 @@ not by a key supplied with that artifact.
 Same rules, applied to a bundle instead of a tarball. It downloads the exact named asset for its
 platform, checks it against the signed manifest, unpacks and verifies in a temporary directory,
 retains the current bundle as `Legion Control.previous.app`, and swaps through a helper after a
-bounded wait for the old process to exit. If the new build does not write its launch marker within
-45 seconds, the helper attempts to restore the previous bundle. Staging and verification precede
-the swap; filesystem or process failures can still require recovery.
+bounded wait for the old process to exit. Every download is bounded: the release reply at 1 MiB,
+the manifest at 256 KiB, its signature at 4 KiB, and the archive at its signed size.
+
+If the new build does not write its launch marker within 45 seconds, the helper stops it if it is
+still on its way up and puts the previous bundle back. Either way it writes down how the swap ended,
+and the build that comes up next settles the update from that note: the new build waits for the
+note that the swap landed before it counts itself installed, and when no note comes while the helper
+could still write one it settles from its own version, so a Mac that went down in the middle still
+records the update. Rolling back to the kept build goes through the same helper, and once it has
+landed the build it replaced is deleted. A run whose state was moved elsewhere with
+`LEGION_CONTROL_HOME` or `LEGION_CONTROL_CONFIG`, or a copy running beside the installed app, never
+installs, rolls back or discards a build and leaves the swap record alone, because the bundle
+belongs to the ordinary installation. Staging and verification precede the swap; filesystem or
+process failures can still require recovery.
 
 The other desktop clients likewise verify the signed artifact and use an update helper with a
 retained previous installation.
@@ -368,5 +422,6 @@ argv values, which can also appear in process listings and command output.
 
 ## Reporting something
 
-If you find a problem with any of the above, open an issue with the reproduction and please do not
-include a bundle until you have read it.
+Report a vulnerability privately, through a security advisory on the repository's GitHub page
+(**Security → Report a vulnerability**), not in a public issue, with the reproduction. Anything that
+is not a security problem can go in an issue. Do not include a bundle until you have read it.

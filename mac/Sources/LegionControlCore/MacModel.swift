@@ -89,6 +89,12 @@ final class MacModel: AgentDevice {
 
     var isReachable: Bool { status != nil }
 
+    /// What this Mac's last read of its own agent says about it as a wake helper (section 10.2).
+    var wakeHelperState: WakePlan.HelperState {
+        if status != nil { return .init(.ready, actionKinds: status?.actions.map(WakePlan.HelperState.kinds)) }
+        return failure.map(WakePlan.HelperState.init(after:)) ?? .unknown
+    }
+
     var isBusy: Bool { status?.busy?.isBusy ?? false }
 
     var autoUpdate: Bool? { status?.updates?.automatic ?? status?.autoUpdate }
@@ -127,7 +133,8 @@ final class MacModel: AgentDevice {
         return nil
     }
 
-    /// The second line of the sidebar entry for this Mac.
+    /// The state of this Mac's row in the sidebar, which VoiceOver reads as the row's value
+    /// (SidebarRow.summary).
     var sidebarSummary: String {
         if failure != nil { return "not readable" }
         guard !services.isEmpty else { return "checking" }
@@ -164,6 +171,9 @@ final class MacModel: AgentDevice {
     func refreshStatus(duringAction: Bool) async {
         await refresh(duringAction: duringAction)
     }
+
+    /// The local agent is a process on this Mac, with no address to hold back.
+    func allowRedial() {}
 
     func describe(_ failure: AgentFailure) -> String {
         failure.localMessage

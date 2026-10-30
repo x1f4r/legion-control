@@ -13,7 +13,8 @@ public sealed record EditPlan(
     string Description,
     string Text,
     IReadOnlyList<string> Problems,
-    SetupConflictPreview Preview)
+    SetupConflictPreview Preview,
+    IReadOnlyList<string>? Warnings = null)
 {
     public bool IsApplicable => Problems.Count == 0;
 }
@@ -27,15 +28,13 @@ public sealed record EditPlan(
 /// including the user's key order.
 public static class ControllerEditor
 {
-    private static readonly JsonSerializerOptions Writing = new() { WriteIndented = true };
-
     /// Applies a change to the document text and works out what it would mean.
     public static EditPlan Plan(string currentText, ControllerConfig? current, string description, Action<JsonObject> change)
     {
         JsonObject root;
         try
         {
-            root = JsonNode.Parse(string.IsNullOrWhiteSpace(currentText) ? "{}" : currentText) as JsonObject
+            root = JsonNode.Parse(string.IsNullOrWhiteSpace(currentText) ? "{}" : currentText, documentOptions: DocumentJson.Nesting) as JsonObject
                    ?? new JsonObject();
         }
         catch (JsonException error)
@@ -54,9 +53,13 @@ public static class ControllerEditor
                 SetupConflictPreview.Between(current, new ControllerConfig()));
         }
 
-        var text = root.ToJsonString(Writing);
+        // Written the way every client writes a document, so the text shown is the text saved, and
+        // held to section 9.7 as a document typed here is.
+        var text = DocumentJson.Write(root);
         var decoded = ControllerConfig.From(Value.Parse(text));
-        return new EditPlan(description, text, decoded.Problems(), SetupConflictPreview.Between(current, decoded));
+        var acceptance = DocumentAcceptance.Check(text, Intake.Local);
+        return new EditPlan(description, text, acceptance.Errors.Select(error => error.Message).ToList(),
+            SetupConflictPreview.Between(current, decoded), acceptance.Warnings.Select(warning => warning.Message).ToList());
     }
 
     /// Adds or replaces one machine.

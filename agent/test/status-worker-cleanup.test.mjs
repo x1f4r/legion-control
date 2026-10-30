@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
-import { deadline } from '../src/config.mjs';
+import { deadline } from '../src/process-runner.mjs';
 import { statusBusy } from '../src/status-probes.mjs';
 
 test('unconfirmed Windows worker exit returns unknown and defers scratch cleanup until exit', async () => {

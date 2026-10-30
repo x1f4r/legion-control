@@ -13,16 +13,31 @@ import { AGENT_VERSION, SRC, withHome } from './helpers.mjs';
 
 const isWindows = process.platform === 'win32';
 
-/** A child that takes the mutex, says so, and then waits to be killed. */
+/**
+ * A child that takes the mutex, says so, and then waits to be killed.
+ *
+ * The hold is kept on globalThis because nothing else refers to it once it is
+ * taken: a handle the collector can no longer reach is finalized, its
+ * connection closes and SQLite gives the lock up, so the lock would last only
+ * until the child's first collection rather than as long as the child. The
+ * child collects once before it reports, so a hold that would not outlast one
+ * is lost on every run rather than on some.
+ */
 function holdInChild(db) {
   const source = `
     import { acquireMutex } from ${JSON.stringify(pathToFileURL(path.join(SRC, 'mutex.mjs')).href)};
     const held = acquireMutex(${JSON.stringify(db)}, { waitMs: 2000 });
-    process.stdout.write(held.ok ? 'held\\n' : 'failed: ' + held.error + '\\n');
-    if (!held.ok) process.exit(1);
+    globalThis.held = held;
+    const ok = held.ok;
+    const said = ok ? 'held\\n' : 'failed: ' + held.error + '\\n';
+    setTimeout(() => {
+      gc();
+      process.stdout.write(said);
+      if (!ok) process.exit(1);
+    }, 0);
     setInterval(() => {}, 1000);
   `;
-  const child = spawn(process.execPath, ['--input-type=module', '-e', source], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { stdio: ['ignore', 'pipe', 'pipe'] });
   return new Promise((resolve, reject) => {
     let out = '';
     child.stdout.on('data', (chunk) => {
@@ -151,6 +166,30 @@ test('probing reports a held lock without disturbing it', async () => {
         child.kill('SIGKILL');
         await exited;
       }
+    }
+  });
+});
+
+test('probing from the process that holds a lock leaves it held', async () => {
+  // Recovery runs inside a cycle that holds the machine lock, and asks the
+  // mutex about the records it finds. Closing any descriptor of a locked file
+  // drops every lock the process has on it, so the probe must go through
+  // SQLite, which keeps the descriptor open while its other connection holds.
+  await withHome(async (home) => {
+    const db = mutexPath(path.join(home, 'op.lock'));
+    const held = acquireMutex(db, { waitMs: 0 });
+    assert.equal(held.ok, true);
+    try {
+      assert.equal(probeMutex(db).state, 'held');
+      assert.equal(probeMutex(db).state, 'held');
+      const source = `
+        import { acquireMutex } from ${JSON.stringify(pathToFileURL(path.join(SRC, 'mutex.mjs')).href)};
+        process.stdout.write(JSON.stringify(acquireMutex(${JSON.stringify(db)}, { waitMs: 0 })));
+      `;
+      const other = JSON.parse(spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8' }).stdout);
+      assert.equal(other.busy, true, 'another process must still find the lock taken');
+    } finally {
+      held.release();
     }
   });
 });

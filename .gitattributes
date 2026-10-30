@@ -15,3 +15,20 @@ contract/fixtures/controller-document.sites-helpers.json -text
 # way. A Windows checkout with CRLF endings would make those snippets match nothing.
 *.mjs text eol=lf
 *.cjs text eol=lf
+# A shell script with CRLF endings fails at its first line on Linux and macOS, and the agent
+# tarball carries agent/install as the checkout has it, so a Windows checkout that converted them
+# would package installers no Linux machine or Mac can run. The PowerShell scripts go into the same
+# tarball, and PowerShell reads LF as well as CRLF.
+*.sh text eol=lf
+*.ps1 text eol=lf
+gradlew text eol=lf
+# The Gradle wrapper's batch file is the other way round: cmd.exe misreads labels in a batch file
+# with LF endings. It is kept byte for byte, with the CRLF endings Gradle writes it with.
+gradlew.bat -text
+# The rest of what the agent tarball carries: the systemd units, which systemd would read with
+# CRLF endings as well, and the package.json the agent's version and floor travel in. With these,
+# every file in the tarball, and so the digests its signed manifest lists, come out the same from
+# any checkout.
+agent/install/*.service text eol=lf
+agent/install/*.timer text eol=lf
+agent/package.json text eol=lf

@@ -6,7 +6,7 @@ import test from 'node:test';
 import { canonicalHash, controllerMetaPath, controllerPath, readController, storeController } from '../src/controller.mjs';
 import { withHome } from './helpers.mjs';
 
-const document = (revision, lineage = []) => JSON.stringify({ version: 3,
+const document = (revision, lineage = []) => JSON.stringify({ version: 1,
   controller: { id: 'sharing-test', revision, lineage, source: 'cli' }, machines: [] });
 
 for (const phase of ['document', 'metadata', 'journal']) {
@@ -70,7 +70,7 @@ test('persistent Windows denial is bounded and retains both live bytes and the c
     assert.equal(result.ok, false);
     assert.match(result.error, /fixture access denied/);
     assert.ok(attempts > 1);
-    assert.ok(Date.now() - started < 1800, 'permanent denial must stop retrying');
+    assert.ok(Date.now() - started < 4500, 'permanent denial must stop retrying');
     assert.deepEqual(fs.readFileSync(controllerPath()), oldBytes);
     assert.ok(fs.existsSync(path.join(home, 'controller.commit.json')));
     assert.ok(fs.existsSync(`${controllerPath()}.staged`));

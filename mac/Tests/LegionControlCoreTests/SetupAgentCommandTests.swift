@@ -5,8 +5,8 @@ import Testing
 struct SetupAgentCommandTests {
     @Test func installerCommandsUsePinnedWrappers() {
         #expect(CommandArguments.installedAgent(platform: .linux, user: "beacon") == CommandArguments.installedAgent(platform: .mac, user: "guest"))
-        let windows = CommandArguments.installedAgent(platform: .windows, user: "First Last")
-        #expect(windows.suffix(2) == ["-File", "C:\\Users\\First Last\\.legion-control\\bin\\legionctl.ps1"])
+        let windows = CommandArguments.installedAgent(platform: .windows, user: "me")
+        #expect(windows.suffix(2) == ["-File", "C:\\Users\\me\\.legion-control\\bin\\legionctl.ps1"])
         #expect(!windows.contains("node"))
     }
 

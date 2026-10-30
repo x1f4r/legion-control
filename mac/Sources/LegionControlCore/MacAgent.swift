@@ -112,7 +112,7 @@ actor MacAgent {
         if verdict.isReply {
             let json = AttemptClassifier.jsonObjectSlice(result.standardOutput) ?? Data()
             do {
-                return try JSONDecoder().decode(Value.self, from: json)
+                return try AgentReplyDecoder.decode(Value.self, from: json)
             } catch {
                 throw AgentFailure(.unreadableOutput,
                                    detail: "\(error.localizedDescription) Output: \(RemoteAgent.condense(result.standardOutput))",

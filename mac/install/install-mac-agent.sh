@@ -27,6 +27,11 @@
 #
 set -euo pipefail
 
+# Everything written from here on is this user's alone, as on Linux: the job's
+# plist says where the agent lives, and the base holds every command it was
+# configured with, the setup and the record of every operation.
+umask 077
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -97,6 +102,17 @@ if [ "$(id -u)" -eq 0 ] && [ "$SKIP_SCHEDULER" -ne 1 ]; then
   die "run this as your own user without sudo. It installs a launchd USER agent and writes into \$HOME."
 fi
 
+# The base is a folder of the agent's own, as install-linux.sh insists before it
+# makes everything in it this user's alone; uninstalling here would otherwise
+# suggest an rm -rf of the home directory.
+if [ -d "$BASE" ]; then
+  REAL_BASE="$(cd -- "$BASE" && pwd -P)"
+  REAL_HOME="$(cd -- "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
+  case "$REAL_HOME/" in
+    "${REAL_BASE%/}/"*) die "LEGIONCTL_HOME is $BASE, which is not a folder of the agent's own but holds the home directory. Point it at one, such as \$HOME/.legion-control. Nothing was changed." ;;
+  esac
+fi
+
 # ---------------------------------------------------------------------------
 # Is the job running right now
 # ---------------------------------------------------------------------------
@@ -162,7 +178,21 @@ if [ "$UNINSTALL" -eq 1 ]; then
   printf '\n  The agent tree and its state were left in place, the Mac app still uses them:\n'
   printf '    %s\n' "$BASE"
   printf '\n  Remove those too, if that is what you want:\n'
-  printf '    rm -rf %s\n' "$BASE"
+  # Quoted for the shell it is pasted into. Unquoted, a home with a space in it
+  # turns the line into one that deletes two other paths.
+  printf '    rm -rf %q\n' "$BASE"
+  # The Mac releases are cut on keeps its signing keys in the same directory,
+  # and the private terms the private-data check reads. None of them is the
+  # agent's and a reinstall brings none of them back, so they are named before
+  # anyone runs that line.
+  KEPT=()
+  for kept in release-signing.key android-release.jks android-release.pw private; do
+    if [ -e "$BASE/$kept" ]; then KEPT+=("$BASE/$kept"); fi
+  done
+  if [ "${#KEPT[@]}" -gt 0 ]; then
+    printf '\n  %s\n' "That also deletes these, which are not the agent's. Move them out first:"
+    for kept in "${KEPT[@]}"; do printf '    %s\n' "$kept"; done
+  fi
   printf '\n  Put the job back:\n'
   printf '    %s\n\n' "$SCRIPT_DIR/install-mac-agent.sh"
   exit 0
@@ -185,9 +215,9 @@ SRC_AGENT="$(cd -- "$SRC_AGENT" 2>/dev/null && pwd -P)" \
   || die "no agent source at ${LEGION_CONTROL_AGENT_SRC:-$SCRIPT_DIR/../../agent}."
 [ -f "$SRC_AGENT/src/index.mjs" ] || die "no agent entry point at $SRC_AGENT/src/index.mjs."
 
-# Node, found rather than assumed. /usr/bin/node does not exist on this machine,
-# node is Homebrew's, and a launchd job does not get the Homebrew prefix on PATH,
-# so the plist needs a real absolute path written into it at install time.
+# Node, found rather than assumed. macOS ships no /usr/bin/node, node usually
+# comes from Homebrew, and a launchd job does not get the Homebrew prefix on
+# PATH, so the plist needs a real absolute path written into it at install time.
 #
 # The Homebrew symlink is preferred over its target on purpose. /opt/homebrew/bin/node
 # points into /opt/homebrew/Cellar/node/<version>/bin/node, and baking that

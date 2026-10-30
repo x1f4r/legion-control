@@ -6,7 +6,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { fresh, SRC, withHome } from './helpers.mjs';
+import { processStartTicks } from '../src/state.mjs';
+import { cli, fresh, SRC, withHome } from './helpers.mjs';
 
 const base = { kind: 'update', service: 'demo', systemId: 'linux' };
 
@@ -145,7 +146,7 @@ test('the wire record carries only what the contract names', async () => {
     const ops = await fresh('operations.mjs');
     const { record } = ops.beginOperation({ id: 'eeeeeeee-1111-4111-8111-111111111111', ...base });
     const wire = ops.wireRecord(ops.readOperation(record.id));
-    for (const internal of ['bootId', 'queueRequested', 'force', 'contract', 'workerClaimed', 'launchPendingUntil']) {
+    for (const internal of ['bootId', 'queueRequested', 'force', 'contract', 'workerClaimed', 'launchPendingUntil', 'ownerStartedAt', 'ownerStartTicks', 'lockOwner']) {
       assert.equal(internal in wire, false, `${internal} is internal and must not reach a client`);
     }
     for (const required of ['id', 'kind', 'service', 'target', 'actionId', 'mode', 'initiator', 'state', 'phase', 'progress', 'requestedAt', 'startedAt', 'updatedAt', 'finishedAt', 'expiresAt', 'pid', 'detached', 'result', 'log', 'agentVersion', 'systemId']) {
@@ -170,6 +171,173 @@ test('an operation whose process is gone is finished as interrupted', async () =
   });
 });
 
+/**
+ * A process that stays up until it is killed, started now, for a record to
+ * name whose pid is plainly alive. With `lock`, it also takes the machine lock
+ * for that operation id, as an operation's own process would.
+ *
+ * The hold is kept on globalThis because nothing else in the child refers to
+ * it once it is taken: a handle the collector can no longer reach is
+ * finalized, its connection closes, and SQLite gives the lock up with it while
+ * the process lives on. The child collects once before it says it is ready,
+ * so a hold that would not outlast a collection is lost every time, not only
+ * on the runs where the collector happens to get to it first.
+ */
+async function liveProcess(home, { lock = null } = {}) {
+  const source = lock
+    ? `import { acquireOperationLock } from ${JSON.stringify(pathToFileURL(path.join(SRC, 'lock.mjs')).href)};
+       const held = acquireOperationLock({ kind: 'update', opId: ${JSON.stringify(lock)}, service: 'demo', waitMs: 5000 });
+       globalThis.held = held;
+       const said = held.ok ? 'ready\\n' : 'failed: ' + held.message + '\\n';
+       setTimeout(() => { gc(); process.stdout.write(said); }, 0);
+       setInterval(() => {}, 1000);`
+    : `process.stdout.write('ready\\n'); setInterval(() => {}, 1000);`;
+  const child = spawn(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], {
+    env: { ...process.env, LEGIONCTL_HOME: home },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  await new Promise((resolve, reject) => {
+    let out = '';
+    child.stdout.on('data', (chunk) => {
+      out += chunk;
+      if (out.includes('ready')) resolve();
+      if (out.includes('failed')) reject(new Error(out));
+    });
+    child.once('exit', () => reject(new Error(`the live process exited early: ${out}`)));
+  });
+  return {
+    pid: child.pid,
+    async stop() {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      child.kill('SIGKILL');
+      await exited;
+    },
+  };
+}
+
+const anHourAgo = () => new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+test('a pid another process holds now does not keep a record running', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const other = await liveProcess(home);
+    try {
+      // Its owner started an hour ago, and the process with that id now started
+      // a moment ago: the id was handed out again, and the owner is gone.
+      const reused = '12121212-1111-4111-8111-111111111111';
+      ops.beginOperation({ id: reused, ...base });
+      ops.recordPhase(reused, 'installing');
+      ops.updateOperation(reused, { pid: other.pid, ownerStartedAt: anHourAgo(), ownerStartTicks: null });
+      assert.equal(ops.deriveState(ops.readOperation(reused)).state, 'finished');
+
+      // The same live pid, with an owner that started before it was written
+      // down, is that owner still at work.
+      const owned = '13131313-1111-4111-8111-111111111111';
+      ops.beginOperation({ id: owned, ...base });
+      ops.updateOperation(owned, { pid: other.pid, ownerStartedAt: new Date().toISOString(), ownerStartTicks: processStartTicks(other.pid) });
+      assert.equal(ops.deriveState(ops.readOperation(owned)).state, 'running');
+
+      // A record from before 3.1.0 names no start time, and a live pid is
+      // taken at its word as it always was.
+      const legacy = '14141414-1111-4111-8111-111111111111';
+      ops.beginOperation({ id: legacy, ...base });
+      ops.updateOperation(legacy, { pid: other.pid, ownerStartedAt: undefined, ownerStartTicks: undefined });
+      assert.equal(ops.deriveState(ops.readOperation(legacy)).state, 'running');
+
+      const recovered = ops.recoverOperations({ systemId: 'linux' });
+      assert.deepEqual(recovered.map((record) => record.id), [reused]);
+      assert.equal(recovered[0].result.action, 'interrupted');
+      assert.deepEqual(ops.servicesNeedingRecovery(recovered).map((entry) => entry.service), ['demo'], 'what it stopped is still put back');
+      assert.equal(ops.readOperation(owned).state, 'running');
+    } finally {
+      await other.stop();
+    }
+  });
+});
+
+test('this process is not the owner of a record an earlier process with its pid left', async () => {
+  await withHome(async () => {
+    const ops = await fresh('operations.mjs');
+    const left = '15151515-1111-4111-8111-111111111111';
+    ops.beginOperation({ id: left, ...base });
+    ops.updateOperation(left, { pid: process.pid, ownerStartedAt: anHourAgo(), ownerStartTicks: null });
+    const mine = '16161616-1111-4111-8111-111111111111';
+    ops.beginOperation({ id: mine, ...base });
+    assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id), [left]);
+    assert.equal(ops.readOperation(mine).state, 'running', 'a record this process opened is its own');
+  });
+});
+
+test('a record that took the machine lock lives exactly as long as that hold', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const { acquireOperationLock, probeOperationLock } = await import('../src/lock.mjs');
+    const id = '17171717-1111-4111-8111-111111111111';
+    const holder = await liveProcess(home, { lock: id });
+    const bystander = await liveProcess(home);
+    try {
+      // Every judgement below rests on this, so a hold lost underneath the test
+      // fails here by name rather than as a record judged finished.
+      assert.equal(probeOperationLock().state, 'held', 'the holder has the machine lock');
+      ops.beginOperation({ id, ...base });
+      ops.updateOperation(id, { pid: holder.pid, ownerStartedAt: new Date().toISOString(), lockOwner: id });
+      assert.equal(ops.deriveState(ops.readOperation(id)).state, 'running', 'the lock is held for it, by its own process');
+
+      // A live pid whose process says it took the lock, while another
+      // operation's sidecar is all there is to read: that sidecar may be one
+      // its holder failed to replace, so the pid is taken at its word.
+      const orphan = '18181818-1111-4111-8111-111111111111';
+      ops.beginOperation({ id: orphan, ...base });
+      ops.updateOperation(orphan, { pid: bystander.pid, ownerStartedAt: new Date().toISOString(), ownerStartTicks: processStartTicks(bystander.pid), lockOwner: orphan });
+      assert.equal(ops.deriveState(ops.readOperation(orphan)).state, 'running');
+
+      // Free, the lock says its owner is gone whatever its pid says now.
+      await holder.stop();
+      assert.equal(ops.deriveState(ops.readOperation(orphan)).state, 'finished', 'the lock is free');
+      ops.updateOperation(id, { pid: bystander.pid });
+      assert.equal(ops.deriveState(ops.readOperation(id)).state, 'finished', 'its hold ended with its process');
+
+      // And held by this process, as a cycle's recovery holds it, no other
+      // process can be holding it for a record of its own.
+      const held = acquireOperationLock({ kind: 'cycle', opId: '19191919-2222-4222-8222-222222222222' });
+      assert.equal(held.ok, true);
+      try {
+        const elsewhere = '1b1b1b1b-1111-4111-8111-111111111111';
+        ops.beginOperation({ id: elsewhere, ...base });
+        ops.updateOperation(elsewhere, { pid: bystander.pid, ownerStartedAt: new Date().toISOString(), lockOwner: elsewhere });
+        assert.equal(ops.deriveState(ops.readOperation(elsewhere)).state, 'finished', 'its live pid is not holding the lock this process holds');
+        const mine = '1a1a1a1a-1111-4111-8111-111111111111';
+        ops.beginOperation({ id: mine, ...base });
+        ops.updateOperation(mine, { lockOwner: '19191919-2222-4222-8222-222222222222' });
+        assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id).sort(), [id, orphan, elsewhere].sort());
+        assert.equal(ops.readOperation(mine).state, 'running', 'a record of this process is its own to finish');
+      } finally {
+        held.lock.release();
+      }
+    } finally {
+      await holder.stop();
+      await bystander.stop();
+    }
+  });
+});
+
+test('recovery finds a running record however many newer ones there are', async () => {
+  await withHome(async () => {
+    const ops = await fresh('operations.mjs');
+    const stuck = '19191919-1111-4111-8111-111111111111';
+    ops.beginOperation({ id: stuck, ...base });
+    ops.updateOperation(stuck, { pid: 99999999, requestedAt: '2026-01-01T00:00:00.000Z' });
+    for (let index = 0; index < ops.HISTORY_LIMIT + 5; index += 1) {
+      const id = `${String(index).padStart(8, '0')}-2222-4222-8222-222222222222`;
+      ops.beginOperation({ id, ...base });
+      ops.finishOperation(id, { ok: true, action: 'noop', reasonCode: null, message: `run ${index}` });
+    }
+    assert.equal(ops.listOperations({ limit: 500 }).some((record) => record.id === stuck), false, 'it is past the newest the history lists');
+    assert.deepEqual(ops.recoverOperations({ systemId: 'linux' }).map((record) => record.id), [stuck]);
+  });
+});
+
 test('an operation interrupted before it touched anything needs no service recovery', async () => {
   await withHome(async () => {
     const ops = await fresh('operations.mjs');
@@ -181,6 +349,19 @@ test('an operation interrupted before it touched anything needs no service recov
   });
 });
 
+test('the records owing a service its recovery are oldest first by when each started, not when each was asked for', async () => {
+  const ops = await fresh('operations.mjs');
+  const owing = (id, requestedAt, startedAt) => ({ id, ...base, phase: 'installing', requestedAt, startedAt });
+  // Newest asked for first, as a listing gives them. The queued one was asked
+  // for first and taken up last.
+  const listed = [
+    owing('direct', '2026-01-01T10:05:00.000Z', '2026-01-01T10:05:00.000Z'),
+    owing('queued', '2026-01-01T10:00:00.000Z', '2026-01-01T10:20:00.000Z'),
+    owing('older', '2026-01-01T09:00:00.000Z', null),
+  ];
+  assert.deepEqual(ops.servicesNeedingRecovery(listed)[0].records.map((record) => record.id), ['older', 'direct', 'queued']);
+});
+
 test('a reboot is only believed with both a new boot and the right system', async () => {
   await withHome(async () => {
     const ops = await fresh('operations.mjs');
@@ -190,10 +371,19 @@ test('a reboot is only believed with both a new boot and the right system', asyn
     assert.equal(rebooted.action, 'rebooted');
     assert.equal(rebooted.ok, true);
 
-    // The machine came back, but into the system it was already in: the arming
-    // silently failed, and calling this a success sends a client off waiting.
-    const wrongSystem = ops.judgeInterrupted(record, { systemId: 'linux', bootId: 'boot-after' });
-    assert.equal(wrongSystem.action, 'failed');
+    // A new boot into another system is not the one asked for, but it is not a
+    // failure either: on a dual-boot machine the record is judged by the system
+    // that wrote it, after the machine came back from the target. Calling it a
+    // success would send a client off waiting; calling it failed would tell it
+    // a reboot that most likely worked did not.
+    const otherSystem = ops.judgeInterrupted(record, { systemId: 'linux', bootId: 'boot-after' });
+    assert.equal(otherSystem.action, 'interrupted');
+    assert.equal(otherSystem.ok, false);
+    assert.equal(otherSystem.reasonCode, 'interrupted');
+    assert.match(otherSystem.message, /running linux now; whether it reached windows in between cannot be told/);
+    const unknownSystem = ops.judgeInterrupted(record, { systemId: null, bootId: 'boot-after' });
+    assert.equal(unknownSystem.action, 'interrupted');
+    assert.match(unknownSystem.message, /an unknown system/);
 
     // No reboot happened at all.
     const noReboot = ops.judgeInterrupted(record, { systemId: 'linux', bootId: 'boot-before' });
@@ -239,11 +429,67 @@ test('a queued request expires, and one per slot replaces the last', async () =>
     assert.equal(ops.dueQueue().length, 2);
 
     // And an expiry is not optional.
-    ops.queueOperation({ id: '66666666-1111-4111-8111-111111111111', kind: 'update', service: 'demo', expiresAt: new Date(Date.now() - 1000).toISOString() });
-    assert.equal(ops.dueQueue().length, 2, 'an expired request is not due');
-    const expired = ops.expireQueue();
-    assert.equal(expired.length, 1);
-    assert.equal(expired[0].result.action, 'expired');
+    ops.queueOperation({ id: '66666666-1111-4111-8111-111111111111', kind: 'update', service: 'demo', ttlMs: 60000 });
+    const later = Date.now() + 2 * 60000;
+    assert.equal(ops.dueQueue({ now: later }).length, 0, 'an expired request is not due');
+    const expired = ops.expireQueue({ now: later });
+    assert.equal(expired.length, 3, 'the one that was replaced is not waiting any more');
+    assert.ok(expired.every((record) => record.result.action === 'expired'));
+  });
+});
+
+test('an expiry lands between a minute and a week from now, however it is written', async () => {
+  const ops = await fresh('operations.mjs');
+  const now = Date.parse('2026-10-29T12:00:00.000Z');
+  const at = (input) => ops.queueExpiry(input, { now }).expiresAt;
+  assert.equal(at({}), '2026-10-29T16:00:00.000Z', 'four hours when nothing is named');
+  assert.equal(at({ ttlMs: 30 * 60000 }), '2026-10-29T12:30:00.000Z');
+  assert.equal(at({ ttlMs: 30 * 24 * 60 * 60000 }), '2026-11-05T12:00:00.000Z', 'a duration past the week is the week');
+  assert.equal(at({ expiresAt: '2027-01-01T00:00:00.000Z' }), '2026-11-05T12:00:00.000Z', 'so is a time past it');
+  assert.equal(at({ expiresAt: '2026-10-29T12:00:10.000Z' }), '2026-10-29T12:01:00.000Z', 'a time in the next minute is the minute');
+  assert.equal(at({ expiresAt: '2026-10-30T09:15:00.000Z' }), '2026-10-30T09:15:00.000Z');
+  for (const past of ['2026-10-29T12:00:00.000Z', '2026-10-28T12:00:00.000Z', '2001-05-01T00:00:00.000Z']) {
+    const refused = ops.queueExpiry({ expiresAt: past }, { now });
+    assert.equal(refused.ok, false, past);
+    assert.match(refused.error, /already past/);
+  }
+  assert.equal(ops.queueExpiry({ expiresAt: 'whenever' }, { now }).ok, false);
+});
+
+test('a request whose expiry has passed is refused without touching the one that waits', async () => {
+  await withHome(async () => {
+    const ops = await fresh('operations.mjs');
+    const waiting = '36363636-1111-4111-8111-111111111111';
+    ops.queueOperation({ id: waiting, kind: 'restart', service: 'demo', ttlMs: 60 * 60000 });
+    const stale = ops.queueOperation({ id: '37373737-1111-4111-8111-111111111111', kind: 'restart', service: 'demo', expiresAt: new Date(Date.now() - 1000).toISOString() });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.badExpiry, true);
+    assert.equal(ops.readOperation('37373737-1111-4111-8111-111111111111'), null, 'nothing was written');
+    assert.deepEqual(ops.dueQueue().map((record) => record.id), [waiting]);
+
+    // A retry of the request that waits is answered with it, whatever the
+    // expiry it was first sent with says by now.
+    const retry = ops.queueOperation({ id: waiting, kind: 'restart', service: 'demo', expiresAt: new Date(Date.now() - 1000).toISOString() });
+    assert.equal(retry.ok, true);
+    assert.equal(retry.replay, true);
+    assert.equal(ops.readOperation(waiting).state, 'queued');
+  });
+});
+
+test('boot and sleep wait in one slot, whatever the target', async () => {
+  await withHome(async () => {
+    const ops = await fresh('operations.mjs');
+    const boot = ops.queueOperation({ id: '38383838-1111-4111-8111-111111111111', kind: 'boot', target: 'windows', ttlMs: 60000 });
+    const otherTarget = ops.queueOperation({ id: '39393939-1111-4111-8111-111111111111', kind: 'boot', target: 'linux', ttlMs: 60000 });
+    assert.equal(otherTarget.replaced, boot.record.id, 'the machine makes one power transition');
+    const sleep = ops.queueOperation({ id: '40404040-1111-4111-8111-111111111111', kind: 'sleep', ttlMs: 60000 });
+    assert.equal(sleep.replaced, otherTarget.record.id);
+    assert.match(ops.readOperation(otherTarget.record.id).result.message, /one power transition at a time/);
+    assert.deepEqual(ops.dueQueue().map((record) => record.kind), ['sleep']);
+
+    // Everything else still has a slot of its own beside it.
+    ops.queueOperation({ id: '41414141-1111-4111-8111-111111111111', kind: 'restart', service: 'demo', ttlMs: 60000 });
+    assert.deepEqual(ops.dueQueue().map((record) => record.kind).sort(), ['restart', 'sleep']);
   });
 });
 
@@ -377,14 +623,218 @@ test('history is bounded, and pruning keeps the newest', async () => {
   });
 });
 
-test('a record from another host is left alone rather than declared dead', async () => {
+test('a failure outlives the newest records by a week, and nothing outlives thirty days', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const day = 24 * 60 * 60 * 1000;
+    const finished = (id, result, daysAgo) => {
+      ops.beginOperation({ id, ...base });
+      ops.finishOperation(id, result);
+      const at = new Date(Date.now() - daysAgo * day).toISOString();
+      ops.updateOperation(id, { requestedAt: at, finishedAt: at });
+    };
+    const failed = { ok: false, action: 'failed', reasonCode: 'latest-unknown', message: 'the registry did not answer' };
+    finished('aaaaaaa1-3333-4333-8333-333333333333', failed, 3);
+    finished('aaaaaaa2-3333-4333-8333-333333333333', { ok: false, action: 'interrupted', reasonCode: 'interrupted', message: 'cut off' }, 6);
+    finished('aaaaaaa3-3333-4333-8333-333333333333', failed, 8);
+    finished('aaaaaaa4-3333-4333-8333-333333333333', { ok: true, action: 'noop', reasonCode: null, message: 'already there' }, 3);
+    // Two hundred newer records, every one of them news: a person asked for each.
+    for (let index = 0; index < ops.HISTORY_LIMIT; index += 1) {
+      finished(`${String(index).padStart(8, '0')}-3333-4333-8333-333333333333`, { ok: true, action: 'noop', reasonCode: null, message: 'nothing new' }, index / (4 * 24));
+    }
+    // And a failure past thirty days, which nothing keeps.
+    finished('aaaaaaa5-3333-4333-8333-333333333333', failed, 31);
+
+    const pruned = ops.pruneOperations();
+    assert.deepEqual(pruned.removed.sort(), [
+      'aaaaaaa3-3333-4333-8333-333333333333',
+      'aaaaaaa4-3333-4333-8333-333333333333',
+      'aaaaaaa5-3333-4333-8333-333333333333',
+    ]);
+    assert.ok(ops.readOperation('aaaaaaa1-3333-4333-8333-333333333333'), 'a failure three days old is kept');
+    assert.ok(ops.readOperation('aaaaaaa2-3333-4333-8333-333333333333'), 'so is an outcome nobody knows');
+    assert.equal(ops.countOperations(), ops.HISTORY_LIMIT + 2);
+    const history = cli(['history', '--limit', '5'], { home }).payload;
+    assert.equal(history.returned, 5);
+    assert.equal(history.retained, ops.HISTORY_LIMIT + 2, 'what the machine holds, past the newest it lists');
+  });
+});
+
+/**
+ * Finished records written straight to disk, as many as days of cycles leave,
+ * without a durable write for each. Each is the template with what it says
+ * and when.
+ */
+function plant(ops, template, id, fields, daysAgo) {
+  const at = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString();
+  const record = { ...template, id, ...fields, state: 'finished', phase: 'done', requestedAt: at, startedAt: at, updatedAt: at, finishedAt: at };
+  fs.writeFileSync(ops.operationPath(id), JSON.stringify(record));
+  return id;
+}
+
+/** One record opened and finished the way the agent does, to plant the rest from. */
+function template(ops) {
+  const { record } = ops.beginOperation({ id: 'template-0000-4000-8000-000000000000', ...base });
+  ops.finishOperation(record.id, { ok: true, action: 'noop', reasonCode: null, message: 'a template' });
+  const finished = ops.readOperation(record.id);
+  fs.rmSync(ops.operationPath(record.id));
+  return finished;
+}
+
+const noop = { ok: false, action: 'noop', reasonCode: 'already-on-target', message: 'already on 1.0.0 and healthy', outcome: 'succeeded' };
+const cycled = { ok: true, action: 'cycled', reasonCode: null, message: '0 updated, 1 left alone, 0 failed', outcome: 'succeeded' };
+const offline = { ok: false, action: 'failed', reasonCode: 'latest-unknown', message: 'could not resolve a valid latest version', outcome: 'failed' };
+
+test('what a cycle only says again is let go, so history lists a failure from days ago', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const shape = template(ops);
+    const scheduled = (id, kind, result, daysAgo, extra = {}) =>
+      plant(ops, shape, id, { kind, service: kind === 'cycle' ? null : 'demo', mode: 'scheduled', result, from: null, to: null, ...extra }, daysAgo);
+
+    // Nobody holds the id of a failure a cycle met in the night: history is
+    // the only way to it.
+    const failure = scheduled('fa11ed00-3333-4333-8333-333333333333', 'update', { ...offline, reasonCode: 'apply-failed', message: 'the install failed' }, 2.5, { from: '1.0.0', to: '2.0.0' });
+    const installed = scheduled('1a57a11d-3333-4333-8333-333333333333', 'update', { ok: true, action: 'updated', reasonCode: null, message: 'updated', outcome: 'succeeded' }, 2.2, { from: '0.9.0', to: '1.0.0' });
+    // Two days of cycles since, each with a record of its own and one for the
+    // service it found nothing new for: more than history can list.
+    const ticks = 2 * 24 * 3;
+    const children = [];
+    const cycles = [];
+    for (let tick = 0; tick < ticks; tick += 1) {
+      const daysAgo = (ticks - tick) / (24 * 3);
+      const child = scheduled(`${String(tick).padStart(8, '0')}-4444-4444-8444-444444444444`, 'update', noop, daysAgo, { from: '1.0.0', to: '1.0.0' });
+      children.push(child);
+      cycles.push(scheduled(`${String(tick).padStart(8, '0')}-5555-4555-8555-555555555555`, 'cycle', cycled, daysAgo - 0.001, {
+        children: [{ opId: child, service: 'demo', action: 'noop', reasonCode: 'already-on-target' }],
+      }));
+    }
+    // A person who asks for the same thing over and over is news every time.
+    const asked = [];
+    for (let index = 0; index < 5; index += 1) {
+      asked.push(plant(ops, shape, `a5ced00${index}-3333-4333-8333-333333333333`, { mode: 'manual', result: noop, from: '1.0.0', to: '1.0.0' }, 1 + index / 10));
+    }
+    const before = ops.listOperations({ limit: 200 }).map((record) => record.id);
+    assert.equal(before.length, 200);
+    assert.ok(!before.includes(failure), 'behind them, the failure was out of sight');
+
+    const pruned = ops.pruneOperations();
+    // The first of what repeats says since when, and the newest three that it still is.
+    const kept = (ids) => [ids[0], ...ids.slice(-ops.REPEAT_LIMIT)];
+    const left = [failure, installed, ...asked, ...kept(children), ...kept(cycles)];
+    assert.equal(pruned.removed.length, 2 * ticks - 2 * (ops.REPEAT_LIMIT + 1));
+    assert.deepEqual(ops.listOperations({ limit: 200 }).map((record) => record.id).sort(), left.sort());
+
+    for (const args of [['history', '--limit', '200'], ['history', '--limit', '200', '--kind', 'update', '--service', 'demo']]) {
+      const history = cli(args, { home }).payload;
+      assert.ok(history.operations.some((entry) => entry.id === failure), `${args.join(' ')} lists the failure`);
+    }
+    assert.equal(cli(['history', '--limit', '200'], { home }).payload.retained, left.length);
+    assert.equal(ops.readOperation(children.at(-1)).result.reasonCode, 'already-on-target', 'what recovery reads is kept');
+
+    // And what the next cycles write is let go the same way.
+    const next = scheduled('99999999-4444-4444-8444-444444444444', 'update', noop, 0, { from: '1.0.0', to: '1.0.0' });
+    assert.deepEqual(ops.pruneOperations().removed, [children.at(-ops.REPEAT_LIMIT)]);
+    assert.ok(ops.readOperation(next));
+    assert.ok(ops.readOperation(children[0]), 'the first is kept as long as it is young enough');
+  });
+});
+
+test('a conflict that lasts is let go as it repeats, whether a child or the cycle itself meets it', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const shape = template(ops);
+    const scheduled = (id, kind, result, daysAgo, extra = {}) =>
+      plant(ops, shape, id, { kind, service: kind === 'cycle' ? null : 'demo', mode: 'scheduled', result, from: null, to: null, ...extra }, daysAgo);
+
+    const failure = scheduled('fa11ed00-3333-4333-8333-333333333333', 'update', { ...offline, reasonCode: 'apply-failed', message: 'the install failed' }, 2.5, { from: '1.0.0', to: '2.0.0' });
+    // Two days of a watchdog holding the service's lock, and now and then a
+    // command an earlier run left unsettled, which stops the whole cycle.
+    // Every tick ends the same way, a conflict, which is not now and nothing
+    // more, however its action is named.
+    const held = { ok: false, action: 'conflict', reasonCode: 'lock-held', message: 'the watchdog holds the lock of Demo', outcome: 'deferred' };
+    const unsettled = { ok: false, action: 'conflict', reasonCode: 'operation-in-progress', message: 'a command an earlier run started is still running', outcome: 'deferred' };
+    const ticks = 2 * 24 * 4;
+    const children = [];
+    const cycles = [];
+    const stopped = [];
+    for (let tick = 0; tick < ticks; tick += 1) {
+      const daysAgo = (ticks - tick) / (24 * 4);
+      const id = String(tick).padStart(8, '0');
+      if (tick % 4 === 0) {
+        stopped.push(scheduled(`${id}-6666-4666-8666-666666666666`, 'cycle', unsettled, daysAgo, { children: [] }));
+        continue;
+      }
+      const child = scheduled(`${id}-4444-4444-8444-444444444444`, 'update', held, daysAgo, { from: '1.0.0', to: '1.0.0' });
+      children.push(child);
+      cycles.push(scheduled(`${id}-5555-4555-8555-555555555555`, 'cycle', { ...cycled, message: '0 updated, 1 left alone, 0 failed' }, daysAgo - 0.001, {
+        children: [{ opId: child, service: 'demo', action: 'conflict', reasonCode: 'lock-held' }],
+      }));
+    }
+    assert.ok(!ops.listOperations({ limit: 200 }).some((record) => record.id === failure), 'behind them, the failure was out of sight');
+
+    ops.pruneOperations();
+    const kept = (ids) => [ids[0], ...ids.slice(-ops.REPEAT_LIMIT)];
+    const left = [failure, ...kept(children), ...kept(cycles), ...kept(stopped)];
+    assert.deepEqual(ops.listOperations({ limit: 200 }).map((record) => record.id).sort(), left.sort());
+    const history = cli(['history', '--limit', '200'], { home }).payload;
+    assert.ok(history.operations.some((entry) => entry.id === failure), 'history lists the failure');
+    assert.equal(history.retained, left.length);
+  });
+});
+
+test('a failure that only repeats keeps its first and newest records, and one that differs stays a week beside it', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const shape = template(ops);
+    const scheduled = (id, kind, result, daysAgo, extra = {}) =>
+      plant(ops, shape, id, { kind, service: kind === 'cycle' ? null : 'demo', mode: 'scheduled', result, from: null, to: null, ...extra }, daysAgo);
+
+    // An install that failed on its own, then a machine offline for five
+    // days: every cycle fails, and so does every service it looks at.
+    const different = scheduled('d1ffe7e0-3333-4333-8333-333333333333', 'update', { ...offline, reasonCode: 'apply-failed', message: 'the install failed' }, 6, { from: '1.0.0', to: '2.0.0' });
+    const ticks = 5 * 24 * 4;
+    const children = [];
+    const cycles = [];
+    for (let tick = 0; tick < ticks; tick += 1) {
+      const daysAgo = (ticks - tick) / (24 * 4);
+      children.push(scheduled(`${String(tick).padStart(8, '0')}-4444-4444-8444-444444444444`, 'update', offline, daysAgo, { from: '1.0.0' }));
+      cycles.push(scheduled(`${String(tick).padStart(8, '0')}-5555-4555-8555-555555555555`, 'cycle', { ...offline, message: '0 updated, 0 left alone, 1 failed' }, daysAgo - 0.001, {
+        children: [{ opId: children.at(-1), service: 'demo', action: 'failed', reasonCode: 'latest-unknown' }],
+      }));
+    }
+    // And a failure from before the week, kept only while it is among the newest.
+    const old = scheduled('01d00000-3333-4333-8333-333333333333', 'update', { ...offline, reasonCode: 'apply-failed', message: 'an older install failed' }, 8, { from: '0.9.0', to: '1.0.0' });
+
+    ops.pruneOperations();
+    const kept = (ids) => [ids[0], ...ids.slice(-ops.REPEAT_LIMIT)];
+    assert.deepEqual(ops.listOperations({ limit: 200 }).map((record) => record.id).sort(), [different, old, ...kept(children), ...kept(cycles)].sort());
+    const history = cli(['history', '--limit', '30'], { home }).payload;
+    assert.ok(history.operations.some((entry) => entry.id === different), 'the install that failed is listed beside what repeats');
+    assert.equal(history.retained, 2 + 2 * (ops.REPEAT_LIMIT + 1));
+
+    // Once two hundred newer records are news, a failure is kept for its week and no longer.
+    for (let index = 0; index < ops.HISTORY_LIMIT; index += 1) {
+      plant(ops, shape, `${String(index).padStart(8, '0')}-6666-4666-8666-666666666666`, { mode: 'manual', result: { ...noop, message: `asked ${index}` } }, index / 1000);
+    }
+    const past = ops.pruneOperations().removed;
+    assert.ok(past.includes(old), 'one from eight days ago goes');
+    assert.ok(!past.includes(different), 'one from six days ago does not');
+  });
+});
+
+test('a record written on another machine is judged like any other, never left running', async () => {
   await withHome(async () => {
     const ops = await fresh('operations.mjs');
+    // A home directory restored from another machine: its boot and its pid
+    // mean nothing here. What it was doing stopped when that machine stopped
+    // running it, so it is interrupted rather than left running for good.
     const { record } = ops.beginOperation({ id: '99999999-1111-4111-8111-111111111111', ...base });
-    ops.updateOperation(record.id, { pid: 99999999, owner: { pid: 99999999, host: 'somebody-elses-machine' } });
-    // The pid means nothing here; the record belongs to a home directory that was
-    // restored or is shared.
-    const derived = ops.deriveState(ops.readOperation(record.id));
-    assert.equal(derived.state, 'finished', 'a dead pid on this host is still judged');
+    ops.recordPhase(record.id, 'installing');
+    ops.updateOperation(record.id, { pid: process.pid, bootId: 'a-boot-of-another-machine' });
+    assert.equal(ops.deriveState(ops.readOperation(record.id)).state, 'finished', 'a pid alive here is not its owner');
+    const recovered = ops.recoverOperations({ systemId: 'linux' });
+    assert.deepEqual(recovered.map((entry) => entry.id), [record.id]);
+    assert.equal(recovered[0].result.action, 'interrupted');
   });
 });

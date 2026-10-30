@@ -69,9 +69,9 @@ data class BusyStatus(
     /**
      * v3: whether anything is watching this service at all.
      *
-     * A service with no busy configuration is not idle, it is
-     * unwatched, and a disruptive change against it is a guess. False here is a warning, not a
-     * verdict.
+     * Not what decides the warning: see [isUnmonitored]. Agents before 3.1.0 also say false for a
+     * service declared never busy, and for a machine with no services, neither of which is
+     * unwatched.
      */
     val monitored: Boolean? = null,
 
@@ -79,21 +79,34 @@ data class BusyStatus(
     val evidence: String? = null,
     val checkedAt: String? = null,
     val elapsedMs: Long? = null,
+    /** The `busy` reply of a machine with several services: each service's own answer. */
+    val services: List<BusyStatus>? = null,
 ) {
     val isBusy: Boolean get() = busy == true
 
     /** True when the answer is "cannot tell", which blocks exactly as busy does. */
     val isUnknown: Boolean get() = unknown == true
 
+    /**
+     * Whether nothing is watching this service: the agent said its evidence is `unmonitored`.
+     *
+     * A service with no busy configuration is not idle, it is unwatched, and a disruptive change
+     * against it is a guess, which is worth a warning. A service declared never busy reads `none`
+     * and is idle by design. Agents before 3.1.0 send `monitored: false` for it as well, which is why
+     * this reads the evidence and not that flag: on the flag alone every such service, and every
+     * machine with no services at all, was warned about.
+     */
+    val isUnmonitored: Boolean get() = evidence == "unmonitored"
+
     /** True only when something actually looked and found nothing running. */
-    val isIdleForSure: Boolean get() = busy == false && unknown != true && monitored != false
+    val isIdleForSure: Boolean get() = busy == false && unknown != true && !isUnmonitored
 
     val summary: String
         get() = reason?.takeIf { it.isNotBlank() }
             ?: when {
                 isUnknown -> "cannot tell"
                 isBusy -> "working"
-                monitored == false -> "not monitored"
+                isUnmonitored -> "not monitored"
                 else -> "idle"
             }
 }
@@ -131,7 +144,13 @@ data class ServiceProcess(
     val state: String? = null,
     val startedAt: String? = null,
     val error: String? = null,
-)
+) {
+    /**
+     * Whether the probe failed, so [running] says nothing (contract section 6). A probe that could
+     * not read the process list is not a process that stopped, and is never drawn as one.
+     */
+    val isUnknown: Boolean get() = error != null
+}
 
 /** v3: whether the service answers, separated from whether its process exists. */
 @Serializable
@@ -373,6 +392,11 @@ data class AgentSelf(
     val node: String? = null,
     /** True when this session came through the restricted dispatcher. */
     val restrictedSession: Boolean? = null,
+    /**
+     * v3.1: the oldest agent this one may be replaced by (contract section 13). Absent from older
+     * agents, and only an agent that reports it may ever be offered a deliberate downgrade.
+     */
+    val floor: String? = null,
 )
 
 @Serializable
@@ -438,6 +462,8 @@ data class OpResult(
      * without saying so, because force bypasses only the busy gate and never a missing postcondition.
      */
     val verified: Boolean? = null,
+    /** v3.1: how it ended, as the agent states it on a finished record. See [Outcome]. */
+    val outcome: String? = null,
 )
 
 @Serializable
@@ -453,7 +479,11 @@ data class OpChild(
     val service: String? = null,
     val action: String? = null,
     val reasonCode: String? = null,
-)
+    val outcome: String? = null,
+) {
+    /** How this service's part ended, stated or reduced from its own fields. */
+    val effectiveOutcome: Outcome get() = Outcome.reduce(outcome = outcome, action = action, reasonCode = reasonCode)
+}
 
 /**
  * One operation, exactly as the agent stores and returns it.
@@ -490,6 +520,8 @@ data class OpRecord(
     val systemId: String? = null,
     /** Set when this reply is the record of an earlier request with the same id. */
     val replayed: Boolean? = null,
+    /** v3.1: `pending` while queued or running, the result's outcome once finished. See [Outcome]. */
+    val outcome: String? = null,
 ) {
     val opState: OpState? get() = OpState.fromWire(state)
     val opKind: OpKind? get() = OpKind.fromWire(kind)
@@ -497,6 +529,19 @@ data class OpRecord(
     val opAction: OpAction? get() = OpAction.fromWire(result?.action)
 
     val isFinished: Boolean get() = opState == OpState.FINISHED
+
+    /**
+     * How this operation stands, as contract section 5.6 reduces a record: its result, read in the
+     * light of its state and of the outcome stated on the record or, failing that, on the result.
+     */
+    val effectiveOutcome: Outcome
+        get() = Outcome.reduce(
+            outcome = outcome ?: result?.outcome,
+            state = state,
+            ok = result?.ok,
+            action = result?.action,
+            reasonCode = result?.reasonCode,
+        )
 
     /** What this operation is about, for a heading: the service, the boot target, or the action. */
     val subject: String?
@@ -521,9 +566,16 @@ data class OpSummary(
     val requestedAt: String? = null,
     val updatedAt: String? = null,
     val expiresAt: String? = null,
+    /** v3.1. See [Outcome]. */
+    val outcome: String? = null,
 ) {
     val opState: OpState? get() = OpState.fromWire(state)
     val opKind: OpKind? get() = OpKind.fromWire(kind)
+
+    /** How this operation stands, stated or reduced from the summary's own fields. */
+    val effectiveOutcome: Outcome
+        get() = Outcome.reduce(outcome = outcome, state = state, action = action, reasonCode = reasonCode)
+
     val subject: String?
         get() = service?.takeIf { it.isNotBlank() }
             ?: target?.takeIf { it.isNotBlank() }
@@ -706,7 +758,21 @@ data class AgentActionResult(
 
     /** v3: what `self-update` verified. */
     val manifest: AgentManifestSummary? = null,
+
+    /** v3: each service's part of a `cycle`, with the id of the operation it ran under. */
+    val children: List<OpChild>? = null,
+
+    /** v3.1: how the request stands, which is what a client decides on. See [Outcome]. */
+    val outcome: String? = null,
 ) {
+    /**
+     * How the request stands, from the reply's own fields (contract section 5.6). A reply that
+     * embeds a record is followed by the record's [OpRecord.effectiveOutcome] instead: the reply to
+     * `cancel` says whether cancelling worked, and its record says what became of the change.
+     */
+    val effectiveOutcome: Outcome
+        get() = Outcome.reduce(outcome = outcome, ok = ok, action = action, reasonCode = reasonCode)
+
     /** The action, preferring the operation record's own result. */
     val effectiveAction: String? get() = op?.result?.action ?: action
 
@@ -762,7 +828,20 @@ data class ConfigSetReply(
     val divergent: Boolean? = null,
     /** What the machine is keeping, on a refusal. */
     val current: ControllerMeta? = null,
+    /** Every rule the document broke, on a `config-invalid` refusal. */
+    val problems: List<ConfigProblem>? = null,
+    /**
+     * On a `restricted` refusal, the launch values this machine does not hold, by path (contract
+     * section 9.4): what a restricted key may not publish.
+     */
+    val launchChanges: List<String>? = null,
+    /** v3.1: how the request stands. See [Outcome]. */
+    val outcome: String? = null,
 ) {
+    /** How the request stands, stated or reduced from the reply's own fields (contract section 5.6). */
+    val effectiveOutcome: Outcome
+        get() = Outcome.reduce(outcome = outcome, ok = ok, action = action, reasonCode = reasonCode)
+
     val stored: Boolean get() = action == "stored" || action == "replaced"
     val unchanged: Boolean get() = action == "noop"
     val accepted: Boolean get() = ok == true && (stored || unchanged)
@@ -836,6 +915,8 @@ data class DoctorReport(
     val contract: Int? = null,
     val agentVersion: String? = null,
     val checks: List<DoctorCheck>? = null,
+    /** How many checks came out at each level: ok, warn and fail. */
+    val counts: Map<String, Int>? = null,
     val message: String? = null,
     val error: String? = null,
 ) {
@@ -862,12 +943,17 @@ data class HistoryReply(
     val entries: List<OpSummary> get() = operations ?: history ?: items ?: emptyList()
 }
 
-/** One line of the agent's log. */
+/**
+ * One line of the agent's log.
+ *
+ * The text is under `line`, as the contract has always named it. This read `text`, which no agent
+ * ever sent, so every log this app asked for came back empty.
+ */
 @Serializable
 data class LogLine(
     val at: String? = null,
     val command: String? = null,
-    val text: String? = null,
+    val line: String? = null,
 )
 
 /** One `logs` reply. Same open question as [HistoryReply]; see question A3. */

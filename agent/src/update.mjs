@@ -5,7 +5,7 @@
 //
 //   open the record -> take the machine lock -> RECOVER anything a previous run
 //   left half done -> resolve the target version -> compare -> check busy ->
-//   pre-warm the cache -> CHECK BUSY AGAIN -> drain -> stop -> install ->
+//   pre-warm the cache -> drain -> CHECK BUSY AGAIN -> stop -> install ->
 //   verify -> start -> health -> close the record.
 //
 // Four of those steps are there because of a specific way this went wrong:
@@ -19,7 +19,9 @@
 //   The busy check happens TWICE, and the second one is immediately before the
 //   stop. Between the first check and the stop sits a cache warm that can take
 //   three attempts of up to three minutes each, and work started inside that
-//   window used to be thrown away by a decision made nine minutes earlier.
+//   window used to be thrown away by a decision made nine minutes earlier. The
+//   drain sits in that window too, so work that starts while it runs is seen by
+//   the second check rather than stopped.
 //
 //   A drain runs before the stop where the service has one. Checking is not
 //   preventing: only the service itself can refuse new work, and where it can,
@@ -28,17 +30,23 @@
 //   An update is only reported as done when something PROVES it. A command that
 //   exits zero has proved that it ran, and nothing else.
 //
+// Only what the install changed is ever rolled back. A drain the service
+// refused, or a stop it did not complete, leaves it exactly as it was. The npm
+// path used to answer either with a rollback, which stopped the service that
+// had just said it was not ready and reinstalled the version it was running.
+//
 // We NEVER install while the machine is busy without being told to. An installer
 // replaces files underneath a running service, and a service that loads code
 // lazily starts failing on files that changed under it. Deferring costs a delay;
 // installing under a live turn costs the user's work.
 
-import { describeFailure, runArgv } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
-import { appendLog, recordPhase } from './operations.mjs';
-import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { appendLog, listOperations, recordPhase, updateOperation, whenStarted } from './operations.mjs';
+import { describeFailure, mutationWorstCaseMs, runMutationArgv, unsettledWork } from './process-runner.mjs';
+import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
+import { PROCESS_COMMAND_MS } from './probes/process.mjs';
 import { hasUpdatePath, scheduledEligibility } from './policy.mjs';
 import { log, note } from './log.mjs';
 import { ensureServiceStateWritable, requireServiceStateSave as saveServiceState, ServiceStateError, serviceState } from './state.mjs';
@@ -46,18 +54,27 @@ import * as appProvider from './providers/app.mjs';
 import * as commandProvider from './providers/command.mjs';
 import * as npmProvider from './providers/npm.mjs';
 import {
+  BIND_GRACE_MS,
+  canDrain,
   canRestart,
   drainService,
   isRunning,
   livenessOf,
+  recoveryEvidence,
   restartService,
   serviceHealth,
   startAndSettle,
   stopAndWait,
+  SYSTEMD_RESTART_MS,
   waitForServiceHealth,
 } from './service.mjs';
 
 const HEALTH_WAIT_MS = 120000;
+/** How long a service started again after a failure gets to answer. */
+export const RECOVERY_HEALTH_MS = 60000;
+/** How long a verify command gets, and a rollback command. */
+const VERIFY_COMMAND_MS = 120000;
+const ROLLBACK_COMMAND_MS = 600000;
 // How many times an app is asked to apply the SAME staged build before we stop
 // asking. Three is enough to ride out a transient failure, and small enough that
 // a build which will never apply cannot keep restarting the user's app.
@@ -81,8 +98,15 @@ function recordLastUpdate(service, result, from, to, message) {
 async function ensureServiceUp(service) {
   const health = await serviceHealth(service);
   if (health.ok) return true;
+  // Except over a command that may still be running: a service started while
+  // its installer is still writing is the collision every lock here prevents.
+  const unsettled = await unsettledWork();
+  if (unsettled) {
+    log(`${service.name} was not started again: ${unsettled.message}`, 'update');
+    return false;
+  }
   await startAndSettle(service);
-  const second = await waitForServiceHealth(service, 60000);
+  const second = await waitForServiceHealth(service, RECOVERY_HEALTH_MS);
   if (!second.ok) log(`WARNING: ${service.name} is not answering after the recovery start`, 'update');
   return second.ok;
 }
@@ -90,8 +114,8 @@ async function ensureServiceUp(service) {
 /**
  * Put a service back that a previous run left stopped.
  *
- * A run killed by its scheduler's time limit (systemd TimeoutStartSec=900, the
- * Windows task ExecutionTimeLimit) can have stopped the service deliberately and
+ * A run killed by its scheduler's time limit (systemd's TimeoutStartSec, the
+ * Windows task's ExecutionTimeLimit) can have stopped the service deliberately and
  * then died before starting it again, which no restart policy undoes. This runs
  * before anything else, including the version lookup, so an offline machine
  * still gets its service back.
@@ -132,6 +156,86 @@ function deferred({ service, from = null, to = null, busy, message }) {
     message,
     service: service?.id ?? null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// How long it can take
+// ---------------------------------------------------------------------------
+
+// A scheduled cycle has a deadline, because its scheduler ends a cycle that
+// runs too long (scheduler.mjs), and it only starts what can be done by then.
+// These are the longest each piece of work can take, added up from the
+// timeouts its steps use, the mutation runner's stop of a command that runs
+// out included.
+//
+// What is counted is the part that can leave the service down: for an update,
+// from the drain to the health check that says it is back. What comes before
+// it changes nothing, and a cycle ended there loses only time. A rollback the
+// update turns out to need is not counted: it is what puts the service back,
+// and it is never skipped for time. If the scheduler ends the cycle in the
+// middle of one, the next cycle's recovery takes over what it left.
+
+function stopWorstMs(service) {
+  if (service.process?.type === 'app') return mutationWorstCaseMs(appProvider.APP_COMMAND_MS) + appProvider.QUIT_WAIT_MS;
+  return mutationWorstCaseMs(PROCESS_COMMAND_MS) + STOP_WAIT_MS;
+}
+
+function startWorstMs(service) {
+  if (service.process?.type === 'app') return mutationWorstCaseMs(appProvider.APP_COMMAND_MS) + appProvider.LAUNCH_GRACE_MS;
+  return mutationWorstCaseMs(PROCESS_COMMAND_MS) + BIND_GRACE_MS;
+}
+
+/** The drain, and the busy check after it that decides whether the stop goes ahead. */
+function drainWorstMs(service) {
+  return (canDrain(service) ? mutationWorstCaseMs(service.drain.timeoutSeconds * 1000) : 0) + BUSY_BUDGET_MS;
+}
+
+function npmInstallWorstMs() {
+  return npmProvider.NPM_VERSION_MS + mutationWorstCaseMs(npmProvider.NPM_INSTALL_MS);
+}
+
+/** An update, from the drain (an app has none) until the service answers on the new version. */
+export function updateWorstCaseMs(service) {
+  if (service.kind === 'app') return stopWorstMs(service) + startWorstMs(service) + HEALTH_WAIT_MS + appProvider.VERSION_WAIT_MS;
+  const install = service.kind === 'npm'
+    ? npmInstallWorstMs()
+    : mutationWorstCaseMs(commandProvider.UPDATE_COMMAND_MS) + mutationWorstCaseMs(VERIFY_COMMAND_MS);
+  return drainWorstMs(service) + stopWorstMs(service) + install + startWorstMs(service) + HEALTH_WAIT_MS;
+}
+
+/** A restart, until the service answers again. */
+export function restartWorstCaseMs(service) {
+  const type = service.process?.type;
+  const restart = type === 'systemd-user' || type === 'systemd-system'
+    ? mutationWorstCaseMs(SYSTEMD_RESTART_MS) + BIND_GRACE_MS
+    : stopWorstMs(service) + startWorstMs(service);
+  return restart + HEALTH_WAIT_MS;
+}
+
+/**
+ * Recovery putting a service back (scheduler.mjs): a start, and where an
+ * interrupted update may have to be rolled back, the gate in front of that
+ * rollback and the rollback itself, a second start after it included.
+ */
+export function recoveryWorstCaseMs(service, { rollback = false } = {}) {
+  const start = startWorstMs(service) + RECOVERY_HEALTH_MS;
+  if (!rollback) return start;
+  const undo = service.kind === 'npm'
+    ? stopWorstMs(service) + npmInstallWorstMs()
+    : mutationWorstCaseMs(ROLLBACK_COMMAND_MS);
+  return start + BUSY_BUDGET_MS + drainWorstMs(service) + undo + startWorstMs(service) + HEALTH_WAIT_MS + start;
+}
+
+/**
+ * An update that waits for the next cycle, because this one does not have
+ * the time its disruptive part can take. Like one the busy gate defers, it
+ * leaves the version noted as waiting.
+ */
+function outOfTime({ service, from, to, message }) {
+  saveServiceState(service, { pendingRestart: true, pendingVersion: to });
+  log(message, 'update');
+  recordLastUpdate(service, 'deferred', from, to, message);
+  return { ok: true, action: 'deferred', reasonCode: REASON.timedOut, from, to, message, service: service.id };
 }
 
 // ---------------------------------------------------------------------------
@@ -206,19 +310,17 @@ export async function runRestart(config, service, options = {}) {
 // npm
 // ---------------------------------------------------------------------------
 
-async function performUpgrade(service, to, prefix, opId, lock) {
-  lock.phase('stopping');
-  recordPhase(opId, 'stopping');
-  const drained = drainService(service);
-  if (!drained.ok) throw new Error(drained.message);
-  if (drained.drained) appendLog(opId, drained.message);
-
-  const stopped = await stopAndWait(service, STOP_WAIT_MS);
-  if (!stopped.ok) throw new Error(stopped.message);
-
+/**
+ * Everything from the install on, with the service already stopped. Any step
+ * that fails throws, and `reached.installing` says whether the install had
+ * begun, which is the one thing that decides whether there is anything to roll
+ * back.
+ */
+async function performUpgrade(service, to, prefix, opId, lock, reached) {
   lock.phase('installing');
   recordPhase(opId, 'installing', { note: `npm install ${service.package}@${to}` });
-  const installed = npmProvider.installVersion(service, to, prefix);
+  reached.installing = true;
+  const installed = await npmProvider.installVersion(service, to, prefix);
   if (!installed.ok) throw new Error(installed.message);
 
   // Verify at the prefix we installed into, not by re-running prefix discovery.
@@ -241,26 +343,53 @@ async function performUpgrade(service, to, prefix, opId, lock) {
   return { to };
 }
 
-async function rollBack(service, previous, prefix, opId, lock) {
+/**
+ * Nothing is rolled back over a command that may still be running. The runner
+ * answers only once a timed-out install has been stopped and seen gone; when it
+ * could not see that, the install may still be writing, and reinstalling or
+ * starting anything over it would be two writers on one service. The operation
+ * then reports its outcome as unknown (operate.mjs), and the ledger keeps every
+ * later mutation off the machine until it has gone.
+ */
+async function rollbackHeld() {
+  const unsettled = await unsettledWork();
+  return unsettled ? `nothing was rolled back or restarted, because ${unsettled.message}` : null;
+}
+
+/**
+ * Enter a phase the way every step of a run does, on the lock a second
+ * mutation reads and on the record a client polls. A rollback is handed this
+ * rather than the run itself, because recovery rolls back for a run that is
+ * already over and notes each step on that run's record instead.
+ */
+function entering(opId, lock) {
+  return (phase, progress = null) => {
+    lock.phase(phase);
+    recordPhase(opId, phase, progress);
+  };
+}
+
+async function rollBack(service, previous, prefix, enter) {
+  const held = await rollbackHeld();
+  if (held) return { ok: false, message: held };
   if (!previous) {
     await ensureServiceUp(service);
     return { ok: false, message: 'nothing to roll back to: no previous version was installed' };
   }
-  lock.phase('rolling-back');
-  recordPhase(opId, 'rolling-back', { note: `back to ${previous}` });
+  enter('rolling-back', { note: `back to ${previous}` });
   note(`rolling back to ${previous}`, 'update');
 
   // The same rule as the forward install: npm may not rewrite the package while
-  // a process still has those files open. If the upgrade failed at the stop, the
-  // old service is still up on the version we would reinstall, so the honest
-  // move is to leave it alone rather than corrupt a working install.
+  // a process still has those files open. An upgrade that got as far as the
+  // start can have left the new version running, and one that will not stop
+  // now is left alone rather than reinstalled underneath.
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
   if (!stopped.ok) {
     await ensureServiceUp(service);
     return { ok: false, message: `rollback skipped, ${service.name} would not stop: ${stopped.message}` };
   }
 
-  const reinstalled = npmProvider.installVersion(service, previous, prefix);
+  const reinstalled = await npmProvider.installVersion(service, previous, prefix);
   if (!reinstalled.ok) {
     await ensureServiceUp(service);
     return { ok: false, message: `rollback install failed: ${reinstalled.message}` };
@@ -285,7 +414,7 @@ async function rollBack(service, previous, prefix, opId, lock) {
  * Shared by the npm and command cycles, which reach it the same way. Runs inside
  * the held lock, so it restarts directly rather than re-entering runRestart.
  */
-async function alreadyOnTarget(config, service, from, to, { force, opId }) {
+async function alreadyOnTarget(config, service, from, to, { force, opId, budget }) {
   const health = await serviceHealth(service);
   if (health.ok) {
     if (serviceState(service).pendingRestart) {
@@ -312,6 +441,21 @@ async function alreadyOnTarget(config, service, from, to, { force, opId }) {
     });
   }
 
+  // A restart the scheduler ends half way leaves the service stopped, so in a
+  // cycle it waits for one with the time, as an update does at its drain.
+  const late = budget?.refuses(restartWorstCaseMs(service), `the restart of ${service.name}`);
+  if (late) {
+    return {
+      ok: true,
+      action: 'deferred',
+      reasonCode: REASON.timedOut,
+      from,
+      to,
+      message: `already on ${to} but unhealthy; ${late}`,
+      service: service.id,
+    };
+  }
+
   const restart = await performRestart(service, { opId });
   if (!restart.ok) {
     const message = `already on ${to} but unhealthy; restart failed: ${restart.message}`;
@@ -323,7 +467,7 @@ async function alreadyOnTarget(config, service, from, to, { force, opId }) {
   return { ok: true, action: 'updated', reasonCode: null, from, to, message };
 }
 
-async function runNpmUpdate(config, service, { force, opId, lock }) {
+async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
   const prefix = npmProvider.resolveNpmPrefix(service);
   const from = npmProvider.installedVersion(service);
 
@@ -348,7 +492,11 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
     return { ok: false, action: 'failed', reasonCode: REASON.latestUnknown, from, to: null, message };
   }
 
-  if (from === to) return alreadyOnTarget(config, service, from, to, { force, opId });
+  // What recovery reads if this run dies part way through: the version it is
+  // going from and to, and the prefix it installs into (contract section 5.5).
+  updateOperation(opId, { from, to, npmPrefix: prefix });
+
+  if (from === to) return alreadyOnTarget(config, service, from, to, { force, opId, budget });
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
@@ -361,27 +509,62 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
     return deferred({ service, from, to, busy, message });
   }
 
+  // The download leaves nothing down, but against a slow registry its tries
+  // can take nine minutes of a cycle that has none to spare, so it waits for
+  // a cycle that could still install what it fetches. It is shorter than the
+  // install the update's worst case counts, so one begun here is over before
+  // the cycle has to end, however long it takes.
+  const what = `the update of ${service.name} to ${to}`;
+  const short = budget?.refuses(updateWorstCaseMs(service), what);
+  if (short) return outOfTime({ service, from, to, message: short });
+
   lock.phase('warming');
   recordPhase(opId, 'warming', { note: `${service.package}@${to}` });
   const warmed = npmProvider.warmCache(service, to);
   if (!warmed.ok) log(`npm cache add did not succeed after ${warmed.attempts} attempts: ${warmed.message}`, 'update');
 
-  // The second check, and the important one. The warm above can legitimately
-  // take minutes; anything that started during it would otherwise be destroyed
-  // by a decision made before it existed.
-  lock.phase('checking-busy');
+  // The drain is the first step that can leave the service down, so it is
+  // where a scheduled cycle decides, with what the download took spent,
+  // whether it still has the time.
+  const late = budget?.refuses(updateWorstCaseMs(service), what);
+  if (late) return outOfTime({ service, from, to, message: late });
+
+  note(`updating ${service.name} ${from ?? 'nothing'} -> ${to}`, 'update');
+
+  lock.phase('stopping');
+  recordPhase(opId, 'stopping');
+  const drained = await drainService(service);
+  if (!drained.ok) {
+    log(drained.message, 'update');
+    recordLastUpdate(service, 'failed', from, to, drained.message);
+    return { ok: false, action: 'failed', reasonCode: REASON.busy, from, to, message: drained.message };
+  }
+  if (drained.drained) appendLog(opId, drained.message);
+
+  // The second check, and the important one, immediately before the stop. The
+  // warm above can legitimately take minutes; anything that started during it,
+  // or that the drain left running, would otherwise be destroyed by a decision
+  // made before it existed.
   const fresh = await busyNow(config, service);
   if (fresh.busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `work started while the download was being prepared (${fresh.busy.reason}); ${to} is downloaded and will be installed at the next idle window`;
+    const message = `work started while the update was being prepared (${fresh.busy.reason}); ${to} is downloaded and will be installed at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy: fresh.busy, message });
   }
 
+  const stopped = await stopAndWait(service, STOP_WAIT_MS);
+  if (!stopped.ok) {
+    const message = `${service.name} would not stop: ${stopped.message}`;
+    log(message, 'update');
+    recordLastUpdate(service, 'failed', from, to, message);
+    return { ok: false, action: 'failed', reasonCode: REASON.notRunning, from, to, message };
+  }
+
+  const reached = { installing: false };
   try {
-    note(`updating ${service.name} ${from ?? 'nothing'} -> ${to}`, 'update');
-    await performUpgrade(service, to, prefix, opId, lock);
+    await performUpgrade(service, to, prefix, opId, lock, reached);
     saveServiceState(service, { pendingRestart: false, pendingVersion: null });
     const message = `updated ${from ?? 'nothing'} -> ${to}`;
     log(message, 'update');
@@ -391,7 +574,15 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
     if (err instanceof ServiceStateError) throw err;
     const failure = err?.message ?? String(err);
     log(`update to ${to} failed: ${failure}`, 'update');
-    const rolledBack = await rollBack(service, from, prefix, opId, lock);
+    if (!reached.installing) {
+      // Stopped, and nothing on disk has changed: the service only has to come
+      // back on the version it was already running.
+      const restarted = await ensureServiceUp(service);
+      const message = `${failure}; nothing was installed, and ${service.name} ${restarted ? 'was started again' : 'could not be started again'}`;
+      recordLastUpdate(service, 'failed', from, to, message);
+      return { ok: false, action: 'failed', reasonCode: REASON.internal, from, to, message };
+    }
+    const rolledBack = await rollBack(service, from, prefix, entering(opId, lock));
     const message = `${failure}; ${rolledBack.message}`;
     if (rolledBack.ok) {
       recordLastUpdate(service, 'rolled-back', from, to, message);
@@ -420,7 +611,7 @@ async function runNpmUpdate(config, service, { force, opId, lock }) {
  * version did not change we have to say the update failed, because the
  * alternative is reporting success for a restart that achieved nothing.
  */
-async function runAppUpdate(config, service, { force, opId, lock }) {
+async function runAppUpdate(config, service, { force, opId, lock, budget }) {
   const state = serviceState(service, { isFirst: config.services[0]?.id === service.id });
   const from = appProvider.installedVersion(service);
   const staged = appProvider.stagedVersion(service);
@@ -498,6 +689,9 @@ async function runAppUpdate(config, service, { force, opId, lock }) {
     recordLastUpdate(service, 'deferred', from, staged, message);
     return deferred({ service, from, to: staged, busy, message });
   }
+
+  const late = budget?.refuses(updateWorstCaseMs(service), `applying ${staged} to ${service.name}`);
+  if (late) return outOfTime({ service, from, to: staged, message: late });
 
   lock.phase('stopping');
   recordPhase(opId, 'stopping', { note: 'asking the app to quit so the staged build applies' });
@@ -579,7 +773,7 @@ async function runAppUpdate(config, service, { force, opId, lock }) {
  * With NEITHER available there is no postcondition, and no flag creates one.
  * --force overrides the busy gate; it cannot make an unverifiable thing verified.
  */
-function checkPostcondition(service, { to }) {
+async function checkPostcondition(service, { to }) {
   const installed = commandProvider.installedVersion(service);
 
   // The version this service is ACTUALLY on, or null when it cannot be read.
@@ -598,7 +792,7 @@ function checkPostcondition(service, { to }) {
   }
 
   if (service.verify) {
-    const result = runArgv(service.verify, { timeoutMs: 120000 });
+    const result = await runMutationArgv(service.verify, { timeoutMs: VERIFY_COMMAND_MS });
     if (!result.ok) {
       return {
         ok: false,
@@ -656,12 +850,14 @@ function checkPostcondition(service, { to }) {
  * so this is only ever the rollback hook the config supplies — and saying "there
  * is no rollback" out loud is better than implying the machine is fine.
  */
-async function rollBackCommand(service, opId, lock) {
+async function rollBackCommand(service, enter) {
   // Whatever happens here, the version reported afterwards is read fresh from
   // the service. A rollback changes what is installed, so echoing the reading
   // taken before it would name a version that is no longer there.
   const finalVersion = () => commandProvider.installedVersion(service);
 
+  const held = await rollbackHeld();
+  if (held) return { ok: false, installed: finalVersion(), message: held };
   if (!service.rollback) {
     const recovered = await ensureServiceUp(service);
     return {
@@ -672,9 +868,8 @@ async function rollBackCommand(service, opId, lock) {
         : 'no rollback command is configured, and the service could not be restarted; this machine needs attention',
     };
   }
-  lock.phase('rolling-back');
-  recordPhase(opId, 'rolling-back');
-  const result = runArgv(service.rollback, { timeoutMs: 600000 });
+  enter('rolling-back');
+  const result = await runMutationArgv(service.rollback, { timeoutMs: ROLLBACK_COMMAND_MS });
   if (!result.ok) {
     await ensureServiceUp(service);
     return { ok: false, installed: finalVersion(), message: `the rollback command failed: ${describeFailure(result)}` };
@@ -699,7 +894,7 @@ async function rollBackCommand(service, opId, lock) {
   };
 }
 
-async function runCommandUpdate(config, service, { force, opId, lock }) {
+async function runCommandUpdate(config, service, { force, opId, lock, budget }) {
   const from = commandProvider.installedVersion(service);
   if (!service.update) {
     return {
@@ -741,7 +936,10 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
     return { ok: false, action: 'failed', reasonCode: REASON.postconditionFailed, from, to: null, message };
   }
 
-  if (to && from === to) return alreadyOnTarget(config, service, from, to, { force, opId });
+  // What recovery reads if this run dies part way through (contract section 5.5).
+  updateOperation(opId, { from, to });
+
+  if (to && from === to) return alreadyOnTarget(config, service, from, to, { force, opId, budget });
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
@@ -754,11 +952,14 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
     return deferred({ service, from, to, busy, message });
   }
 
+  const late = budget?.refuses(updateWorstCaseMs(service), `the update of ${service.name}${to ? ` to ${to}` : ''}`);
+  if (late) return outOfTime({ service, from, to, message: late });
+
   note(`updating ${service.name} ${from ?? 'nothing'} -> ${to ?? 'whatever the update command installs'}`, 'update');
 
   lock.phase('stopping');
   recordPhase(opId, 'stopping');
-  const drained = drainService(service);
+  const drained = await drainService(service);
   if (!drained.ok) {
     log(drained.message, 'update');
     recordLastUpdate(service, 'failed', from, to, drained.message);
@@ -785,9 +986,9 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
 
   lock.phase('installing');
   recordPhase(opId, 'installing');
-  const updated = commandProvider.update(service);
+  const updated = await commandProvider.update(service);
   if (!updated.ok) {
-    const rolled = await rollBackCommand(service, opId, lock);
+    const rolled = await rollBackCommand(service, entering(opId, lock));
     const message = `the update command failed: ${updated.message}; ${rolled.message}`;
     log(message, 'update');
     recordLastUpdate(service, rolled.ok ? 'rolled-back' : 'failed', from, to, message);
@@ -805,7 +1006,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
   recordPhase(opId, 'starting');
   const started = await startAndSettle(service);
   if (!started.ok) {
-    const rolled = await rollBackCommand(service, opId, lock);
+    const rolled = await rollBackCommand(service, entering(opId, lock));
     const message = `${service.name} was updated but would not start: ${started.message}; ${rolled.message}`;
     log(message, 'update');
     recordLastUpdate(service, rolled.ok ? 'rolled-back' : 'failed', from, to, message);
@@ -823,7 +1024,7 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
   recordPhase(opId, 'health');
   const health = await waitForServiceHealth(service, HEALTH_WAIT_MS);
   if (!health.ok) {
-    const rolled = await rollBackCommand(service, opId, lock);
+    const rolled = await rollBackCommand(service, entering(opId, lock));
     const message = `${service.name} was updated but is not answering: ${describeHealth(health)}; ${rolled.message}`;
     log(message, 'update');
     recordLastUpdate(service, rolled.ok ? 'rolled-back' : 'failed', from, to, message);
@@ -839,9 +1040,9 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
 
   lock.phase('verifying');
   recordPhase(opId, 'verifying');
-  const postcondition = checkPostcondition(service, { to });
+  const postcondition = await checkPostcondition(service, { to });
   if (!postcondition.ok) {
-    const rolled = await rollBackCommand(service, opId, lock);
+    const rolled = await rollBackCommand(service, entering(opId, lock));
     const message = `${postcondition.message}; ${rolled.message}`;
     log(message, 'update');
     recordLastUpdate(service, rolled.ok ? 'rolled-back' : 'failed', from, to, message);
@@ -878,6 +1079,152 @@ async function runCommandUpdate(config, service, { force, opId, lock }) {
 }
 
 // ---------------------------------------------------------------------------
+// Recovery
+// ---------------------------------------------------------------------------
+
+/**
+ * The phases in which an interrupted update may have changed what is
+ * installed. One that died in `stopping` never reached its install, so the
+ * version on disk is still the one the service was running, whatever a
+ * version command says about it now, and rolling it back would be a
+ * disruptive step taken for nothing.
+ */
+const INSTALL_BEGUN = new Set(['installing', 'verifying', 'starting', 'rolling-back']);
+
+/**
+ * Whether an update of the same service that started after this one has since
+ * finished and settled its version: installed and verified it, rolled back, or
+ * found it already on its target. What is installed is then that run's doing,
+ * and rolling it back to the version an older run started from would undo it.
+ * Started after, not asked for after: an update queued before this one was
+ * asked for can be taken up once it is over.
+ */
+function versionSettledSince(record) {
+  const since = whenStarted(record);
+  return listOperations({ service: record.service, kind: 'update', state: 'finished', limit: 200 }).some(
+    (later) =>
+      later.id !== record.id &&
+      whenStarted(later) > since &&
+      (['updated', 'rolled-back'].includes(later.result?.action) || later.result?.reasonCode === REASON.alreadyOnTarget),
+  );
+}
+
+/**
+ * What is installed now, or null with the reason it cannot be read. For npm a
+ * package.json that is missing or unparseable is a reading, not a failure to
+ * read: it is exactly what an install that took the old tree away and never
+ * wrote the new one leaves behind.
+ */
+function installedNow(service, record) {
+  if (service.kind === 'npm') {
+    return { version: npmProvider.installedVersionAt(service, record.npmPrefix ?? npmProvider.resolveNpmPrefix(service)), error: null };
+  }
+  return commandProvider.readInstalledVersion(service);
+}
+
+/**
+ * What the version of a service owes the updates an interruption left behind
+ * (contract section 5.5), judged from every record still owing it, oldest
+ * first by when each started, the clock versionSettledSince tells a later run
+ * by. Like a process reading, it is one of three states:
+ *
+ *   none     nothing is to be rolled back;
+ *   owed     the version installed is neither the `from` of the run that
+ *            decides nor a version it or a later run was going to, so it goes
+ *            back to that `from`;
+ *   unknown  nothing can say, with `error` saying why, and nothing is rolled
+ *            back on it.
+ *
+ * Only runs that reached their install count. The one that decides is the
+ * oldest of them that noted a `from` and that no later update has settled,
+ * because its `from` is the last version known to be whole. A later run's own
+ * `from` is only what it found on disk, which can be the very half-written
+ * install this is looking for, so it never counts as whole; a `to` is where
+ * an install lands when it finishes. A run that noted no `from`, because
+ * nothing was installed before it or because an agent before 3.1.0 wrote its
+ * record, has nothing known to go back to, and an app keeps no previous build
+ * to restore.
+ *
+ * A version that cannot be read is unknown, never neither. npm's own reading
+ * cannot fail that way, but a version command can, timing out or needing the
+ * service up to answer, and a rollback is too disruptive to take on that. So
+ * is a version other than `from` after an update that named none it was going
+ * to, as one confirmed by `verify` alone does: that is as likely to be the
+ * finished install as a half-done one.
+ */
+export function rollbackOwed(service, records) {
+  if (service.kind !== 'npm' && service.kind !== 'command') return { state: 'none' };
+  const installs = records.filter((record) => record.kind === 'update' && INSTALL_BEGUN.has(record.phase));
+  const first = installs.findIndex((record) => (record.from ?? null) !== null && !versionSettledSince(record));
+  if (first === -1) return { state: 'none' };
+  const record = installs[first];
+  const after = installs.slice(first);
+  const from = record.from;
+  const to = [...new Set(after.map((entry) => entry.to ?? null).filter((version) => version !== null))];
+  const reading = installedNow(service, record);
+  if (reading.error) return { state: 'unknown', record, error: `its version could not be read: ${reading.error}` };
+  if (reading.version === from || to.includes(reading.version)) return { state: 'none' };
+  if (after.some((entry) => (entry.to ?? null) === null)) {
+    return {
+      state: 'unknown',
+      record,
+      error: `it is on ${reading.version ?? 'no version'}, and nothing names the version the update was going to, so that cannot be told from an install it did not finish`,
+    };
+  }
+  return { state: 'owed', record, from, to, installed: reading.version };
+}
+
+/**
+ * Roll a service back for an update that was interrupted half way, from the
+ * cycle that found it. The rollback is the update's own, the npm reinstall or
+ * the configured rollback command, with each step noted on the interrupted
+ * record rather than entered as a phase of the cycle.
+ *
+ * A service that is running again is stopped for it only through the gate the
+ * update's own stop goes through: a busy check, the drain, and a second check
+ * immediately before anything stops. A unit that came back by itself on a
+ * half-written tree takes new work like any other, and checking is not
+ * preventing. A drain it refuses leaves it running, and the rollback owed.
+ *
+ * Returns { settled, action, reasonCode, message }. The obligation is met once
+ * the rollback took, or once the service is seen running even though it did
+ * not: putting the version right is then an update's business, and stopping a
+ * running service on every cycle to try again would be damage of its own.
+ */
+export async function rollBackInterrupted(config, service, owed, { running }) {
+  const { record, from } = owed;
+  const found = `${service.name} is on ${owed.installed ?? 'a version that cannot be read'}, neither ${[from, ...owed.to].join(' nor ')}`;
+  const held = await rollbackHeld();
+  if (held) return { settled: false, action: 'conflict', reasonCode: REASON.operationInProgress, message: `${found}, and ${held}` };
+  const waiting = (busy, why = '') => ({
+    settled: false,
+    action: 'deferred',
+    reasonCode: busyReasonCode(busy),
+    message: `${found}, and the rollback to ${from} waits for an idle machine (${why}${busy.reason})`,
+  });
+  if (running && (service.kind === 'npm' || service.rollback)) {
+    const { busy } = await busyNow(config, service);
+    if (busy.busy) return waiting(busy);
+    const drained = await drainService(service);
+    if (!drained.ok) {
+      return { settled: false, action: 'drain-refused', reasonCode: REASON.busy, message: `${found}, and ${service.name} was not rolled back to ${from}: ${drained.message}` };
+    }
+    if (drained.drained) appendLog(record.id, `recovery: ${drained.message}`);
+    const fresh = await busyNow(config, service);
+    if (fresh.busy.busy) return waiting(fresh.busy, 'work started while it was being prepared: ');
+  }
+  note(`${found} after an interrupted update; rolling it back`, 'recover');
+  const enter = (phase, progress = null) => appendLog(record.id, `recovery: ${phase}${progress?.note ? `, ${progress.note}` : ''}`);
+  const rolled =
+    service.kind === 'npm'
+      ? await rollBack(service, from, record.npmPrefix ?? npmProvider.resolveNpmPrefix(service), enter)
+      : await rollBackCommand(service, enter);
+  const message = `${found}; ${rolled.message}`;
+  if (rolled.ok) return { settled: true, action: 'rolled-back', reasonCode: null, message };
+  return { settled: (await recoveryEvidence(service)).state === 'running', action: 'rollback-failed', reasonCode: REASON.applyFailed, message };
+}
+
+// ---------------------------------------------------------------------------
 // The entry point
 // ---------------------------------------------------------------------------
 
@@ -897,9 +1244,13 @@ export function installedFor(service) {
  *   reports which policy declined it.
  *   "manual" is a person asking. Policy is not consulted at all — the busy gate
  *   still is, and --force is the only thing that overrides it.
+ *
+ * `budget` is the time a cycle has left (scheduler.mjs). With one, an update
+ * whose disruptive part might not be over before the cycle has to end waits
+ * for the next cycle rather than starting; a person who asks has no deadline.
  */
 export async function runUpdate(config, service, options = {}) {
-  const { mode = 'manual', force = false } = options;
+  const { mode = 'manual', force = false, budget = null } = options;
   let refusal = null;
 
   if (mode === 'scheduled') {
@@ -945,9 +1296,9 @@ export async function runUpdate(config, service, options = {}) {
       try {
         ensureServiceStateWritable(service);
         stateReady = true;
-        if (service.kind === 'app') return await runAppUpdate(config, service, { force, opId, lock });
-        if (service.kind === 'npm') return await runNpmUpdate(config, service, { force, opId, lock });
-        return await runCommandUpdate(config, service, { force, opId, lock });
+        if (service.kind === 'app') return await runAppUpdate(config, service, { force, opId, lock, budget });
+        if (service.kind === 'npm') return await runNpmUpdate(config, service, { force, opId, lock, budget });
+        return await runCommandUpdate(config, service, { force, opId, lock, budget });
       } catch (error) {
         if (!(error instanceof ServiceStateError)) throw error;
         // Once the state was writable the update may have run, so a failure to

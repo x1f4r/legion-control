@@ -9,7 +9,10 @@ import com.x1f4r.legioncontrol.net.StdinSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
@@ -125,7 +128,7 @@ class AgentClient(
         CommandSafety.READ,
         budgeted = true,
     ).also { reply ->
-        abilities = AgentAbilities.of(reply.value).copy(verbs = abilities.verbs)
+        abilities = AgentAbilities.of(reply.value)
         lastStatus = reply.value
         restrictedRoutes[reply.route.id] = reply.value.agent?.restrictedSession == true
     }
@@ -135,24 +138,7 @@ class AgentClient(
 
     suspend fun version(): AgentReply<AgentVersion> =
         call(listOf("version"), SHORT_TIMEOUT_MILLIS, AgentVersion.serializer(), CommandSafety.READ)
-            .also { abilities = AgentAbilities.of(it.value).copy(verbs = abilities.verbs) }
-
-    /**
-     * The verb list, read once per session and only because of one optional command.
-     *
-     * The wake proxy is an optional verb rather than part of contract 3 proper, so this app finds
-     * out whether it exists instead of assuming either way.
-     */
-    suspend fun readVerbs(): Set<String> {
-        if (abilities.verbs.isNotEmpty()) return abilities.verbs
-        val reply = call(listOf("help"), SHORT_TIMEOUT_MILLIS, HelpReply.serializer(), CommandSafety.READ)
-        val verbs = reply.value.verbs
-        abilities = abilities.copy(
-            contract = reply.value.contract ?: abilities.contract,
-            verbs = verbs,
-        )
-        return verbs
-    }
+            .also { abilities = AgentAbilities.of(it.value) }
 
     /** The agent's own preflight. `--deep` adds the network checks and costs seconds. */
     suspend fun doctor(serviceId: String? = null, deep: Boolean = false): AgentReply<DoctorReport> = call(
@@ -200,8 +186,10 @@ class AgentClient(
             }
         }
         val budget = waitSeconds?.let { (it * 1000L) + OP_WAIT_MARGIN_MILLIS } ?: SHORT_TIMEOUT_MILLIS
-        val reply = call(arguments, budget, OpEnvelope.serializer(), CommandSafety.READ)
-        return AgentReply(reply.value.record(), reply.route, reply.systemId)
+        // Read as a tree first, because "no such operation" is told by a key that is there and null,
+        // which a decoded class cannot tell from a key that is missing.
+        val reply = call(arguments, budget, JsonObject.serializer(), CommandSafety.READ)
+        return AgentReply(readOperation(operationId, reply.value), reply.route, reply.systemId)
     }
 
     suspend fun history(
@@ -271,7 +259,7 @@ class AgentClient(
         revision: Long,
         replace: Boolean = false,
     ): AgentReply<ConfigSetReply> {
-        Contract.requireToken(setupId, "setup id")
+        Contract.requireSetupId(setupId)
         if (revision < 0) refuse("A setup revision counts up from zero, and this one is $revision.")
         return call(
             buildList {
@@ -309,17 +297,18 @@ class AgentClient(
      * On stdin rather than in flags because the patch has three shapes of value in it, one of which
      * is a list of objects, and none of that belongs on a command line under any quoting rules. It
      * is also what lets the restricted dispatcher allow this command at all.
+     *
+     * No `--op`: `policy` and `auto-update` take only `--service` (contract section 4), and an
+     * agent refuses any other flag on them, so these four are never tracked by an id.
      */
     suspend fun writePolicy(
         patch: PolicyPatch,
         serviceId: String? = null,
-        operationId: String? = null,
     ): AgentReply<AgentActionResult> = call(
         buildList {
             add("policy")
             add("set")
             addService(serviceId)
-            addOperationId(operationId)
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
@@ -371,13 +360,11 @@ class AgentClient(
     suspend fun setAutoUpdate(
         enabled: Boolean,
         serviceId: String? = null,
-        operationId: String? = null,
     ): AgentReply<AgentActionResult> = call(
         buildList {
             add("auto-update")
             add(if (enabled) "on" else "off")
             addService(serviceId)
-            addOperationId(operationId)
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
@@ -388,7 +375,6 @@ class AgentClient(
     suspend fun pauseUpdates(
         duration: String,
         serviceId: String? = null,
-        operationId: String? = null,
     ): AgentReply<AgentActionResult> {
         if (!Contract.isDuration(duration)) refuse("A pause is written like 30m, 4h or 2d, not \"$duration\".")
         return call(
@@ -397,7 +383,6 @@ class AgentClient(
                 add("pause")
                 add(duration)
                 addService(serviceId)
-                addOperationId(operationId)
             },
             SHORT_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
@@ -407,13 +392,11 @@ class AgentClient(
 
     suspend fun resumeUpdates(
         serviceId: String? = null,
-        operationId: String? = null,
     ): AgentReply<AgentActionResult> = call(
         buildList {
             add("auto-update")
             add("resume")
             addService(serviceId)
-            addOperationId(operationId)
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
@@ -625,30 +608,6 @@ class AgentClient(
     }
 
     /**
-     * Asks this machine to send a magic packet at another one on its own network.
-     *
-     * A proposed contract addition, and used only when `help` actually listed the verb. See
-     * the app's fallback is an ordinary configured action on the helper machine, which needs
-     * nothing new at all.
-     */
-    suspend fun wakeProxy(
-        targetMachineId: String,
-        operationId: String? = null,
-    ): AgentReply<AgentActionResult> {
-        Contract.requireToken(targetMachineId, "machine id")
-        return call(
-            buildList {
-                add("wake")
-                add(targetMachineId)
-                addOperationId(operationId)
-            },
-            WAKE_PROXY_TIMEOUT_MILLIS,
-            AgentActionResult.serializer(),
-            CommandSafety.MUTATION,
-        )
-    }
-
-    /**
      * One authenticated request against exactly one address, and what it did.
      *
      * The diagnostics page runs these on demand and nothing else does. It is the authenticated
@@ -762,6 +721,14 @@ class AgentClient(
          */
         onlySystem: MachineSystem? = null,
     ): AgentReply<T> {
+        // Contract section 9.9: nothing is sent to a system this device does not drive, and with none
+        // driven on the whole machine there is nothing to try on any route. Said as what would change
+        // that, so the machine is not drawn as one that is asleep. A machine the document in force
+        // has an error inside (section 9.7) is not dialled at all, not even for the bootstrap.
+        if (machine.problem != null) throw notDriven()
+        if (overrideArgv == null && machine.systems.isNotEmpty() && machine.systems.none { it.isDriven }) {
+            throw notDriven()
+        }
         val deadline = clock() + timeoutMillis
         val walk = AttemptWalk(safety)
         val failures = Failures()
@@ -784,14 +751,18 @@ class AgentClient(
                 val remaining = deadline - clock()
                 if (attemptsMade > 0 && remaining < MINIMUM_ATTEMPT_MILLIS) break@routes
 
-                val argv = (overrideArgv ?: system.agent) + arguments + if (budgeted && abilities.speaksV3) {
+                val launcher = overrideArgv ?: system.agent
+                val argv = launcher + arguments + if (budgeted && abilities.speaksV3) {
                     val budget = statusBudget(remaining, attemptsMade) ?: break@routes
                     listOf("--budget-ms", budget.toString())
                 } else {
                     emptyList()
                 }
                 val line = try {
-                    commandLine(grammarOn(endpoint, system, (overrideArgv ?: system.agent).size), argv)
+                    // A guard behind the launch gate, which leaves a system it does not drive no
+                    // command: with nothing in front of the verb, the verb alone would be the command.
+                    if (launcher.isEmpty()) throw refusedLine(CommandLineRefusal("no-command", null, null))
+                    commandLine(grammarOn(endpoint, system, launcher.size), argv)
                 } catch (refused: AgentFailure.BadRequest) {
                     // Nothing was sent, and another system's line may be fine: a request that could
                     // not be made is never sent, which is what lets the walk go on.
@@ -835,19 +806,26 @@ class AgentClient(
             }
         }
 
-        if (attemptsMade == 0) {
-            failures.worthReporting()?.let { throw it }
-            // Not a single system on this machine can be driven: every one either names no agent or
-            // has a shell this app does not write for. Saying "did not answer" would send the user
-            // to look at the network.
-            machine.systems.firstOrNull { it.isConfigured && it.grammar == null }?.let { system ->
-                throw AgentFailure.BadRequest(
-                    "This app cannot write commands for ${system.name}.",
-                    describeRefusal(system.grammarRefusal ?: UNKNOWN_SHELL, null),
-                )
-            }
-        }
         throw failures.worthReporting() ?: AgentFailure.Unreachable(machine.name, routes.probeSummary())
+    }
+
+    /**
+     * Why not a single system on this machine is driven, by what would change it: an approval this
+     * device can give, a shell the setup names that no line can be written for, or a setup that gives
+     * it no command this device could run at all. The machine page says the same of each system.
+     * Saying "did not answer" would send the user to look at the network.
+     */
+    private fun notDriven(): AgentFailure.BadRequest {
+        val nothing = "Nothing on ${machine.name} is driven from this device."
+        machine.problem?.let { return AgentFailure.BadRequest("Nothing is sent to ${machine.name} until the setup is fixed.", it) }
+        if (machine.systems.any { it.awaitsApproval }) {
+            return AgentFailure.BadRequest(nothing, "Not driven from this device until its command is approved.")
+        }
+        for (system in machine.systems) {
+            val refusal = system.grammarRefusal ?: continue
+            return AgentFailure.BadRequest("This app cannot write commands for ${system.name}.", describeRefusal(refusal, null))
+        }
+        return AgentFailure.BadRequest(nothing, "The setup gives it no command this device can run.")
     }
 
     /**
@@ -874,12 +852,14 @@ class AgentClient(
     private fun commandLine(grammar: RemoteShell, argv: List<String>): String = try {
         buildRemoteCommand(grammar, argv)
     } catch (refusal: CommandLineRefusal) {
-        // Nothing was sent, and the fix is a field in the document.
-        throw AgentFailure.BadRequest(
-            "This app cannot write that command for the shell on the far side.",
-            refusal.message,
-        )
+        throw refusedLine(refusal)
     }
+
+    /** Nothing was sent, and the fix is a field in the document. */
+    private fun refusedLine(refusal: CommandLineRefusal) = AgentFailure.BadRequest(
+        "This app cannot write that command for the shell on the far side.",
+        refusal.message,
+    )
 
     /** The reply decoded, or null when it is a JSON object this build cannot read as [deserializer]. */
     private fun <T : Any> decode(outcome: CommandOutcome, deserializer: KSerializer<T>): T? {
@@ -1064,7 +1044,6 @@ class AgentClient(
         const val BOOT_TIMEOUT_MILLIS = 60_000L
         const val SLEEP_TIMEOUT_MILLIS = 60_000L
         const val RESTART_TIMEOUT_MILLIS = 240_000L
-        const val WAKE_PROXY_TIMEOUT_MILLIS = 90_000L
         const val SELF_UPDATE_TIMEOUT_MILLIS = 300_000L
 
         /** A configured action is somebody else's script, and the agent gives it its own timeout. */
@@ -1164,6 +1143,28 @@ internal data class OpEnvelope(
             replayed = replayed,
         )
     }
+}
+
+/**
+ * One `op ID` reply: the record, or [AgentFailure.NoSuchOperation] when the reply carries `op: null`.
+ *
+ * The null is read before `ok`, because it is the answer whatever the code beside it says: 3.1.0
+ * refuses with `not-configured` and 3.0.x with `bad-argument`, and both mean the machine never had
+ * the operation or has pruned it (contract section 4). Any other refusal is a read that failed.
+ */
+internal fun readOperation(operationId: String, reply: JsonObject): OpRecord {
+    if (reply["op"] is JsonNull) {
+        throw AgentFailure.NoSuchOperation(
+            operationId,
+            (reply["message"] as? JsonPrimitive)?.contentOrNull ?: "there is no operation $operationId on this machine",
+        )
+    }
+    val envelope = try {
+        AgentJson.decodeFromJsonElement(OpEnvelope.serializer(), reply)
+    } catch (failure: Exception) {
+        throw AgentFailure.BadOutput("The operation read could not be decoded.", failure, DispatchStage.ACKNOWLEDGED)
+    }
+    return envelope.record()
 }
 
 /** Refused reads cannot establish a route, capabilities, system identity or operation state. */

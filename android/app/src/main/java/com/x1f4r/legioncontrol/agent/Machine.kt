@@ -1,6 +1,5 @@
 package com.x1f4r.legioncontrol.agent
 
-import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.MachineConfig
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.RouteKind
@@ -24,7 +23,8 @@ enum class Platform(val wire: String) {
  *
  * [id] is the whole of the contract with the far side: it is what the agent's own `system.id`
  * reports, what a boot target is named by, and what the interpreter path is chosen with. [agent] is
- * the argv run over ssh, straight out of the configuration and never assembled here.
+ * the argv run over ssh, as the launch gate left it and never assembled here: the command this
+ * device approved, which is not always the one the shared document names.
  */
 data class MachineSystem(
     val id: String,
@@ -32,14 +32,17 @@ data class MachineSystem(
     val platform: Platform,
     val agent: List<String>,
     /**
-     * The grammar this system's command line is written in, as contract section 15.1 gives it from
-     * the document's `platform`, `shell` and `restricted`, or null when it has none.
+     * The grammar this system's command line is written in: the one recorded with the tuple this
+     * device approved (contract section 9.9), or null when it runs nothing.
      *
-     * Computed once, here, and never derived anywhere else. A route whose last status reported a
-     * restricted session can only ever move it to [RemoteShell.DISPATCH] at run time.
+     * Decided once, by the launch gate, and never derived anywhere else. A route whose last status
+     * reported a restricted session can only ever move it to [RemoteShell.DISPATCH] at run time.
      */
     val grammar: RemoteShell? = RemoteShell.POSIX,
-    /** Why [grammar] is null: `unknown-shell` or `restricted-agent-shape`. */
+    /**
+     * Why no line can be written for the command the setup offers here, `unknown-shell` or
+     * `restricted-agent-shape`, when that is why it is not driven.
+     */
     val grammarRefusal: String? = null,
     /**
      * Whether this device approved the command it runs here (contract section 9.9).
@@ -50,6 +53,11 @@ data class MachineSystem(
      * words rather than by the empty argv alone.
      */
     val launchState: LaunchState = LaunchState.APPROVED,
+    /**
+     * Whether the command the setup offers here waits for an approval this device can give: for a
+     * system that is not driven, the one thing that would make it driven.
+     */
+    val awaitsApproval: Boolean = false,
 ) {
     /**
      * A system the agent named that the configuration does not have. It can still be reported and
@@ -58,11 +66,10 @@ data class MachineSystem(
     val isConfigured: Boolean get() = agent.isNotEmpty()
 
     /**
-     * Whether commands are sent to this system at all: it names an agent, and its document gives
-     * that agent a grammar. A system whose `shell` is not one the contract knows is kept and shown,
-     * and never driven.
+     * Whether commands are sent to this system at all: it has an approved command and a grammar to
+     * write it in. Anything else is kept and shown, and never driven.
      */
-    val isDriven: Boolean get() = isConfigured && grammar != null
+    val isDriven: Boolean get() = isConfigured && grammar != null && launchState != LaunchState.NOT_DRIVEN
 }
 
 /** Where a system's command stands with this device's approvals (contract section 9.9). */
@@ -77,14 +84,20 @@ enum class LaunchState {
     NOT_DRIVEN,
 }
 
-/** Everything a magic packet needs, and how to tell when the machine is back. */
+/**
+ * Everything a magic packet needs, as the document says it.
+ *
+ * Kept as written, and decided only by the wake plan (contract section 10.2): which broadcast
+ * entries are addresses, which ports are ports, and what to send to when there are none. Whether the
+ * machine is back is an authenticated status poll, never a probe of a port.
+ */
 data class WakeTarget(
     val mac: String,
+    /** `wake.broadcast` as written. Only the dotted IPv4 entries are ever sent to. */
     val broadcasts: List<String>,
+    /** `wake.ports` as written. Only 1 to 65535 count; with none of those, 9 and 7. */
     val ports: List<Int>,
-    val probeHost: String,
-    val probePort: Int,
-    /** The phone counts as at home when one of its addresses starts with this. */
+    /** The deprecated `wake.lanPrefix`, which places the machine only when it names no site. */
     val lanPrefix: String?,
     /** The site this machine's network is, when the document names sites. */
     val siteId: String?,
@@ -124,6 +137,11 @@ data class Machine(
     val siteId: String? = null,
     /** A hint that this machine is always powered. Changes what a warning says, nothing else. */
     val alwaysOn: Boolean = false,
+    /**
+     * Why nothing is dialled or run on this machine: the first error of contract section 9.7 inside
+     * it, in the document in force. Null on every machine of a document without errors.
+     */
+    val problem: String? = null,
 ) {
     fun system(id: String?): MachineSystem? = systems.firstOrNull { it.id == id }
 
@@ -133,27 +151,33 @@ data class Machine(
     val addresses: List<String> get() = endpoints.map { it.address }
 }
 
-/** The machines the configuration describes, in the order it lists them. */
-fun ControllerConfig.toMachines(): List<Machine> = machines.map { it.toMachine() }
+/**
+ * The machines of the gate's configuration, in the order the document lists them.
+ *
+ * Only the gate's configuration is ever turned into machines. The systems take their command and
+ * grammar from what the gate wrote into them, and a system it did not decide on, which is every
+ * system of a configuration read straight from a document, runs nothing.
+ */
+fun LaunchGate.Effective.toMachines(): List<Machine> = config?.machines.orEmpty().map { it.toMachine() }
 
-private fun MachineConfig.toMachine(): Machine {
+/**
+ * One machine of a configuration. Its systems run only what the gate wrote into them, so one read
+ * straight from a document runs nothing; its wake block is the document's.
+ */
+internal fun MachineConfig.toMachine(): Machine {
     val systems = systems.map { system ->
-        // The document's own strings, compared exactly. Platform.fromWire forgives a capital letter
-        // for the sake of a glyph; the grammar does not, or two clients would quote differently.
-        val choice = grammarFor(
-            platform = system.platform,
-            shell = system.shell,
-            restricted = system.restricted,
-            restrictedSession = false,
-            agentLength = system.agent.size,
-        )
+        val driven = system.launchState != LaunchState.NOT_DRIVEN && system.grammar != null
         MachineSystem(
             id = system.id,
             name = system.name?.takeIf { it.isNotBlank() } ?: system.id,
+            // Platform.fromWire forgives a capital letter for the sake of a glyph. Nothing that
+            // decides how a line is quoted reads it: that is the gate's grammar.
             platform = Platform.fromWire(system.platform),
-            agent = system.agent,
-            grammar = choice.grammar,
-            grammarRefusal = choice.refusal,
+            agent = if (driven) system.agent else emptyList(),
+            grammar = system.grammar.takeIf { driven },
+            grammarRefusal = system.grammarRefusal.takeUnless { driven },
+            launchState = if (driven) system.launchState else LaunchState.NOT_DRIVEN,
+            awaitsApproval = system.awaitsApproval,
         )
     }
     val endpoints = endpoints.map { endpoint ->
@@ -168,11 +192,6 @@ private fun MachineConfig.toMachine(): Machine {
             label = endpoint.label?.takeIf { it.isNotBlank() } ?: endpoint.host,
         )
     }
-    // The address the wake waits on. The config's own probe if it named one, otherwise the LAN
-    // address the packet is going to reach the machine on anyway: a machine that has just come out
-    // of sleep answers sshd well before a tunnel has re-registered, so waiting on a remote address
-    // would report a failure for a machine that is already up.
-    val fallbackProbe = endpoints.firstOrNull { it.kind == RouteKind.LAN } ?: endpoints.firstOrNull()
     return Machine(
         id = id,
         name = name?.takeIf { it.isNotBlank() } ?: id,
@@ -180,16 +199,13 @@ private fun MachineConfig.toMachine(): Machine {
         systems = systems,
         siteId = site?.takeIf { it.isNotBlank() },
         alwaysOn = alwaysOn,
+        problem = problem,
         wake = wake?.let { wake ->
             WakeTarget(
                 mac = wake.mac,
-                broadcasts = wake.broadcast.filter { it.isNotBlank() },
-                ports = wake.ports.filter { it in 1..65535 }.ifEmpty { listOf(9, 7) },
-                probeHost = wake.probe?.host?.takeIf { it.isNotBlank() }
-                    ?: fallbackProbe?.host.orEmpty(),
-                probePort = wake.probe?.port?.takeIf { it in 1..65535 }
-                    ?: fallbackProbe?.port ?: 22,
-                lanPrefix = wake.lanPrefix?.takeIf { it.isNotBlank() },
+                broadcasts = wake.broadcast,
+                ports = wake.ports,
+                lanPrefix = wake.lanPrefix,
                 siteId = site?.takeIf { it.isNotBlank() },
                 helpers = wake.effectiveHelpers.mapNotNull { helper ->
                     val machineId = helper.machine.takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -224,5 +240,7 @@ fun Machine.resolveSystem(reportedId: String?, reportedName: String?, platformNa
         name = reportedName?.takeIf { it.isNotBlank() } ?: id,
         platform = Platform.fromWire(platformName),
         agent = emptyList(),
+        grammar = null,
+        launchState = LaunchState.NOT_DRIVEN,
     )
 }

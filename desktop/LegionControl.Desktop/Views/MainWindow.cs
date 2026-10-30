@@ -13,11 +13,16 @@ namespace LegionControl.Desktop.Views;
 /// The window.
 ///
 /// A native machine list keeps fleet navigation separate from the selected machine's controls.
-/// Polling refreshes the reading while retaining machine selection and disclosure choices.
+/// Polling refreshes the reading while retaining machine selection and disclosure choices, and
+/// every control that is still there: each change builds the page afresh into [_content], and
+/// [LiveTree] lays that over [_shown], so focus and a screen reader's place survive a poll.
 public sealed class MainWindow : Window
 {
     private readonly AppModel _app;
-    private readonly StackPanel _content = Ui.Column(0);
+    /// The page as this rebuild draws it, before it is laid over [_shown].
+    private StackPanel _content = Ui.Column(0);
+    /// The page in the window.
+    private readonly StackPanel _shown = Ui.Column(0);
     private readonly ListBox _machineList = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly FleetSelection _selection = new();
     private string[] _machineIds = Array.Empty<string>();
@@ -25,10 +30,12 @@ public sealed class MainWindow : Window
     private bool _updatingNavigation;
     private string _page = "machine";
     private bool _rebuildQueued;
+    private bool _closed;
     private readonly StackPanel _updateNotice = Ui.Column(0);
     private readonly CancellationTokenSource _updateLifetime = new();
     private readonly DispatcherTimer _updateTimer = new() { Interval = AppUpdateSuggestions.PeriodicInterval };
     private bool _reviewingUpdate;
+    private LaunchReviewSheet? _launchReview;
     private readonly Grid _panes = new();
     private readonly Border _navigation = new();
     private readonly ComboBox _devicePicker = new() { MinWidth = 120, MaxWidth = 220, HorizontalAlignment = HorizontalAlignment.Stretch };
@@ -47,7 +54,7 @@ public sealed class MainWindow : Window
         FontFamily = Ui.NativeFont;
         if (Application.Current is { } application) application.Resources["NativeFontFamily"] = Ui.NativeFont;
 
-        _content.Margin = new Thickness(16, 8, 16, 16);
+        _shown.Margin = new Thickness(16, 8, 16, 16);
         var root = new DockPanel();
         var toolbar = new Grid { ColumnDefinitions = new ColumnDefinitions("auto,*,auto"), Margin = new Thickness(12, 8, 12, 0) };
         var devices = Ui.Action("Devices", () =>
@@ -64,8 +71,11 @@ public sealed class MainWindow : Window
             Ui.MenuAction("Site details", () => Sheets.Text(this, "Site", _app.Presence.Sentence)),
             Ui.MenuAction("Check for app updates", CheckForUpdate),
             Ui.MenuAction("About", () => Sheets.Text(this, "Legion Control", $"Version {AgentContract.ClientVersion}")),
+            // Closing the window only hides it while there is a tray to bring it back from, so the
+            // window says how to end the app as well.
+            Ui.MenuAction("Quit", Quit),
         }, "Application menu");
-        var toolbarActions = Ui.Actions(Ui.Action("Refresh", () => { _ = _app.RefreshAllAsync(); }), appMenu);
+        var toolbarActions = Ui.Actions(Ui.Action("Refresh", () => Run("Refreshing", () => _app.RefreshAllAsync())), appMenu);
         toolbarActions.Margin = new Thickness(8, 0, 0, 0);
         Grid.SetColumn(toolbarActions, 2); toolbar.Children.Add(toolbarActions);
         DockPanel.SetDock(toolbar, Dock.Top); root.Children.Add(toolbar);
@@ -75,10 +85,14 @@ public sealed class MainWindow : Window
         var heading = Ui.SectionHeading("Devices"); heading.Margin = new Thickness(8, 8, 0, 8);
         DockPanel.SetDock(heading, Dock.Top); navigationContent.Children.Add(heading);
         navigationContent.Children.Add(_machineList);
+        // Neither has text of its own to be read out: the list sits under a heading, and the
+        // picker that stands in for it in a narrow window has none at all.
+        Avalonia.Automation.AutomationProperties.SetName(_machineList, "Devices");
+        Avalonia.Automation.AutomationProperties.SetName(_devicePicker, "Device");
         _navigation.Child = navigationContent; _navigation.BorderBrush = Ui.Hairline;
         _navigation.BorderThickness = new Thickness(0, 0, 1, 0);
         _panes.Children.Add(_navigation);
-        var scroll = new ScrollViewer { Content = _content, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+        var scroll = new ScrollViewer { Content = _shown, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
         Grid.SetColumn(scroll, 1); _panes.Children.Add(scroll);
         root.Children.Add(_panes);
         _devicePicker.SelectionChanged += (_, _) =>
@@ -100,9 +114,12 @@ public sealed class MainWindow : Window
         Content = root;
 
         _app.Changed += QueueRebuild;
+        PropertyChanged += (_, change) =>
+        {
+            if (change.Property == IsVisibleProperty || change.Property == WindowStateProperty) FollowVisibility();
+        };
         Opened += (_, _) =>
         {
-            _app.StartPolling();
             SuggestAppUpdate();
             _updateTimer.Start();
             Rebuild();
@@ -111,11 +128,33 @@ public sealed class MainWindow : Window
         _updateTimer.Tick += (_, _) => { if (IsActive) SuggestAppUpdate(); };
         Closed += (_, _) =>
         {
+            _closed = true;
             _updateTimer.Stop();
             _updateLifetime.Cancel();
             _app.Changed -= QueueRebuild;
             _app.StopPolling();
         };
+    }
+
+    /// Whether a close is a person closing the window, which hides it in the tray. Closing for the
+    /// app or the session shutting down, and a close this app asked for, really close it.
+    public static bool HidesInsteadOfClosing(WindowCloseReason reason, bool isProgrammatic) =>
+        reason == WindowCloseReason.WindowClosing && !isProgrammatic;
+
+    /// Polls only while somebody can see the window: never while it is hidden in the tray or
+    /// minimised. Shown again, it reads every machine at once.
+    private void FollowVisibility()
+    {
+        if (_closed) return;
+        if (IsVisible && WindowState != WindowState.Minimized) _app.StartPolling();
+        else _app.PausePolling();
+    }
+
+    private void Quit()
+    {
+        if (Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime lifetime)
+            lifetime.Shutdown();
+        else Close();
     }
 
     private void QueueRebuild()
@@ -131,27 +170,48 @@ public sealed class MainWindow : Window
 
     private void Rebuild()
     {
-        _updateNotice.Children.Clear();
+        var notice = Ui.Column(0);
         if (_app.AppUpdate is UpdateAvailability.Ready ready)
-            _updateNotice.Children.Add(Ui.Actions(
+            notice.Children.Add(Ui.Keyed(Ui.Actions(
                 Ui.Note($"Legion Control {ready.Manifest.Version} available"),
-                Ui.Action("Review update", () => ReviewAvailableUpdate(ready))));
+                Ui.Action("Review update", () => ReviewAvailableUpdate(ready))), "app-update"));
+        LiveTree.Update(_updateNotice, notice);
         var showNavigation = CompactPresentation.ShowNavigation(Bounds.Width, _navigationExpanded);
         _navigation.IsVisible = showNavigation;
         _panes.ColumnDefinitions = new ColumnDefinitions(showNavigation ? $"{CompactPresentation.NavigationWidth},*" : "0,*");
         _devicePicker.IsVisible = !showNavigation;
         UpdateNavigation();
-        _content.Children.Clear();
+        _content = Ui.Column(0);
         BuildHeader();
         if (_page == "setup")
         {
             BuildSetup();
-            _content.Children.Add(Ui.Actions(Ui.Action("Edit the setup", () => new SetupEditor(_app).Show(this))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Edit the setup", () => new SetupEditor(_app).Show(this))), "setup:edit"));
         }
         else if (_page == "device") BuildDiagnostics();
         else if (_selection.SelectedId is { } id && _app.Machine(id) is { } selected) BuildMachine(selected);
         else BuildEmpty();
+        LiveTree.Update(_shown, _content);
+        // Commands nobody here approved open their review once per revision. Not now keeps it
+        // shut for that revision; the notice above stays.
+        if (IsVisible && _launchReview is null && _app.LaunchReview.Count > 0 && !_app.IsLaunchReviewDeferred) OpenLaunchReview();
+    }
 
+    private void OpenLaunchReview()
+    {
+        if (_launchReview is { } open)
+        {
+            open.Activate();
+            return;
+        }
+        var sheet = new LaunchReviewSheet(_app);
+        sheet.Closed += (_, _) =>
+        {
+            _launchReview = null;
+            if (_app.LaunchReview.Count > 0) _app.DeferLaunchReview();
+        };
+        _launchReview = sheet;
+        sheet.Show(this);
     }
 
     private void UpdateNavigation()
@@ -177,30 +237,36 @@ public sealed class MainWindow : Window
     private void BuildHeader()
     {
         if (_app.Config.Problem is { } problem)
-            _content.Children.Add(Ui.Actions(Ui.Note("Setup needs attention", Ui.Bad),
-                Ui.Action("Details", () => Sheets.Text(this, "Setup", problem))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Note("Setup needs attention", Ui.Bad),
+                Ui.Action("Details", () => Sheets.Text(this, "Setup", problem))), "notice:setup"));
+        if (_app.Approvals.Problem is { } launchProblem)
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Note("Approved commands need attention", Ui.Bad),
+                Ui.Action("Details", () => Sheets.Text(this, "Approved commands", launchProblem))), "notice:approvals"));
         if (_app.Config.Warnings.Count > 0)
-            _content.Children.Add(Ui.Actions(Ui.Action("Setup warnings", () => Sheets.Text(this, "Setup", string.Join("\n", _app.Config.Warnings)))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Setup warnings", () => Sheets.Text(this, "Setup", string.Join("\n", _app.Config.Warnings)))), "notice:warnings"));
         var unresolved = _app.Reconciler.Outcomes.Count(entry => entry.Value is ReconcileOutcome.NeedsDecision);
         if (unresolved > 0 && _page != "setup")
-            _content.Children.Add(Ui.Actions(Ui.Note("Setup changes need review", Ui.Unknown),
-                Ui.Action("Review", () => { _page = "setup"; Rebuild(); })));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Note("Setup changes need review", Ui.Unknown),
+                Ui.Action("Review", () => { _page = "setup"; Rebuild(); })), "notice:setup-changes"));
+        if (_app.LaunchReview.Count > 0 && _page != "setup")
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Note("Commands from the shared setup need approval", Ui.Unknown),
+                Ui.Action("Review", OpenLaunchReview)), "notice:commands"));
     }
 
     private void BuildEmpty()
     {
-        _content.Children.Add(Ui.Rule());
-        _content.Children.Add(Ui.SectionHeading("Nothing configured"));
-        _content.Children.Add(Ui.Note(
+        _content.Children.Add(Ui.Keyed(Ui.Rule(), "empty:rule"));
+        _content.Children.Add(Ui.Keyed(Ui.SectionHeading("Nothing configured"), "empty:heading"));
+        _content.Children.Add(Ui.Keyed(Ui.Note(
             _app.Config.IsMissing
                 ? $"There is no setup document at {_app.Config.Path}. One example machine can be written there to start from, or a document can be fetched from a machine that already has one."
-                : "The setup document lists no machines."));
-        _content.Children.Add(Ui.Actions(
+                : "The setup document lists no machines."), "empty:note"));
+        _content.Children.Add(Ui.Keyed(Ui.Actions(
             Ui.Action("Write an example there", () =>
             {
                 var problem = _app.Config.WriteExample();
                 if (problem is not null) Sheets.Text(this, "Could not write it", problem);
-            }, _app.Config.IsMissing)));
+            }, _app.Config.IsMissing, _app.Config.IsMissing ? null : "There is a setup document there already.")), "empty:actions"));
     }
 
     private void BuildMachine(MachineModel machine)
@@ -217,17 +283,46 @@ public sealed class MainWindow : Window
             : machine.Status is { } status ? (status.SystemName ?? status.SystemId ?? "Online") + (machine.IsSelf ? " · This device" : "")
             : "Not checked yet";
         identity.Children.Add(Ui.Note(state, machine.Failure is null ? null : Ui.Unknown));
+        foreach (var line in LaunchLines(machine)) identity.Children.Add(Ui.Note(line, Ui.Unknown));
+        if (HoldLine(machine) is { } hold) identity.Children.Add(Ui.Note(hold, Ui.Unknown));
         heading.Children.Add(identity);
         var controls = BuildMachineActions(machine);
         if (ContentWidth < 650) { Grid.SetRow(controls, 1); Grid.SetColumnSpan(controls, 2); }
         else Grid.SetColumn(controls, 1);
-        heading.Children.Add(controls); _content.Children.Add(heading);
+        heading.Children.Add(controls); _content.Children.Add(Ui.Keyed(heading, $"machine:{machine.Id}"));
         if (machine.Failure?.Kind is FailureKind.HostKeyUnknown or FailureKind.HostKeyChanged)
-            _content.Children.Add(Ui.Actions(Ui.Action("Review host key", () => TrustAsync(machine))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Review host key", () => TrustAsync(machine))), $"machine:{machine.Id}:host-key"));
         else if (machine.Failure is not null || machine.Status?.Config?.BlocksMutations == true)
-            _content.Children.Add(Ui.Actions(Ui.Action("Details", () => ShowMachineDetails(machine))));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Details", () => ShowMachineDetails(machine))), $"machine:{machine.Id}:details"));
         BuildOperations(machine);
         BuildServices(machine);
+    }
+
+    /// The wake holds for this machine, in one line, while there are any.
+    private string? HoldLine(MachineModel machine)
+    {
+        var held = _app.Tracker.WakeHoldsFor(machine.Id)
+            .Select(hold => $"{_app.Machine(hold.MachineId)?.Name ?? hold.MachineId}'s {hold.Intent.ActionId}")
+            .Distinct().ToList();
+        return held.Count == 0 ? null
+            : $"Waking held: {string.Join(", ", held)} may still be running, so other helpers' commands wait until it is known how it ended.";
+    }
+
+    /// What this device runs on each system whose command is not simply the one the setup offers.
+    private IEnumerable<string> LaunchLines(MachineModel machine)
+    {
+        var systems = machine.Machine.Systems;
+        foreach (var system in systems)
+        {
+            var waiting = _app.LaunchReview.Any(entry => entry.Path == LaunchValues.SystemPath(machine.Id, system.Id));
+            var line = system.LaunchState switch
+            {
+                LaunchState.ApprovedWithChangeWaiting => "Runs the approved command. A changed one is waiting for approval.",
+                LaunchState.NotDriven when waiting => "Not driven from this device until its command is approved.",
+                _ => null,
+            };
+            if (line is not null) yield return systems.Count > 1 ? $"{system.Name}: {line}" : line;
+        }
     }
 
     private void ShowMachineDetails(MachineModel machine)
@@ -288,8 +383,9 @@ public sealed class MainWindow : Window
                 section.Children.Add(Ui.DetailRow(reading.Name, reading.Value is { } value ? $"{value:g} {reading.Unit}".Trim() : "unavailable"));
                 if (reading.Error is { } error) section.Children.Add(Ui.Actions(Ui.Action("Details", () => Sheets.Text(this, reading.Name, error))));
             }
-            section.Children.Add(Ui.Actions(Ui.Action(_app.Settings.KeepMetricsHistory ? "Stop keeping telemetry history" : "Keep telemetry history",
-                () => _app.UpdateSettings(_app.Settings with { KeepMetricsHistory = !_app.Settings.KeepMetricsHistory }))));
+            var keep = !_app.Settings.KeepMetricsHistory;
+            section.Children.Add(Ui.Actions(Ui.Action(keep ? "Keep telemetry history" : "Stop keeping telemetry history",
+                () => _app.UpdateSettings(settings => settings with { KeepMetricsHistory = keep }))));
             if (_app.Settings.KeepMetricsHistory)
                 section.Children.Add(Ui.Actions(Ui.Action("Telemetry history", () => Sheets.Text(this, "Telemetry history",
                     string.Join("\n", machine.Metrics.Readings.SelectMany(snapshot => snapshot.Reading.Readings.Select(reading =>
@@ -307,7 +403,7 @@ public sealed class MainWindow : Window
             var labels = new Grid { ColumnDefinitions = new ColumnDefinitions("*,140,190,140"), Margin = new Thickness(0, 4, 0, 6) };
             foreach (var pair in new[] { (0, "Service"), (1, "State"), (2, "Version") })
             { var text = Ui.Note(pair.Item2); Grid.SetColumn(text, pair.Item1); labels.Children.Add(text); }
-            _content.Children.Add(labels);
+            _content.Children.Add(Ui.Keyed(labels, $"machine:{machine.Id}:service-columns"));
         }
         foreach (var service in status.Services)
         {
@@ -328,10 +424,10 @@ public sealed class MainWindow : Window
             if (service.CanUpdate != false)
             {
                 items.Add(Ui.MenuAction("Update", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id })));
-                items.Add(Ui.MenuAction("Update when idle", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id, WhenIdle = true, Expires = "4h" }), machine.Capabilities.SupportsQueueUntilIdle));
-                items.Add(Ui.MenuAction("Schedule", () => EditPolicy(machine, service.Id), machine.Capabilities.SupportsPolicy));
-                items.Add(Ui.MenuAction("Pause a day", () => Policy(machine, service.Id, PolicyPatch.PauseFor(TimeSpan.FromDays(1))), machine.Capabilities.SupportsPolicy));
-                items.Add(Ui.MenuAction("Resume", () => Policy(machine, service.Id, PolicyPatch.Resume()), machine.Capabilities.SupportsPolicy));
+                items.Add(Ui.MenuAction("Update when idle", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id, WhenIdle = true, Expires = "4h" }), machine.Capabilities.SupportsQueueUntilIdle, machine.Capabilities.UnsupportedReason));
+                items.Add(Ui.MenuAction("Schedule", () => EditPolicy(machine, service.Id), machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason));
+                items.Add(Ui.MenuAction("Pause a day", () => Policy(machine, service.Id, PolicyPatch.PauseFor(TimeSpan.FromDays(1))), machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason));
+                items.Add(Ui.MenuAction("Resume", () => Policy(machine, service.Id, PolicyPatch.Resume()), machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason));
             }
             if (service.CanRestart == true || service.CanUpdate != false)
                 items.Insert(1, Ui.MenuAction("Restart", () => Request(machine, new MachineRequest { Kind = RequestKind.Restart, Service = service.Id })));
@@ -339,7 +435,8 @@ public sealed class MainWindow : Window
                 CompactPresentation.HasUpdate(service) ? Ui.Action("Update", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id }), primary: true) : null,
                 Ui.MenuButton("⋯", items, service.DisplayName + " actions"));
             actions.Margin = new Thickness(0); Grid.SetColumn(actions, wide ? 3 : 1); row.Children.Add(actions);
-            _content.Children.Add(new Border { Child = row, BorderBrush = Ui.Hairline, BorderThickness = new Thickness(0, 1, 0, 0) });
+            _content.Children.Add(Ui.Keyed(new Border { Child = row, BorderBrush = Ui.Hairline, BorderThickness = new Thickness(0, 1, 0, 0) },
+                $"machine:{machine.Id}:service:{service.Id}"));
         }
     }
 
@@ -401,11 +498,12 @@ public sealed class MainWindow : Window
                     new MachineRequest { Kind = RequestKind.Update, Service = id, WhenIdle = true, Expires = "4h" }),
                 machine.Capabilities.SupportsQueueUntilIdle,
                 machine.Capabilities.SupportsQueueUntilIdle ? null : "This agent cannot hold a request until the machine is idle."),
-            Ui.Action("Edit schedule", () => EditPolicy(machine, id), machine.Capabilities.SupportsPolicy),
+            Ui.Action("Edit schedule", () => EditPolicy(machine, id), machine.Capabilities.SupportsPolicy,
+                machine.Capabilities.UnsupportedReason),
             Ui.Action("Pause a day", () => Policy(machine, id, PolicyPatch.PauseFor(TimeSpan.FromDays(1))),
-                machine.Capabilities.SupportsPolicy),
+                machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason),
             Ui.Action("Resume", () => Policy(machine, id, PolicyPatch.Resume()),
-                machine.Capabilities.SupportsPolicy)));
+                machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason)));
     }
     private void BuildOperations(MachineModel machine, StackPanel? destination = null, bool includeRecent = false)
     {
@@ -417,24 +515,28 @@ public sealed class MainWindow : Window
             if (id is not null && !seen.Add(id)) return;
             var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,auto"), Margin = new Thickness(0, 2, 0, 2) };
             row.Children.Add(Ui.Note(title + " · " + state));
+            const string noId = "The machine gave this no id to ask it about.";
             var actions = Ui.Actions(
-                queued ? Ui.Action("Cancel", () => Cancel(machine, id!), id is not null) : null,
-                Ui.Action("Details", () => OperationDetails(machine, id!), id is not null));
+                queued ? Ui.Action("Cancel", () => Cancel(machine, id!), id is not null, id is null ? noId : null) : null,
+                Ui.Action("Details", () => OperationDetails(machine, id!), id is not null, id is null ? noId : null));
             actions.Margin = new Thickness(8, 0, 0, 0); Grid.SetColumn(actions, 1); row.Children.Add(actions);
-            rows.Children.Add(row);
+            rows.Children.Add(Ui.Keyed(row, $"operation:{id ?? title}"));
         }
         foreach (var operation in machine.Status?.Operations.Running ?? Array.Empty<OperationSummary>())
             Add(operation.Id, operation.Describe(), operation.Phase ?? "In progress", false);
         foreach (var operation in machine.Status?.Operations.Queued ?? Array.Empty<OperationSummary>())
             Add(operation.Id, operation.Describe(), "Waiting until idle", true);
-        foreach (var operation in machine.Operations.Where(operation => operation.Outcome is OperationOutcome.Pending or OperationOutcome.Queued or OperationOutcome.Unresolved))
-            Add(operation.Id, operation.Intent.Describe(), operation.OutcomeUnknown ? "Outcome unknown" : operation.Outcome.ToString(), operation.Outcome == OperationOutcome.Queued);
-        if (rows.Children.Count > 0) target.Children.Add(rows);
+        foreach (var operation in machine.Operations.Where(operation => !operation.IsResolved))
+            Add(operation.Id, operation.Intent.Describe(),
+                operation.OutcomeUnknown || operation.Outcome == OperationOutcome.Unknown ? "Outcome unknown"
+                    : operation.State == OperationState.Queued ? "Waiting until idle" : "In progress",
+                operation.State == OperationState.Queued);
+        if (rows.Children.Count > 0) target.Children.Add(Ui.Keyed(rows, $"machine:{machine.Id}:operations"));
         if (!includeRecent) return;
         target.Children.Add(Ui.SectionHeading("Recent changes"));
         rows = Ui.Column(2);
-        foreach (var operation in machine.Operations.Where(operation => operation.Outcome is not (OperationOutcome.Pending or OperationOutcome.Queued or OperationOutcome.Unresolved)).Take(20))
-            Add(operation.Id, operation.Intent.Describe(), operation.Message ?? operation.Outcome.ToString(), false);
+        foreach (var operation in machine.Operations.Where(operation => operation.IsResolved).Take(20))
+            Add(operation.Id, operation.Intent.Describe(), operation.Message ?? operation.Outcome.Wire(), false);
         foreach (var operation in machine.Status?.Operations.Recent ?? Array.Empty<OperationSummary>())
             Add(operation.Id, operation.Describe(), operation.Message ?? operation.OutcomeText, false);
         if (!target.Children.Contains(rows)) target.Children.Add(rows);
@@ -444,7 +546,8 @@ public sealed class MainWindow : Window
     {
         var section = Ui.Column(2);
         BuildOperations(machine, section, includeRecent: true);
-        section.Children.Add(Ui.Actions(Ui.Action("Operation history", () => History(machine), machine.Capabilities.SupportsHistory)));
+        section.Children.Add(Ui.Actions(Ui.Action("Operation history", () => History(machine), machine.Capabilities.SupportsHistory,
+            machine.Capabilities.UnsupportedReason)));
         Ui.ShowDetails(this, machine.Name + " activity", section);
     }
 
@@ -453,14 +556,16 @@ public sealed class MainWindow : Window
         var status = machine.Status;
         var live = status is not null && machine.Failure is null;
         var boot = (status?.BootTargets ?? Array.Empty<BootTarget>()).Select(target => Ui.MenuAction("Boot into " + target.DisplayName,
-            () => Request(machine, new MachineRequest { Kind = RequestKind.Boot, Target = target.Id }), live && target.Id is not null)).ToArray();
+            () => Request(machine, new MachineRequest { Kind = RequestKind.Boot, Target = target.Id }), live && target.Id is not null,
+            !live ? "Waits for the machine to answer." : target.Id is null ? "The machine gave this system no id to boot it by." : null)).ToArray();
         var items = new List<MenuItem>
         {
             Ui.MenuAction("Device details", () => ShowMachineDetails(machine)),
             Ui.MenuAction("Activity", () => ShowActivity(machine)),
         };
         var configuredActions = (status?.Actions ?? Array.Empty<AgentAction>()).Select(action => Ui.MenuAction(action.DisplayName,
-            () => Request(machine, new MachineRequest { Kind = RequestKind.Run, ActionId = action.Id }), action.Id is not null)).ToList();
+            () => Request(machine, new MachineRequest { Kind = RequestKind.Run, ActionId = action.Id }), action.Id is not null,
+            action.Id is null ? "The machine gave this action no id to run it by." : null)).ToList();
         if (machine.Capabilities.SupportsCycle)
             configuredActions.Add(Ui.MenuAction("Run the cycle", () => Request(machine, new MachineRequest { Kind = RequestKind.Cycle })));
         if (configuredActions.Count > 0) items.Add(new MenuItem { Header = "Actions", ItemsSource = configuredActions });
@@ -473,22 +578,39 @@ public sealed class MainWindow : Window
             foreach (var helperId in plan.OfferToWakeFirst)
                 if (_app.Machine(helperId) is { } helper)
                     wake.Add(Ui.MenuAction("Wake " + helper.Name + " first", () => Wake(helper)));
+            // Only a person lifts a hold: the command held may still be running on its helper. With
+            // another helper to ask, the way past is asking it. With none, it is running the held
+            // command again, after a question that says it may then run twice.
+            if (plan.IsHeld && _app.PlanOtherHelpers(machine) is not null)
+                wake.Add(Ui.MenuAction("Try the other helpers", () => TryOtherHelpers(machine)));
+            else if (plan.IsHeld && _app.PlanRunAgain(machine) is { } again)
+                wake.Add(Ui.MenuAction(WakePlanner.RunAgainLabel(again), () => RunHeldAgain(machine, again)));
             wake.Add(Ui.MenuAction("Wake details", () => Sheets.Text(this, "Wake", plan.Sentence(machine.Name) + "\n" + string.Join("\n", plan.Obstacles))));
             items.Add(new MenuItem { Header = "Wake options", ItemsSource = wake });
         }
         var restricted = status?.Agent?.RestrictedSession == true || machine.Machine.Systems.All(system => system.Restricted);
         items.Add(Ui.MenuAction("Service setup", () => EditServices(machine), machine.Capabilities.SpeaksV3 && !restricted,
-            restricted ? "Requires an administrator SSH key" : null));
-        items.Add(Ui.MenuAction("Machine schedule", () => EditPolicy(machine, null), machine.Capabilities.SupportsPolicy));
+            restricted ? "Requires an administrator SSH key" : machine.Capabilities.UnsupportedReason));
+        items.Add(Ui.MenuAction("Machine schedule", () => EditPolicy(machine, null), machine.Capabilities.SupportsPolicy,
+            machine.Capabilities.UnsupportedReason));
         var (bundle, bundleProblem) = AgentBundle.Load();
         if (status is not null && (bundle is null || status.AgentVersion != bundle.Version))
-            items.Add(Ui.MenuAction("Install agent " + (bundle?.Version ?? AgentContract.BundledAgentVersion), () => InstallAgent(machine), bundle is not null, bundleProblem));
+        {
+            // A bundle older than the agent, or below its version floor, is never offered as an
+            // install. Going back is offered only to an agent that can be told so, and only through
+            // a confirmation that says what it does.
+            var goesBack = bundle is null ? null : AgentInstaller.GoesBack(bundle.Version, machine.Capabilities);
+            if (goesBack is null)
+                items.Add(Ui.MenuAction("Install agent " + (bundle?.Version ?? AgentContract.BundledAgentVersion), () => InstallAgent(machine), bundle is not null, bundleProblem));
+            else if (machine.Capabilities.SupportsAllowDowngrade)
+                items.Add(Ui.MenuAction("Go back to agent " + bundle!.Version + "…", () => GoBackToAgent(machine, bundle.Version, goesBack)));
+        }
         items.Add(new MenuItem { Header = "Diagnostics", ItemsSource = new[]
         {
-            Ui.MenuAction("Check agent", () => Doctor(machine), machine.Capabilities.SupportsDoctor),
-            Ui.MenuAction("Deep diagnostics", () => Doctor(machine, true), machine.Capabilities.SupportsDoctor),
-            Ui.MenuAction("Recent log", () => Logs(machine), machine.Capabilities.SupportsLogs),
-            Ui.MenuAction("Export diagnostics", () => Bundle(machine), machine.Capabilities.SupportsBundle),
+            Ui.MenuAction("Check agent", () => Doctor(machine), machine.Capabilities.SupportsDoctor, machine.Capabilities.UnsupportedReason),
+            Ui.MenuAction("Deep diagnostics", () => Doctor(machine, true), machine.Capabilities.SupportsDoctor, machine.Capabilities.UnsupportedReason),
+            Ui.MenuAction("Recent log", () => Logs(machine), machine.Capabilities.SupportsLogs, machine.Capabilities.UnsupportedReason),
+            Ui.MenuAction("Export diagnostics", () => Bundle(machine), machine.Capabilities.SupportsBundle, machine.Capabilities.UnsupportedReason),
         }});
         return Ui.Actions(
             live ? Ui.Action("Sleep", () => Request(machine, new MachineRequest { Kind = RequestKind.Sleep }))
@@ -512,9 +634,16 @@ public sealed class MainWindow : Window
 
     private void BuildSetup()
     {
-        _content.Children.Add(Ui.Rule());
-        _content.Children.Add(Ui.SectionHeading("The setup"));
-        _content.Children.Add(Ui.Actions(Ui.Action("Setup details", SetupDetails)));
+        _content.Children.Add(Ui.Keyed(Ui.Rule(), "setup:rule"));
+        _content.Children.Add(Ui.Keyed(Ui.SectionHeading("The setup"), "setup:heading"));
+        _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Setup details", SetupDetails)), "setup:details"));
+        if (_app.LaunchReview.Count > 0)
+        {
+            _content.Children.Add(Ui.Keyed(Ui.DetailRow("Commands",
+                _app.LaunchReview.Count == 1 ? "1 waits for approval on this device" : $"{_app.LaunchReview.Count} wait for approval on this device",
+                Ui.Unknown), "setup:commands"));
+            _content.Children.Add(Ui.Keyed(Ui.Actions(Ui.Action("Review commands", OpenLaunchReview)), "setup:review-commands"));
+        }
         foreach (var machine in _app.Machines)
         {
             if (!_app.Reconciler.Outcomes.TryGetValue(machine.Id, out var outcome)) continue;
@@ -524,11 +653,16 @@ public sealed class MainWindow : Window
                 ReconcileOutcome.Failed => Ui.Bad,
                 _ => null,
             };
-            _content.Children.Add(Ui.DetailRow(machine.Name, outcome.Sentence_, colour));
+            _content.Children.Add(Ui.Keyed(Ui.DetailRow(machine.Name, outcome.Sentence_, colour), $"setup:{machine.Id}"));
             if (outcome is ReconcileOutcome.NeedsDecision)
             {
-                _content.Children.Add(Ui.Actions(
-                    Ui.Action("Sort this out", () => Diverged(machine, outcome))));
+                _content.Children.Add(Ui.Keyed(Ui.Actions(
+                    Ui.Action("Sort this out", () => Diverged(machine, outcome))), $"setup:{machine.Id}:decide"));
+            }
+            if (outcome is ReconcileOutcome.Withheld)
+            {
+                _content.Children.Add(Ui.Keyed(Ui.Actions(
+                    Ui.Action("Try again", () => TryAgain(machine))), $"setup:{machine.Id}:try-again"));
             }
         }
     }
@@ -542,65 +676,68 @@ public sealed class MainWindow : Window
 
     private void BuildDiagnostics()
     {
-        _content.Children.Add(Ui.Rule());
-        _content.Children.Add(Ui.SectionHeading("This device"));
-        _content.Children.Add(Ui.DetailRow("Notifications",
+        _content.Children.Add(Ui.Keyed(Ui.Rule(), "device:rule"));
+        _content.Children.Add(Ui.Keyed(Ui.SectionHeading("This device"), "device:heading"));
+        _content.Children.Add(Ui.Keyed(Ui.DetailRow("Notifications",
             _app.Settings.NotifyOnOperationFinished
                 ? _app.Notifications.IsAvailable ? "on" : "on, but " + _app.Notifications.Describe()
-                : "off"));
-        _content.Children.Add(Ui.Actions(
+                : "off"), "device:notifications"));
+        // What the button says it does, whatever another process wrote to the file since.
+        var announce = !_app.Settings.NotifyOnOperationFinished;
+        _content.Children.Add(Ui.Keyed(Ui.Actions(
             Ui.Action("Edit the setup", () => new SetupEditor(_app).Show(this)),
             Ui.Action("This device's own settings", () => new BindingsEditor(_app).Show(this)),
-            Ui.Action(_app.Settings.NotifyOnOperationFinished ? "Stop announcing operations" : "Announce finished operations",
-                () => _app.UpdateSettings(_app.Settings with
-                {
-                    NotifyOnOperationFinished = !_app.Settings.NotifyOnOperationFinished,
-                })),
-            Ui.Action("Check for an update to this app", CheckForUpdate)));
+            Ui.Action(announce ? "Announce finished operations" : "Stop announcing operations",
+                () => _app.UpdateSettings(settings => settings with { NotifyOnOperationFinished = announce })),
+            Ui.Action("Check for an update to this app", CheckForUpdate)), "device:actions"));
         if (_app.UpdateSuggestions.LastResult is { } updateResult)
-            _content.Children.Add(Ui.Note(updateResult.Sentence_));
+            _content.Children.Add(Ui.Keyed(Ui.Note(updateResult.Sentence_), "device:update-result"));
     }
 
     // MARK: the things the buttons do
 
-    private async void Request(MachineModel machine, MachineRequest request)
+    /// Every one of them that awaits anything runs through [Ui.Run], so an error none of them
+    /// planned for is shown and logged rather than taking the window down.
+    private void Run(string what, Func<Task> task, bool quiet = false) => Ui.Run(this, what, task, quiet);
+
+    private void Request(MachineModel machine, MachineRequest request) => Run("Sending the request", async () =>
     {
         var confirmation = Confirmation.For(request, machine.Status, machine.Name, machine.IsSelf);
         var answer = await Sheets.ConfirmAsync(this, request, confirmation);
         if (answer is null) return;
         var outcome = await machine.RequestAsync(answer);
-        if (outcome is CommandOutcome.Done { Outcome: OperationOutcome.Succeeded or OperationOutcome.Noop }) return;
+        if (outcome.IsKnownSuccess) return;
         Sheets.Text(this, answer.Describe(), outcome.Sentence_);
-    }
+    });
 
-    private async void EditPolicy(MachineModel machine, string? service)
+    private void EditPolicy(MachineModel machine, string? service) => Run("Reading the update policy", async () =>
     {
         var (reply, problem) = await machine.ReadPolicyAsync(service);
         if (reply is null) { Sheets.Text(this, "Policy", problem ?? "Policy unavailable."); return; }
         await new PolicyEditor(machine, service, reply).ShowDialog(this);
-    }
+    });
 
-    private async void Policy(MachineModel machine, string? service, PolicyPatch patch)
+    private void Policy(MachineModel machine, string? service, PolicyPatch patch) => Run("Changing the update policy", async () =>
     {
         var (_, problem) = await machine.WritePolicyAsync(service, patch);
         if (problem is not null) Sheets.Text(this, "The policy was not changed", problem);
         await machine.RefreshAsync();
-    }
+    });
 
-    private async void Cancel(MachineModel machine, string id)
+    private void Cancel(MachineModel machine, string id) => Run("Cancelling the operation", async () =>
     {
         var outcome = await machine.CancelAsync(id);
         if (outcome is not CommandOutcome.Done) Sheets.Text(this, "Cancel", outcome.Sentence_);
-    }
+    });
 
-    private async void History(MachineModel machine)
+    private void History(MachineModel machine) => Run("Reading the operation history", async () =>
     {
         var (history, problem) = await machine.HistoryAsync();
         Sheets.Text(this, "Operation history", problem is not null ? problem :
-            string.Join("\n", history.Select(op => $"{op.Id}: {op.Describe()} — {op.Message ?? op.Action ?? op.Outcome.ToString()}")));
-    }
+            string.Join("\n", history.Select(op => $"{op.Id}: {op.Describe()} — {op.Message ?? op.OutcomeText}")));
+    });
 
-    private async void Doctor(MachineModel machine, bool deep = false)
+    private void Doctor(MachineModel machine, bool deep = false) => Run("Checking the agent", async () =>
     {
         var (report, problem) = await machine.DoctorAsync(deep: deep);
         if (report is null)
@@ -612,15 +749,15 @@ public sealed class MainWindow : Window
             $"{check.Verdict.ToString().ToLowerInvariant(),-8} {check.DisplayName,-28} {check.Summary}"
             + (check.Fix is { } fix ? $"\n         fix: {fix}" : "")));
         Sheets.Text(this, $"Doctor — {machine.Name}", text);
-    }
+    });
 
-    private async void Logs(MachineModel machine)
+    private void Logs(MachineModel machine) => Run("Reading the agent log", async () =>
     {
         var (lines, problem) = await machine.LogsAsync();
         Sheets.Text(this, $"Log — {machine.Name}", problem ?? string.Join("\n", lines));
-    }
+    });
 
-    private async void Bundle(MachineModel machine)
+    private void Bundle(MachineModel machine) => Run("Exporting diagnostics", async () =>
     {
         var (text, problem) = await machine.BundleAsync();
         if (text is null)
@@ -640,9 +777,33 @@ public sealed class MainWindow : Window
         {
             Sheets.Text(this, "Bundle", $"Could not write {path}: {error.Message}");
         }
-    }
+    });
 
-    private async void Wake(MachineModel machine, string? desiredSystem = null)
+    /// Runs the other helpers' commands while one run for this machine may still be going, after a
+    /// question that says so. Nothing else ever lifts a hold on a person's behalf.
+    private void TryOtherHelpers(MachineModel machine) => Run($"Waking {machine.Name}", async () =>
+    {
+        var confirmed = await Sheets.AskAsync(this, $"Try the other helpers for {machine.Name}?",
+            $"A helper command run earlier to wake {machine.Name} has not reported how it ended, so it may still be running. Trying the other helpers runs their commands, and does not run that one again.",
+            "Try them");
+        if (!confirmed) return;
+        var report = await _app.WakeAsync(machine, HoldChoice.OtherHelpers);
+        Sheets.Text(this, $"Wake — {machine.Name}", string.Join("\n", report.Attempts.Append(report.Sentence)));
+    });
+
+    /// Runs a held helper command again when no other helper could be asked, after a question that
+    /// says the first run may still be going and this can make it two. Without it, a hold on a
+    /// helper that keeps no records would last until the machine answered.
+    private void RunHeldAgain(MachineModel machine, WakePlan again) => Run($"Waking {machine.Name}", async () =>
+    {
+        var confirmed = await Sheets.AskAsync(this, $"{WakePlanner.RunAgainLabel(again)} for {machine.Name}?",
+            WakePlanner.RunAgainWarning(again, machine.Name), "Run it again");
+        if (!confirmed) return;
+        var report = await _app.WakeAsync(machine, HoldChoice.RunAgain);
+        Sheets.Text(this, $"Wake — {machine.Name}", string.Join("\n", report.Attempts.Append(report.Sentence)));
+    });
+
+    private void Wake(MachineModel machine, string? desiredSystem = null) => Run($"Waking {machine.Name}", async () =>
     {
         var report = await _app.WakeAsync(machine);
         if (report.Confirmed && desiredSystem is not null && report.SystemId != desiredSystem)
@@ -652,9 +813,9 @@ public sealed class MainWindow : Window
         }
         Sheets.Text(this, $"Wake — {machine.Name}",
             string.Join("\n", report.Attempts.Append(report.Sentence)));
-    }
+    });
 
-    private async void TrustAsync(MachineModel machine)
+    private void TrustAsync(MachineModel machine) => Run("Checking the host key", async () =>
     {
         var route = TrustRoute(machine);
         if (route is null) return;
@@ -682,7 +843,7 @@ public sealed class MainWindow : Window
                 Sheets.Text(this, "Trust", $"{conflict.Sentence}\n\n{conflict.Fix}");
                 return;
         }
-    }
+    });
 
     private MachineRoute? TrustRoute(MachineModel machine)
     {
@@ -692,7 +853,7 @@ public sealed class MainWindow : Window
             : routes.FirstOrDefault();
     }
 
-    private async void OperationDetails(MachineModel machine, string id)
+    private void OperationDetails(MachineModel machine, string id) => Run("Reading the operation", async () =>
     {
         var tracked = machine.Operations.FirstOrDefault(operation => operation.Id == id);
         if (tracked?.Output is { } output)
@@ -700,14 +861,15 @@ public sealed class MainWindow : Window
         try
         {
             var reply = await machine.NewAgent().OperationAsync(id, null, machine.Capabilities);
-            var record = reply.Value;
-            Sheets.Text(this, "Operation details", record is null ? "No operation record returned." :
-                $"{record.Describe()}\n{record.Result?.Message}\n\n{record.Result?.Output}");
+            var record = reply.Value.Record;
+            Sheets.Text(this, "Operation details", record is not null
+                ? $"{record.Describe()}\n{record.Result?.Message}\n\n{record.Result?.Output}"
+                : reply.Value.NoRecord ? $"{machine.Name} has no operation {id}." : reply.Value.Envelope.Sentence() ?? "No operation record returned.");
         }
         catch (AgentFailure failure) { Sheets.Text(this, "Operation details", failure.Sentence(machine.Name)); }
-    }
+    });
 
-    private async void EditServices(MachineModel machine)
+    private void EditServices(MachineModel machine) => Run("Opening the service setup", async () =>
     {
         try
         {
@@ -717,9 +879,26 @@ public sealed class MainWindow : Window
             await new ServiceEditor(machine, reply.Value).ShowDialog(this);
         }
         catch (AgentFailure failure) { Sheets.Text(this, "Service setup", failure.Sentence(machine.Name)); }
-    }
+    });
 
-    private async void InstallAgent(MachineModel machine)
+    /// Installs the bundled agent where it is older than the one running, or below the version
+    /// floor: only after a person answered a question that says so, and then with the agent told
+    /// in as many words.
+    private void GoBackToAgent(MachineModel machine, string version, string goesBack) => Run("Going back to an older agent", async () =>
+    {
+        var floor = AgentVersions.IsOlder(version, machine.Capabilities.Floor)
+            ? $" and lowers the machine's version floor to it, so the machine accepts agents from {version} up until a newer one raises the floor again"
+            : "";
+        var confirmed = await Sheets.AskAsync(this, $"Go back to agent {version}?",
+            $"This build carries agent {version}, {goesBack} on {machine.Name}. Going back installs it anyway{floor}.",
+            "Go back");
+        if (!confirmed) return;
+        var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, allowDowngrade: true);
+        Sheets.Text(this, "Agent", outcome.Report);
+        await machine.RefreshAsync();
+    });
+
+    private void InstallAgent(MachineModel machine) => Run("Installing the agent", async () =>
     {
         await machine.RefreshAsync();
         if (machine.Status is null || machine.Failure is not null)
@@ -736,48 +915,57 @@ public sealed class MainWindow : Window
         Sheets.Text(this, "Agent", outcome.Report);
         await machine.RefreshAsync();
         if (outcome is not AgentInstallOutcome.Installed || system is null || installationBase is null || _app.Config.Document is not { } document) return;
-        var argv = system.Agent.ToArray();
-        var script = Array.FindIndex(argv, item => item.Replace('\\', '/').EndsWith("/agent/src/index.mjs", StringComparison.Ordinal));
-        if (script < 0) return;
-        argv[script] = installationBase.TrimEnd('/', '\\') + "/bin/launcher.mjs";
+        // Read again: the install took minutes, and the machine, its system or its command may
+        // have changed in the setup, or left it, while it ran.
+        if (AgentInstaller.LauncherCommand(_app.Machine(machine.Id)?.Machine, system.Id, installationBase) is not (var argv, var launcher)) return;
         if (!await Sheets.AskAsync(this, "Use the stable agent launcher?",
-            $"The upgrade succeeded. Update only this system's script argument in the shared setup to {argv[script]}? The remaining arguments are preserved.", "Update launcher path")) return;
+            $"The upgrade succeeded. Update only this system's script argument in the shared setup to {launcher}? The remaining arguments are preserved.", "Update launcher path")) return;
         if (_app.Config.Document?.Hash != document.Hash)
         { Sheets.Text(this, "Setup changed", "The setup changed while this choice was open. Review its current agent path before editing it."); return; }
-        var root = System.Text.Json.Nodes.JsonNode.Parse(document.Text)!.AsObject();
-        var configured = root["machines"]!.AsArray().First(item => item?["id"]?.GetValue<string>() == machine.Id)!;
-        var os = configured["systems"]!.AsArray().First(item => item?["id"]?.GetValue<string>() == system.Id)!;
-        os["agent"] = new System.Text.Json.Nodes.JsonArray(argv.Select(item => (System.Text.Json.Nodes.JsonNode)item).ToArray());
-        var (_, problem) = _app.Config.ApplyEdit(root.ToJsonString(), "selected stable launcher");
-        if (problem is not null) Sheets.Text(this, "Launcher path", problem);
-    }
-
-    private async void Diverged(MachineModel machine, ReconcileOutcome outcome)
-    {
-        if (outcome is not ReconcileOutcome.NeedsDecision decision) return;
-        var (differences, problem) = await _app.Reconciler.PrepareMergeAsync(machine);
-        if (problem is not null)
+        var (_, problem, refused) = _app.MigrateAgentCommand(machine.Id, system.Id, argv, document.Hash);
+        if (refused.Count > 0)
         {
-            Sheets.Text(this, "The setup", problem);
+            Sheets.Text(this, "Launcher path", string.Join("\n", refused.Select(refusal => refusal.Sentence))
+                + "\nThe agent was upgraded; its launcher path in the setup was left as it is.");
             return;
         }
-        var answer = await Sheets.DivergenceAsync(this, machine.Name,
-            decision.Sharing.Sentence_ ?? "The two copies differ.", differences, decision.Sharing is SetupSharing.DifferentSetup);
+        if (problem is not null) Sheets.Text(this, "Launcher path", problem);
+    });
+
+    private void Diverged(MachineModel machine, ReconcileOutcome outcome) => Run("Settling the setup", async () =>
+    {
+        if (outcome is not ReconcileOutcome.NeedsDecision decision) return;
+        // The screen is built from what the machine sent; every answer but Replace needs its
+        // verified bytes, and every answer acts on exactly what the screen showed, only while the
+        // setup here is still the one it was built from.
+        var (session, problem) = await _app.Reconciler.PrepareMergeAsync(machine);
+        if (session is null)
+        {
+            Sheets.Text(this, "The setup", problem ?? "The machine's setup could not be read.");
+            return;
+        }
+        var answer = await Sheets.DivergenceAsync(this, machine.Name, decision.Sharing.Sentence_ ?? "The two copies differ.", session);
         if (answer is null) return;
 
         var result = answer.Choice switch
         {
-            "merge" => await _app.Reconciler.MergeAsync(machine, answer.PerEntry),
-            "keep-mine" => await _app.Reconciler.KeepMineAsync(machine),
-            "take-theirs" => await _app.Reconciler.TakeTheirsAsync(machine),
-            "replace-theirs" => await _app.Reconciler.ReplaceTheirsAsync(machine),
+            "merge" => await _app.Reconciler.MergeAsync(machine, session, answer.PerEntry),
+            "keep-mine" => await _app.Reconciler.KeepMineAsync(machine, session),
+            "take-theirs" => await _app.Reconciler.TakeTheirsAsync(machine, session),
+            "replace-theirs" => await _app.Reconciler.ReplaceTheirsAsync(machine, session),
             _ => "Nothing was done.",
         };
         if (result is not null) Sheets.Text(this, "The setup", result);
         await _app.RefreshAllAsync();
-    }
+    });
 
-    private async void CheckForUpdate()
+    private void TryAgain(MachineModel machine) => Run("Trying again", async () =>
+    {
+        await _app.Reconciler.TryAgainAsync(machine);
+        Rebuild();
+    });
+
+    private void CheckForUpdate() => Run("Checking for an update", async () =>
     {
         if (_reviewingUpdate) return;
         _reviewingUpdate = true;
@@ -790,21 +978,21 @@ public sealed class MainWindow : Window
             await ReviewUpdateAsync(ready);
         }
         finally { _reviewingUpdate = false; }
-    }
+    });
 
-    private async void SuggestAppUpdate()
+    private void SuggestAppUpdate() => Run("Checking for an update", async () =>
     {
         if (!_app.Settings.CheckForAppUpdates || _updateLifetime.IsCancellationRequested) return;
         await _app.CheckForAppUpdateAsync(_updateLifetime.Token, force: false);
-    }
+    }, quiet: true);
 
-    private async void ReviewAvailableUpdate(UpdateAvailability.Ready ready)
+    private void ReviewAvailableUpdate(UpdateAvailability.Ready ready) => Run("Installing the update", async () =>
     {
         if (_reviewingUpdate) return;
         _reviewingUpdate = true;
         try { await ReviewUpdateAsync(ready); }
         finally { _reviewingUpdate = false; }
-    }
+    });
 
     private async Task ReviewUpdateAsync(UpdateAvailability.Ready ready)
     {
@@ -819,11 +1007,14 @@ public sealed class MainWindow : Window
         if (!StillCurrent()) return;
         if (!await Sheets.AskAsync(this, "App update available", ready.Sentence_, "Download and verify")) return;
         if (!StillCurrent()) return;
-        var (bytes, downloadProblem) = await new AppUpdates().DownloadAsync(ready, _updateLifetime.Token);
-        if (!StillCurrent()) return;
-        if (bytes is null) { Sheets.Text(this, "App update", downloadProblem ?? "Download failed."); return; }
-        var installer = new AppInstaller();
-        var (staged, stageProblem) = installer.Stage(bytes, ready.Artifact.Name);
+        var installer = new AppInstaller { HealthWindow = _app.Settings.UpdateHealthWindow };
+        var archive = installer.DownloadPath(ready.Artifact.Name);
+        var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, _updateLifetime.Token);
+        // Staging is what deletes the archive, so a review that ends before it deletes it here.
+        if (!StillCurrent()) { installer.Discard(ready.Artifact.Name); return; }
+        if (downloadProblem is not null) { installer.Discard(ready.Artifact.Name); Sheets.Text(this, "App update", downloadProblem); return; }
+        // A hundred megabytes unpacked: off the window's thread, or the window stops drawing.
+        var (staged, stageProblem) = await Task.Run(() => installer.Stage(archive, ready.Artifact.Name));
         if (staged is null) { Sheets.Text(this, "App update", stageProblem ?? "Staging failed."); return; }
         if (!StillCurrent()) return;
         if (!await Sheets.AskAsync(this, "Verified update ready",

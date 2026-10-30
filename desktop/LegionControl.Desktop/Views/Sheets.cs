@@ -1,4 +1,5 @@
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using LegionControl.Desktop.Model;
@@ -20,6 +21,7 @@ public static class Sheets
             WindowStartupLocation = WindowStartupLocation.CenterOwner };
         var body = Ui.Column(8); body.Margin = new Thickness(20);
         body.Children.Add(Ui.Note(description)); var field = new TextBox(); body.Children.Add(field);
+        AutomationProperties.SetName(field, title);
         string? answer = null;
         body.Children.Add(Ui.Actions(Ui.Action("Cancel", dialog.Close), Ui.Action("Use this path", () =>
         { answer = string.IsNullOrWhiteSpace(field.Text) ? null : field.Text.Trim(); dialog.Close(); })));
@@ -63,6 +65,7 @@ public static class Sheets
         }
         body.Children.Add(Ui.Note("The new fingerprints belong to:"));
         var select = new ComboBox { ItemsSource = groups.Select(g => g.Id).ToList(), SelectedIndex = 0 };
+        AutomationProperties.SetName(select, "The new fingerprints belong to");
         body.Children.Add(select);
         var assignments = new List<(HostPublicKey Key, ComboBox Select)>();
         for (var i = 0; i < offer.ExistingKeys.Count; i++)
@@ -70,6 +73,7 @@ public static class Sheets
             body.Children.Add(Ui.Note($"Existing pin: {offer.ExistingFingerprints[i]}"));
             var assignment = new ComboBox { ItemsSource = groups.Select(g => g.Id).ToList(), SelectedIndex = -1,
                 PlaceholderText = "Assign this existing pin to an OS" };
+            AutomationProperties.SetName(assignment, $"Operating system of the existing pin {offer.ExistingFingerprints[i]}");
             body.Children.Add(assignment); assignments.Add((offer.ExistingKeys[i], assignment));
         }
         HostApproval? answer = null;
@@ -199,8 +203,9 @@ public static class Sheets
     public sealed record DivergenceAnswer(string Choice, IReadOnlyDictionary<string, SetupChoice> PerEntry);
 
     public static async Task<DivergenceAnswer?> DivergenceAsync(
-        Window owner, string machineName, string sentence, IReadOnlyList<SetupDifference> differences, bool differentSetup = false)
+        Window owner, string machineName, string sentence, MergeSession session)
     {
+        var differentSetup = session.DifferentSetup;
         var dialog = new Window
         {
             Title = $"Two versions of the setup",
@@ -215,12 +220,16 @@ public static class Sheets
         body.Margin = new Thickness(20);
         body.Children.Add(Ui.Title(differentSetup ? $"{machineName} holds a different setup" : $"{machineName} and this device have both been edited"));
         body.Children.Add(Ui.Note(sentence));
+        // Both revisions and who wrote each, so nobody chooses between two hashes.
+        body.Children.Add(Ui.DetailRow("Here", Revision(session.Mine?.Identity)));
+        body.Children.Add(Ui.DetailRow(machineName, Revision(session.Theirs.Identity)));
         body.Children.Add(Ui.Note(differentSetup
-            ? "Adopt the machine's setup here or explicitly replace its copy with this device's setup. Review the differences first."
-            : "Merging keeps both sides: every entry only one side changed is taken from that side. The entries below were changed on both, so they need an answer."));
+            ? DifferentSetupNote(session)
+            : session.MergeProblem ?? "Merging keeps both sides: every entry only one side changed is taken from that side. The entries below were changed on both, or nothing says which side changed them, so they need an answer."));
 
         body.Children.Add(Ui.SectionHeading("What differs"));
-        foreach (var difference in differences)
+        foreach (var line in session.Preview.Lines()) body.Children.Add(Ui.Note(line));
+        foreach (var difference in session.Differences)
         {
             var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,auto"), Margin = new Thickness(0, 2, 0, 2) };
             row.Children.Add(new TextBlock
@@ -237,7 +246,8 @@ public static class Sheets
                     SelectedIndex = 0,
                     MinWidth = 90,
                 };
-                var key = difference.Key;
+                var key = difference.Entry;
+                AutomationProperties.SetName(picker, $"Whose {key} to keep");
                 choices[key] = SetupChoice.Theirs;
                 picker.SelectionChanged += (_, _) =>
                     choices[key] = picker.SelectedIndex == 1 ? SetupChoice.Mine : SetupChoice.Theirs;
@@ -248,7 +258,7 @@ public static class Sheets
             {
                 var side = new TextBlock
                 {
-                    Text = difference.Change == SetupChange.Mine ? "kept from here" : "taken from there",
+                    Text = difference.Kind == SetupChange.Mine ? "kept from here" : "taken from there",
                     Foreground = Ui.Muted,
                     VerticalAlignment = VerticalAlignment.Center,
                 };
@@ -260,22 +270,22 @@ public static class Sheets
 
         var buttons = new WrapPanel { Margin = new Thickness(0, 16, 0, 0) };
         buttons.Children.Add(Ui.Action("Leave it", () => dialog.Close()));
-        if (!differentSetup) buttons.Children.Add(Ui.Action("Merge", () =>
+        if (session.CanMerge) buttons.Children.Add(Ui.Action("Merge", () =>
         {
             answer = new DivergenceAnswer("merge", choices);
             dialog.Close();
         }));
-        if (!differentSetup) buttons.Children.Add(Ui.Action("Keep mine", () =>
+        if (session.CanMerge) buttons.Children.Add(Ui.Action("Keep mine", () =>
         {
             answer = new DivergenceAnswer("keep-mine", choices);
             dialog.Close();
         }, explanation: "Writes a new revision that descends from both, so the machine accepts it without being forced."));
-        if (differentSetup) buttons.Children.Add(Ui.Action("Replace the machine's copy with mine", () =>
+        if (session.CanReplace) buttons.Children.Add(Ui.Action("Replace the machine's copy with mine", () =>
         {
             answer = new DivergenceAnswer("replace-theirs", choices);
             dialog.Close();
         }));
-        buttons.Children.Add(Ui.Action("Take theirs", () =>
+        if (session.CanTakeTheirs) buttons.Children.Add(Ui.Action("Take theirs", () =>
         {
             answer = new DivergenceAnswer("take-theirs", choices);
             dialog.Close();
@@ -286,6 +296,22 @@ public static class Sheets
         await dialog.ShowDialog(owner);
         return answer;
     }
+
+    /// What a different setup leaves to do, said for the buttons below it: adopt it, replace it,
+    /// either, or why neither can be done from here.
+    private static string DifferentSetupNote(MergeSession session) => (session.CanTakeTheirs, session.CanReplace) switch
+    {
+        (true, true) => "Adopt the machine's setup here or explicitly replace its copy with this device's setup. Review the differences first.",
+        (true, false) => $"{session.ReplaceProblem} The machine's setup can be adopted here. Review the differences first.".TrimStart(),
+        (false, true) => $"{session.TakeProblem} Its copy can still be replaced with this device's setup. Review the differences first.",
+        _ => $"{session.TakeProblem} {session.ReplaceProblem}".TrimEnd(),
+    };
+
+    /// One revision and who wrote it, in one line, with nothing a peer wrote hidden in it.
+    private static string Revision(ControllerIdentity? identity) => identity is null
+        ? "no setup"
+        : $"revision {identity.RevisionNumber}, written by {LaunchGate.Show(identity.Device ?? "?")} ({LaunchGate.Show(identity.Source ?? "?")})"
+          + (identity.UpdatedAt is { } at ? $" at {LaunchGate.Show(at)}" : "");
 
     /// A plain "here is some text" window, for logs, bundles and doctor output.
     public static void Text(Window owner, string title, string text)

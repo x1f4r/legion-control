@@ -2052,12 +2052,12 @@
       "uniqueItems": true
     },
     "configuredId": {
-      "description": "Agent-configured service, action or boot target identifier; matches config.mjs ID_PATTERN.",
+      "description": "Agent-configured service, action or boot target identifier; matches contract.mjs CONFIGURED_ID_PATTERN.",
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
     },
     "setupId": {
-      "description": "Shared setup identity; matches controller.mjs SETUP_ID_PATTERN, not the generic argv grammar.",
+      "description": "Shared setup identity; matches contract.mjs SETUP_ID_PATTERN, not the generic argv grammar.",
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
     },

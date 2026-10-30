@@ -11,11 +11,11 @@
 // ones are safe.
 
 import dgram from 'node:dgram';
-import { runArgv } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { recordPhase } from './operations.mjs';
-import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { mutationWorstCaseMs, runMutationArgv } from './process-runner.mjs';
+import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { log, note } from './log.mjs';
 
 const MAX_OUTPUT_LINES = 20;
@@ -142,6 +142,15 @@ export function shapeOutput(stdout, stderr, maxLines = MAX_OUTPUT_LINES) {
   return hidden > 0 ? `${shown.join('\n')}\n… ${hidden} more line${hidden === 1 ? '' : 's'}` : shown.join('\n');
 }
 
+/**
+ * The longest a queued action can take once a cycle takes it up
+ * (scheduler.mjs): its busy check where it has one, and its command or its
+ * wake packets, which share the action's timeout.
+ */
+export function actionWorstCaseMs(action) {
+  return (action.busyGated ? BUSY_BUDGET_MS : 0) + mutationWorstCaseMs(action.timeoutSeconds * 1000);
+}
+
 /** Run one configured action. Always returns an object; never throws. */
 export async function runAction(config, id, options = {}) {
   const { force = false } = options;
@@ -204,11 +213,33 @@ export async function runAction(config, id, options = {}) {
         return { ok: true, action: 'ran', reasonCode: null, id: action.id, exitCode: 0, output, message };
       }
 
-      const run = runArgv(action.command, { timeoutMs: action.timeoutSeconds * 1000 });
+      // The mutation runner answers once the action has exited, or once its
+      // deadline has stopped everything it started and that has been seen
+      // gone, so nothing it started can still be at work after this reply and
+      // the lock it releases. What it leaves running after exiting by itself,
+      // an app it opened, it left there on purpose.
+      const run = await runMutationArgv(action.command, { timeoutMs: action.timeoutSeconds * 1000 });
       const output = shapeOutput(run.stdout, run.stderr);
 
+      if (run.refused) {
+        // It never started: an earlier command may still be running. That is
+        // something in the way, and it is named when it can be.
+        log(`${action.name} was ${run.error}`, 'run');
+        return {
+          ok: false,
+          action: run.conflict ? 'conflict' : 'failed',
+          reasonCode: run.conflict ? REASON.operationInProgress : REASON.internal,
+          id: action.id,
+          exitCode: null,
+          output: '',
+          message: `${action.name} was ${run.error}`,
+          ...(run.conflict ? { conflict: run.conflict } : {}),
+        };
+      }
       if (run.timedOut) {
-        const message = `${action.name} did not finish within ${action.timeoutSeconds} s and was stopped`;
+        const message = run.terminated
+          ? `${action.name} did not finish within ${action.timeoutSeconds} s and was stopped`
+          : `${action.name} did not finish within ${action.timeoutSeconds} s and could not be confirmed stopped; nothing else changes this machine until it has`;
         log(message, 'run');
         return {
           ok: false,
@@ -218,6 +249,23 @@ export async function runAction(config, id, options = {}) {
           exitCode: null,
           output,
           message,
+        };
+      }
+      if (run.terminated !== null) {
+        // Stopped as it started, by a runner whose ledger would not record
+        // it. It ran for that moment, so what it did is as unknown as for a
+        // deadline, and no client may send it again.
+        const message = `${action.name} was not let run: ${run.error}; what it did before it was stopped is unknown`;
+        log(message, 'run');
+        return {
+          ok: false,
+          action: 'failed',
+          reasonCode: REASON.internal,
+          id: action.id,
+          exitCode: null,
+          output,
+          message,
+          outcome: 'unknown',
         };
       }
       if (!run.ok) {

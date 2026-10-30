@@ -21,18 +21,9 @@
 
 import { spawnDetached } from './detached.mjs';
 import { fileURLToPath } from 'node:url';
-import { checkWorkerModules } from './selftest-modules.mjs';
-import {
-  AGENT_METADATA_PROBLEM,
-  AGENT_VERSION,
-  basePath,
-  configPath,
-  isSupportedPlatform,
-  loadConfig,
-  platformName,
-  readJsonDocument,
-  saveConfig,
-} from './config.mjs';
+import { checkWorkerModules, importModules, WORKER_ENTRIES } from './selftest-modules.mjs';
+import { loadConfig, readJsonDocument, saveConfig } from './config-store.mjs';
+import { AGENT_METADATA_PROBLEM, AGENT_VERSION, basePath, configPath, isSupportedPlatform, platformName } from './paths.mjs';
 import {
   CONTRACT_VERSION,
   DURATION_PATTERN,
@@ -47,14 +38,18 @@ import {
   resolveDeadline,
 } from './contract.mjs';
 import { runAction } from './actions.mjs';
+import { windowsPowerShellModulePath } from './process-runner.mjs';
 import { MAX_CONTROLLER_BYTES, readController, readControllerMeta, storeController } from './controller.mjs';
 import { buildBundle, runDoctor } from './doctor.mjs';
 import { reportedFloor } from './floor.mjs';
 import { acquireOperationLock } from './lock.mjs';
 import { log, readLogLines } from './log.mjs';
+import { redactReply, restrictedRedactor } from './redact.mjs';
+import { finishUnrunnable, replayOf } from './operate.mjs';
 import {
   beginOperation,
   cancelOperation,
+  countOperations,
   currentInitiator,
   deriveState,
   listOperations,
@@ -72,125 +67,241 @@ import { runBoot, runSleep } from './power.mjs';
 import { aggregateBusy, checkAllBusy } from './probes/busy.mjs';
 import { runCycle } from './scheduler.mjs';
 import { livenessOf, selectService } from './service.mjs';
+import { processStartTicks } from './state.mjs';
 import { buildStatus, DEFAULT_STATUS_BUDGET_MS } from './status.mjs';
-import { serviceState } from './state.mjs';
 import { checkBundle, resolveBootstrapLayout, runBootstrapInstall, runRollback, runSelfUpdate } from './selfupdate.mjs';
 import { runRestart, runUpdate } from './update.mjs';
-import { authorize, parseCommandLine } from './dispatch.mjs';
+import { authorize, isRestrictedSession, parseCommandLine } from './dispatch.mjs';
+import { PATH_OPTIONS, parseArgs } from './args.mjs';
+
+/** For a command every invocation of which asks for a change. */
+const always = () => true;
 
 /**
- * The command table. `flags` stand alone, `options` take a value, `positional`
- * documents what a bare argument means. Anything outside it is refused, which is
- * what stops a typo from being read as a different command's flag.
+ * The command table, and the only place a command is wired to what answers
+ * it: help, the refusal of an unknown command and dispatch all read it, so a
+ * command cannot be listed without being answered or answered without being
+ * listed. `flags` stand alone, `options` take a value, and anything outside
+ * them is refused, which is what stops a typo from being read as a different
+ * command's flag.
+ *
+ * `mutates` says whether the command can change the machine at all, which is
+ * what a broken config.json refuses. `changes` says whether one invocation
+ * asks for a change, and so states an outcome (contract section 5.6): a dry
+ * run, a bundle check and a read of a mutating command's setting do not.
+ *
+ * Three more say how a mutating command's invocation meets config.json.
+ * `readOnly` names the ones that promise to change nothing, so loading the
+ * file leaves even its last good copy alone; a command that cannot mutate
+ * promises that always. `withoutConfig` names the ones that still answer when
+ * the file cannot be used, because what they do never reads it. `prepare`
+ * settles what has to be settled before anything is read at all, and a reply
+ * from it answers the invocation there and then.
+ *
+ * `run` answers a validated invocation, given the loaded configuration.
  */
 const COMMANDS = {
-  status: { flags: [], options: ['budget-ms'], mutates: false, summary: 'bounded snapshot of the machine, its services and its operations' },
-  busy: { flags: [], options: ['budget-ms'], mutates: false, summary: 'the aggregated busy state, with per-service evidence' },
+  status: {
+    flags: [], options: ['budget-ms'], mutates: false, summary: 'bounded snapshot of the machine, its services and its operations',
+    run: ({ loaded, options }) => commandStatus(loaded, options),
+  },
+  busy: {
+    flags: [], options: ['budget-ms'], mutates: false, summary: 'the aggregated busy state, with per-service evidence',
+    run: ({ config, options }) => commandBusy(config, options),
+  },
   update: {
     flags: ['force', 'detach', 'when-idle'],
     options: ['service', 'op', 'expires'],
     mutates: true,
-    summary: 'update one service',
+    changes: always,
+    summary: 'update one service; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, flags, options }) => commandUpdate(config, flags, options),
   },
   restart: {
     flags: ['force', 'detach', 'when-idle'],
     options: ['service', 'op', 'expires'],
     mutates: true,
-    summary: 'restart one service',
+    changes: always,
+    summary: 'restart one service; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, flags, options }) => commandRestart(config, flags, options),
   },
   boot: {
     flags: ['force', 'no-reboot', 'when-idle'],
     options: ['op', 'expires'],
     mutates: true,
-    summary: 'arm a boot target and reboot into it',
+    changes: always,
+    summary: 'arm a boot target and reboot into it; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, positional, flags, options }) => commandBoot(config, positional, flags, options),
   },
-  sleep: { flags: ['force', 'when-idle'], options: ['op', 'expires'], mutates: true, summary: 'suspend this machine' },
+  sleep: {
+    flags: ['force', 'when-idle'],
+    options: ['op', 'expires'],
+    mutates: true,
+    changes: always,
+    summary: 'suspend this machine; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, flags, options }) => commandSleep(config, flags, options),
+  },
   run: {
     flags: ['force', 'detach', 'when-idle'],
     options: ['op', 'expires'],
     mutates: true,
-    summary: 'run a configured action',
+    changes: always,
+    summary: 'run a configured action; --when-idle waits for an idle machine, up to --expires (1m to 7d), and cannot be combined with --force',
+    run: ({ config, positional, flags, options }) => commandRun(config, positional, flags, options),
   },
-  cycle: { flags: ['dry-run', 'force'], options: ['op'], mutates: true, summary: 'the scheduled maintenance cycle over every eligible service' },
-  'auto-update': { flags: [], options: ['service'], mutates: true, summary: 'on, off, pause <duration> or resume' },
-  policy: { flags: [], options: ['service'], mutates: true, summary: 'read the update policy; "policy set" reads a JSON patch from stdin' },
-  'service-config': { flags: ['stdin'], options: [], mutates: true, summary: 'administrative service configuration: get, validate --stdin, or set --stdin' },
-  op: { flags: [], options: ['wait'], mutates: false, summary: 'one operation record; --wait long-polls until it finishes' },
-  cancel: { flags: [], options: [], mutates: true, summary: 'cancel a queued operation' },
-  history: { flags: [], options: ['limit', 'service', 'kind'], mutates: false, summary: 'recent operations, newest first' },
-  logs: { flags: [], options: ['lines', 'op'], mutates: false, summary: 'the tail of the agent log, or one operation\'s log' },
-  doctor: { flags: ['deep'], options: ['service'], mutates: false, summary: 'check everything that can be wrong with this machine' },
-  bundle: { flags: [], options: [], mutates: false, summary: 'a diagnostic bundle with secrets removed' },
+  cycle: {
+    flags: ['dry-run', 'force'], options: ['op'], mutates: true, summary: 'the scheduled maintenance cycle over every eligible service',
+    changes: (positional, flags) => !flags.has('dry-run'),
+    readOnly: (positional, flags) => flags.has('dry-run'),
+    run: ({ config, flags, options }) => commandCycle(config, flags, options),
+  },
+  'auto-update': {
+    flags: [], options: ['service'], mutates: true, summary: 'on, off, pause <duration> or resume',
+    changes: always,
+    run: ({ config, positional, options }) => commandAutoUpdate(config, positional, options),
+  },
+  policy: {
+    flags: [], options: ['service'], mutates: true, summary: 'read the update policy; "policy set" reads a JSON patch from stdin',
+    changes: (positional) => positional[0] === 'set',
+    readOnly: (positional) => positional[0] === undefined,
+    run: ({ config, positional, options }) => commandPolicy(config, positional, options),
+  },
+  'service-config': {
+    flags: ['stdin'], options: [], mutates: true, summary: 'administrative service configuration: get, validate --stdin, or set --stdin',
+    changes: (positional) => positional[0] === 'set',
+    // Administrative documents can contain private command arguments. This
+    // command refuses a restricted session before config loading or input
+    // reads, and owns its read-only validation and locked compare-and-swap
+    // itself, so it is answered before the config is loaded at all.
+    beforeConfig: true,
+    run: async ({ positional, flags }) => {
+      const result = await commandServiceConfig(positional, flags);
+      return { payload: wrap(result), exitCode: result.ok ? 0 : 1 };
+    },
+  },
+  op: {
+    flags: [], options: ['wait'], mutates: false, summary: 'one operation record; --wait long-polls until it finishes',
+    run: ({ config, positional, options }) => commandOp(config, positional, options),
+  },
+  cancel: {
+    flags: [], options: [], mutates: true, summary: 'cancel a queued operation',
+    changes: always,
+    run: ({ positional }) => commandCancel(positional),
+  },
+  history: {
+    flags: [], options: ['limit', 'service', 'kind'], mutates: false, summary: 'recent operations, newest first',
+    run: ({ config, options }) => commandHistory(config, options),
+  },
+  logs: {
+    flags: [], options: ['lines', 'op'], mutates: false, summary: 'the tail of the agent log, or one operation\'s log',
+    run: ({ options }) => commandLogs(options),
+  },
+  doctor: {
+    flags: ['deep'], options: ['service'], mutates: false, summary: 'check everything that can be wrong with this machine',
+    run: ({ loaded, flags, options }) => commandDoctor(loaded, flags, options),
+  },
+  bundle: {
+    flags: [], options: [], mutates: false, summary: 'a diagnostic bundle with secrets removed',
+    run: ({ loaded }) => commandBundle(loaded),
+  },
   config: {
     flags: ['replace'],
     options: ['controller-id', 'revision'],
     mutates: true,
+    changes: (positional) => positional[0] === 'set',
+    // The setup document is a file of its own, which a broken config.json
+    // leaves readable; only a replacement waits for a usable one.
+    readOnly: (positional) => positional[0] !== 'set',
+    withoutConfig: (positional) => positional[0] !== 'set',
     summary: 'the stored setup document; "config set" replaces it from stdin, "config meta" reads its identity',
+    run: ({ positional, flags, options }) => commandConfig(positional, flags, options),
   },
   'self-update': {
     flags: ['stdin', 'install', 'rollback', 'check', 'allow-downgrade'],
     options: ['from', 'op'],
     mutates: true,
+    changes: (positional, flags) => !flags.has('check'),
+    // A bundle check reads only the bundle. The bootstrap install takes over
+    // from an older agent, whose config.json this one may not accept yet, and
+    // runs from the tree it was unpacked to, which says where it is to live.
+    readOnly: (positional, flags) => flags.has('check'),
+    withoutConfig: (positional, flags) => flags.has('check') || flags.has('install'),
+    prepare: ({ flags }) => (flags.has('install') ? settleBootstrapBase() : null),
     summary: 'replace this agent from a signed bundle',
+    run: ({ config, flags, options }) => commandSelfUpdate(config, flags, options),
   },
-  dispatch: { flags: [], options: [], mutates: true, summary: 'run one allowed command from SSH_ORIGINAL_COMMAND (restricted keys)' },
-  'op-run': { flags: [], options: [], mutates: true, internal: true, summary: 'the detached worker for one operation' },
-  version: { flags: ['check'], options: [], mutates: false, summary: 'the agent version, and with --check a self-test' },
-  help: { flags: [], options: [], mutates: false, summary: 'print this list' },
+  // main() runs it before anything is parsed: the command it carries is in
+  // SSH_ORIGINAL_COMMAND, and is parsed and loaded like any other.
+  dispatch: {
+    flags: [], options: [], mutates: true, summary: 'run one allowed command from SSH_ORIGINAL_COMMAND (restricted keys)',
+    run: () => commandDispatch(),
+  },
+  'op-run': {
+    flags: [], options: [], mutates: true, internal: true, summary: 'the detached worker for one operation',
+    run: ({ config, positional }) => commandOpRun(config, positional),
+  },
+  // These two answer on any platform: neither touches the machine.
+  version: {
+    flags: ['check'], options: [], mutates: false, anyPlatform: true, summary: 'the agent version, and with --check a self-test',
+    run: ({ loaded, flags }) => commandVersion(flags, loaded),
+  },
+  help: {
+    flags: [], options: [], mutates: false, anyPlatform: true, summary: 'print this list',
+    run: () => ({ payload: wrap(helpPayload(null)), exitCode: 0 }),
+  },
 };
 
-const VALUE_OPTIONS = new Set([
-  'service',
-  'op',
-  'expires',
-  'budget-ms',
-  'wait',
-  'limit',
-  'kind',
-  'lines',
-  'controller-id',
-  'revision',
-  'from',
-]);
-
-/** Options whose value is a path and therefore not held to the token grammar. */
-const PATH_OPTIONS = new Set(['from']);
-
-function emit(payload, exitCode) {
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
-  process.exitCode = exitCode;
+/** The command an invocation names, or null when it names none this agent has. */
+function commandNamed(name) {
+  return typeof name === 'string' && Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : null;
 }
 
-function parseArgs(argv) {
-  const flags = new Set();
-  const options = new Map();
-  const positional = [];
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === '-h' || arg === '--help') {
-      flags.add('help');
-      continue;
+/**
+ * Write the one reply. A restricted key reads it redacted (contract section
+ * 13): the configured values of config.json and its last good copy are
+ * replaced wherever the reply quotes them in free text. Records and the log on
+ * disk keep everything, for the person who owns the machine.
+ *
+ * If redaction itself fails, the reply is replaced rather than sent as it
+ * was: a restricted key gets an internal error, and a mutation's outcome is
+ * unknown, so its client re-reads the operation instead of guessing.
+ *
+ * Only the first call writes anything. A failure that surfaces after the reply
+ * has gone, an exception in a stray callback or a promise nobody awaited, must
+ * not put a second object on stdout, which would make the first unreadable.
+ */
+let emitted = false;
+
+function emit(payload, exitCode) {
+  if (emitted) return;
+  let reply = payload;
+  let code = exitCode;
+  if (isRestrictedSession()) {
+    try {
+      reply = redactReply(payload, restrictedRedactor());
+    } catch (error) {
+      log(`a reply could not be redacted for a restricted session: ${error?.message ?? error}`, 'main');
+      const message = 'the reply could not be redacted for a restricted session';
+      reply = {
+        ok: false,
+        contract: CONTRACT_VERSION,
+        agentVersion: AGENT_VERSION,
+        system: systemIdentity ?? { id: platformName(), name: platformName() },
+        reasonCode: REASON.internal,
+        message,
+        ...(answeringMutation || 'outcome' in payload ? { outcome: 'unknown' } : {}),
+        command: null,
+        error: message,
+      };
+      code = 1;
     }
-    if (!arg.startsWith('--')) {
-      positional.push(arg);
-      continue;
-    }
-    const body = arg.slice(2);
-    const equals = body.indexOf('=');
-    if (equals !== -1) {
-      options.set(body.slice(0, equals), body.slice(equals + 1));
-      continue;
-    }
-    if (VALUE_OPTIONS.has(body)) {
-      // The value is the next argument, consumed here so it cannot be mistaken
-      // for the command's own positional argument.
-      options.set(body, argv[index + 1] ?? '');
-      index += 1;
-      continue;
-    }
-    flags.add(body);
   }
-  return { flags, options, positional };
+  // Marked written only once there is something to write, so a reply that
+  // cannot be serialised still leaves room for the failure that says so.
+  const text = `${JSON.stringify(reply)}\n`;
+  emitted = true;
+  process.stdout.write(text);
+  process.exitCode = code;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,17 +461,34 @@ function queueTtl(options) {
   return { ok: true, ttlMs: null, expiresAt: resolved.at };
 }
 
-/** The keys a mutating reply carries whatever its outcome, per command. */
-function queuedShape(kind, { service, target, actionId }) {
-  if (kind === 'update') return { service, from: null, to: null };
+/**
+ * The keys a mutating reply carries whatever its outcome, per command, with
+ * what the work reported where it has reported anything: a request that is
+ * only queued has not, and a replay has what its record kept.
+ */
+function commandShape(kind, { service, target, actionId }, result = null) {
+  if (kind === 'update') return { service, from: result?.from ?? null, to: result?.to ?? null };
   if (kind === 'restart') return { service };
-  if (kind === 'boot') return { target, armed: false };
-  if (kind === 'run') return { id: actionId, exitCode: null, output: '' };
+  if (kind === 'boot') return { target, armed: ['armed', 'rebooting', 'rebooted'].includes(result?.action) };
+  if (kind === 'run') return { id: actionId, exitCode: result?.exitCode ?? null, output: result?.output ?? '' };
   return {};
 }
 
-/** Park a request until the machine is idle, and answer `queued`. */
+/**
+ * Park a request until the machine is idle, and answer `queued`.
+ *
+ * `--when-idle` with `--force` is refused. One asks to wait until nothing is
+ * busy, the other not to care whether anything is, and a queued request that
+ * did both used to skip the wait and the busy gate alike: an interruption
+ * nobody watching asked for, at a time nobody chose.
+ */
 function queueRequest({ kind, service = null, target = null, actionId = null, flags, options, config }) {
+  if (flags.has('force')) {
+    return badArgument(
+      `${kind} --when-idle waits until the machine is idle, and --force does not wait for that; ask for one or the other`,
+      { command: kind, argument: '--force' },
+    );
+  }
   const ttl = queueTtl(options);
   if (!ttl.ok) return badArgument(ttl.error, { command: kind, argument: '--expires' });
 
@@ -370,7 +498,6 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
     service,
     target,
     actionId,
-    force: flags.has('force'),
     systemId: config.system.id,
     noReboot: flags.has('no-reboot'),
     ttlMs: ttl.ttlMs,
@@ -380,31 +507,13 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
   // An id already bound to another request is a bad --op, never a replay and
   // never a conflict to wait out (contract section 5.5).
   if (queued.conflict) return badArgument(queued.error, { command: kind, argument: '--op' });
+  if (queued.badExpiry) return badArgument(queued.error, { command: kind, argument: '--expires' });
   if (!queued.ok) {
     return refuse(REASON.internal, `the request could not be recorded: ${queued.error}`, { command: kind, argument: null, error: queued.error });
   }
   if (queued.replay) {
     const record = queued.record;
-    return mutationReply({
-      ...(record.state === 'finished' ? record.result : record.state === 'queued' ? {
-        ok: true,
-        action: 'queued',
-        message: `this request is already queued as ${record.id}`,
-      } : {
-        ok: true,
-        action: 'already-running',
-        reasonCode: REASON.alreadyRunning,
-        detached: record.detached === true,
-        message: `this request is already running as ${record.id}; it was not started a second time`,
-      }),
-      replayed: true,
-    }, {
-      ...queuedShape(kind, { service, target, actionId }),
-      ...(kind === 'boot' ? { armed: ['armed', 'rebooting', 'rebooted'].includes(record.result?.action) } : {}),
-      ...(kind === 'update' ? { from: record.result?.from ?? null, to: record.result?.to ?? null } : {}),
-      ...(kind === 'run' ? { exitCode: record.result?.exitCode ?? null, output: record.result?.output ?? '' } : {}),
-      op: wireRecord(record),
-    });
+    return mutationReply(replayOf(record), { ...commandShape(kind, { service, target, actionId }, record.result), op: wireRecord(record) });
   }
 
   const what = service ?? target ?? actionId ?? kind;
@@ -414,7 +523,7 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
     message: `${what} will be ${verb} on the next idle cycle, or dropped at ${queued.record.expiresAt}`,
     // Every mutating reply keeps its command's shape, whatever the answer is, so
     // a client decodes one thing per verb rather than one per outcome.
-    ...queuedShape(kind, { service, target, actionId }),
+    ...commandShape(kind, { service, target, actionId }),
     op: wireRecord(queued.record),
     ...(queued.replaced ? { replaced: queued.replaced } : {}),
   });
@@ -425,8 +534,10 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
  *
  * Windows sshd kills the children of a session when the session ends, so a
  * detached spawn there has to go through WMI, which creates the process outside
- * the session's job. If either route fails the work is run synchronously instead
- * and the reply says `detached: false` — a slow answer beats a lost one.
+ * the session's job. Linux can end a session's processes too, so the worker
+ * starts in a scope of the user's systemd manager wherever there is one. If
+ * the launch fails the work is run synchronously instead and the reply says
+ * `detached: false` — a slow answer beats a lost one.
  */
 function detachOperation(record) {
   return spawnDetached({ entry: fileURLToPath(new URL('./index.mjs', import.meta.url)), id: record.id, home: basePath() });
@@ -522,7 +633,6 @@ async function commandUpdate(config, flags, options) {
     to: result.to ?? null,
     op: result.op ? wireRecord(readOperation(result.opId)) : null,
     ...(result.verified !== undefined ? { verified: result.verified } : {}),
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -542,7 +652,6 @@ async function commandRestart(config, flags, options) {
   return mutationReply(result, {
     service: service.id,
     op: result.opId ? wireRecord(readOperation(result.opId)) : null,
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -563,17 +672,13 @@ async function commandBoot(config, positional, flags, options) {
     );
   }
 
-  if (flags.has('when-idle')) {
-    if (!target) return badArgument('boot --when-idle needs a target', { command: 'boot' });
-    return queueRequest({ kind: 'boot', target, flags, options, config });
-  }
+  if (flags.has('when-idle')) return queueRequest({ kind: 'boot', target, flags, options, config });
 
   const result = await runBoot(config, target, { ...operationOptions(flags, options), noReboot: flags.has('no-reboot') });
   return mutationReply(result, {
     target: result.target ?? target ?? null,
     armed: result.armed === true,
     op: result.opId ? wireRecord(readOperation(result.opId)) : null,
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -584,7 +689,6 @@ async function commandSleep(config, flags, options) {
   const result = await runSleep(config, operationOptions(flags, options));
   return mutationReply(result, {
     op: result.opId ? wireRecord(readOperation(result.opId)) : null,
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -601,10 +705,7 @@ async function commandRun(config, positional, flags, options) {
       { command: 'run', argument: id ?? null, accepts: known, error: `unknown action: ${id ?? '(none given)'}` },
     );
   }
-  if (flags.has('when-idle')) {
-    if (!id) return badArgument('run --when-idle needs an action id', { command: 'run' });
-    return queueRequest({ kind: 'run', actionId: id, flags, options, config });
-  }
+  if (flags.has('when-idle')) return queueRequest({ kind: 'run', actionId: id, flags, options, config });
 
   const shared = operationOptions(flags, options);
   if (flags.has('detach')) return detachedRun(config, { kind: 'run', actionId: id, ...shared });
@@ -616,7 +717,6 @@ async function commandRun(config, positional, flags, options) {
     output: result.output ?? '',
     detached: false,
     op: result.opId ? wireRecord(readOperation(result.opId)) : null,
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -715,7 +815,7 @@ function policyReply(config, serviceId, { message = null, changed = [] } = {}) {
       // client does not need one round trip per service to render the page.
       services: config.services.map((service) => ({
         id: service.id,
-        updates: policyUpdates(describeServiceUpdates(config, service, { state: serviceState(service, { readOnly: true }) }), service),
+        updates: policyUpdates(describeServiceUpdates(config, service), service),
       })),
     });
   }
@@ -725,9 +825,48 @@ function policyReply(config, serviceId, { message = null, changed = [] } = {}) {
   return ok({
     ...(message ? { message } : {}),
     service: serviceId,
-    updates: policyUpdates(describeServiceUpdates(config, service, { state: serviceState(service, { readOnly: true }) }), service),
+    updates: policyUpdates(describeServiceUpdates(config, service), service),
     autoUpdate: config.updates.automatic === true,
     changed,
+  });
+}
+
+/**
+ * Write a patch of the update policy into config.json, where the policy
+ * lives, the pause included. `policy set` and `auto-update` both write
+ * through this, so they cannot come to mean different things by the same
+ * setting. A service's policy is in its own updates block, where a null
+ * removes the key so the machine's value is inherited again. The machine's is
+ * in the top-level one, where there is nothing to inherit from, so a null
+ * clears the setting instead.
+ */
+function saveUpdatesPatch(serviceId, patch) {
+  return saveConfig((stored) => {
+    const next = { ...stored };
+    if (serviceId) {
+      const services = Array.isArray(next.services) ? next.services.map((entry) => ({ ...entry })) : [];
+      const index = services.findIndex((entry) => entry.id === serviceId);
+      if (index === -1) return next;
+      const updates = { ...(services[index].updates ?? {}) };
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === null) delete updates[key];
+        else updates[key] = value;
+      }
+      services[index] = { ...services[index], updates };
+      next.services = services;
+      return next;
+    }
+    const updates = { ...(next.updates ?? {}) };
+    for (const [key, value] of Object.entries(patch)) {
+      if (key === 'pauseUntil' && value === null) updates.pauseUntil = null;
+      else if (key === 'maintenanceWindows' && value === null) updates.maintenanceWindows = [];
+      else updates[key] = value;
+    }
+    next.updates = updates;
+    // The 2.x spelling is kept in step so an older client reading the file sees
+    // the same answer.
+    if ('automatic' in patch) next.autoUpdate = patch.automatic;
+    return next;
   });
 }
 
@@ -771,39 +910,7 @@ async function commandPolicy(config, positional, options) {
   const changed = Object.keys(patch);
   if (changed.length === 0) return policyReply(config, serviceId, { message: 'nothing in the patch changed anything' });
 
-  // A pause set from a client is operational, not a change to the document the
-  // machine's owner wrote, so it lands in state rather than rewriting config.json
-  // — except at the machine level, where there is no per-service state to hold it.
-  const saved = saveConfig((stored) => {
-    const next = { ...stored };
-    if (serviceId) {
-      const services = Array.isArray(next.services) ? next.services.map((entry) => ({ ...entry })) : [];
-      const index = services.findIndex((entry) => entry.id === serviceId);
-      if (index === -1) return next;
-      const updates = { ...(services[index].updates ?? {}) };
-      for (const [key, value] of Object.entries(patch)) {
-        if (value === null) delete updates[key];
-        else updates[key] = value;
-      }
-      services[index] = { ...services[index], updates };
-      next.services = services;
-      return next;
-    }
-    const updates = { ...(next.updates ?? {}) };
-    for (const [key, value] of Object.entries(patch)) {
-      // At the machine level there is nothing to inherit from, so a null clears
-      // the setting rather than meaning "inherit".
-      if (key === 'pauseUntil' && value === null) updates.pauseUntil = null;
-      else if (key === 'maintenanceWindows' && value === null) updates.maintenanceWindows = [];
-      else updates[key] = value;
-    }
-    next.updates = updates;
-    // The 2.x spelling is kept in step so an older client reading the file sees
-    // the same answer.
-    if ('automatic' in patch) next.autoUpdate = patch.automatic;
-    return next;
-  });
-
+  const saved = saveUpdatesPatch(serviceId, patch);
   if (!saved.ok) {
     return refuse(REASON.configInvalid, saved.error ?? 'the policy could not be written', {
       command: 'policy',
@@ -832,20 +939,7 @@ function commandAutoUpdate(config, positional, options) {
   if (serviceId && !config.services.some((service) => service.id === serviceId)) return missingService(config, serviceId);
 
   const apply = (patch, message) => {
-    const saved = saveConfig((stored) => {
-      const next = { ...stored };
-      if (serviceId) {
-        const services = Array.isArray(next.services) ? next.services.map((entry) => ({ ...entry })) : [];
-        const index = services.findIndex((entry) => entry.id === serviceId);
-        if (index === -1) return next;
-        services[index] = { ...services[index], updates: { ...(services[index].updates ?? {}), ...patch } };
-        next.services = services;
-        return next;
-      }
-      next.updates = { ...(next.updates ?? {}), ...patch };
-      if ('automatic' in patch) next.autoUpdate = patch.automatic;
-      return next;
-    });
+    const saved = saveUpdatesPatch(serviceId, patch);
     if (!saved.ok) {
       return refuse(REASON.configInvalid, saved.error ?? 'config.json could not be written', {
         command: 'auto-update',
@@ -934,7 +1028,7 @@ function commandHistory(config, options) {
   const service = options.get('service') ?? null;
   const kind = options.get('kind') ?? null;
   const records = listOperations({ limit, service, kind }).map((record) => deriveState(record, { systemId: config?.system.id ?? null }));
-  const retained = listOperations({ limit: 200 }).length;
+  const retained = countOperations();
   return ok({
     operations: records.map(summarize),
     limit,
@@ -1088,7 +1182,7 @@ async function commandConfig(positional, flags, options) {
   }
 
   try {
-    const stored = storeController(bytes, { id, revision, replace: flags.has('replace') });
+    const stored = storeController(bytes, { id, revision, replace: flags.has('replace'), restricted: isRestrictedSession() });
     if (!stored.ok) {
       log(`config set refused: ${stored.error}`, 'config');
       return refuse(stored.reasonCode ?? REASON.badArgument, stored.error, {
@@ -1100,6 +1194,9 @@ async function commandConfig(positional, flags, options) {
         // and only the second is a merge, so it always says which.
         ...(stored.reasonCode === REASON.controllerConflict ? { divergent: stored.divergent === true } : {}),
         ...(stored.current ? { current: stored.current } : {}),
+        // Why a document was refused, as paths a client can point at.
+        ...(stored.problems ? { problems: stored.problems } : {}),
+        ...(stored.launchChanges ? { launchChanges: stored.launchChanges } : {}),
         error: stored.error,
       });
     }
@@ -1121,6 +1218,8 @@ async function commandConfig(positional, flags, options) {
       revision: stored.meta.revision,
       source: stored.meta.source,
       ...(action === 'replaced' ? { replaced: true } : {}),
+      // Stored all the same: what a client can use but would say something about.
+      ...(stored.notes?.length > 0 ? { notes: stored.notes } : {}),
     });
   } finally {
     lock.lock.release();
@@ -1157,6 +1256,18 @@ async function commandBundle(loaded) {
 // Self-update
 // ---------------------------------------------------------------------------
 
+/**
+ * Point this process at the base the bootstrap install belongs to, which is
+ * the one it was unpacked into, before config.json or anything else is read
+ * from there. A refusal when the tree is not where an install has to run from.
+ */
+function settleBootstrapBase() {
+  const layout = resolveBootstrapLayout(import.meta.url, process.env.LEGIONCTL_HOME ?? null);
+  if (!layout.ok) return badArgument(layout.error, { command: 'self-update', argument: '--install' });
+  process.env.LEGIONCTL_HOME = layout.base;
+  return null;
+}
+
 async function commandSelfUpdate(config, flags, options) {
   const modes = ['check', 'rollback', 'install'].filter((flag) => flags.has(flag));
   if (modes.length > 1 || (flags.has('install') && (flags.has('stdin') || options.has('from')))) {
@@ -1168,7 +1279,7 @@ async function commandSelfUpdate(config, flags, options) {
   // Going below the installed agent or the version floor is a decision only an
   // unrestricted session makes (contract section 13). The dispatcher already
   // refuses the flag; this holds however else a restricted session got here.
-  if (flags.has('allow-downgrade') && process.env.LEGIONCTL_RESTRICTED === '1') {
+  if (flags.has('allow-downgrade') && isRestrictedSession()) {
     const message = 'self-update --allow-downgrade takes the agent below the installed one or the version floor, which a restricted key may not do';
     return refuse(REASON.restricted, message, { command: 'self-update', argument: '--allow-downgrade', error: message });
   }
@@ -1238,13 +1349,13 @@ async function commandSelfUpdate(config, flags, options) {
 /**
  * Open the record, hand it to a detached worker, and answer `accepted`.
  *
- * Every answer keeps the command's own shape (`queuedShape`), whatever it is,
+ * Every answer keeps the command's own shape (`commandShape`), whatever it is,
  * so a client decodes one thing per verb: `--detach` is a way of asking, not a
  * different reply.
  */
 async function detachedRun(config, { kind, service = null, target = null, actionId = null, opId, force, mode }) {
   const id = opId ?? newOperationId();
-  const shape = queuedShape(kind, { service, target, actionId });
+  const shape = commandShape(kind, { service, target, actionId });
   const opened = beginOperation({ id, kind, service, target, actionId, force, mode,
     systemId: config.system.id, detached: true, queueRequested: false });
   // An id already bound to another request is a bad --op (contract section 5.5).
@@ -1256,19 +1367,7 @@ async function detachedRun(config, { kind, service = null, target = null, action
   }
   if (opened.replay) {
     const existing = opened.record;
-    if (existing.state === 'finished') {
-      return mutationReply({ ...existing.result, action: existing.result?.action ?? 'failed' }, {
-        ...shape,
-        ...(kind === 'update' ? { from: existing.result?.from ?? null, to: existing.result?.to ?? null } : {}),
-        ...(kind === 'run' ? { exitCode: existing.result?.exitCode ?? null, output: existing.result?.output ?? '' } : {}),
-        op: wireRecord(existing), replayed: true,
-      });
-    }
-    // Still running: the client follows it exactly as it would `accepted`, and
-    // `accepted` would claim this request started it.
-    return mutationReply({ ok: true, action: 'already-running', reasonCode: REASON.alreadyRunning, detached: existing.detached === true,
-      message: `operation ${id} is already ${existing.state}; it was not started a second time` }, {
-      ...shape, op: wireRecord(existing), replayed: true });
+    return mutationReply(replayOf(existing), { ...commandShape(kind, { service, target, actionId }, existing.result), op: wireRecord(existing) });
   }
 
   updateOperation(id, { launchPendingUntil: new Date(Date.now() + 30000).toISOString() });
@@ -1283,10 +1382,54 @@ async function detachedRun(config, { kind, service = null, target = null, action
     updateOperation(id, { detached: false });
     return { synchronous: { id, kind, service, target, actionId, force, mode } };
   }
-  updateOperation(id, (record) => record.state === 'running' && record.pid === process.pid ? { pid: started.pid } : {});
+  // The worker started no later than now, which is what tells it from a later
+  // process given its id should it die before it claims the record.
+  updateOperation(id, (record) => record.state === 'running' && record.pid === process.pid
+    ? { pid: started.pid, ownerStartedAt: new Date().toISOString(), ownerStartTicks: processStartTicks(started.pid) }
+    : {});
   return mutationReply({ ok: true, action: 'accepted',
     message: `${kind} accepted as operation ${id}; ask "op ${id} --wait 20" for the result` }, {
     ...shape, detached: true, op: wireRecord(readOperation(id)) });
+}
+
+/**
+ * Do the work an opened record asks for, in this process, exactly as the
+ * request would have done it: what a detached worker does, and what a detach
+ * that could not start one falls back to. `record` is the record, or the
+ * request it was opened for. Null for a kind that is never run detached.
+ *
+ * A service or action removed from the setup since the request was made can
+ * no longer be run, and whoever holds the record is the only one left to end
+ * it: a refusal of its own would leave it running for good.
+ */
+async function runOpened(config, record) {
+  const shared = { existingOpId: record.id, force: record.force === true, noReboot: record.noReboot === true, mode: record.mode ?? 'manual' };
+  if (record.kind === 'update' || record.kind === 'restart') {
+    const service = config.services.find((entry) => entry.id === record.service);
+    if (!service) {
+      return finishUnrunnable(record.id, {
+        ok: false,
+        action: 'failed',
+        reasonCode: REASON.unknownService,
+        message: `the ${record.kind} names ${record.service}, which this machine no longer has`,
+      });
+    }
+    return record.kind === 'update' ? runUpdate(config, service, shared) : runRestart(config, service, shared);
+  }
+  if (record.kind === 'run') {
+    if (!config.actions.some((action) => action.id === record.actionId)) {
+      return finishUnrunnable(record.id, {
+        ok: false,
+        action: 'failed',
+        reasonCode: REASON.unknownAction,
+        message: `the run names the action ${record.actionId}, which this machine no longer has`,
+      });
+    }
+    return runAction(config, record.actionId, shared);
+  }
+  if (record.kind === 'boot') return runBoot(config, record.target, shared);
+  if (record.kind === 'sleep') return runSleep(config, shared);
+  return null;
 }
 
 /** The detached worker. Never called by a client. */
@@ -1296,21 +1439,8 @@ async function commandOpRun(config, positional) {
   const record = readOperation(id);
   if (!record) return badArgument(`there is no operation ${id}`, { command: 'op-run' });
 
-  const shared = { existingOpId: id, force: record.force === true, noReboot: record.noReboot === true, mode: record.mode ?? 'manual' };
-  let result;
-  if (record.kind === 'update' || record.kind === 'restart') {
-    const service = config.services.find((entry) => entry.id === record.service);
-    if (!service) return missingService(config, record.service);
-    result = record.kind === 'update' ? await runUpdate(config, service, shared) : await runRestart(config, service, shared);
-  } else if (record.kind === 'run') {
-    result = await runAction(config, record.actionId, shared);
-  } else if (record.kind === 'boot') {
-    result = await runBoot(config, record.target, shared);
-  } else if (record.kind === 'sleep') {
-    result = await runSleep(config, shared);
-  } else {
-    return badArgument(`a ${record.kind} operation cannot be run detached`, { command: 'op-run' });
-  }
+  const result = await runOpened(config, record);
+  if (!result) return badArgument(`a ${record.kind} operation cannot be run detached`, { command: 'op-run' });
   return mutationReply(result, { op: wireRecord(readOperation(id)) });
 }
 
@@ -1353,27 +1483,12 @@ async function commandVersion(flags, loaded) {
     // cannot start is exactly what this catches, while the working agent is
     // still in place — which is why self-update runs it on the staged tree
     // before swapping anything.
-    const modules = [
-      'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'boot.mjs', 'config.mjs', 'contract.mjs', 'controller.mjs',
-      'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
-      'operate.mjs', 'operations.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
-      'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs',
-      'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'scheduler.mjs',
-      'selfupdate.mjs', 'service.mjs', 'state.mjs', 'status.mjs', 'trust.mjs', 'update.mjs',
-    ];
-    const failed = [];
-    let loadedCount = 0;
-    for (const name of modules) {
-      try {
-        await import(`./${name}`);
-        loadedCount += 1;
-      } catch (err) {
-        failed.push(`${name}: ${err.message}`);
-      }
-    }
+    const imported = await importModules();
+    const failed = imported.failed;
+    let loadedCount = imported.loaded;
     const workers = checkWorkerModules(fileURLToPath(new URL('.', import.meta.url)));
     if (!workers.ok) failed.push(`worker modules: ${workers.error}`);
-    else loadedCount += 2;
+    else loadedCount += WORKER_ENTRIES.length;
     // The version every reply carries comes from package.json. A tree that
     // cannot say which version it is must not replace one that can.
     if (AGENT_METADATA_PROBLEM) failed.push(`package.json: ${AGENT_METADATA_PROBLEM}`);
@@ -1390,59 +1505,13 @@ async function commandVersion(flags, loaded) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-async function dispatch(command, positional, flags, options, loaded) {
-  const config = loaded.config;
-  switch (command) {
-    case 'status':
-      return commandStatus(loaded, options);
-    case 'busy':
-      return commandBusy(config, options);
-    case 'update':
-      return commandUpdate(config, flags, options);
-    case 'restart':
-      return commandRestart(config, flags, options);
-    case 'boot':
-      return commandBoot(config, positional, flags, options);
-    case 'sleep':
-      return commandSleep(config, flags, options);
-    case 'run':
-      return commandRun(config, positional, flags, options);
-    case 'cycle':
-      return commandCycle(config, flags, options);
-    case 'auto-update':
-      return commandAutoUpdate(config, positional, options);
-    case 'policy':
-      return commandPolicy(config, positional, options);
-    case 'op':
-      return commandOp(config, positional, options);
-    case 'cancel':
-      return commandCancel(positional);
-    case 'history':
-      return commandHistory(config, options);
-    case 'logs':
-      return commandLogs(options);
-    case 'doctor':
-      return commandDoctor(loaded, flags, options);
-    case 'bundle':
-      return commandBundle(loaded);
-    case 'config':
-      return commandConfig(positional, flags, options);
-    case 'self-update':
-      return commandSelfUpdate(config, flags, options);
-    case 'op-run':
-      return commandOpRun(config, positional);
-    case 'version':
-      return commandVersion(flags, loaded);
-    case 'help':
-      return { payload: wrap(helpPayload(null)), exitCode: 0 };
-    default:
-      return refuse(REASON.badArgument, `unknown command: ${command}`, {
-        command,
-        argument: command,
-        accepts: Object.keys(COMMANDS).filter((name) => !COMMANDS[name].internal),
-        error: `unknown command: ${command}`,
-      });
-  }
+function unknownCommand(command) {
+  return refuse(REASON.badArgument, `unknown command: ${command}`, {
+    command,
+    argument: command,
+    accepts: Object.keys(COMMANDS).filter((name) => !COMMANDS[name].internal),
+    error: `unknown command: ${command}`,
+  });
 }
 
 /**
@@ -1453,11 +1522,7 @@ async function dispatch(command, positional, flags, options, loaded) {
  */
 function mutatingInvocation(command, positional, flags) {
   if (flags.has('help')) return false;
-  if (['update', 'restart', 'boot', 'sleep', 'run', 'cancel', 'auto-update'].includes(command)) return true;
-  if (command === 'cycle') return !flags.has('dry-run');
-  if (command === 'self-update') return !flags.has('check');
-  if (['config', 'policy', 'service-config'].includes(command)) return positional[0] === 'set';
-  return false;
+  return commandNamed(command)?.changes?.(positional, flags) === true;
 }
 
 /** Whether the reply being built answers a mutating invocation, for the last-resort handler in main(). */
@@ -1487,15 +1552,8 @@ async function answer(command, positional, flags, options) {
     return { payload: wrap(helpPayload(command ? null : 'no command given')), exitCode: command ? 0 : 1 };
   }
 
-  const meta = COMMANDS[command];
-  if (!meta) {
-    return refuse(REASON.badArgument, `unknown command: ${command}`, {
-      command,
-      argument: command,
-      accepts: Object.keys(COMMANDS).filter((name) => !COMMANDS[name].internal),
-      error: `unknown command: ${command}`,
-    });
-  }
+  const meta = commandNamed(command);
+  if (!meta) return unknownCommand(command);
 
   const unknownFlag = [...flags].find((flag) => flag !== 'help' && !meta.flags.includes(flag));
   const unknownOption = [...options.keys()].find((option) => !meta.options.includes(option));
@@ -1511,24 +1569,14 @@ async function answer(command, positional, flags, options) {
   const invalid = validateArguments(command, positional, options);
   if (invalid) return invalid;
 
-  // Administrative documents can contain private command arguments. This path
-  // enforces restricted-session refusal before config loading or input reads,
-  // and owns its read-only validation and locked compare-and-swap itself.
-  if (command === 'service-config') {
-    const result = await commandServiceConfig(positional, flags);
-    return { payload: wrap(result), exitCode: result.ok ? 0 : 1 };
-  }
+  if (meta.beforeConfig) return meta.run({ positional, flags, options });
 
-  const bootstrapInstall = command === 'self-update' && flags.has('install');
-  if (bootstrapInstall) {
-    const layout = resolveBootstrapLayout(import.meta.url, process.env.LEGIONCTL_HOME ?? null);
-    if (!layout.ok) return badArgument(layout.error, { command: 'self-update', argument: '--install' });
-    process.env.LEGIONCTL_HOME = layout.base;
-  }
+  const prepared = meta.prepare?.({ positional, flags, options }) ?? null;
+  if (prepared) return prepared;
 
   // Everything except version and help touches a real machine, so refuse early
   // and clearly on a platform this agent was never written for.
-  if (!isSupportedPlatform() && command !== 'version' && command !== 'help') {
+  if (!isSupportedPlatform() && !meta.anyPlatform) {
     return refuse(
       REASON.unsupportedPlatform,
       `legionctl runs on linux, windows and mac only; this host reports ${JSON.stringify(process.platform)}`,
@@ -1536,19 +1584,14 @@ async function answer(command, positional, flags, options) {
     );
   }
 
-  // Read-only commands promise to change nothing, including the last-good copy.
-  const controllerRead = command === 'config' && positional[0] !== 'set';
-  const bundleCheck = command === 'self-update' && flags.has('check');
-  const readOnlyInvocation = !meta.mutates || controllerRead || bundleCheck ||
-    (command === 'policy' && positional[0] === undefined) ||
-    (command === 'cycle' && flags.has('dry-run'));
-  const loaded = loadConfig({ readOnly: readOnlyInvocation });
+  // Read-only invocations promise to change nothing, including the last-good copy.
+  const loaded = loadConfig({ readOnly: meta.readOnly?.(positional, flags) ?? !meta.mutates });
   if (loaded.config) systemIdentity = loaded.config.system;
 
   // A machine whose configuration cannot be read can still be inspected, and
   // every inspection says why the rest is refused. Nothing that would change it
   // runs on a configuration nobody can read.
-  if (meta.mutates && !controllerRead && !bundleCheck && !loaded.ok && !bootstrapInstall) {
+  if (meta.mutates && !loaded.ok && !meta.withoutConfig?.(positional, flags)) {
     const problems = loaded.problems ?? [];
     // The file is there and unusable. `config-missing` is reserved for a machine
     // that has no config at all, and that machine is inert rather than broken —
@@ -1567,28 +1610,15 @@ async function answer(command, positional, flags, options) {
     );
   }
 
-  const result = await dispatch(command, positional, flags, options, loaded);
+  const result = await meta.run({ config: loaded.config, loaded, positional, flags, options });
 
   // A detach that could not spawn falls back to doing the work here, so the
   // caller gets a real answer rather than a promise nobody will keep. It keeps
   // the command's own shape, like every other answer to it.
   if (result.synchronous) {
     const fallback = result.synchronous;
-    const shared = { existingOpId: fallback.id, force: fallback.force, mode: fallback.mode };
-    let ran;
-    if (fallback.kind === 'update' || fallback.kind === 'restart') {
-      const service = loaded.config.services.find((entry) => entry.id === fallback.service);
-      ran = fallback.kind === 'update' ? await runUpdate(loaded.config, service, shared) : await runRestart(loaded.config, service, shared);
-    } else {
-      ran = await runAction(loaded.config, fallback.actionId, shared);
-    }
-    return mutationReply(ran, {
-      ...queuedShape(fallback.kind, fallback),
-      ...(fallback.kind === 'update' ? { from: ran.from ?? null, to: ran.to ?? null } : {}),
-      ...(fallback.kind === 'run' ? { exitCode: ran.exitCode ?? null, output: ran.output ?? '' } : {}),
-      detached: false,
-      op: wireRecord(readOperation(fallback.id)),
-    });
+    const ran = await runOpened(loaded.config, fallback);
+    return mutationReply(ran, { ...commandShape(fallback.kind, fallback, ran), detached: false, op: wireRecord(readOperation(fallback.id)) });
   }
 
   return result;
@@ -1602,6 +1632,9 @@ async function answer(command, positional, flags, options) {
  * the same execute() an ordinary session uses.
  */
 async function commandDispatch() {
+  // Only a restricted key arrives here, so its reply is redacted whether or
+  // not the forced command said so, a refusal included.
+  process.env.LEGIONCTL_RESTRICTED = '1';
   const line = process.env.SSH_ORIGINAL_COMMAND ?? '';
   const authorized = authorize(line);
   if (!authorized.ok) {
@@ -1621,17 +1654,22 @@ async function commandDispatch() {
     }
     return refused;
   }
-  process.env.LEGIONCTL_RESTRICTED = '1';
   return execute(authorized.argv);
 }
 
 async function main() {
+  // Every powershell.exe this agent starts inherits this, and one that finds
+  // PowerShell 7's module folders first cannot load the modules it needs.
+  if (process.platform === 'win32' && process.env.PSModulePath) {
+    process.env.PSModulePath = windowsPowerShellModulePath(process.env.PSModulePath);
+  }
   const argv = process.argv.slice(2);
   const { payload, exitCode } = argv[0] === 'dispatch' ? await commandDispatch() : await execute(argv);
   emit(payload, exitCode);
 }
 
-main().catch((error) => {
+/** The reply to a failure nothing else caught: internal, and unknown for a mutation. */
+function emitUnexpected(error) {
   const message = error?.stack ? String(error.stack).split('\n')[0] : String(error);
   log(`unhandled failure: ${message}`, 'main');
   emit(
@@ -1649,4 +1687,34 @@ main().catch((error) => {
     },
     1,
   );
-});
+}
+
+// stdout and stderr are pipes to an ssh session, and the other end can go at
+// any moment: a client that gave up, a phone that slept. Writing to a closed
+// pipe fails asynchronously with EPIPE, and an `error` event nobody listens for
+// ends the process there and then, which used to kill the agent half way
+// through a rollback for the sake of a progress line. The reply cannot reach a
+// reader who has gone, and the work is worth finishing anyway.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on('error', () => { /* the reader has gone; the log still has everything */ });
+}
+
+// Anything thrown where main() cannot catch it still gets its one reply. The
+// process then ends as soon as that reply is written: the state such a failure
+// leaves behind is unknown, and a mutation in progress is better left to
+// recovery than continued on it. process.exit() would drop whatever stdout has
+// not yet written to its pipe, so it waits for that first.
+function failUnexpectedly(error) {
+  emitUnexpected(error);
+  const exit = () => process.exit();
+  setTimeout(exit, 2000).unref();
+  try {
+    process.stdout.write('', exit);
+  } catch {
+    exit();
+  }
+}
+process.on('uncaughtException', failUnexpectedly);
+process.on('unhandledRejection', failUnexpectedly);
+
+main().catch(emitUnexpected);

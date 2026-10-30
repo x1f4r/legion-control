@@ -8,22 +8,24 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentBundle
 import com.x1f4r.legioncontrol.agent.SignedTarball
-import com.x1f4r.legioncontrol.agent.AgentAction
+import com.x1f4r.legioncontrol.agent.HelperState
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.Contract
+import com.x1f4r.legioncontrol.agent.AgentStatus
 import com.x1f4r.legioncontrol.agent.ControllerFetch
 import com.x1f4r.legioncontrol.agent.Machine
-import com.x1f4r.legioncontrol.agent.SetupDecision
+import com.x1f4r.legioncontrol.agent.SetupPeerState
 import com.x1f4r.legioncontrol.agent.SetupProvenance
-import com.x1f4r.legioncontrol.agent.decideFromMeta
-import com.x1f4r.legioncontrol.agent.decideFromStatus
-import com.x1f4r.legioncontrol.agent.provenanceOf
-import com.x1f4r.legioncontrol.agent.shouldAskForMeta
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.DocumentProblem
 import com.x1f4r.legioncontrol.data.EXAMPLE_CONTROLLER_CONFIG
 import com.x1f4r.legioncontrol.data.KeyChange
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
+import com.x1f4r.legioncontrol.data.LaunchValues
 import com.x1f4r.legioncontrol.agent.SetupChangePreview
 import com.x1f4r.legioncontrol.data.SetupMerge
+import com.x1f4r.legioncontrol.data.SetupDivergence
+import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.endpointCount
 import com.x1f4r.legioncontrol.data.machineIds
@@ -32,6 +34,7 @@ import com.x1f4r.legioncontrol.data.sameMachine
 import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.data.advisories
 import com.x1f4r.legioncontrol.data.SiteConfig
+import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.net.SiteMatch
 import com.x1f4r.legioncontrol.net.matchSite
 import kotlinx.coroutines.CancellationException
@@ -39,11 +42,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.util.concurrent.ConcurrentHashMap
+import java.time.Instant
 
 /**
  * The app, which is a list of machines, a shared setup, and this phone.
@@ -65,25 +71,34 @@ class AppModel(
     private val remembered: RememberedSettings,
     private val bindings: com.x1f4r.legioncontrol.data.BindingsStore,
     private val notifications: NotificationSettings,
+    /** Held by every change while it is sent or followed, which keeps the process running. */
+    keepAlive: KeepAlive,
 ) {
     private val app = context.applicationContext
 
     /**
      * The scope changes run on.
      *
-     * Deliberately not tied to the screen. Polling stops when the app is put away; an update that
-     * was asked for does not, because locking the phone is not withdrawing the request. A failure
-     * nothing caught is logged rather than allowed to end the process.
+     * Deliberately not tied to the screen, and never cancelled: this model belongs to the process.
+     * Polling stops when the app is put away; an update that was asked for does not, because locking
+     * the phone is not withdrawing the request. A failure nothing caught is logged rather than
+     * allowed to end the process.
      */
     private val scope =
         CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler("AppModel"))
     private var clockJob: Job? = null
     private var polling = false
 
-    private val notifier = AndroidOperationNotifier(app) { notifications.enabled }
+    /**
+     * Whether the screen is in front of somebody: between the activity's resume and pause, which is
+     * also exactly when it polls. A change that ends now is told by the page, not by a notification.
+     */
+    val inFront: Boolean get() = polling
+
+    private val notifier = AndroidOperationNotifier(app, enabled = { notifications.enabled }, inFront = { inFront })
 
     /** Every change this app has asked for, across launches. */
-    val operations = OperationCenter(services.operations, scope, notifier)
+    val operations = OperationCenter(services.operations, scope, notifier, keepAlive)
 
     var machines: List<MachineModel> by mutableStateOf(emptyList())
         private set
@@ -109,7 +124,14 @@ class AppModel(
     /** Where this device is standing, and how sure that is. */
     var siteMatch: SiteMatch by mutableStateOf(SiteMatch.NoSites)
         private set
-    private var addresses: List<String> = emptyList()
+
+    /**
+     * This device's candidate addresses, each with its network (contract section 10.1). Read by
+     * every placement: the site line, route order and the wake plan, which is worked out again from
+     * these immediately before every wake.
+     */
+    var addresses: List<LocalAddress> by mutableStateOf(emptyList())
+        private set
 
     /** The signed agent bundle this build carries, once it has been checked. */
     var agentBundle: SignedTarball? by mutableStateOf(null)
@@ -120,7 +142,7 @@ class AppModel(
         private set
 
     /** The setup editor, which every peer has. */
-    val editor = SetupEditorModel(services, bindings)
+    val editor = SetupEditorModel(services)
 
     /** What is in the raw configuration field, which is not in force until Apply says so. */
     var configDraft: String by mutableStateOf(services.configText.value)
@@ -155,8 +177,11 @@ class AppModel(
 
     private data class Handover(val line: String, val at: Long)
 
-    /** Machines whose setup this device is currently publishing to, so nothing is pushed twice. */
-    private val publishing = ConcurrentHashMap.newKeySet<String>()
+    /** Setup sync with every machine: what to send, when, and what to take (contract section 9.5). */
+    private val sync = SetupPeerSync(services)
+
+    /** Why the setup is not being sent to each machine, by machine id, while it is not. Drawn from. */
+    private val holds = mutableStateMapOf<String, String>()
 
     val hasMachines: Boolean get() = machines.isNotEmpty()
 
@@ -186,15 +211,30 @@ class AppModel(
 
     val sites: List<SiteConfig> get() = services.config.value?.sites.orEmpty()
 
-    /** Warnings about the setup that are worth showing and are never a reason to refuse it. */
+    /**
+     * Warnings about the setup that are worth showing and are never a reason to refuse it: what
+     * contract section 9.7 says this app cannot use, and what this app says beside it.
+     */
     val advisories: List<String>
-        get() = services.config.value?.advisories().orEmpty()
+        get() = services.acceptance.value?.warnings.orEmpty().map { it.message } +
+            services.config.value?.advisories().orEmpty()
+
+    /**
+     * What is wrong with the document in force, when an earlier build stored one this one would
+     * refuse. It stays in force; nothing is published and no machine an error is inside is driven
+     * until it is fixed in the editor.
+     */
+    val setupErrors: List<DocumentProblem>
+        get() = services.acceptance.value?.errors.orEmpty()
+
+    /** Why this device's setup cannot replace another machine's copy, or null when it can. */
+    val replaceProblem: String? get() = whyNotReplace(setupErrors)
 
     private val fleet = object : FleetContext {
         override val machines: List<Machine> get() = clients.map { it.machine }
         override val sites: List<SiteConfig> get() = this@AppModel.sites
-        override val siteMatch: SiteMatch get() = this@AppModel.siteMatch
-        override val localAddresses: List<String> get() = addresses
+        override val localAddresses: List<LocalAddress> get() = addresses
+        override val currentSite: String? get() = bindings.bindings.value.currentSite
         override val deviceName: String get() = services.deviceName()
         override val agentBundle: SignedTarball? get() = this@AppModel.agentBundle
         override val agentBundleProblem: String? get() = this@AppModel.agentBundleProblem
@@ -202,14 +242,11 @@ class AppModel(
         override fun client(machineId: String): MachineClient? =
             clients.firstOrNull { it.machine.id == machineId }
 
-        override fun helperAwake(machineId: String): Boolean? =
-            this@AppModel.machines.firstOrNull { it.machine.id == machineId }?.let { model ->
-                model.isAwake.takeIf { model.lastChecked != null }
-            }
+        override fun helperState(machineId: String): HelperState =
+            this@AppModel.machines.firstOrNull { it.machine.id == machineId }?.helperState ?: HelperState.UNKNOWN
 
-        override fun action(machineId: String, actionId: String): AgentAction? =
-            this@AppModel.machines.firstOrNull { it.machine.id == machineId }
-                ?.actions?.firstOrNull { it.id == actionId }
+        override suspend fun readHelper(machineId: String): HelperState =
+            this@AppModel.machines.firstOrNull { it.machine.id == machineId }?.readForWake() ?: HelperState.UNKNOWN
 
         override fun forgetRoute(machineId: String) = services.forgetRoute(machineId)
 
@@ -222,12 +259,18 @@ class AppModel(
     }
 
     private val setup = object : SetupSync {
+        override fun state(machineId: String): SetupPeerState = sync.state(machineId)
+
         override suspend fun reconcile(
             client: MachineClient,
-            reportedHash: String?,
-            speaksV3: Boolean,
-            asked: MutableSet<String>,
-        ): String? = reconcileSetup(client, reportedHash, speaksV3, asked)
+            reply: AgentStatus,
+            localMutation: Boolean,
+            state: SetupPeerState,
+        ): String? = try {
+            sync.reconcile(client, reply, localMutation, state)
+        } finally {
+            noteHold(client.machine.id)
+        }
 
         override fun remember(machineId: String, line: String) {
             handovers[machineId] = Handover(line, System.currentTimeMillis())
@@ -235,14 +278,33 @@ class AppModel(
 
         override fun noteFor(machineId: String, now: Long): String? =
             handovers[machineId]?.takeIf { now - it.at < HANDOVER_NOTE_MS }?.line
+
+        override fun holdFor(machineId: String): String? = holds[machineId]
+
+        override fun retry(machineId: String) {
+            sync.retry(machineId)
+            noteHold(machineId)
+        }
+    }
+
+    /** Copies one machine's hold into what the screen draws from. */
+    private fun noteHold(machineId: String) {
+        val hold = sync.hold(machineId)
+        if (hold == null) holds.remove(machineId) else holds[machineId] = hold
     }
 
     init {
+        // Machines are rebuilt from what the gate lets this device run, which changes with the
+        // document and with every approval. The editor and the raw field follow the document alone:
+        // approving a command must not throw away an edit somebody is halfway through.
         scope.launch {
-            services.config.collect { configuration ->
-                rebuild(configuration?.let { services.clients(it) } ?: emptyList())
+            services.launch.collect { gated ->
+                rebuild(gated.config?.let { services.clients(gated) } ?: emptyList())
                 recomputeSite()
             }
+        }
+        scope.launch {
+            services.config.collect { followDocument() }
         }
         scope.launch {
             services.networkAddresses().collect { current ->
@@ -348,9 +410,20 @@ class AppModel(
         clockJob = null
     }
 
-    fun close() {
-        stopPolling()
-        scope.cancel()
+    /**
+     * The machine a tapped notification asked to show, until the screen has moved to it. Only ever a
+     * machine this setup has: the id comes in on an intent, which anything on the phone can send.
+     */
+    var requestedMachine: String? by mutableStateOf(null)
+        private set
+
+    fun openMachine(machineId: String) {
+        if (machines.any { it.machine.id == machineId }) requestedMachine = machineId
+    }
+
+    /** The screen is on the requested machine's page now. */
+    fun openedMachine() {
+        requestedMachine = null
     }
 
     fun refreshAll() {
@@ -363,142 +436,16 @@ class AppModel(
 
     // MARK: - The setup
 
-    /**
-     * R1, for one machine, run on every successful poll.
-     *
-     * Two things happen without asking and both are along strict descent. Everything else either
-     * costs one `config meta` round trip or stops at a person, and neither ever happens twice for
-     * the same copy.
-     */
-    private suspend fun reconcileSetup(
-        client: MachineClient,
-        reportedHash: String?,
-        speaksV3: Boolean,
-        asked: MutableSet<String>,
-    ): String? {
-        val applied = services.provenance.value
-        val name = client.machine.name
-
-        return when (val decision = decideFromStatus(reportedHash, applied, speaksV3)) {
-            SetupDecision.InSync -> null
-
-            is SetupDecision.CannotCarry -> null
-
-            is SetupDecision.Push -> publish(client, decision.reason)
-
-            SetupDecision.AskForMeta -> {
-                if (applied == null) return fetchAndAdopt(client, reportedHash)
-                if (!shouldAskForMeta(reportedHash, applied.hash, asked)) return null
-                reportedHash?.let(asked::add)
-
-                val meta = client.configMeta().getOrNull()?.meta
-                if (meta == null) {
-                    // Nothing was learned, so nothing is remembered as asked: a round trip that
-                    // failed says nothing about the document and is worth repeating.
-                    reportedHash?.let(asked::remove)
-                    return null
-                }
-                val held = SetupProvenance(
-                    authority = meta.id,
-                    revision = meta.revision,
-                    hash = meta.hash ?: reportedHash,
-                    lineage = meta.lineage.orEmpty(),
-                    updatedAt = meta.updatedAt,
-                    sourceKind = meta.source,
-                    device = meta.device,
-                    readFrom = name,
-                )
-                when (val settled = decideFromMeta(held, applied)) {
-                    SetupDecision.InSync -> null
-                    is SetupDecision.Push -> publish(client, settled.reason)
-                    is SetupDecision.Adopt -> fetchAndAdopt(client, held.hash)
-                    is SetupDecision.DifferentSetup -> {
-                        val text = fetchText(client) ?: return null
-                        services.recordIdentityClash(name, settled.reason, text, held)
-                        "$name is carrying a different setup. It is waiting for a decision."
-                    }
-
-                    is SetupDecision.Diverged -> {
-                        val text = fetchText(client) ?: return null
-                        services.recordDivergence(name, settled.reason, text, held)
-                        "$name has a copy of the setup that was edited separately. " +
-                            "It is waiting to be merged."
-                    }
-
-                    SetupDecision.AskForMeta, is SetupDecision.CannotCarry -> null
-                }
-            }
-
-            is SetupDecision.Adopt -> fetchAndAdopt(client, reportedHash)
-            is SetupDecision.DifferentSetup, is SetupDecision.Diverged -> null
-        }
-    }
-
-    /**
-     * Publishes this device's copy to one machine.
-     *
-     * At most one attempt per machine at a time, and never while a change is running on it: the
-     * machine's own lock would refuse it anyway, and hammering it for the privilege is noise.
-     */
-    private suspend fun publish(client: MachineClient, reason: String): String? {
-        val document = services.document.value ?: return null
-        val identity = document.identity ?: return null
-        val machineId = client.machine.id
-        if (!publishing.add(machineId)) return null
-        return try {
-            client.configSet(
-                canonicalDocument = document.canonicalText,
-                setupId = identity.id,
-                revision = identity.revision,
-                replace = false,
-            ).fold(
-                onSuccess = { reply ->
-                    when {
-                        reply.unchanged -> null
-                        reply.stored -> "The setup was sent to ${client.machine.name}. $reason"
-                        else -> "${client.machine.name} would not take the setup: " +
-                            (reply.message ?: reply.reason?.sentence ?: "it refused it")
-                    }
-                },
-                onFailure = { failure ->
-                    // A push whose reply was lost is byte-identical when it is tried again and the
-                    // agent answers `noop`, so there is nothing to recover here: the next poll does
-                    // it. Nothing is reported for an ordinary unreachable machine.
-                    if (failure.dispatchStage.mayHaveRun) {
-                        "The setup may or may not have reached ${client.machine.name}. " +
-                            "The next check settles it."
-                    } else {
-                        null
-                    }
-                },
-            )
-        } finally {
-            publishing.remove(machineId)
-        }
-    }
-
-    private suspend fun fetchText(client: MachineClient): String? =
-        (client.fetchSetup().getOrNull() as? ControllerFetch.Document)?.text
-
-    /** The machine has a newer copy of the same setup, so take it. */
-    private suspend fun fetchAndAdopt(client: MachineClient, expectedHash: String?): String? {
-        val text = fetchText(client) ?: return null
-        return when (val outcome = services.adoptFromMachine(text, expectedHash, client.machine.name)) {
-            is SetupOutcome.Applied -> "Setup updated from ${client.machine.name}."
-            SetupOutcome.Unchanged -> null
-            is SetupOutcome.Invalid ->
-                "${client.machine.name} is carrying a setup this app cannot use. ${outcome.reason}"
-
-            is SetupOutcome.Diverged, is SetupOutcome.DifferentSetup -> null
-        }
-    }
-
     fun applyConfig() {
+        // Shown once, as section 9.5 asks: a document that named no setup is given an id here.
+        val named = ControllerDocument.parse(configDraft).getOrNull()?.setupId != null
         val failure = services.applyPasted(configDraft, services.deviceName())
         configError = failure
         configNote = if (failure == null) {
             draftMatchesApplied = true
-            "The setup is in force and will be sent to every machine that will take it."
+            val assigned = services.provenance.value?.authority?.takeUnless { named }
+            "The setup is in force and will be sent to every machine that will take it." +
+                (assigned?.let { " It was given the setup id $it." } ?: "")
         } else {
             null
         }
@@ -517,22 +464,20 @@ class AppModel(
             "hardware address and agent paths in it before applying it."
     }
 
-    /** Takes the other side of a divergence wholesale. */
+    /**
+     * Take theirs: the other side's verified bytes, unchanged, over the document this screen was
+     * built against and no other.
+     */
     fun takeTheirs() {
         val divergence = divergence ?: return
-        val failure = services.adoptDivergent(divergence)
-        configError = failure
-        if (failure == null) configNote = "Took the copy from ${divergence.machineName}."
+        settled(services.adoptDivergent(divergence)) { "Took the copy from ${divergence.machineName}." }
     }
 
     /** Keeps this device's copy, as a revision that descends from both so every machine takes it. */
     fun keepMine() {
         val divergence = divergence ?: return
-        val failure = services.keepMineOver(divergence, services.deviceName())
-        configError = failure
-        if (failure == null) {
-            configNote = "Kept this device's setup. It will be sent to every machine."
-        }
+        val choices = divergenceDifferences().associate { it.entry to SetupMerge.Choice.MINE }
+        mergeAndApply(divergence, choices) { "Kept this device's setup. It will be sent to every machine." }
     }
 
     fun dismissDivergence() = services.clearDivergence()
@@ -543,46 +488,112 @@ class AppModel(
     val mergeChoices = mutableStateMapOf<String, SetupMerge.Choice>()
 
     /**
-     * What the two sides disagree about, at the granularity somebody can decide from.
+     * The two hashes [mergeChoices] were made for. A choice about one copy says nothing about
+     * another, so the choices start again from the defaults whenever the question on screen is a
+     * different one.
+     */
+    private var choicesFor: String? = null
+
+    /**
+     * Why Merge and Keep mine cannot be offered for the divergence on screen, or null: this device's
+     * copy has an error that leaves its entries undefined, and is fixed in the editor first. Take
+     * theirs is always offered.
+     */
+    val mergeBlocked: String?
+        get() {
+            divergence ?: return null
+            val mine = services.document.value ?: return "There is no setup here to merge."
+            return SetupMerge.mineBlocks(mine.canonicalText)
+        }
+
+    /**
+     * What the two sides disagree about, at the granularity somebody can decide from (contract
+     * section 9.8).
      *
-     * The base is the newest revision both were made from, when this device still has a copy of it.
-     * With it, an entry only one side touched needs no answer at all; without it, every difference
-     * is a two-way choice, which is a worse afternoon rather than a wrong answer.
+     * The base is the newest revision both were made from, when this device still has a copy of it
+     * that hashes to it. With it, an entry only one side touched needs no answer at all; without it,
+     * every difference is a two-way choice, which is a worse afternoon rather than a wrong answer.
      */
     fun divergenceDifferences(): List<SetupMerge.Difference> {
         val divergence = divergence ?: return emptyList()
-        val mine = services.document.value?.root ?: return emptyList()
-        val theirs = ControllerDocument.parse(divergence.theirText).getOrNull()?.root
-            ?: return emptyList()
-        val base = divergence.baseHash
-            ?.let(services::revision)
-            ?.let { ControllerDocument.parse(it).getOrNull()?.root }
-        val differences = SetupMerge.differences(mine, theirs, base)
-        if (mergeChoices.isEmpty()) mergeChoices.putAll(SetupMerge.defaults(differences))
+        val mine = services.document.value ?: return emptyList()
+        val differences = try {
+            SetupMerge.differences(mine.canonicalText, divergence.theirText, baseOf(divergence))
+        } catch (refused: SetupMerge.Unmergeable) {
+            return emptyList()
+        }
+        val question = "${mine.hash} ${divergence.theirProvenance.hash}"
+        if (choicesFor != question) {
+            mergeChoices.clear()
+            choicesFor = question
+        }
+        if (mergeChoices.isEmpty()) differences.forEach { mergeChoices[it.entry] = it.defaultChoice }
         return differences
     }
 
-    fun chooseMerge(path: String, choice: SetupMerge.Choice) {
-        mergeChoices[path] = choice
+    fun chooseMerge(entry: String, choice: SetupMerge.Choice) {
+        mergeChoices[entry] = choice
     }
 
     /** Writes one revision made from both, which every machine takes as an ordinary fast-forward. */
     fun applyMerge() {
         val divergence = divergence ?: return
-        val mine = services.document.value?.root ?: return
-        val theirs = ControllerDocument.parse(divergence.theirText).getOrNull()?.root ?: return
         // Make sure the defaults exist even if the screen was never scrolled through.
         divergenceDifferences()
-        val merged = SetupMerge.merge(mine, theirs, mergeChoices.toMap())
-        val failure = services.applyMerge(
-            ControllerDocument.of(merged),
-            divergence.theirProvenance,
-            services.deviceName(),
-        )
-        configError = failure
-        if (failure == null) {
+        mergeAndApply(divergence, mergeChoices.toMap()) { "Merged. The result is on its way to every machine." }
+    }
+
+    private fun mergeAndApply(divergence: SetupDivergence, choices: Map<String, SetupMerge.Choice>, done: () -> String) {
+        val mine = services.document.value ?: return
+        val outcome = try {
+            SetupMerge.merge(
+                baseText = baseOf(divergence),
+                mineText = mine.canonicalText,
+                theirsText = divergence.theirText,
+                mineHash = mine.hash,
+                theirsHash = divergence.theirProvenance.hash ?: return,
+                writer = SetupMerge.Writer(ControllerDocument.CLIENT_KIND, services.deviceName(), Instant.now().toString()),
+                choices = choices,
+            )
+        } catch (refused: SetupMerge.Unmergeable) {
+            configError = refused.message
+            return
+        }
+        val text = outcome.resultText ?: run {
+            configError = "Those choices would make a setup that breaks a rule every client holds it to " +
+                "(${outcome.error}), so nothing was written. Take the other side of the entry that names it."
+            return
+        }
+        settled(services.applyMerge(text, divergence.mineProvenance?.hash)) {
             mergeChoices.clear()
-            configNote = "Merged. The result is on its way to every machine."
+            done()
+        }
+    }
+
+    /** The kept base of a divergence, which the store already checked hashes to it. */
+    private fun baseOf(divergence: SetupDivergence): String? = divergence.baseHash?.let(services::revision)
+
+    /**
+     * What a decision on a divergence or a different setup came to. A document that changed while
+     * the screen was open is not replaced: the screen closes, and the next check compares again.
+     */
+    private fun settled(outcome: SetupOutcome, done: () -> String) {
+        when (outcome) {
+            is SetupOutcome.Applied, SetupOutcome.Unchanged -> {
+                configError = null
+                configNote = done()
+            }
+
+            SetupOutcome.HeadMoved -> {
+                services.clearDivergence()
+                services.clearIdentityClash()
+                mergeChoices.clear()
+                configError = null
+                configNote = "The setup here changed while this was open; comparing again."
+            }
+
+            is SetupOutcome.Invalid -> configError = outcome.reason
+            is SetupOutcome.NotSaved -> configError = outcome.reason
         }
     }
 
@@ -611,6 +622,12 @@ class AppModel(
             notifications.enabled = value
         }
 
+    /**
+     * Whether Android lets this app post a notification now. Asked rather than remembered: the user
+     * can take it back in the system settings at any time, and the setting here is not told.
+     */
+    fun notificationsPermitted(): Boolean = notifier.permitted()
+
     val deviceBindings get() = bindings.bindings
 
     val bindingsActions = object : BindingsActions {
@@ -631,39 +648,86 @@ class AppModel(
         editorOpen = false
     }
 
-    /** Replaces a machine's different setup with this one. The only place `--replace` is ever sent. */
+    /**
+     * Whether a Replace is out to a machine. The button waits for it: the reply to a second press
+     * could come back after the first one's and say the wrong thing about it.
+     */
+    var replacing: Boolean by mutableStateOf(false)
+        private set
+
+    /**
+     * What the last Replace came to, with the question it was pressed on. It is drawn on that
+     * question's page, where it was pressed, for as long as that question is the one open: the
+     * Device page, where the setup's other notes go, is not where anybody pressing it is looking.
+     */
+    private var replaced: Pair<SetupIdentityClash, SetupPeerSync.Replaced>? by mutableStateOf(null)
+
+    /** What Replace came to on the question on screen, or null when it was not pressed there. */
+    internal val replaceOutcome: SetupPeerSync.Replaced?
+        get() = replaced?.takeIf { it.first == identityClash }?.second
+
+    /**
+     * Whether Replace can be pressed on the question on screen: not while one is out, and not again
+     * on a question it already found out of date, where all it could do is say so again.
+     */
+    val canReplace: Boolean
+        get() = replaceProblem == null && !replacing && replaceOutcome !is SetupPeerSync.Replaced.Stale
+
+    /**
+     * Replaces a machine's different setup with this one. The only place `--replace` is ever sent,
+     * so it goes to the machine that served the copy on screen, found by its id: a name is free
+     * text, and another machine may carry the same one. It is checked against what that machine's
+     * latest status says it holds, which [heldBy] finds the same way.
+     *
+     * The question closes only when the machine says it took the document, or, when it is out of
+     * date, at the machine's next status, which asks again; until then it says why nothing was
+     * sent. A refusal, a push the lock held back and a reply that leaves it open whether the copy
+     * was replaced all keep it on screen, saying so.
+     */
     fun replaceTheirSetup() {
         val clash = identityClash ?: return
-        val client = clients.firstOrNull { it.machine.name == clash.machineName } ?: return
-        val document = services.document.value ?: return
-        val identity = document.identity ?: return
+        if (replacing) return
+        val client = clients.firstOrNull { it.machine.id == clash.machineId } ?: return
+        // Asked of the setup as it is now, not only when the page was drawn.
+        replaceProblem?.let {
+            configError = it
+            return
+        }
+        val latest = machines.heldBy(clash.machineId)
+        replacing = true
+        replaced = null
+        configError = null
         scope.launch {
-            client.configSet(
-                canonicalDocument = document.canonicalText,
-                setupId = identity.id,
-                revision = identity.revision,
-                replace = true,
-            ).fold(
-                onSuccess = {
-                    configNote = "${clash.machineName} now carries this setup."
-                    services.clearIdentityClash()
-                },
-                onFailure = { configError = it.sentence },
-            )
+            try {
+                val outcome = sync.replace(client, clash, latest)
+                replaced = clash to outcome
+                // The question and its page are gone, so the line goes with the setup's others.
+                if (outcome is SetupPeerSync.Replaced.Done) configNote = outcome.line
+            } finally {
+                replacing = false
+                // A refusal no retry can cure holds this hash for the machine, as a push's does, and
+                // its page says so with Try again.
+                noteHold(client.machine.id)
+            }
         }
     }
 
     /** Adopts the other setup entirely, dropping this device's. */
     fun adoptTheirSetup() {
         val clash = identityClash ?: return
-        val failure = services.adoptOtherSetup(clash)
-        configError = failure
-        if (failure == null) {
-            configNote = "This device now follows the setup from ${clash.machineName}."
-        }
+        replaced = null
+        settled(services.adoptOtherSetup(clash)) { "This device now follows the setup from ${clash.machineName}." }
     }
 
-    fun dismissIdentityClash() = services.clearIdentityClash()
+    /**
+     * Leave it: not asked about again until this device's setup or that copy changes, on any
+     * machine carrying the same copy.
+     */
+    fun dismissIdentityClash() {
+        val clash = identityClash ?: return
+        sync.leave(clash.theirProvenance.hash)
+        services.clearIdentityClash()
+    }
 
     // MARK: - Bootstrap
 
@@ -719,14 +783,12 @@ class AppModel(
         }
     }
 
+    /**
+     * What a fetch found. A document is not applied here: it is shown first, every command, key
+     * file and update source in it, and only [confirmEnrolment] puts it in force.
+     */
     private fun applyFetched(fetched: ControllerFetch, source: SetupSource): String = when (fetched) {
-        is ControllerFetch.Document -> {
-            val failure = services.applyPasted(fetched.text, services.deviceName())
-            val found = services.config.value?.machines?.size ?: 0
-            failure?.let { "The setup from ${source.host} was refused. $it" }
-                ?: "The setup came from ${source.host}: $found " +
-                    "machine${if (found == 1) "" else "s"}."
-        }
+        is ControllerFetch.Document -> enrolment.offer(fetched.text, source.host)
 
         ControllerFetch.NothingStored ->
             "That machine has no setup stored yet. Paste one here, or fetch from a machine that has one."
@@ -736,6 +798,83 @@ class AppModel(
 
         ControllerFetch.Unreadable ->
             "${source.host} answered with something that is not a setup."
+    }
+
+    // MARK: - Enrolment and the commands this device runs (contract section 9.9)
+
+    /** A fetched setup waiting to be confirmed or cancelled. Nothing of it is applied until then. */
+    val enrolment = SetupEnrolment(services)
+
+    /** Confirm on the summary of a fetched setup. See [SetupEnrolment.confirm]. */
+    fun confirmEnrolment() {
+        enrolment.confirm()?.let { fetchOutcome = it }
+    }
+
+    /** Cancel on the summary of a fetched setup, which leaves this device as it was. */
+    fun cancelEnrolment() {
+        enrolment.cancel()?.let { fetchOutcome = it }
+    }
+
+    /** Each launch value of the setup in force that waits for this device's approval. */
+    val launchReview: StateFlow<List<LaunchReviewEntry>> =
+        services.launch.map { it.review }.stateIn(scope, SharingStarted.Eagerly, services.launch.value.review)
+
+    /** Why the record of approved commands could not be read, when it could not. */
+    val launchProblem: StateFlow<String?> get() = services.launchProblem
+
+    var launchNote: String? by mutableStateOf(null)
+        private set
+
+    /** The revision whose review was put off with Not now. Kept in memory, for this run only. */
+    private var deferredReview: String? by mutableStateOf(null)
+
+    /** Set by Review: the review page shows even for a revision it was put off for. */
+    private var reviewAsked: Boolean by mutableStateOf(false)
+
+    /**
+     * Review was pressed and the screen has not moved to the page yet. Taken once, as the machine a
+     * notification asked for is: this model outlives every screen, and a count of presses was read
+     * again by each screen built after them, which moved to the review page nobody had asked for.
+     */
+    var launchReviewRequested: Boolean by mutableStateOf(false)
+        private set
+
+    /** Whether the review page is up: something waits, and it was not put off for this revision. */
+    fun showsLaunchReview(review: List<LaunchReviewEntry>): Boolean =
+        review.isNotEmpty() && (reviewAsked || deferredReview != setupProvenance?.hash)
+
+    fun openLaunchReview() {
+        reviewAsked = true
+        launchReviewRequested = true
+    }
+
+    /** The screen has moved to the review page, or had none to move to. */
+    fun openedLaunchReview() {
+        launchReviewRequested = false
+    }
+
+    /** Not now: the page does not come back for this revision in this run. The badge stays. */
+    fun deferLaunchReview(hash: String?) {
+        deferredReview = hash
+        reviewAsked = false
+    }
+
+    /** Approve: records exactly the values shown, at their places. */
+    fun approveLaunch(entries: List<LaunchReviewEntry>) {
+        launchNote = services.approveLaunch(entries)
+            ?: if (entries.size == 1) "Approved on this device." else "Approved ${entries.size} on this device."
+    }
+
+    /** Whether [entry] has an approved value at its place that an edit can put back. */
+    fun canRevertLaunch(entry: LaunchReviewEntry): Boolean =
+        entry.approved != null && services.document.value?.let { LaunchValues.reverted(it.root, entry) } != null
+
+    /**
+     * Revert: an ordinary edit made here that puts back the value this device approved at that
+     * place, made by the editor, which waits while it holds an edit of its own.
+     */
+    fun revertLaunch(entry: LaunchReviewEntry) {
+        launchNote = editor.revertLaunch(entry)
     }
 
     private fun explain(failure: Throwable, source: SetupSource): String = when (failure) {
@@ -757,7 +896,13 @@ class AppModel(
             machines.forEach { it.startPolling() }
             operations.resume(clients)
         }
+    }
+
+    private fun followDocument() {
         editor.reset(services.document.value)
+        // A hold is for one revision, so a new one lifts it on screen at once rather than at the
+        // next check.
+        machines.forEach { noteHold(it.machine.id) }
         // The field follows what is in force only while nobody is halfway through typing into it.
         // Losing an edit to a document that arrived from another peer is exactly the thing the whole
         // reconciliation is meant to prevent, and clobbering the field would do it locally instead.
@@ -791,3 +936,31 @@ class NotificationSettings(context: Context) {
         const val KEY = "operation-notifications"
     }
 }
+
+/**
+ * Why a setup with [errors] cannot be sent over another machine's copy with `--replace`, or null
+ * when it can. A device whose setup has a section 9.7 error pushes nothing until it is fixed
+ * (contract section 9.5), and a replacement least of all: an agent before 3.1.0 stores whatever it
+ * is sent.
+ */
+internal fun whyNotReplace(errors: List<DocumentProblem>): String? {
+    val first = errors.firstOrNull() ?: return null
+    return "This device's setup has an error to fix in the editor before it can replace another copy: ${first.message}"
+}
+
+/**
+ * The line under Replace on the different-setup question, once nothing is out: what the last
+ * Replace on it came to, or the setup's latest note. While [problem] says why Replace is off, that
+ * goes before what an earlier press came to, which may say to try again when nothing can be tried
+ * until the error is fixed.
+ */
+internal fun replaceLine(outcome: SetupPeerSync.Replaced?, configError: String?, problem: String?): String? =
+    if (problem != null) configError ?: problem else outcome?.line ?: configError
+
+/**
+ * The document [machineId]'s latest status says it holds, or null when it has none to go by. Found
+ * by id, as Replace finds the machine it sends to: a name is free text, and another machine may
+ * carry the same one.
+ */
+internal fun List<MachineModel>.heldBy(machineId: String): String? =
+    firstOrNull { it.machine.id == machineId }?.status?.controller?.hash

@@ -25,7 +25,9 @@ public class CompactPresentationTests
         Assert.Equal("Stopped", CompactPresentation.ServiceState(service with { Running = false }, false));
         Assert.Equal("In progress", CompactPresentation.ServiceState(service, true));
         Assert.Equal("Working", CompactPresentation.ServiceState(service with { Busy = new BusyState { Busy = true } }, false));
-        Assert.Equal("Not monitored", CompactPresentation.ServiceState(service with { Busy = new BusyState { Busy = true, Monitored = false, Unknown = false } }, false));
+        Assert.Equal("Not monitored", CompactPresentation.ServiceState(service with { Busy = new BusyState { Busy = true, Monitored = false, Unknown = false, Evidence = "unmonitored" } }, false));
+        // Declared never busy is an answer, however an agent before 3.1.0 spelled `monitored`.
+        Assert.Equal("Update available", CompactPresentation.ServiceState(service with { Busy = new BusyState { Monitored = false, Evidence = "none" } }, false));
         Assert.Equal("Activity unknown", CompactPresentation.ServiceState(service with { Busy = new BusyState { Busy = true, Unknown = true } }, false));
         Assert.Equal("Update available", CompactPresentation.ServiceState(service with { Busy = new BusyState() }, false));
     }

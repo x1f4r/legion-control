@@ -1,12 +1,10 @@
 package com.x1f4r.legioncontrol.ui
 
+import android.content.Intent
 import android.os.Bundle
-import kotlinx.coroutines.flow.map
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import com.x1f4r.legioncontrol.data.BindingsStore
-import com.x1f4r.legioncontrol.net.UpdateSource
 import com.x1f4r.legioncontrol.ui.theme.LegionTheme
 
 /**
@@ -14,43 +12,30 @@ import com.x1f4r.legioncontrol.ui.theme.LegionTheme
  *
  * Polling is driven from resume and pause here rather than from inside a composable, because the
  * rule is not "poll while something is drawn" but "poll while the screen is in front of you". No
- * service, no worker, no alarm: when this activity stops, every question this app asks a machine
- * stops with it.
+ * worker and no alarm: when this activity stops, every question this app asks a machine stops with
+ * it.
  *
  * What does not stop is a change somebody asked for. An update takes minutes and locking the phone
- * is not withdrawing the request, so those run on the model's own scope and are reconciled by their
- * operation id when the app comes back.
+ * is not withdrawing the request, so those run on the model's own scope, held in the foreground by
+ * [ChangeService] until they settle, and are reconciled by their operation id when the app comes
+ * back if Android ended the process anyway.
  *
- * The model is held by the activity, which the manifest keeps alive across rotation and a light or
- * dark switch, so turning the phone sideways does not throw away a reading and start another ssh
- * connection to get the same answer back.
+ * The models belong to the process, in [LegionApplication], so this activity can be recreated for
+ * any reason at all without a change in flight noticing. The manifest still keeps it alive across
+ * rotation, a light or dark switch, a new font size, density or language, for the composition's
+ * sake: what is half typed into a field is kept by the screen, not the model.
  */
 class MainActivity : ComponentActivity() {
-    private lateinit var model: AppModel
-    private lateinit var updates: AppUpdateModel
+    private val legion: LegionApplication get() = application as LegionApplication
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val services = createControlServices(applicationContext)
-        model = AppModel(
-            context = applicationContext,
-            services = services,
-            remembered = RememberedSettings(applicationContext),
-            bindings = BindingsStore(applicationContext),
-            notifications = NotificationSettings(applicationContext),
-        )
-        // Held here for the same reason the model is, plus one of its own: the page that draws it
-        // is a page of a pager and is disposed the moment it is swiped away from. State kept inside
-        // it would ask GitHub for the release list again on every swipe back.
-        // The repository the setup names, held to GitHub's grammar first: UpdateSource falls back to
-        // the built-in one, and says so, rather than put a peer's arbitrary text into a URL.
-        updates = AppUpdateModel(applicationContext) {
-            UpdateSource.of(services.config.value?.appUpdates?.githubRepo)
-        }
-        updates.observeRepositories(services.config.map { config ->
-            UpdateSource.of(config?.appUpdates?.githubRepo)
-        })
+        val model = legion.model
+        val updates = legion.updates
+        // A recreated activity is handed its first intent again, and a machine tapped open an hour
+        // ago is not where anybody wants to be put back.
+        if (savedInstanceState == null) open(intent)
         setContent {
             LegionTheme {
                 LegionApp(model, updates)
@@ -58,21 +43,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        open(intent)
+    }
+
+    /** A tapped notification names the machine its change was on; the screen goes to it. */
+    private fun open(intent: Intent?) {
+        intent?.getStringExtra(AndroidOperationNotifier.EXTRA_MACHINE)?.let(legion.model::openMachine)
+    }
+
     override fun onResume() {
         super.onResume()
-        model.startPolling()
-        updates.start()
+        legion.model.startPolling()
+        legion.updates.start()
     }
 
     override fun onPause() {
         super.onPause()
-        model.stopPolling()
-        updates.stop()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        model.close()
-        updates.close()
+        legion.model.stopPolling()
+        legion.updates.stop()
     }
 }

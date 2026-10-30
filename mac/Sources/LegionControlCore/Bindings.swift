@@ -104,6 +104,37 @@ struct Bindings: Codable, Sendable, Equatable {
 
     /// Whether this device can drive itself without ssh.
     var canControlSelfLocally: Bool { selfBinding != nil && localAgent?.isUsable == true }
+
+    /// What is wrong with a bindings file, in the terms of `bindings.schema.json`, or nothing.
+    ///
+    /// The rule that matters most is the absence of a shell. A local agent is spawned as an argv and
+    /// never handed to a shell: there is no far side to parse it, so a `shell` beside it would add a
+    /// quoting layer with nothing on the other end, and a file that asks for one is refused rather
+    /// than run some other way than its author meant. Keys this build does not know elsewhere are
+    /// left alone, as every other file this app reads leaves them.
+    static func problems(in data: Data) -> [String] {
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return ["The private settings are not a JSON object."]
+        }
+        var problems: [String] = []
+        if let local = root["localAgent"] {
+            let object = local as? [String: Any]
+            let argv = object?["argv"] as? [Any]
+            if argv.map({ (1...20).contains($0.count) && $0.allSatisfy { ($0 as? String)?.isEmpty == false } }) != true {
+                problems.append("localAgent needs an argv: the binary to run and its arguments, each a non-empty string.")
+            }
+            for key in (object ?? [:]).keys.sorted() where key != "argv" {
+                problems.append("localAgent.\(key) is not a setting. A local agent is spawned as an argv; there is no shell on this path to configure.")
+            }
+        }
+        if let binding = root["self"] {
+            let machine = (binding as? [String: Any])?["machine"] as? String
+            if !(machine.map(AgentToken.isValid) ?? false) {
+                problems.append("self needs the id of the machine this device is.")
+            }
+        }
+        return problems
+    }
 }
 
 /// Holds the bindings file and writes it back.
@@ -120,6 +151,9 @@ final class BindingsStore {
     private(set) var isPresent = false
     /// Why the file could not be read or written, when that happened.
     private(set) var problem: String?
+    /// True while the file on disk is one this build does not use, so `bindings` are the ones from
+    /// before it, or none at all when it was refused at launch.
+    private(set) var isRefused = false
 
     let url: URL
 
@@ -146,21 +180,42 @@ final class BindingsStore {
             bindings = .empty
             isPresent = false
             problem = nil
+            isRefused = false
             return
         }
         isPresent = true
+        let problems = Bindings.problems(in: data)
+        guard problems.isEmpty else {
+            // Kept as it was, for the same reason as a file that does not decode.
+            problem = "\(path) is not used, so this device's private settings are the ones from before it. \(problems.joined(separator: " "))"
+            isRefused = true
+            return
+        }
         do {
             bindings = try JSONDecoder().decode(Bindings.self, from: data)
             problem = nil
+            isRefused = false
         } catch {
             // Kept as it was rather than reset. A broken bindings file is a file someone is editing,
             // and throwing away which machine this device is would be a surprising way to react.
             problem = "\(path) could not be read, so this device's private settings are the ones from before it. \(error.localizedDescription)"
+            isRefused = true
         }
     }
 
+    /// Change one thing and write the file back.
+    ///
+    /// The file is read again first, and the change is made to what it holds now. A file this
+    /// build refuses is left exactly as it is. It used to be written over from memory, which is
+    /// nothing at all when the file was refused at launch, so picking a site in a menu threw away
+    /// which machine this device is, its keys and every override, in a file that was waiting only
+    /// for one key to be fixed.
     @discardableResult
     func update(_ change: (inout Bindings) -> Void) -> String? {
+        reloadIfChanged()
+        if isRefused {
+            return "Nothing was saved, because saving would write over \(path), which this device is not using. Fix or remove it first."
+        }
         var edited = bindings
         change(&edited)
         do {

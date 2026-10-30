@@ -16,8 +16,9 @@
 
 [Unit]
 Description=T3 Code server (web mode, loopback only)
-After=network-online.target
-Wants=network-online.target
+# No ordering on network-online.target: the server listens on loopback only,
+# and that unit belongs to the system manager anyway. A user manager has none
+# of that name, so After= and Wants= on it did nothing at all.
 
 # The update cycle stops this unit, swaps the package and starts it again. If a
 # crash loop ever develops, do not let systemd give up and leave the box dark.
@@ -30,9 +31,11 @@ Type=simple
 # Spell it out. This is not decoration: the launcher npm drops in the global bin
 # starts with "#!/usr/bin/env node", so without /usr/bin on PATH the unit fails
 # at exec with a bare "no such file or directory" that points at nothing useful.
-Environment=PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin
+# Both paths are quoted: the npm prefix is in the home directory, and a space
+# there would split them.
+Environment="PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin"
 
-ExecStart=@NPM_BIN@/t3 start --mode web --host 127.0.0.1 --port @PORT@ --no-browser
+ExecStart="@NPM_BIN@/t3" start --mode web --host 127.0.0.1 --port @PORT@ --no-browser
 
 # Bind to loopback only. Anything outside the box reaches the server through a
 # VPN or a relay, never by listening on the LAN.

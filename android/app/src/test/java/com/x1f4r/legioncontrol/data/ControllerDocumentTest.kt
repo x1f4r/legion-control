@@ -168,6 +168,33 @@ class ControllerDocumentTest {
         assertEquals(document.hash, again.hash)
     }
 
+    /**
+     * C1: a document read from a machine is the bytes it was read as. Its hash is the machine's, in
+     * whatever spacing and escaping its writer used, until it is edited here; only then is it
+     * printed, and even then every number keeps the spelling it was read with.
+     */
+    @Test
+    fun `a parsed document hashes the text it was read from until it is edited`() {
+        val written = "{\r\n    \"version\": 1,\r\n    \"machines\": [ { \"id\": \"pi\", \"weight\": 22.0, \"note\": \"caf\\u00e9\" } ]\r\n}"
+        val document = ControllerDocument.parse(written).getOrThrow()
+        assertEquals(CanonicalSetup.canonicalText(written), document.canonicalText)
+        assertEquals(CanonicalSetup.hashOf(written), document.hash)
+
+        val edited = document.editMachine("pi") { it.withText("name", "Beacon") }
+        val text = edited.canonicalText
+        assertTrue(text, text.contains("\"weight\": 22.0"))
+        assertTrue("printed the way JSON.stringify(value, null, 2) prints it", text.startsWith("{\n  \"version\": 1,\n  \"machines\": [\n    {\n"))
+        assertTrue(text.contains("\"note\": \"café\""))
+    }
+
+    @Test
+    fun `text that is not strictly JSON is not a document`() {
+        // The lenient reader agent replies go through would take these. A machine would not.
+        listOf("{version: 1, machines: []}", "{\"version\":1,\"machines\":[],}", "{\"version\":01,\"machines\":[]}").forEach {
+            assertTrue(it, ControllerDocument.parse(it).isFailure)
+        }
+    }
+
     @Test
     fun `a document that is not an object is refused with a sentence`() {
         val outcome = ControllerDocument.parse("[1,2,3]")

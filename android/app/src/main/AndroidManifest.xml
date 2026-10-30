@@ -15,8 +15,18 @@
          the setting is turned on, because a permission prompt for a feature nobody asked for is how
          people learn to refuse everything. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Keeping the app running while a change somebody asked for is still being sent or watched,
+         so locking the phone does not freeze it halfway. Both are granted at install: there is
+         nothing to ask. The second is the one Android 14 and later require for the dataSync type. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- The same service keeps the CPU running while it runs, screen off: a locked phone on battery
+         otherwise suspends, and a wake's readiness polls or the pause before reading an operation
+         again wait for the screen to come back. Granted at install too. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
+        android:name="com.x1f4r.legioncontrol.ui.LegionApplication"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
@@ -29,7 +39,7 @@
         <activity
             android:name="com.x1f4r.legioncontrol.ui.MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|fontWeightAdjustment|locale|layoutDirection"
             android:label="@string/app_name"
             android:theme="@style/Theme.LegionControl"
             android:windowSoftInputMode="adjustResize">
@@ -39,6 +49,13 @@
             </intent-filter>
         </activity>
     
+        <!-- Does no work of its own. It runs only while a change is in flight, says so in a quiet
+             notification, and stops itself when the last one settles. -->
+        <service
+            android:name="com.x1f4r.legioncontrol.ui.ChangeService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- The installer and explicit diagnostic sharing can read only their dedicated cache
              directories; application keys and private configuration are never exposed. -->
         <provider

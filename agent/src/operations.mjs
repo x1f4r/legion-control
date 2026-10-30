@@ -23,17 +23,27 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AGENT_VERSION, operationsDir, runArgv } from './config.mjs';
 import { CONTRACT_VERSION, DISRUPTED_PHASES, OPERATION_ID_PATTERN, outcomeOf, PHASES, producedOutcome, REASON } from './contract.mjs';
+import { holdsOperationLock, probeOperationLock } from './lock.mjs';
 import { log } from './log.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
-import { processIsAlive, writeJsonAtomic } from './state.mjs';
+import { AGENT_VERSION, operationsDir } from './paths.mjs';
+import { runArgv } from './process-runner.mjs';
+import { ownStartTime, processIsAlive, processStartTicks, writeJsonAtomic } from './state.mjs';
 
-/** How many finished records are kept, and for how long. */
+/**
+ * How many finished records are kept whatever they say, how many of those a
+ * cycle writes saying the same thing again are kept besides the first, how
+ * long one that failed or whose outcome is unknown is kept however many came
+ * after it, and the longest any record is kept (pruneOperations).
+ */
 export const HISTORY_LIMIT = 200;
+export const REPEAT_LIMIT = 3;
+export const FAILURE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-/** A queued request with no expiry of its own. */
+/** A queued request with no expiry of its own, and the bounds of any it names. */
 export const DEFAULT_QUEUE_TTL_MS = 4 * 60 * 60 * 1000;
+export const MIN_QUEUE_TTL_MS = 60 * 1000;
 export const MAX_QUEUE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Per-operation log lines kept in the record. */
 export const LOG_LIMIT = 200;
@@ -179,8 +189,13 @@ export function writeOperation(record) {
   }
 }
 
-/** Every record on disk, newest first. Never throws. */
-export function listOperations({ limit = 30, service = null, kind = null, state = null, recoveryPending = false } = {}) {
+/**
+ * Every record on disk that matches, newest first, however many there are.
+ * Never throws. What the agent itself has to find, a record still running or
+ * still owing a service its recovery, is looked for here, among all of them:
+ * one older than the newest HISTORY_LIMIT is no less unfinished.
+ */
+function scanOperations({ service = null, kind = null, state = null, recoveryPending = false } = {}) {
   let names = [];
   try {
     names = fs.readdirSync(operationsDir());
@@ -199,7 +214,17 @@ export function listOperations({ limit = 30, service = null, kind = null, state 
     records.push(record);
   }
   records.sort((a, b) => String(b.requestedAt ?? '').localeCompare(String(a.requestedAt ?? '')));
-  return records.slice(0, Math.min(limit, HISTORY_LIMIT));
+  return records;
+}
+
+/** Every record on disk, newest first, at most HISTORY_LIMIT of them. Never throws. */
+export function listOperations({ limit = 30, ...filter } = {}) {
+  return scanOperations(filter).slice(0, Math.min(limit, HISTORY_LIMIT));
+}
+
+/** How many records the machine holds, which retention lets go past HISTORY_LIMIT. */
+export function countOperations() {
+  return scanOperations().length;
 }
 
 /**
@@ -371,6 +396,12 @@ function baseRecord(input) {
     finishedAt: null,
     expiresAt: input.expiresAt ?? null,
     pid: input.state === 'queued' ? null : process.pid,
+    // What tells this pid's process from a later one with the same id, and
+    // the operation whose hold on the machine lock is this owner's evidence of
+    // life once it takes it (see ownerAlive). None of them is on the wire.
+    ownerStartedAt: input.state === 'queued' ? null : ownStartTime(),
+    ownerStartTicks: input.state === 'queued' ? null : processStartTicks(process.pid),
+    lockOwner: null,
     detached: input.detached === true,
     workerClaimed: input.state !== 'queued' && input.detached !== true,
     bootId: bootIdentity(),
@@ -493,6 +524,17 @@ export function finishOperation(id, result, { keepPhase = false } = {}) {
 }
 
 /**
+ * The version a finished record keeps. An update notes its versions on the
+ * record while it runs, and a result that names one, null included, is the
+ * version it read at the end: a rollback that left the version unreadable must
+ * not come back as the target it was going to. Only a result that names none,
+ * a throw or a conflict, keeps what the record noted.
+ */
+function versionOf(fromResult, fromRecord) {
+  return fromResult !== undefined ? fromResult : fromRecord ?? null;
+}
+
+/**
  * The result a finished record stores, with its outcome.
  *
  * A record's `ok` is exactly "it finished without a reason code" (contract
@@ -513,8 +555,8 @@ function storedResult(record, result) {
     action: result.action,
     reasonCode,
     message: result.message ?? '',
-    from: result.from ?? record.from ?? null,
-    to: result.to ?? record.to ?? null,
+    from: versionOf(result.from, record.from),
+    to: versionOf(result.to, record.to),
     exitCode: result.exitCode ?? null,
     output: result.output ?? null,
   };
@@ -534,8 +576,8 @@ function finishOperationUnlocked(id, result, { keepPhase = false } = {}) {
     // interrupted run, so a crash or a live watchdog cannot lose the retry.
     recoveryPending: record.recoveryPending === true || Boolean(keepPhase && result.action === 'interrupted' && record.service && DISRUPTED_PHASES.has(record.phase)),
     finishedAt: nowIso(),
-    from: result.from ?? record.from ?? null,
-    to: result.to ?? record.to ?? null,
+    from: versionOf(result.from, record.from),
+    to: versionOf(result.to, record.to),
     result: storedResult(record, result),
     log: appendLine(record.log, `finished: ${result.action}${result.reasonCode ? ` (${result.reasonCode})` : ''}`),
   }));
@@ -597,6 +639,9 @@ export function claimOperation(id, { pid = process.pid, parentPid = process.ppid
         startedAt: record.startedAt ?? nowIso(),
         updatedAt: nowIso(),
         pid,
+        ownerStartedAt: pid === process.pid ? ownStartTime() : null,
+        ownerStartTicks: processStartTicks(pid),
+        lockOwner: null,
         workerClaimed: true,
         launchPendingUntil: null,
         mode: record.state === 'queued' ? 'queued' : record.mode,
@@ -613,25 +658,61 @@ export function claimOperation(id, { pid = process.pid, parentPid = process.ppid
 // ---------------------------------------------------------------------------
 
 /**
+ * When a queued request expires: `expiresAt`, an absolute time, or `ttlMs`
+ * from now, four hours when neither is given. Whichever it is, it lands in
+ * [now + 1 minute, now + 7 days], so no way of writing it buys a request that
+ * outlives the week or one that is gone before a cycle could see it.
+ *
+ * A time already past is refused rather than raised to the minute. Nobody asks
+ * for a request that has expired before it was made, and accepting one would
+ * still replace whatever waited in its slot: the valid request would be
+ * cancelled for one that never runs.
+ */
+export function queueExpiry({ ttlMs = null, expiresAt = null } = {}, { now = Date.now() } = {}) {
+  let at = now + (Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_QUEUE_TTL_MS);
+  if (expiresAt !== null && expiresAt !== undefined) {
+    at = Date.parse(expiresAt);
+    if (Number.isNaN(at)) return { ok: false, expiresAt: null, error: `the expiry ${JSON.stringify(expiresAt)} is not a time` };
+    if (at <= now) {
+      return { ok: false, expiresAt: null, error: `the expiry ${new Date(at).toISOString()} is already past, so the request was not queued and nothing waiting was replaced` };
+    }
+  }
+  return { ok: true, expiresAt: new Date(Math.min(Math.max(at, now + MIN_QUEUE_TTL_MS), now + MAX_QUEUE_TTL_MS)).toISOString(), error: null };
+}
+
+/**
+ * The slot a queued request takes. A person who presses "update when idle"
+ * twice meant it once, and two records would run the same update twice in a
+ * row, so each service, target or action has one. Boot and sleep share a
+ * single slot, whatever the target: the machine makes one power transition,
+ * and two queued ones would both fire, the second on whatever the first left.
+ */
+function queueSlot(record) {
+  if (record.kind === 'boot' || record.kind === 'sleep') return 'power';
+  return `${record.kind}:${record.service ?? record.target ?? record.actionId ?? '-'}`;
+}
+
+/**
  * Park a request until the machine is idle.
  *
  * The expiry is not optional. A "restart when idle" that is still waiting three
  * days later is not a request anybody remembers making, and applying it then is
- * worse than dropping it.
+ * worse than dropping it (queueExpiry). At most one request waits in each slot
+ * (queueSlot), and a newer one replaces it.
  *
- * At most one queued request per (kind, service|target|actionId): a person who
- * presses "update when idle" twice meant it once, and two records would run the
- * same update twice in a row.
+ * Returns what beginOperation does, with `replaced`, or `badExpiry` with the
+ * error when the expiry is refused, in which case nothing was written.
  */
 export function queueOperation(input) {
-  const ttlMs = Math.min(
-    Number.isFinite(input.ttlMs) && input.ttlMs > 0 ? input.ttlMs : DEFAULT_QUEUE_TTL_MS,
-    MAX_QUEUE_TTL_MS,
-  );
-  const expiresAt = input.expiresAt ?? new Date(Date.now() + ttlMs).toISOString();
+  const expiry = queueExpiry(input);
 
   try {
     return withOperationsStore(() => {
+      // A retry of a request already queued is answered whatever its expiry
+      // says by now, which may have passed since it was first sent.
+      if (!expiry.ok && !(input.id && readOperation(input.id))) {
+        return { ok: false, badExpiry: true, error: expiry.error, replaced: null };
+      }
       // Bind or validate the incoming id before changing the existing slot. In
       // particular, replaying an older replaced id must not cancel the request
       // that replaced it.
@@ -641,21 +722,23 @@ export function queueOperation(input) {
         phase: 'queued',
         mode: 'queued',
         queueRequested: true,
-        expiresAt,
+        expiresAt: expiry.expiresAt,
       });
       if (!opened.ok || opened.replay) return { ...opened, replaced: null };
 
-      const slot = `${input.kind}:${input.service ?? input.target ?? input.actionId ?? '-'}`;
+      const slot = queueSlot(input);
       let replaced = null;
       try {
-        for (const record of listOperations({ limit: HISTORY_LIMIT, state: 'queued' })) {
+        for (const record of scanOperations({ state: 'queued' })) {
           if (record.id === opened.record.id) continue;
-          if (`${record.kind}:${record.service ?? record.target ?? record.actionId ?? '-'}` !== slot) continue;
+          if (queueSlot(record) !== slot) continue;
           finishOperationUnlocked(record.id, {
             ok: true,
             action: 'cancelled',
             reasonCode: REASON.cancelled,
-            message: 'replaced by a newer request for the same thing',
+            message: slot === 'power'
+              ? 'replaced by a newer boot or sleep request: the machine makes one power transition at a time'
+              : 'replaced by a newer request for the same thing',
           });
           replaced = record.id;
         }
@@ -680,7 +763,7 @@ export function queueOperation(input) {
 
 /** Queued records that have not expired, oldest first: a queue, not a stack. */
 export function dueQueue({ now = Date.now() } = {}) {
-  return listOperations({ limit: HISTORY_LIMIT, state: 'queued' })
+  return scanOperations({ state: 'queued' })
     .filter((record) => {
       const expires = Date.parse(record.expiresAt ?? '');
       return Number.isNaN(expires) || expires > now;
@@ -692,7 +775,7 @@ export function dueQueue({ now = Date.now() } = {}) {
 export function expireQueue({ now = Date.now() } = {}) {
   return withOperationsStore(() => {
     const expired = [];
-    for (const record of listOperations({ limit: HISTORY_LIMIT, state: 'queued' })) {
+    for (const record of scanOperations({ state: 'queued' })) {
       const expires = Date.parse(record.expiresAt ?? '');
       if (Number.isNaN(expires) || expires > now) continue;
       const finished = finishOperationUnlocked(record.id, {
@@ -773,7 +856,8 @@ export function deferQueuedOperation(id, result) {
       return finishOperationUnlocked(id, { ok: true, action: 'expired', reasonCode: REASON.expired, message: 'the queued request expired while waiting for an idle window' });
     }
     return updateOperationUnlocked(id, {
-      state: 'queued', phase: 'queued', pid: null, startedAt: null, workerClaimed: false, result: null,
+      state: 'queued', phase: 'queued', pid: null, ownerStartedAt: null, ownerStartTicks: null, lockOwner: null,
+      startedAt: null, workerClaimed: false, result: null,
       log: appendLine(record.log, `waiting for idle: ${result.message ?? result.reasonCode ?? 'busy'}`),
     });
   });
@@ -794,7 +878,61 @@ function powerTransitionPending(record, bootId, now = Date.now()) {
 
 export function pendingPowerOperation({ excludeId = null } = {}) {
   const bootId = bootIdentity();
-  return listOperations({ state: 'running' }).find((record) => record.id !== excludeId && powerTransitionPending(record, bootId)) ?? null;
+  return scanOperations({ state: 'running' }).find((record) => record.id !== excludeId && powerTransitionPending(record, bootId)) ?? null;
+}
+
+/**
+ * Whether the process that owns a running record is still at work on it.
+ *
+ * kill(pid, 0) on its own cannot say. Process ids are handed out again, and a
+ * record whose owner died long ago used to read as running for as long as some
+ * other process had its pid, which on Windows is soon: the operation never
+ * ended, and a service it had stopped was never put back. So two better kinds
+ * of evidence come first.
+ *
+ *   The machine lock. An owner that took it holds it until it has finished
+ *   the record, and the operating system takes it away the moment the owner
+ *   dies. So a record whose owner took it is gone once the lock is free, and
+ *   gone while this process holds it, as a cycle's recovery does: no other
+ *   process can then. It is alive while the sidecar says the operation it
+ *   names holds the lock in its process. A sidecar naming something else
+ *   says nothing either way, because its holder may have failed to write it.
+ *
+ *   The start time. Beside its pid the record keeps when that process
+ *   started, and a process holding the pid now that started after that is not
+ *   its owner (processIsAlive). This process knows its own exactly.
+ *
+ * Only where neither can say is a live pid taken at its word, as before:
+ * judging a live operation dead would start a service under an install that
+ * is still running. A boot or a sleep that has dispatched its transition
+ * gives the lock back on purpose and clears its claim to it first.
+ */
+function ownerAlive(record) {
+  if (!Number.isInteger(record.pid)) return false;
+  if (record.pid !== process.pid && record.lockOwner) {
+    if (holdsOperationLock()) return false;
+    const { state, sidecar } = probeOperationLock();
+    if (state === 'free') return false;
+    if (state === 'held' && sidecar?.op === record.lockOwner && sidecar.pid === record.pid) return true;
+  }
+  return processIsAlive(record.pid, { startedAt: record.ownerStartedAt ?? null, startTicks: record.ownerStartTicks ?? null });
+}
+
+/**
+ * Whether a running record is still somebody's, which recovery and every read
+ * ask alike: one waiting out its power transition, one a detached worker is
+ * still being launched for, and one whose owner is alive (ownerAlive). A
+ * record from an earlier boot is nobody's, whatever its pid names now.
+ */
+function stillOwned(record, { bootId, now }) {
+  if (powerTransitionPending(record, bootId, now)) return true;
+  const sameBoot = !record.bootId || !bootId || record.bootId === bootId;
+  if (!sameBoot) return false;
+  // A detached launcher gets a bounded grace period in which to create the
+  // worker and let it claim the record. The launcher pid may disappear
+  // before the child reaches Node, especially through Windows CIM.
+  if (record.workerClaimed !== true && Date.parse(record.launchPendingUntil ?? '') > now) return true;
+  return ownerAlive(record);
 }
 
 /**
@@ -807,6 +945,13 @@ export function pendingPowerOperation({ excludeId = null } = {}) {
  * because the arming silently failed. So a boot only reads as `rebooted` when
  * BOTH the boot identity changed AND the system now running is the one that was
  * asked for. Anything less is an outcome nobody observed, and it says so.
+ *
+ * That includes a new boot into some other system. Every system on a dual-boot
+ * machine keeps its own agent and its own records, so a reboot from Linux into
+ * Windows is only ever judged by the Linux agent, once the machine is back in
+ * Linux: by then the boot identity has changed and the system running is not
+ * the target, whether or not Windows came up in between. Calling that a
+ * failure would tell a client a reboot that most likely worked did not.
  *
  * A suspend leaves no trace at all once the machine is awake again, so an
  * interrupted sleep is always reported as unknown rather than guessed at.
@@ -836,9 +981,11 @@ export function judgeInterrupted(record, { systemId = null, bootId = bootIdentit
     }
     return {
       ok: false,
-      action: 'failed',
+      action: 'interrupted',
       reasonCode: REASON.interrupted,
-      message: `the machine rebooted but is running ${systemId ?? 'an unknown system'}, not the requested ${record.target}`,
+      message:
+        `the machine has rebooted since the reboot into ${record.target} was dispatched, and is running ` +
+        `${systemId ?? 'an unknown system'} now; whether it reached ${record.target} in between cannot be told from here`,
     };
   }
 
@@ -863,25 +1010,13 @@ export function judgeInterrupted(record, { systemId = null, bootId = bootIdentit
 }
 
 /**
- * Finish every record whose process is gone.
- *
- * Only records this host owns are judged. A record written on another host (a
- * restored home directory, a shared profile) is left alone rather than declared
- * dead on the strength of a pid that means nothing here.
+ * Finish every running record whose owner is gone (stillOwned), however old.
  */
 export function recoverOperations({ systemId = null, bootId = bootIdentity(), now = Date.now() } = {}) {
   return withOperationsStore(() => {
     const recovered = [];
-    for (const record of listOperations({ limit: HISTORY_LIMIT })) {
-      if (record.state !== 'running') continue;
-      if (powerTransitionPending(record, bootId, now)) continue;
-      const sameBoot = !record.bootId || !bootId || record.bootId === bootId;
-      // A detached launcher gets a bounded grace period in which to create the
-      // worker and let it claim the record. The launcher pid may disappear
-      // before the child reaches Node, especially through Windows CIM.
-      if (sameBoot && record.workerClaimed !== true && Date.parse(record.launchPendingUntil ?? '') > now) continue;
-      if (sameBoot && record.pid === process.pid) continue;
-      if (sameBoot && Number.isInteger(record.pid) && processIsAlive(record.pid)) continue;
+    for (const record of scanOperations({ state: 'running' })) {
+      if (stillOwned(record, { bootId, now })) continue;
       const verdict = judgeInterrupted(record, { systemId, bootId });
       const finished = finishOperationUnlocked(record.id, { ...verdict, from: record.from, to: record.to }, { keepPhase: true });
       if (finished) recovered.push(finished);
@@ -899,35 +1034,111 @@ export function recoverOperations({ systemId = null, bootId = bootIdentity(), no
  */
 export function deriveState(record, { systemId = null, bootId = bootIdentity(), now = Date.now() } = {}) {
   if (record.state !== 'running') return record;
-  if (powerTransitionPending(record, bootId, now)) return record;
-  const sameBoot = !record.bootId || !bootId || record.bootId === bootId;
-  if (sameBoot && record.workerClaimed !== true && Date.parse(record.launchPendingUntil ?? '') > now) return record;
-  if (sameBoot && record.pid === process.pid) return record;
-  if (sameBoot && Number.isInteger(record.pid) && processIsAlive(record.pid)) return record;
+  if (stillOwned(record, { bootId, now })) return record;
+  // The owner may have finished it a moment ago and let the lock go since.
+  const current = readOperation(record.id);
+  if (current && current.state !== 'running') return current;
   const verdict = judgeInterrupted(record, { systemId, bootId });
   return { ...record, state: 'finished', derived: true, pid: null, finishedAt: new Date(now).toISOString(), result: { ...verdict, from: record.from, to: record.to } };
 }
 
 /**
- * Services an interrupted operation may have left stopped, with the phase it
- * reached, so the caller can decide what putting them back means.
+ * When a run began, the clock recovery tells an older run from a later one by.
+ * A queued request is asked for well before it is taken up, so the time it was
+ * asked for cannot say which of two runs found what the other left on disk. A
+ * record that never started has only the time it was asked for.
+ */
+export function whenStarted(record) {
+  return String(record.startedAt ?? record.requestedAt ?? '');
+}
+
+/**
+ * Services an interrupted operation may have left stopped, each with every
+ * record that still owes it something, oldest first and with the phase each
+ * reached, so the caller can decide what putting it back means. All of them,
+ * not one: a restart interrupted before an update that was killed part way
+ * through its install owes the service a start, the update owes it a look at
+ * the version, and settling the first must not quietly settle the second.
+ *
+ * `records` come newest first by when each was asked for, as every listing
+ * does, and oldest here means started first. An update queued before another
+ * and taken up after it installed on top of what the other left, and weighing
+ * it as the older of the two once rolled a finished install back.
  */
 export function servicesNeedingRecovery(records) {
   const needing = new Map();
-  for (const record of records) {
+  const oldestFirst = [...records].reverse().sort((a, b) => whenStarted(a).localeCompare(whenStarted(b)));
+  for (const record of oldestFirst) {
     if (!record.service) continue;
     const phase = record.phase ?? '';
     if (!DISRUPTED_PHASES.has(phase)) continue;
-    needing.set(record.service, record);
+    if (!needing.has(record.service)) needing.set(record.service, []);
+    needing.get(record.service).push(record);
   }
-  return [...needing.values()];
+  return [...needing].map(([service, owing]) => ({ service, records: owing }));
 }
 
 // ---------------------------------------------------------------------------
 // Retention
 // ---------------------------------------------------------------------------
 
-/** Keep the newest HISTORY_LIMIT finished records, and nothing older than 30 days. */
+/**
+ * Whether an ending left everything as it was: nothing new, or not now.
+ *
+ * Not now is told by the outcome rather than by the action's name, so a
+ * conflict counts as much as a deferral: a watchdog holding a service's lock,
+ * or a command an earlier run left unsettled, makes every tick end the same
+ * way for as long as it lasts.
+ */
+function changedNothing(ending) {
+  return ending?.action === 'noop' || producedOutcome(ending ?? {}) === 'deferred';
+}
+
+/**
+ * What a record says again, or null when it is news.
+ *
+ * A quarter-hourly cycle writes a record of its own and one for every service
+ * it looks at, and most of them say what the one before said: nothing was new,
+ * the machine was busy, something else held the lock, the registry did not
+ * answer. Only what the scheduler did can repeat; what a person asked for is
+ * news however often they ask. Of that, only a record that changed nothing
+ * (changedNothing) or failed is a repeat, told by how it ended: the kind, the
+ * service, the action, the reason and the versions. An update that installed
+ * something never repeats, and neither does a cycle that ran one.
+ */
+function repeatOf(record) {
+  if (record.mode !== 'scheduled') return null;
+  const result = record.result ?? {};
+  const routine =
+    record.kind === 'cycle'
+      ? changedNothing(result) || (result.action === 'cycled' && Array.isArray(record.children) && record.children.every(changedNothing))
+      : record.kind === 'update' && changedNothing(result);
+  if (!routine && !['failed', 'unknown'].includes(recordOutcome(record))) return null;
+  return JSON.stringify([record.kind, record.service ?? null, result.action ?? null, result.reasonCode ?? null, record.from ?? null, record.to ?? null]);
+}
+
+/**
+ * Let go of finished records nobody needs any more.
+ *
+ * Retention was the newest HISTORY_LIMIT, whatever they said. Two services and
+ * their cycle filled that in about seventeen hours, almost every record of it
+ * a cycle saying nothing was new, so a failure on Friday night was gone before
+ * anybody looked on Saturday, and while it lasted it was listed behind them.
+ *
+ * So of the records that say again what an earlier one said (repeatOf), only
+ * the first, which says since when, and the newest REPEAT_LIMIT, which say it
+ * still is, are kept; the rest go however new they are. Of what is left, the
+ * newest HISTORY_LIMIT stay whatever they say, and a failure, or an outcome
+ * nobody knows, stays a week however many came after it. What that can add is
+ * bounded by how many different ways things failed in a week, as a failure
+ * that only repeats keeps four records. Nothing is kept past thirty days, and
+ * a record still owing a service its recovery is never let go.
+ *
+ * Letting a repeat go never changes what recovery reads. A later update that
+ * found the service on its target is what tells it not to roll the service
+ * back (update.mjs), and it asks only whether there is one: the newest of
+ * them is never a repeat that is let go.
+ */
 export function pruneOperations({ now = Date.now() } = {}) {
   return withOperationsStore(() => pruneOperationsUnlocked({ now }));
 }
@@ -949,17 +1160,39 @@ function pruneOperationsUnlocked({ now = Date.now() } = {}) {
   }
   finished.sort((a, b) => String(b.finishedAt ?? b.requestedAt ?? '').localeCompare(String(a.finishedAt ?? a.requestedAt ?? '')));
 
-  const removed = [];
-  finished.forEach((record, index) => {
+  const ageOf = (record) => {
     const at = Date.parse(record.finishedAt ?? record.requestedAt ?? '');
-    const tooOld = !Number.isNaN(at) && now - at > HISTORY_MAX_AGE_MS;
-    if (index < HISTORY_LIMIT && !tooOld) return;
+    return Number.isNaN(at) ? 0 : now - at;
+  };
+  // Newest first, so the last record seen saying something is the first that
+  // said it, of those young enough to be kept at all.
+  const firsts = new Map();
+  for (const record of finished) {
+    const repeat = repeatOf(record);
+    if (repeat && ageOf(record) <= HISTORY_MAX_AGE_MS) firsts.set(repeat, record.id);
+  }
+
+  const removed = [];
+  const repeats = new Map();
+  let kept = 0;
+  for (const record of finished) {
+    const age = ageOf(record);
+    const repeat = repeatOf(record);
+    const seen = repeat && firsts.get(repeat) !== record.id ? (repeats.get(repeat) ?? 0) + 1 : 0;
+    if (seen > 0) repeats.set(repeat, seen);
+    if (age <= HISTORY_MAX_AGE_MS && seen <= REPEAT_LIMIT) {
+      if (kept < HISTORY_LIMIT) {
+        kept += 1;
+        continue;
+      }
+      if (['failed', 'unknown'].includes(recordOutcome(record)) && age <= FAILURE_RETENTION_MS) continue;
+    }
     try {
       fs.rmSync(operationPath(record.id), { force: true });
       removed.push(record.id);
     } catch {
       /* it will be reconsidered next time */
     }
-  });
+  }
   return { removed };
 }

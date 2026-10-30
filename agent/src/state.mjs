@@ -23,8 +23,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath, stateDir } from './config.mjs';
 import { acquireMutex, mutexPath } from './mutex.mjs';
+import { basePath, operationsDir, stateDir } from './paths.mjs';
+import { runCommand } from './process-runner.mjs';
 
 /** How long we are willing to wait for another process to finish its write. */
 const LOCK_WAIT_MS = 10000;
@@ -52,25 +53,132 @@ export function legacyStatePath() {
 }
 
 /**
- * True when the pid is still running. EPERM means it exists but is not ours.
- *
- * The locks no longer use this — exclusion is the operating system's job now, and
- * a lock is held exactly while its owner's process is alive, with nothing here
- * having to work that out. It stays because the Windows watchdog's own lock file
- * records a pid, and doctor reports on it.
+ * How far apart two start times may be and still name the same process. Process
+ * ids are reused, so a record of one is checked against when it started, and
+ * the clocks on either side of that comparison are not read at the same moment.
  */
-export function processIsAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+export const SAME_PROCESS_SLACK_MS = 2000;
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * A start time as `ps -o lstart=` prints it in the C locale, "Thu Oct 29
+ * 10:15:42 2026" in local time, in milliseconds; null for anything else.
+ */
+export function parseProcessStart(text) {
+  const match = /^\s*[A-Z][a-z]{2}\s+([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(String(text ?? ''));
+  const month = match ? MONTHS.indexOf(match[1]) : -1;
+  if (month < 0) return null;
+  const [day, hours, minutes, seconds, year] = match.slice(2).map(Number);
+  return new Date(year, month, day, hours, minutes, seconds).getTime();
+}
+
+/**
+ * When this process started, as a record keeps it beside the pid. Worked out
+ * once: the clock can be set while the process runs, a Raspberry Pi with no
+ * clock of its own sets it from the network after it has booted, and a start
+ * time worked out again after that would no longer match the one written.
+ */
+const OWN_START = new Date(Date.now() - process.uptime() * 1000).toISOString();
+
+export function ownStartTime() {
+  return OWN_START;
+}
+
+/**
+ * On Linux, when a process started in clock ticks since the boot, from
+ * /proc/<pid>/stat, or null. Within a boot it names one process exactly, and
+ * unlike any time of day it does not move when the clock is set: ps works its
+ * start times out from the clock as it is now, so a process that started
+ * before the clock was set forward looks as if it started after.
+ */
+export function processStartTicks(pid) {
+  if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 0) return null;
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM';
+    return parseStartTicks(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'));
+  } catch {
+    return null;
   }
 }
 
-function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+/**
+ * The start ticks in a /proc/<pid>/stat line: its 22nd field, counted from the
+ * last parenthesis, since the command name before it may hold spaces and
+ * parentheses of its own. Null for anything else.
+ */
+export function parseStartTicks(text) {
+  const line = String(text ?? '');
+  const close = line.lastIndexOf(')');
+  if (close === -1) return null;
+  const ticks = line.slice(close + 2).split(' ')[19];
+  return /^[0-9]+$/.test(ticks ?? '') ? ticks : null;
+}
+
+/**
+ * When a process started, in milliseconds, or null when nothing here can say.
+ *
+ * ps prints the time in the format of its locale, and an ssh session passes on
+ * whatever locale its client had, so it is always asked in the C locale.
+ * Windows has no ps; CIM keeps the creation date of every process.
+ */
+export function processStartTime(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (process.platform === 'win32') {
+    const script = `$process = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = ${pid}'; ` +
+      'if ($process.CreationDate) { ([DateTimeOffset]$process.CreationDate).ToUnixTimeMilliseconds() }';
+    const result = runCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { timeoutMs: 15000 });
+    const text = result.ok ? result.stdout.trim() : '';
+    return /^[0-9]+$/.test(text) ? Number(text) : null;
+  }
+  const result = runCommand('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], { timeoutMs: 5000, env: { ...process.env, LC_ALL: 'C' } });
+  return result.ok ? parseProcessStart(result.stdout) : null;
+}
+
+/**
+ * True when the pid is still running. EPERM means it exists but is not ours.
+ *
+ * A pid on its own only says that SOME process has it now, and process ids are
+ * handed out again, on Windows soon. So whoever wrote the pid down also writes
+ * down when that process started, no later than which it must have, and a
+ * process that holds the id now and started well after that is somebody else's:
+ * the one that was named is gone. On Linux the ticks it started at, where they
+ * were written down too, say it exactly (processStartTicks). A start time that
+ * cannot be read cannot prove anything, and the pid is taken for running, as it
+ * always was. The locks do not depend on any of this, the operating system
+ * holds those; the records of operations, the command ledger and the Windows
+ * watchdog's lock file do.
+ */
+export function processIsAlive(pid, { startedAt = null, startTicks = null } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if (err.code !== 'EPERM') return false;
+  }
+  const ticks = startTicks ? processStartTicks(pid) : null;
+  if (ticks !== null) return ticks === startTicks;
+  const named = Date.parse(startedAt ?? '');
+  if (Number.isNaN(named)) return true;
+  const started = pid === process.pid ? Date.parse(ownStartTime()) : processStartTime(pid);
+  return started === null || started <= named + SAME_PROCESS_SLACK_MS;
+}
+
+/**
+ * A directory only this user can enter (T8). The base and everything the agent
+ * writes under it hold configured commands, the setup and the record of every
+ * operation, so they are 0700 whatever the umask was. A directory created with
+ * more, by an older agent or an installer, is narrowed when the agent next
+ * writes into it. Windows has no mode bits worth setting here; its installer
+ * sets the ACL, and doctor says when it allows too much.
+ */
+export function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform === 'win32') return;
+  try {
+    if ((fs.statSync(dir).mode & 0o077) !== 0) fs.chmodSync(dir, 0o700);
+  } catch {
+    /* not ours to change; doctor's files.private says so */
+  }
 }
 
 /**
@@ -117,39 +225,66 @@ export function readJsonStore(file) {
   return readJson(file);
 }
 
+const sharingWait = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Run a file operation again, for up to three seconds, while Windows refuses
+ * it with EPERM, EACCES or EBUSY. A reader, the search indexer or an antivirus
+ * scanner holding the destination open for a moment makes a rename over it
+ * fail until it lets go, and deleting the destination first would leave a
+ * moment with no file at all. So the same atomic operation is tried again. A
+ * second was too short on a busy machine, where the reader that holds the
+ * file waits for the processor like everything else. Anywhere else those
+ * errors mean what they say, the first time.
+ */
+export function retryWindowsSharing(operation, { platform = process.platform, waitMs = 3000 } = {}) {
+  const deadline = performance.now() + waitMs;
+  let pauseMs = 10;
+  for (;;) {
+    try {
+      return operation();
+    } catch (error) {
+      const remaining = deadline - performance.now();
+      if (platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || remaining <= 0) throw error;
+      Atomics.wait(sharingWait, 0, 0, Math.min(pauseMs, remaining));
+      pauseMs = Math.min(pauseMs * 2, 100);
+    }
+  }
+}
+
 /**
  * Atomic write with a temp name unique to this process and call.
  *
  * The shared "<file>.tmp" name the first version used meant two concurrent
  * writers wrote into the same temp file and renamed each other's half-written
  * bytes into place. The pid and a random suffix make that impossible, and the
- * directory fsync makes the rename durable rather than merely ordered.
+ * directory fsync makes the rename durable rather than merely ordered. On
+ * Windows the rename waits out a reader holding the file (retryWindowsSharing).
+ *
+ * Every file the agent writes this way is private, as writePrivateAtomic's are.
  */
 export function writeJsonAtomic(file, value) {
-  return writeAtomic(file, `${JSON.stringify(value, null, 2)}\n`, 0o666);
+  return writePrivateAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 /**
- * The same atomic write for exact bytes that only this user may read: the temp
- * file is created 0600, so the rename puts a private file in place rather than
- * one a later chmod has to catch up with.
+ * The atomic write for exact bytes that only this user may read: the temp file
+ * is created 0600 in a 0700 directory, so the rename puts a private file in
+ * place rather than one a later chmod has to catch up with. A rename replaces
+ * the file, so a chmod somebody made by hand never lasted past the next write.
  */
 export function writePrivateAtomic(file, data) {
-  return writeAtomic(file, data, 0o600);
-}
-
-function writeAtomic(file, data, mode) {
-  ensureDir(path.dirname(file));
+  ensurePrivateDir(path.dirname(file));
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
   try {
-    const fd = fs.openSync(tmp, 'wx', mode);
+    const fd = fs.openSync(tmp, 'wx', 0o600);
     try {
       fs.writeFileSync(fd, data);
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmp, file);
+    retryWindowsSharing(() => fs.renameSync(tmp, file));
     try {
       const dirFd = fs.openSync(path.dirname(file), 'r');
       try {
@@ -170,6 +305,44 @@ function writeAtomic(file, data, mode) {
     }
     return { ok: false, error: `${file} could not be written: ${err.message}` };
   }
+}
+
+/** The temp names an atomic write leaves while it runs: this file's, the controller's and the lock sidecar's. */
+const TEMP_NAME = /\.tmp-[0-9]+(?:-[0-9a-f]+)?$/;
+/** How old a temp file has to be before nobody can still be writing it. */
+const ORPHAN_AGE_MS = 10 * 60 * 1000;
+
+/**
+ * Remove the temp files of writes whose process died between creating the
+ * file and renaming it into place. Nothing reads them and nothing else would
+ * ever take them away, so a machine whose agent was killed now and then
+ * collected them for good. A temp file lives for as long as one write, so one
+ * ten minutes old has nobody left to finish it; anything younger is left to
+ * the write it may still belong to.
+ */
+export function removeOrphanedTemporaries({ dirs = [basePath(), stateDir(), operationsDir()], now = Date.now() } = {}) {
+  const removed = [];
+  for (const dir of dirs) {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!TEMP_NAME.test(name)) continue;
+      const file = path.join(dir, name);
+      try {
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || now - stat.mtimeMs < ORPHAN_AGE_MS) continue;
+        fs.rmSync(file, { force: true });
+        removed.push(file);
+      } catch {
+        /* it is looked at again by the next cycle */
+      }
+    }
+  }
+  return removed;
 }
 
 /**

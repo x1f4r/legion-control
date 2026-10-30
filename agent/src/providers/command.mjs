@@ -6,7 +6,8 @@
 // the service reports upToDate: null and the apps say the version was not
 // checked; without update the service can only be restarted.
 
-import { compilePattern, describeFailure, runArgv } from '../config.mjs';
+import { compilePattern } from '../config-schema.mjs';
+import { describeFailure, runArgv, runMutationArgv } from '../process-runner.mjs';
 import { cachedLookup, channelCacheKey } from './npm.mjs';
 
 /** First line of stdout, trimmed. Anything else is not a version. */
@@ -19,10 +20,24 @@ function firstLine(stdout) {
 }
 
 export function installedVersion(service, { timeoutMs = 15000 } = {}) {
-  if (!service.installedVersion) return null;
+  return readInstalledVersion(service, { timeoutMs }).version;
+}
+
+/**
+ * The installed version as a reading: the version, or null with the reason
+ * nothing could be read. installedVersion() folds a failure into null, which
+ * is right for a version shown beside the service and wrong for anything that
+ * acts on it. A version command can fail for reasons that say nothing about
+ * what is installed, a timeout or one that needs the service up to answer, and
+ * recovery must never take that for a version that is neither of the ones an
+ * update noted.
+ */
+export function readInstalledVersion(service, { timeoutMs = 15000 } = {}) {
+  if (!service.installedVersion) return { version: null, error: `${service.name} has no installedVersion command` };
   const result = runArgv(service.installedVersion, { timeoutMs });
-  if (!result.ok) return null;
-  return firstLine(result.stdout);
+  if (!result.ok) return { version: null, error: describeFailure(result) };
+  const version = firstLine(result.stdout);
+  return version ? { version, error: null } : { version: null, error: `${result.command} printed no version` };
 }
 
 /**
@@ -53,8 +68,16 @@ export function cachedLatestVersion(service, options = {}) {
   );
 }
 
-export function update(service, { timeoutMs = 600000 } = {}) {
+/** How long an update command gets. */
+export const UPDATE_COMMAND_MS = 600000;
+
+/**
+ * Run the update command. It changes the machine, so it goes through the
+ * mutation runner: a deadline stops everything it started before anything
+ * after it, a rollback included, may begin.
+ */
+export async function update(service, { timeoutMs = UPDATE_COMMAND_MS } = {}) {
   if (!service.update) return { ok: false, message: `${service.name} has no update command configured` };
-  const result = runArgv(service.update, { timeoutMs });
+  const result = await runMutationArgv(service.update, { timeoutMs });
   return { ok: result.ok, message: result.ok ? null : describeFailure(result), result };
 }

@@ -112,7 +112,9 @@ Uninstall first. That wipes the app's ssh key, so see the next section.
 **A setup, fetched from a machine.** Every machine carries the setup and every device is a
 peer: the phone edits and publishes it exactly as the Mac and the desktop do, and there is no
 device whose copy wins by rank. On first launch the Machines page asks for a host, a port and a
-user; **Fetch** runs `config` there with the phone's key and applies what comes back.
+user; **Fetch** runs `config` there with the phone's key and shows every machine's command, key
+file and update source in what comes back. **Confirm** applies it and approves those commands on
+this phone; **Cancel** applies nothing.
 
 After that it keeps itself in step on every poll. Two things happen without asking, and both
 only along strict descent: the phone pushes to a machine whose copy its own was made from, and
@@ -124,7 +126,10 @@ below.
 
 The same block lives under **This device → Setup**, next to the JSON field for pasting a
 document by hand (**Insert example** drops in a template whose hardware address is a
-placeholder). Either way the document is validated first and nothing is stored until it passes.
+placeholder). Either way the document is checked first and nothing is stored until it passes.
+What passes is exactly what contract section 9.7 accepts, the same on every client: a machine
+with no systems or addresses yet, an address with no id or no user and a wake block with no
+broadcast are warnings that say why something is not driven, never a reason to refuse the setup.
 The machines' endpoints are dialled directly by the app's own ssh client, in the order listed:
 a tunnel address first works from anywhere, a LAN address as the fallback works from home.
 
@@ -186,6 +191,7 @@ same state, so neither can be out of step with the other.
 | One per service on it | Versions, health, what it is doing now, the relay, the last update, when the schedule may touch it, Update now, Update when idle, Restart, Restart when idle |
 | Edit the setup | Machines, addresses, systems, sites and wake helpers, with the raw document one page along |
 | Setup edited twice | Two copies neither made from the other, with a per-entry merge |
+| Approve commands | Commands the shared setup changed, each beside the one this phone approved, with Approve, Revert and Not now |
 | This device | The app's version and self update, this phone's key, what this device is called and where it is standing, whether finished changes are announced, the setup, and everything this phone has asked for |
 
 **Service setup** edits the full agent configuration with templates, a validation preview, and an
@@ -198,7 +204,7 @@ unavailable, with probe errors under Details; the phone does not retain a teleme
 history remains readable when the machine is offline. Diagnostics offers address checks, agent
 checks and an explicit deep check; logs and secondary results are shown on demand.
 
-Four things about the actions are worth knowing.
+Five things about the actions are worth knowing.
 
 **Update now is dead unless a newer version was actually found**: an agent that could not reach
 the registry does not know, and an update pressed on the strength of an unknown stops the
@@ -220,6 +226,12 @@ the machine what became of that id rather than repeating the command. Being told
 not the same as having rebooted: the row says the outcome is not known until the machine answers
 as the system that was asked for.
 
+**Locking the phone does not stop a change.** While one is being sent or watched, the app keeps
+itself running with a quiet "Seeing a change through" notification, which goes once the machine
+has said how the change ended or after half an hour of not saying. With *Finished changes* on,
+the outcome is announced only when you are not looking at the app, and tapping it opens the
+machine.
+
 ## Editing the setup
 
 Every device is a peer. The **Edit the setup** page is a form over the document itself rather
@@ -237,18 +249,56 @@ reach, and travels on the next poll of each one. Behind that:
 - The phone pushes only where its copy descends from the machine's, and adopts only where the
   machine's descends from its own. Descent has a direction, so two devices can never take turns
   overwriting each other.
+- Adopting is a compare-and-swap. The machine's stored bytes, checked against the hash it
+  reported, replace this phone's copy only if that is still the one the decision was made from,
+  so an edit saved while the read was out stays and the next poll shows the two as diverged.
+- Pushes keep to the guardrails of section 9.5: one setup request at a time per machine, a
+  minute's pause after one fails, nothing while a change runs on the machine, and none from a
+  copy with an error in it. A push the machine refuses for a restricted key or an invalid
+  document is held for that revision, with the reason under the machine and **Try again**.
 - Anything else is a question. **Setup edited twice** shows both revisions, who wrote them, and
-  a difference per machine, address, system, wake block or site, defaulting to whichever side
-  actually changed each one. Merging writes a revision descending from both, which every machine
-  then accepts as an ordinary fast-forward, so nothing is replaced.
+  a difference per machine, address, system, wake block, site or unknown key, defaulting to
+  whichever side actually changed each one; a deletion against an edit is asked about. Merging
+  (section 9.8) starts from this phone's copy, keeps its order and every number as it was
+  written, and writes a revision descending from both, which every machine then accepts as an
+  ordinary fast-forward, so nothing is replaced. The base it compares against is the newest
+  revision both copies descend from that the phone kept and still accepts; one it would refuse is
+  skipped like one it never kept, and with none every difference is asked about.
+- A document already in force that this build would refuse stays in force with its errors
+  shown: nothing is published from it, and a machine an error is inside is not driven until the
+  editor fixes it.
 - A machine carrying an entirely different setup cannot be merged with, and is the one place the
-  app ever sends `--replace`, after an explicit decision.
+  app ever sends `--replace`, after an explicit decision, and never from a copy with an error in
+  it: **Replace** stays off, with the error to fix beside it. Nothing is sent when the machine's
+  latest status names another document than the one shown, or when this phone's setup changed
+  since the question was asked: the question says so where Replace was pressed, and the machine's
+  next status closes it and asks again. Otherwise it closes only when the machine says it stored
+  this phone's copy: a refusal, a push its lock held back and a reply that leaves it open whether
+  the copy was replaced each say so on the question and keep it.
+
+**Commands wait for approval on each device** (contract section 9.9). Lineage shows that a
+document claims an ancestor, not who wrote it, and any key that may publish the setup, a
+restricted one included, can write a descendant. So the phone never takes what it runs from
+replication alone. A system's `agent` with the grammar its `platform`, `shell` and `restricted`
+give, and `appUpdates.githubRepo`, are launch values: the document is adopted as always, but the
+phone runs a launch value only once it approved it, and until then keeps running the one it
+approved at that place, or drives nothing there. What approves is **Approve** on the review, an
+edit or paste made on this phone, confirming a fetch on a phone with no setup yet, and the first
+start of this build, which approves what the phone already applies. Adopting from a machine,
+merging, keeping this phone's copy and following another setup approve nothing. The launcher
+migration of an approved command to `<base>/bin/launcher.mjs` is taken without asking. In the
+editor, a system whose command waits is read-only, with Approve and Revert, because changing its
+shell would otherwise approve the argv beside it; Revert is applied at once, so it waits while an
+edit is in progress. The record is the `approved-launch` preference
+beside the setup text, written in the same edit as the document; clearing the app's data clears
+both, and the next setup confirmed here counts as the first.
 
 The hash all of this turns on is the canonical form from `contract/hash-vectors.json`: strict
 UTF-8, one leading byte order mark stripped, CRLF and CR to LF, a fixed six-character whitespace
 set trimmed from both ends, exactly one trailing newline. `data/CanonicalSetup.kt` implements
-that rule and `CanonicalSetupTest` checks every shared vector, including the ones that must be
-refused.
+that rule and the `hash` family of `ContractVectorsTest` checks every shared vector, including
+the ones that must be refused. A copy read from a machine is hashed and stored as the bytes the
+agent keeps (`raw`), never printed again first.
 
 ## Testing on an emulator
 

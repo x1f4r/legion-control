@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { buildBundle, redactConfig } from '../src/doctor.mjs';
+import { buildBundle } from '../src/doctor.mjs';
+import { redactConfig } from '../src/redact.mjs';
 import { log } from '../src/log.mjs';
 import { cli, withHome, writeConfig } from './helpers.mjs';
 

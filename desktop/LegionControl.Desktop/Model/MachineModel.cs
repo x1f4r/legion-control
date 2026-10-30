@@ -16,6 +16,10 @@ public sealed class MachineModel
 {
     private readonly IProcessRunner _runner;
     private readonly OperationTracker _tracker;
+    private readonly object _readingGate = new();
+    /// How many readings have started, and the number of the last one applied.
+    private long _readingsStarted;
+    private long _readingApplied;
 
     public MachineModel(
         MachineConfig machine,
@@ -39,6 +43,9 @@ public sealed class MachineModel
     /// Where this device is, as far as anything can tell. Set by the app, used for route order and
     /// for whether a magic packet from here could reach this machine.
     public SitePresence Presence { get; set; } = new();
+    /// Where ssh writes its own log for each attempt, when not in the state directory's. Set by
+    /// the app for a run that changes nothing on disk.
+    public string? SshLogDirectory { get; init; }
 
     /// The last complete reading, or null when there has never been one.
     public AgentStatus? Status { get; private set; }
@@ -86,40 +93,61 @@ public sealed class MachineModel
 
     // MARK: reading
 
-    public async Task RefreshAsync(CancellationToken cancellationToken = default)
+    /// Reads the machine once. Polls overlap: one stuck on a dead route can still be waiting when
+    /// the next has already come back from a live one. So every reading is numbered when it
+    /// starts, and one that finishes after a later-started reading was applied is dropped, failure
+    /// and success alike: a slow poll never puts an older picture over a newer one.
+    ///
+    /// An answer is this machine awake, so it releases every wake hold for it recorded before the
+    /// question was asked (contract section 10.2). [dialEveryRoute] is for a wake: the addresses
+    /// of a machine coming up are dialled even within the minute after one failed.
+    public async Task RefreshAsync(CancellationToken cancellationToken = default, bool dialEveryRoute = false)
     {
+        var sequence = Interlocked.Increment(ref _readingsStarted);
+        var asked = DateTimeOffset.UtcNow;
         try
         {
-            var reply = await NewAgent().StatusAsync(Capabilities, PreferredSystem(), null, cancellationToken);
-            var previousSystem = Routes.RememberedSystemId;
-            Status = reply.Value;
-            Failure = null;
-            LastReadAt = DateTimeOffset.UtcNow;
-            Capabilities = AgentCapabilities.Of(reply.Value);
-
-            // A machine that came back as a different system is reached differently: the address
-            // the other system answers on is no longer the one to try first.
-            if (reply.Value.SystemId is { } reported && previousSystem is not null && reported != previousSystem)
+            var reply = await NewAgent(dialEveryRoute).StatusAsync(Capabilities, PreferredSystem(), null, cancellationToken);
+            _tracker.ReleaseWakeHolds(Machine.Id, asked);
+            lock (_readingGate)
             {
-                Routes.ForgetRoute($"the machine answered as {reported} rather than {previousSystem}");
-            }
-            Routes.Remember(reply.Route, reply.System, reply.Value.Agent?.RestrictedSession == true);
+                if (sequence < _readingApplied) return;
+                _readingApplied = sequence;
+                var previousSystem = Routes.RememberedSystemId;
+                Status = reply.Value;
+                Failure = null;
+                LastReadAt = DateTimeOffset.UtcNow;
+                Capabilities = AgentCapabilities.Of(reply.Value);
 
-            ObserveTransition(reply.Value);
-            if (Settings.KeepMetricsHistory && reply.Value.Metrics is { } metrics)
-            {
-                Metrics.Add(metrics, Settings.MetricsHistoryLimit);
+                // A machine that came back as a different system is reached differently: the
+                // address the other system answers on is no longer the one to try first.
+                if (reply.Value.SystemId is { } reported && previousSystem is not null && reported != previousSystem)
+                {
+                    Routes.ForgetRoute($"the machine answered as {reported} rather than {previousSystem}");
+                }
+                Routes.Remember(reply.Route, reply.System, reply.Value.Agent?.RestrictedSession == true);
+
+                ObserveTransition(reply.Value);
+                if (Settings.KeepMetricsHistory && reply.Value.Metrics is { } metrics)
+                {
+                    Metrics.Add(metrics, Settings.MetricsHistoryLimit);
+                }
             }
         }
         catch (AgentFailure failure)
         {
-            Failure = failure;
-            LastReadAt = DateTimeOffset.UtcNow;
-            NoteFailedRoutes(failure);
-            ObserveAbsence(failure);
-            // The status is kept. A machine that has gone to sleep is still a machine we know the
-            // shape of, and blanking the section would lose the very rows that explain why it is
-            // not answering.
+            lock (_readingGate)
+            {
+                if (sequence < _readingApplied) return;
+                _readingApplied = sequence;
+                Failure = failure;
+                LastReadAt = DateTimeOffset.UtcNow;
+                NoteFailedRoutes(failure);
+                ObserveAbsence(failure);
+                // The status is kept. A machine that has gone to sleep is still a machine we know
+                // the shape of, and blanking the section would lose the very rows that explain why
+                // it is not answering.
+            }
         }
         Changed?.Invoke();
     }
@@ -215,7 +243,7 @@ public sealed class MachineModel
         TrackedOperation tracked;
         try
         {
-            (tracked, _) = _tracker.Begin(operationId, Machine.Id, Routes.RememberedSystemId, request.Intent);
+            (tracked, _) = _tracker.Begin(operationId, Machine.Id, Routes.RememberedSystemId, request.Intent, request.WakeTarget);
         }
         catch (InvalidOperationException error)
         {
@@ -321,19 +349,24 @@ public sealed class MachineModel
         }
         if (result.Operation is { } record) tracked = _tracker.Apply(tracked.Id, record) ?? tracked;
 
-        if (result.IsConflict)
+        // The outcome decides what happens next (contract section 5.6), and the action only says
+        // which kind of it this is: a request held until idle, a machine on its way down, or work
+        // the agent took away to finish on its own.
+        var outcome = result.Outcome;
+        if (outcome == OperationOutcome.Deferred && result.IsConflict)
         {
             var conflict = result.Conflict;
             var sentence = conflict is null
                 ? $"{Name} is already busy with another operation, so nothing was started."
                 : $"{Name} is already running {OperationSummary.Describe(conflict.Kind, conflict.Service, null, null)}"
                   + (conflict.Phase is { } phase ? $" ({phase})" : "") + ", so nothing was started.";
-            _tracker.Update(tracked with { Outcome = OperationOutcome.Conflict, Message = sentence });
+            _tracker.Update(tracked with { State = OperationState.Finished, Outcome = OperationOutcome.Deferred, Message = sentence,
+                ReasonCode = result.Envelope.ReasonCode });
             Changed?.Invoke();
             return new CommandOutcome.Conflicted(conflict, sentence);
         }
 
-        if (result.IsQueued)
+        if (outcome == OperationOutcome.Pending && result.IsQueued)
         {
             var expires = result.ExpiresAt;
             var sentence = $"Held until {Name} is idle"
@@ -341,7 +374,7 @@ public sealed class MachineModel
                 + (result.Replaced is { } replaced ? $" It replaced an earlier queued request ({replaced})." : "");
             var queued = tracked with
             {
-                Outcome = OperationOutcome.Queued,
+                Outcome = OperationOutcome.Pending,
                 State = OperationState.Queued,
                 ExpiresAt = expires,
                 Message = sentence,
@@ -351,7 +384,7 @@ public sealed class MachineModel
             return new CommandOutcome.Queued(queued, expires, sentence);
         }
 
-        if (result.AcknowledgedTransition)
+        if (outcome == OperationOutcome.Pending && result.AcknowledgedTransition)
         {
             Transition = new TransitionWatch
             {
@@ -366,7 +399,9 @@ public sealed class MachineModel
             return new CommandOutcome.Done(result, OperationOutcome.Pending, sentence);
         }
 
-        if (result.IsAccepted)
+        // Anything else the agent still owns is followed by its id: an accepted request, a replay
+        // of one still running, or a reply that simply says pending.
+        if (outcome == OperationOutcome.Pending)
         {
             // The id to poll is the one this app sent, never the one the reply happens to carry. An
             // agent that echoes a different id is answering about something else, and following it
@@ -392,12 +427,13 @@ public sealed class MachineModel
             return new CommandOutcome.Following(tracked, sentence);
         }
 
-        var outcome = result.Outcome;
         var reason = result.Envelope.ReasonCode;
         var text = result.Envelope.Sentence(request.Service) ?? DescribeOutcome(request, outcome, result);
         _tracker.Update(tracked with
         {
-            State = OperationState.Finished,
+            // An unknown outcome is finished only when a record says so. Without one, the id is
+            // still worth reading again; with one, there is nothing more to learn by asking.
+            State = outcome == OperationOutcome.Unknown ? result.Operation?.State ?? OperationState.Unknown : OperationState.Finished,
             Outcome = outcome,
             Message = text,
             Output = result.Output,
@@ -405,20 +441,14 @@ public sealed class MachineModel
         });
         Changed?.Invoke();
 
-        if (outcome == OperationOutcome.Deferred)
+        return outcome switch
         {
-            return new CommandOutcome.Refused(text, ReasonCode.IsForceable(reason), reason);
-        }
-        if (outcome == OperationOutcome.Failed)
-        {
-            return new CommandOutcome.Failed(text, result.Output);
-        }
-        if (outcome == OperationOutcome.Unresolved)
-        {
-            return new CommandOutcome.NotKnown(
-                $"{Name} answered without saying what became of {request.Describe()}. {text}".Trim(), tracked.Id);
-        }
-        return new CommandOutcome.Done(result, outcome, text);
+            OperationOutcome.Deferred => new CommandOutcome.Refused(text, ReasonCode.IsForceable(reason), reason),
+            OperationOutcome.Failed => new CommandOutcome.Failed(text, result.Output),
+            OperationOutcome.Unknown => new CommandOutcome.NotKnown(
+                $"{Name} answered without saying what became of {request.Describe()}. {text}".Trim(), tracked.Id),
+            _ => new CommandOutcome.Done(result, outcome, text),
+        };
     }
 
     /// Polls one operation until it finishes or the caller gives up.
@@ -453,25 +483,36 @@ public sealed class MachineModel
             {
                 var reply = await NewAgent().OperationAsync(operationId, 20, Capabilities, PreferredSystem(), null,
                     cancellationToken);
-                if (reply.Value is not { } record)
+                if (reply.Value.NoRecord)
                 {
-                    // The agent has no record of an id it was given. That is an answer: nothing
-                    // with this id ever ran there.
-                    var missing = $"{Name} has no record of {operationId}. Nothing with that id ran there.";
-                    if (tracked is not null)
-                    {
-                        _tracker.Update(tracked with { Outcome = OperationOutcome.Unresolved, Message = missing });
-                    }
+                    // The agent has no record of an id it was given. That is an answer: the request
+                    // never started there.
+                    var missing = NeverStarted(operationId, reply.Value.Envelope.ReasonCode);
                     Changed?.Invoke();
-                    return new CommandOutcome.NotKnown(missing, operationId);
+                    return new CommandOutcome.Failed(missing, null);
+                }
+                if (reply.Value.Record is not { } record)
+                {
+                    // A reply that names no operation at all says nothing about this one, no more
+                    // than a poll that never came back: the same id is asked again.
+                    var silent = reply.Value.Envelope.Sentence() ?? $"{Name} answered without the record of {operationId}.";
+                    if (++lostLinks >= 4)
+                    {
+                        _tracker.MarkUnknown(operationId, silent);
+                        Changed?.Invoke();
+                        return new CommandOutcome.NotKnown($"{silent} The operation id is {operationId}.", operationId);
+                    }
+                    await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
+                    continue;
                 }
                 tracked = _tracker.Apply(operationId, record) ?? tracked;
                 Changed?.Invoke();
-                if (tracked?.Outcome == OperationOutcome.Conflict)
+                if (tracked is not null && !tracked.Intent.Matches(record))
                 {
                     return new CommandOutcome.Conflicted(null, tracked.Message ?? "That id belongs to a different operation.");
                 }
-                if (record.IsFinished)
+                // Followed until the record is no longer pending. A finished record never is.
+                if (record.Outcome != OperationOutcome.Pending)
                 {
                     var sentence = record.Result?.Message
                         ?? ReasonCode.Describe(record.Result?.ReasonCode, record.Service)
@@ -481,9 +522,10 @@ public sealed class MachineModel
                         OperationOutcome.Failed => new CommandOutcome.Failed(sentence, record.Result?.Output),
                         OperationOutcome.Deferred => new CommandOutcome.Refused(
                             sentence, ReasonCode.IsForceable(record.Result?.ReasonCode), record.Result?.ReasonCode),
-                        OperationOutcome.Unresolved => new CommandOutcome.NotKnown(sentence, operationId),
+                        OperationOutcome.Unknown => new CommandOutcome.NotKnown(sentence, operationId),
                         _ => new CommandOutcome.Done(
-                            new ActionResult { Operation = record, Action = record.Result?.Action, Output = record.Result?.Output }, record.Outcome, sentence),
+                            new ActionResult { Operation = record, Action = record.Result?.Action, Output = record.Result?.Output, Outcome = record.Outcome },
+                            record.Outcome, sentence),
                     };
                 }
             }
@@ -518,22 +560,27 @@ public sealed class MachineModel
             $"{request.Describe()} on {Name} is still running. The id is {operationId}.", operationId);
     }
 
-    /// Asks about an operation without waiting for it, for the rows that resolve themselves in the
-    /// background after a link came back.
-    public async Task<TrackedOperation?> ResolveAsync(string operationId, CancellationToken cancellationToken = default)
+    /// Asks about an operation once, for the rows that resolve themselves in the background after a
+    /// link came back. [waitSeconds] waits on the agent's side for a record that is still running,
+    /// which is how a wake reads a held helper action once more before it moves on. A wake also
+    /// passes [dialEveryRoute]: the one read a hold gets has to go out even over the address whose
+    /// run just timed out, or the hold would stand on a question nobody asked.
+    public async Task<TrackedOperation?> ResolveAsync(
+        string operationId, CancellationToken cancellationToken = default, int? waitSeconds = null, bool dialEveryRoute = false)
     {
         if (!Capabilities.SupportsOperationQuery) return _tracker.Find(operationId);
         try
         {
-            var reply = await NewAgent().OperationAsync(operationId, null, Capabilities, PreferredSystem(), null,
+            var reply = await NewAgent(dialEveryRoute).OperationAsync(operationId, waitSeconds, Capabilities, PreferredSystem(), null,
                 cancellationToken);
-            if (reply.Value is not { } record) return _tracker.Find(operationId);
-            var updated = _tracker.Apply(operationId, record);
+            if (reply.Value.NoRecord) NeverStarted(operationId, reply.Value.Envelope.ReasonCode);
+            else if (reply.Value.Record is { } record) _tracker.Apply(operationId, record);
+            else return _tracker.Find(operationId);
+            var updated = _tracker.Find(operationId);
             if (Transition is { OperationId: var pending } watch && pending == operationId && updated?.IsResolved == true)
                 Transition = watch with
                 {
-                    State = updated.Outcome is OperationOutcome.Succeeded or OperationOutcome.Noop
-                        ? TransitionState.Observed : TransitionState.Contradicted,
+                    State = updated.Outcome == OperationOutcome.Succeeded ? TransitionState.Observed : TransitionState.Contradicted,
                     Note = updated.Message,
                 };
             Changed?.Invoke();
@@ -544,6 +591,27 @@ public sealed class MachineModel
             // Still unknown. That is the honest state and it stays on screen as one.
             return _tracker.Find(operationId);
         }
+    }
+
+    /// Resolves an operation the machine has no record of as one that never started: not in effect
+    /// there, and a new attempt is a new request. A record pruned long since reads the same, which
+    /// is why the sentence says both. Returns that sentence.
+    private string NeverStarted(string operationId, string? reasonCode)
+    {
+        var sentence = $"{Name} has no record of {operationId}: the request never arrived there, or was pruned long since. Nothing with that id is running.";
+        if (_tracker.Find(operationId) is { } tracked)
+        {
+            _tracker.Update(tracked with
+            {
+                UpdatedAt = DateTimeOffset.UtcNow,
+                State = OperationState.Finished,
+                Outcome = OperationOutcome.Failed,
+                Message = sentence,
+                ReasonCode = reasonCode,
+                OutcomeUnknown = false,
+            });
+        }
+        return sentence;
     }
 
     public async Task<CommandOutcome> CancelAsync(string operationId, CancellationToken cancellationToken = default)
@@ -558,14 +626,18 @@ public sealed class MachineModel
             var reply = await NewAgent().MutateAsync(argv, TimeSpan.FromSeconds(40), PreferredSystem(), null,
                 cancellationToken: cancellationToken);
             var result = reply.Value;
-            if (result.Outcome == OperationOutcome.Cancelled)
+            // The cancel succeeded; the request it cancelled is deferred, finished without acting,
+            // with the reason code its own record carries, so it reads as cancelled rather than as
+            // turned down.
+            if (result.Outcome == OperationOutcome.Succeeded && result.Action == "cancelled")
             {
                 if (_tracker.Find(operationId) is { } tracked)
                 {
-                    _tracker.Update(tracked with { Outcome = OperationOutcome.Cancelled, Message = "Cancelled." });
+                    _tracker.Update(tracked with { State = OperationState.Finished, Outcome = OperationOutcome.Deferred, Message = "Cancelled.",
+                        ReasonCode = ReasonCode.Cancelled });
                 }
                 Changed?.Invoke();
-                return new CommandOutcome.Done(result, OperationOutcome.Cancelled, "Cancelled.");
+                return new CommandOutcome.Done(result, OperationOutcome.Succeeded, "Cancelled.");
             }
             var sentence = result.Envelope.Sentence() ?? "The agent did not cancel it.";
             // A running operation is not killable, and the agent says so rather than pretending.
@@ -694,23 +766,27 @@ public sealed class MachineModel
 
     // MARK: the setup
 
-    /// Where this machine stands against the document this device holds, from the status alone.
+    /// Where this machine stands against the document this device holds, from the status and
+    /// what is filed about the hash it reports (contract section 9.5).
     ///
-    /// Status carries a hash and no lineage, so this can only ever say three things for certain:
-    /// the same, the machine holds nothing, or the machine holds something this document descends
-    /// from. Anything else needs [ReadSetupMetaAsync], which costs a round trip and is only spent
-    /// when it is the only way to tell "behind" from "diverged".
+    /// Status carries a hash and no lineage, so without [SetupMeta] for that hash this can only say
+    /// the same, behind, or another setup; anything else is [SetupSharing.Unknown] until a
+    /// reconciliation has read the machine's lineage.
     public SetupSharing EvaluateSharing(ControllerDocument? document)
     {
-        if (Status is null || document is null) return new SetupSharing.Unknown();
-        if (!Capabilities.SupportsSetupLineage && Status.Controller is null) return new SetupSharing.Unsupported();
-
-        var mark = Status.Controller;
-        return SetupLineage.DecideFromStatus(document.Hash, document.Identity, mark?.Hash) switch
+        if (Status is not { } status || document is null) return new SetupSharing.Unknown();
+        var filed = SetupMeta is { Hash: { } hash } meta
+            ? new Dictionary<string, ControllerMark>(StringComparer.Ordinal) { [hash] = meta }
+            : new Dictionary<string, ControllerMark>(StringComparer.Ordinal);
+        var decision = SetupSync.Decide(LocalHead.Of(document), status.ContractVersion, status.Controller, filed);
+        return decision.Kind switch
         {
-            Descent.Same => new SetupSharing.UpToDate(),
-            Descent.TheyHaveNothing => new SetupSharing.Behind(),
-            Descent.TheyAreBehind => new SetupSharing.Behind(),
+            SetupDecision.Unsupported => new SetupSharing.Unsupported(),
+            SetupDecision.InSync => new SetupSharing.UpToDate(),
+            SetupDecision.Push => new SetupSharing.Behind(),
+            SetupDecision.Fetch => new SetupSharing.Ahead(),
+            SetupDecision.DifferentSetup => new SetupSharing.DifferentSetup($"{Name} holds a different setup."),
+            SetupDecision.Diverged => new SetupSharing.Diverged($"{Name} and this device have both changed the setup."),
             _ => new SetupSharing.Unknown(),
         };
     }
@@ -741,80 +817,69 @@ public sealed class MachineModel
         Changed?.Invoke();
     }
 
-    /// Hands this machine the document.
+    /// Hands this machine the document, and returns the reply exactly as it came; null when none
+    /// was read, with what went wrong. What the reply means is contract section 9.5's to say
+    /// ([SetupSync.AfterPush]), not this method's.
     ///
     /// `replace` is only ever true after a person answered the "different setup" question in front
     /// of a preview. Nothing in this app sends it on its own initiative.
-    public async Task<SetupSharing> PushSetupAsync(
+    public async Task<(ConfigReply? Reply, string? Problem)> PushSetupAsync(
         ControllerDocument document, bool replace = false, CancellationToken cancellationToken = default)
     {
         try
         {
             var reply = await NewAgent().WriteConfigAsync(document, replace, Capabilities, PreferredSystem(), null,
                 cancellationToken);
-            var result = reply.Value;
-            if (result.Envelope.Ok == false)
-            {
-                var code = result.Envelope.ReasonCode;
-                var sentence = result.Envelope.Sentence() ?? "The machine refused the document.";
-                Sharing = code switch
-                {
-                    // Behind: the machine holds something this document descends from the other way
-                    // round. The next poll fetches it.
-                    ReasonCode.StaleRevision => new SetupSharing.Ahead(),
-                    ReasonCode.ControllerConflict when result.Divergent => new SetupSharing.Diverged(sentence),
-                    ReasonCode.ControllerConflict => new SetupSharing.DifferentSetup(sentence),
-                    _ => new SetupSharing.Failed(sentence),
-                };
-                SetupMeta = result.Current ?? SetupMeta;
-                Changed?.Invoke();
-                return Sharing;
-            }
-            // `noop` means the machine already held exactly these bytes, which is what an
-            // idempotent retry after a cut link looks like. It is a success.
-            Sharing = result.Action == "noop" ? new SetupSharing.UpToDate() : new SetupSharing.JustShared();
-            Changed?.Invoke();
-            return Sharing;
-        }
-        catch (AgentFailure failure)
-        {
-            Sharing = new SetupSharing.Failed(failure.Sentence(Name));
-            Changed?.Invoke();
-            return Sharing;
-        }
-    }
-
-    /// Reads the document this machine holds, so this device can fast-forward to it or merge it.
-    ///
-    /// The hash is checked here rather than trusted: a document whose bytes do not hash to what the
-    /// machine says they hash to is not adopted at all.
-    public async Task<(ControllerDocument? Document, string? Problem)> FetchSetupAsync(CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            var reply = await NewAgent().ReadConfigAsync(PreferredSystem(), null, cancellationToken);
-            var text = reply.Value.Document;
-            if (text is null) return (null, $"{Name} did not send a setup document.");
-            ControllerDocument document;
-            try
-            {
-                document = ControllerDocument.FromText(text);
-            }
-            catch (Canonical.NotUtf8)
-            {
-                return (null, $"{Name} sent something that is not valid UTF-8.");
-            }
-            if (reply.Value.Hash is { } hash && hash != document.Hash)
-            {
-                return (null,
-                    $"{Name} reports the hash {hash} for a document that hashes to {document.Hash} here. Nothing was adopted.");
-            }
-            return (document, null);
+            if (reply.Value.Current is { } current) SetupMeta = current;
+            return (reply.Value, null);
         }
         catch (AgentFailure failure)
         {
             return (null, failure.Sentence(Name));
         }
+        catch (CommandSurface.InvalidArgument refused)
+        {
+            return (null, refused.Message);
+        }
+    }
+
+    /// Reads `config` and returns the reply as it came, or null with what went wrong.
+    public async Task<(ConfigReply? Reply, string? Problem)> ReadSetupAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var reply = await NewAgent().ReadConfigAsync(PreferredSystem(), null, cancellationToken);
+            return (reply.Value, null);
+        }
+        catch (AgentFailure failure)
+        {
+            return (null, failure.Sentence(Name));
+        }
+    }
+
+    /// Reads the document this machine holds, verified, for a person to compare, merge or adopt.
+    ///
+    /// The bytes are the agent's `raw` text, or what an agent before 3.1.0 sends rebuilt as section
+    /// 9.5 says, and they are adopted only when they hash to exactly what the machine says they
+    /// hash to. A reply without a hash describes no document at all.
+    public async Task<(ControllerDocument? Document, string? Problem)> FetchSetupAsync(CancellationToken cancellationToken = default)
+    {
+        var (reply, problem) = await ReadSetupAsync(cancellationToken);
+        if (reply is null) return (null, problem);
+        return Verified(reply);
+    }
+
+    /// The document a `config` reply carries, when its bytes are the ones its hash covers.
+    public (ControllerDocument? Document, string? Problem) Verified(ConfigReply reply)
+    {
+        if (reply.Envelope.Ok == false) return (null, reply.Envelope.Sentence() ?? $"{Name} did not send its setup.");
+        if (reply.Hash is not { } hash) return (null, $"{Name} holds no setup, or did not say which one it holds.");
+        if (reply.Document is not { } text) return (null, $"{Name} did not send a setup document.");
+        var document = ControllerDocument.FromText(text);
+        if (document.Hash == hash) return (document, null);
+        return (null, reply.Raw is null
+            ? $"{Name} reports the hash {hash}, and the document it sent hashes to {document.Hash} here. Its agent sends the document only as parsed JSON, which this device cannot always rebuild byte for byte, so the agent on {Name} has to be updated before its setup can be adopted. Nothing was adopted."
+            : $"{Name} reports the hash {hash} for a document that hashes to {document.Hash} here. Nothing was adopted.");
     }
 
     // MARK: plumbing
@@ -828,8 +893,9 @@ public sealed class MachineModel
     }
 
     /// The agent for this machine: spawned here when this device is the machine and a local agent
-    /// is bound, and over ssh otherwise.
-    public RemoteAgent NewAgent()
+    /// is bound, and over ssh otherwise. Addresses that failed within the last minute are left out
+    /// unless [dialEveryRoute] says a machine is expected to be coming up.
+    public RemoteAgent NewAgent(bool dialEveryRoute = false)
     {
         if (Bindings.CanRunLocally(Machine.Id))
         {
@@ -840,11 +906,12 @@ public sealed class MachineModel
             return new RemoteAgent(Machine, _runner, local: new LocalExecution(Bindings.LocalAgent, system));
         }
         var routes = Routes.Order(Bindings.RoutesFor(Machine), ExpectedSystemId(), Presence.IsOnNetworkOf(Machine))
-            .Where(route => !Routes.IsBackedOff(route.Id)).ToList();
+            .Where(route => dialEveryRoute || !Routes.IsBackedOff(route.Id)).ToList();
         return new RemoteAgent(Machine, _runner, routes)
         {
             KnownHostsFile = Bindings.KnownHosts,
             RestrictedSessions = Routes.RestrictedSessions,
+            SshLogDirectory = SshLogDirectory ?? AppPaths.SshLogDirectory,
         };
     }
 
@@ -869,18 +936,18 @@ public sealed class MachineModel
         _ => TimeSpan.FromMinutes(2),
     };
 
-    private static string DescribeOutcome(MachineRequest request, OperationOutcome outcome, ActionResult result) => outcome switch
+    private static string DescribeOutcome(MachineRequest request, OperationOutcome outcome, ActionResult result) => (outcome, result.Action) switch
     {
-        OperationOutcome.Succeeded when request.Kind == RequestKind.Update && result.To is { } to =>
+        (OperationOutcome.Succeeded, "noop") => "There was nothing to do.",
+        (OperationOutcome.Succeeded, _) when request.Kind == RequestKind.Update && result.To is { } to =>
             $"Updated {request.Service ?? "the service"} to {to}.",
-        OperationOutcome.Succeeded => $"{request.Describe()} done.",
-        OperationOutcome.Noop => "There was nothing to do.",
-        OperationOutcome.Failed => $"{request.Describe()} failed.",
-        OperationOutcome.Deferred => $"{request.Describe()} was deferred.",
-        OperationOutcome.Cancelled => "Cancelled.",
-        OperationOutcome.Expired => "The request expired before the machine was idle.",
-        OperationOutcome.Interrupted => $"{request.Describe()} was cut off before it finished.",
-        OperationOutcome.Conflict => "Something else holds the machine.",
+        (OperationOutcome.Succeeded, _) => $"{request.Describe()} done.",
+        (OperationOutcome.Failed, _) => $"{request.Describe()} failed.",
+        (OperationOutcome.Deferred, "cancelled") => "Cancelled.",
+        (OperationOutcome.Deferred, "expired") => "The request expired before the machine was idle.",
+        (OperationOutcome.Deferred, "conflict") => "Something else holds the machine.",
+        (OperationOutcome.Deferred, _) => $"{request.Describe()} was deferred.",
+        (OperationOutcome.Unknown, "interrupted") => $"{request.Describe()} was cut off before it finished.",
         _ => $"{request.Describe()}: the machine did not say what happened.",
     };
 }

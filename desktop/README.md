@@ -14,6 +14,11 @@ the models the window draws, so a check that passes over ssh is a check of the t
 
 A bare invocation opens the window. Command flags run without a window and exit.
 
+Closing the window hides it in the tray, and **Quit**, in the tray's menu or the window's **App**
+menu, ends the app. Nothing is read from any machine while the window is hidden or minimised, and
+showing it again reads every machine at once. On a Linux desktop that draws no tray icons (GNOME
+without the AppIndicator extension), closing the window quits, since nothing could bring it back.
+
 Choose `Legion-Control-linux-x64.tar.gz`, `Legion-Control-linux-arm64.tar.gz`, or
 `Legion-Control-windows-x64.zip` from [the latest release](https://github.com/x1f4r/legion-control/releases/latest).
 The ARM64 build supports a Raspberry Pi running a 64-bit Linux OS. Its headless commands do not
@@ -41,18 +46,50 @@ Nothing here returns 0 for an outcome nobody observed. A command whose reply was
 operation id, and `--command op --machine ID --op ID` asks the machine what became of it rather than
 sending it again.
 
+A request somebody cancelled is 0, as it always was. One the machine finished without acting,
+deferred while busy, by its schedule or a lock, or expired before the machine was idle, is 1: that
+it did not happen is known. Builds before 1.4.0 gave `--command op` 2 for a deferred operation, and
+a change interrupted part way 1; nobody knows whether an interrupted change took effect, so it is 2.
+An error the command line did not plan for still ends in one of the three: 1 for a command that
+only reads, 2 for one that may have changed something, with the details in the log.
+
+On Windows the app is a windowed program. A command-line run writes to the console of the cmd or
+PowerShell that started it, and output redirected to a file or a pipe goes there instead. Neither
+shell waits for a windowed program at its prompt, so the prompt can come back before the output
+does, and the exit code is there to read only when the shell waited: a batch file always does, cmd
+does with `start /wait legion-control --command status --machine pi` (then `echo %ERRORLEVEL%`), and
+PowerShell does when the output is piped, as in `legion-control --command status --machine pi |
+Out-Host` (then `$LASTEXITCODE`).
+
+`--smoke` changes nothing on disk: a setup with no controller block is not given one, a first
+start's approvals are evaluated without being recorded, no wake hold is released, and ssh's own log
+for each attempt goes to a directory of the run's own under the system's temporary one, removed
+when the run ends. With `--json` it prints the JSON report and nothing else.
+
 ## Where things live
 
 | what | Linux | Windows |
 | --- | --- | --- |
 | the setup document | `~/.config/legion-control/config.json` | `%APPDATA%\legion-control\config.json` |
 | this device's own settings | `bindings.json` beside it | the same |
+| the commands this device approved | `approved-launch.json` beside it | the same |
 | earlier setups, by hash | `revisions/` beside it | the same |
 | operations this app started | `operations.json` beside it | the same |
 | desktop preferences | `desktop-settings.json` beside it | the same |
 | ssh's own log while a command runs, deleted after each attempt | `ssh-logs/` beside it | the same |
+| what went wrong that nothing on screen planned for | `legion-control-desktop.log` beside it | the same |
+| the last update helper's log, and the one before | `updates/update.log`, `updates/update.log.1` | the same |
 
 Linux uses `$XDG_CONFIG_HOME/legion-control/` instead when `XDG_CONFIG_HOME` is set.
+
+The window and the command line both write these files. Each change takes the file's `.lock`,
+reads it again and applies only that change, so neither writes back what the other changed since
+it started. A file that is there but cannot be read is moved aside to `<name>.corrupt-<unix time>`
+before anything is written in its place, and the log says so. Only one window opens on a state
+directory (`window.lock`); a second start of the window brings the open one forward (`window.show`)
+and exits. Every copy of the app, the window and the command line alike, also holds
+`<installation>.lock` beside the installation directory while it runs, so an update never renames
+the installation while anything runs from it, whichever state directory that uses.
 
 Three environment variables move all of it, which is how a test run touches nothing that matters:
 
@@ -78,12 +115,70 @@ when it descends from the one that machine already holds. So:
 
 `--command setup` shows where each machine stands. `--reconcile-once` does one pass.
 `--command setup --machine ID --merge | --keep-mine | --take-theirs | --replace-theirs` are the four
-answers, and none of them happens on its own. Merging keeps both sides: entries only one device
-changed are taken from that device, and entries both changed are the only ones anybody is asked
-about.
+answers, and none of them happens on its own. Each acts on the machine's document as it is read
+then, verified against its hash, and only while this device's setup is still the one it was compared
+with; `--hash HASH` adds that the machine's document is still the one you looked at. Merging keeps
+both sides: entries only one device changed are taken from that device, and entries both changed,
+or every differing entry when no shared revision this device accepts is kept here, are the only ones
+anybody is asked about. From the command line those take the machine's side.
+
+A machine that refuses a revision because this device's key is restricted there, or because the
+document breaks one of its rules, is not sent that revision again until the setup here changes or a
+person presses Try again. A device with an administrator key publishes it on its next reading.
+
+A setup file with an error in it is still applied, with the error shown: nothing is published from
+here until it is fixed, and a machine the error is inside is neither reached nor run. A file that is
+no document at all, half saved for one, never replaces the setup before it.
 
 `--replace` is the one command that overwrites a different setup, and it is only ever sent after a
-person has answered that question in front of a preview of what changes.
+person has answered that question in front of a preview of what changes, while the machine's latest
+reading still names the copy the preview was built from. It is never sent over a copy of this
+device's own setup, nor from a setup here that has an error in it. A different setup whose copy
+cannot be verified, or is one this device does not accept, can still be replaced: the preview is
+built from what the machine sent, and only taking its setup needs the verified bytes.
+
+## Commands from the shared setup
+
+Ancestry says that a document claims to descend from another, not who wrote it, and any key that may
+publish the setup, a restricted one included, can write a descendant. So the values that decide what
+this device runs with its own key are never taken from replication alone: each system's agent argv
+with the grammar its line is written in, a machine's `ssh.identityFile`, `appUpdates.githubRepo` and
+`local`. The document still applies as it arrives. A system whose command changed keeps running the
+one this device approved there, and a system with no approved command is not driven at all, until a
+person approves the new one here.
+
+`approved-launch.json` holds what this device approved. It is never published. The first start of
+this build approves everything in the setup it already applies. Deleting the file makes the next
+start do that again, with the setup as it is then, whatever a peer brought in meanwhile, and every
+command-line run is a start: a scheduled `--reconcile-once`, or the `--command setup` that lists what
+waits. Until then nothing counts as approved, and an approval or an edit made in between begins a new
+record holding only what it approved. No start records the setup after that, and everything else
+waits for review.
+
+An edit made here approves what it changed. In the editor and with `--command edit --in`, it is
+refused when the setup moved on since the text was read (start again from the setup as it is now),
+and when it changes a command that waits for approval or carries one somewhere else: under a renamed
+machine or on a new system, with or without a shell of its own. A file given to
+`--command edit --in` without its `controller` block also needs `--hash HASH`, the setup it was
+written against. A hand edit of the file that keeps its `controller` block is never refused, because
+it is already written when it is read: it applies, approves what it changed, and leaves a waiting
+command it changed or carried waiting. A file put in place without its `controller` block becomes a
+setup of its own: on a device that applies none it is the first setup there and approves what it
+holds, and over a setup that is applied it approves nothing, so whatever it changed waits for review.
+Importing a setup into a device that has none approves everything in it, after showing all of it.
+Nothing that arrives from another peer approves anything, and neither do merges.
+
+`--approve-launch` takes the hash the listing printed, and approves nothing once the setup is no
+longer that document, so a revision adopted in between is never approved unseen.
+
+```
+legion-control --command setup                                   # what waits, beside what was approved
+legion-control --command setup --approve-launch 'machines[tower].systems[linux]' --hash HASH
+legion-control --command setup --approve-launch all --hash HASH
+legion-control --command setup --revert-launch 'machines[tower].systems[linux]'
+```
+
+`--reconcile-once` exits 1 while anything waits, as it does while two copies need a decision.
 
 ## Private settings
 
@@ -123,6 +218,19 @@ step somebody can take, because a cascade is how the tower nobody wanted on ends
 
 A packet is never evidence. Nothing acknowledges one, so the only thing this app accepts as a wake
 is the machine's own agent answering afterwards.
+
+A helper's command that is not a declared `wol` action could do anything, so it is never run twice
+by accident. When one ends without saying how it went, the machine is held: this device notes it in
+its own operation history, says so under the machine's name, and runs no other helper's command for
+it until the helper's record says it finished, the helper has no such operation, the machine
+answers, or the helper leaves the setup. Time, a restart and the helper being away never release a
+hold. Only a person goes past one, and one way at a time. While the hold keeps another helper
+back, "Try the other helpers" in the wake options, or `--try-other-helpers` beside `--yes`, asks
+the others and releases the hold; the held command is not run again in that walk. With no other
+helper to ask, "Run <helper>'s command again", or `--run-held-again`, releases the hold and runs the
+held command a second time; both say first that the earlier run may still be going. A 2.x
+helper keeps no records to read, so short of the machine answering or the helper leaving the setup,
+that is the only way its hold ends.
 
 ## Trust
 
@@ -165,8 +273,9 @@ bootstrap is limited to recognized layouts or an explicitly supplied `--base` di
 
 The window checks at startup and when it becomes active, with a fifteen-minute throttle. A timer
 also checks every six hours while the window is active; an unfocused window catches up when
-activated. Closing the window stops this timer. The local `checkForAppUpdates` preference in
-`desktop-settings.json` defaults to `true`; a manual check is always available in **This device**.
+activated, and one hidden in the tray checks nothing until it is shown. Quitting stops this timer.
+The local `checkForAppUpdates` preference in `desktop-settings.json` defaults to `true`; a manual
+check is always available in **This device**.
 
 An available release appears above machine navigation as **Review update**, so it remains reachable
 while scrolling or switching machines. A transient failure keeps the previous verified offer
@@ -174,9 +283,27 @@ visible. Changing the configured release repository clears it immediately and in
 review, even if the repository is then changed back.
 
 **Review update → Download and verify** downloads the exact artifact for this OS and architecture
-and checks its size and hash against the signed manifest. **Install and restart** explicitly starts
-the replacement helper. The previous build is retained and restored if the new window cannot
-render. Checks do not download or install an app automatically.
+and checks its size and hash against the signed manifest. The release list, manifest and signature
+are read only up to 1 MiB, 256 KiB and 4 KiB, a manifest of any schema but 1 is refused, and the
+archive is streamed to disk and stopped at the first byte past the size the manifest signed. The
+release repository must be a GitHub `owner/name`. **Install and restart** explicitly starts the
+replacement helper. Checks do not download or install an app automatically.
+
+The helper waits until every copy of the app has exited, the window and any command line run
+alike. If one is still running after two minutes it changes nothing: a window that never closed is
+left open, and otherwise the installed build is started again, so the window that asked for the
+update comes back. Once none runs, it copies the new build beside the installation and swaps the
+two directories by renaming them, so the installation is always one whole build and a file a
+release dropped goes with the old one. The build it replaced is kept beside it as
+`<installation>.previous`. The new build has a minute to draw its window
+(`updateHealthSeconds` in `desktop-settings.json`, 10 to 600); if it does not, it is stopped, and
+once it and any copy started from it meanwhile have gone the previous build is renamed back and
+started. A copy still running after two minutes keeps the new build installed, with the previous
+one left at `<installation>.previous`. Every way out that leaves the app closed starts it again.
+
+Because the whole directory is swapped, the installation directory must hold the app and nothing
+else, in a directory this account can write. Anything else there, or a directory it cannot write,
+is named before the app quits, and nothing is changed.
 
 Headless invocations do not run an update-check timer. Check or explicitly install from the CLI:
 
@@ -186,9 +313,11 @@ legion-control --command app-update --yes
 ```
 
 The second command verifies and stages the update, then starts the helper. It reports completion
-as pending until the replacement launches; the helper opens the graphical app. On a Pi without a
-desktop session, verify the signed manifest and archive, then replace the complete installation
-directory instead of using the restart helper, whose health check requires a rendered window.
+as pending until the replacement launches; the helper opens the graphical app. The helper's health
+check requires a rendered window, so the command refuses where none can be drawn (no `DISPLAY` or
+`WAYLAND_DISPLAY`, or the Windows services session an ssh login runs in), and while a window is
+open, which the helper would otherwise wait for. On a Pi without a desktop session, verify the
+signed manifest and archive, then replace the complete installation directory by hand.
 
 ## Building
 

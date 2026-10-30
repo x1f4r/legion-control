@@ -4,7 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { runCommandAsync } from '../src/config.mjs';
+import { runCommand, runCommandAsync } from '../src/process-runner.mjs';
 import { SRC, withHome } from './helpers.mjs';
 
 const posix = process.platform !== 'win32';
@@ -28,7 +28,7 @@ test('async deadline kills descendants that retain stdout after their parent exi
 test('an isolated CLI exits at its deadline when a descendant inherited its pipes', { skip: !posix }, async () => {
   const descendant = 'setTimeout(()=>{},5000)';
   const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:['ignore',1,2]}).unref();`;
-  const source = `import {runCommandAsync} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'config.mjs')).href)};console.log(JSON.stringify(await runCommandAsync(process.execPath,['-e',${JSON.stringify(parent)}],{timeoutMs:150})));`;
+  const source = `import {runCommandAsync} from ${JSON.stringify(pathToFileURL(path.join(SRC, 'process-runner.mjs')).href)};console.log(JSON.stringify(await runCommandAsync(process.execPath,['-e',${JSON.stringify(parent)}],{timeoutMs:150})));`;
   const started = Date.now();
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', timeout: 2000 });
   assert.equal(result.status, 0, result.stderr);
@@ -56,6 +56,18 @@ test('failed process-group cancellation still settles and closes inherited pipes
       try { process.kill(-group, 'SIGKILL'); } catch { /* the group already exited */ }
     }
   }
+});
+
+test('a synchronous reading that runs out of time is a failure, even from a command that exited zero', { skip: !posix }, () => {
+  // spawnSync waits for the output pipes as well as the command. This one
+  // exits 0 at once and leaves a child holding stdout, which came back as
+  // status 0 with a timeout: a health check or a version read as answered.
+  const descendant = 'setTimeout(()=>{},1500)';
+  const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:['ignore',1,2]}).unref();process.stdout.write('1.2.3');`;
+  const result = runCommand(process.execPath, ['-e', parent], { timeoutMs: 300 });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.code, 0, 'the command itself did exit zero');
+  assert.equal(result.ok, false);
 });
 
 test('successful asynchronous commands retain their result and bounded output', async () => {

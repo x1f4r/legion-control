@@ -1,318 +1,356 @@
 import Foundation
 
-/// What a device knows about its agent's copy of the setup.
-struct SetupCopyState {
-    /// What this device last decided about the copy.
-    var decision: SetupSync.Decision = .unknown
-    /// The agent's own lineage, once `config meta` has been read. Read at most once per differing
-    /// hash, because status deliberately does not carry it.
-    var remoteIdentity: ControllerIdentity?
-    var remoteLineageForHash: String?
-    /// The document last sent, when it went, and what it ended in.
-    var lastShare: (hash: String, at: Date, failure: String?)?
-    var isSharing = false
+/// What became of a setup a person asked to take from a device's agent.
+enum SetupTaking: Sendable, Equatable {
+    /// It is applied here.
+    case adopted
+    /// Nothing is applied yet: what it runs is on screen, waiting for the person to confirm it.
+    case awaitingConfirmation
+    /// It was not applied, and this says why.
+    case refused(String)
+}
+
+/// What a Replace a person asked for came to, for the question it was asked on.
+enum SetupReplacement: Sendable, Equatable {
+    /// The agent holds this device's document now, and the question is answered.
+    case replaced
+    /// Nothing was sent, because the question is no longer the one either side would ask: it closes,
+    /// the device's line says why, and it is asked again from what both hold now.
+    case outdated(String)
+    /// Not replaced, or not known to be, so the question stays open with this said on it: a refusal,
+    /// a push the lock held back, a write whose result is unknown, or another action holding the
+    /// device.
+    case notReplaced(String)
 }
 
 /// Everything the divergence sheet needs.
+///
+/// Built only from bytes that hash to what the agent reports and pass section 9.7, after the
+/// decision was made again from them: a machine that has moved on to something this device can
+/// simply take is taken from instead of shown.
 struct SetupDivergence: Sendable, Identifiable {
     var machineId: String
     var machineName: String
+    /// The document the sheet was built from. Merge, Keep mine and Take theirs are compare-and-swaps
+    /// against its hash: an edit saved while the sheet was open is never overwritten.
     var mine: ControllerDocument
     var theirsBytes: Data
+    var theirsHash: String
     var theirsIdentity: ControllerIdentity
     var baseBytes: Data?
     var differences: [SetupMerge.Difference]
     /// True when the two are different setups rather than two branches of one.
     var isDifferentSetup: Bool
+    /// Why Merge and Keep mine cannot be used, as the sentence to show, when they cannot: this
+    /// device's document has to be fixed in the editor first (section 9.8), or the two could not be
+    /// compared at all. Take theirs never waits.
+    var mergeBlocker: String?
 
     var id: String { machineId }
+
+    /// Why this device's setup cannot be sent over the peer's, when it cannot: a document with a
+    /// section 9.7 error pushes nothing until it is fixed (section 9.5), and a replacement least of
+    /// all, because an agent before 3.1.0 stores whatever it is sent.
+    var replaceBlocker: String? { mine.replaceBlocker }
+
+    /// What the sheet says about the common ancestor. With a blocker nothing is decided entry by
+    /// entry, so it says only whether one was found: the blocker says why the two cannot be
+    /// compared, and that may be this very ancestor, kept here but refused by peer intake.
+    var ancestorNote: String {
+        switch (baseBytes != nil, mergeBlocker != nil) {
+        case (false, false): "not kept on this device, so every difference needs a decision"
+        case (true, false): "found, so only the entries both sides changed need a decision"
+        case (false, true): "not kept on this device"
+        case (true, true): "found"
+        }
+    }
+}
+
+extension ControllerDocument {
+    /// Why this document cannot be sent over a peer's setup with `--replace`, as the sentence to
+    /// show, or nil when it can.
+    var replaceBlocker: String? {
+        guard let error = errors.first else { return nil }
+        return "This device's setup has an error to fix in the editor before it can replace another copy: \(error.message)"
+    }
+}
+
+// MARK: - The channel
+
+/// How every device's agent is a SetupChannel: through the same `send` everything else goes over.
+extension AgentDevice {
+    func appliedSetup() -> ControllerDocument? { controllerConfig?() }
+
+    func commitSetup(_ bytes: Data, describedAs description: String, replacing expectedHead: String?) -> ConfigStore.AdoptOutcome {
+        adoptSetup?(bytes, description, expectedHead) ?? .refused("The setup has nowhere to go on this device.")
+    }
+
+    func configMeta() async throws -> AgentConfigResult {
+        try await send(.configMeta(), decoding: AgentConfigResult.self)
+    }
+
+    func configRead() async throws -> RemoteControllerDocument {
+        try await send(.configRead(), decoding: RemoteControllerDocument.self)
+    }
+
+    func configSet(_ document: ControllerDocument, replace: Bool) async throws -> AgentConfigResult {
+        try await send(try AgentRequest.configSet(document, replace: replace, dialect: dialect), decoding: AgentConfigResult.self)
+    }
+
+    func saySetup(_ line: String, isError: Bool, detail: String?) {
+        setStatus(line, isError: isError, detail: detail)
+    }
+
+    func setupDidChange() { onStateChange?() }
 }
 
 // MARK: - Sharing the setup
 
-/// The setup half of a device, written once for the machines over ssh and for this Mac's own agent.
-///
-/// The local agent is a replica like any other. It is not privileged, it is not the source of
-/// truth, and it gets the same fast-forward-or-ask treatment as a machine across the world.
 extension AgentDevice {
     /// What this device last decided about its agent's copy of the setup.
-    var setupDecision: SetupSync.Decision { core.setup.decision }
+    var setupDecision: SetupSync.Verdict { core.setup.verdict }
 
-    /// The agent's own lineage, once `config meta` has been read.
-    var remoteSetupIdentity: ControllerIdentity? { core.setup.remoteIdentity }
+    /// What the agent said about the document it holds now.
+    var remoteSetupIdentity: ControllerIdentity? { core.setup.remoteIdentity(for: status) }
 
     /// What the Setup row says.
     var setupSharing: SetupSharing {
-        if let lastShare = core.setup.lastShare, let local = controllerConfig?(), lastShare.hash == local.hash,
-           let failure = lastShare.failure {
-            return .failed(failure)
-        }
-        return SetupSync.sharing(
-            for: core.setup.decision,
-            machine: name,
-            local: controllerConfig?(),
-            remote: core.setup.remoteIdentity ?? status?.controller?.identity
-        )
+        core.setup.sharing(holder: setupHolder, local: controllerConfig?(), status: status)
     }
 
     /// Decide what to do about this device's copy, and do the safe half of it automatically.
-    ///
-    /// Two moves need no permission, because both follow strict descent and neither can lose
-    /// anything: push when the agent is holding one of this document's ancestors, and fetch when
-    /// this document is one of the agent's ancestors. Descent is acyclic, so two devices can never
-    /// take turns overwriting each other. Everything else stops and asks.
     func reconcileSetup() {
-        guard core.activity == nil, !core.setup.isSharing else { return }
-        guard let status else { return }
-        let local = controllerConfig?()
-
-        let view = SetupSync.MachineView(
-            reportsCopy: status.reportsControllerCopy,
-            contract: status.contractVersion,
-            hash: status.controllerHash,
-            identity: remoteIdentity(for: status),
-            lineage: lineageIfCurrent(for: status)
-        )
-        let decision = SetupSync.decide(local: local, machine: view)
-        core.setup.decision = decision
-
-        switch decision {
-        case .inSync, .unsupported, .unknown, .diverged, .differentSetup:
-            return
-        case .push:
-            guard let local else { return }
-            // One attempt per document per device until the reply is read, then a minute's backoff.
-            if let lastShare = core.setup.lastShare, lastShare.hash == local.hash,
-               Date().timeIntervalSince(lastShare.at) < SetupSync.retryAfter { return }
-            publish(local)
-        case .fetch:
-            fetchSetup()
-        case .readMeta:
-            readRemoteSetupMeta()
-        }
+        core.setup.reconcile(over: self)
     }
 
-    private func remoteIdentity(for status: AgentStatus) -> ControllerIdentity? {
-        if let identity = core.setup.remoteIdentity, core.setup.remoteLineageForHash == status.controllerHash {
-            return identity
-        }
-        return status.controller?.identity
+    /// Decide again from the status already read, because the setup here changed under a question.
+    func compareSetupAgain() {
+        core.setup.decideAgain(over: self)
     }
 
-    /// The agent's lineage, but only when it belongs to the hash the agent is reporting now.
-    private func lineageIfCurrent(for status: AgentStatus) -> [String]? {
-        guard let hash = core.setup.remoteLineageForHash, hash == status.controllerHash else { return nil }
-        return core.setup.remoteIdentity?.lineage ?? []
+    /// Send a push that was held after a refusal again, because a person asked.
+    func tryAgainSharingSetup() {
+        core.setup.tryAgain(over: self)
     }
 
-    /// Send this document, because the agent holds one of its ancestors.
-    private func publish(_ local: ControllerDocument) {
-        core.setup.isSharing = true
-        let dialect = dialect
-        let generation = core.agentGeneration
-        Task { @MainActor in
-            var failure: String?
-            do {
-                let request = try AgentRequest.configSet(local, replace: false, dialect: dialect)
-                let result = try await self.send(request, decoding: AgentConfigResult.self)
-                if result.ok == false {
-                    // A refusal here is information, not a fault: the agent has told us our document
-                    // does not descend from what it holds, which is exactly the case a person has to
-                    // look at.
-                    self.core.setup.remoteIdentity = result.identity
-                    self.core.setup.remoteLineageForHash = result.storedHash
-                    failure = result.reason?.sentence(subject: "the setup", message: result.error ?? result.message)
-                        ?? result.error ?? "the agent kept the copy it had."
-                } else if let stored = result.storedHash, stored != local.hash {
-                    failure = "the agent stored something other than the document it was given."
-                }
-            } catch let error as AgentFailure {
-                failure = error.detailText ?? self.describe(error)
-            } catch let invalid as AgentRequest.Invalid {
-                failure = invalid.message
-            } catch {
-                failure = error.localizedDescription
-            }
-
-            // The agent this went to was replaced while it was out. What it made of the document
-            // says nothing about the new one, which gets a push of its own on its first read.
-            guard self.core.agentGeneration == generation else {
-                self.core.setup.isSharing = false
-                self.onStateChange?()
-                return
-            }
-            let sentence = failure.map { "The setup could not be shared with \(self.name): \($0)" }
-            self.core.setup.lastShare = (hash: local.hash, at: Date(), failure: sentence)
-            if let sentence { self.setStatus(sentence, isError: true) }
-            self.core.setup.isSharing = false
-            self.onStateChange?()
-        }
-    }
-
-    /// Read the agent's document and adopt it, because this device is behind.
-    private func fetchSetup() {
-        core.setup.isSharing = true
-        Task { @MainActor in
-            defer {
-                self.core.setup.isSharing = false
-                self.onStateChange?()
-            }
-            guard let fetched = await self.readRemoteDocument() else { return }
-            if let problem = self.adoptSetup?(fetched.bytes, "adopted from \(self.setupHolder)") {
-                self.setStatus("The setup from \(self.setupHolder) could not be adopted: \(problem)", isError: true)
-            } else {
-                self.setStatus("Adopted the setup from \(self.setupHolder): revision \(fetched.identity.revisionNumber).")
-            }
-        }
-    }
-
-    /// Read `config` and check that what came back really is what the agent says it holds.
-    ///
-    /// Every way this can fail is said out loud. The local side used to return nothing on a failed
-    /// read without a word, so a setup this Mac could not read looked exactly like one that was
-    /// never asked for.
-    private func readRemoteDocument() async -> (bytes: Data, identity: ControllerIdentity)? {
-        do {
-            let reply = try await send(.configRead(), decoding: RemoteControllerDocument.self)
-            guard let document = reply.documentBytes else {
-                setStatus("No setup document came back from \(setupHolder).", isError: true)
-                return nil
-            }
-            let canonical = try Canonical.bytes(document)
-            let hash = Canonical.sha256(canonical)
-            // The hash the agent reports has to match the bytes it sent. Anything else means the
-            // document was mangled on the way, and adopting it would spread the damage.
-            if let reported = reply.hash, reported != hash {
-                setStatus("The setup from \(setupHolder) does not match the hash it reports, so it was not adopted.",
-                          isError: true)
-                return nil
-            }
-            return (canonical, reply.meta?.identity ?? ControllerIdentity())
-        } catch let error as AgentFailure {
-            setStatus("The setup on \(setupHolder) could not be read: \(describe(error))",
-                      isError: true, detail: error.detailText)
-            return nil
-        } catch {
-            setStatus("The setup on \(setupHolder) could not be read: \(error.localizedDescription)", isError: true)
-            return nil
-        }
-    }
-
-    /// Read the agent's lineage, which `status` deliberately does not carry.
-    private func readRemoteSetupMeta() {
-        guard let hash = status?.controllerHash, core.setup.remoteLineageForHash != hash else { return }
-        core.setup.isSharing = true
-        Task { @MainActor in
-            defer {
-                self.core.setup.isSharing = false
-                self.onStateChange?()
-            }
-            do {
-                let result = try await self.send(.configMeta(), decoding: AgentConfigResult.self)
-                self.core.setup.remoteIdentity = result.identity
-                self.core.setup.remoteLineageForHash = result.storedHash ?? hash
-                self.reconcileSetup()
-            } catch {
-                // Nothing decided. The next poll asks again.
-            }
-        }
-    }
-
-    /// Gather everything the divergence sheet needs, then raise it.
+    /// Read the agent's document, decide again from it, and raise the divergence sheet when it still
+    /// diverges.
     func openSetupDivergence() {
         guard let local = controllerConfig?() else { return }
-        let isDifferent = core.setup.decision == .differentSetup
-        guard isDifferent || core.setup.decision == .diverged else { return }
+        guard [.diverged, .differentSetup].contains(core.setup.verdict.decision) else { return }
 
         Task { @MainActor in
-            guard let fetched = await self.readRemoteDocument() else {
-                self.onStateChange?()
-                return
+            defer { self.onStateChange?() }
+            guard let theirs = await self.verifiedRemoteDocument() else { return }
+            let verdict = self.core.setup.decideAgain(after: theirs, over: self)
+            guard [.diverged, .differentSetup].contains(verdict.decision) else { return }
+            let base = self.setupBase?(local.hash, local.identity.ancestors, theirs.hash, theirs.identity.ancestors)
+            // Two documents that could not be compared are said to be that, never drawn as two that
+            // differ in nothing: a kept base that peer intake refuses, for one, stops the merge just
+            // as it stops the comparison. An error in this device's own document is said for the
+            // sheet it is on: a different setup is only ever compared, never merged or kept.
+            var blocker: String?
+            var differences: [SetupMerge.Difference] = []
+            if let problem = SetupMerge.blocker(mine: local.bytes) {
+                blocker = verdict.decision == .diverged
+                    ? "This device's setup has to be fixed in the editor before it can be merged or kept: \(problem)"
+                    : "This device's setup has to be fixed in the editor before the two can be compared: \(problem)"
+            } else {
+                do {
+                    differences = try SetupMerge.differences(base: base, mine: local.bytes, theirs: theirs.bytes)
+                } catch let failure as SetupMerge.MergeFailure {
+                    blocker = failure.message
+                } catch {
+                    blocker = "The two setups could not be compared: \(error.localizedDescription)"
+                }
             }
-            let base = self.setupBase?(local.identity, fetched.identity)
-            let differences = (try? SetupMerge.differences(mine: local.bytes, theirs: fetched.bytes, base: base)) ?? []
             self.onSetupDiverged?(SetupDivergence(
                 machineId: self.historyMachineId,
                 machineName: self.name,
                 mine: local,
-                theirsBytes: fetched.bytes,
-                theirsIdentity: fetched.identity,
+                theirsBytes: theirs.bytes,
+                theirsHash: theirs.hash,
+                theirsIdentity: theirs.identity,
                 baseBytes: base,
                 differences: differences,
-                isDifferentSetup: isDifferent
+                isDifferentSetup: verdict.decision == .differentSetup,
+                mergeBlocker: blocker
             ))
+        }
+    }
+
+    /// The agent's document, when it is the agent's own bytes and section 9.7 accepts it. Anything
+    /// else is said on the device's line and gives nil: neither a merge nor taking it may start from
+    /// bytes nobody can vouch for.
+    private func verifiedRemoteDocument() async -> SetupPeerSync.VerifiedRead? {
+        switch await core.setup.readDocument(over: self) {
+        case .failed(let sentence, let detail):
+            setStatus(sentence, isError: true, detail: detail)
+            return nil
+        case .read(let read):
+            guard read.isVerified else {
+                setStatus("The setup on \(setupHolder) does not reproduce the hash its agent reports, so it cannot be checked. Its agent has to be updated first.",
+                          isError: true)
+                return nil
+            }
+            if let error = read.verdict.errors.first {
+                setStatus("The setup on \(setupHolder) breaks a rule every device holds a setup to, so it cannot be used: \(error.message)",
+                          isError: true)
+                return nil
+            }
+            return read
         }
     }
 
     func requestSetupReplacement() {
         guard case .conflict(let reason) = setupSharing else { return }
+        guard let local = controllerConfig?() else { return }
+        if let problem = local.replaceBlocker {
+            setStatus(problem, isError: true)
+            return
+        }
+        // The question is about the two documents as they are now, and so is the answer.
+        let shown = status?.controller?.hash
         ask?(PendingDialog(
             id: "replace-setup-\(historyMachineId)",
             title: "Replace the setup \(setupHolder) is holding?",
             message: "\(reason)\n\nReplacing it overwrites the copy the agent has with the document this app is running on.",
             confirmTitle: "Replace it",
-            perform: { [weak self] in self?.replaceSetup() }
+            perform: { [weak self] in self?.replaceSetup(over: shown, from: local.hash) }
         ))
     }
 
     /// Overwrite the agent's copy with this device's, because the user decided to.
     ///
     /// The only place `--replace` is ever sent, and only after a question with both revisions and
-    /// their authors in it.
-    func replaceSetup() {
-        guard let local = controllerConfig?() else { return }
-        let dialect = dialect
-        let generation = core.agentGeneration
-        perform("Replacing the setup on \(name)", kind: .shareSetup, subject: "setup") { _ in
-            do {
-                let request = try AgentRequest.configSet(local, replace: true, dialect: dialect)
-                let result = try await self.send(request, decoding: AgentConfigResult.self)
-                if result.ok == false {
-                    let sentence = result.error ?? result.message ?? "the agent refused the document."
-                    self.setStatus("The setup was not replaced: \(sentence)", isError: true)
-                    return .init(state: .failed, summary: "The setup on \(self.setupHolder) was not replaced. \(sentence)")
-                }
-                // A push noted against an agent that has since been replaced would hold back the
-                // new one's for a minute.
-                if self.core.agentGeneration == generation {
-                    self.core.setup.lastShare = (hash: local.hash, at: Date(), failure: nil)
-                }
-                self.core.setup.remoteIdentity = nil
-                self.core.setup.remoteLineageForHash = nil
-                self.setStatus("Replaced the setup \(self.setupHolder) was holding with this device's.")
-                return .init(state: .succeeded,
-                             summary: "\(self.name) now holds revision \(local.identity.revisionNumber).",
-                             refresh: true)
-            } catch let failure as AgentFailure {
-                return self.reportFailure(failure, verb: "Replacing the setup")
-            } catch let invalid as AgentRequest.Invalid {
-                self.setStatus(invalid.message, isError: true)
-                return .init(state: .failed, summary: invalid.message)
-            } catch {
-                return self.reportFailure(
-                    AgentFailure(.unreadableOutput, detail: error.localizedDescription, dispatch: .unknown),
-                    verb: "Replacing the setup"
-                )
+    /// their authors in it. `theirs` is the hash of the agent's document the question showed, nil
+    /// when it showed none, and `mine` the hash of this device's document it was asked over. Nothing
+    /// is sent once either has moved on: `--replace` overwrites whatever the agent holds when it
+    /// arrives, and a newer copy nobody here has seen must not go on a decision about an older one.
+    ///
+    /// `ended` hears what it came to, once, so the question it was asked on can close or stay.
+    func replaceSetup(over theirs: String?, from mine: String,
+                      then ended: @escaping @MainActor (SetupReplacement) -> Void = { _ in }) {
+        // A hand edit of the file that waits for its revision leaves no document here to send, and
+        // returning without a word, once the question was answered, looked like a Replace that went.
+        guard let local = controllerConfig?() else {
+            let sentence = "The setup here changed since that was shown, so nothing was sent."
+            setStatus(sentence, isError: true)
+            ended(.outdated(sentence))
+            return
+        }
+        // Asked of the setup as it is now, not only of the one a sheet was built over.
+        if let problem = local.replaceBlocker {
+            setStatus(problem, isError: true)
+            ended(.notReplaced(problem))
+            return
+        }
+        guard local.hash == mine else {
+            let sentence = "The setup here changed since that was shown, so nothing was sent. It is compared again."
+            setStatus(sentence, isError: true)
+            compareSetupAgain()
+            ended(.outdated(sentence))
+            return
+        }
+        if let holds = status?.controller?.hash, holds != theirs {
+            if holds == local.hash {
+                let sentence = "Nothing needed sending: \(setupHolder) holds this device's setup already."
+                setStatus(sentence)
+                ended(.outdated(sentence))
+            } else {
+                let sentence = "Nothing was sent: \(setupHolder) holds another document now, not the one shown. Read it again first."
+                setStatus(sentence, isError: true)
+                ended(.outdated(sentence))
             }
+            return
+        }
+        let generation = core.agentGeneration
+        let started = perform("Replacing the setup on \(name)", kind: .shareSetup, subject: "setup") { _ in
+            let resolution = await self.sendReplacement(of: local, generation: generation)
+            ended(resolution.state == .succeeded ? .replaced : .notReplaced(resolution.summary))
+            return resolution
+        }
+        if !started {
+            ended(.notReplaced("Nothing was sent while \(name) is busy with another action. Try again once it has finished."))
+        }
+    }
+
+    /// One `config set --replace` of `local`, and what it came to, said on the device's line.
+    private func sendReplacement(of local: ControllerDocument, generation: Int) async -> ActionResolution {
+        do {
+            let result = try await configSet(local, replace: true)
+            // Decided on the outcome, not on `ok`: a push the lock held back is a later attempt,
+            // not a refusal, and one the agent failed on while it wrote may have replaced the copy
+            // or not.
+            let said = result.error ?? result.message
+            switch Outcome.of(result) {
+            case .succeeded where result.hash == local.hash:
+                break
+            case .succeeded:
+                // Done is what every client counts as done, and what an automatic push reads as
+                // one: a success that names the document sent. One naming another, or none, leaves
+                // the agent holding something nobody here can vouch for.
+                let sentence = result.hash == nil
+                    ? "its agent did not say which document it holds now."
+                    : "its agent answered with a document other than the one sent."
+                setStatus("The setup may or may not have been replaced: \(sentence)", isError: true)
+                return .init(state: .unknown, summary: "The setup on \(setupHolder) may or may not have been replaced: \(sentence)",
+                             refresh: true, unresolved: true)
+            case .deferred:
+                let sentence = said ?? result.reason?.sentence(subject: "the setup", message: nil) ?? "\(name) is busy."
+                setStatus("The setup was not replaced yet: \(sentence)")
+                return .init(state: .deferred, summary: "The setup on \(setupHolder) was not replaced yet. \(sentence)",
+                             refresh: true)
+            case .unknown, .pending:
+                let sentence = said ?? "\(name) could not say."
+                setStatus("The setup may or may not have been replaced: \(sentence)", isError: true)
+                return .init(state: .unknown, summary: "The setup on \(setupHolder) may or may not have been replaced. \(sentence)",
+                             refresh: true, unresolved: true)
+            case .failed:
+                let sentence = said ?? "the agent refused the document."
+                setStatus("The setup was not replaced: \(sentence)", isError: true)
+                return .init(state: .failed, summary: "The setup on \(setupHolder) was not replaced. \(sentence)")
+            }
+            // A push noted against an agent that has since been replaced is not the new one's.
+            if core.agentGeneration == generation { core.setup.didReplace(with: local.hash) }
+            setStatus("Replaced the setup \(setupHolder) was holding with this device's.")
+            return .init(state: .succeeded,
+                         summary: "\(name) now holds revision \(local.identity.revisionNumber).",
+                         refresh: true)
+        } catch let failure as AgentFailure {
+            return reportFailure(failure, verb: "Replacing the setup")
+        } catch let invalid as AgentRequest.Invalid {
+            setStatus(invalid.message, isError: true)
+            return .init(state: .failed, summary: invalid.message)
+        } catch {
+            return reportFailure(
+                AgentFailure(.unreadableOutput, detail: error.localizedDescription, dispatch: .unknown),
+                verb: "Replacing the setup"
+            )
         }
     }
 
     /// Adopt what the agent holds, dropping this device's branch.
+    ///
+    /// On a device that applies no setup yet this is enrolment, and nothing is applied until the
+    /// person has seen every command the setup would have this device run and confirmed it. With a
+    /// setup applied it is a compare-and-swap against the document applied when the read started.
     func adoptRemoteSetup() {
+        let head = controllerConfig?()?.hash
         Task { @MainActor in
-            guard let fetched = await self.readRemoteDocument() else {
-                self.onStateChange?()
-                return
-            }
-            if let problem = self.adoptSetup?(fetched.bytes, "took the setup from \(self.setupHolder)") {
-                self.setStatus(problem, isError: true)
-            } else {
+            defer { self.onStateChange?() }
+            guard let theirs = await self.verifiedRemoteDocument() else { return }
+            let taking = self.takeSetup?(theirs.bytes, theirs.identity, self.setupHolder, head)
+                ?? .refused("The setup from \(self.setupHolder) has nowhere to go on this device.")
+            switch taking {
+            case .adopted:
                 self.setStatus("This device now uses the setup from \(self.setupHolder).")
-                self.core.setup.remoteIdentity = nil
-                self.core.setup.remoteLineageForHash = nil
-                self.core.setup.decision = .unknown
+                self.core.setup.verdict = SetupSync.Verdict(.unknown)
+            case .awaitingConfirmation:
+                self.setStatus("The setup from \(self.setupHolder) is waiting for you to confirm what it runs. Nothing has been applied yet.")
+            case .refused(let problem):
+                self.setStatus(problem, isError: true)
             }
-            self.onStateChange?()
         }
     }
 }

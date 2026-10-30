@@ -39,17 +39,20 @@ struct DivergenceView: View {
                     }
                 }
                 DetailRow(label: "Common ancestor") {
-                    Text(divergence.baseBytes == nil
-                         ? "not kept on this device, so every difference needs a decision"
-                         : "found, so only the entries both sides changed need a decision")
+                    Text(divergence.ancestorNote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
-            if divergence.differences.isEmpty {
+            if let blocker = divergence.mergeBlocker {
                 SectionHeading(title: "Differences")
-                Text("The two documents differ but no entry this app compares has changed. That usually means only formatting or an unknown key moved.")
+                Text(blocker)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if divergence.differences.isEmpty {
+                SectionHeading(title: "Differences")
+                Text("The two documents differ only in how they are written: member order, spacing or the spelling of a number. Merging keeps this device's.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
@@ -58,21 +61,31 @@ struct DivergenceView: View {
 
             SectionHeading(title: "Settle it")
 
+            // While a Replace is out the sheet waits for its answer, which closes it or says here
+            // why the copy was not replaced. Taking theirs meanwhile would race it.
+            let replacing = model.replacingSetupOn == divergence.machineId
             FlowRow(spacing: 10) {
                 if divergence.isDifferentSetup {
-                    Button("Replace its copy with mine") { model.replaceSetupOnPeer(divergence) }
-                        .buttonStyle(.borderedProminent)
+                    Button("Replace its copy with mine") {
+                        problem = nil
+                        model.replaceSetupOnPeer(divergence) { problem = $0 }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(divergence.replaceBlocker != nil || replacing)
                 } else {
                     Button("Merge") { apply(choices) }
                         .buttonStyle(.borderedProminent)
+                        .disabled(divergence.mergeBlocker != nil)
                     Button("Keep mine") { problem = model.keepMine(divergence) }
+                        .disabled(divergence.mergeBlocker != nil)
                 }
                 Button("Take theirs") { problem = model.takeTheirs(divergence) }
+                    .disabled(replacing)
                 Button("Not now") { model.divergence = nil }
             }
 
             QuietNote(text: divergence.isDifferentSetup
-                ? "Replacing is the explicit decision to put this setup id on that peer. Taking theirs keeps this device's current document in the revision history first."
+                ? divergence.replaceBlocker ?? "Replacing is the explicit decision to put this setup id on that peer. Taking theirs keeps this device's current document in the revision history first."
                 : "Merging and \"keep mine\" both produce a new revision that descends from both sides, so every machine accepts it without anything being overwritten. \"Take theirs\" keeps the version it replaces in the revision history.")
                 .padding(.top, 12)
 
@@ -133,7 +146,9 @@ struct DivergenceView: View {
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 if difference.needsDecision {
-                    Picker("", selection: Binding(
+                    // Named after its difference, so that among the form controls VoiceOver lists
+                    // each picker says which setting it decides, not only that it keeps something.
+                    Picker("Which to keep for \(difference.label)", selection: Binding(
                         get: { choices[difference.id] ?? difference.defaultChoice },
                         set: { choices[difference.id] = $0 }
                     )) {
@@ -167,12 +182,12 @@ struct DivergenceView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func kindDescription(_ kind: SetupMerge.Difference.Kind) -> String {
+    private func kindDescription(_ kind: SetupMerge.Kind) -> String {
         switch kind {
-        case .onlyMineChanged: "changed here"
-        case .onlyTheirsChanged: "changed on \(divergence.machineName)"
-        case .bothChanged: "changed on both"
-        case .unknownBase: "no common ancestor to compare against"
+        case .mine: "changed here"
+        case .theirs: "changed on \(divergence.machineName)"
+        case .both: "changed on both"
+        case .noBase: "no common ancestor to compare against"
         }
     }
 

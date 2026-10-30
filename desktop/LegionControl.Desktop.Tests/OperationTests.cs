@@ -1,3 +1,4 @@
+using LegionControl.Desktop.Cli;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Contract;
 using LegionControl.Desktop.Model;
@@ -70,7 +71,9 @@ public class OperationTrackerTests
             """));
         var applied = tracker.Apply("op-00000002", record!);
         Assert.NotNull(applied);
-        Assert.Equal(OperationOutcome.Conflict, applied!.Outcome);
+        // Not this request's outcome: what this app asked for under the id is not in effect.
+        Assert.Equal(OperationOutcome.Failed, applied!.Outcome);
+        Assert.True(applied.IsResolved);
         Assert.Contains("not the", applied.Message);
     }
 
@@ -106,6 +109,75 @@ public class OperationTrackerTests
         Assert.False(operation.IsResolved);
         Assert.Equal("update", operation.Intent.Kind);
         Assert.Equal("t3", operation.Intent.Service);
+    }
+
+    [Fact]
+    public void AnOutcomeAnEarlierBuildStoredIsReadAsTheOneSectionFivePointSixGivesIt()
+    {
+        // Builds before contract 3.1 kept eleven words. Each comes back as the outcome the contract
+        // gives that ending, so a row resolved then stays resolved and a queued one is followed.
+        using var home = new TempHome();
+        var path = home.Write("operations.json", """
+            { "version": 1, "operations": [
+              { "id": "op-noop-0001", "machineId": "pi", "intent": { "kind": "update" }, "state": "finished", "outcome": "Noop" },
+              { "id": "op-conflict-01", "machineId": "pi", "intent": { "kind": "update" }, "state": "finished", "outcome": "Conflict" },
+              { "id": "op-cancel-001", "machineId": "pi", "intent": { "kind": "boot" }, "state": "finished", "outcome": "Cancelled" },
+              { "id": "op-interrupt-1", "machineId": "pi", "intent": { "kind": "update" }, "state": "finished", "outcome": "Interrupted" },
+              { "id": "op-queued-001", "machineId": "pi", "intent": { "kind": "restart" }, "state": "queued", "outcome": "Queued" },
+              { "id": "op-unseen-001", "machineId": "pi", "intent": { "kind": "restart" }, "state": "unknown", "outcome": "Unresolved" } ] }
+            """);
+        var tracker = new OperationTracker(path);
+        Assert.Equal(OperationOutcome.Succeeded, tracker.Find("op-noop-0001")!.Outcome);
+        Assert.Equal(OperationOutcome.Deferred, tracker.Find("op-conflict-01")!.Outcome);
+        Assert.Equal(OperationOutcome.Deferred, tracker.Find("op-cancel-001")!.Outcome);
+        var interrupted = tracker.Find("op-interrupt-1")!;
+        Assert.Equal(OperationOutcome.Unknown, interrupted.Outcome);
+        // A finished record that does not say how it went has nothing more to tell.
+        Assert.True(interrupted.IsResolved);
+        var queued = tracker.Find("op-queued-001")!;
+        Assert.Equal(OperationOutcome.Pending, queued.Outcome);
+        Assert.Equal(OperationState.Queued, queued.State);
+        var unseen = tracker.Find("op-unseen-001")!;
+        Assert.Equal(OperationOutcome.Unknown, unseen.Outcome);
+        Assert.False(unseen.IsResolved);
+        Assert.Equal(new[] { "op-queued-001", "op-unseen-001" }, tracker.Unfinished.Select(operation => operation.Id).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void WhatTheOtherProcessWroteSurvivesThisOneWritingTheList()
+    {
+        // The window and the command line keep one list. A hold the command line records while the
+        // window is open is the only thing stopping a second helper's command, so the window's next
+        // write must keep it, and must not bring back what the command line released or forgot.
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var window = new OperationTracker(path);
+        var (shown, _) = window.Begin("op-window-0001", "nas", "linux", UpdateT3);
+        var commandLine = new OperationTracker(path);
+        var run = new OperationIntent("run", ActionId: "wake-tower");
+        commandLine.Begin("op-hold-00001", "pi", "linux", run, wakeTarget: "tower");
+
+        // The window sees it before it plans a wake, and keeps it through a change of its own.
+        Assert.Equal("op-hold-00001", Assert.Single(window.WakeHoldsFor("tower")).Id);
+        window.Update(shown with { Message = "still running" });
+        Assert.Single(new OperationTracker(path).WakeHoldsFor("tower"));
+        Assert.Equal("still running", new OperationTracker(path).Find("op-window-0001")!.Message);
+
+        // Released there, it stays released when the window writes again.
+        commandLine.ReleaseWakeHolds("tower", DateTimeOffset.MaxValue);
+        window.Update(shown with { Message = "finished" });
+        Assert.Empty(new OperationTracker(path).WakeHoldsFor("tower"));
+        Assert.Empty(window.WakeHoldsFor("tower"));
+
+        // Forgotten there, it is not brought back by the window's copy of it.
+        commandLine.Begin("op-never-0001", "pi", "linux", UpdateT3);
+        window.Update(shown with { Message = "again" });
+        Assert.NotNull(window.Find("op-never-0001"));
+        commandLine.Forget("op-never-0001");
+        window.Update(shown with { Message = "once more" });
+        Assert.Null(new OperationTracker(path).Find("op-never-0001"));
+        Assert.Null(window.Find("op-never-0001"));
+        Assert.Equal("once more", new OperationTracker(path).Find("op-window-0001")!.Message);
     }
 
     [Fact]
@@ -200,6 +272,49 @@ public class MachineRequestTests
         { "ok": true, "contract": 3, "agentVersion": "3.0.0", "system": { "id": "linux" },
           "services": [ { "id": "t3", "busy": { "busy": false, "unknown": false, "monitored": true } } ] }
         """;
+
+    [Fact]
+    public async Task AnOperationAPersonCancelledExitsZeroAsItAlwaysDidAndAnyOtherDeferralOne()
+    {
+        // Scripts written for 1.3 read 0 from `--command op` for a cancelled request. The contract
+        // calls it deferred now, and its reason code is what keeps it apart from being turned down.
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var tracker = new OperationTracker(path);
+        var cancelReply = Repo.ReadFixture("cancel.cancelled.json");
+        var runner = new FakeRunner(call => FakeRunner.Ok(call.RemoteCommand.Contains("status") ? V3Status : cancelReply));
+        var model = new MachineModel(Machine, runner, tracker, DesktopSettings.Default with { FollowOperations = false });
+        await model.RefreshAsync();
+        const string id = "8c3a5f60-1d29-4b74-a8e3-5f0c7b91d642";
+        var boot = new OperationIntent("boot", Target: "windows", WhenIdle: true);
+        tracker.Begin(id, "pi", "linux", boot);
+        Assert.True((await model.CancelAsync(id)).IsKnownSuccess);
+        var cancelled = tracker.Find(id)!;
+        Assert.Equal(OperationOutcome.Deferred, cancelled.Outcome);
+        Assert.Equal(Runner.Ok, Runner.ExitFor(cancelled));
+
+        // The cancelled request's own record reads the same, and so does what an earlier build kept.
+        var other = new OperationTracker(Path.Combine(home.Path, "other.json"));
+        other.Begin(id, "pi", "linux", boot);
+        var record = OperationRecord.From(Value.Parse(cancelReply)["op"])!;
+        Assert.Equal(Runner.Ok, Runner.ExitFor(other.Apply(id, record)!));
+        var earlier = new OperationTracker(home.Write("earlier.json", """
+            { "version": 1, "operations": [
+              { "id": "op-cancel-001", "machineId": "pi", "intent": { "kind": "boot" }, "state": "finished", "outcome": "Cancelled" } ] }
+            """));
+        Assert.Equal(Runner.Ok, Runner.ExitFor(earlier.Find("op-cancel-001")!));
+
+        // Turned down while busy, or expired, it is known not to have happened.
+        Assert.Equal(Runner.Failed, Runner.ExitFor(cancelled with { ReasonCode = ReasonCode.Busy }));
+        Assert.Equal(Runner.Failed, Runner.ExitFor(cancelled with { ReasonCode = ReasonCode.Expired }));
+        Assert.Equal(Runner.Failed, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Failed }));
+        Assert.Equal(Runner.NotKnown, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Unknown }));
+        Assert.Equal(Runner.NotKnown, Runner.ExitFor(cancelled with { Outcome = OperationOutcome.Pending, ReasonCode = null }));
+
+        // A change whose id turns out to name a request somebody cancelled exits as the cancel did.
+        Assert.Equal(Runner.Ok, Runner.ExitFor(new CommandOutcome.Refused("Cancelled.", false, ReasonCode.Cancelled)));
+        Assert.Equal(Runner.Failed, Runner.ExitFor(new CommandOutcome.Refused("Busy.", true, ReasonCode.Busy)));
+    }
 
     [Fact]
     public async Task ADeferredReplyIsNotAFailureAndOffersForce()
@@ -412,19 +527,186 @@ public class MachineRequestTests
         Assert.Single(runner.Calls);
     }
 
-    [Fact]
-    public async Task ARequestWithAnIdTheAgentHasNeverHeardOfIsNotASuccess()
+    [Theory]
+    [InlineData("not-configured")]
+    [InlineData("bad-argument")]
+    public async Task ARequestWithAnIdTheAgentHasNeverHeardOfNeverStarted(string code)
     {
+        // `op: null` is the agent saying it has no such operation, with not-configured from 3.1.0
+        // and bad-argument from 3.0.x. The request never arrived: it is resolved as not in effect,
+        // never as a success, and a new attempt is a new request.
         using var home = new TempHome();
         var runner = new FakeRunner(call => call.RemoteCommand.Contains(" op ")
-            ? FakeRunner.Ok("""{ "ok": false, "contract": 3, "reasonCode": "bad-argument", "op": null }""")
+            ? FakeRunner.Ok($$"""{ "ok": false, "contract": 3, "reasonCode": "{{code}}", "op": null }""")
             : FakeRunner.Ok(V3Status));
         var model = NewModel(home, runner);
         await model.RefreshAsync();
         var outcome = await model.FollowAsync("abcdefab-1234-4567-8901-abcdefabcdef",
             new MachineRequest { Kind = RequestKind.Update, Service = "t3" }, limit: TimeSpan.FromSeconds(5));
+        var failed = Assert.IsType<CommandOutcome.Failed>(outcome);
+        Assert.Contains("no record", failed.Sentence);
+        Assert.False(outcome.IsKnownSuccess);
+    }
+
+    [Theory]
+    [InlineData("not-configured")]
+    [InlineData("bad-argument")]
+    public async Task AnUnknownOutcomeTheMachineHasNoRecordOfIsResolvedAsNeverStarted(string code)
+    {
+        using var home = new TempHome();
+        var id = DispatchedAndLost(home);
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains(" op ")
+            ? FakeRunner.Ok($$"""{ "ok": false, "contract": 3, "reasonCode": "{{code}}", "op": null }""")
+            : FakeRunner.Ok(V3Status));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+
+        var resolved = await model.ResolveAsync(id);
+        Assert.NotNull(resolved);
+        Assert.Equal(OperationOutcome.Failed, resolved!.Outcome);
+        Assert.Equal(OperationState.Finished, resolved.State);
+        Assert.True(resolved.IsResolved);
+        Assert.False(resolved.OutcomeUnknown);
+        Assert.Contains("no record", resolved.Message);
+        Assert.Empty(model.UnresolvedOperations);
+    }
+
+    [Fact]
+    public async Task AnOpReplyThatNamesNoOperationIsNoAnswerAboutOne()
+    {
+        // A refusal with no `op` key at all says nothing about the operation. It is not "no
+        // record", and the row stays what it was until something that is evidence arrives.
+        using var home = new TempHome();
+        var id = DispatchedAndLost(home);
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains(" op ")
+            ? FakeRunner.Ok("""{ "ok": false, "contract": 3, "reasonCode": "internal", "message": "the record store is locked" }""")
+            : FakeRunner.Ok(V3Status));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+        var still = await model.ResolveAsync(id);
+        Assert.Contains(runner.Calls, call => call.RemoteCommand.Contains($"op {id}"));
+        Assert.False(still!.IsResolved);
+        Assert.True(still.OutcomeUnknown);
+    }
+
+    /// A restart of t3 on pi whose reply was lost after it was dispatched, as the operations file
+    /// the model starts from holds it.
+    private static string DispatchedAndLost(TempHome home)
+    {
+        const string id = "abcdefab-1234-4567-8901-abcdefabcdef";
+        var tracker = new OperationTracker(Path.Combine(home.Path, "operations.json"));
+        tracker.Begin(id, "pi", "linux", new OperationIntent("restart", "t3"));
+        tracker.MarkUnknown(id, "the link went away after the command was sent");
+        return id;
+    }
+
+    [Fact]
+    public async Task AnActionThisBuildNeverHeardOfIsNotASuccessAndIsNotSentAgain()
+    {
+        // ok is true, and the action is a word nobody wrote a case for. That is no evidence the
+        // update happened, and an outcome nobody knows is read again by its id, never resent.
+        using var home = new TempHome();
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains("status")
+            ? FakeRunner.Ok(V3Status)
+            : FakeRunner.Ok("""{ "ok": true, "contract": 3, "action": "teleported", "reasonCode": null }"""));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+        var outcome = await model.RequestAsync(new MachineRequest { Kind = RequestKind.Update, Service = "t3" });
         var notKnown = Assert.IsType<CommandOutcome.NotKnown>(outcome);
-        Assert.Contains("no record", notKnown.Sentence);
+        Assert.NotNull(notKnown.OperationId);
+        Assert.False(outcome.IsKnownSuccess);
+        var tracked = Assert.Single(model.Operations);
+        Assert.Equal(OperationOutcome.Unknown, tracked.Outcome);
+        Assert.False(tracked.IsResolved);
+        Assert.Single(runner.Calls, call => call.RemoteCommand.Contains(" update"));
+    }
+
+    [Fact]
+    public async Task ARefusalThatNamesItsReasonIsAFailureWithThatReason()
+    {
+        // ok is false with a code and no action: the agent said no and why, which is a known
+        // failure rather than a mystery.
+        using var home = new TempHome();
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains("status")
+            ? FakeRunner.Ok(V3Status)
+            : FakeRunner.Ok("""{ "ok": false, "contract": 3, "reasonCode": "unknown-service", "message": "no service called t4" }"""));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+        var failed = Assert.IsType<CommandOutcome.Failed>(await model.RequestAsync(new MachineRequest { Kind = RequestKind.Update, Service = "t3" }));
+        Assert.Contains("no service called t4", failed.Sentence);
+        var tracked = Assert.Single(model.Operations);
+        Assert.Equal(OperationOutcome.Failed, tracked.Outcome);
+        Assert.True(tracked.IsResolved);
+    }
+
+    [Fact]
+    public async Task TheStatedOutcomeDecidesOverTheActionBesideIt()
+    {
+        // Agent 3.1.0 says what a client decides on. A producer that knows a failed install may
+        // have changed the machine reports unknown, whatever its action word says.
+        using var home = new TempHome();
+        var runner = new FakeRunner(call => call.RemoteCommand.Contains("status")
+            ? FakeRunner.Ok(V3Status)
+            : FakeRunner.Ok("""{ "ok": false, "contract": 3, "action": "failed", "reasonCode": "apply-failed", "outcome": "unknown" }"""));
+        var model = NewModel(home, runner);
+        await model.RefreshAsync();
+        Assert.IsType<CommandOutcome.NotKnown>(await model.RequestAsync(new MachineRequest { Kind = RequestKind.Update, Service = "t3" }));
+        Assert.Equal(OperationOutcome.Unknown, Assert.Single(model.Operations).Outcome);
+    }
+
+    [Fact]
+    public async Task AReplayOfARequestStillRunningIsFollowedLikeAnAcceptedOne()
+    {
+        using var home = new TempHome();
+        const string id = "abcdefab-1234-4567-8901-abcdefabcdef";
+        var runner = new FakeRunner(call =>
+        {
+            var command = call.RemoteCommand;
+            if (command.Contains(" status")) return FakeRunner.Ok(V3Status);
+            if (command.Contains(" op ")) return FakeRunner.Ok($$"""
+                { "ok": true, "contract": 3, "op": { "id": "{{id}}", "kind": "update", "service": "t3", "state": "finished",
+                  "result": { "ok": true, "action": "updated", "to": "1.2.3" } } }
+                """);
+            return FakeRunner.Ok($$"""
+                { "ok": true, "contract": 3, "action": "already-running", "reasonCode": "already-running", "replayed": true,
+                  "op": { "id": "{{id}}", "kind": "update", "service": "t3", "state": "running", "result": null } }
+                """);
+        });
+        var model = NewModel(home, runner, DesktopSettings.Default);
+        await model.RefreshAsync();
+        var outcome = await model.RequestAsync(new MachineRequest { Kind = RequestKind.Update, Service = "t3", OperationId = id });
+        Assert.Equal(OperationOutcome.Succeeded, Assert.IsType<CommandOutcome.Done>(outcome).Outcome);
+        Assert.Contains(runner.Calls, call => call.RemoteCommand.Contains($"op {id}"));
+    }
+
+    [Fact]
+    public void AServiceDeclaredNeverBusyIsWatchedAndNothingWarns()
+    {
+        // `busy.type: "none"` is an answer (contract section 6). Agent 3.1.0 says monitored true;
+        // agents before it said monitored false beside the same evidence, and that is not a gap.
+        var services = Value.Parse(Repo.ReadContract("fixtures/busy.declared-none.json"))["services"].AsArray();
+        var none = BusyState.From(services[0])!;
+        Assert.Equal("none", none.Evidence);
+        Assert.False(none.IsUnmonitored);
+        Assert.True(BusyState.From(services[1])!.IsUnmonitored);
+        var legacy = AgentStatus.From(Value.Parse("""
+            { "ok": true, "contract": 3, "agentVersion": "3.0.1",
+              "services": [ { "id": "demo", "busy": { "busy": false, "unknown": false, "monitored": false,
+                              "reason": "declared never busy", "evidence": "none" } } ] }
+            """));
+        var declared = legacy.Service("demo")!.Busy!;
+        Assert.False(declared.IsUnmonitored);
+        Assert.True(declared.IsSafeToDisturb);
+        Assert.IsType<BusyVerdict.Idle>(BusyVerdict.Read(legacy, "demo"));
+        Assert.False(Confirmation.For(new MachineRequest { Kind = RequestKind.Restart, Service = "demo" }, legacy, "Pi").NeedsForce);
+
+        // Only the evidence of a missing probe is unwatched, and that still blocks.
+        var unwatched = AgentStatus.From(Value.Parse("""
+            { "ok": true, "contract": 3,
+              "services": [ { "id": "edge", "busy": { "busy": true, "unknown": true, "monitored": false, "evidence": "unmonitored" } } ] }
+            """));
+        Assert.True(unwatched.Service("edge")!.Busy!.IsUnmonitored);
+        Assert.IsType<BusyVerdict.Unknown>(BusyVerdict.Read(unwatched, "edge"));
     }
 
     [Fact]

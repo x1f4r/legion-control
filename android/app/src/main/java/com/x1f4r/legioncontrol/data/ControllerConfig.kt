@@ -1,16 +1,20 @@
 package com.x1f4r.legioncontrol.data
 
-import com.x1f4r.legioncontrol.agent.Addresses
 import com.x1f4r.legioncontrol.agent.CommandLineRefusal
-import com.x1f4r.legioncontrol.agent.Contract
-import com.x1f4r.legioncontrol.agent.ControllerSource
+import com.x1f4r.legioncontrol.agent.LaunchState
 import com.x1f4r.legioncontrol.agent.RemoteShell
 import com.x1f4r.legioncontrol.agent.buildRemoteCommand
 import com.x1f4r.legioncontrol.agent.describeRefusal
 import com.x1f4r.legioncontrol.agent.grammarFor
-import com.x1f4r.legioncontrol.net.parseMacAddress
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * The controller config, exactly as docs/configuration.md describes it.
@@ -20,8 +24,8 @@ import kotlinx.serialization.json.Json
  * edits preserve unknown fields through ControllerDocument rather than this decoded view.
  *
  * Every field has a default, so a document missing a key decodes instead of failing, and the
- * checking is done afterwards by [validate] where a failure can be a sentence rather than a
- * serialization exception nobody can act on.
+ * checking is done before, by [DocumentAcceptance] on the document itself, where a failure can be a
+ * sentence rather than a serialization exception nobody can act on.
  */
 @Serializable
 data class ControllerConfig(
@@ -103,6 +107,12 @@ data class MachineConfig(
     val endpoints: List<EndpointConfig> = emptyList(),
     val wake: WakeConfig? = null,
     val systems: List<SystemConfig> = emptyList(),
+    /**
+     * The first error contract section 9.7 found inside this machine, when the document in force has
+     * one. Never read from a document: applied intake keeps a document with errors in force and
+     * disables each machine one is inside, so nothing is dialled or run on it until it is fixed.
+     */
+    @Transient val problem: String? = null,
 )
 
 /**
@@ -128,10 +138,12 @@ data class EndpointConfig(
 data class WakeConfig(
     val mac: String = "",
     val broadcast: List<String> = emptyList(),
-    val ports: List<Int> = listOf(9, 7),
+    /** As written; none means 9 and 7, which the wake plan decides (contract section 10.2). */
+    val ports: List<Int> = emptyList(),
+    /** Not used by any 1.4 client: readiness is an authenticated status poll. Kept for 1.2. */
     val probe: WakeProbeConfig? = null,
     /**
-     * This phone counts as at home when one of its addresses starts with this.
+     * The network this machine is on, as a prefix of section 10.1.
      *
      * The pre-sites way of saying where a machine is. Still read, and used for a machine that names
      * no site, so a 1.2 document keeps working unchanged.
@@ -218,6 +230,26 @@ data class SystemConfig(
      * the serialisation right, before anything has answered.
      */
     val restricted: Boolean = false,
+    /**
+     * The grammar this device writes the system's line in, as the launch gate decided it.
+     *
+     * Never read from a document, which has no such key: it is written by `LaunchGate` together
+     * with [agent], from the tuple this device approved (contract section 9.9). A document saying
+     * `"grammar"` here is an unknown key like any other.
+     */
+    @Transient val grammar: RemoteShell? = null,
+    /**
+     * Whether this device runs [agent] at all. Not driven until the launch gate says otherwise, so a
+     * configuration that never went through the gate drives nothing.
+     */
+    @Transient val launchState: LaunchState = LaunchState.NOT_DRIVEN,
+    /**
+     * Why no line can be written for the command the setup offers here: the code of its tuple's
+     * `refused:<code>` grammar (contract section 15.1), as the launch gate read it, or null.
+     */
+    @Transient val grammarRefusal: String? = null,
+    /** Whether the command the setup offers here waits for an approval this device can give. */
+    @Transient val awaitsApproval: Boolean = false,
 )
 
 @Serializable
@@ -228,15 +260,15 @@ data class AppUpdatesConfig(
 /** Where the app looks for its own releases when the config does not say. */
 const val DEFAULT_GITHUB_REPO = "x1f4r/legion-control"
 
-/** The version of the document this app understands. */
-private const val SUPPORTED_VERSION = 1
-
 /** How many ancestors a document carries. Beyond this cap, a stale branch reads as divergence. */
 internal const val MAX_LINEAGE = 32
 
 /**
  * Lenient on the way in for the same reason the agent's replies are: the Mac's half of this
  * document is not ours to reject, and a key added by a later release must cost nothing here.
+ *
+ * What the document may hold is decided before this ever runs, by [DocumentAcceptance]; this only
+ * turns an accepted tree into types.
  */
 private val ConfigJson: Json = Json {
     ignoreUnknownKeys = true
@@ -245,275 +277,118 @@ private val ConfigJson: Json = Json {
 }
 
 /**
- * Reads a pasted document, or explains in one sentence why it cannot be used.
+ * A document contract section 9.7 accepted, in the typed model, with what it says of it.
+ *
+ * Under applied intake [verdict] may hold errors: the document in force is never refused on load,
+ * its errors are shown, and each machine an error is inside carries it as [MachineConfig.problem],
+ * which is what keeps it from being dialled or run.
+ */
+data class AcceptedConfig(
+    val config: ControllerConfig,
+    val verdict: DocumentAcceptance.Verdict,
+) {
+    /** Everything worth saying beside the setup that is never a reason to refuse it. */
+    val advisories: List<String> get() = verdict.warnings.map { it.message } + config.advisories()
+}
+
+/**
+ * Reads a document from a machine, a revision this device kept or one about to be stored, or
+ * explains in one sentence why it cannot be used.
  *
  * Both halves matter. A document that does not parse and a document that parses into something
  * unusable are the same thing to the person holding the phone, and both have to come back as
  * something they can act on rather than as a stack trace or as an app that quietly does nothing.
  */
-fun readControllerConfig(text: String): Result<ControllerConfig> {
-    if (text.isBlank()) {
-        return failure("There is nothing to apply. Paste a configuration, or insert the example.")
+fun readControllerConfig(text: String): Result<ControllerConfig> = acceptControllerConfig(text).map { it.config }
+
+/**
+ * Section 9.7 for [text] under [intake], and the typed model of what it accepted.
+ *
+ * Peer intake refuses a document with any error, with the first of them as the reason. Applied
+ * intake keeps one as long as section 12 accepts its bytes. Local intake is not read here: a typed
+ * or pasted document gets its identity first ([DocumentAcceptance.needsIdentity]) and is then read
+ * like any other.
+ */
+fun acceptControllerConfig(text: String, intake: Intake = Intake.PEER): Result<AcceptedConfig> {
+    val verdict = DocumentAcceptance.check(text, intake)
+    val document = verdict.document
+    if (!verdict.keep || document == null) {
+        return failure(verdict.errors.firstOrNull()?.message ?: "That configuration could not be read.")
     }
-    val parsed = try {
-        ConfigJson.decodeFromString(ControllerConfig.serializer(), text)
-    } catch (failure: Exception) {
-        return failure("That is not a configuration this app can read: ${oneLine(failure)}")
-    }
-    return parsed.validate()
+    val config = decode(document, verdict.machineErrors, tolerant = intake == Intake.APPLIED)
+        ?: return failure("That is not a configuration this app can read.")
+    return Result.success(AcceptedConfig(config, verdict))
 }
 
 /**
- * The checks that decide whether this document can actually drive the app.
+ * An accepted tree in the typed model.
  *
- * Deliberately not "everything that could be wrong": a name, a label or a platform that is missing
- * or unknown falls back, because none of those can strand the app. What is checked is what the app
- * would otherwise fail on silently: an id it cannot tell apart from another, a machine with nowhere
- * to dial or nothing to run, and a hardware address a magic packet cannot be built from.
+ * Numbers are handed over as integers wherever they hold one, because a schema-valid `22.0` is a
+ * port and the decoder would otherwise refuse it for its spelling. The stored text is not touched:
+ * this copy exists only to be decoded. An applied document with errors in it is read part by part,
+ * so a machine that cannot be read at all drops out rather than taking the setup with it, and every
+ * machine an error is inside is marked with it.
  */
-fun ControllerConfig.validate(): Result<ControllerConfig> {
-    if (version != null && version != SUPPORTED_VERSION) {
-        return failure(
-            "This configuration says version $version, and this app understands version " +
-                "$SUPPORTED_VERSION.",
-        )
+private fun decode(document: SetupJson.Object, problems: Map<Int, DocumentProblem>, tolerant: Boolean): ControllerConfig? {
+    val tree = forDecoding(document) as JsonObject
+    val whole = runCatching { ConfigJson.decodeFromJsonElement(ControllerConfig.serializer(), tree) }.getOrNull()
+    if (whole == null && !tolerant) return null
+    val config = whole ?: ControllerConfig(
+        version = part(tree["version"], Int.serializer()),
+        sites = (tree["sites"] as? JsonArray).orEmpty().mapNotNull { part(it, SiteConfig.serializer()) },
+        controller = part(tree["controller"], ControllerIdentity.serializer()),
+        machines = emptyList(),
+        appUpdates = part(tree["appUpdates"], AppUpdatesConfig.serializer()) ?: AppUpdatesConfig(),
+    )
+    val machines = if (whole != null) {
+        whole.machines.map<MachineConfig, MachineConfig?> { it }
+    } else {
+        (tree["machines"] as? JsonArray).orEmpty().map { part(it, MachineConfig.serializer()) }
     }
-    if (machines.isEmpty()) return failure("The configuration lists no machines.")
-
-    // V1. The setup block, when there is one.
-    controller?.let { identity ->
-        if (identity.id.isBlank()) {
-            return failure(
-                "The \"controller\" block has no id. It names the setup, and revisions are only " +
-                    "ever compared within one setup.",
-            )
-        }
-        if (!Contract.isToken(identity.id)) {
-            return failure(
-                "The setup id \"${identity.id}\" is not a valid identifier. Letters, digits " +
-                    "and . _ : @ / \\ ~ = + - only, starting with a letter or a digit.",
-            )
-        }
-        if (identity.revision != null && identity.revision < 0) {
-            return failure("The setup revision is ${identity.revision}. It has to count up from zero.")
-        }
-        if (identity.lineage.size > MAX_LINEAGE) {
-            return failure(
-                "The setup carries ${identity.lineage.size} ancestor hashes and at most " +
-                    "$MAX_LINEAGE are allowed.",
-            )
-        }
-        identity.lineage.firstOrNull { !Contract.isSha256Hex(it) }?.let {
-            return failure("\"$it\" in the setup's ancestry is not a sha256 hash.")
-        }
-        if (identity.lineage.size != identity.lineage.toSet().size) {
-            return failure("The setup's ancestry lists the same hash twice.")
-        }
-        identity.source?.takeIf { it.isNotBlank() }?.let { kind ->
-            if (ControllerSource.fromWire(kind) == null) {
-                return failure(
-                    "The setup says it was written by \"$kind\". That has to be one of mac, " +
-                        "desktop, phone, cli or legacy.",
-                )
-            }
-        }
-    }
-
-    // V2. Sites, and the machines that name them.
-    val seenSites = mutableSetOf<String>()
-    for (site in sites) {
-        if (site.id.isBlank()) return failure("Every site needs an id.")
-        if (!Contract.isToken(site.id)) {
-            return failure("The site id \"${site.id}\" is not a valid identifier.")
-        }
-        if (!seenSites.add(site.id)) {
-            return failure("Two sites share the id \"${site.id}\". Ids have to be unique.")
-        }
-    }
-
-    val machineIds = machines.map { it.id }.toSet()
-    val seenMachines = mutableSetOf<String>()
-    for (machine in machines) {
-        val where = machine.id.ifBlank { machine.name.orEmpty() }.ifBlank { "a machine" }
-        if (machine.id.isBlank()) return failure("Every machine needs an id. $where has none.")
-        if (!seenMachines.add(machine.id)) {
-            return failure("Two machines share the id \"${machine.id}\". Ids have to be unique.")
-        }
-
-        if (machine.systems.isEmpty()) {
-            return failure("$where has no systems. Every machine needs at least one.")
-        }
-        val seenSystems = mutableSetOf<String>()
-        for (system in machine.systems) {
-            if (system.id.isBlank()) return failure("A system on $where has no id.")
-            if (!seenSystems.add(system.id)) {
-                return failure("$where lists the system \"${system.id}\" twice.")
-            }
-            if (system.agent.isEmpty() || system.agent.any { it.isBlank() }) {
-                return failure(
-                    "The system \"${system.id}\" on $where has no agent command. That is the argv " +
-                        "run over ssh, for example [\"/usr/bin/node\", \"…/agent/src/index.mjs\"].",
-                )
-            }
-            val declared = system.shell
-            if (declared != null && RemoteShell.fromWire(declared) == null) {
-                return failure(
-                    "The system \"${system.id}\" on $where says its shell is \"$declared\". " +
-                        "It has to be \"posix\", \"cmd\" or \"powershell\".",
-                )
-            }
-        }
-
-        if (machine.endpoints.isEmpty()) {
-            return failure("$where has no endpoints. Every machine needs at least one address.")
-        }
-        val seenEndpoints = mutableSetOf<String>()
-        for (endpoint in machine.endpoints) {
-            if (endpoint.id.isBlank()) return failure("An endpoint on $where has no id.")
-            if (!seenEndpoints.add(endpoint.id)) {
-                return failure("$where lists the endpoint \"${endpoint.id}\" twice.")
-            }
-            if (endpoint.kind != "lan" && endpoint.kind != "remote") {
-                return failure(
-                    "The endpoint \"${endpoint.id}\" on $where has kind \"${endpoint.kind}\". " +
-                        "It has to be \"lan\" or \"remote\".",
-                )
-            }
-            if (endpoint.host.isBlank()) {
-                return failure("The endpoint \"${endpoint.id}\" on $where has no host.")
-            }
-            if (endpoint.port !in 1..65535) {
-                return failure(
-                    "The endpoint \"${endpoint.id}\" on $where has port ${endpoint.port}.",
-                )
-            }
-            if (endpoint.user.isBlank()) {
-                return failure(
-                    "The endpoint \"${endpoint.id}\" on $where has no user to log in as.",
-                )
-            }
-            val hint = endpoint.system
-            if (hint != null && hint !in seenSystems) {
-                return failure(
-                    "The endpoint \"${endpoint.id}\" on $where points at the system \"$hint\", " +
-                        "which $where does not have.",
-                )
-            }
-        }
-
-        machine.site?.takeIf { it.isNotBlank() }?.let { site ->
-            if (site !in seenSites) {
-                return failure(
-                    "$where says it is at the site \"$site\", and this configuration has no site " +
-                        "with that id.",
-                )
-            }
-        }
-
-        val wake = machine.wake
-        if (wake != null) {
-            if (parseMacAddress(wake.mac) == null) {
-                return failure(
-                    "The wake address \"${wake.mac}\" on $where is not a hardware address. Six " +
-                        "hex pairs, separated by colons.",
-                )
-            }
-            if (wake.broadcast.none { it.isNotBlank() }) {
-                return failure(
-                    "$where can be woken but has no broadcast address to send the magic packet to.",
-                )
-            }
-            // V3. Every helper has to exist, not be the machine itself, and name a runnable action.
-            for (entry in wake.effectiveHelpers) {
-                val helper = entry.machine.takeIf { it.isNotBlank() }
-                    ?: return failure("$where lists a wake helper with no machine id.")
-                if (helper == machine.id) {
-                    return failure(
-                        "$where names itself as its own wake helper. A machine that is asleep " +
-                            "cannot send its own magic packet.",
-                    )
-                }
-                if (helper !in machineIds) {
-                    return failure(
-                        "$where names \"$helper\" as a wake helper, and there is no machine " +
-                            "with that id in this configuration.",
-                    )
-                }
-                if (entry.action.isBlank()) {
-                    return failure(
-                        "$where's wake helper \"$helper\" does not say which action on it sends " +
-                            "the packet.",
-                    )
-                }
-                if (!Contract.isToken(entry.action)) {
-                    return failure(
-                        "The wake action \"${entry.action}\" on $where's helper \"$helper\" is " +
-                            "not a valid identifier.",
-                    )
-                }
-            }
-            if (wake.helpers.isNotEmpty() && wake.helper != null &&
-                wake.helper.machine != wake.helpers.first().machine
-            ) {
-                return failure(
-                    "$where lists wake helpers and also a single \"helper\" that is not the first " +
-                        "of them. The single one exists so an older client can still read the list, " +
-                        "so it has to be the first.",
-                )
-            }
-        }
-    }
-
-    // V3, the other half: a helper that needs waking by a helper that needs waking by the first one
-    // would sit there forever. Cycles are refused rather than broken at run time.
-    helperCycle()?.let { return failure(it) }
-
-    return Result.success(this)
+    return config.copy(
+        machines = machines.mapIndexedNotNull { index, machine ->
+            val problem = problems[index] ?: return@mapIndexedNotNull machine
+            machine?.copy(problem = problem.message)
+        },
+    )
 }
 
-/** The names of the machines in a helper cycle, or null when there is none. */
-private fun ControllerConfig.helperCycle(): String? {
-    val edges = machines.associate { machine ->
-        machine.id to machine.wake?.effectiveHelpers.orEmpty().map { it.machine }
-    }
-    val visiting = mutableSetOf<String>()
-    val settled = mutableSetOf<String>()
+/** One part of a document, or null when it is not there or cannot be read. */
+private fun <T> part(element: JsonElement?, serializer: KSerializer<T>): T? =
+    element?.let { runCatching { ConfigJson.decodeFromJsonElement(serializer, it) }.getOrNull() }
 
-    fun walk(id: String, path: List<String>): String? {
-        if (id in settled) return null
-        if (!visiting.add(id)) {
-            val cycle = (path.dropWhile { it != id } + id).joinToString(" wakes ")
-            return "These machines wake each other in a circle: $cycle. One of them has to be " +
-                "reachable without a helper."
-        }
-        for (next in edges[id].orEmpty()) {
-            walk(next, path + id)?.let { return it }
-        }
-        visiting.remove(id)
-        settled.add(id)
-        return null
-    }
-
-    for (machine in machines) walk(machine.id, emptyList())?.let { return it }
-    return null
+/** The tree as kotlinx reads it, with every number that holds an integer written as one. */
+private fun forDecoding(node: SetupJson): JsonElement = when (node) {
+    is SetupJson.Object -> JsonObject(node.members.associateTo(LinkedHashMap()) { (name, value) -> name to forDecoding(value) })
+    is SetupJson.Array -> JsonArray(node.items.map(::forDecoding))
+    is SetupJson.Number -> wholeNumberOf(node)?.let(::JsonPrimitive) ?: node.toElement()
+    else -> node.toElement()
 }
 
-/** Warnings that are worth showing beside a field and are never a reason to refuse a document. */
+/**
+ * The whole number [node] is to `JSON.parse` and `Number.isInteger`, which is how section 9.7 and
+ * the agent read one, or null when it is not one: `7`, `7.0` and `0.7e1` are all 7.
+ *
+ * Only a revision has no upper bound in the schema, and one past the range of a Long reads as the
+ * largest Long rather than as a document this app cannot read. Nothing is lost by it: the agent
+ * holds a revision as a double, which stops telling one whole number from the next long before a
+ * Long runs out, so no fleet can count that far anyway.
+ */
+internal fun wholeNumberOf(node: SetupJson?): Long? {
+    val value = (node as? SetupJson.Number)?.lexeme?.toDoubleOrNull() ?: return null
+    // Past either end of the range of a Long, toLong() stops at that end: the largest Long above
+    // it, the smallest below it.
+    return if (value.isFinite() && value == Math.floor(value)) value.toLong() else null
+}
+
+/**
+ * What is worth saying beside a field that section 9.7 does not say already, and is never a reason
+ * to refuse a document: a command this phone runs differently from what it reads like, and one its
+ * grammar cannot write at all.
+ */
 fun ControllerConfig.advisories(): List<String> = buildList {
-    val byId = machines.associateBy { it.id }
     for (machine in machines) {
         val where = machine.name?.takeIf { it.isNotBlank() } ?: machine.id
-
-        // Contract section 15.6: an address outside the dial grammar is kept and never dialled.
-        for (endpoint in machine.endpoints) {
-            if (!Addresses.isDialable(endpoint.host, endpoint.user, endpoint.port)) {
-                add(
-                    "The address \"${endpoint.id}\" on $where (${endpoint.user}@${endpoint.host}:" +
-                        "${endpoint.port}) is not a host, user and port this app dials, so it is skipped.",
-                )
-            }
-        }
-
         for (system in machine.systems) {
             val name = system.name ?: system.id
             // Argv elements are literal. A tilde reached the home directory only while a shell
@@ -540,53 +415,10 @@ fun ControllerConfig.advisories(): List<String> = buildList {
             problem?.let { add("The command for $name on $where cannot be sent: $it") }
         }
     }
-    for (machine in machines) {
-        val wake = machine.wake ?: continue
-        val where = machine.name?.takeIf { it.isNotBlank() } ?: machine.id
-        val helpers = wake.effectiveHelpers
-
-        // V5. Nothing on its LAN and nobody to ask.
-        val placed = machine.site != null || !wake.lanPrefix.isNullOrBlank()
-        if (!placed && helpers.isEmpty()) {
-            add(
-                "$where can be woken, and nothing says which network it is on and no helper is " +
-                    "configured, so only a device already on its LAN could wake it.",
-            )
-        }
-
-        for (entry in helpers) {
-            val helper = byId[entry.machine] ?: continue
-            val helperWhere = helper.name?.takeIf { it.isNotBlank() } ?: helper.id
-            // V4. A helper somewhere else is legitimate, and only if the action reaches across.
-            if (machine.site != null && helper.site != null && machine.site != helper.site) {
-                add(
-                    "$helperWhere is at a different site than $where, so \"${entry.action}\" only " +
-                        "wakes it if that action reaches the other network another way, through a " +
-                        "router or a VPN.",
-                )
-            }
-        }
-
-        // W5. A wake path whose helpers are all machines that may themselves be asleep.
-        if (helpers.isNotEmpty() && helpers.none { byId[it.machine]?.alwaysOn == true }) {
-            val site = machine.site?.let { id -> sites.firstOrNull { it.id == id }?.displayName ?: id }
-            add(
-                "None of the helpers for $where is marked as always on" +
-                    (site?.let { ", so there is no always-on helper for $it" } ?: "") +
-                    ". Waking it may need one of them woken first.",
-            )
-        }
-    }
 }
 
-private fun failure(message: String): Result<ControllerConfig> =
+private fun <T> failure(message: String): Result<T> =
     Result.failure(IllegalArgumentException(message))
-
-private fun oneLine(failure: Throwable): String {
-    val text = failure.message?.takeIf { it.isNotBlank() } ?: failure::class.java.simpleName
-    val first = text.lineSequence().first().trim()
-    return if (first.length <= 200) first else first.take(200) + "..."
-}
 
 /**
  * The document from docs/configuration.md, with the two keys only the Mac reads left out and the

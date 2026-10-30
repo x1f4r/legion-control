@@ -254,7 +254,9 @@ public static class CommandSurface
     }
 
     /// Hands the machine the setup document. The bytes go in on stdin; only the identity travels as
-    /// arguments, which is why those are the only two things validated here.
+    /// arguments, which is why those are the only two things validated here. The id is held to the
+    /// setup-id grammar the agent applies, not the wider token grammar: an id with `@` or `/` in it
+    /// passes the one and is refused by the agent as a bad argument.
     ///
     /// `--replace` is never added on this app's own initiative. It is the explicit human decision
     /// that one setup replaces another, made in front of a preview of what changes.
@@ -263,7 +265,7 @@ public static class CommandSurface
         var argv = new List<string> { "config", "set" };
         if (capabilities.SupportsSetupLineage && controllerId is not null && revision is not null)
         {
-            Require("controller id", controllerId);
+            if (!IsValidSetupId(controllerId)) throw new InvalidArgument("setup id", controllerId);
             argv.AddRange(new[] { "--controller-id", controllerId, "--revision", revision.Value.ToString() });
         }
         if (replace)
@@ -302,10 +304,16 @@ public static class CommandSurface
 
     /// Installs a signed agent archive that arrives on standard input. The archive is verified on
     /// this side before it is sent and again by the agent before it is used.
-    public static string[] SelfUpdateFromStdin(string? operationId, AgentCapabilities capabilities)
+    ///
+    /// [allowDowngrade] is a person's explicit decision to put an older agent in, or one below the
+    /// machine's version floor, made in front of a confirmation that says so (contract section 13).
+    /// Nothing in this app sets it on its own initiative, and it is refused here for an agent that
+    /// reports no floor or answers over a restricted key.
+    public static string[] SelfUpdateFromStdin(string? operationId, AgentCapabilities capabilities, bool allowDowngrade = false)
     {
         RequireV3("self-update", capabilities);
         var argv = new List<string> { "self-update", "--stdin" };
+        if (allowDowngrade) AddAllowDowngrade(argv, capabilities);
         if (operationId is not null)
         {
             if (!IsValidOperationId(operationId)) throw new InvalidArgument("operation id", operationId);
@@ -318,10 +326,25 @@ public static class CommandSurface
     /// asked to install itself.
     public static string[] SelfUpdateInstall() => new[] { "self-update", "--install" };
 
-    public static string[] SelfUpdateRollback(AgentCapabilities capabilities)
+    /// Puts the retained previous agent back. Below the version floor that is a downgrade, and
+    /// [allowDowngrade] is the same explicit decision as for an install.
+    public static string[] SelfUpdateRollback(AgentCapabilities capabilities, bool allowDowngrade = false)
     {
         RequireV3("self-update", capabilities);
-        return new[] { "self-update", "--rollback" };
+        var argv = new List<string> { "self-update", "--rollback" };
+        if (allowDowngrade) AddAllowDowngrade(argv, capabilities);
+        return argv.ToArray();
+    }
+
+    private static void AddAllowDowngrade(List<string> argv, AgentCapabilities capabilities)
+    {
+        if (!capabilities.SupportsAllowDowngrade)
+        {
+            throw new NotAvailable(capabilities.RestrictedSession
+                ? "self-update --allow-downgrade over a restricted key"
+                : "self-update --allow-downgrade", capabilities.ContractVersion);
+        }
+        argv.Add("--allow-downgrade");
     }
 
     private static void AddService(List<string> argv, string? service)

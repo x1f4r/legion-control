@@ -340,7 +340,7 @@
       },
       {
         "name": "configured-id-colon",
-        "purpose": "A colon is in the generic token grammar but not in a configured id, which the agent matches against config.mjs ID_PATTERN.",
+        "purpose": "A colon is in the generic token grammar but not in a configured id, which the agent matches against contract.mjs CONFIGURED_ID_PATTERN.",
         "consumers": [
           "agent",
           "mac",

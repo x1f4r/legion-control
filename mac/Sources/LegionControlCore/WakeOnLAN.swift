@@ -9,11 +9,20 @@ enum WakeOnLAN {
     /// one that is dropped is simply gone.
     static let repeats = 3
 
-    /// Sends the magic packet. Returns nil on success, or a sentence describing what went wrong.
-    static func sendMagicPackets(_ wake: WakeConfig) async -> String? {
+    /// Where one direct step sends, as the wake plan decided it.
+    struct Packets: Sendable, Equatable {
+        /// The hardware address from the wake block, as the setup writes it.
+        var mac: String?
+        var broadcasts: [String]
+        var ports: [UInt16]
+    }
+
+    /// Sends the magic packets: `repeats` to every address and port. Returns nil when any packet
+    /// left, or a sentence describing what went wrong when none did.
+    static func sendMagicPackets(_ packets: Packets) async -> String? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: sendMagicPacketsBlocking(wake))
+                continuation.resume(returning: sendMagicPacketsBlocking(packets))
             }
         }
     }
@@ -36,8 +45,8 @@ enum WakeOnLAN {
         return packet
     }
 
-    private static func sendMagicPacketsBlocking(_ wake: WakeConfig) -> String? {
-        guard let bytes = wake.macBytes else {
+    private static func sendMagicPacketsBlocking(_ packets: Packets) -> String? {
+        guard let bytes = WakeConfig(mac: packets.mac).macBytes else {
             return "The configured hardware address is not valid."
         }
         let packet = magicPacket(for: bytes)
@@ -55,12 +64,12 @@ enum WakeOnLAN {
 
         var delivered = 0
         var lastError: String?
-        for address in wake.broadcast {
+        for address in packets.broadcasts {
             guard var destination = socketAddress(host: address, port: 0) else {
                 lastError = "Could not parse the broadcast address \(address)."
                 continue
             }
-            for port in wake.ports {
+            for port in packets.ports {
                 destination.sin_port = port.bigEndian
                 for _ in 0..<repeats {
                     let sent = packet.withUnsafeBytes { buffer -> Int in

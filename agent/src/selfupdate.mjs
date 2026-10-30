@@ -5,8 +5,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AGENT_VERSION, basePath, incomingDir, runCommand } from './config.mjs';
+import { AGENT_VERSION, basePath, incomingDir } from './paths.mjs';
+import { powerShellLiteral, runCommand } from './process-runner.mjs';
 import { CONTRACT_VERSION, REASON } from './contract.mjs';
+import { isRestrictedSession } from './dispatch.mjs';
 import { stageFiles, verifyAgentArchive, verifyAgentTree, MAX_ARCHIVE_BYTES } from './archive.mjs';
 import { commitInstallSwap, commitRollbackSwap, recoverAgentSwap, swapPaths } from './agent-swap.mjs';
 import { effectiveFloor, judgeAgentTransition, lowerFloor, raiseFloor, restoreFloor, treeDeclaration } from './floor.mjs';
@@ -167,7 +169,7 @@ function judgeTransition(mode, verified, base, allowDowngrade) {
     live: floor.live,
     floor: floor.version,
     floorUnreadable: floor.unreadable,
-    restricted: process.env.LEGIONCTL_RESTRICTED === '1',
+    restricted: isRestrictedSession(),
     allowDowngrade: allowDowngrade === true,
   });
 }
@@ -235,6 +237,9 @@ function replayTarget(opId, variant) {
   return typeof existing.target === 'string' && existing.target.startsWith(`${variant}:`) ? existing.target : variant;
 }
 
+/** The UTF-8 byte order mark, which tells Windows PowerShell 5.1 how a script is encoded. */
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+
 /** Publish only authenticated recovery helpers, before the live tree can move. */
 function publishStableLauncher(files, base) {
   const windows = process.platform === 'win32';
@@ -243,12 +248,16 @@ function publishStableLauncher(files, base) {
   for (const name of ['install/launcher.mjs', wrapper, dispatcher]) {
     if (!Buffer.isBuffer(files.get(name))) throw new Error(`the signed bundle is missing the recovery helper ${name}`);
   }
-  const nodeLiteral = windows ? `'${process.execPath.replaceAll("'", "''")}'` : `'${process.execPath.replaceAll("'", "'\\''")}'`;
+  const nodeLiteral = windows ? powerShellLiteral(process.execPath) : `'${process.execPath.replaceAll("'", "'\\''")}'`;
   const marker = windows ? '@NODE_POWERSHELL@' : '@NODE_SHELL@';
   const wrapperText = files.get(wrapper).toString('utf8');
   if (!wrapperText.includes(marker)) throw new Error(`the signed recovery wrapper has no ${marker} placeholder`);
+  // The PowerShell wrapper opens with a byte order mark, as install-windows.ps1 writes it: without
+  // one Windows PowerShell 5.1 reads a script in the ANSI code page, and a node path that is not
+  // ASCII would come out as other characters.
+  const rendered = Buffer.from(wrapperText.replaceAll(marker, nodeLiteral));
   const outputs = [
-    [windows ? 'legionctl.ps1' : 'legionctl', Buffer.from(wrapperText.replaceAll(marker, nodeLiteral)), windows ? 0o644 : 0o755],
+    [windows ? 'legionctl.ps1' : 'legionctl', windows ? Buffer.concat([UTF8_BOM, rendered]) : rendered, windows ? 0o644 : 0o755],
     [windows ? 'dispatch.ps1' : 'dispatch.sh', files.get(dispatcher), windows ? 0o644 : 0o755],
     ['launcher.mjs', files.get('install/launcher.mjs'), 0o644],
   ];
@@ -468,6 +477,6 @@ export async function runRollback(config, options = {}) {
 
 export function ensureIncoming() {
   const dir = incomingDir();
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
 }

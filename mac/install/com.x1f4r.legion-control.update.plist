@@ -21,7 +21,7 @@
     a service is mid work and must be left alone, are all its call.
 
     Which services exist and what updating one means are the agent config's
-    business, not this file's. On this Mac an update can be as small as asking a
+    business, not this file's. On a Mac an update can be as small as asking a
     desktop app that has already downloaded its own build to quit and start
     again, so the whole job of the cycle is deciding when that is safe. That is
     precisely the decision the agent's busy rule exists to make, and it fails
@@ -34,9 +34,9 @@
 
     <!--
         An absolute node path, resolved at install time and baked in rather than
-        assumed. There is no /usr/bin/node on this Mac at all, node comes from
-        Homebrew, and a launchd agent starts with a minimal PATH that does not
-        include /opt/homebrew/bin, so "node" alone would simply not be found.
+        assumed. macOS ships no /usr/bin/node, node usually comes from Homebrew,
+        and a launchd agent starts with a minimal PATH that does not include
+        /opt/homebrew/bin, so "node" alone would simply not be found.
     -->
     <key>ProgramArguments</key>
     <array>
@@ -111,6 +111,15 @@
 
     <key>WorkingDirectory</key>
     <string>@BASE@</string>
+
+    <!--
+        What a cycle writes is this user's alone, as the Linux unit's UMask=0077
+        has it: the agent's configuration, the setup, the operation records and
+        the log, and what a service update installs. 63 is octal 077; a plist
+        has no octal integers.
+    -->
+    <key>Umask</key>
+    <integer>63</integer>
 
     <!--
         launchd hands a job a bare PATH of /usr/bin:/bin:/usr/sbin:/sbin. node

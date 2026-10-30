@@ -5,14 +5,20 @@
 #   command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\Users\<you>\.legion-control\bin\dispatch.ps1",restrict ssh-ed25519 AAAA... phone
 #
 # What the key asked for arrives in SSH_ORIGINAL_COMMAND. THIS SCRIPT NEVER
-# INTERPRETS IT: the variable is left in the environment for the agent's own
-# `dispatch` to parse with its grammar, and is never expanded into a command
-# line here, so PowerShell cannot be persuaded to evaluate any part of it.
+# INTERPRETS IT: the value is copied, as one string, into the agent's
+# environment under the same fixed name for the agent's own `dispatch` to parse
+# with its grammar, and is never expanded into a command line here, so
+# PowerShell cannot be persuaded to evaluate any part of it.
 #
 # The grammar the agent accepts is POSIX-shaped (single quotes, `\'` for a
 # literal quote) on every platform. A client talking to a restricted key
 # serialises that way regardless of what the remote login shell would have been,
 # because on this path there is no shell at all.
+#
+# The agent starts with an environment built from a fixed list and nothing
+# else. A key's session can carry variables the client sent (sshd's AcceptEnv),
+# and some of them run code: NODE_OPTIONS=--import=data:... would execute
+# whatever it names before the agent's first line.
 
 $ErrorActionPreference = 'Stop'
 
@@ -30,6 +36,40 @@ if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     Fail "the stable agent launcher is not installed at $launcher"
 }
 
+# What the agent and the Windows tools it runs need from the session: where
+# things are, the locale, the connection it answers, the command itself, and
+# what Windows says about the machine, which powershell.exe, reg, schtasks and
+# npm read like any other program. Nothing here names code to load.
+# PSModulePath does, the folders PowerShell loads modules from, so it stays
+# out; a powershell.exe started without it builds the default again.
+$allowed = @(
+    'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES', 'TZ', 'TMPDIR',
+    'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_ORIGINAL_COMMAND',
+    'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+    'PROGRAMDATA', 'PROGRAMFILES', 'TEMP', 'TMP', 'USERNAME', 'USERDOMAIN',
+    'SYSTEMDRIVE', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)', 'COMMONPROGRAMW6432',
+    'ALLUSERSPROFILE', 'PUBLIC', 'COMPUTERNAME', 'OS', 'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS'
+)
+$process = [System.EnvironmentVariableTarget]::Process
+$kept = @{}
+foreach ($name in $allowed) {
+    $value = [Environment]::GetEnvironmentVariable($name, $process)
+    if ($null -ne $value) { $kept[$name] = $value }
+}
+# Cleared and refilled in this process, so the agent inherits exactly this and
+# its standard streams stay the ones sshd gave this script. Windows keeps each
+# drive's working directory in hidden variables named like =C:, which .NET
+# leaves out of this list and SetEnvironmentVariable would refuse. They name no
+# code, and skipping one keeps a name like that from ever stopping the script.
+foreach ($name in @([Environment]::GetEnvironmentVariables($process).Keys)) {
+    if (([string] $name).StartsWith('=')) { continue }
+    [Environment]::SetEnvironmentVariable([string] $name, $null, $process)
+}
+foreach ($name in $kept.Keys) {
+    [Environment]::SetEnvironmentVariable($name, $kept[$name], $process)
+}
+
+# This describes the access path. It is not an authenticated key identity.
 $env:LEGIONCTL_RESTRICTED = '1'
 $env:LEGIONCTL_CLIENT = 'restricted-ssh'
 

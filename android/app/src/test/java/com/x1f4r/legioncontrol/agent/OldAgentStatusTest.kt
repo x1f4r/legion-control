@@ -84,6 +84,7 @@ class OldAgentStatusTest {
                 SystemConfig(id = "windows", name = "Windows", platform = "windows", agent = listOf("node", "a.mjs")),
             ),
         ).let { ControllerConfig(machines = listOf(it)) }
+            .approvedHere()
             .toMachines()
             .single()
 

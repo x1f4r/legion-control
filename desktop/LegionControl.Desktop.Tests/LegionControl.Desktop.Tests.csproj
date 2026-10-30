@@ -5,6 +5,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+    <!-- As in the app: a warning fails the build, an advisory against a package does not. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
     <RootNamespace>LegionControl.Desktop.Tests</RootNamespace>
     <!-- The app is a WinExe; referencing it from a test project is fine, but the test host has to
          stay a console application. -->
@@ -15,6 +18,8 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- The window, its tray and its icon, run in memory with no display. -->
+    <PackageReference Include="Avalonia.Headless.XUnit" Version="11.3.20" />
   </ItemGroup>
 
   <ItemGroup>

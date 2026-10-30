@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
-import { linuxSchedulerCommand, runDoctor } from '../src/doctor.mjs';
-import { loadConfig } from '../src/config.mjs';
+import { linuxSchedulerCommand, runDoctor, schedulerTimeLimitCheck, schedulerTimeLimitMs } from '../src/doctor.mjs';
+import { loadConfig } from '../src/config-store.mjs';
 import { withHome, writeConfig } from './helpers.mjs';
 
 const base = '/home/me/.legion-control';
@@ -16,7 +16,7 @@ test('doctor accepts the installed same-base stable launcher cycle', () => {
   assert.equal(inspect(`"${base}/bin/legionctl" cycle`).ok, true);
   assert.equal(inspect(`${base}/bin/legionctl cycle`).ok, true);
   const template = fs.readFileSync(new URL('../install/legion-control-update.service', import.meta.url), 'utf8');
-  const escapedBase = '/home/user/Legion "test" \\ 100%';
+  const escapedBase = '/home/me/Legion "test" \\ 100%';
   const launcher = `${escapedBase}/bin/legionctl`.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('%', '%%');
   assert.equal(linuxSchedulerCommand(template.replaceAll('@LAUNCHER@', launcher), { base: escapedBase, node }).ok, true);
 });
@@ -75,6 +75,43 @@ test('legacy Node cannot be approved with a redirected or unproven home', () => 
   assert.equal(linuxSchedulerCommand(`[Service]\nExecStart="${node}" "${custom}/agent/src/index.mjs" cycle`, { base: custom, node, home }).ok, false);
 });
 
+test('doctor reads how long each scheduler lets a cycle run', () => {
+  const minutes = (value) => value * 60 * 1000;
+  const unit = fs.readFileSync(new URL('../install/legion-control-update.service', import.meta.url), 'utf8');
+  assert.equal(schedulerTimeLimitMs(unit, { kind: 'unit' }), minutes(30), 'the unit as installed');
+  for (const [text, expected] of [
+    ['TimeoutStartSec=900', minutes(15)],
+    ['TimeoutStartSec=30min', minutes(30)],
+    ['TimeoutStartSec=1h 30min', minutes(90)],
+    ['TimeoutStartSec=infinity', Infinity],
+    ['TimeoutStartSec=0', Infinity],
+    ['TimeoutStartSec=900\nTimeoutStartSec=2400', minutes(40)],
+    ['# TimeoutStartSec=900', null],
+    ['TimeoutStartSec=soon', null],
+    ['TimeoutStartSec=5 fortnights', null],
+  ]) assert.equal(schedulerTimeLimitMs(text, { kind: 'unit' }), expected, text);
+
+  const task = (limit) => `<Task><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>${limit}</Settings></Task>`;
+  for (const [limit, expected] of [
+    ['<ExecutionTimeLimit>PT15M</ExecutionTimeLimit>', minutes(15)],
+    ['<ExecutionTimeLimit>PT30M</ExecutionTimeLimit>', minutes(30)],
+    ['<ExecutionTimeLimit>PT1H30M</ExecutionTimeLimit>', minutes(90)],
+    ['<ExecutionTimeLimit>P1DT2H</ExecutionTimeLimit>', minutes(26 * 60)],
+    ['<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>', Infinity],
+    ['', minutes(72 * 60)],
+    ['<ExecutionTimeLimit>PT</ExecutionTimeLimit>', null],
+    ['<ExecutionTimeLimit>fifteen</ExecutionTimeLimit>', null],
+  ]) assert.equal(schedulerTimeLimitMs(task(limit), { kind: 'task' }), expected, limit || 'no limit named');
+
+  assert.equal(schedulerTimeLimitCheck(minutes(30), 'fix it').level, 'ok');
+  assert.equal(schedulerTimeLimitCheck(Infinity, 'fix it').summary, 'the scheduler lets a cycle run as long as it needs');
+  const short = schedulerTimeLimitCheck(minutes(15), 're-run the installer');
+  assert.equal(short.level, 'warn');
+  assert.equal(short.summary, 'the scheduler ends a cycle after 15 min, sooner than the 30 min a cycle may take');
+  assert.equal(short.fix, 're-run the installer');
+  assert.equal(schedulerTimeLimitCheck(null, 'fix it'), null, 'a limit nothing can read adds no check');
+});
+
 test('Linux doctor reports the installed launcher correctly through the scheduler check', {
   skip: process.platform === 'win32' ? 'The mocked Linux doctor requires a POSIX filesystem home.' : false,
 }, async () => withHome(async (home) => {
@@ -92,6 +129,12 @@ test('Linux doctor reports the installed launcher correctly through the schedule
     const loaded = loadConfig({ readOnly: true });
     const result = await runDoctor(loaded);
     assert.equal(result.checks.find((check) => check.id === 'scheduler.command').level, 'ok');
+    assert.equal(result.checks.some((check) => check.id === 'scheduler.timeLimit'), false, 'a unit that names no limit adds no check');
+    command = `"${home}/bin/legionctl" cycle\nTimeoutStartSec=900`;
+    const short = (await runDoctor(loaded)).checks.find((check) => check.id === 'scheduler.timeLimit');
+    assert.equal(short.level, 'warn');
+    assert.match(short.fix, /install-linux\.sh/);
+    command = `"${home}/bin/legionctl" cycle`;
     command = '"/other/installation/bin/legionctl" cycle';
     const refused = await runDoctor(loaded);
     const scheduler = refused.checks.find((check) => check.id === 'scheduler.command');

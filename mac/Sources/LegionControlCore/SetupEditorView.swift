@@ -26,7 +26,12 @@ struct SetupEditorView: View {
         VStack(alignment: .leading, spacing: 0) {
             PageHeading(title: "Setup", note: model.config.config?.identity.name)
 
-            Picker("", selection: $selection) {
+            if LaunchWaitingNotice.isNeeded(model) {
+                LaunchWaitingNotice(model: model)
+                    .padding(.bottom, 16)
+            }
+
+            Picker("Part of the setup", selection: $selection) {
                 Text("Sites").tag(Selection.sites)
                 Text("This device").tag(Selection.bindings)
                 ForEach(config?.machines ?? []) { machine in
@@ -65,8 +70,31 @@ struct SetupEditorView: View {
                     .padding(.top, 14)
             }
 
+            if !model.setupErrors.isEmpty {
+                SetupErrorsNote(errors: model.setupErrors).padding(.top, 12)
+            }
             ForEach(model.setupWarnings, id: \.self) { warning in
                 QuietNote(text: warning).padding(.top, 12)
+            }
+        }
+    }
+}
+
+/// What the applied setup breaks, said once, with the reason it matters.
+struct SetupErrorsNote: View {
+    let errors: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            StatusText(symbol: "exclamationmark.triangle",
+                       text: "This setup breaks a rule every device holds it to, so it is not shared until it is fixed, and a machine with a problem is not driven.",
+                       tint: .orange)
+            ForEach(errors, id: \.self) { error in
+                Text(error)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -103,7 +131,7 @@ private struct SitesEditor: View {
                         }
                         .controlSize(.small)
                     }
-                    Text("addresses starting \(site.lanPrefixes.isEmpty ? "—" : site.lanPrefixes.joined(separator: ", "))")
+                    Text("addresses in \(site.lanPrefixes.isEmpty ? "—" : site.lanPrefixes.joined(separator: ", "))")
                         .font(.callout).foregroundStyle(.secondary)
                     Text("broadcast \(site.broadcast.isEmpty ? "—" : site.broadcast.joined(separator: ", "))")
                         .font(.callout).foregroundStyle(.secondary)
@@ -116,17 +144,17 @@ private struct SitesEditor: View {
             VStack(alignment: .leading, spacing: 10) {
                 LabelledField("Id", text: $draftId, placeholder: "home-a")
                 LabelledField("Name", text: $draftName, placeholder: "Attic house")
-                LabelledField("Address prefixes", text: $draftPrefixes, placeholder: "10.0.0., 192.168.50.")
+                LabelledField("Address prefixes", text: $draftPrefixes, placeholder: "192.168.50., 10.0.0.0/20")
                 LabelledField("Broadcast", text: $draftBroadcast, placeholder: "10.0.0.255")
 
                 Button("Add the site") {
                     problem = model.editSetup("added the site \(draftName.isEmpty ? draftId : draftName)") { root in
-                        try ControllerEditor.upsertSite([
-                            "id": draftId.trimmingCharacters(in: .whitespaces),
-                            "name": draftName.isEmpty ? draftId : draftName,
-                            "lanPrefixes": splitList(draftPrefixes),
-                            "broadcast": splitList(draftBroadcast)
-                        ], in: &root)
+                        try ControllerEditor.upsertSite(ControllerEditor.siteEntry(
+                            id: draftId.trimmingCharacters(in: .whitespaces),
+                            name: draftName.isEmpty ? draftId : draftName,
+                            prefixes: splitList(draftPrefixes),
+                            broadcast: splitList(draftBroadcast)
+                        ), in: &root)
                     }
                     if problem == nil {
                         draftId = ""; draftName = ""; draftPrefixes = ""; draftBroadcast = ""
@@ -156,7 +184,7 @@ private struct MachineEditor: View {
             VStack(alignment: .leading, spacing: 12) {
                 DetailRow("Id", machine.id)
                 DetailRow(label: "Site") {
-                    Picker("", selection: Binding(
+                    Picker("Site", selection: Binding(
                         get: { machine.site ?? "" },
                         set: { site in
                             problem = model.editSetup("moved \(machine.name) to a different site") { root in
@@ -248,7 +276,10 @@ private struct MachineEditor: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Text(system.name).font(.headline)
-                        Text("\(system.platform.rawValue) · \(Self.grammarLabel(system))\(system.isRestricted ? " · restricted key" : "")")
+                        // The document's own field, because this is the document as it is written:
+                        // a restricted system the dispatcher could not take has no grammar, and the
+                        // hint is what says why it is not driven.
+                        Text("\(system.platform.rawValue) · \(Self.grammarLabel(system))\(system.restricted == true ? " · restricted key" : "")")
                             .font(.caption).foregroundStyle(.secondary)
                         Spacer(minLength: 8)
                         if machine.systems.count > 1 {
@@ -260,20 +291,49 @@ private struct MachineEditor: View {
                             .controlSize(.small)
                         }
                     }
-                    Text(system.agent.joined(separator: " "))
+                    Text(LaunchValues.visible(system.agent.joined(separator: " ")))
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                    if let waiting = waiting(system) {
+                        waitingRow(waiting)
+                    }
                 }
                 .padding(.bottom, 10)
             }
 
-            SystemForm { entry in
+            SystemForm(waiting: Set(machine.systems.filter { waiting($0) != nil }.map(\.id))) { entry in
                 problem = model.editSetup("added a system to \(machine.name)") { root in
                     try ControllerEditor.upsertSystem(entry, onMachine: machine.id, in: &root)
                 }
                 return problem == nil
+            }
+        }
+    }
+
+    /// The review entry for a system whose command is waiting for approval on this device.
+    private func waiting(_ system: SystemConfig) -> LaunchReviewEntry? {
+        model.launchReview.first { $0.location == .system(machine: machine.id, system: system.id) }
+    }
+
+    /// A waiting command is read-only here, with its two answers beside it. Editing one field of it
+    /// would otherwise make the rest of what the shared setup says about that system this device's
+    /// own edit, approved without ever being shown whole.
+    private func waitingRow(_ entry: LaunchReviewEntry) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            StatusText(symbol: "exclamationmark.shield",
+                       text: entry.approvable ? "Waiting for approval on this device" : "Cannot be approved on this device",
+                       tint: .orange)
+                .font(.caption)
+            Spacer(minLength: 8)
+            if entry.approvable {
+                Button("Approve") { model.approveLaunch([entry]) }
+                    .controlSize(.small)
+            }
+            if entry.approved != nil {
+                Button("Revert") { problem = model.revertLaunch(entry) }
+                    .controlSize(.small)
             }
         }
     }
@@ -314,7 +374,7 @@ private struct MachineEditor: View {
                 .padding(.bottom, 12)
 
                 HStack(spacing: 10) {
-                    Picker("", selection: $helperMachine) {
+                    Picker("Helper machine", selection: $helperMachine) {
                         Text("Choose a machine").tag("")
                         ForEach((config?.machines ?? []).filter { $0.id != machine.id }) { candidate in
                             Text(candidate.name).tag(candidate.id)
@@ -372,7 +432,7 @@ private struct NewMachineEditor: View {
 
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Platform").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                Picker("", selection: $platform) {
+                Picker("Platform", selection: $platform) {
                     ForEach(Platform.allCases, id: \.self) { value in
                         Text(value.defaultName).tag(value)
                     }
@@ -385,7 +445,7 @@ private struct NewMachineEditor: View {
             if platform == .windows {
                 HStack(alignment: .firstTextBaseline, spacing: 18) {
                     Text("Shell").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                    Picker("", selection: $windowsShell) {
+                    Picker("Shell", selection: $windowsShell) {
                         Text("cmd").tag("cmd")
                         Text("powershell").tag("powershell")
                     }
@@ -489,7 +549,7 @@ private struct EndpointForm: View {
 
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Kind").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                Picker("", selection: $kind) {
+                Picker("Kind", selection: $kind) {
                     Text("On the LAN").tag("lan")
                     Text("Remote").tag("remote")
                 }
@@ -500,7 +560,7 @@ private struct EndpointForm: View {
                 HStack(alignment: .firstTextBaseline, spacing: 18) {
                     Text("Only when running").font(.subheadline).foregroundStyle(.secondary)
                         .frame(width: 140, alignment: .leading)
-                    Picker("", selection: $system) {
+                    Picker("Only when running", selection: $system) {
                         Text("Any system").tag("")
                         ForEach(systems) { entry in Text(entry.name).tag(entry.id) }
                     }
@@ -545,6 +605,9 @@ private func undialablePart(host: String, user: String, port: String = "") -> St
 }
 
 private struct SystemForm: View {
+    /// The ids of systems whose command is waiting for approval here, which this form will not
+    /// write over.
+    var waiting: Set<String> = []
     var save: ([String: Any]) -> Bool
 
     @State private var id = ""
@@ -561,7 +624,7 @@ private struct SystemForm: View {
 
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Platform").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                Picker("", selection: $platform) {
+                Picker("Platform", selection: $platform) {
                     ForEach(Platform.allCases, id: \.self) { value in Text(value.defaultName).tag(value) }
                 }
                 .labelsHidden().pickerStyle(.segmented).fixedSize()
@@ -569,7 +632,7 @@ private struct SystemForm: View {
 
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 Text("Shell").font(.subheadline).foregroundStyle(.secondary).frame(width: 140, alignment: .leading)
-                Picker("", selection: $shell) {
+                Picker("Shell", selection: $shell) {
                     // A Windows system always names its shell: no client guesses one for it.
                     if platform != .windows { Text("What the platform implies").tag("") }
                     ForEach(["posix", "cmd", "powershell"], id: \.self) { value in Text(value).tag(value) }
@@ -601,13 +664,19 @@ private struct SystemForm: View {
                 if restricted { entry["restricted"] = true }
                 if save(entry) { id = ""; name = ""; shell = platform == .windows ? "cmd" : ""; argv = ""; restricted = false }
             }
-            .disabled(!AgentToken.isValid(id.trimmingCharacters(in: .whitespaces)) || !argumentsFit)
+            .disabled(!AgentToken.isValid(id.trimmingCharacters(in: .whitespaces)) || !argumentsFit || isWaiting)
+
+            if isWaiting {
+                QuietNote(text: "The command for \(id.trimmingCharacters(in: .whitespaces)) is waiting for approval on this device. Approve or revert it before changing it.")
+            }
         }
         .onChange(of: platform) { _, newPlatform in
             // cmd is what a stock Windows OpenSSH runs, so it is what a new Windows system starts with.
             if newPlatform == .windows, shell.isEmpty { shell = "cmd" }
         }
     }
+
+    private var isWaiting: Bool { waiting.contains(id.trimmingCharacters(in: .whitespaces)) }
 
     /// A restricted system the dispatcher could not take would be saved only to be refused on every
     /// command.

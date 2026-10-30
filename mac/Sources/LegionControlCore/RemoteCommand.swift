@@ -239,9 +239,15 @@ struct RemoteCommand: Sendable, Equatable {
 
     /// The grammar this line is written in: the system's own, unless the route says the key on the
     /// far side is restricted to the dispatcher.
+    ///
+    /// Only the system's `agent` and `grammar` are read, which on a running model are the launch
+    /// gate's: the tuple this device approved. The document's `shell` and `restricted` are not read
+    /// here at all, so a peer that changes them changes nothing that is written until it is
+    /// approved. A restricted session only ever moves the line to the dispatcher's grammar, and
+    /// that depends on nothing but how many words the approved argv has.
     var grammar: Result<CommandGrammar, CommandLineRefusal> {
         guard restrictedSession else { return system.grammar }
-        return CommandGrammar.resolve(platform: system.platform, shell: system.shell, restricted: system.restricted,
+        return CommandGrammar.resolve(platform: nil, shell: nil, restricted: nil,
                                       restrictedSession: true, agentLength: system.agent.count)
     }
 

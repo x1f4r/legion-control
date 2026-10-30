@@ -18,7 +18,30 @@ node --test contract/test/*.test.mjs
 
 `./scripts/check.sh` runs all four components on a configured Mac. Set `LEGION_ANDROID_JAVA_HOME` to select JDK 21 and `LEGION_DOTNET` to select a .NET 10 executable. For isolated Mac tests, set `LEGION_CONTROL_HOME` to a temporary directory. Desktop tests create their own temporary state.
 
-The agent check runs syntax checks, agent tests, root release/installer tests and contract validation. The Mac check runs Swift tests and a release build. Android runs debug/release unit tests and debug lint. Desktop runs its tests and release build. For Android release packaging, also run:
+The agent check runs, in order: the agent's own check, the syntax of every JavaScript file in the checkout, the invisible-character check, the version check, the agent tests, the release and installer tests in `tests/`, contract validation, the generated-file check and the contract tests, and last the private-data check, so a private value it finds never hides what the tests would have said. The Mac check runs Swift tests and a release build. Android runs debug/release unit tests and debug lint. Desktop runs its tests and release build.
+
+`npm --prefix agent run check` parses the modules the agent ships and refuses zero-width, bidirectional and byte order mark characters in `agent/src`, `agent/install`, `agent/scripts`, `agent/test` and `agent/package.json`, allowing only a byte order mark at the start of a `.ps1`, which Windows PowerShell 5.1 needs to read a script as UTF-8. `node scripts/check-invisible.mjs` applies the same rule to every file git tracks or would track. A test or comment that means such a character writes it as an escape. Note that some editing tools turn a written `\u` escape into the character itself; the two checks are how that is caught.
+
+### Private data
+
+The repository is public, and `node scripts/check-private-data.mjs` keeps it free of the values that have reached it before. It reads every file git tracks or would track, and each file's name, skipping ignored and binary files, and refuses:
+
+- a home directory whose user is not a placeholder: `/home/<user>`, `/Users/<user>`, `<drive>:\Users\<user>` with `\`, `\\` or `/` between the parts, `/mnt/<drive>/Users/<user>` and `/var/home/<user>`, unless the user is `me`, `runner`, `runneradmin`, `Shared`, `Public` or `Default`;
+- a private IPv4 address, or a three-part `192.168` prefix, outside 10.0.0.0/24, 192.168.1.0/24, 192.168.10.0/24 and 192.168.50.0/24 and the few shared values the script lists. The documentation ranges 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24 are not private and pass;
+- private terms: the real names, user names, host names and addresses that would identify the maintainers, which a public check cannot spell out.
+
+The terms come from the `LEGION_PRIVATE_TERMS` environment variable, which CI fills from the repository secret of that name, and from `~/.legion-control/private/terms.txt`, outside the repository and never committed. Both have one format: one entry per line, or several separated by commas; a line starting with `#` is a comment; each term is at least three characters and matches case-insensitively in every line and file name. An entry may list the public places its term is allowed in after it, each after a `!`, such as `jdoe ! github.com/jdoe/ ! com.jdoe.`; each place must contain the term and cannot contain a comma. A finding prints the file, the line and the entry number, never the term. Without either source the check says it looked for no private terms and still checks homes and addresses.
+
+Set the secret under **Settings → Secrets and variables → Actions**, or with `gh secret set LEGION_PRIVATE_TERMS < ~/.legion-control/private/terms.txt`. Until it exists, and on pull requests from forks, the CI job checks only homes and addresses.
+
+### Linting the shell and PowerShell scripts
+
+```sh
+git ls-files -z -- '*.sh' | xargs -0 shellcheck -S warning
+pwsh -NoProfile -File scripts/check-powershell.ps1
+```
+
+The PowerShell check needs PSScriptAnalyzer 1.25.0: `Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser`. Every PowerShell script in the repository stays ASCII, because Windows PowerShell reads a script without a byte order mark in the ANSI code page. For Android release packaging, also run:
 
 ```sh
 (cd android && ./gradlew :app:assembleDebug :app:assembleRelease :app:lintRelease --console=plain)
@@ -35,7 +58,7 @@ node --test tests/*.test.mjs
 node contract/validate.mjs
 ```
 
-The [Checks workflow](../.github/workflows/checks.yml) runs the agent on Linux, Windows and macOS with Node 24/26; Mac on macOS; Android with JDK 21; and desktop on all three operating systems. Its Linux/Windows jobs also publish native desktop outputs. Passing locally does not replace checking CI on the exact PR head.
+The [Checks workflow](../.github/workflows/checks.yml) runs `scripts/check.sh agent` on Linux, Windows and macOS with Node 24 and 26; the private-data check again with the repository's terms; ShellCheck and PSScriptAnalyzer; Mac on macOS; Android with JDK 21; and desktop on all three operating systems, whose Windows job also publishes the native output. Three release dry runs build what a release would, an unsigned Android release APK then signed the way `android/build-apk.sh` signs it, the desktop archives, and the Mac app without installing it, and read no secret. The Windows agent jobs are the only place the PowerShell dispatcher, the Windows process-tree walk and the Windows installer tests run, so a change to any of them is not checked until those jobs are green. Passing locally does not replace checking CI on the exact PR head.
 
 ## Artifacts and native clients
 
@@ -102,6 +125,16 @@ Exercise each applicable flow on Mac, Android, Linux and Windows. Android has no
 | Compatibility | A 1.2 client still loads additive setup fields and retains its old behavior. It does not gain remote helper wake or contract-3 peer features. |
 
 For physical wake/boot tests, retain target-side evidence and the authenticated return status. Test both actual sites and both OS routes; fixture targets and UDP loopback listeners do not prove a physical cross-site wake.
+
+## Manual checks before a release
+
+Some behaviour no test here can reach. Run these once on the release candidate and keep what you saw.
+
+- **The Windows restricted dispatcher.** On a Windows machine with the installed forced command (`powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <base>\bin\dispatch.ps1`), set `SSH_ORIGINAL_COMMAND` to `'<node>' '<base>\bin\launcher.mjs' status` and then to the same with `doctor`, with `NODE_OPTIONS=--import=<file URL of a script that writes a marker file>`. Both replies must be valid JSON for their schemas, `status` must answer `ok: true` (also when the temporary path is an 8.3 short path), `doctor`'s `files.private` and `ssh.shell` must give real verdicts rather than "could not be read", and no marker file may appear. The two PowerShell tests in `agent/test/dispatch.test.mjs` do the same on the Windows CI jobs, and fail rather than skip there.
+- **A detached operation outliving its session on Linux.** On a systemd host with linger on and `KillUserProcesses=yes` in `/etc/systemd/logind.conf`, start `legionctl run <a slow action> --detach --op <id>` over ssh, close the session, and confirm from a new one that `legionctl op <id>` finishes with `ran`. `npm --prefix agent test` runs the automated part where a user manager answers.
+- **The Mac app's accessibility.** With Accessibility Inspector or VoiceOver, a machine row in the sidebar reads its name and state (for example "pi, asleep or unreachable"), the setup row reads "Setup, revision N", and on a divergence sheet each picker in the form-controls rotor says "Which to keep for" and the entry it decides.
+- **The Mac app's update pages.** Look at the Legion Control sidebar page, the first-run page's Legion Control section and the panel's row, with Review, the menu, the Go back and Discard confirmations, and diagnostics export from both the window and the panel. "Collecting diagnostics…" appears only after a save location was chosen, never during or after a cancel.
+- **The desktop's wake past a hold.** Let a lone helper's wake command time out, open Wake options for the target, and confirm that only "Run <helper>'s command again" is offered and that its question warns about a second run.
 
 ## Recorded integration evidence
 

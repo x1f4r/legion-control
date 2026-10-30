@@ -24,10 +24,34 @@ final class AppModel {
     var dialog: PendingDialog?
     /// The setup disagreement waiting to be settled, when there is one.
     var divergence: SetupDivergence?
+    /// The machine a Replace from the divergence sheet is out to, while it is. The sheet waits for
+    /// it: the reply to a second press could come back after the first one's.
+    private(set) var replacingSetupOn: String?
 
     let config: ConfigStore
     /// This device's own settings, which are never published to anyone.
     let bindings: BindingsStore
+    /// The launch values this device approved: the only commands it runs. Never published either.
+    let approvals: LaunchApprovalStore
+
+    /// The setup as this device runs it: the applied document, with every launch value this device
+    /// has not approved replaced by the one it approved at that place, or by nothing
+    /// (LaunchGate.swift). Every transport, bootstrap and update path reads this, never the
+    /// document itself.
+    private(set) var effectiveSetup: ControllerConfig?
+    /// The launch values from the shared setup waiting for a person on this device.
+    private(set) var launchReview: [LaunchReviewEntry] = []
+    /// Whether the review sheet is up. It comes up by itself for a document whose review has not
+    /// been put off in this run.
+    var isReviewingLaunch = false
+    /// A setup a person asked to take while this device applies none, waiting for them to confirm
+    /// every command it would run.
+    var enrolment: LaunchEnrolment?
+    /// The documents whose review was put off in this run, by hash. Held in memory only: the badge
+    /// stays, and the next run asks again.
+    @ObservationIgnored private var deferredLaunchReviews: Set<String> = []
+    /// How a machine is reached. Replaced in tests, so a model the app builds never starts ssh.
+    @ObservationIgnored private let makeRemoteAgent: @MainActor (Machine) -> RemoteAgent
 
     /// Legion Control's own updates.
     let appUpdates: AppUpdateModel
@@ -49,21 +73,36 @@ final class AppModel {
         bindings: BindingsStore = BindingsStore(),
         operations: OperationStore = OperationStore(),
         appUpdates: AppUpdateModel = AppUpdateModel(),
-        remembered: RememberedSettings = RememberedSettings()
+        remembered: RememberedSettings = RememberedSettings(),
+        approvals: LaunchApprovalStore? = nil,
+        remoteAgent: @escaping @MainActor (Machine) -> RemoteAgent = { RemoteAgent(machine: $0) }
     ) {
         self.config = config
         self.bindings = bindings
         self.operations = operations
         self.appUpdates = appUpdates
         self.remembered = remembered
+        self.makeRemoteAgent = remoteAgent
+        // The record comes first and is seeded before anything is evaluated, from the file this
+        // device already runs: an upgrade drives exactly what it drove before and asks nothing,
+        // and only what arrives after it waits for a person.
+        let approvals = approvals ?? LaunchApprovalStore(url: config.approvalsURL)
+        self.approvals = approvals
+        approvals.seedIfMissing(from: config.rawBytes)
         appUpdates.onStateChange = { [weak self] in self?.onStateChange?() }
+        // Before the first hand edit is reconciled, which is an edit made here like any other.
+        config.onLocalEdit = { [weak self] before, after in
+            self?.approvals.recordLocalEdit(before: before, after: after)
+        }
         config.onChange = { [weak self] in
             guard let self else { return }
             _ = self.config.reconcileExternalEdit(deviceName: self.bindings.bindings.effectiveDeviceName)
             self.rebuild()
         }
         bindings.onChange = { [weak self] in self?.rebuild() }
-        appUpdates.repo = { [weak self] in self?.config.config?.updateRepo ?? ControllerConfig.AppUpdatesConfig.defaultRepo }
+        // The gated repository: one a peer named and this device never approved is not where this
+        // app downloads itself from.
+        appUpdates.repo = { [weak self] in self?.effectiveSetup?.updateRepo ?? ControllerConfig.AppUpdatesConfig.defaultRepo }
         appUpdates.operations = operations
         _ = config.reconcileExternalEdit(deviceName: bindings.bindings.effectiveDeviceName)
         rebuild()
@@ -71,9 +110,11 @@ final class AppModel {
 
     // MARK: - Where this device is
 
-    /// Recomputed when a viewer appears rather than on every draw: enumerating interfaces is cheap
-    /// but not free, and a laptop does not change network between two rows of a table.
-    private(set) var placement = SiteAwareness.Placement(matching: [], confirmed: nil)
+    /// Recomputed on every poll and immediately before a wake is planned (section 10.1), rather
+    /// than on every draw: enumerating interfaces is cheap but not free, and a laptop does not
+    /// change network between two rows of a table. It used to be read only when a viewer appeared,
+    /// so a laptop that moved house with the window open went on planning from the old one.
+    private(set) var placement = SiteAwareness.Placement.nowhere
 
     func refreshPlacement() {
         placement = SiteAwareness.placement(
@@ -88,10 +129,15 @@ final class AppModel {
 
     /// Say outright which site this device is at, because prefixes cannot tell two identical private
     /// networks apart and guessing wrong means broadcasting into the wrong house.
-    func confirmSite(_ id: String?) {
-        bindings.update { $0.currentSite = id }
+    ///
+    /// Returns why nothing was saved, when it was not: a private settings file this device refuses
+    /// is never written over, and the picker otherwise just snapped back without a word.
+    @discardableResult
+    func confirmSite(_ id: String?) -> String? {
+        let problem = bindings.update { $0.currentSite = id }
         refreshPlacement()
         onStateChange?()
+        return problem
     }
 
     // MARK: - Following the setup
@@ -108,13 +154,17 @@ final class AppModel {
     /// two reach the agent in different ways. An action running in the dropped model finishes
     /// there, and its record still lands and is announced as usual, but no section shows it any
     /// more, and the agent's own mutation lock is then all that stands in the way of a second one.
+    ///
+    /// Every model is built from the gated setup, so what a machine is sent is decided here, once,
+    /// for every way a document can have arrived.
     private func rebuild() {
+        applyLaunchGate()
         appUpdates.repositoryDidChange()
         let binding = bindings.bindings
         let selfMachineId = binding.canControlSelfLocally ? binding.selfBinding?.machine : nil
 
         let existing = Dictionary(machines.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        machines = config.machines
+        machines = (effectiveSetup?.machines ?? [])
             // A machine this device *is*, and can drive by spawning an agent here, is not reached
             // over ssh at all: it is the local model below. Without a local agent binding it stays
             // an ordinary machine, dialled at whatever address the user configured, because
@@ -127,6 +177,14 @@ final class AppModel {
             }
 
         rebuildLocalModel(selfMachineId: selfMachineId)
+
+        // A wake hold on a helper the setup no longer has is a hold no wake will ever ask about.
+        // Only the applied setup decides that: a file that fails to load says nothing about which
+        // machines are in it.
+        if let applied = config.config {
+            operations.releaseWakeHolds(onHelpersOtherThan: Set(applied.machines.map(\.id)),
+                                        reason: "the helper is no longer in the setup")
+        }
 
         // A question raised by a machine that has just been edited out of the setup has nothing left
         // to act on.
@@ -143,9 +201,42 @@ final class AppModel {
     }
 
     private func makeMachineModel(_ machine: Machine) -> MachineModel {
-        let model = MachineModel(machine: machine, remembered: remembered)
+        let model = MachineModel(machine: machine, agent: makeRemoteAgent(machine), remembered: remembered)
         wire(model)
         return model
+    }
+
+    // MARK: - What this device runs
+
+    /// Run the launch gate over the applied document and this device's record, and keep what it
+    /// decides. The record is read again first if it changed on disk.
+    private func applyLaunchGate() {
+        approvals.reloadIfChanged(seedingFrom: config.rawBytes)
+        // Before the gate reads the record: a first setup written here by hand is this device's own,
+        // and must not come up for review as if it had arrived (section 9.9).
+        if let first = config.takeFirstSetupWrittenHere() { approvals.recordLocalEdit(before: nil, after: first) }
+        guard let applied = config.config else {
+            effectiveSetup = nil
+            launchReview = []
+            isReviewingLaunch = false
+            return
+        }
+        let gated = LaunchGate.effective(applied, document: config.bytes, record: approvals.record)
+        approvals.recordAccepted(gated.accepted)
+        effectiveSetup = gated.config
+        launchReview = gated.review
+        if launchReview.isEmpty {
+            isReviewingLaunch = false
+        } else if let hash = config.hash, !deferredLaunchReviews.contains(hash) {
+            // A command waiting for approval is not run, so the person hears about it before they
+            // find a machine that does nothing when asked.
+            isReviewingLaunch = true
+        }
+    }
+
+    /// Re-read the record when it changed on disk, and run everything again if it did.
+    private func reloadApprovalsIfChanged() {
+        if approvals.reloadIfChanged(seedingFrom: config.rawBytes) { rebuild() }
     }
 
     /// What every device is told the same way: where questions go, where history is written, and
@@ -156,11 +247,15 @@ final class AppModel {
         device.controllerConfig = { [weak self] in self?.config.document }
         device.operations = operations
         device.onOperationFinished = { [weak self] record in self?.announce(record) }
-        device.adoptSetup = { [weak self] bytes, description in
-            self?.config.adopt(bytes, describedAs: description)
+        device.adoptSetup = { [weak self] bytes, description, head in
+            self?.config.adopt(bytes, describedAs: description, replacing: head) ?? .refused("Legion Control is closing.")
         }
-        device.setupBase = { [weak self] mine, theirs in
-            self?.config.commonAncestor(mine: mine, theirs: theirs)
+        device.takeSetup = { [weak self] bytes, identity, holder, head in
+            self?.takeSetup(bytes, identity: identity, from: holder, replacing: head) ?? .refused("Legion Control is closing.")
+        }
+        device.setupBase = { [weak self] mineHash, mineLineage, theirsHash, theirsLineage in
+            self?.config.commonAncestor(mineHash: mineHash, mineLineage: mineLineage,
+                                        theirsHash: theirsHash, theirsLineage: theirsLineage)
         }
         device.onSetupDiverged = { [weak self] divergence in self?.divergence = divergence }
     }
@@ -168,7 +263,7 @@ final class AppModel {
     private func wire(_ model: MachineModel) {
         wireDevice(model)
         model.bindings = { [weak self] in self?.bindings.bindings ?? .empty }
-        model.setup = { [weak self] in self?.config.config }
+        model.setup = { [weak self] in self?.effectiveSetup }
         model.peer = { [weak self] id in self?.machine(id: id) }
         model.localPeer = { [weak self] id in
             guard let local = self?.mac, local.boundMachineId == id else { return nil }
@@ -176,11 +271,25 @@ final class AppModel {
         }
         model.migrateAgentCommand = { [weak self, weak model] system, argv in
             guard let self, let model else { return }
-            _ = self.editSetup("updated the agent launcher on \(model.name)") { root in
+            // A command waiting for approval is not this device's to build on. The migration
+            // offered here started from the approved one, and writing it over the waiting one would
+            // leave the rest of that system as the shared setup has it.
+            if self.launchReview.contains(where: { $0.location == .system(machine: model.id, system: system) }) {
+                model.setStatus("The command for this system is waiting for approval here, so it was not changed. Approve or revert it first.",
+                                isError: true)
+                return
+            }
+            if let problem = self.editSetup("updated the agent launcher on \(model.name)", { root in
                 try ControllerEditor.upsertSystem(["id": system, "agent": argv], onMachine: model.id, in: &root)
+            }) {
+                model.setStatus(problem, isError: true)
             }
         }
-        model.placement = { [weak self] in self?.placement ?? SiteAwareness.Placement(matching: [], confirmed: nil) }
+        model.placement = { [weak self] in self?.placement ?? .nowhere }
+        model.freshPlacement = { [weak self] in
+            self?.refreshPlacement()
+            return self?.placement ?? .nowhere
+        }
     }
 
     /// The local model: either this device's own agent as configured by `local`, or the machine this
@@ -189,8 +298,13 @@ final class AppModel {
     /// Like the machines, the model is kept once there is one. A new name, a new agent command or a
     /// new binding is taken in place, so an action running here is never left behind in a model
     /// the app no longer shows.
+    ///
+    /// The deprecated shared `local` is a launch value like any other: this Mac spawns
+    /// `node <local.agent>`, so it runs the path it approved, and a peer naming a new one changes
+    /// nothing here until a person approves it. The binding's own argv is private to this device
+    /// and needs no approval.
     private func rebuildLocalModel(selfMachineId: String?) {
-        if let selfMachineId, let machine = config.config?.machine(id: selfMachineId),
+        if let selfMachineId, let machine = effectiveSetup?.machine(id: selfMachineId),
            let argv = bindings.bindings.localAgent?.argv, !argv.isEmpty {
             let local = LocalConfig(enabled: true, name: bindings.bindings.effectiveDeviceName, agent: argv.last ?? "")
             if let mac {
@@ -208,7 +322,7 @@ final class AppModel {
             return
         }
 
-        if !bindings.isPresent, let local = config.local {
+        if !bindings.isPresent, let local = effectiveSetup?.local, local.enabled {
             if let mac {
                 if mac.config != local || mac.boundMachineId != nil {
                     mac.update(config: local, agent: MacAgent(scriptPath: local.agentPath),
@@ -228,17 +342,46 @@ final class AppModel {
     private func wireLocal(_ model: MacModel) {
         wireDevice(model)
         model.migrateAgentCommand = { [weak self, weak model] argv in
-            guard let self, model?.boundMachineId != nil else { return }
-            _ = self.bindings.update { $0.localAgent = .init(argv: argv) }
+            guard let self, let model, model.boundMachineId != nil else { return }
+            // Said on this device's line, where the change was asked for. A private settings file
+            // this device refuses is left exactly as it is, and saying nothing made it look done.
+            if let problem = self.bindings.update({ $0.localAgent = .init(argv: argv) }) {
+                model.setStatus(problem, isError: true)
+            }
         }
     }
 
-    func replaceSetupOnPeer(_ divergence: SetupDivergence) {
-        self.divergence = nil
+    /// Replace the peer's different setup with this device's, from the divergence sheet.
+    ///
+    /// The sheet stays up while the request is out and closes on what settles the question: the
+    /// agent took the document, or the question turned out to be out of date, which the device's
+    /// line says and the device's row asks again. A refusal, a push the lock held back and a write
+    /// whose result is unknown leave it open, with `said` hearing why, as every client leaves it.
+    func replaceSetupOnPeer(_ divergence: SetupDivergence, said: @escaping @MainActor (String) -> Void = { _ in }) {
         if let machine = machine(id: divergence.machineId) {
-            machine.replaceSetup()
-        } else if mac?.historyMachineId == divergence.machineId {
-            mac?.replaceSetup()
+            replaceSetup(on: machine, for: divergence, said: said)
+        } else if let mac, mac.historyMachineId == divergence.machineId {
+            replaceSetup(on: mac, for: divergence, said: said)
+        }
+    }
+
+    /// The same, on the device the sheet was raised for, found or given.
+    func replaceSetup(on device: some AgentDevice, for divergence: SetupDivergence,
+                      said: @escaping @MainActor (String) -> Void = { _ in }) {
+        guard replacingSetupOn == nil else { return }
+        replacingSetupOn = divergence.machineId
+        device.replaceSetup(over: divergence.theirsHash, from: divergence.mine.hash) { [weak self] ending in
+            guard let self else { return }
+            self.replacingSetupOn = nil
+            switch ending {
+            case .replaced, .outdated:
+                // Closed only if it is still the sheet on screen: another may have come up meanwhile.
+                if self.divergence?.machineId == divergence.machineId, self.divergence?.theirsHash == divergence.theirsHash {
+                    self.divergence = nil
+                }
+            case .notReplaced(let sentence):
+                said(sentence)
+            }
         }
     }
 
@@ -266,12 +409,20 @@ final class AppModel {
     }
 
     /// Give a hand written or pasted document an identity, so it can take part in reconciliation.
+    ///
+    /// It approves nothing itself. Only the controller block changes, so no launch value changed,
+    /// and a document without an id is not always this person's own: a peer's copy with lineage but
+    /// no id is fetched like any other, and giving it an id must not make what it runs approved.
+    /// What a file with no identity runs was settled when it was applied (section 9.9): as the
+    /// first setup a device applies it was approved then, because it was written there, and put
+    /// over an applied setup it is a setup of its own whose changes wait for review.
     @discardableResult
     func adoptOwnDocument() -> String? {
         guard let raw = config.rawBytes, config.config?.identity.id == nil else { return nil }
         do {
             let edited = try ControllerEditor.adopting(raw, deviceName: bindings.bindings.effectiveDeviceName)
-            let problem = config.adopt(edited.bytes, describedAs: "gave this setup an identity")
+            let problem = describe(config.adopt(edited.bytes, describedAs: "gave this setup an identity",
+                                                replacing: config.document?.hash))
             onStateChange?()
             return problem
         } catch let failure as ControllerEditor.EditFailure {
@@ -282,37 +433,40 @@ final class AppModel {
     }
 
     /// Settle a divergence by merging the two branches.
+    ///
+    /// The merge is built from the two documents the sheet showed and written only over the one it
+    /// was built from: a setup saved here while the sheet was open closes it, and the comparison is
+    /// made again from what is applied now.
     @discardableResult
     func resolveDivergence(_ divergence: SetupDivergence,
                            choices: [String: SetupMerge.Choice]) -> String? {
+        if let blocker = divergence.mergeBlocker { return blocker }
         do {
-            let identity = divergence.mine.identity.merged(
-                with: divergence.theirsIdentity,
-                mineHash: divergence.mine.hash,
-                theirsHash: Canonical.sha256(divergence.theirsBytes),
-                device: bindings.bindings.effectiveDeviceName
-            )
-            let merged = try SetupMerge.merge(
+            let outcome = try SetupMerge.merge(
+                base: divergence.baseBytes,
                 mine: divergence.mine.bytes,
                 theirs: divergence.theirsBytes,
-                base: divergence.baseBytes,
-                differences: divergence.differences,
-                choices: choices,
-                identity: identity
+                mineHash: divergence.mine.hash,
+                theirsHash: divergence.theirsHash,
+                writer: SetupMerge.Writer(source: ControllerIdentity.sourceKind,
+                                          device: bindings.bindings.effectiveDeviceName,
+                                          now: ISO8601DateFormatter.lenient.string(from: Date())),
+                choices: choices
             )
+            guard let merged = outcome.result else {
+                // Nothing is written. The rule the choices broke, or that this device's setup broke
+                // already and the choices kept, is what the person needs to know.
+                let rule = outcome.error ?? "a rule"
+                return "That merge would break the rule \(rule) every device holds a setup to, so nothing was written. Choose the other side for the entry it comes from."
+            }
             // Both branches are kept, so whichever machine is holding either of them accepts the
             // merge as a fast-forward.
             config.keepRevision(divergence.mine.bytes)
             config.keepRevision(divergence.theirsBytes)
-            let problem = config.adopt(merged, describedAs: "merged with \(divergence.machineName)")
-            if problem == nil { self.divergence = nil }
-            onStateChange?()
-            return problem
+            return settle(divergence, with: config.adopt(merged, describedAs: "merged with \(divergence.machineName)",
+                                                         replacing: divergence.mine.hash))
         } catch let failure as SetupMerge.MergeFailure {
             return failure.message
-        } catch let failure as Canonical.NotUTF8 {
-            _ = failure
-            return "The merged document is not valid UTF-8, so nothing was written."
         } catch {
             return error.localizedDescription
         }
@@ -328,14 +482,140 @@ final class AppModel {
         return resolveDivergence(divergence, choices: choices)
     }
 
-    /// Settle a divergence by taking the machine's branch.
+    /// Settle a divergence by taking the machine's branch, unchanged.
     @discardableResult
     func takeTheirs(_ divergence: SetupDivergence) -> String? {
         config.keepRevision(divergence.mine.bytes)
-        let problem = config.adopt(divergence.theirsBytes, describedAs: "took the setup from \(divergence.machineName)")
-        if problem == nil { self.divergence = nil }
+        return settle(divergence, with: config.adopt(divergence.theirsBytes, describedAs: "took the setup from \(divergence.machineName)",
+                                                     replacing: divergence.mine.hash))
+    }
+
+    /// What one way of settling a divergence came to. A setup that changed here while the sheet was
+    /// open closes it, and the device the sheet was about compares again from what is applied now.
+    private func settle(_ divergence: SetupDivergence, with outcome: ConfigStore.AdoptOutcome) -> String? {
+        defer { onStateChange?() }
+        switch outcome {
+        case .adopted:
+            self.divergence = nil
+            return nil
+        case .headMoved:
+            self.divergence = nil
+            let note = "The setup here changed while this was open; comparing again."
+            if let machine = machine(id: divergence.machineId) {
+                machine.setStatus(note)
+                machine.compareSetupAgain()
+            } else if let mac, mac.historyMachineId == divergence.machineId {
+                mac.setStatus(note)
+                mac.compareSetupAgain()
+            }
+            return note
+        case .refused(let problem):
+            return problem
+        }
+    }
+
+    /// An adoption's outcome as the sentence an edit path returns: nil when it was applied.
+    private func describe(_ outcome: ConfigStore.AdoptOutcome) -> String? {
+        switch outcome {
+        case .adopted: nil
+        case .headMoved: "The setup here changed meanwhile, so nothing was written. Try again."
+        case .refused(let problem): problem
+        }
+    }
+
+    // MARK: - Commands from the shared setup
+
+    /// Approve exactly the values the review showed. Whatever the document has moved on to since
+    /// is a new entry of its own.
+    func approveLaunch(_ entries: [LaunchReviewEntry]) {
+        approvals.approve(entries)
+        rebuild()
+    }
+
+    /// Put the approved value back over the one waiting, as an ordinary edit: it is written into
+    /// the shared setup and replicates like any other change made here.
+    @discardableResult
+    func revertLaunch(_ entry: LaunchReviewEntry) -> String? {
+        guard let approved = entry.approved else { return nil }
+        return editSetup("put back the approved \(launchDescription(entry.location))") { root in
+            try ControllerEditor.restoreLaunchValue(approved, at: entry.location, in: &root)
+        }
+    }
+
+    /// Not now. The sheet does not come up by itself again for this document in this run; the
+    /// notice in the panel and on the setup page stays until the values are settled.
+    func deferLaunchReview(_ hash: String?) {
+        if let hash { deferredLaunchReviews.insert(hash) }
+        isReviewingLaunch = false
+    }
+
+    /// Bring the review up, because a person asked for it.
+    func reviewLaunch() {
+        isReviewingLaunch = !launchReview.isEmpty
+    }
+
+    /// What one location is, in words, for the edit history and the sheet.
+    func launchDescription(_ location: LaunchLocation) -> String {
+        let machine = location.machineId.map { id in config.config?.machine(id: id)?.name ?? id }
+        switch location {
+        case .system(let machineId, let systemId):
+            let system = config.config?.machine(id: machineId)?.system(id: systemId)?.name ?? systemId
+            return "command for \(system) on \(machine ?? machineId)"
+        case .identityFile:
+            return "identity file for \(machine ?? "this machine")"
+        case .repo:
+            return "update repository"
+        case .local:
+            return "local agent"
+        }
+    }
+
+    /// Take a setup from a device's agent, because a person asked to.
+    ///
+    /// With a setup applied here this adopts a different one, which approves nothing: what it runs
+    /// waits for review like anything else that arrived. With none it is enrolment, and nothing is
+    /// written until the person has seen every command it runs and confirmed them.
+    func takeSetup(_ bytes: Data, identity: ControllerIdentity, from holder: String, replacing head: String?) -> SetupTaking {
+        guard config.config == nil else {
+            switch config.adopt(bytes, describedAs: "took the setup from \(holder)", replacing: head) {
+            case .adopted: return .adopted
+            case .headMoved: return .refused("The setup here changed while the one on \(holder) was being read, so nothing was taken. Look at the two again first.")
+            case .refused(let problem): return .refused(problem)
+            }
+        }
+        let canonical = try? Canonical.bytes(bytes)
+        enrolment = LaunchEnrolment(
+            bytes: bytes,
+            holder: holder,
+            identity: identity,
+            projection: LaunchValues.projection(of: canonical),
+            config: canonical.flatMap { try? JSONDecoder().decode(ControllerConfig.self, from: $0) }
+        )
+        onStateChange?()
+        return .awaitingConfirmation
+    }
+
+    /// Apply the setup the enrolment summary showed, approving every launch value in it.
+    @discardableResult
+    func confirmEnrolment() -> String? {
+        guard let enrolment else { return nil }
+        // A setup applied here meanwhile turns this into adopting a different one, which approves
+        // nothing. It is not slipped through as an enrolment.
+        guard config.config == nil else {
+            self.enrolment = nil
+            onStateChange?()
+            return "A setup was applied on this device meanwhile, so nothing was enrolled."
+        }
+        let problem = describe(config.enrol(enrolment.bytes, describedAs: "enrolled with the setup from \(enrolment.holder)"))
+        if problem == nil { self.enrolment = nil }
         onStateChange?()
         return problem
+    }
+
+    /// Cancel applies nothing.
+    func cancelEnrolment() {
+        enrolment = nil
+        onStateChange?()
     }
 
     // MARK: - Aggregates
@@ -394,7 +674,11 @@ final class AppModel {
     }
 
     /// Warnings about the setup itself, which are not reasons to refuse it.
-    var setupWarnings: [String] { config.config?.warnings() ?? [] }
+    var setupWarnings: [String] { config.warnings.map(\.message) + (config.config?.commandWarnings() ?? []) }
+
+    /// What the applied setup breaks (section 9.7). It is applied all the same, without the machines
+    /// an error is inside, and not shared until these are fixed.
+    var setupErrors: [String] { config.errors.map(\.message) }
 
     /// The freshest reading anywhere, for the "checked N minutes ago" line.
     var lastChecked: Date? {
@@ -472,6 +756,8 @@ final class AppModel {
         pollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 self?.config.reloadIfChanged()
+                self?.reloadApprovalsIfChanged()
+                self?.refreshPlacement()
                 await self?.refreshEverything(userInitiated: false)
                 try? await Task.sleep(for: .seconds(15))
             }
@@ -486,6 +772,7 @@ final class AppModel {
     /// The window or the panel came on screen.
     func viewerAppeared() {
         config.reloadIfChanged()
+        reloadApprovalsIfChanged()
         refreshPlacement()
         // Foreground entry rechecks stale release metadata independently of fleet polling.
         appUpdates.checkIfStale()
@@ -539,6 +826,33 @@ final class AppModel {
         dialog.alternative?()
     }
 
+    // MARK: - Legion Control itself
+
+    /// Going back quits this build and starts the kept one, so it is asked first, in the one place
+    /// the window and the panel both draw a question.
+    func requestRollback() {
+        guard let version = appUpdates.rollbackVersion else { return }
+        dialog = PendingDialog(
+            id: "app-roll-back",
+            title: "Go back to Legion Control \(version)?",
+            message: "Legion Control quits, puts \(version) back in its place and starts it.",
+            confirmTitle: "Go back",
+            perform: { [weak self] in self?.appUpdates.rollBack() }
+        )
+    }
+
+    /// Discarding cannot be undone, so it is asked first too.
+    func requestDiscardPreviousBuild() {
+        guard let version = appUpdates.rollbackVersion else { return }
+        dialog = PendingDialog(
+            id: "app-discard-previous",
+            title: "Discard Legion Control \(version)?",
+            message: "The build kept from the last update is deleted, and going back to it is no longer possible.",
+            confirmTitle: "Discard",
+            perform: { [weak self] in self?.appUpdates.discardPrevious() }
+        )
+    }
+
     // MARK: - Diagnostics
 
     /// Everything a bug report needs, as one piece of text.
@@ -558,7 +872,12 @@ final class AppModel {
         if let problem = config.problem { lines.append("config problem: \(problem)") }
         if let problem = bindings.problem { lines.append("bindings problem: \(problem)") }
         if let problem = operations.persistenceProblem { lines.append("history problem: \(problem)") }
+        if let problem = approvals.problem { lines.append("approvals problem: \(problem)") }
+        for error in setupErrors { lines.append("setup error: \(error)") }
         for warning in setupWarnings { lines.append("setup warning: \(warning)") }
+        // Paths only, never the commands: a bug report is not where an argv from the shared setup
+        // belongs.
+        for entry in launchReview { lines.append("waiting for approval: \(entry.path)") }
         lines.append("")
 
         for machine in machines {
@@ -566,7 +885,7 @@ final class AppModel {
             lines.append("link: \(machine.stateDescription)")
             lines.append("agent: \(machine.status?.version ?? "not read"), \(machine.dialect.description)")
             lines.append("route: \(machine.lastRoute?.label ?? "none recorded")")
-            lines.append("setup: \(machine.setupDecision)")
+            lines.append("setup: \(machine.setupDecision.decision.rawValue)\(machine.setupDecision.reason.map { " (\($0))" } ?? "")")
             for note in machine.notes { lines.append("note: \(note)") }
             for service in machine.services {
                 lines.append("service \(service.id): installed=\(service.installed ?? "-") latest=\(service.latest ?? "-") running=\(service.running.map(String.init) ?? "-") healthy=\(service.healthy.map(String.init) ?? "-") busy=\(service.busy?.summary ?? "-")")
@@ -595,23 +914,24 @@ final class AppModel {
     /// Writes the documented example config, but never over anything that is already there.
     @discardableResult
     func writeExampleConfig() -> String? {
-        config.writeExample()
+        config.writeExample(deviceName: bindings.bindings.effectiveDeviceName)
     }
 
-    /// Opens the config in whatever the user edits text with. `open -t` is the system's own answer to
-    /// that question, so the app does not have to have an opinion.
-    func openConfigInEditor() {
-        let path = config.path
+    /// Opens a file in whatever the user edits text with. `open -t` is the system's own answer to
+    /// that question, so the app does not have to have an opinion. Replaced in tests, which have no
+    /// business opening anything in front of the person running them.
+    @ObservationIgnored var openInEditor: @MainActor (String) -> Void = { path in
         Task.detached {
             _ = await Shell.run(executable: "/usr/bin/open", arguments: ["-t", path], timeout: 20)
         }
+    }
+
+    func openConfigInEditor() {
+        openInEditor(config.path)
     }
 
     func openBindingsInEditor() {
-        let path = bindings.path
-        Task.detached {
-            _ = await Shell.run(executable: "/usr/bin/open", arguments: ["-t", path], timeout: 20)
-        }
+        openInEditor(bindings.path)
     }
 
     func movePrivateSettingsOut() -> String? {
@@ -619,7 +939,10 @@ final class AppModel {
             return "First choose this device's machine and local agent command under Setup → This device. The existing local configuration has been retained."
         }
         if let problem = bindings.update({ value in
-            for machine in config.machines {
+            // Only the identity files this device approved move into its private settings. One a
+            // peer named and nobody here approved is dropped with the rest, never made private and
+            // trusted by the move.
+            for machine in effectiveSetup?.machines ?? [] {
                 guard let key = machine.ssh?.identityFile, !key.isEmpty else { continue }
                 var specific = value.machines?[machine.id] ?? .init()
                 if specific.identityFile == nil { specific.identityFile = key }

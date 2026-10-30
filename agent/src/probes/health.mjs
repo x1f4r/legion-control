@@ -6,8 +6,8 @@
 // the two apart and reports both: `process` says the thing exists, `health` says
 // it works.
 
-import { describeFailure, runArgv, runArgvAsync } from '../config.mjs';
 import { httpGet } from '../http.mjs';
+import { describeFailure, runArgv, runArgvAsync } from '../process-runner.mjs';
 
 /** The port a service answers on, or null when health is not measured over HTTP. */
 export function healthPort(service) {

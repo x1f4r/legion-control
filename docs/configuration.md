@@ -540,7 +540,7 @@ An action has **either** a `command` or a `wol` block, never both.
     "id": "wake-tower",
     "name": "Wake the tower",
     "wol": {
-      "mac": "AA:BB:CC:DD:EE:FF",
+      "mac": "02:00:00:00:00:01",
       // Where to send it. Usually the broadcast address of the LAN this machine is on.
       "broadcast": ["192.168.50.255"],
       // Default [9, 7].
@@ -664,7 +664,7 @@ below for where your key paths and ssh aliases go instead.
 
       // Wake on LAN. Leave the block out for a machine that cannot be woken.
       "wake": {
-        "mac": "AA:BB:CC:DD:EE:FF",
+        "mac": "02:00:00:00:00:01",
         "broadcast": ["192.168.50.255"],
         "ports": [9, 7],
         // Polled after the packet, to tell when the machine is back.
@@ -672,11 +672,11 @@ below for where your key paths and ssh aliases go instead.
         // Machines that can send the packet when you cannot, tried in order.
         // See "Waking from somewhere else".
         "helpers": [
-          { "machine": "pi-flat",     "action": "wake-tower" },
-          { "machine": "router-flat", "action": "wake-tower" }
+          { "machine": "pi",  "action": "wake-tower" },
+          { "machine": "nas", "action": "wake-tower" }
         ],
         // Compatibility: the same as helpers[0], written by editors so a 1.2 client still works.
-        "helper": { "machine": "pi-flat", "action": "wake-tower" }
+        "helper": { "machine": "pi", "action": "wake-tower" }
       },
 
       // Every system installed on the machine. "id" must match the agent's system.id on that
@@ -686,9 +686,9 @@ below for where your key paths and ssh aliases go instead.
           // The key for this system is restricted to the dispatcher: see security.md. Clients send
           // a plain argv list rather than a line for a shell to parse. Default false.
           "restricted": true,
-          "agent": ["/usr/bin/node", "/home/me/.legion-control/agent/src/index.mjs"] },
+          "agent": ["/usr/bin/node", "/home/me/.legion-control/bin/launcher.mjs"] },
         { "id": "windows", "name": "Windows 11", "platform": "windows", "shell": "powershell",
-          "agent": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"] }
+          "agent": ["C:\\Program Files\\nodejs\\node.exe", "C:\\Users\\me\\.legion-control\\bin\\launcher.mjs"] }
       ]
     }
   ],
@@ -765,6 +765,14 @@ as proof**:
 - Set `currentSite` in your private bindings to say which one you are actually on. It is a routing
   hint only, and it is per device, because it is a fact about where *you* are.
 
+A prefix is either dotted, one to three octets with an optional trailing dot (`192.168.1`,
+`192.168.1.`), or CIDR (`192.168.16.0/20`, a length from 8 to 32 with no host bits set). It matches
+on octet or bit boundaries, never as text, so `192.168.1` holds `192.168.1.7` and not
+`192.168.10.7`. Anything else never matches and is a warning, never a reason to refuse the document;
+editors refuse it, and write an octet-aligned prefix with its trailing dot so an older client that
+compares text still gets it right. Only this device's addresses on interfaces that are up and can
+broadcast count: never loopback, a tunnel or a VPN.
+
 What is never in doubt is the machine itself. Reaching a machine authenticates it against its
 pinned ssh host key, so an address that happens to match another network's numbering cannot get you
 talking to the wrong box — you get a host key mismatch, loudly. And a known remote address is never
@@ -781,12 +789,12 @@ the packet, and point the sleeper's `wake` block at it:
 
 ```jsonc
 "wake": {
-  "mac": "AA:BB:CC:DD:EE:FF",
+  "mac": "02:00:00:00:00:01",
   "helpers": [
-    { "machine": "pi-flat",     "action": "wake-tower" },
-    { "machine": "router-flat", "action": "wake-tower" }
+    { "machine": "pi",  "action": "wake-tower" },
+    { "machine": "nas", "action": "wake-tower" }
   ],
-  "helper": { "machine": "pi-flat", "action": "wake-tower" }
+  "helper": { "machine": "pi", "action": "wake-tower" }
 }
 ```
 
@@ -795,7 +803,7 @@ with, in the helper's own agent config, a native wake action — no third-party 
 ```jsonc
 "actions": [
   { "id": "wake-tower", "name": "Wake the tower",
-    "wol": { "mac": "AA:BB:CC:DD:EE:FF", "broadcast": ["192.168.50.255"] } }
+    "wol": { "mac": "02:00:00:00:00:01", "broadcast": ["192.168.50.255"] } }
 ]
 ```
 
@@ -804,10 +812,25 @@ targets, nothing but wake actions.
 
 #### What a client actually does
 
-1. **On the target's site** — send the packet directly, to `wake.broadcast` or the site's.
-2. **Otherwise** — walk `helpers` in order. For each one whose last known state was not asleep, run
-   its action. The first that reports it sent packets wins.
-3. **Nothing worked** — say so, with one line per helper: unreachable, action failed, or asleep.
+Every client builds the same plan, which `contract/tools/wake-plan.mjs` and the shared wake vectors
+pin:
+
+1. **Directly**, when the wake block has a `mac` and this device is on the target's network: three
+   magic packets to each of `wake.broadcast`, or else the site's `broadcast`, or else the directed
+   broadcast of the address that placed this device, or else `255.255.255.255`, on `wake.ports` or
+   9 and 7. The step is skipped, and the plan says why, when there is no `mac`, when the target's
+   site is one of several that match, when the target names no site and has no `lanPrefix`, or when
+   this device is elsewhere.
+2. **Through the helpers**, `wake.helpers` in order, or `[wake.helper]` without them. A helper is
+   skipped, with the reason, when it is not in the setup, is the target itself, repeats an earlier
+   entry, was last read asleep, cannot be used from here (its key or host key failed, its agent is
+   missing, or no system of it is approved on this device), does not list that action, or is held
+   (below). A helper not read yet is read once just before its turn.
+3. **Nothing worked**: one line per step taken and per helper skipped.
+
+After a packet left, or a helper's action finished `ran`, the client polls the target's status: first
+after five seconds, then at intervals growing by 1.6 up to twenty seconds, for two minutes. An
+answer ends the wake; no answer moves on to the next step.
 
 A helper is never woken automatically to serve as a helper. That would quietly turn the machine you
 are trying not to leave running into a machine that is always running, which is the opposite of the
@@ -817,17 +840,29 @@ thing you choose.
 #### A sent packet is not a woken machine
 
 UDP is fire and forget. The agent can tell you it put three datagrams on the wire; it cannot tell
-you anything arrived, and neither can you. So the packet is never the end of it: readiness is an
-authenticated poll of the target, at most every three seconds, and only a real reply counts. If the
-direct broadcast produces no answer, the client moves on to the configured helpers rather than
-declaring success.
+you anything arrived, and neither can you. So the packet is never the end of it: readiness is the
+authenticated status poll above, and only a real reply counts. If the direct broadcast produces no
+answer, the client moves on to the configured helpers rather than declaring success.
 
 Failing over between helpers is careful about a helper whose connection dropped mid-request. A
-`wol` action is a pure packet send and is safe to repeat, so it simply retries. A general `command`
-action is not: the client queries that same operation id on the helper when it can reach it again,
-and only moves to the next helper once the first is a known failure or a known unknown. It never
-re-runs an arbitrary command on a hunch — and it never retries a boot or a sleep without
-reconciling the operation first.
+`wol` action is a pure packet send and is safe to repeat. Any other action may do anything, so a
+request to one that ended without a result the client could read (a dropped link, a timeout, a
+reply still queued or running when it stopped watching) leaves a **wake hold** for the target on
+that device. While a hold exists, no helper runs a command for that target unless its action is a
+declared `wol`, the held helper included; direct packets and `wol` helpers still go. Before the next
+wake the client reads the held operation once on its helper. The hold is released when that record
+is finished, whatever it says, when the helper says it has no such operation, when the target
+answers, when the helper leaves the setup, or when a person chooses to go past it. Time, a restart
+of the app, a network change or an unreachable helper never release it, and each device keeps its
+own holds.
+
+Going past a hold is the same on every client. While another helper could be asked, each offers
+**Try the other helpers** (`--try-other-helpers` on the desktop's command line), which asks after
+confirming, releases the holds and asks only the others: the held command is not run again in that
+walk, and the next wake asks every helper. When no other helper could be asked it offers **Run
+<helper>'s command again** (`--run-held-again`) instead, after a warning that the command may then
+run twice beside the first. None of them retries a boot or a sleep without reading its operation
+first.
 
 `machine.alwaysOn` changes nothing except what the apps say. A wake path whose only helpers are not
 marked always-on gets told, in the editor and in the failure message, that there is no always-on
@@ -908,7 +943,7 @@ your real ssh setup.
 
   // How to run the agent here without ssh. The argv is spawned directly — no shell is involved,
   // so there is nothing to quote and no "shell" key to set.
-  "localAgent": { "argv": ["node", "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs"] },
+  "localAgent": { "argv": ["C:\\Program Files\\nodejs\\node.exe", "C:\\Users\\me\\.legion-control\\bin\\launcher.mjs"] },
 
   // Which site you are actually on, when the addresses cannot tell. See below.
   "currentSite": "flat",
@@ -923,7 +958,7 @@ your real ssh setup.
 
   // Per machine overrides. "sshAlias" names an entry in THIS device's ~/.ssh/config.
   "machines": {
-    "attic-box": { "identityFile": "~/.ssh/id_attic", "sshAlias": "attic-box-lan" }
+    "laptop": { "identityFile": "~/.ssh/id_attic", "sshAlias": "laptop-lan" }
   }
 }
 ```
@@ -1040,6 +1075,14 @@ overwriting each other. Everything else stops and waits for you.
 A machine running an agent too old to carry a setup is simply left out of all this, and said to be
 left out. It is not a conflict.
 
+Some pushes are held rather than retried. A machine that refused a revision with `restricted` or
+`config-invalid` is not sent that revision again until the setup here changes or a person asks; a
+device whose key there is not restricted publishes it on its next reading. A device whose own setup
+has an error in it (see "Rules the editors enforce") publishes nothing until it is fixed, and still
+reads, fetches and merges. A failed request backs off for a minute per applied hash, one machine
+has one setup request in flight at a time, and nothing is pushed while an operation is changing the
+machine.
+
 ### When two people edited at once
 
 Divergence means same setup, both sides changed, neither grew from the other. The apps show both
@@ -1055,6 +1098,24 @@ You get three choices:
 - **Keep mine.** This makes a new revision whose lineage includes theirs, so it is accepted as an
   ordinary fast-forward. It never uses the replace override.
 - **Take theirs.** Fetch and apply.
+
+The common ancestor is the newest revision in both lineages that this device kept, whose bytes still
+hash to it, and which passes the checks every device holds a peer's setup to. A kept revision that
+fails them, kept by an older build, is skipped like one that was not kept. Theirs has to pass the
+same checks. Your own copy may carry only an unknown site or a broken wake helper, which taking
+theirs' side of that entry repairs; any other error in it has to be fixed in the editor before Merge
+or Keep mine is offered, and Take theirs is offered either way. A merged result that would break a
+rule is not written, and the app says which rule.
+
+A different setup on a machine is a different question with two answers: replace that machine's
+copy with yours, or follow its setup here. Replacing is the one place the replace override is ever
+sent, after a preview of what it overwrites, and never from a device whose own setup has an error.
+Every client sends nothing when the machine's latest status names another document than the one
+the preview was built from, or when its own setup changed since, and asks again instead: the
+override takes whatever the machine holds when it arrives. And every client decides on the reply's
+outcome, and counts the copy replaced only when that outcome is a success naming the document it
+sent: a refusal, a push the machine's lock held back, a write whose result is unknown and a success
+that names another document or none each leave the question open.
 
 Each device keeps the last thirty documents it has applied, filed by hash, which is what makes the
 three-way merge possible and what lets you look at what the setup used to be.
@@ -1088,9 +1149,65 @@ copy of the previous bytes, rewrites only the `controller` block to bump the rev
 lineage, and publishes on the next poll. Change the `id` by hand and you have declared a new setup,
 which the machines will ask you about.
 
-A document with no `controller` block at all — a hand-written file, or the pasted example — gets a
-fresh setup id, revision 1 and an empty lineage before anything is applied or published, and the app
-tells you the id it assigned.
+A document whose `controller` block is missing or has no `id` — a hand-written file, or the pasted
+example — gets a fresh setup id, revision 1 and an empty lineage before anything is applied or
+published, and the app tells you the id it assigned. Put over a setup that is already applied, such
+a file becomes a setup of its own and approves none of the commands it changed: they wait for review
+on that device (see "Commands from the shared setup"). On a device that applies no setup yet, every
+client takes it as the first setup there and approves what it holds, as it would the same text
+pasted into the editor.
+
+### Commands from the shared setup
+
+Lineage says that a document claims to grow out of another, not who wrote it, and any key that may
+publish the setup can write a descendant. So the values that decide what a device runs with its own
+key are never taken from replication alone. These **launch values** are:
+
+- each system's `agent` argv, together with the grammar its command line is written in, which
+  `platform`, `shell` and `restricted` decide;
+- a machine's deprecated `ssh.identityFile`;
+- `appUpdates.githubRepo`;
+- the top-level `local`, which only the Mac acts on.
+
+Everything else applies as it arrives. A launch value runs on a device only once that device
+approved it. Until then the value it last approved at that place runs, or the default: a system with
+no approved command is not driven at all, an unapproved key gives way to the one last approved for
+that machine or none, an unapproved repository to the approved one or the built-in one, and an
+unapproved `local` to the approved one or none. Without asking, a device accepts a value it approved
+anywhere in the setup, a value that runs nothing (no argv, no key, the built-in repository, no
+`local`), and the move of an approved command from `<base>/agent/src/index.mjs` to
+`<base>/bin/launcher.mjs` under the same interpreter, base and grammar.
+
+What approves, and nothing else does: **Approve** in the review; an edit made on this device, in an
+editor, by pasting, or by hand in the file with its `controller` block kept, for the values it
+changed; a file whose `controller` block is missing or has no `id`, written on a device that applies
+no setup yet, for everything it holds; importing a setup into a device that applies none, in the
+import or fetch flow, after showing every launch value it holds; and, once, the first start of a 1.4
+client, which records what the setup it already applies runs. Fetching automatically, Take theirs,
+Merge, Keep mine, following a different setup and restoring a kept revision approve nothing.
+
+The review shows each waiting value beside the one approved at that place, and offers **Approve**,
+**Revert** (an ordinary edit back to the approved value, which reaches the other devices like any
+edit) or leaving it. A value a person cannot read as it is, an argv item, key path or `local.agent`
+holding a control, invisible or bidirectional character, can only be reverted or left.
+
+- **Mac:** the window opens **Approve commands from the shared setup** when something waits, with
+  each value under *Approved here* and *In the setup now*, **Approve**, **Revert**, **Approve all**
+  and **Not now**. A machine whose system waits says so on its row.
+- **Android:** **Approve commands** lists the same, with Approve, Revert and Not now. In the setup
+  editor a system whose command waits is read-only, with Approve and Revert.
+- **Linux and Windows desktop:** the window shows the review, and from the command line
+  `--command setup` lists what waits beside what was approved, `--command setup --approve-launch
+  <place> --hash HASH` (or `all`) approves it, and `--revert-launch <place>` reverts it.
+  `--approve-launch` approves nothing once the setup is no longer the document with that hash, and
+  `--reconcile-once` exits 1 while anything waits. `desktop/README.md` has the details.
+
+Each device keeps what it approved to itself and never publishes it: `approved-launch.json` beside
+the applied setup on the Mac and the desktop, and the `approved-launch` preference on Android.
+Deleting the record makes the next start record the setup it applies then, whatever a peer brought
+in meanwhile. Agent 3.1.0, on a session whose key is restricted, refuses a push that carries a
+launch value its own copy would not accept, so a restricted key cannot change what another device's
+key runs there either.
 
 ### Bootstrapping a new device
 

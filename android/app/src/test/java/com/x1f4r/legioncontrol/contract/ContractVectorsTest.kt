@@ -1,6 +1,19 @@
 package com.x1f4r.legioncontrol.contract
 
 import com.x1f4r.legioncontrol.agent.Addresses
+import com.x1f4r.legioncontrol.agent.AgentJson
+import com.x1f4r.legioncontrol.agent.ConfigSetReply
+import com.x1f4r.legioncontrol.agent.ControllerMark
+import com.x1f4r.legioncontrol.agent.SetupDecision
+import com.x1f4r.legioncontrol.agent.SetupExpectation
+import com.x1f4r.legioncontrol.agent.SetupFetched
+import com.x1f4r.legioncontrol.agent.SetupHead
+import com.x1f4r.legioncontrol.agent.SetupMeta
+import com.x1f4r.legioncontrol.agent.SetupPeerState
+import com.x1f4r.legioncontrol.agent.admit
+import com.x1f4r.legioncontrol.agent.afterPush
+import com.x1f4r.legioncontrol.agent.decide
+import com.x1f4r.legioncontrol.agent.gate
 import com.x1f4r.legioncontrol.agent.AttemptClassifier
 import com.x1f4r.legioncontrol.agent.AttemptReading
 import com.x1f4r.legioncontrol.agent.AttemptWalk
@@ -9,17 +22,39 @@ import com.x1f4r.legioncontrol.agent.CommandSafety
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.DispatchStage
 import com.x1f4r.legioncontrol.agent.FailureKind
+import com.x1f4r.legioncontrol.agent.OpRecord
+import com.x1f4r.legioncontrol.agent.OpSummary
+import com.x1f4r.legioncontrol.agent.Outcome
 import com.x1f4r.legioncontrol.agent.RemoteShell
 import com.x1f4r.legioncontrol.agent.buildRemoteCommand
 import com.x1f4r.legioncontrol.agent.grammarFor
+import com.x1f4r.legioncontrol.agent.HelperState
+import com.x1f4r.legioncontrol.agent.WakeHold
+import com.x1f4r.legioncontrol.agent.WakeStep
+import com.x1f4r.legioncontrol.agent.planWake
+import com.x1f4r.legioncontrol.agent.readinessSchedule
+import com.x1f4r.legioncontrol.agent.toMachine
 import com.x1f4r.legioncontrol.agent.statusBudget
+import com.x1f4r.legioncontrol.data.CanonicalSetup
+import com.x1f4r.legioncontrol.data.DocumentAcceptance
+import com.x1f4r.legioncontrol.data.DocumentProblem
+import com.x1f4r.legioncontrol.data.Intake
+import com.x1f4r.legioncontrol.data.JsonEquality
+import com.x1f4r.legioncontrol.data.LaunchTuple
+import com.x1f4r.legioncontrol.data.LaunchValues
+import com.x1f4r.legioncontrol.data.SetupMerge
+import com.x1f4r.legioncontrol.data.readControllerConfig
+import com.x1f4r.legioncontrol.net.LanPrefix
+import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.contract.VectorJson.boolean
 import com.x1f4r.legioncontrol.contract.VectorJson.long
 import com.x1f4r.legioncontrol.contract.VectorJson.string
 import com.x1f4r.legioncontrol.contract.VectorJson.strings
 import com.x1f4r.legioncontrol.contract.VectorJson.number
 import com.x1f4r.legioncontrol.contract.VectorJson.text
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -27,6 +62,7 @@ import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Base64
 
 /**
  * The shared conformance vectors, run through this app's own code.
@@ -44,26 +80,41 @@ class ContractVectorsTest {
     @Test
     fun `command lines, attempts, walks, budgets and addresses match the contract`() = runFamily("transport")
 
+    @Test
+    fun `launch values, their review and what runs match the contract`() = runFamily("launch")
+
+    @Test
+    fun `canonical bytes, hashes and refusals match the contract`() = runFamily("hash")
+
+    @Test
+    fun `which setup documents are accepted matches the contract`() = runFamily("setup-acceptance")
+
+    @Test
+    fun `deciding, admitting, gating and reading push replies match the contract`() = runFamily("setup-reconcile")
+
+    @Test
+    fun `merges, bases and number equality match the contract`() = runFamily("setup-merge")
+
+    @Test
+    fun `outcomes of replies, records and summaries match the contract`() = runFamily("outcome")
+
+    @Test
+    fun `prefixes, broadcasts, wake plans and readiness match the contract`() = runFamily("wake")
+
     /**
-     * Every adapter is for a group this client consumes, and every consumed family is either adapted
-     * in full or still listed as pending.
+     * Every adapter is for a group this client consumes, and every group it consumes has one: all
+     * nine families, with nothing left pending.
      */
     @Test
     fun `every consumed group has exactly one adapter`() {
         val consumed = VectorJson.consumedGroups()
         assertEquals("adapters for groups this client does not consume", emptySet<String>(), adapters.keys - consumed)
-
-        val families = consumed.map { it.substringBefore('/') }.toSet()
-        for (family in families) {
-            val groups = consumed.filter { it.startsWith("$family/") }.toSet()
-            val adapted = groups.filter { it in adapters }.toSet()
-            if (family in PENDING_FAMILIES) {
-                assertTrue("$family is adapted and still listed as pending", adapted.isEmpty())
-            } else {
-                assertEquals("$family groups without an adapter", emptySet<String>(), groups - adapted)
-            }
-        }
-        assertEquals("pending families the index does not list", emptySet<String>(), PENDING_FAMILIES - families)
+        assertEquals("groups without an adapter", emptySet<String>(), consumed - adapters.keys)
+        assertEquals(
+            "families this client consumes",
+            setOf("hash", "identifiers", "outcome", "transport", "setup-acceptance", "launch", "setup-reconcile", "setup-merge", "wake"),
+            consumed.map { it.substringBefore('/') }.toSet(),
+        )
     }
 
     private fun runFamily(family: String) {
@@ -97,6 +148,31 @@ class ContractVectorsTest {
         "identifiers/duration" to identifier(Contract::isDuration),
         "identifiers/clockTime" to identifier(Contract::isClockTime),
         "identifiers/sha256" to identifier(Contract::isSha256Hex),
+
+        // A key that is absent is absent from the reply, and the reducer reads it as null, exactly as
+        // it reads a null that is there.
+        "outcome/reduce" to { input ->
+            val outcome = Outcome.reduce(
+                outcome = input.string("outcome"),
+                state = input.string("state"),
+                ok = input.boolean("ok"),
+                action = input.string("action"),
+                reasonCode = input.string("reasonCode"),
+            )
+            buildJsonObject { put("outcome", outcome.wire) }
+        },
+
+        // Through the decoders a real record and a real summary go through, and the property every
+        // screen reads them by.
+        "outcome/records" to { input ->
+            val value = input["value"] as JsonObject
+            val outcome = when (input.string("kind")) {
+                "record" -> AgentJson.decodeFromJsonElement(OpRecord.serializer(), value).effectiveOutcome
+                "summary" -> AgentJson.decodeFromJsonElement(OpSummary.serializer(), value).effectiveOutcome
+                else -> throw AssertionError("an outcome record is a record or a summary, not ${input["kind"]}")
+            }
+            buildJsonObject { put("outcome", outcome.wire) }
+        },
 
         "transport/grammars" to { input ->
             val choice = grammarFor(
@@ -195,7 +271,296 @@ class ContractVectorsTest {
             val port = value?.takeIf { Regex("^-?[0-9]+$").matches(it) }?.toIntOrNull()
             buildJsonObject { put("valid", port != null && Addresses.isPort(port)) }
         },
+
+        // The record is the case's own when it gives one, and otherwise what a device seeds from the
+        // held document; restrictedRefused is the held document's own values, never the record's.
+        "launch/review" to { input ->
+            val heldText = input.string("heldText")
+            val held = heldText?.let { Json.parseToJsonElement(it) as JsonObject }
+            val record = (input["approvals"] as? JsonObject)
+                ?: held?.let { LaunchValues.approvalsFrom(it, seededFrom = CanonicalSetup.hashOf(heldText)) }
+                ?: LaunchValues.EMPTY_RECORD
+            val offered = LaunchValues.projection(Json.parseToJsonElement(input.string("offeredText")!!) as JsonObject)
+            buildJsonObject {
+                put(
+                    "review",
+                    JsonArray(
+                        LaunchValues.review(record, offered).map { entry ->
+                            buildJsonObject {
+                                put("path", entry.path)
+                                put("scope", entry.scope.wire)
+                                put("kind", entry.kind)
+                                put("approvable", entry.approvable)
+                            }
+                        },
+                    ),
+                )
+                put(
+                    "effective",
+                    JsonArray(
+                        LaunchValues.effective(record, offered).map { entry ->
+                            buildJsonObject {
+                                put("path", entry.path)
+                                put("scope", entry.scope.wire)
+                                put("state", entry.state.wire)
+                                put("agent", entry.tuple?.agent?.let { JsonArray(it.map(::JsonPrimitive)) } ?: JsonNull)
+                                put("grammar", text(entry.tuple?.grammar))
+                                put("text", text(entry.text))
+                            }
+                        },
+                    ),
+                )
+                put("restrictedRefused", held != null && LaunchValues.review(LaunchValues.approvalsFrom(held), offered).isNotEmpty())
+            }
+        },
+
+        "launch/migration" to { input ->
+            buildJsonObject {
+                put("migration", LaunchValues.isLauncherMigration(LaunchTuple.from(input["approved"]), LaunchTuple.from(input["offered"])))
+            }
+        },
+
+        // A vector of the flat layout is its own input.
+        "hash/vectors" to { input ->
+            val bytes = Base64.getDecoder().decode(input.string("inputBase64")!!)
+            val valid = CanonicalSetup.canonicalTextOrNull(bytes) != null
+            val reject = CanonicalSetup.rejectionOf(bytes)
+            buildJsonObject {
+                put("canonicalBase64", text(if (valid) Base64.getEncoder().encodeToString(CanonicalSetup.canonicalBytes(bytes)) else null))
+                put("sha256", text(if (valid) CanonicalSetup.hashOf(bytes) else null))
+                put("accepted", reject == null)
+                put("reject", text(reject))
+            }
+        },
+
+        "setup-acceptance/documents" to { input ->
+            val intake = Intake.entries.single { it.wire == input.string("intake") }
+            val verdict = DocumentAcceptance.check(input.string("text")!!, intake)
+            buildJsonObject {
+                put("valid", verdict.valid)
+                put("errors", codes(verdict.errors))
+                put("warnings", codes(verdict.warnings))
+                put("assignsIdentity", verdict.assignsIdentity)
+                put("keep", verdict.keep)
+            }
+        },
+
+        "setup-reconcile/decide" to { input ->
+            val local = input["local"] as? JsonObject
+            val status = input["status"] as? JsonObject
+            val mark = status?.get("controller") as? JsonObject
+            val decided = decide(
+                head = local?.let { SetupHead(it.string("hash")!!, it.string("id"), it.strings("lineage")) },
+                contract = status?.long("contract")?.toInt(),
+                mark = mark?.let { ControllerMark(hash = it.string("hash"), id = it.string("id")) },
+                metaByHash = (input["metaByHash"] as JsonObject).mapValues { (_, meta) ->
+                    meta as JsonObject
+                    SetupMeta(meta.string("id"), meta.strings("lineage"))
+                },
+            )
+            buildJsonObject {
+                put("decision", decided.decision.wire)
+                put("reason", text(decided.reason))
+                put("expect", text(decided.expect))
+            }
+        },
+
+        "setup-reconcile/admit" to { input ->
+            val expected = input["expected"] as JsonObject
+            val fetched = input["fetched"] as JsonObject
+            val admission = admit(
+                SetupExpectation(expected.string("localHash")!!, expected.string("localId")!!, expected.string("remoteHash")!!),
+                input.string("currentLocalHash"),
+                SetupFetched(fetched.string("hash")!!, fetched.string("replyHash")!!, fetched.string("id"), fetched.strings("lineage")),
+                input.boolean("accepted")!!,
+            )
+            buildJsonObject { put("admission", admission.wire) }
+        },
+
+        "setup-reconcile/gate" to { input ->
+            val given = input["state"] as JsonObject
+            val state = SetupPeerState().apply {
+                inFlight = given.boolean("inFlight")!!
+                (given["failedAt"] as JsonObject).forEach { (hash, at) -> failedAt[hash] = (at as JsonPrimitive).content.toLong() }
+                (given["held"] as JsonObject).forEach { (hash, code) -> held[hash] = (code as JsonPrimitive).content }
+                localInvalid = given.boolean("localInvalid")!!
+                localMutation = given.boolean("localMutation")!!
+                runningOperations = given.long("runningOperations")!!.toInt()
+                lockedAt = given.long("lockedAt")
+                statusAt = given.long("statusAt")
+                settled += given.strings("settled")
+            }
+            val gated = gate(
+                SetupDecision.entries.single { it.wire == input.string("decision") },
+                input.string("localHash")!!,
+                input.string("remoteHash"),
+                input.string("agentVersion"),
+                input.long("now")!!,
+                state,
+            )
+            buildJsonObject {
+                put("action", gated.action.wire)
+                put("reason", text(gated.reason))
+            }
+        },
+
+        // The reply is read by the same decoder a real `config set` reply goes through.
+        "setup-reconcile/pushReply" to { input ->
+            val reply = (input["reply"] as? JsonObject)?.let { AgentJson.decodeFromJsonElement(ConfigSetReply.serializer(), it) }
+            val effect = afterPush(reply, input.string("localHash")!!)
+            buildJsonObject {
+                put("effect", effect.effect.wire)
+                put("metaHash", text(effect.metaHash))
+            }
+        },
+
+        "setup-merge/merges" to { input ->
+            val writer = input["writer"] as JsonObject
+            val choices = (input["choices"] as JsonObject).mapValues { (_, side) ->
+                if ((side as JsonPrimitive).content == "mine") SetupMerge.Choice.MINE else SetupMerge.Choice.THEIRS
+            }
+            val outcome = SetupMerge.merge(
+                baseText = input.string("baseText"),
+                mineText = input.string("mineText")!!,
+                theirsText = input.string("theirsText")!!,
+                mineHash = input.string("mineHash")!!,
+                theirsHash = input.string("theirsHash")!!,
+                writer = SetupMerge.Writer(writer.string("source")!!, writer.string("device")!!, writer.string("now")!!),
+                choices = choices,
+            )
+            buildJsonObject {
+                put(
+                    "differences",
+                    JsonArray(
+                        outcome.differences.map { difference ->
+                            buildJsonObject {
+                                put("entry", difference.entry)
+                                put("kind", difference.kind.wire)
+                            }
+                        },
+                    ),
+                )
+                put("resultText", text(outcome.resultText))
+                put("error", text(outcome.error))
+            }
+        },
+
+        "setup-merge/bases" to { input ->
+            val kept = (input["kept"] as JsonObject).mapValues { (_, text) -> (text as JsonPrimitive).content }
+            val base = SetupMerge.commonBase(
+                input.string("mineHash"),
+                input.string("theirsHash"),
+                input.strings("mineLineage"),
+                input.strings("theirsLineage"),
+                kept::get,
+            )
+            buildJsonObject { put("base", text(base)) }
+        },
+
+        "setup-merge/numbers" to { input ->
+            buildJsonObject { put("equal", JsonEquality.sameNumber(input.string("a")!!, input.string("b")!!)) }
+        },
+
+        // Through the matcher every placement uses: a prefix that does not parse contains nothing.
+        "wake/prefixes" to { input ->
+            val prefix = LanPrefix.parse(input.string("prefix"))
+            buildJsonObject {
+                put("valid", prefix != null)
+                put(
+                    "contains",
+                    JsonArray(
+                        input.strings("addresses").map { text ->
+                            val address = LanPrefix.parseIPv4(text)
+                            JsonPrimitive(prefix != null && address != null && prefix.contains(address))
+                        },
+                    ),
+                )
+            }
+        },
+
+        "wake/broadcasts" to { input ->
+            buildJsonObject { put("valid", LanPrefix.parseIPv4(input.string("text")) != null) }
+        },
+
+        // The document goes through the reader every document goes through, and its machines through
+        // the model this app wakes them from.
+        "wake/plans" to { input ->
+            val config = readControllerConfig(input.string("documentText")!!).getOrThrow()
+            val machines = config.machines.map { it.toMachine() }
+            val here = input["here"] as JsonObject
+            val helpers = (input["helpers"] as JsonObject).mapValues { (_, read) ->
+                read as JsonObject
+                HelperState(
+                    HelperState.Kind.entries.single { it.wire == read.string("state") },
+                    (read["actions"] as? JsonObject)?.mapValues { (_, kind) -> (kind as JsonPrimitive).content },
+                )
+            }
+            val holds = (input["holds"] as JsonArray).map { it as JsonObject }.map { WakeHold(it.string("helper")!!, it.string("action")!!) }
+            val plan = planWake(
+                target = machines.single { it.id == input.string("target") },
+                machines = machines,
+                sites = config.sites,
+                addresses = here.strings("addresses").mapNotNull(LocalAddress::parse),
+                currentSite = here.string("currentSite"),
+                helpers = helpers,
+                holds = holds,
+            )
+            buildJsonObject {
+                put("matching", JsonArray(plan.matching.map(::JsonPrimitive)))
+                put("effective", text(plan.effective))
+                put("steps", JsonArray(plan.steps.map(::step)))
+                put(
+                    "skipped",
+                    JsonArray(
+                        plan.skipped.map { skip ->
+                            buildJsonObject {
+                                put("kind", skip.kind.wire)
+                                put("machine", text(skip.machine))
+                                put("action", text(skip.action))
+                                put("reason", skip.reason.wire)
+                            }
+                        },
+                    ),
+                )
+                put("offerWakeFirst", JsonArray(plan.offerWakeFirst.map(::JsonPrimitive)))
+            }
+        },
+
+        "wake/readiness" to { input ->
+            buildJsonObject {
+                put("pollStartsMs", JsonArray(readinessSchedule(input.boolean("sentAnything")!!).map(::JsonPrimitive)))
+            }
+        },
     )
+
+    /** A step as the plans group writes one: every key present, null where it does not apply. */
+    private fun step(step: WakeStep): JsonObject = buildJsonObject {
+        when (step) {
+            is WakeStep.Direct -> {
+                put("kind", "direct")
+                put("machine", JsonNull)
+                put("action", JsonNull)
+                put("readFirst", JsonNull)
+                put("broadcast", JsonArray(step.broadcast.map(::JsonPrimitive)))
+                put("ports", JsonArray(step.ports.map(::JsonPrimitive)))
+                put("repeats", step.repeats)
+            }
+
+            is WakeStep.Helper -> {
+                put("kind", "helper")
+                put("machine", step.machine)
+                put("action", step.action)
+                put("readFirst", step.readFirst)
+                put("broadcast", JsonNull)
+                put("ports", JsonNull)
+                put("repeats", JsonNull)
+            }
+        }
+    }
+
+    /** The codes of [problems], each once, sorted, as the acceptance vectors list them. */
+    private fun codes(problems: List<DocumentProblem>): JsonArray =
+        JsonArray(problems.map { it.code }.distinct().sorted().map(::JsonPrimitive))
 
     private fun identifier(check: (String?) -> Boolean): (JsonObject) -> JsonObject = { input ->
         buildJsonObject { put("valid", check(input.string("value"))) }
@@ -208,16 +573,4 @@ class ContractVectorsTest {
         put("routeLevel", reading.routeLevel)
     }
 
-    private companion object {
-        /**
-         * Families this client consumes whose adapters arrive with the work that implements them.
-         *
-         * A debt, listed so it cannot be forgotten: the accounting test fails when a family here is
-         * adapted, or when the index stops listing it, and the list is empty once the Android port
-         * of every reference has landed.
-         */
-        val PENDING_FAMILIES = setOf(
-            "hash", "outcome", "setup-acceptance", "launch", "setup-reconcile", "setup-merge", "wake",
-        )
-    }
 }

@@ -131,6 +131,7 @@ class AgentBundle private constructor(
                 file = file,
                 sha256 = artifact.sha256.lowercase(),
                 size = artifact.size.takeIf { it > 0 } ?: bytes.size.toLong(),
+                version = agentVersion,
             )
             Result.success(AgentBundle(signed, verified, agentVersion))
         }
@@ -153,6 +154,8 @@ data class SignedTarball(
     /** Lowercase hex, as the install script compares it. */
     val sha256: String,
     val size: Long,
+    /** The agent version its signed manifest names, which decides whether it would be a downgrade. */
+    val version: String? = null,
 )
 
 /**
@@ -198,8 +201,11 @@ sealed interface AgentDeploymentPath {
             abilities: AgentAbilities,
             lastStatus: AgentStatus?,
             system: MachineSystem?,
+            /** The version of the signed bundle that would be sent, when it is known. */
+            bundled: String? = null,
         ): AgentDeploymentPath {
             if (lastStatus?.ok != true) return Unavailable(READ_STATUS_FIRST)
+            downgradeFrom(bundled, lastStatus)?.let { return Unavailable(it) }
             if ((abilities.contract ?: 0) >= Contract.REQUIRED) return Stdin
             if (!AgentBootstrap.isAuthenticatedLegacy(lastStatus)) {
                 return Unavailable(
@@ -219,5 +225,41 @@ sealed interface AgentDeploymentPath {
                 ?: return Unavailable("The installation base cannot be derived from this command.")
             return UploadAndInstall(system, layout)
         }
+
+        /**
+         * Why installing [bundled] would take the machine backwards, or null (contract section 13,
+         * "Version floor").
+         *
+         * Never offered below the version the machine runs, and never below the floor its agent
+         * reports, which the agent would refuse anyway. A downgrade is only ever a deliberate
+         * `--allow-downgrade` from an explicit confirmation on an agent that reports a floor, and
+         * this app offers none: it installs the agent it carries forwards or not at all. A version
+         * that does not read as three numbers decides nothing either way.
+         */
+        internal fun downgradeFrom(bundled: String?, status: AgentStatus): String? {
+            val carried = parseVersion(bundled) ?: return null
+            val running = status.version
+            if (parseVersion(running)?.let { compareVersions(carried, it) < 0 } == true) {
+                return "This machine runs control agent $running, newer than the $bundled this app " +
+                    "carries, so nothing older is installed over it."
+            }
+            val floor = status.agent?.floor
+            if (parseVersion(floor)?.let { compareVersions(carried, it) < 0 } == true) {
+                return "The agent on this machine will not go below version $floor, and this app " +
+                    "carries $bundled."
+            }
+            return null
+        }
+
+        /** `X.Y.Z` as three numbers, compared numerically as the agent compares them, or null. */
+        private fun parseVersion(text: String?): List<Long>? {
+            val match = text?.let { VERSION.find(it) } ?: return null
+            return match.groupValues.drop(1).map { it.toLongOrNull() ?: return null }
+        }
+
+        private fun compareVersions(a: List<Long>, b: List<Long>): Int =
+            a.zip(b).firstOrNull { (x, y) -> x != y }?.let { (x, y) -> x.compareTo(y) } ?: 0
+
+        private val VERSION = Regex("^([0-9]+)\\.([0-9]+)\\.([0-9]+)")
     }
 }

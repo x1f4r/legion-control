@@ -37,6 +37,17 @@ data class OperationIntent(
     val whenIdle: Boolean = false,
     /** The `DUR` form, e.g. `4h`. Only meaningful with [whenIdle]. */
     val expires: String? = null,
+    /**
+     * Whether these fields are the whole request, so that "Try again" can send it once more, exactly,
+     * under a new id. Set by the update, restart, boot, sleep and action buttons and by nothing else.
+     *
+     * False by default, because a wrong true sends a change nobody asked for and a wrong false only
+     * costs a button. A write of the update policy is recorded as an update ([policyWrite]) and keeps
+     * no patch, so rebuilding one would stop and reinstall a service instead; a wake helper's action
+     * would run without the hold the wake walk keeps; and an intent written before this field was,
+     * by a build that recorded policy writes the same way, cannot be told apart from an update.
+     */
+    val repeatable: Boolean = false,
 ) {
     /** What this operation is about, for a heading. */
     val subject: String?
@@ -51,6 +62,16 @@ data class OperationIntent(
             force -> OpMode.FORCE
             else -> OpMode.MANUAL
         }
+
+    companion object {
+        /**
+         * A write of the update schedule, pause or policy for [service], or for the machine when null.
+         *
+         * Recorded under [OpKind.UPDATE], which is what it governs, and never [repeatable]: the switch,
+         * the pause or the patch it sent is not kept here, and the fields that are describe an update.
+         */
+        fun policyWrite(service: String?) = OperationIntent(kind = OpKind.UPDATE, service = service)
+    }
 }
 
 /**
@@ -73,7 +94,14 @@ enum class TrackedState {
     /** The agent accepted it to run at the next idle moment. */
     QUEUED,
 
-    /** The agent held it back and the user is being asked whether to insist. */
+    /**
+     * The agent held it back, by design, and the user is being asked whether to insist.
+     *
+     * Over, as far as following it goes: a deferred change is finished on the agent and reading it
+     * again only reads the same refusal, which is how this app used to ask a machine the same
+     * question in a tight loop for half an hour. Insisting, or asking again later, is a new request
+     * with a new id.
+     */
     AWAITING_DECISION,
 
     /**
@@ -89,7 +117,8 @@ enum class TrackedState {
     FINISHED,
     ;
 
-    val isOver: Boolean get() = this == FINISHED
+    /** Whether there is nothing left to follow: the agent is done with it, one way or another. */
+    val isOver: Boolean get() = this == FINISHED || this == AWAITING_DECISION
 
     val isPending: Boolean get() = !isOver
 }
@@ -144,11 +173,33 @@ data class OperationRecord(
     val expiresAt: Long? = null,
     /** Whether the agent said it checked that the thing it set out to do actually happened. */
     val verified: Boolean? = null,
-    /** True only when sending this again cannot do it twice. */
+    /**
+     * True when asking for it again is safe: nothing reached the machine, or the agent finished it in
+     * a way that leaves nothing done twice by a second request. A second request always has an id of
+     * its own (contract section 5.6), so a stored refusal is never replayed back at it. Whether it is
+     * offered also depends on the intent being the whole request; see [canTryAgain].
+     */
     val retryable: Boolean = false,
     /** True when the agent accepted `--op` and can therefore be asked what happened. */
     val trackable: Boolean = false,
     val log: List<OperationLogLine> = emptyList(),
+    /**
+     * How it stands by contract section 5.6, from the last reply or record the agent gave, or from
+     * what was seen here. Null until there is anything to go on, and on a record written by a build
+     * that predates outcomes.
+     */
+    val outcome: Outcome? = null,
+    /**
+     * The machine this helper action was run to wake, for an action the helper does not declare
+     * `wol` (contract section 10.2). While such a record is unresolved it is a wake hold: no other
+     * command helper is run for that machine, so an ambiguous script never runs on two helpers.
+     */
+    val wakeTarget: String? = null,
+    /**
+     * Set when the hold was released without the record being resolved: the target answered, or a
+     * person chose to try the other helpers. The record is still followed; it just holds nothing.
+     */
+    val wakeReleased: Boolean = false,
 ) {
     val isOver: Boolean get() = state.isOver
     val isPending: Boolean get() = state.isPending
@@ -157,6 +208,12 @@ data class OperationRecord(
 
     val opAction: OpAction? get() = OpAction.fromWire(action)
     val reason: ReasonCode? get() = ReasonCode.fromWire(reasonCode)
+
+    /**
+     * Whether this is a wake hold on [wakeTarget]: a non-`wol` helper action whose record has not
+     * been read finished, and that nobody has released. It is never released by time.
+     */
+    val holdsWake: Boolean get() = wakeTarget != null && !isOver && !wakeReleased
 
     /** The reason in words: the known sentence, or the agent's own code opened out. */
     val reasonSentence: String? get() = ReasonCode.describe(reasonCode)
@@ -173,16 +230,36 @@ data class OperationRecord(
     /** Whether it can still be withdrawn. */
     val isCancellable: Boolean get() = state == TrackedState.QUEUED
 
-    /** Whether it ended well. Null while it is not over, and while the outcome is not known. */
+    /**
+     * Whether "Try again" is drawn: exactly when [retryRequest] has a request to send to an agent that
+     * lists its services. Whether it can be pressed is the same question asked of the machine's last
+     * reading, which the screen asks with the same function, so the button and the press behind it
+     * can never disagree.
+     */
+    val canTryAgain: Boolean get() = retryRequest(detach = false, services = ServiceNaming.BY_NAME) != null
+
+    /**
+     * Whether it ended well. Null while it is not over, while the outcome is not known, and for a
+     * change the agent held back, which neither worked nor failed.
+     */
     val succeeded: Boolean?
-        get() = when (state) {
-            TrackedState.FINISHED -> opAction?.isSuccess ?: (reasonCode == null)
-            else -> null
+        get() {
+            if (state != TrackedState.FINISHED) return null
+            return when (outcome) {
+                Outcome.SUCCEEDED -> true
+                Outcome.FAILED -> false
+                // Written by a build that predates outcomes, which read it off the action.
+                null -> opAction?.isSuccess ?: (reasonCode == null)
+                else -> null
+            }
         }
 
-    /** Whether it ended in a way worth telling the user about when they were not looking. */
+    /**
+     * Whether it ended in a way worth telling the user about when they were not looking. A change
+     * held back for a decision is not: the question is on screen, and it was never one before.
+     */
     val isNoteworthyEnding: Boolean
-        get() = isOver && opAction != OpAction.NOOP
+        get() = state == TrackedState.FINISHED && opAction != OpAction.NOOP
 
     /** Progress as a fraction, when the agent counted steps. */
     val progressFraction: Float?
@@ -191,6 +268,110 @@ data class OperationRecord(
             val total = progressOf?.takeIf { it > 0 } ?: return null
             return (step.toFloat() / total.toFloat()).coerceIn(0f, 1f)
         }
+}
+
+/** A second request for a change that is over, as "Try again" sends it under a new id. */
+sealed interface RetryRequest {
+    data class Update(val request: UpdateRequest) : RetryRequest
+    data class Restart(val service: String?, val request: InterruptRequest) : RetryRequest
+    data class Boot(val target: String, val request: InterruptRequest) : RetryRequest
+    data class Sleep(val request: InterruptRequest) : RetryRequest
+    data class Run(val actionId: String, val request: InterruptRequest) : RetryRequest
+}
+
+/**
+ * How a machine's agent is told which service an update or restart is for, by its last reading.
+ *
+ * Three answers and not two, because sending no `--service` means two different things. To the first
+ * agent, which lists no services and drives exactly one, it is the only way to name that one. To
+ * every later agent it means the first service in its configuration, which is another service
+ * whenever the change was for any other. So nothing that names a service is rebuilt until the
+ * machine has answered and said which of the two it is.
+ */
+enum class ServiceNaming {
+    /** The reading listed the services, so the agent takes `--service` and is always given one. */
+    BY_NAME,
+
+    /** The reading listed none: the first agent, which drives one service and takes no `--service`. */
+    NOT_TAKEN,
+
+    /**
+     * No reading to go on: none yet, the last one failed, or the agent answered `ok:false`, which
+     * is a refusal and not an account of what it runs, and usually lists no services at all.
+     */
+    UNKNOWN,
+    ;
+
+    companion object {
+        /** What [status] says, read as [AgentStatus.reportsServices] decides `--service` for the buttons. */
+        fun of(status: AgentStatus?): ServiceNaming =
+            when (status?.takeIf { it.ok != false }?.reportsServices) {
+                true -> BY_NAME
+                false -> NOT_TAKEN
+                null -> UNKNOWN
+            }
+    }
+}
+
+/**
+ * What "Try again" sends for this change, or null when it offers nothing (contract section 5.6).
+ *
+ * Only for a change that is over, ended without anything a second request could double, and whose
+ * intent is the whole request: an update, a restart, a boot, a sleep or an action, rebuilt with the
+ * same force and queueing it was first asked for with, and naming the subject it named. A cycle, an
+ * agent install, a policy write and anything written down without [OperationIntent.repeatable] are
+ * never rebuilt here, because the fields kept for them would send something else. [detach] and
+ * [services] are what the machine's agent takes now, as its last reading says. An update or a restart
+ * goes without `--service` only to an agent that takes none, and is not rebuilt at all while nobody
+ * knows which kind of agent it is, because to every other agent that is the first service.
+ */
+fun OperationRecord.retryRequest(
+    detach: Boolean,
+    services: ServiceNaming = ServiceNaming.BY_NAME,
+): RetryRequest? {
+    if (!isOver || !retryable || !intent.repeatable) return null
+    val force = intent.force
+    val whenIdle = intent.whenIdle
+    val expires = intent.expires
+    return when (intent.kind) {
+        OpKind.UPDATE -> intent.serviceArgument(services)?.let { service ->
+            RetryRequest.Update(UpdateRequest(service.id, force, whenIdle, expires, detach))
+        }
+
+        OpKind.RESTART -> intent.serviceArgument(services)?.let { service ->
+            RetryRequest.Restart(service.id, InterruptRequest(force, whenIdle, expires, detach))
+        }
+
+        // The contract gives a boot and a sleep no `--detach`, so neither is ever sent with one.
+        OpKind.BOOT -> intent.target?.takeIf { it.isNotBlank() }?.let { target ->
+            RetryRequest.Boot(target, InterruptRequest(force, whenIdle, expires))
+        }
+
+        OpKind.SLEEP -> RetryRequest.Sleep(InterruptRequest(force, whenIdle, expires))
+
+        OpKind.RUN -> intent.actionId?.takeIf { it.isNotBlank() }?.let { action ->
+            RetryRequest.Run(action, InterruptRequest(force, whenIdle, expires, detach))
+        }
+
+        OpKind.CYCLE, OpKind.SELF_UPDATE -> null
+    }
+}
+
+/** The `--service` a second update or restart carries: [id], or none to an agent that takes none. */
+private class ServiceArgument(val id: String?)
+
+/**
+ * The service this intent named, as [services] says the agent is to be told it, or null when it
+ * cannot be told it. An id the command line cannot carry is not dropped in its place, as the buttons
+ * drop it, because to an agent that takes `--service` a request without one is the first service.
+ */
+private fun OperationIntent.serviceArgument(services: ServiceNaming): ServiceArgument? {
+    val named = service?.takeIf { it.isNotBlank() } ?: return null
+    return when (services) {
+        ServiceNaming.BY_NAME -> named.takeIf { Contract.isToken(it) }?.let { ServiceArgument(it) }
+        ServiceNaming.NOT_TAKEN -> ServiceArgument(null)
+        ServiceNaming.UNKNOWN -> null
+    }
 }
 
 /** Everything that can move an operation along. */
@@ -205,6 +386,16 @@ sealed interface OperationEvent {
 
     /** A record read back with `op ID`, whether or not this phone was listening when it ran. */
     data class Observed(val record: OpRecord, override val at: Long) : OperationEvent
+
+    /**
+     * `op ID` answered that the machine has no such operation: `op: null`, under `not-configured`
+     * or, from a 3.0.x agent, `bad-argument`. `cancel ID` says the same with `not-configured`.
+     *
+     * For a change the agent was never heard from about, that settles it: the agent writes the record
+     * before it acts, so the request never arrived. For one the agent had already answered about, the
+     * record has been pruned since, and what became of it is not known.
+     */
+    data class NotRecorded(override val at: Long) : OperationEvent
 
     /**
      * The transport gave up. [stage] decides whether this can be sent again.
@@ -272,10 +463,33 @@ fun OperationRecord.reduce(event: OperationEvent): OperationRecord {
 
         is OperationEvent.Observed -> applyRecord(event.record, event.at)
 
+        is OperationEvent.NotRecorded -> if (!answered) {
+            copy(
+                state = TrackedState.FINISHED,
+                action = action ?: OpAction.FAILED.wire,
+                outcome = Outcome.FAILED,
+                summary = "${kind.label} on $subjectName never reached $machineName: it has no " +
+                    "record of it.",
+                updatedAt = event.at,
+                // It never arrived, so asking for it again cannot do it twice.
+                retryable = true,
+            ).logged(event.at, "$machineName has no record of this operation.", isError = true)
+        } else {
+            copy(
+                state = TrackedState.FINISHED,
+                outcome = Outcome.UNKNOWN,
+                summary = "$machineName no longer has a record of ${kind.label.lowercase()} on " +
+                    "$subjectName, so how it ended is not known.",
+                updatedAt = event.at,
+                retryable = false,
+            ).logged(event.at, "$machineName has no record of this operation any more.", isError = true)
+        }
+
         is OperationEvent.TransportFailed -> when (event.stage) {
             DispatchStage.NOT_STARTED -> copy(
                 state = TrackedState.FINISHED,
                 action = OpAction.FAILED.wire,
+                outcome = Outcome.FAILED,
                 summary = event.summary,
                 detail = event.detail,
                 updatedAt = event.at,
@@ -290,15 +504,16 @@ fun OperationRecord.reduce(event: OperationEvent): OperationRecord {
                 summary = unknownSentence(),
                 detail = event.detail,
                 updatedAt = event.at,
-                // The one thing this whole file exists to prevent, unless the agent kept the record,
-                // in which case sending the same id again is a read and not a repeat.
-                retryable = trackable,
+                // The one thing this whole file exists to prevent. An agent that kept the record is
+                // asked about it by its id, which is a read; nothing is ever sent a second time.
+                retryable = false,
             ).logged(event.at, event.summary, isError = true)
         }
 
         is OperationEvent.Resolved -> copy(
             state = TrackedState.FINISHED,
             action = event.action.wire,
+            outcome = Outcome.SUCCEEDED,
             summary = event.summary,
             detail = event.detail ?: detail,
             updatedAt = event.at,
@@ -309,15 +524,16 @@ fun OperationRecord.reduce(event: OperationEvent): OperationRecord {
             state = TrackedState.OUTCOME_UNKNOWN,
             summary = event.summary,
             updatedAt = event.at,
-            // Still not retryable unless the agent keeps records. Giving up on finding out is not
-            // the same as finding out it did not happen.
-            retryable = trackable,
+            // Still not offered again. Giving up on finding out is not the same as finding out it
+            // did not happen.
+            retryable = false,
         ).logged(event.at, event.summary, isError = true)
 
         is OperationEvent.Expired -> copy(
             state = TrackedState.FINISHED,
             action = OpAction.EXPIRED.wire,
             reasonCode = ReasonCode.EXPIRED.wire,
+            outcome = Outcome.DEFERRED,
             summary = "${kind.label} on $subjectName waited for an idle moment and gave up.",
             updatedAt = event.at,
             retryable = true,
@@ -326,6 +542,24 @@ fun OperationRecord.reduce(event: OperationEvent): OperationRecord {
         is OperationEvent.Note -> logged(event.at, event.text, event.isError)
     }
 }
+
+/**
+ * Whether the agent has ever answered about this change, with a reply or with a record read back.
+ *
+ * Read off what only an answer leaves behind: an outcome, being queued or running, a phase, progress
+ * or an action. Never off [OperationRecord.outcome] alone, which a build before outcomes did not write,
+ * so a change such a build saw running would otherwise be taken for one that never arrived and be
+ * offered again. A change with none of these was only ever sent, or lost on the way.
+ */
+private val OperationRecord.answered: Boolean
+    get() = outcome != null ||
+        state == TrackedState.RUNNING ||
+        state == TrackedState.QUEUED ||
+        phase != null ||
+        progressNote != null ||
+        progressStep != null ||
+        progressOf != null ||
+        action != null
 
 private fun OperationRecord.unknownSentence(): String =
     if (trackable) {
@@ -382,26 +616,30 @@ private fun OperationRecord.applyRecord(record: OpRecord, at: Long): OperationRe
         expiresAt = parseInstantMillis(record.expiresAt) ?: expiresAt,
     ).appendLog(record, at)
 
+    val outcome = record.effectiveOutcome
+    if (outcome.isTerminal) return base.settle(outcome, at)
+
+    // Pending: the agent still owns it, and it is followed with `op ID --wait` until it is not. A
+    // finished record never reduces to pending from an agent that states outcomes; one from an older
+    // agent that ended on `rebooting` or `sleeping` has nothing more to say when read again, so it
+    // waits for the machine to be seen instead.
     return when (record.opState) {
         OpState.QUEUED -> base.copy(
             state = TrackedState.QUEUED,
+            outcome = outcome,
             summary = queuedSentence(base.expiresAt),
             retryable = false,
         )
 
-        OpState.RUNNING -> base.copy(
-            state = TrackedState.RUNNING,
-            summary = runningSentence(record),
-            retryable = false,
-        )
+        OpState.FINISHED -> base.copy(outcome = outcome).unsettled()
 
-        OpState.FINISHED -> base.finish(at)
-
-        // A record with no state this build recognises. Treated as still running rather than as an
-        // ending: an unrecognised value must never become a verdict.
-        null -> base.copy(
-            state = if (state == TrackedState.FINISHED) state else TrackedState.RUNNING,
-            summary = runningSentence(record),
+        // Running, or a state this build does not know, which the reducer has already called pending
+        // only because the agent said so. A record never reopens a change that is already over.
+        else -> base.copy(
+            state = if (isOver) state else TrackedState.RUNNING,
+            outcome = if (isOver) this.outcome else outcome,
+            summary = if (isOver) summary else runningSentence(record),
+            retryable = if (isOver) retryable else false,
         )
     }
 }
@@ -420,80 +658,107 @@ private fun OperationRecord.appendLog(record: OpRecord, at: Long): OperationReco
 }
 
 /**
- * A finished record, turned into the sentence the user reads.
+ * A change the agent was told about and has not been seen to finish: a 2.x `rebooting` or
+ * `sleeping`, which keeps no record to read, or a record that ended on one.
  *
- * The two cases worth the care are `noop` and the boot/sleep pair. A no-op says why, from the
- * reasonCode, and never gets the words "already up to date" put in its mouth. A `rebooting` or
- * `sleeping` result is not an ending at all, whatever `state` says, because the machine was told and
- * being told is not having done it.
+ * Being told is not having done it, so this is not an ending. It waits for the machine to be seen in
+ * the state that was asked for, and nothing sends it again.
  */
-private fun OperationRecord.finish(at: Long): OperationRecord {
-    val settledAction = opAction
-    if (settledAction != null && !settledAction.isSettled) {
-        return copy(
-            state = TrackedState.OUTCOME_UNKNOWN,
-            summary = when (settledAction) {
-                OpAction.REBOOTING -> "$machineName was told to reboot into $subjectName. " +
-                    "Waiting to see it come back as $subjectName."
+private fun OperationRecord.unsettled(): OperationRecord = copy(
+    state = TrackedState.OUTCOME_UNKNOWN,
+    summary = when (opAction) {
+        OpAction.REBOOTING -> "$machineName was told to reboot into $subjectName. " +
+            "Waiting to see it come back as $subjectName."
 
-                OpAction.SLEEPING -> "$machineName was told to sleep. Waiting to see it stop answering."
-                OpAction.QUEUED -> queuedSentence(expiresAt)
-                else -> unknownSentence()
-            },
-            retryable = false,
-        )
-    }
+        OpAction.SLEEPING -> "$machineName was told to sleep. Waiting to see it stop answering."
+        OpAction.QUEUED -> queuedSentence(expiresAt)
+        else -> unknownSentence()
+    },
+    retryable = false,
+)
 
-    return when (settledAction) {
-        OpAction.DEFERRED -> copy(
-            state = TrackedState.AWAITING_DECISION,
-            summary = "${kind.label} on $subjectName was held back: ${whyNot()}.",
-            retryable = false,
-        )
+/**
+ * A terminal outcome (contract section 5.6), turned into a state and the sentence the user reads.
+ *
+ * The outcome decides the state and whether a second request is offered; the action only decides the
+ * words. A no-op says why, from the reasonCode, and never gets the words "already up to date" put in
+ * its mouth. A change the agent held back is over: insisting, or asking later, is a new request with
+ * a new id, and only a busy refusal asks first whether to force it. An outcome nobody knows is never
+ * offered again, because the first request may well have done it.
+ */
+private fun OperationRecord.settle(outcome: Outcome, at: Long): OperationRecord {
+    val ending = opAction
+    val settled = when (outcome) {
+        Outcome.PENDING -> return unsettled()
 
-        OpAction.NOOP -> copy(
-            state = TrackedState.FINISHED,
-            summary = "${kind.label} on $subjectName changed nothing: ${whyNot()}.",
-            retryable = true,
-        )
+        Outcome.SUCCEEDED -> when (ending) {
+            // What was asked for already holds, so asking again would only be told so again.
+            OpAction.NOOP -> copy(
+                state = TrackedState.FINISHED,
+                summary = "${kind.label} on $subjectName changed nothing: ${whyNot()}.",
+                retryable = false,
+            )
 
-        OpAction.CONFLICT -> copy(
-            state = TrackedState.FINISHED,
-            summary = "${kind.label} on $subjectName could not start: ${whyNot()}.",
-            retryable = true,
-        )
+            OpAction.CANCELLED -> copy(
+                state = TrackedState.FINISHED,
+                summary = "${kind.label} on $subjectName was cancelled before it ran.",
+                retryable = true,
+            )
 
-        OpAction.CANCELLED -> copy(
-            state = TrackedState.FINISHED,
-            summary = "${kind.label} on $subjectName was cancelled before it ran.",
-            retryable = true,
-        )
+            else -> copy(
+                state = TrackedState.FINISHED,
+                summary = successSentence(),
+                retryable = false,
+            )
+        }
 
-        OpAction.EXPIRED -> copy(
-            state = TrackedState.FINISHED,
-            summary = "${kind.label} on $subjectName waited for an idle moment and gave up.",
-            retryable = true,
-        )
+        Outcome.DEFERRED -> when (ending) {
+            OpAction.DEFERRED -> copy(
+                state = TrackedState.AWAITING_DECISION,
+                summary = "${kind.label} on $subjectName was held back: ${whyNot()}.",
+                retryable = true,
+            )
 
-        OpAction.INTERRUPTED -> copy(
-            state = TrackedState.FINISHED,
-            summary = "${kind.label} on $subjectName was interrupted before it finished.",
-            retryable = true,
-        )
+            OpAction.CANCELLED -> copy(
+                state = TrackedState.FINISHED,
+                summary = "${kind.label} on $subjectName was cancelled before it ran.",
+                retryable = true,
+            )
 
-        OpAction.FAILED, null -> copy(
+            OpAction.EXPIRED -> copy(
+                state = TrackedState.FINISHED,
+                summary = "${kind.label} on $subjectName waited for an idle moment and gave up.",
+                retryable = true,
+            )
+
+            else -> copy(
+                state = TrackedState.FINISHED,
+                summary = "${kind.label} on $subjectName could not start: ${whyNot()}.",
+                retryable = true,
+            )
+        }
+
+        Outcome.FAILED -> copy(
             state = TrackedState.FINISHED,
             action = action ?: OpAction.FAILED.wire,
             summary = "${kind.label} on $subjectName failed: ${whyNot()}.",
             retryable = true,
         )
 
-        else -> copy(
+        Outcome.UNKNOWN -> copy(
             state = TrackedState.FINISHED,
-            summary = successSentence(),
+            summary = when (ending) {
+                OpAction.INTERRUPTED -> "${kind.label} on $subjectName was interrupted before it " +
+                    "finished, and whether it took effect is not known."
+
+                else -> "${kind.label} on $subjectName ended without saying whether it took effect: " +
+                    "${whyNot()}."
+            },
             retryable = false,
         )
-    }.logged(at, detail ?: "Finished.", isError = settledAction?.isSuccess == false)
+    }
+    return settled.copy(outcome = outcome)
+        .logged(at, detail ?: "Finished.", isError = outcome == Outcome.FAILED || outcome == Outcome.UNKNOWN)
 }
 
 /**
@@ -549,11 +814,13 @@ private fun OperationRecord.successSentence(): String = when (kind) {
 }
 
 /**
- * A 2.x reply, which has no operation record and no reasonCode.
+ * A reply with no operation record: every 2.x reply, and a refusal from a 3.x agent.
  *
  * Read as generously as the old contract allows and no further. In particular a `noop` from a 2.x
  * agent says nothing about why, and this refuses to invent a reason for it. Rendering
  * "the schedule is off" as "already on the latest build" is worse than saying the agent did not say.
+ * The outcome is reduced from the reply's own fields, as every client reduces one (section 5.6): a
+ * refusal with a code is a failure, an action nobody knows is unknown, and neither is a success.
  */
 private fun OperationRecord.applyFlatReply(result: AgentActionResult, at: Long): OperationRecord {
     val message = result.effectiveMessage
@@ -568,17 +835,21 @@ private fun OperationRecord.applyFlatReply(result: AgentActionResult, at: Long):
         action = result.effectiveAction ?: action,
     )
 
-    val settled = OpAction.fromWire(result.effectiveAction)
-    if (settled == null && result.ok == false) {
-        return base.copy(
-            state = TrackedState.FINISHED,
-            action = OpAction.FAILED.wire,
-            summary = "${kind.label} on $subjectName failed: ${base.whyNot()}.",
-            retryable = true,
-        ).logged(at, base.whyNot(), isError = true)
-    }
+    val outcome = result.effectiveOutcome
+    if (outcome != Outcome.PENDING) return base.settle(outcome, at)
 
-    return base.finish(at)
+    // A pending reply from an agent that keeps records is followed by its id. One from an agent that
+    // keeps none can only be settled by seeing the machine in the state that was asked for.
+    return if (trackable) {
+        base.copy(
+            state = TrackedState.RUNNING,
+            outcome = outcome,
+            summary = "${kind.label} on $subjectName is running on $machineName.",
+            retryable = false,
+        )
+    } else {
+        base.copy(outcome = outcome).unsettled()
+    }
 }
 
 /**

@@ -13,7 +13,7 @@ import Observation
 /// AgentDeviceSetup.swift, and a model adds only what is really its own: how its agent is reached,
 /// how its status is read, and what power means for the machine it is.
 @MainActor
-protocol AgentDevice: AnyObject, Sendable {
+protocol AgentDevice: SetupChannel {
     /// What every device keeps the same way.
     var core: DeviceCore { get }
     /// What sentences and the operation history call this device.
@@ -28,8 +28,6 @@ protocol AgentDevice: AnyObject, Sendable {
     var recordedSystem: (id: String?, name: String?) { get }
     /// The route the last call went over, for the operation record.
     var recordedRoute: String? { get }
-    /// What sentences about this device's copy of the setup call whoever holds it.
-    var setupHolder: String { get }
     /// Whether a fresh status read follows every action, rather than only the ones whose resolution
     /// asks for one.
     var readsAfterEveryAction: Bool { get }
@@ -41,6 +39,10 @@ protocol AgentDevice: AnyObject, Sendable {
     func send<Value: Decodable & Sendable>(_ request: AgentRequest, decoding: Value.Type) async throws -> Value
     /// Read the status again, as the poll would.
     func refreshStatus(duringAction: Bool) async
+    /// Let the next call dial this device again at once, though the last one did not get through.
+    /// For a call that is expected to find the device answering again, such as the next poll of an
+    /// operation it took.
+    func allowRedial()
     /// A transport failure in this device's own words: a machine names itself and talks about ssh,
     /// this Mac has no connection to blame.
     func describe(_ failure: AgentFailure) -> String
@@ -78,8 +80,8 @@ final class DeviceCore {
     /// good read can put the last action's own outcome back.
     fileprivate(set) var lineIsRefreshFailure = false
 
-    /// What this device knows about its agent's copy of the setup. Kept by AgentDeviceSetup.swift.
-    var setup = SetupCopyState()
+    /// Sharing the setup with this device's agent (SetupPeerSync.swift).
+    let setup = SetupPeerSync()
 
     /// Counts the agents this device has been pointed at. A reply that set out before the count
     /// moved came from an agent the device no longer runs, and is not taken as the new one's.
@@ -87,6 +89,10 @@ final class DeviceCore {
 
     /// The last time the app asked the far side about an operation it had lost track of.
     @ObservationIgnored fileprivate var lastReconcileAttempt: Date = .distantPast
+
+    /// How an action waits before polling its operation again after a poll that did not get
+    /// through. The tests hand in one that returns at once.
+    @ObservationIgnored var pollPause: @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
 
     /// How often an operation with an unknown outcome is chased.
     static let reconcileEvery: TimeInterval = 60
@@ -105,12 +111,18 @@ final class DeviceCore {
     /// The setup this device is running on. Every agent gets a copy of it, the local one included:
     /// the file is the source of truth, and no device is an exception to that.
     var controllerConfig: (@MainActor () -> ControllerDocument?)?
-    /// Adopt a document read off this device's agent.
-    var adoptSetup: (@MainActor (Data, String) -> String?)?
-    /// The bytes of the newest document both lineages remember, when this device kept them. Without
-    /// it a merge can still be done, but every difference needs a decision instead of only the ones
-    /// both sides touched.
-    var setupBase: (@MainActor (ControllerIdentity, ControllerIdentity) -> Data?)?
+    /// Adopt a document read off this device's agent, in place of the applied document with the
+    /// hash given, nil for none: a compare-and-swap (ConfigStore.adopt).
+    var adoptSetup: (@MainActor (Data, String, String?) -> ConfigStore.AdoptOutcome)?
+    /// Take a document a person asked to take from this device's agent, in place of the applied
+    /// document with the hash given. With no setup applied here that is enrolment: every launch
+    /// value in it is shown, and nothing is written until the person confirms. With one applied it
+    /// is adopting a different setup, which approves nothing.
+    var takeSetup: (@MainActor (Data, ControllerIdentity, String, String?) -> SetupTaking)?
+    /// The bytes of the base a merge of the two documents needs (section 9.8), when this device
+    /// kept them: mine's hash and lineage, then theirs'. Without it a merge can still be done, but
+    /// every difference needs a decision instead of only the ones both sides touched.
+    var setupBase: (@MainActor (String, [String], String, [String]) -> Data?)?
     /// Raise the divergence sheet.
     var onSetupDiverged: (@MainActor (SetupDivergence) -> Void)?
 
@@ -128,7 +140,7 @@ final class DeviceCore {
         agentGeneration += 1
         doctor = nil
         doctorRanAt = nil
-        setup = SetupCopyState(isSharing: setup.isSharing)
+        setup.agentDidChange()
     }
 }
 
@@ -177,6 +189,31 @@ struct WakeActionOutcome: Sendable {
     var summary: String
     var failure: AgentFailure?
     var isDeclaredWakePacket: Bool
+    /// True when the command may have run and nothing has said how it ended: a wake hold for the
+    /// target now stands, and no other helper runs a command for it.
+    var isAmbiguous: Bool
+}
+
+/// Whether installing an agent takes a device back rather than forward (section 13).
+enum AgentDowngrade {
+    /// What makes installing `version` over the agent that sent `status` a way back, or nil when it
+    /// is not one: older than the agent running, or below its version floor.
+    static func reason(installing version: String, over status: AgentStatus) -> String? {
+        if let running = status.version, AgentVersion.isOlder(version, than: running) {
+            return "Agent \(version) is older than the \(running) running there"
+        }
+        if let floor = status.agent?.floor, AgentVersion.isOlder(version, than: floor) {
+            return "Agent \(version) is below the version floor \(floor) kept there"
+        }
+        return nil
+    }
+
+    /// Whether going back may be asked for at all: only of an agent that reports a floor, which
+    /// every agent that knows `--allow-downgrade` does, and never over a restricted key, whose
+    /// dispatcher refuses the flag. An agent from before the floor is never taken back from here.
+    static func isOffered(by status: AgentStatus) -> Bool {
+        status.agent?.reportsFloor == true && !status.isRestrictedSession
+    }
 }
 
 // MARK: - What every device reads the same way
@@ -282,12 +319,17 @@ extension AgentDevice {
         set { core.controllerConfig = newValue }
     }
 
-    var adoptSetup: (@MainActor (Data, String) -> String?)? {
+    var adoptSetup: (@MainActor (Data, String, String?) -> ConfigStore.AdoptOutcome)? {
         get { core.adoptSetup }
         set { core.adoptSetup = newValue }
     }
 
-    var setupBase: (@MainActor (ControllerIdentity, ControllerIdentity) -> Data?)? {
+    var takeSetup: (@MainActor (Data, ControllerIdentity, String, String?) -> SetupTaking)? {
+        get { core.takeSetup }
+        set { core.takeSetup = newValue }
+    }
+
+    var setupBase: (@MainActor (String, [String], String, [String]) -> Data?)? {
         get { core.setupBase }
         set { core.setupBase = newValue }
     }
@@ -331,8 +373,10 @@ extension AgentDevice {
         guard let next = owed.first else { return }
         core.lastReconcileAttempt = Date()
 
-        // The status the poll just read may already carry it, which costs nothing at all.
-        if let known = status?.operation(id: next.id) {
+        // The status the poll just read may already carry it, which costs nothing at all. Not for a
+        // finished cycle: a summary names none of its services, and a cycle is decided on them too.
+        if let known = status?.operation(id: next.id),
+           next.kind != .updateAll || !known.isFinished || known.children != nil {
             operations.reconcile(next.id, with: known)
             onStateChange?()
             return
@@ -497,24 +541,18 @@ extension AgentDevice {
                 build: { intent in try AgentRequest.cycle(intent: intent, dryRun: false, dialect: dialect) },
                 intent: .init(detach: dialect.supportsDetach, operationId: operation),
                 interpret: { result, conclusion in
+                    // The cycle's own outcome first, and each service's part folded into it, in the
+                    // one place its record read again is decided too, so the two cannot disagree.
                     let children = conclusion.operation?.children ?? result.children ?? []
-                    let updated = children.filter { $0.action == "updated" }.count
-                    let held = children.filter { $0.action == "deferred" || $0.action == "queued" }.count
-                    let failed = children.filter { $0.action == "failed" || $0.action == "rolled-back" }.count
-                    var parts: [String] = []
-                    if updated > 0 { parts.append("\(updated) updated") }
-                    if held > 0 { parts.append("\(held) held back") }
-                    if failed > 0 { parts.append("\(failed) failed") }
-                    if parts.isEmpty { parts.append("nothing to do") }
-                    let sentence = "Maintenance cycle on \(self.name): \(parts.joined(separator: ", "))."
-                    // The counts say how it went; the lines say which service it went that way for,
-                    // and why, which is the part anyone acting on a failure needs.
-                    let detail = children.map { child in
-                        "\(child.service ?? "service"): \(child.action ?? "no result")\(child.reasonCode.map { " (\($0))" } ?? "")"
-                    }.joined(separator: "\n")
-                    self.setStatus(sentence, isError: failed > 0, detail: detail.isEmpty ? result.message : detail)
-                    return .init(state: failed == 0 ? .succeeded : .failed, summary: sentence,
-                                 detail: detail.isEmpty ? result.message : detail, refresh: true)
+                    guard let report = CycleReport(result, children: children, machine: self.name) else {
+                        // Held back by the lock or refused before any service was looked at.
+                        return self.otherOutcome(result, subject: self.name, verb: "The maintenance cycle")
+                    }
+                    // A service nobody can say the end of leaves the whole cycle owed, never failed:
+                    // its record is read again by its id, and nothing is sent twice.
+                    self.setStatus(report.summary, isError: report.state.isProblem, detail: report.detail)
+                    return .init(state: report.state, summary: report.summary, detail: report.detail,
+                                 refresh: true, unresolved: report.outcome == .unknown)
                 }
             )
         }
@@ -572,16 +610,17 @@ extension AgentDevice {
     }
 
     /// Run a configured action here on another machine's behalf and retain its operation identity.
-    func runWakeAction(_ actionId: String, target: String) async -> WakeActionOutcome {
+    func runWakeAction(_ actionId: String, target: String, targetId: String) async -> WakeActionOutcome {
         if !isCommandable { await refreshStatus(duringAction: false) }
         let declared = actions.first { $0.id == actionId }?.isDeclaredWakePacket ?? false
         guard isCommandable else {
-            return .init(sent: false, summary: "not reachable", failure: nil, isDeclaredWakePacket: declared)
+            return .init(sent: false, summary: "not reachable", failure: nil, isDeclaredWakePacket: declared, isAmbiguous: false)
         }
-        return await WakeAction.run(action: actionId, target: target, machineId: historyMachineId, machineName: name,
-                                    declaredPacket: declared, dialect: dialect, operations: operations,
+        return await WakeAction.run(action: actionId, target: target, targetId: targetId, machineId: historyMachineId,
+                                    machineName: name, declaredPacket: declared, dialect: dialect, operations: operations,
                                     send: { try await self.send($0, decoding: AgentActionResult.self) },
-                                    read: { try await self.send($0, decoding: AgentOperationResult.self) })
+                                    read: { try await self.send($0, decoding: AgentOperationResult.self) },
+                                    redial: { self.allowRedial() })
     }
 
     // MARK: - Policy
@@ -596,6 +635,11 @@ extension AgentDevice {
             do {
                 let request = try AgentRequest.autoUpdate(enabled, service: serviceId, dialect: dialect)
                 let result = try await self.send(request, decoding: AgentActionResult.self)
+                // A refusal is a reply too. Read as a saved setting, it put the switch where the
+                // person moved it while the agent kept the old value.
+                guard Outcome.of(result) == .succeeded else {
+                    return self.otherOutcome(result, subject: subject, verb: "The update setting")
+                }
                 let value = result.updates?.automatic ?? result.autoUpdate ?? enabled
                 saved(value)
                 let sentence = value
@@ -633,7 +677,25 @@ extension AgentDevice {
             do {
                 let request = try AgentRequest.policySet(service: serviceId, patch: patch)
                 let result = try await self.send(request, decoding: AgentPolicyResult.self)
-                guard result.ok != false else {
+                // Decided on the outcome, as every other change is. Read off `ok`, a policy held
+                // back by the lock read as refused, and one the agent failed on half-way through
+                // writing read as not changed, when nobody can say whether it was.
+                let reason = AgentReason(code: result.reasonCode)
+                switch Outcome.of(result) {
+                case .succeeded:
+                    break
+                case .deferred:
+                    let said = reason?.sentence(subject: subject, message: result.message) ?? result.message ?? "\(self.name) is busy."
+                    let sentence = "The policy change was held back: \(said)"
+                    self.setStatus(sentence, detail: result.message)
+                    return .init(state: .deferred, summary: sentence, detail: result.message, refresh: true)
+                case .unknown, .pending:
+                    // A `policy set` is answered in one round trip, so nothing follows a pending one.
+                    let said = result.message ?? reason?.sentence(subject: subject, message: nil)
+                    let sentence = "The policy change may or may not have taken effect: \(said ?? "\(self.name) could not say.")"
+                    self.setStatus(sentence, isError: true, detail: result.message)
+                    return .init(state: .unknown, summary: sentence, detail: result.message, refresh: true, unresolved: true)
+                case .failed:
                     let sentence = result.message ?? "\(subject): the policy was not changed."
                     self.setStatus(sentence, isError: true)
                     return .init(state: .failed, summary: sentence)
@@ -684,12 +746,17 @@ extension AgentDevice {
             do {
                 let request = try AgentRequest.cancel(id: operation.id)
                 let result = try await self.send(request, decoding: AgentActionResult.self)
-                let sentence = result.ok == false
-                    ? (result.message ?? "The queued request could not be cancelled.")
-                    : "\(operation.displayName) is no longer queued."
-                self.setStatus(sentence, isError: result.ok == false)
-                if result.ok != false { self.operations?.finish(operation.id, state: .cancelled, summary: sentence) }
-                return .init(state: result.ok == false ? .failed : .succeeded, summary: sentence, refresh: true)
+                // Decided on the outcome, not on `ok`. A request that started while the cancel was
+                // on its way answers `conflict` with `ok: true`: nothing was cancelled, and the work
+                // it was meant to stop is running.
+                let outcome = Outcome.of(result)
+                let sentence = outcome == .succeeded
+                    ? "\(operation.displayName) is no longer queued."
+                    : (result.message ?? "The queued request could not be cancelled.")
+                self.setStatus(sentence, isError: outcome != .succeeded)
+                if outcome == .succeeded { self.operations?.finish(operation.id, state: .cancelled, summary: sentence) }
+                return .init(state: OperationOutcome.state(outcome, action: result.action), summary: sentence, refresh: true,
+                             unresolved: outcome == .unknown)
             } catch let failure as AgentFailure {
                 return self.reportFailure(failure, verb: "The cancellation")
             } catch let invalid as AgentRequest.Invalid {
@@ -772,9 +839,43 @@ extension AgentDevice {
 
     // MARK: - Trusted agent deployment
 
+    /// Why installing the bundled agent would take this device back rather than forward, or nil
+    /// when it would not.
+    var bundledAgentGoesBack: String? {
+        guard let bundle = AgentBundle.shared, let status else { return nil }
+        return AgentDowngrade.reason(installing: bundle.version, over: status)
+    }
+
+    /// Whether going back to the bundled agent may be asked for here at all.
+    var canGoBackToBundledAgent: Bool {
+        bundledAgentGoesBack != nil && status.map(AgentDowngrade.isOffered) == true
+    }
+
+    /// Going back is a decision of its own, taken in front of a question that says what it does.
+    func requestBundledAgentDowngrade() {
+        guard let bundle = AgentBundle.shared, let reason = bundledAgentGoesBack, canGoBackToBundledAgent else { return }
+        let floor = status?.agent?.floor
+        let lowers = floor.map { AgentVersion.isOlder(bundle.version, than: $0) } == true
+            ? " It also lowers the version floor \(name) keeps to \(bundle.version)."
+            : ""
+        ask?(PendingDialog(
+            id: "agent-downgrade-\(historyMachineId)",
+            title: "Go back to agent \(bundle.version) on \(name)?",
+            message: "\(reason). Going back replaces the agent with this older one, signed by the same release key.\(lowers) Do this only to undo a release that broke something.",
+            confirmTitle: "Go back to \(bundle.version)",
+            perform: { [weak self] in self?.installBundledAgent(allowDowngrade: true) }
+        ))
+    }
+
     /// Install the agent this build was made with, after verifying its signature here.
-    func installBundledAgent() {
+    ///
+    /// Never as an upgrade when it is older than the agent running, or below the version floor: an
+    /// agent 3.1.0 refuses that without `--allow-downgrade`, and this app used to offer it all the
+    /// same. `allowDowngrade` comes only from the question above.
+    func installBundledAgent(allowDowngrade: Bool = false) {
         guard let bundle = AgentBundle.shared, let status, status.ok == true, isCommandable else { return }
+        let goesBack = AgentDowngrade.reason(installing: bundle.version, over: status) != nil
+        guard goesBack == allowDowngrade, !allowDowngrade || AgentDowngrade.isOffered(by: status) else { return }
         if let previous = unresolvedOperations.first(where: { $0.kind == .appUpdate && $0.subject == "control agent" }) {
             setStatus("Agent installation \(previous.id) still has an unknown outcome. Check its result before starting another installation.", isError: true)
             reconcileNow()
@@ -791,7 +892,10 @@ extension AgentDevice {
                     return await self.installOverLegacyAgent(payload, operation: operation, version: bundle.version)
                 }
                 return await self.dispatch(operation: operation, subject: "control agent", verb: "Installing the agent",
-                                           build: { _ in try AgentRequest.selfUpdateFromStdin(operation: operation).sending(payload) },
+                                           build: { _ in
+                                               try AgentRequest.selfUpdateFromStdin(operation: operation, allowDowngrade: allowDowngrade,
+                                                                                    agent: status.agent).sending(payload)
+                                           },
                                            intent: .init(operationId: operation)) { result, _ in
                     guard result.didInstallAgent else {
                         return self.otherOutcome(result, subject: "control agent", verb: "Installing the agent")
@@ -824,7 +928,7 @@ extension AgentDevice {
         let dialect = dialect
         do {
             let request = try build(intent)
-            let driver = OperationDriver(
+            var driver = OperationDriver(
                 send: { [weak self] request in
                     guard let self else { throw CancellationError() }
                     return try await self.send(request, decoding: AgentActionResult.self)
@@ -841,6 +945,8 @@ extension AgentDevice {
                     self?.onStateChange?()
                 }
             )
+            driver.pause = core.pollPause
+            driver.beforeRetry = { [weak self] in self?.allowRedial() }
 
             core.watchedOperation = operation
             defer { core.watchedOperation = nil }
@@ -875,6 +981,20 @@ extension AgentDevice {
                 setStatus(sentence)
                 return .init(state: .queued, summary: sentence, detail: result.message,
                              refresh: true, expiresAt: expires)
+            }
+
+            // The outcome is what this app decides on, and an action word is no evidence when the
+            // agent itself does not know how the work went: a producer that knows a failed update
+            // may have changed the machine says `unknown` whatever the action beside it says. The
+            // record is left owed and read again by its id, never sent again.
+            if Outcome.of(result) == .unknown {
+                // The agent's own words first: a reason code's sentence was written for an ending
+                // that is known, and "failed" is exactly what this is not.
+                let said = result.message ?? result.reason?.sentence(subject: subject, message: nil)
+                let sentence = "\(verb) may or may not have taken effect: \(said ?? "\(name) could not say.")"
+                setStatus(sentence, isError: true, detail: result.message)
+                return .init(state: .unknown, summary: sentence, detail: result.message,
+                             refresh: true, unresolved: true)
             }
 
             return interpret(result, conclusion)

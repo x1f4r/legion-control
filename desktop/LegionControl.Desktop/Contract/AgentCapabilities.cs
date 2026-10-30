@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace LegionControl.Desktop.Contract;
 
 /// What the agent on the far side can be asked to do.
@@ -14,6 +16,12 @@ public sealed record AgentCapabilities
     /// The `contract` number from the last reply. Zero until something has answered.
     public int ContractVersion { get; init; }
     public string? AgentVersion { get; init; }
+    /// The version floor the status reported, when it reported one.
+    public string? Floor { get; init; }
+    /// Whether the status carried a floor at all, null included: agent 3.1.0 and later.
+    public bool ReportsFloor { get; init; }
+    /// Whether this machine's own session is restricted, as its last status said.
+    public bool RestrictedSession { get; init; }
 
     public static readonly AgentCapabilities None = new();
 
@@ -21,6 +29,9 @@ public sealed record AgentCapabilities
     {
         ContractVersion = status.ContractVersion,
         AgentVersion = status.AgentVersion,
+        Floor = status.Agent?.Floor,
+        ReportsFloor = status.Agent?.ReportsFloor ?? false,
+        RestrictedSession = status.Agent?.RestrictedSession == true,
     };
 
     public static AgentCapabilities Of(AgentEnvelope envelope) => new()
@@ -58,6 +69,19 @@ public sealed record AgentCapabilities
     public bool SupportsSetupLineage => SpeaksV3;
     public bool SupportsConfigMeta => SpeaksV3;
 
+    /// Why a control that needs contract 3 is disabled, in a sentence the window shows beside it,
+    /// or null when it is not. A 2.x agent sends no contract number at all, so its version is what
+    /// says it answered.
+    public string? UnsupportedReason => SpeaksV3 ? null
+        : IsUnknown && AgentVersion is null ? "Waits for this machine's agent to answer."
+        : $"Needs agent 3.0 or later; this machine runs {AgentVersion ?? "an older one"}.";
+
+    /// Whether `self-update --allow-downgrade` may be sent: only to an agent that reports a version
+    /// floor, which every agent that knows the flag does, and never over a restricted key, which the
+    /// dispatcher refuses it from. An older agent has no floor to cross and has never heard of the
+    /// flag, so nothing in this app takes it back to an older agent.
+    public bool SupportsAllowDowngrade => SpeaksV3 && ReportsFloor && !RestrictedSession;
+
     /// One line for the machine section.
     public string Summary => ContractVersion switch
     {
@@ -66,6 +90,42 @@ public sealed record AgentCapabilities
         var version when version > AgentContract.RequiredContract => $"contract {version}, newer than this app knows",
         var version => $"contract {version}",
     };
+}
+
+/// Agent versions, compared the way the version floor compares them (contract section 13): the
+/// three leading numbers, numerically, and whatever follows them ignored. A version without three
+/// leading numbers compares with nothing.
+public static class AgentVersions
+{
+    private static readonly Regex Leading = new(@"\A([0-9]+)\.([0-9]+)\.([0-9]+)", RegexOptions.CultureInvariant);
+
+    /// Negative when [left] is the older, zero when the same, positive when the newer; null when
+    /// either is not a version.
+    public static int? Compare(string? left, string? right)
+    {
+        if (Parse(left) is not { } a || Parse(right) is not { } b) return null;
+        for (var index = 0; index < 3; index += 1)
+        {
+            // Digits without their leading zeros: the longer is the larger, and of two as long the
+            // first that differs decides. No number is too long to compare that way.
+            var (x, y) = (a[index], b[index]);
+            if (x.Length != y.Length) return x.Length.CompareTo(y.Length);
+            var order = string.CompareOrdinal(x, y);
+            if (order != 0) return Math.Sign(order);
+        }
+        return 0;
+    }
+
+    /// Whether [version] is known to be older than [other]. Not knowing is not older.
+    public static bool IsOlder(string? version, string? other) => Compare(version, other) < 0;
+
+    private static string[]? Parse(string? version)
+    {
+        if (version is null || Leading.Match(version) is not { Success: true } match) return null;
+        return new[] { match.Groups[1], match.Groups[2], match.Groups[3] }
+            .Select(group => group.Value.TrimStart('0') is { Length: > 0 } digits ? digits : "0")
+            .ToArray();
+    }
 }
 
 /// Facts about the contract this build was written against.

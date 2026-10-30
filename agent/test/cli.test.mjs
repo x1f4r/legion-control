@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { AGENT_VERSION, cli, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
+import { AGENT_VERSION, REPO, cli, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
 
 /** A home with the fixture service configured and running. */
 async function withService(body, { config = null, initial = {} } = {}) {
@@ -207,6 +207,41 @@ test('a queued request waits, is visible, and the cycle runs it when idle', asyn
   );
 });
 
+test('a queued request takes no --force, and no expiry in the past or past the week', async () => {
+  const withAction = (dir) => ({ ...fixtureConfig(dir), actions: [{ id: 'hello', name: 'Hello', command: [process.execPath, '-e', ''] }] });
+  await withService(async ({ home }) => {
+    for (const args of [
+      ['update', '--when-idle', '--force'],
+      ['restart', '--when-idle', '--force'],
+      ['run', 'hello', '--when-idle', '--force'],
+      ['sleep', '--when-idle', '--force'],
+    ]) {
+      const refused = cli(args, { home });
+      assert.equal(refused.exitCode, 1, args.join(' '));
+      assert.equal(refused.payload.reasonCode, 'bad-argument');
+      assert.equal(refused.payload.argument, '--force');
+      assert.match(refused.payload.message, /--when-idle waits until the machine is idle, and --force does not wait for that/);
+    }
+    assert.match(cli(['help'], { home }).payload.commands.find((command) => command.name === 'update').summary, /cannot be combined with --force/);
+
+    const waiting = cli(['restart', '--when-idle', '--expires', '30m'], { home }).payload;
+    assert.equal(waiting.action, 'queued');
+    const past = cli(['restart', '--when-idle', '--expires', new Date(Date.now() - 60000).toISOString()], { home });
+    assert.equal(past.payload.reasonCode, 'bad-argument');
+    assert.equal(past.payload.argument, '--expires');
+    assert.match(past.payload.message, /already past/);
+    const queued = cli(['status'], { home }).payload.operations.queued;
+    assert.deepEqual(queued.map((summary) => summary.id), [waiting.op.id], 'the request that waits was not replaced');
+
+    const week = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    for (const expires of ['30d', new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()]) {
+      const capped = cli(['update', '--when-idle', '--expires', expires], { home }).payload;
+      assert.equal(capped.action, 'queued', expires);
+      assert.ok(Math.abs(Date.parse(capped.op.expiresAt) - week) < 60000, `${expires} is the week at most, not ${capped.op.expiresAt}`);
+    }
+  }, { config: withAction });
+});
+
 test('a queued request can be cancelled before it runs', async () => {
   await withService(async ({ home }) => {
     const queued = cli(['restart', '--when-idle'], { home });
@@ -359,6 +394,24 @@ test('every argument that arrives over ssh is validated', async () => {
   });
 });
 
+test('a command is only ever one the command table names', async () => {
+  await withService(async ({ home }) => {
+    // Every object has these as properties of its own prototype. Read straight
+    // off the table, `toString --force` used to get as far as the flag check
+    // and die there with a TypeError, answered as an internal failure.
+    for (const args of [['toString', '--force'], ['constructor', '--op=abcdefgh'], ['__proto__'], ['hasOwnProperty']]) {
+      const { payload, exitCode } = cli(args, { home });
+      assert.equal(exitCode, 1);
+      assert.equal(payload.reasonCode, 'bad-argument', `${args.join(' ')}: ${payload.message}`);
+      assert.equal(payload.message, `unknown command: ${args[0]}`);
+      assert.ok(payload.accepts.includes('status'));
+    }
+    // The refusal and help read the one table, so they offer the same commands.
+    const help = cli(['help'], { home }).payload;
+    assert.deepEqual(cli(['nonsense'], { home }).payload.accepts, help.commands.map(({ name }) => name));
+  });
+});
+
 test('an unknown service, action and boot target each say what does exist', async () => {
   await withService(async ({ home }) => {
     const service = cli(['update', '--service', 'nope'], { home });
@@ -370,6 +423,12 @@ test('an unknown service, action and boot target each say what does exist', asyn
 
     const target = cli(['boot', 'nope'], { home });
     assert.equal(target.payload.reasonCode, 'not-configured');
+
+    // Asked to wait for an idle machine, a missing action or target is refused
+    // in the same way, before anything is queued.
+    assert.equal(cli(['run', '--when-idle'], { home }).payload.reasonCode, 'unknown-action');
+    assert.equal(cli(['boot', '--when-idle'], { home }).payload.reasonCode, 'not-configured');
+    assert.equal(cli(['status'], { home }).payload.operations.queued.length, 0);
   });
 });
 
@@ -453,6 +512,17 @@ test('auto-update pause and resume are the same setting the policy reports', asy
     const resumed = cli(['auto-update', 'resume'], { home });
     assert.equal(resumed.payload.updates.pauseUntil, null);
     assert.equal(cli(['auto-update', 'nonsense'], { home }).payload.reasonCode, 'bad-argument');
+
+    // For one service, resuming hands the setting back to the machine, exactly
+    // as a null in "policy set" does, and config.json says so the same way.
+    const stored = () => JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8')).services[0].updates ?? {};
+    assert.ok(cli(['auto-update', 'pause', '4h', '--service', 'demo'], { home }).payload.updates.pauseUntil);
+    const handedBack = cli(['auto-update', 'resume', '--service', 'demo'], { home }).payload.updates;
+    assert.deepEqual([handedBack.pauseUntil, handedBack.inheritedKeys.pauseUntil], [null, true]);
+    assert.equal(Object.hasOwn(stored(), 'pauseUntil'), false);
+    cli(['auto-update', 'pause', '4h', '--service', 'demo'], { home });
+    cli(['policy', 'set', '--service', 'demo'], { home, stdin: '{"pauseUntil":null}' });
+    assert.equal(Object.hasOwn(stored(), 'pauseUntil'), false);
   });
 });
 
@@ -485,7 +555,7 @@ test('doctor reports the scheduler, the busy source and the lock, with fixes', a
   await withService(async ({ home }) => {
     const { payload } = cli(['doctor'], { home });
     const ids = payload.checks.map((check) => check.id);
-    for (const id of ['config.parse', 'config.validate', 'base.writable', 'node.version', 'locks', 'ops.dir', 'clock', 'session.restricted', 'agent.floor', 'agent.signed', 'controller.copy', 'sleep.tool', 'scheduler.present', 'scheduler.command', 'scheduler.lastRun', 'service.demo.process', 'service.demo.health', 'service.demo.busy']) {
+    for (const id of ['config.parse', 'config.validate', 'base.writable', 'files.private', 'node.version', 'locks', 'ops.dir', 'clock', 'session.restricted', 'agent.floor', 'agent.signed', 'controller.copy', 'sleep.tool', 'scheduler.present', 'scheduler.command', 'scheduler.lastRun', 'service.demo.process', 'service.demo.health', 'service.demo.busy']) {
       assert.ok(ids.includes(id), `doctor should check ${id}`);
     }
     for (const check of payload.checks) {
@@ -494,7 +564,8 @@ test('doctor reports the scheduler, the busy source and the lock, with fixes', a
     assert.equal(typeof payload.counts.ok, 'number');
     assert.equal(payload.counts.ok + payload.counts.warn + payload.counts.fail, payload.checks.length);
     // Every check id has to be one the contract names, or a client cannot render it.
-    const allowed = /^(?:config\.(?:parse|validate)|base\.writable|node\.(?:version|sqlite)|npm\.(?:available|prefix)|service\.[A-Za-z0-9][A-Za-z0-9._-]*\.(?:process|health|busy|relay|latest|endpoint)|scheduler\.(?:present|command|lastRun)|privileges\.(?:sudo|boot)|sleep\.tool|locks|ops\.dir|controller\.copy|session\.restricted|clock|agent\.(?:floor|signed))$/;
+    const common = JSON.parse(fs.readFileSync(path.join(REPO, 'contract', 'schemas', 'common.schema.json'), 'utf8'));
+    const allowed = new RegExp(common.$defs.doctorCheck.properties.id.pattern, 'u');
     for (const check of payload.checks) assert.match(check.id, allowed, `${check.id} is not a contract check id`);
   });
 });

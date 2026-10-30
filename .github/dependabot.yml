@@ -1,0 +1,39 @@
+# Updates for what the builds and CI pull in from elsewhere: the pinned actions, the Android
+# dependencies and Gradle wrapper, and the desktop's NuGet packages. Each ecosystem comes as one
+# pull request a week, which CI checks like any other change. The agent has no dependencies, and
+# the Mac app none outside the SDK.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: gradle
+    directory: /android
+    schedule:
+      interval: weekly
+    groups:
+      android:
+        patterns: ['*']
+    ignore:
+      # android/gradle/libs.versions.toml says why both are held where they are. AGP 8.13 calls into
+      # a Gradle internal that 9.6 removed, which CI would catch; sshj 0.40 moves ed25519 onto a JCE
+      # provider Android ships only part of, which shows up on a phone and in no unit test.
+      - dependency-name: gradle-wrapper
+        versions: ['>= 9.6']
+      - dependency-name: com.hierynomus:sshj
+        versions: ['>= 0.40']
+
+  - package-ecosystem: nuget
+    directories:
+      - /desktop/LegionControl.Desktop
+      - /desktop/LegionControl.Desktop.Tests
+    schedule:
+      interval: weekly
+    groups:
+      desktop:
+        patterns: ['*']

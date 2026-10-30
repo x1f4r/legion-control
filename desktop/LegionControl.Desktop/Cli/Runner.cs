@@ -32,9 +32,60 @@ public static class Runner
         "timeout", "out", "site", "pause", "windows", "automatic", "patience", "screenshot",
         "quit-after", "update-marker", "budget", "in", "self", "system", "local-agent",
         "identity", "device", "alias", "template", "command", "route", "trust-systems", "legacy-system", "base", "local-agent-json",
+        "approve-launch", "revert-launch", "hash",
     };
 
-    public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output)
+    public static Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output) =>
+        RunAsync(arguments, output, readOnly => new AppModel(readOnly: readOnly));
+
+    /// The same, with the app [open] makes in place of the one this device's own files make. A
+    /// test passes one that drives a runner of its own, so the command line it checks is the one
+    /// that ships.
+    public static Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output, Func<AppModel> open) =>
+        RunAsync(arguments, output, _ => open());
+
+    /// The same, with [open] told whether the run may change anything on disk. A smoke run may
+    /// not: it reads everything and changes nothing, so a setup with no identity yet is not given
+    /// one, a first start's approvals are not recorded, and no wake hold is released.
+    ///
+    /// Whatever escapes a command is still one of the three exit codes, with a sentence and a line
+    /// in the log: a runtime's own crash code means nothing to whoever reads it. A command that can
+    /// change something on a machine is then not known (2), because nobody can say how far it got;
+    /// one that only reads did not do what was asked, and that is known (1).
+    public static async Task<int> RunAsync(IReadOnlyList<string> arguments, TextWriter output, Func<bool, AppModel> open)
+    {
+        try
+        {
+            return await RunCoreAsync(arguments, output, open);
+        }
+        catch (Exception error)
+        {
+            AppLog.Write($"the command line ({string.Join(" ", arguments.Take(2))})", error);
+            var reads = arguments.Contains("--smoke") || arguments.Contains("--version") || arguments.Contains("-h")
+                || arguments.Contains("--help") || CommandOf(arguments) is { } verb && ReadingVerbs.Contains(verb);
+            output.WriteLine($"The command stopped on an error this app did not expect: {error.Message}"
+                             + (reads ? "" : " Whether anything changed on the far side is not known.")
+                             + $" The details are in {AppLog.Path}.");
+            return reads ? Failed : NotKnown;
+        }
+    }
+
+    /// The verbs that change nothing anywhere, as the usage lists them under "Reading". `wake`,
+    /// `trust`, `edit` and `bindings` are not here: each of them changes something when asked to.
+    private static readonly HashSet<string> ReadingVerbs = new(StringComparer.Ordinal)
+    {
+        "status", "doctor", "logs", "history", "bundle", "op", "templates", "version",
+    };
+
+    /// The verb, however it was spelled, before anything else is parsed.
+    private static string? CommandOf(IReadOnlyList<string> arguments)
+    {
+        var index = arguments.ToList().IndexOf("--command");
+        if (index >= 0) return index + 1 < arguments.Count ? arguments[index + 1] : null;
+        return arguments.Count > 0 && !arguments[0].StartsWith("--", StringComparison.Ordinal) ? arguments[0] : null;
+    }
+
+    private static async Task<int> RunCoreAsync(IReadOnlyList<string> arguments, TextWriter output, Func<bool, AppModel> open)
     {
         if (arguments.Contains("-h")) { WriteUsage(output); return Ok; }
         var command = arguments.Count > 0 && !arguments[0].StartsWith("--", StringComparison.Ordinal)
@@ -64,7 +115,7 @@ public static class Runner
 
         if (command == "version") return Version(output);
         var json = line.Has("json");
-        using var app = new AppModel();
+        using var app = open(command == "smoke");
         using var cancellation = new CancellationTokenSource(
             TimeSpan.FromSeconds(line.Number("timeout") ?? 300));
         var token = cancellation.Token;
@@ -109,11 +160,14 @@ public static class Runner
     /// Everything a person setting this up would want to check, in one pass and without changing
     /// anything: the document, this device's own settings, where it thinks it is, and what every
     /// machine answers.
+    ///
+    /// With --json only the report is printed, so whatever reads it reads JSON and nothing else.
     private static async Task<int> SmokeAsync(
-        AppModel app, CommandLine line, TextWriter output, bool json, CancellationToken token)
+        AppModel app, CommandLine line, TextWriter standardOutput, bool json, CancellationToken token)
     {
         var report = new List<object>();
         var worst = Ok;
+        var output = json ? TextWriter.Null : standardOutput;
 
         output.WriteLine($"Legion Control {AgentContract.ClientVersion}, contract {AgentContract.RequiredContract} required");
         output.WriteLine($"Setup document   {app.Config.Path}");
@@ -132,9 +186,14 @@ public static class Runner
         if (app.Config.Document is { } document)
         {
             var identity = document.Identity;
-            output.WriteLine($"Setup           {identity.Id ?? "no id"} revision {identity.RevisionNumber}, hash {document.Hash[..12]}, lineage {identity.Lineage.Count}");
+            output.WriteLine($"Setup           {identity.Id ?? "no id"} revision {identity.RevisionNumber}, hash {ReconcileOutcome.Short(document.Hash)}, lineage {identity.Lineage.Count}");
         }
         foreach (var warning in app.Config.Warnings) output.WriteLine($"Setup warning    {warning}");
+        if (app.Approvals.Problem is { } launchProblem) output.WriteLine($"Approvals        {launchProblem}");
+        if (app.LaunchReview.Count is var waiting and > 0)
+        {
+            output.WriteLine($"Approvals        {waiting} launch {(waiting == 1 ? "value waits" : "values wait")} for approval on this device; see --command setup");
+        }
         output.WriteLine($"This device      {app.Bindings.Device}"
                          + (app.Bindings.Self is { } self ? $", bound to machine \"{self.Machine}\"" : ", not bound to a machine")
                          + (app.Bindings.LocalAgent.Count > 0 ? ", local agent configured" : ""));
@@ -146,6 +205,7 @@ public static class Runner
         if (machines.Count == 0)
         {
             output.WriteLine(only is null ? "The setup lists no machines." : $"No machine called \"{only}\".");
+            if (json) standardOutput.WriteLine(JsonSerializer.Serialize(report, Indented));
             return Failed;
         }
 
@@ -208,7 +268,7 @@ public static class Runner
             output.WriteLine();
         }
 
-        if (json) output.WriteLine(JsonSerializer.Serialize(report, Indented));
+        if (json) standardOutput.WriteLine(JsonSerializer.Serialize(report, Indented));
         return worst;
     }
 
@@ -259,11 +319,24 @@ public static class Runner
             output.WriteLine($"{id,-16} {outcome.Sentence_}");
             if (outcome is ReconcileOutcome.NeedsDecision) worst = Math.Max(worst, Failed);
             if (outcome is ReconcileOutcome.Failed) worst = Math.Max(worst, Failed);
+            // A machine that refused the document as invalid will not take it until somebody
+            // fixes it. One that takes it only from an administrator key is waiting for a peer,
+            // which is how a restricted device is meant to work.
+            if (outcome is ReconcileOutcome.Withheld { Sharing: SetupSharing.Refused }) worst = Math.Max(worst, Failed);
         }
         if (app.Config.Document is { } document)
         {
             output.WriteLine();
             output.WriteLine($"This device holds revision {document.Identity.RevisionNumber}, hash {document.Hash}");
+        }
+        // Like a divergence, a command waiting for approval is something only a person settles, and
+        // until then the machine it belongs to is not driven the way the setup says.
+        if (app.LaunchReview.Count > 0)
+        {
+            output.WriteLine();
+            output.WriteLine($"Waiting for approval on this device: {string.Join(", ", app.LaunchReview.Select(entry => entry.Path))}");
+            output.WriteLine("Review them with --command setup.");
+            worst = Math.Max(worst, Failed);
         }
         if (json)
         {
@@ -278,6 +351,9 @@ public static class Runner
     private static async Task<int> SetupAsync(
         AppModel app, CommandLine line, TextWriter output, bool json, CancellationToken token)
     {
+        if (line.Value("approve-launch") is { } approve) return ApproveLaunch(app, approve, line.Value("hash"), output);
+        if (line.Value("revert-launch") is { } revert) return RevertLaunch(app, revert, output);
+
         var machine = line.Value("machine") is null ? null : Pick(app, line, output);
 
         if (line.Has("take-theirs") || line.Has("keep-mine") || line.Has("merge") || line.Has("replace-theirs"))
@@ -288,19 +364,33 @@ public static class Runner
                 return Failed;
             }
             await machine.RefreshAsync(token);
+            // The decision acts on the document read now, verified, and only while the setup here
+            // is still the one it was compared with. --hash names the machine's document the
+            // person decided about, and nothing else is taken.
+            var (session, sessionProblem) = await app.Reconciler.PrepareMergeAsync(machine, token);
+            if (session is null)
+            {
+                output.WriteLine(sessionProblem);
+                return Failed;
+            }
+            if (line.Value("hash") is { } shown && shown != session.TheirsHash)
+            {
+                output.WriteLine($"{machine.Name} holds {session.TheirsHash} now, not {shown}. Nothing was changed; read it again with --command setup.");
+                return Failed;
+            }
             var problem = line switch
             {
-                _ when line.Has("take-theirs") => await app.Reconciler.TakeTheirsAsync(machine, token),
-                _ when line.Has("keep-mine") => await app.Reconciler.KeepMineAsync(machine, token),
-                _ when line.Has("merge") => await app.Reconciler.MergeAsync(machine, null, token),
-                _ => await app.Reconciler.ReplaceTheirsAsync(machine, token),
+                _ when line.Has("take-theirs") => await app.Reconciler.TakeTheirsAsync(machine, session, token),
+                _ when line.Has("keep-mine") => await app.Reconciler.KeepMineAsync(machine, session, token),
+                _ when line.Has("merge") => await app.Reconciler.MergeAsync(machine, session, null, token),
+                _ => await app.Reconciler.ReplaceTheirsAsync(machine, session, token),
             };
             if (problem is not null)
             {
                 output.WriteLine(problem);
                 return Failed;
             }
-            output.WriteLine($"Done. This device now holds revision {app.Config.Document?.Identity.RevisionNumber} ({app.Config.Document?.Hash[..12]}).");
+            output.WriteLine($"Done. This device now holds revision {app.Config.Document?.Identity.RevisionNumber} ({(app.Config.Document is { } held ? ReconcileOutcome.Short(held.Hash) : "nothing")}).");
             return Ok;
         }
 
@@ -311,17 +401,21 @@ public static class Runner
         }
 
         output.WriteLine($"Setup     {document.Identity.Id}");
-        output.WriteLine($"Revision  {document.Identity.RevisionNumber} by {document.Identity.Device ?? "?"} ({document.Identity.Source ?? "?"})");
+        // Whatever the revision says about who wrote it, with nothing a person could not see: the
+        // waiting commands below are approved from this listing.
+        output.WriteLine($"Revision  {document.Identity.RevisionNumber} by {(document.Identity.Device is { } device ? LaunchGate.Show(device) : "?")} ({(document.Identity.Source is { } source ? LaunchGate.Show(source) : "?")})");
         output.WriteLine($"Hash      {document.Hash}");
-        output.WriteLine($"Lineage   {(document.Identity.Lineage.Count == 0 ? "none" : string.Join(", ", document.Identity.Lineage.Select(hash => hash[..12])))}");
+        output.WriteLine($"Lineage   {(document.Identity.Lineage.Count == 0 ? "none" : string.Join(", ", document.Identity.Lineage.Select(ReconcileOutcome.Short)))}");
         output.WriteLine($"Kept      {app.Config.Ledger.Hashes().Count} earlier documents");
+        if (app.Approvals.Problem is { } launchProblem) output.WriteLine($"Approvals {launchProblem}");
+        WriteLaunchReview(app, output);
 
         foreach (var each in app.Machines.Where(each => machine is null || each.Id == machine.Id))
         {
             await each.RefreshAsync(token);
             var mark = each.Status?.Controller;
             output.WriteLine();
-            output.WriteLine($"{each.Name,-16} {(mark?.Hash is { } hash ? hash[..12] : "nothing")}"
+            output.WriteLine($"{each.Name,-16} {(mark?.Hash is { } hash ? ReconcileOutcome.Short(hash) : "nothing")}"
                              + (mark?.Revision is { } revision ? $" revision {revision}" : "")
                              + $"  {each.EvaluateSharing(document).Sentence_ ?? "unknown"}");
         }
@@ -332,7 +426,96 @@ public static class Runner
             revision = document.Identity.RevisionNumber,
             hash = document.Hash,
             lineage = document.Identity.Lineage,
+            launchReview = app.LaunchReview.Select(entry => new
+            {
+                path = entry.Path,
+                scope = entry.Scope.Wire(),
+                kind = entry.Kind,
+                approvable = entry.Approvable,
+            }),
         }, Indented));
+        return Ok;
+    }
+
+    /// Each launch value this device has not approved, beside the one it did approve at that place.
+    private static void WriteLaunchReview(AppModel app, TextWriter output)
+    {
+        if (app.LaunchReview.Count == 0 || app.Config.Document is not { } document) return;
+        output.WriteLine();
+        output.WriteLine($"Waiting for approval on this device. {LaunchGate.Provenance(document.Identity)}");
+        foreach (var entry in app.LaunchReview)
+        {
+            output.WriteLine($"  {entry.Path}  {entry.Kind}{(entry.Approvable ? "" : ", cannot be approved: it can only be reverted or left")}");
+            output.WriteLine($"    approved  {(entry.Recorded ? LaunchGate.Describe(entry.Scope, entry.Approved) : "nothing")}");
+            output.WriteLine($"    offered   {LaunchGate.Describe(entry.Scope, entry.Offered)}");
+        }
+        output.WriteLine($"Approving lets this device run the command over ssh with its own key: --approve-launch PATH --hash {document.Hash}, or all in place of PATH.");
+        output.WriteLine("--revert-launch PATH puts the approved value back into the shared setup as an edit.");
+    }
+
+    /// Approves what waits at one path, or everything that can be approved, and says exactly what
+    /// was recorded.
+    ///
+    /// [listed] is the hash the listing printed, and nothing is approved unless the setup is still
+    /// that document. What waits comes from the document, and one adopted between the listing and
+    /// this run, by the window's next reading for one, would have its values approved without
+    /// anybody having seen them.
+    private static int ApproveLaunch(AppModel app, string which, string? listed, TextWriter output)
+    {
+        if (listed is null)
+        {
+            output.WriteLine("Nothing was approved. List what waits with --command setup, then approve with the hash it prints: --approve-launch PATH --hash HASH.");
+            return Failed;
+        }
+        if (app.Config.Document?.Hash != listed)
+        {
+            output.WriteLine("Nothing was approved: the setup is no longer the one that listing showed. List what waits again with --command setup.");
+            return Failed;
+        }
+        var chosen = which == "all"
+            ? app.LaunchReview
+            : app.LaunchReview.Where(entry => entry.Path == which).ToList();
+        if (chosen.Count == 0)
+        {
+            output.WriteLine(app.LaunchReview.Count == 0
+                ? "Nothing waits for approval on this device."
+                : $"Nothing waits for approval at {which}. Waiting: {string.Join(", ", app.LaunchReview.Select(entry => entry.Path))}");
+            return Failed;
+        }
+        var approvable = chosen.Where(entry => entry.Approvable).ToList();
+        if (approvable.Count > 0 && app.ApproveLaunch(approvable) is { } problem)
+        {
+            output.WriteLine(problem);
+            return Failed;
+        }
+        foreach (var entry in approvable) output.WriteLine($"approved  {entry.Path}  {LaunchGate.Describe(entry.Scope, entry.Offered)}");
+        foreach (var entry in chosen.Where(entry => !entry.Approvable))
+        {
+            output.WriteLine($"refused   {entry.Path} cannot be approved: it holds a character a person could not see, a shape this app cannot quote, or a repository that is not owner/name. Revert it with --revert-launch {entry.Path}, or leave it.");
+        }
+        return approvable.Count == chosen.Count ? Ok : Failed;
+    }
+
+    /// Puts the value this device approved back at one path, as an ordinary edit that replicates.
+    private static int RevertLaunch(AppModel app, string path, TextWriter output)
+    {
+        if (app.LaunchReview.FirstOrDefault(entry => entry.Path == path) is not { } entry)
+        {
+            output.WriteLine($"Nothing waits for approval at {path}.");
+            return Failed;
+        }
+        if (!entry.CanRevert)
+        {
+            output.WriteLine($"This device approved nothing at {path} that it could put back. Approve the offered value, or leave it.");
+            return Failed;
+        }
+        if (app.RevertLaunch(entry) is { } problem)
+        {
+            output.WriteLine(problem);
+            return Failed;
+        }
+        output.WriteLine($"reverted  {path}  {LaunchGate.Describe(entry.Scope, entry.Approved)}");
+        output.WriteLine($"This device now holds revision {app.Config.Document?.Identity.RevisionNumber}, hash {app.Config.Document?.Hash}.");
         return Ok;
     }
 
@@ -437,17 +620,12 @@ public static class Runner
             output.WriteLine($"This device has no record of {id}, and the machine was not asked about an id it never got from here.");
             return NotKnown;
         }
-        output.WriteLine($"{tracked.Intent.Describe()}  {tracked.Outcome.ToString().ToLowerInvariant()}");
+        output.WriteLine($"{tracked.Intent.Describe()}  {tracked.Outcome.Wire()}");
         if (tracked.Phase is { } phase) output.WriteLine($"phase   {phase}");
         if (tracked.Message is { } message) output.WriteLine($"message {message}");
         if (!json && tracked.Output is { } commandOutput) output.WriteLine(commandOutput);
         if (json) output.WriteLine(JsonSerializer.Serialize(tracked, Indented));
-        return tracked.Outcome switch
-        {
-            OperationOutcome.Succeeded or OperationOutcome.Noop or OperationOutcome.Cancelled => Ok,
-            OperationOutcome.Failed or OperationOutcome.Expired or OperationOutcome.Conflict => Failed,
-            _ => NotKnown,
-        };
+        return ExitFor(tracked);
     }
 
     private static async Task<int> CancelAsync(AppModel app, CommandLine line, TextWriter output, CancellationToken token)
@@ -539,18 +717,60 @@ public static class Runner
     {
         var machine = Pick(app, line, output);
         if (machine is null) return Failed;
-        var plan = app.PlanWake(machine);
-        output.WriteLine(plan.Sentence(machine.Name));
-        foreach (var obstacle in plan.Obstacles) output.WriteLine($"  {obstacle}");
-        foreach (var offer in plan.OfferToWakeFirst) output.WriteLine($"  \"{offer}\" could be woken first, as a separate step.");
-        if (plan.IsEmpty) return Failed;
+        var tryOthers = line.Has("try-other-helpers");
+        var runAgain = line.Has("run-held-again");
+        if (tryOthers && runAgain)
+        {
+            output.WriteLine("--try-other-helpers and --run-held-again are two different choices. Give one of them.");
+            return Failed;
+        }
+        await app.ReleaseWakeHoldsAsync(machine, token);
+        var plan = app.PlanWake(machine, refreshPresence: true);
+        // There is one way past a hold at a time, and it is the one the window offers: with another
+        // helper to ask, asking it; with none, running the held command again. Asking the others
+        // past the only helper would run nothing, and leave the held command free to run again
+        // later without anyone having chosen that.
+        var others = plan.IsHeld ? app.PlanOtherHelpers(machine) : null;
+        var again = plan.IsHeld && others is null ? app.PlanRunAgain(machine) : null;
+        var choice = tryOthers && others is not null ? HoldChoice.OtherHelpers
+            : runAgain && again is not null ? HoldChoice.RunAgain
+            : HoldChoice.Stand;
+        var walked = choice switch
+        {
+            HoldChoice.OtherHelpers => others!,
+            HoldChoice.RunAgain => again!,
+            _ => plan,
+        };
+        output.WriteLine(walked.Sentence(machine.Name));
+        foreach (var obstacle in walked.Obstacles) output.WriteLine($"  {obstacle}");
+        foreach (var offer in walked.OfferToWakeFirst) output.WriteLine($"  \"{offer}\" could be woken first, as a separate step.");
+        if (choice == HoldChoice.RunAgain) output.WriteLine($"  {WakePlanner.RunAgainWarning(again!, machine.Name)}");
+        if (choice == HoldChoice.Stand && others is not null)
+        {
+            if (runAgain)
+            {
+                output.WriteLine($"  {WakePlanner.OtherHelperFirst(machine.Name)} Add --try-other-helpers for that.");
+                return Failed;
+            }
+            output.WriteLine("  A helper command run for it earlier may still be going. Add --try-other-helpers to run the other helpers' commands anyway.");
+        }
+        if (choice == HoldChoice.Stand && again is not null)
+        {
+            if (tryOthers)
+            {
+                output.WriteLine($"  {WakePlanner.NoOtherHelper(machine.Name)}");
+                output.WriteLine("  Add --run-held-again instead to run it again anyway, knowing it can then run twice.");
+                return Failed;
+            }
+            output.WriteLine($"  {WakePlanner.RunAgainWarning(again, machine.Name)} Add --run-held-again to run it again anyway.");
+        }
+        if (walked.IsEmpty) return Failed;
         if (!line.Has("yes"))
         {
             output.WriteLine("Add --yes to actually try it.");
             return Ok;
         }
-        var report = await app.WakeAsync(machine,
-            TimeSpan.FromSeconds(line.Number("patience") ?? 120), token);
+        var report = await app.WakeAsync(machine, choice, token);
         foreach (var attempt in report.Attempts) output.WriteLine($"  {attempt}");
         output.WriteLine(report.Sentence);
         return report.Confirmed ? Ok : NotKnown;
@@ -637,12 +857,19 @@ public static class Runner
         if (!line.Has("yes"))
         {
             var (bundle, problem) = AgentBundle.Load();
+            var goesBack = bundle is null ? null : AgentInstaller.GoesBack(bundle.Version, machine.Capabilities);
             output.WriteLine(bundle is null
                 ? problem!
-                : $"This build carries agent {bundle.Version}, verified against the release key. {machine.Name} answers {machine.Capabilities.Summary}. Add --yes to install.");
+                : goesBack is null
+                    ? $"This build carries agent {bundle.Version}, verified against the release key. {machine.Name} answers {machine.Capabilities.Summary}. Add --yes to install."
+                    : $"This build carries agent {bundle.Version}, verified against the release key, {goesBack} on {machine.Name}. "
+                      + (AgentVersions.IsOlder(bundle.Version, machine.Capabilities.Floor) ? "Going back lowers the machine's version floor to it. " : "")
+                      + "Add --allow-downgrade --yes to go back deliberately.");
             return bundle is null ? Failed : Ok;
         }
-        var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, token, line.Value("base"));
+        // Going back is a decision of its own: --yes alone never installs an older agent.
+        var outcome = await new AgentInstaller(new ProcessRunner()).InstallAsync(machine, token, line.Value("base"),
+            allowDowngrade: line.Has("allow-downgrade"));
         output.WriteLine(outcome.Report);
         return outcome switch
         {
@@ -658,6 +885,20 @@ public static class Runner
         output.WriteLine(availability.Sentence_);
         if (availability is UpdateAvailability.Ready ready && line.Has("yes"))
         {
+            // The helper counts the new build as working only once it has drawn its window. Where
+            // none can be drawn every update is undone, and with a window open the helper waits
+            // for it, and changes nothing, rather than swap it out from under it. Either way it is
+            // refused here, before anything is downloaded.
+            if (AppInstaller.CannotProveHealth() is { } headless)
+            {
+                output.WriteLine(headless);
+                return Failed;
+            }
+            if (InstanceLock.IsWindowOpen())
+            {
+                output.WriteLine("The window is open. Install the update from there, or quit it and run this again.");
+                return Failed;
+            }
             var review = app.BeginAppUpdateReview(ready);
             bool StillCurrent()
             {
@@ -666,15 +907,19 @@ public static class Runner
                 return false;
             }
             if (!StillCurrent()) return Failed;
-            var (bytes, downloadProblem) = await new AppUpdates().DownloadAsync(ready, token);
-            if (!StillCurrent()) return Failed;
-            if (bytes is null) { output.WriteLine(downloadProblem); return Failed; }
-            var installer = new AppInstaller();
-            var (staged, stageProblem) = installer.Stage(bytes, ready.Artifact.Name);
+            var installer = new AppInstaller { HealthWindow = app.Settings.UpdateHealthWindow };
+            var archive = installer.DownloadPath(ready.Artifact.Name);
+            var downloadProblem = await new AppUpdates().DownloadAsync(ready, archive, token);
+            // Staging is what deletes the archive, so an update that ends before it deletes it here.
+            if (!StillCurrent()) { installer.Discard(ready.Artifact.Name); return Failed; }
+            if (downloadProblem is not null) { installer.Discard(ready.Artifact.Name); output.WriteLine(downloadProblem); return Failed; }
+            var (staged, stageProblem) = installer.Stage(archive, ready.Artifact.Name);
             if (staged is null) { output.WriteLine(stageProblem); return Failed; }
             if (!StillCurrent()) return Failed;
             var (started, failure) = installer.Apply();
-            output.WriteLine(started ? "Verified update staged; the helper will replace and launch the app after this command exits. Completion is pending." : failure);
+            output.WriteLine(started
+                ? $"Verified update staged; the helper will replace and launch the app after this command exits. Completion is pending; the helper writes what it does to {installer.LogPath}."
+                : failure);
             return started ? NotKnown : Failed;
         }
         return availability is UpdateAvailability.Unavailable ? Failed : Ok;
@@ -700,7 +945,47 @@ public static class Runner
                 output.WriteLine($"Could not read {input}: {error.Message}");
                 return Failed;
             }
-            var (document, problem) = app.Config.ApplyEdit(text, $"applied from {Path.GetFileName(input)}");
+            // The file was read out from one revision and is applied as an edit of it. Over any
+            // other it would put back what that one held, a command reverted since included, and an
+            // edit approves what it changes. A file without a controller block says nothing about
+            // where it came from, so while a setup is applied it is taken only with --hash naming
+            // the one it was written against, as --command setup prints it.
+            var applied = app.Config.Document;
+            var readFrom = ControllerIdentity.From(Value.Parse(text)["controller"]);
+            var named = line.Value("hash");
+            if (applied is not null && !readFrom.HasIdentity && named is null)
+            {
+                output.WriteLine($"{input} has no controller block, so it does not say which setup it was read out from. Nothing was applied.");
+                output.WriteLine("Read it out again with --command edit --out PATH, or name the setup it was written against with --hash HASH.");
+                return Failed;
+            }
+            if ((named is not null && named != applied?.Hash)
+                || (applied is not null && readFrom.HasIdentity
+                    && (readFrom.Id != applied.Identity.Id || readFrom.RevisionNumber != applied.Identity.RevisionNumber
+                        || readFrom.UpdatedAt != applied.Identity.UpdatedAt
+                        || !readFrom.Lineage.SequenceEqual(applied.Identity.Lineage, StringComparer.Ordinal))))
+            {
+                // The hash of the setup applied now is what lets a file with no controller block
+                // through, so it is never printed for one: a person who named the setup they read
+                // it out from would only rerun with it. A file that carries an identity is checked
+                // against that too, and the hash gets it nowhere.
+                output.WriteLine(applied is null
+                    ? $"This device holds no setup for {input} to be an edit of. Nothing was applied."
+                    : readFrom.HasIdentity
+                        ? $"{input} was not read out from the setup this device holds now (revision {applied.Identity.RevisionNumber}, hash {applied.Hash}). Nothing was applied."
+                        : $"{input} was not written against the setup this device holds now. Nothing was applied.");
+                output.WriteLine("Read it out again with --command edit --out PATH, make the change there, and apply that.");
+                return Failed;
+            }
+            // The same refusals as the window's editor: an edit approves the commands it changes, so
+            // it may not change one that is waiting for approval.
+            var (document, problem, refused) = app.ApplyEdit(text, applied?.Hash, $"applied from {Path.GetFileName(input)}");
+            if (refused.Count > 0)
+            {
+                foreach (var refusal in refused) output.WriteLine(refusal.Sentence);
+                output.WriteLine("Nothing was applied. Approve or revert a waiting value with --command setup --approve-launch PATH --hash HASH or --revert-launch PATH.");
+                return Failed;
+            }
             if (document is null)
             {
                 output.WriteLine(problem ?? "The document was refused.");
@@ -727,33 +1012,31 @@ public static class Runner
     }
 
     /// This device's own settings. Never published, and never part of the document.
+    ///
+    /// Each flag is one change, applied to the bindings as the file holds them when they are
+    /// written, so a window that saved something else meanwhile keeps it.
     private static int Bindings(AppModel app, CommandLine line, TextWriter output)
     {
-        var bindings = app.Bindings;
-        var changed = false;
+        var changes = new List<Func<Config.Bindings, Config.Bindings>>();
 
         if (line.Value("device") is { } device)
         {
-            bindings = bindings with { DeviceName = device };
-            changed = true;
+            changes.Add(bindings => bindings with { DeviceName = device });
         }
         if (line.Has("clear-self"))
         {
-            bindings = bindings with { Self = null, LocalAgent = Array.Empty<string>() };
-            changed = true;
+            changes.Add(bindings => bindings with { Self = null, LocalAgent = Array.Empty<string>() });
         }
         if (line.Value("self") is { } self)
         {
-            bindings = bindings with { Self = new SelfBinding(self, line.Value("system") ?? bindings.Self?.System) };
-            changed = true;
+            changes.Add(bindings => bindings with { Self = new SelfBinding(self, line.Value("system") ?? bindings.Self?.System) });
         }
         if (line.Value("local-agent") is { } localAgent)
         {
-            bindings = bindings with
+            changes.Add(bindings => bindings with
             {
                 LocalAgent = localAgent.Split(' ', StringSplitOptions.RemoveEmptyEntries),
-            };
-            changed = true;
+            });
         }
         if (line.Value("local-agent-json") is { } localJson)
         {
@@ -762,34 +1045,33 @@ public static class Runner
                 var argv = JsonSerializer.Deserialize<string[]>(localJson);
                 if (argv is null || argv.Length == 0 || argv.Any(string.IsNullOrEmpty))
                     throw new JsonException("Use a nonempty JSON array of argv strings.");
-                bindings = bindings with { LocalAgent = argv };
-                changed = true;
+                changes.Add(bindings => bindings with { LocalAgent = argv });
             }
             catch (JsonException error) { output.WriteLine(error.Message); return Failed; }
         }
         if (line.Value("identity") is { } identity)
         {
-            bindings = bindings with { IdentityFile = identity };
-            changed = true;
+            changes.Add(bindings => bindings with { IdentityFile = identity });
         }
         if (line.Value("site") is { } site)
         {
-            bindings = bindings with { CurrentSite = site };
-            changed = true;
+            changes.Add(bindings => bindings with { CurrentSite = site });
         }
         if (line.Value("alias") is { } alias && line.Value("machine") is { } machineId)
         {
-            var machines = bindings.Machines.ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.Ordinal);
-            machines[machineId] = machines.TryGetValue(machineId, out var existing)
-                ? existing with { SshAlias = alias }
-                : new MachineBinding(null, alias);
-            bindings = bindings with { Machines = machines };
-            changed = true;
+            changes.Add(bindings =>
+            {
+                var machines = bindings.Machines.ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.Ordinal);
+                machines[machineId] = machines.TryGetValue(machineId, out var existing)
+                    ? existing with { SshAlias = alias }
+                    : new MachineBinding(null, alias);
+                return bindings with { Machines = machines };
+            });
         }
 
-        if (changed)
+        if (changes.Count > 0)
         {
-            var problem = app.UpdateBindings(bindings);
+            var problem = app.UpdateBindings(bindings => changes.Aggregate(bindings, (current, change) => change(current)));
             if (problem is not null)
             {
                 output.WriteLine(problem);
@@ -899,14 +1181,29 @@ public static class Runner
 
     private static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };
 
-    private static int ExitFor(CommandOutcome outcome) => outcome switch
+    /// The exit code `--command op` gives an operation this device tracks. A request a person
+    /// cancelled exits 0, as it always has: the contract calls it deferred, and the cancel is what
+    /// was asked for. Any other deferral, turned down while busy, by a policy or a lock, or expired
+    /// before the machine was idle, is known not to have acted and exits 1.
+    public static int ExitFor(TrackedOperation operation) => operation.Outcome switch
+    {
+        OperationOutcome.Succeeded => Ok,
+        OperationOutcome.Deferred when operation.ReasonCode == ReasonCode.Cancelled => Ok,
+        OperationOutcome.Failed or OperationOutcome.Deferred => Failed,
+        _ => NotKnown,
+    };
+
+    /// The exit code of a request's outcome. A request that turns out to have been cancelled, as a
+    /// replay of its id or a followed one can, exits 0 for the same reason as above.
+    public static int ExitFor(CommandOutcome outcome) => outcome switch
     {
         CommandOutcome.Done done => done.Outcome switch
         {
-            OperationOutcome.Succeeded or OperationOutcome.Noop or OperationOutcome.Cancelled => Ok,
-            OperationOutcome.Pending or OperationOutcome.Unresolved => NotKnown,
+            OperationOutcome.Succeeded => Ok,
+            OperationOutcome.Pending or OperationOutcome.Unknown => NotKnown,
             _ => Failed,
         },
+        CommandOutcome.Refused { ReasonCode: ReasonCode.Cancelled } => Ok,
         CommandOutcome.Queued or CommandOutcome.Following => Ok,
         CommandOutcome.NotKnown => NotKnown,
         _ => Failed,
@@ -942,7 +1239,7 @@ public static class Runner
         }
         if (status.Controller is { } mark)
         {
-            output.WriteLine($"setup      {mark.Hash?[..12] ?? "none"} revision {mark.RevisionNumber} from {mark.Provenance}");
+            output.WriteLine($"setup      {(mark.Hash is { } hash ? ReconcileOutcome.Short(hash) : "none")} revision {mark.RevisionNumber} from {mark.Provenance}");
         }
     }
 
@@ -1008,7 +1305,8 @@ public static class Runner
         legion-control [--smoke | --command <verb> [options]]
 
         With no arguments it opens its window. Everything below runs without one and exits:
-          0 it did what was asked, 1 it did not, 2 the outcome is not known.
+          0 it did what was asked, 1 it did not, 2 the outcome is not known. An operation a person
+          cancelled reads 0; one deferred, refused while busy or expired before it ran reads 1.
 
         Reading, and changing nothing:
           --smoke [--machine ID] [--json]     read the setup and every machine, and say what is wrong
@@ -1020,6 +1318,10 @@ public static class Runner
           --command bundle  [--machine ID] [--out FILE]
           --command op      --machine ID --op ID
           --command wake    --machine ID      what could wake it, in order; --yes to try
+                            [--try-other-helpers]  run the other helpers' commands while one may
+                                              still be running
+                            [--run-held-again]  with no other helper to ask, run the held one's
+                                              command again; it can then run twice
           --command trust   --machine ID [--route ID]  show the host keys; --accept to pin them
           --command edit    [--out FILE]      print or save the setup document
           --command bindings                  this device's own settings, which are never shared
@@ -1036,19 +1338,30 @@ public static class Runner
           --command cancel  --machine ID --op ID
           --command policy  --machine ID [--service ID] [--automatic on|off|inherit]
                             [--pause 4h | --resume] [--windows "mon,tue:02:00-06:00" | --windows none]
-          --command agent-install --machine ID [--yes]
+          --command agent-install --machine ID [--yes] [--allow-downgrade]
           --command app-update
 
         Changing this device's own settings, or the setup document:
           --command bindings [--device NAME] [--self MACHINE [--system ID]] [--clear-self]
                              [--local-agent "node /path/to/agent/src/index.mjs"]
                              [--identity ~/.ssh/key] [--site ID] [--machine ID --alias NAME]
-          --command edit --in FILE            apply an edited document as the next revision
+          --command edit --in FILE [--hash HASH]
+                                              apply an edited document as the next revision; a file
+                                              with no controller block needs the hash of the setup
+                                              it was written against
 
         The setup, when peers disagree. Each is a decision, and none of them happens on its own:
           --reconcile-once                    one pass: publish where behind, adopt where ahead
                                               (also spelled --command reconcile-once)
           --command setup --machine ID --merge | --keep-mine | --take-theirs | --replace-theirs
+
+        Commands from the shared setup run only once this device approved them:
+          --command setup                     lists what waits, beside what this device approved
+          --command setup --approve-launch PATH --hash HASH | --approve-launch all --hash HASH
+                                              approves what the listing with that hash showed there,
+                                              and prints what it recorded
+          --command setup --revert-launch PATH
+                                              puts the approved value back, as an edit that replicates
 
         Where things live:
           LEGION_CONTROL_CONFIG  the setup document to read

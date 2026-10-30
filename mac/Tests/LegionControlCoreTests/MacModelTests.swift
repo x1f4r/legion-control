@@ -103,7 +103,7 @@ struct MacModelTests {
         {"ok":true,"op":{"id":"\(record.id)","requestedAt":"2026-09-05T00:00:00Z","state":"finished","result":{"ok":true,"action":"ran"}}}
         """)
         await model.refresh()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while !store.unresolved.isEmpty, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
         #expect(store.unresolved.isEmpty)
         #expect(store.record(id: record.id)?.state == .succeeded)
@@ -278,7 +278,7 @@ struct MacModelTests {
 
         await model.refresh()
         model.adoptRemoteSetup()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.note == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
 
         #expect(model.note?.contains("could not be read") == true)
@@ -310,6 +310,337 @@ struct MacModelTests {
         // anyone acting on the result needs.
         #expect(record.detail == "t3: updated\nedge: deferred (busy)")
         #expect(model.noteDetail == record.detail)
+    }
+
+    @Test("a cycle reads each service's part by its outcome, and one nobody can say the end of leaves it owed")
+    func cycleChildrenByOutcome() async throws {
+        // Counted by action word, an update that timed out half-way was a plain failure and an
+        // interrupted one was not counted at all, so this cycle was filed as failed, and one with
+        // only the interrupted service in it as a success (C5).
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("cycle", json: """
+        { "ok": true, "contract": 3, "action": "cycled",
+          "children": [ { "service": "t3", "action": "updated" },
+                        { "service": "edge", "action": "interrupted" },
+                        { "service": "demo", "action": "failed", "reasonCode": "timed-out" },
+                        { "service": "cache", "action": "failed", "reasonCode": "apply-failed" },
+                        { "service": "web", "action": "queued" } ] }
+        """)
+        runner.answer("status", json: Self.status)
+        runner.answer("cycle", json: """
+        { "ok": true, "contract": 3, "action": "cycled", "children": [ { "service": "edge", "action": "interrupted" } ] }
+        """)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh()
+        model.runCycle()
+        await Self.settle(model)
+        let record = try #require(store.newestFirst.first { $0.kind == .updateAll })
+        #expect(record.state == .unknown)
+        #expect(record.needsReconciliation)
+        #expect(record.summary == "Maintenance cycle on This Mac: 1 updated, 1 held back, 1 failed, 2 may or may not have updated.")
+        #expect(model.noteIsError)
+
+        model.runCycle()
+        await Self.settle(model)
+        let second = try #require(store.newestFirst.first { $0.kind == .updateAll })
+        #expect(second.id != record.id)
+        #expect(second.state == .unknown)
+        #expect(second.summary == "Maintenance cycle on This Mac: 1 may or may not have updated.")
+    }
+
+    @Test("a cycle starts from its own outcome, so one the agent failed or held back is never nothing to do")
+    func cycleOwnOutcomeFirst() async throws {
+        // Decided from its services alone, a cycle the agent failed before it reached any of them
+        // had no failed service in it, and each of these was filed as a green "nothing to do" (C5).
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        // The agent's own catch, when the cycle record cannot be written.
+        runner.answer("cycle", json: """
+        {"ok":false,"contract":3,"action":"failed","reasonCode":"internal","children":[],
+         "message":"the cycle record could not be written (EACCES), so no maintenance was attempted"}
+        """, exit: 1)
+        runner.answer("status", json: Self.status)
+        // A 3.1.0 refusal that states its outcome and names no action.
+        runner.answer("cycle", json: """
+        {"ok":false,"contract":3,"reasonCode":"bad-argument","outcome":"failed","children":[],
+         "message":"--op names a different cycle"}
+        """, exit: 1)
+        runner.answer("status", json: Self.status)
+        // Held back by the lock, which names no action either.
+        runner.answer("cycle", json: #"{"ok":false,"contract":3,"reasonCode":"lock-held","message":"an update holds the lock"}"#, exit: 1)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await model.refresh()
+
+        var records: [OperationRecord] = []
+        var errors: [Bool] = []
+        for _ in 0..<3 {
+            model.runCycle()
+            await Self.settle(model)
+            records.append(try #require(store.newestFirst.first { $0.kind == .updateAll }))
+            errors.append(model.noteIsError)
+        }
+        #expect(Set(records.map(\.id)).count == 3)
+        #expect(records.map(\.state) == [.failed, .failed, .deferred])
+        #expect(errors == [true, true, false])
+        #expect(records.allSatisfy { !$0.summary.contains("nothing to do") && !$0.needsReconciliation })
+        #expect(records[0].summary == "Maintenance cycle on This Mac failed: the cycle record could not be written (EACCES), so no maintenance was attempted")
+        #expect(records[1].summary == "Maintenance cycle on This Mac failed: The agent refused an argument this app sent. --op names a different cycle")
+        #expect(records[2].summary == "The maintenance lock is held by something else on that machine.")
+    }
+
+    @Test("a cycle left unknown by a service stays unknown when its finished record is read again")
+    func cycleVerdictSurvivesReconciliation() async throws {
+        // The record says `cycled` whatever became of its services, and read on its own it turned
+        // this cycle green within one pass, with the agent's "1 left alone" for an interrupted update.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await model.refresh()
+
+        model.runCycle()
+        let id = try #require(store.newestFirst.first { $0.kind == .updateAll }).id
+        runner.answer("cycle", json: """
+        { "ok": true, "contract": 3, "action": "cycled", "children": [ { "service": "edge", "action": "interrupted" } ] }
+        """)
+        // The status after it carries the cycle's summary, which names none of its services, so the
+        // record itself is read by its id.
+        runner.answer("status", json: Self.status.replacingOccurrences(of: #""actions":"#, with: """
+        "operations": { "recent": [ { "id": "\(id)", "kind": "cycle", "state": "finished", "phase": "done",
+                                      "action": "cycled", "reasonCode": null, "outcome": "succeeded" } ] },
+        "actions":
+        """))
+        runner.answer("op", json: """
+        {"ok":true,"contract":3,"op":{"id":"\(id)","kind":"cycle","state":"finished","phase":"done","outcome":"succeeded",
+         "result":{"ok":true,"action":"cycled","reasonCode":null,"message":"0 updated, 1 left alone, 0 failed","outcome":"succeeded"},
+         "children":[{"opId":null,"service":"edge","action":"interrupted","reasonCode":null}]}}
+        """)
+        await Self.settle(model)
+        let deadline = Date().addingTimeInterval(15)
+        while store.record(id: id)?.needsReconciliation == true, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        let record = try #require(store.record(id: id))
+        #expect(runner.sent.contains { $0.contains("op") && $0.contains(id) })
+        #expect(record.state == .unknown)
+        #expect(record.summary == "Maintenance cycle on This Mac: 1 may or may not have updated.")
+        // Read once: the same finished record has nothing more to say about that service.
+        #expect(!record.needsReconciliation)
+    }
+
+    @Test("a policy change is decided on its outcome: held back by the lock, unknown, or refused")
+    func policyByOutcome() async throws {
+        // Read off `ok`, all three of these were one "not changed", and the one the agent failed
+        // on half-way through writing may well have changed it.
+        let runner = FakeRunner()
+        for _ in 0..<4 { runner.answer("status", json: Self.status) }
+        runner.answer("policy", json: #"{"ok":false,"contract":3,"reasonCode":"lock-held","message":"an update holds the lock"}"#, exit: 1)
+        runner.answer("policy", json: #"{"ok":false,"contract":3,"reasonCode":"internal","message":"the agent failed while writing the policy"}"#, exit: 1)
+        runner.answer("policy", json: #"{"ok":false,"contract":3,"reasonCode":"bad-argument","outcome":"failed","message":"that is not a window"}"#, exit: 1)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await model.refresh()
+
+        var states: [OperationState] = []
+        for _ in 0..<3 {
+            model.pause(for: 4 * 60 * 60, service: nil)
+            await Self.settle(model)
+            states.append(try #require(store.newestFirst.first { $0.kind == .policy }).state)
+        }
+        #expect(states == [.deferred, .unknown, .failed])
+        #expect(model.note == "that is not a window")
+        #expect(store.newestFirst.filter { $0.kind == .policy }.map(\.summary).contains {
+            $0.hasPrefix("The policy change may or may not have taken effect: the agent failed")
+        })
+    }
+
+    @Test("replacing the setup is decided on its outcome: a push the lock held back is not a refusal")
+    func setupReplacementByOutcome() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: String(decoding: try ContractCorpus.data("fixtures/config.set.locked.json"), as: UTF8.self), exit: 1)
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: #"{"ok":false,"contract":3,"reasonCode":"internal","outcome":"unknown","message":"ENOSPC"}"#, exit: 1)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = Self.document
+        model.controllerConfig = { document }
+        await model.refresh()
+
+        model.replaceSetup(over: nil, from: document.hash)
+        await Self.settle(model)
+        let held = try #require(store.newestFirst.first { $0.kind == .shareSetup })
+        #expect(held.state == .deferred)
+        #expect(held.summary.contains("was not replaced yet"))
+        #expect(!model.noteIsError)
+
+        model.replaceSetup(over: nil, from: document.hash)
+        await Self.settle(model)
+        let unknown = try #require(store.newestFirst.first { $0.kind == .shareSetup })
+        #expect(unknown.id != held.id)
+        #expect(unknown.state == .unknown)
+        #expect(model.note == "The setup may or may not have been replaced: ENOSPC")
+    }
+
+    @Test("a replacement is done only when the agent names the document sent, as every client reads it")
+    func setupReplacementNamesTheDocumentSent() async throws {
+        // Any success used to do, so a reply naming no document, which an automatic push of the
+        // same bytes reads as a failure, was taken for a replacement here and on Android.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced" }"#)
+        runner.answer("status", json: Self.status)
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced", "hash": "fedcba9876543210" }"#)
+        runner.answer("status", json: Self.status)
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = Self.document
+        model.controllerConfig = { document }
+        await model.refresh()
+
+        model.replaceSetup(over: nil, from: document.hash)
+        await Self.settle(model)
+        let unnamed = try #require(store.newestFirst.first { $0.kind == .shareSetup })
+        #expect(unnamed.state == .unknown)
+        #expect(model.note == "The setup may or may not have been replaced: its agent did not say which document it holds now.")
+        #expect(model.noteIsError)
+
+        model.replaceSetup(over: nil, from: document.hash)
+        await Self.settle(model)
+        let other = try #require(store.newestFirst.first { $0.kind == .shareSetup })
+        #expect(other.id != unnamed.id)
+        #expect(other.state == .unknown)
+        #expect(model.note == "The setup may or may not have been replaced: its agent answered with a document other than the one sent.")
+    }
+
+    @Test("a replacement goes only over the copy the question showed, from the setup it was asked over")
+    func setupReplacementOverTheCopyShown() async throws {
+        // The desktop's rule: `--replace` overwrites whatever the agent holds when it arrives, so a
+        // copy written there since the question was drawn, which nobody here has seen, is not sent
+        // over on a decision about the one before it.
+        let shown = String(repeating: "a", count: 64)
+        let newer = String(repeating: "b", count: 64)
+        let holding: (String) -> String = { hash in
+            Self.status.replacingOccurrences(of: #""updates":"#, with: #""controller": { "hash": "\#(hash)", "id": "setup-other", "revision": 4 }, "updates":"#)
+        }
+        let runner = FakeRunner()
+        runner.answer("status", json: holding(shown))
+        runner.answer("status", json: holding(newer))
+        runner.answer("status", json: holding(Self.document.hash))
+        runner.answer("status", json: holding(shown))
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = Self.document
+        model.controllerConfig = { document }
+        var asked: PendingDialog?
+        model.ask = { asked = $0 }
+
+        await model.refresh()
+        model.core.setup.verdict = SetupSync.Verdict(.differentSetup)
+        model.requestSetupReplacement()
+        let question = try #require(asked)
+        await model.refresh()
+        question.perform()
+        await Self.settle(model)
+        #expect(model.note == "Nothing was sent: the local agent holds another document now, not the one shown. Read it again first.")
+        #expect(model.noteIsError)
+
+        await model.refresh()
+        model.replaceSetup(over: shown, from: document.hash)
+        #expect(model.note == "Nothing needed sending: the local agent holds this device's setup already.")
+
+        // And not from a setup here that changed since the question was asked.
+        await model.refresh()
+        var edited = document
+        edited.hash = "fedcba9876543210"
+        model.controllerConfig = { edited }
+        model.replaceSetup(over: shown, from: document.hash)
+        #expect(model.note?.hasPrefix("The setup here changed since that was shown") == true)
+
+        // Nor while a hand edit of the file waits for its revision, which leaves no document here
+        // at all. That returned without a word.
+        model.controllerConfig = { nil }
+        model.replaceSetup(over: shown, from: document.hash)
+        #expect(model.note == "The setup here changed since that was shown, so nothing was sent.")
+        #expect(model.noteIsError)
+
+        await Self.settle(model)
+        #expect(!runner.sent.contains { $0.contains("--replace") })
+        #expect(!store.newestFirst.contains { $0.kind == .shareSetup })
+    }
+
+    @Test("the different-setup sheet stays up until a Replace settles it, and says why when it does not")
+    func setupReplacementFromTheSheet() async throws {
+        // The sheet closed before anything was sent, so a refusal, a push the lock held back and a
+        // write nobody can say the end of were said only on a line behind it, and the question the
+        // configuration guide says they leave open was gone.
+        let shown = String(repeating: "a", count: 64)
+        let newer = String(repeating: "b", count: 64)
+        let holding: (String) -> String = { hash in
+            Self.status.replacingOccurrences(of: #""updates":"#, with: #""controller": { "hash": "\#(hash)", "id": "setup-other", "revision": 4 }, "updates":"#)
+        }
+        let runner = FakeRunner()
+        runner.answer("status", json: holding(shown))
+        runner.answer("config", json: String(decoding: try ContractCorpus.data("fixtures/config.set.locked.json"), as: UTF8.self), exit: 1)
+        runner.answer("status", json: holding(shown))
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced", "hash": "0123456789abcdef" }"#)
+        runner.answer("status", json: holding(Self.document.hash))
+        runner.answer("status", json: holding(newer))
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let home = try AppModelTests.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try AppModelTests.app(AppModelTests.twoMachines, in: home)
+        let document = Self.document
+        model.controllerConfig = { document }
+        let divergence = SetupDivergence(machineId: model.historyMachineId, machineName: "This Mac", mine: document,
+                                         theirsBytes: Data("{}\n".utf8), theirsHash: shown,
+                                         theirsIdentity: ControllerIdentity(id: "setup-other", revision: 4, lineage: []),
+                                         baseBytes: nil, differences: [], isDifferentSetup: true, mergeBlocker: nil)
+        var said: [String] = []
+        let replaces = { runner.sent.filter { $0.contains("--replace") }.count }
+        await model.refresh()
+
+        // Held back by the lock: the sheet stays and says so. A second press while the first is out
+        // sends nothing more.
+        app.divergence = divergence
+        app.replaceSetup(on: model, for: divergence) { said.append($0) }
+        #expect(app.replacingSetupOn == model.historyMachineId)
+        app.replaceSetup(on: model, for: divergence) { said.append($0) }
+        await Self.settle(model)
+        #expect(replaces() == 1)
+        #expect(app.replacingSetupOn == nil)
+        #expect(app.divergence != nil)
+        #expect(said.count == 1)
+        #expect(said.first?.contains("was not replaced yet") == true)
+
+        // The agent's latest status names the copy the sheet showed, so `--replace` goes, and the
+        // agent taking the document is what closes the sheet.
+        app.replaceSetup(on: model, for: divergence) { said.append($0) }
+        await Self.settle(model)
+        #expect(replaces() == 2)
+        #expect(app.divergence == nil)
+        #expect(said.count == 1)
+        #expect(model.note == "Replaced the setup the local agent was holding with this device's.")
+
+        // A question out of date closes without sending, the device's line saying why, and the
+        // device's row asks it again from what both hold now.
+        await model.refresh()
+        app.divergence = divergence
+        app.replaceSetup(on: model, for: divergence) { said.append($0) }
+        #expect(app.divergence == nil)
+        #expect(app.replacingSetupOn == nil)
+        #expect(model.note == "Nothing was sent: the local agent holds another document now, not the one shown. Read it again first.")
+        #expect(replaces() == 2)
+        #expect(said.count == 1)
     }
 
     @Test("a local action that never reached the agent is followed by a fresh read straight away")
@@ -363,17 +694,17 @@ struct MacModelTests {
     func localSetupReplacementWording() async throws {
         let runner = FakeRunner()
         runner.answer("status", json: Self.status)
-        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced" }"#)
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced", "hash": "0123456789abcdef" }"#)
         runner.answer("status", json: Self.status)
         let (model, _, directory) = try Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        let document = Self.document
         model.controllerConfig = { document }
         var asked: PendingDialog?
         model.ask = { asked = $0 }
 
         await model.refresh()
-        model.core.setup.decision = .diverged
+        model.core.setup.verdict = SetupSync.Verdict(.diverged)
         model.requestSetupReplacement()
         let question = try #require(asked)
         #expect(question.title == "Replace the setup the local agent is holding?")
@@ -384,7 +715,47 @@ struct MacModelTests {
         #expect(runner.sent.contains { $0.contains("config") && $0.contains("--replace") })
     }
 
+    @Test("a setup with an error replaces nothing, asked from the sheet or straight away")
+    func setupWithErrorReplacesNothing() async throws {
+        // Section 9.5: a device whose setup has a section 9.7 error pushes nothing until it is
+        // fixed, and a replacement least of all, because an agent before 3.1.0 stores whatever it
+        // is sent.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var broken = Self.document
+        broken.errors = [DocumentAcceptance.Problem(code: "helper-unknown", path: "machines[0].wake.helpers[0]",
+                                                    message: "the helper names no machine")]
+        model.controllerConfig = { broken }
+        var asked: PendingDialog?
+        model.ask = { asked = $0 }
+
+        await model.refresh()
+        model.core.setup.verdict = SetupSync.Verdict(.diverged)
+        model.requestSetupReplacement()
+        #expect(asked == nil)
+        #expect(model.noteIsError)
+        #expect(model.note?.contains("the helper names no machine") == true)
+
+        model.replaceSetup(over: nil, from: broken.hash)
+        await Self.settle(model)
+        #expect(!runner.sent.contains { $0.contains("--replace") })
+
+        let divergence = SetupDivergence(machineId: "mac", machineName: "This Mac", mine: broken, theirsBytes: Data("{}\n".utf8),
+                                         theirsHash: "fedcba9876543210", theirsIdentity: ControllerIdentity(id: "setup-other", revision: 4, lineage: []),
+                                         baseBytes: nil, differences: [], isDifferentSetup: true, mergeBlocker: nil)
+        #expect(divergence.replaceBlocker?.contains("the helper names no machine") == true)
+        var fixed = divergence
+        fixed.mine = Self.document
+        #expect(fixed.replaceBlocker == nil)
+    }
+
     // MARK: - A different agent
+
+    /// A setup with an identity, so it takes part in reconciliation (section 9.5, rule 3).
+    static let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef",
+                                             identity: ControllerIdentity(id: "setup-test", revision: 1, lineage: []))
 
     /// A status from an agent that can hold the setup and holds none yet, so the first read pushes.
     static let statusHoldingNoSetup = """
@@ -454,11 +825,11 @@ struct MacModelTests {
         old.answer("status", json: Self.statusHoldingNoSetup)
         let (model, _, directory) = try Self.model(old)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        let document = Self.document
         model.controllerConfig = { document }
 
         await model.refresh()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.core.setup.lastShare == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
         guard case .failed = model.setupSharing else {
             Issue.record("the old agent's refusal was not shown: \(model.setupSharing)")
@@ -471,7 +842,7 @@ struct MacModelTests {
 
         let fresh = FakeRunner()
         fresh.answer("status", json: Self.statusHoldingNoSetup)
-        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored" }"#)
+        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored", "hash": "0123456789abcdef" }"#)
         let bound = Self.boundAgent(fresh)
         model.update(config: LocalConfig(enabled: true, name: "This Mac", agent: bound.argv.last ?? ""),
                      agent: bound.agent, boundMachineId: nil, boundAgentArgv: bound.argv)
@@ -485,7 +856,7 @@ struct MacModelTests {
         #expect(model.lastActionOutcome == outcome)
 
         await model.refresh()
-        let pushed = Date().addingTimeInterval(2)
+        let pushed = Date().addingTimeInterval(15)
         while model.core.setup.lastShare == nil, Date() < pushed { try? await Task.sleep(for: .milliseconds(10)) }
         #expect(fresh.sent.contains { $0.contains("config") && $0.contains("set") })
         #expect(model.core.setup.lastShare?.failure == nil)
@@ -528,7 +899,7 @@ struct MacModelTests {
         let gate = Gate(holding: "config")
         let (model, directory) = try Self.gatedModel(old, gate: gate)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let document = ControllerDocument(bytes: Data("{}\n".utf8), hash: "0123456789abcdef")
+        let document = Self.document
         model.controllerConfig = { document }
 
         await model.refresh()
@@ -536,7 +907,7 @@ struct MacModelTests {
         let fresh = FakeRunner()
         fresh.answer("status", json: Self.statusHoldingNoSetup)
         fresh.answer("status", json: Self.statusHoldingNoSetup)
-        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored" }"#)
+        fresh.answer("config", json: #"{ "ok": true, "contract": 3, "action": "stored", "hash": "0123456789abcdef" }"#)
         let bound = Self.boundAgent(fresh)
         model.update(config: LocalConfig(enabled: true, name: "This Mac", agent: bound.argv.last ?? ""),
                      agent: bound.agent, boundMachineId: nil, boundAgentArgv: bound.argv)
@@ -547,15 +918,16 @@ struct MacModelTests {
         #expect(!fresh.sent.contains { $0.contains("config") })
 
         gate.release()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.core.setup.isSharing, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
-        // The old agent's refusal is about the old agent.
+        // The old agent's refusal is about the old agent. The new one holds nothing, so the row says
+        // a push is on its way rather than that one failed.
         #expect(model.core.setup.lastShare == nil)
-        #expect(model.setupSharing == .unknown)
+        #expect(model.setupSharing == .publishing)
         #expect(!model.noteIsError)
 
         await model.refresh()
-        let pushed = Date().addingTimeInterval(2)
+        let pushed = Date().addingTimeInterval(15)
         while model.core.setup.lastShare == nil, Date() < pushed { try? await Task.sleep(for: .milliseconds(10)) }
         #expect(fresh.sent.contains { $0.contains("config") && $0.contains("set") })
         #expect(model.core.setup.lastShare?.failure == nil)

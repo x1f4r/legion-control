@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.x1f4r.legioncontrol.agent.AgentDeploymentPath
 import com.x1f4r.legioncontrol.agent.Contract
+import com.x1f4r.legioncontrol.agent.LaunchState
 import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.humanDuration
@@ -70,6 +71,8 @@ fun MachineSection(model: MachineModel, app: AppModel) {
         PlainAction("Details", true) { sheet = "Device details" }
     }
     model.wakeableHelper?.let { PlainAction("Wake helper first", !model.isWorking) { model.requestWakeHelper() } }
+    WakeHoldLine(model, app)
+    LaunchStateLines(model, app)
 
     OperationsBlock(model, showHistory = false)
     SectionHeading("Services")
@@ -117,7 +120,12 @@ fun MachineSection(model: MachineModel, app: AppModel) {
                 DetailRow("Address") { ValueText(model.route?.label, "not known") }
                 model.lastChecked?.let { checked -> DetailRow("Checked") { QuietText(localTime(checked)) } }
                 DetailRow("Setup") { SetupRow(model, app) }
-                model.setupNote?.let { QuietText(it) }
+                model.setupNote?.takeIf { it != model.setupHold }?.let { QuietText(it) }
+                // A refusal no retry can cure holds the push until the setup changes or this is pressed.
+                model.setupHold?.let { hold ->
+                    StatusLine(Mark.Attention, hold)
+                    Actions { PlainAction("Try again", enabled = !model.isWorking) { model.retrySetup() } }
+                }
                 model.status?.config?.problems.orEmpty().forEach { QuietText(listOfNotNull(it.path, it.message).joinToString(": ")) }
                 model.status?.notes.orEmpty().forEach { QuietText(it) }
                 WakeExplanation(model, app)
@@ -143,6 +151,33 @@ fun MachineSection(model: MachineModel, app: AppModel) {
     model.operationDetails?.let { details -> DetailSheet("Change details", model::dismissOperationDetails) {
         androidx.compose.foundation.text.selection.SelectionContainer { Text(details, style = MaterialTheme.typography.bodySmall) }
     } }
+}
+
+/**
+ * Each system that does not run the command the shared setup names, and why (contract section 9.9).
+ *
+ * Nothing at all for a machine whose every system runs what the setup says, which is the usual case.
+ */
+@Composable
+private fun LaunchStateLines(model: MachineModel, app: AppModel) {
+    val review = app.launchReview.collectAsStateSafely()
+    val systems = model.machine.systems.filter { it.launchState != LaunchState.APPROVED }
+    if (systems.isEmpty()) return
+    systems.forEach { system ->
+        // What the gate decided, in the words a command refused for this machine uses too. A command
+        // that waits and can only be reverted is not one to wait for.
+        val state = when {
+            system.launchState == LaunchState.APPROVED_WITH_CHANGE_WAITING ->
+                "Runs the approved command. A changed one is waiting for approval."
+
+            system.awaitsApproval -> "Not driven from this device until its command is approved."
+            else -> "Not driven from this device: the setup gives it no command this device can run."
+        }
+        StatusLine(Mark.Attention, if (model.machine.systems.size > 1) "${system.name}: $state" else state)
+    }
+    if (review.any { it.machineId == model.machine.id }) {
+        Actions { PlainAction("Review", enabled = true) { app.openLaunchReview() } }
+    }
 }
 
 private fun compactMachineState(model: MachineModel): String = when (val state = model.link) {
@@ -261,14 +296,23 @@ internal fun OperationsBlock(model: MachineModel, showHistory: Boolean = true) {
         }
         if (recentExpanded) {
             history.forEach { record ->
-                val mark = when (record.succeeded) {
-                    true -> Mark.Good
-                    false -> Mark.Bad
-                    null -> Mark.Unknown
+                val mark = when {
+                    record.succeeded == true -> Mark.Good
+                    record.succeeded == false -> Mark.Bad
+                    record.outcome == com.x1f4r.legioncontrol.agent.Outcome.DEFERRED -> Mark.Attention
+                    else -> Mark.Unknown
                 }
                 StatusLine(mark, record.summary, style = MaterialTheme.typography.bodySmall)
                 QuietText(localTime(record.updatedAt), Modifier.padding(start = 17.dp, bottom = 4.dp))
-                PlainAction("Details", enabled = !model.isWorking) { model.showOperation(record.id) }
+                Actions {
+                    PlainAction("Details", enabled = !model.isWorking) { model.showOperation(record.id) }
+                    // A new request with a new id, for a change that ended without doing anything
+                    // a second request could double and that can be asked for again exactly. It
+                    // waits, drawn but not pressable, while the reading on screen cannot say how.
+                    if (record.canTryAgain) {
+                        PlainAction("Try again", enabled = model.canTryAgain(record)) { model.retry(record) }
+                    }
+                }
             }
             finishedServer.forEach { summary -> OperationRow(model, summary) }
         }
@@ -279,12 +323,12 @@ internal fun OperationsBlock(model: MachineModel, showHistory: Boolean = true) {
 private fun OperationRow(model: MachineModel, summary: com.x1f4r.legioncontrol.agent.OpSummary) {
     val what = listOfNotNull(summary.opKind?.label ?: summary.kind, summary.subject).joinToString(" ")
     val outcome = summary.action ?: summary.state ?: "outcome unknown"
-    val mark = when {
-        summary.state == "queued" -> Mark.Idle
-        summary.state == "running" -> Mark.Busy
-        com.x1f4r.legioncontrol.agent.OpAction.fromWire(summary.action)?.isSuccess == true -> Mark.Good
-        summary.action == "failed" -> Mark.Bad
-        else -> Mark.Unknown
+    val mark = when (summary.effectiveOutcome) {
+        com.x1f4r.legioncontrol.agent.Outcome.PENDING -> if (summary.state == "queued") Mark.Idle else Mark.Busy
+        com.x1f4r.legioncontrol.agent.Outcome.SUCCEEDED -> Mark.Good
+        com.x1f4r.legioncontrol.agent.Outcome.FAILED -> Mark.Bad
+        com.x1f4r.legioncontrol.agent.Outcome.DEFERRED -> Mark.Attention
+        com.x1f4r.legioncontrol.agent.Outcome.UNKNOWN -> Mark.Unknown
     }
     StatusLine(mark, "$what: $outcome")
     if (summary.state == "finished") localTime(summary.updatedAt ?: summary.requestedAt)?.let { time ->
@@ -303,7 +347,6 @@ private fun OperationRow(model: MachineModel, record: OperationRecord) {
     val mark = when (record.state) {
         TrackedState.OUTCOME_UNKNOWN -> Mark.Unknown
         TrackedState.QUEUED -> Mark.Idle
-        TrackedState.AWAITING_DECISION -> Mark.Attention
         else -> Mark.Busy
     }
     Column(Modifier.padding(vertical = 2.dp)) {
@@ -320,8 +363,8 @@ private fun OperationRow(model: MachineModel, record: OperationRecord) {
             if (record.isCancellable) {
                 PlainAction("Cancel", enabled = true) { model.cancel(record) }
             }
-            if (record.retryable && record.isOver) {
-                PlainAction("Try again", enabled = !model.isWorking) { model.retry(record) }
+            if (record.state == TrackedState.OUTCOME_UNKNOWN && record.trackable) {
+                PlainAction("Check again", enabled = true) { model.checkAgain(record) }
             }
         }
     }
@@ -330,34 +373,73 @@ private fun OperationRow(model: MachineModel, record: OperationRecord) {
 /**
  * Why waking is or is not on offer, from where this device is standing.
  *
- * The sentence is worked out from the site rules rather than written here, because whether a
- * broadcast can reach a machine depends on which network this phone is on and on whether that
- * question can even be answered: two houses on the same router defaults look identical from here.
+ * The sentence is read off the plan a press would follow now, from this device's real addresses,
+ * rather than written here: whether a broadcast can reach a machine depends on which network this
+ * phone is on and on whether that question can even be answered, since two houses on the same
+ * router defaults look identical from here.
  */
 @Composable
 private fun WakeExplanation(model: MachineModel, app: AppModel) {
     if (!model.canWake || model.isAwake) return
-    val plan = com.x1f4r.legioncontrol.agent.planWake(
-        target = model.machine,
-        sites = app.sites,
-        siteMatch = app.siteMatch,
-        machines = app.machines.map { it.machine },
-        localAddresses = emptyList(),
-    )
-    val sentence = when (plan) {
-        is com.x1f4r.legioncontrol.agent.WakePlan.Direct -> plan.why
-        is com.x1f4r.legioncontrol.agent.WakePlan.ViaHelpers -> plan.why
-        is com.x1f4r.legioncontrol.agent.WakePlan.Impossible -> plan.reasons.joinToString(" ")
-        com.x1f4r.legioncontrol.agent.WakePlan.NotConfigured -> null
+    val plan = model.wakePlan ?: return
+    val direct = plan.steps.firstOrNull { it is com.x1f4r.legioncontrol.agent.WakeStep.Direct }
+    val helpers = plan.steps.count { it is com.x1f4r.legioncontrol.agent.WakeStep.Helper }
+    val where = plan.effective?.let { id -> app.sites.firstOrNull { it.id == id }?.displayName }
+    val sentence = when {
+        direct != null -> listOfNotNull(
+            where?.let { "This device is on $it, so it sends the wake packet itself." }
+                ?: "This device is on ${model.machine.name}'s network, so it sends the wake packet itself.",
+            if (helpers > 0) "Then ${helpers.helpersAsked()}." else null,
+        ).joinToString(" ")
+
+        helpers > 0 -> "This device is not on ${model.machine.name}'s network, so ${helpers.helpersAsked()}."
+        plan.skipped.any { it.reason == com.x1f4r.legioncontrol.agent.WakeSkip.Reason.AMBIGUOUS } ->
+            app.siteMatch.explain()
+
+        else -> "Nothing can wake ${model.machine.name} from here: this device is not on its network and " +
+            "no helper can be asked."
     }
-    sentence?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
+    QuietText(sentence, Modifier.padding(top = 2.dp))
 
     model.wakeableHelper?.let { helper ->
-        val name = app.machines.firstOrNull { it.machine.id == helper.machineId }?.machine?.name
-            ?: helper.machineId
+        val name = app.machines.firstOrNull { it.machine.id == helper }?.machine?.name ?: helper
         Actions {
             PlainAction("Wake $name first", enabled = !model.isWorking) { model.requestWakeHelper() }
         }
+    }
+}
+
+private fun Int.helpersAsked(): String = if (this == 1) "one helper is asked" else "$this helpers are asked in turn"
+
+/**
+ * A wake hold on this machine, while there is one (contract section 10.2): a helper's command may
+ * still be running, and no other command helper is asked until its record is read finished.
+ * Releasing it is a person's decision and nothing else's.
+ */
+@Composable
+private fun WakeHoldLine(model: MachineModel, app: AppModel) {
+    val holds = model.wakeHolds
+    if (holds.isEmpty()) return
+    val helpers = holds.map { hold ->
+        app.machines.firstOrNull { it.machine.id == hold.machineId }?.machine?.name ?: hold.machineName
+    }.distinct()
+    StatusLine(
+        Mark.Attention,
+        "A wake command on ${helpers.joinToString(" and ")} may still be running. Other command helpers " +
+            "wait until it is known.",
+    )
+    // With another helper to ask, the way past is asking it; with none, it is running the held
+    // command again, after a question that says it may then run twice.
+    when (val offer = model.wakeHoldOffer) {
+        MachineModel.WakeHoldOffer.OtherHelpers -> Actions {
+            PlainAction("Try the other helpers", enabled = !model.isWorking) { model.requestTryOtherHelpers() }
+        }
+
+        is MachineModel.WakeHoldOffer.RunAgain -> Actions {
+            PlainAction(offer.label, enabled = !model.isWorking) { model.requestRunHeldAgain() }
+        }
+
+        null -> Unit
     }
 }
 

@@ -5,11 +5,28 @@
 // reboots. A reboot that was not verifiably armed is refused, because rebooting
 // an unarmed machine just returns to the system it was already on, and the
 // controller apps would then sit waiting for one that never comes.
+//
+// Every command that arms, and a target's own verify command, goes through the
+// mutation runner, so a deadline stops the whole command before the reply says
+// anything about the firmware. Reading the firmware back changes nothing and
+// stays on the plain runner.
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { describeFailure, detectPlatform, runArgv, runCommand, sleep } from './config.mjs';
+import { detectPlatform } from './paths.mjs';
+import { describeFailure, runArgv, runCommand, runMutation, runMutationArgv, sleep } from './process-runner.mjs';
+
+/**
+ * How long a configured arm command gets, and its verify; a command that
+ * dispatches a reboot or prepares a suspend; and the suspend itself. Arming a
+ * firmware entry runs a few commands of up to 20 seconds each, which is never
+ * longer than an arm and its verify.
+ */
+export const ARM_COMMAND_MS = 60000;
+export const ARM_VERIFY_MS = 30000;
+export const DISPATCH_COMMAND_MS = 20000;
+export const SUSPEND_COMMAND_MS = 30000;
 
 // ---------------------------------------------------------------------------
 // efi-bootnext
@@ -83,12 +100,12 @@ export function resolveEfiEntry(matchSource) {
   return matchEfiEntry(listing.entries, matchSource);
 }
 
-function armEfiBootNext(target) {
+async function armEfiBootNext(target) {
   const resolved = resolveEfiEntry(target.match);
   if (!resolved.ok) return { ok: false, message: resolved.message };
 
   const number = resolved.entry.number;
-  const set = runCommand('sudo', ['-n', 'efibootmgr', '--bootnext', number], { timeoutMs: 20000 });
+  const set = await runMutation('sudo', ['-n', 'efibootmgr', '--bootnext', number], { timeoutMs: 20000 });
   if (!set.ok) return { ok: false, message: `could not set BootNext=${number}: ${describeFailure(set)}` };
 
   const verify = readEfiBootManager();
@@ -117,14 +134,14 @@ function readBootSequence() {
   return { ok: true, value: line ? line.replace(/^\s*bootsequence\s*/i, '').trim() : null, message: null };
 }
 
-function armClearBootSequence() {
+async function armClearBootSequence() {
   const before = readBootSequence();
   if (!before.ok) return { ok: false, message: `could not read {fwbootmgr}: ${before.message}` };
   if (!before.value) {
     return { ok: true, message: 'bootsequence was already clear; the next boot falls through BootOrder' };
   }
 
-  const cleared = runCommand('bcdedit', ['/deletevalue', '{fwbootmgr}', 'bootsequence'], { timeoutMs: 20000 });
+  const cleared = await runMutation('bcdedit', ['/deletevalue', '{fwbootmgr}', 'bootsequence'], { timeoutMs: 20000 });
   if (!cleared.ok) return { ok: false, message: `could not clear bootsequence: ${describeFailure(cleared)}` };
 
   const after = readBootSequence();
@@ -132,8 +149,8 @@ function armClearBootSequence() {
   return { ok: true, message: 'cleared {fwbootmgr} bootsequence; the next boot falls through BootOrder' };
 }
 
-function armBootSequence(target) {
-  const set = runCommand('bcdedit', ['/set', '{fwbootmgr}', 'bootsequence', target.entry], { timeoutMs: 20000 });
+async function armBootSequence(target) {
+  const set = await runMutation('bcdedit', ['/set', '{fwbootmgr}', 'bootsequence', target.entry], { timeoutMs: 20000 });
   if (!set.ok) return { ok: false, message: `could not set bootsequence: ${describeFailure(set)}` };
 
   const after = readBootSequence();
@@ -156,8 +173,8 @@ function readGrubNextEntry() {
   return { ok: true, value: match ? match[1].trim() : null, message: null };
 }
 
-function armGrubReboot(target) {
-  const set = runCommand('sudo', ['-n', 'grub-reboot', target.entry], { timeoutMs: 20000 });
+async function armGrubReboot(target) {
+  const set = await runMutation('sudo', ['-n', 'grub-reboot', target.entry], { timeoutMs: 20000 });
   if (!set.ok) return { ok: false, message: `grub-reboot failed: ${describeFailure(set)}` };
 
   const after = readGrubNextEntry();
@@ -186,7 +203,7 @@ function armGrubReboot(target) {
  * `boot --no-reboot` still arms it, because nothing is lost by trying when
  * nobody is about to close the session on the strength of it.
  */
-function armCommand(target, { requireVerification }) {
+async function armCommand(target, { requireVerification }) {
   if (!target.verify && requireVerification) {
     return {
       ok: false,
@@ -198,13 +215,13 @@ function armCommand(target, { requireVerification }) {
     };
   }
 
-  const armed = runArgv(target.arm, { timeoutMs: 60000 });
+  const armed = await runMutationArgv(target.arm, { timeoutMs: ARM_COMMAND_MS });
   if (!armed.ok) return { ok: false, verified: false, message: `the arm command failed: ${describeFailure(armed)}` };
 
   if (!target.verify) {
     return { ok: true, verified: false, message: `${target.id} armed (no verify command is configured, so this was not read back)` };
   }
-  const verified = runArgv(target.verify, { timeoutMs: 30000 });
+  const verified = await runMutationArgv(target.verify, { timeoutMs: ARM_VERIFY_MS });
   if (!verified.ok) {
     return { ok: false, verified: false, message: `the arm command ran but verification failed: ${describeFailure(verified)}` };
   }
@@ -227,19 +244,19 @@ export function findBootTarget(config, id) {
  * every path except `--no-reboot`. Every firmware method reads itself back
  * regardless; it only changes what a command-described target is allowed to do.
  */
-export function armNextBoot(config, id, { requireVerification = true } = {}) {
+export async function armNextBoot(config, id, { requireVerification = true } = {}) {
   const target = findBootTarget(config, id);
   if (!target) return { ok: false, verified: false, message: `unknown boot target: ${id}` };
 
   switch (target.method) {
     case 'efi-bootnext':
-      return { verified: true, ...armEfiBootNext(target) };
+      return { verified: true, ...(await armEfiBootNext(target)) };
     case 'clear-bootsequence':
-      return { verified: true, ...armClearBootSequence() };
+      return { verified: true, ...(await armClearBootSequence()) };
     case 'bootsequence':
-      return { verified: true, ...armBootSequence(target) };
+      return { verified: true, ...(await armBootSequence(target)) };
     case 'grub-reboot':
-      return { verified: true, ...armGrubReboot(target) };
+      return { verified: true, ...(await armGrubReboot(target)) };
     case 'command':
       return armCommand(target, { requireVerification });
     default:
@@ -264,6 +281,19 @@ function sudoAllows(args) {
   const any = runCommand('sudo', ['-n', '-v'], { timeoutMs: 10000 });
   if (any.ok) return { ok: true, message: null };
   return { ok: false, message: describeFailure(listed) };
+}
+
+/**
+ * Whether a reboot or suspend command took the request: it exited zero.
+ *
+ * These run on the plain runner, whose `ok` is false for a command that exited
+ * zero while something it started still held its output open at the timeout.
+ * For a reading that is no answer at all. For a reboot helper or a suspend
+ * command it is the request taken, and what holds the pipe is the work it
+ * handed on, as with a start command's daemon.
+ */
+function accepted(result) {
+  return result.code === 0;
 }
 
 /**
@@ -292,36 +322,36 @@ export function scheduleReboot(config) {
   // wants this done.
   const helper = config.boot?.rebootHelper;
   if (helper) {
-    const result = runArgv(helper, { timeoutMs: 20000 });
+    const result = runArgv(helper, { timeoutMs: DISPATCH_COMMAND_MS });
     return {
-      ok: result.ok,
+      ok: accepted(result),
       via: 'rebootHelper',
-      message: result.ok ? 'the configured reboot helper accepted the request' : describeFailure(result),
+      message: accepted(result) ? 'the configured reboot helper accepted the request' : describeFailure(result),
     };
   }
 
   const override = config.boot?.reboot;
   if (override) {
-    const result = runArgv(override, { timeoutMs: 20000 });
+    const result = runArgv(override, { timeoutMs: DISPATCH_COMMAND_MS });
     return {
-      ok: result.ok,
+      ok: accepted(result),
       via: 'boot.reboot',
-      message: result.ok ? 'the configured reboot command was accepted' : describeFailure(result),
+      message: accepted(result) ? 'the configured reboot command was accepted' : describeFailure(result),
     };
   }
 
   const current = detectPlatform();
   if (current === 'windows') {
-    const result = runCommand('shutdown', ['/r', '/t', '3'], { timeoutMs: 20000 });
-    return { ok: result.ok, via: 'shutdown', message: result.ok ? 'reboot scheduled in 3 s' : describeFailure(result) };
+    const result = runCommand('shutdown', ['/r', '/t', '3'], { timeoutMs: DISPATCH_COMMAND_MS });
+    return { ok: accepted(result), via: 'shutdown', message: accepted(result) ? 'reboot scheduled in 3 s' : describeFailure(result) };
   }
   if (current === 'mac') {
     const allowed = sudoAllows(['/sbin/shutdown', '-r', '+1']);
     if (!allowed.ok) {
       return { ok: false, via: null, message: `passwordless sudo will not run shutdown: ${allowed.message}` };
     }
-    const result = runCommand('sudo', ['-n', 'shutdown', '-r', '+1'], { timeoutMs: 20000 });
-    return { ok: result.ok, via: 'shutdown', message: result.ok ? 'reboot scheduled in 1 minute' : describeFailure(result) };
+    const result = runCommand('sudo', ['-n', 'shutdown', '-r', '+1'], { timeoutMs: DISPATCH_COMMAND_MS });
+    return { ok: accepted(result), via: 'shutdown', message: accepted(result) ? 'reboot scheduled in 1 minute' : describeFailure(result) };
   }
   if (current === 'linux') {
     const allowed = sudoAllows(['/usr/bin/systemctl', 'reboot']);
@@ -447,24 +477,24 @@ export async function suspendMachine(config) {
 
   const warnings = [];
   for (const command of sleepConfig.before ?? []) {
-    const result = runArgv(command, { timeoutMs: 20000 });
-    if (!result.ok) warnings.push(describeFailure(result));
+    const result = runArgv(command, { timeoutMs: DISPATCH_COMMAND_MS });
+    if (!accepted(result)) warnings.push(describeFailure(result));
   }
   if ((sleepConfig.before ?? []).length > 0 && sleepConfig.settle > 0) {
     await sleep(sleepConfig.settle * 1000);
   }
 
-  const result = runArgv(chosen.command, { timeoutMs: 30000 });
+  const result = runArgv(chosen.command, { timeoutMs: SUSPEND_COMMAND_MS });
   const label = path.basename(chosen.command[0]);
-  if (result.ok) {
-    const accepted = suspendAccepted(label);
+  if (accepted(result)) {
+    const wording = suspendAccepted(label);
     if (warnings.length > 0) {
       return {
         ok: true,
-        message: `${accepted}. Note: ${warnings.join('; ')}, so the machine may stay awake`,
+        message: `${wording}. Note: ${warnings.join('; ')}, so the machine may stay awake`,
       };
     }
-    return { ok: true, message: accepted };
+    return { ok: true, message: wording };
   }
   if (result.timedOut) {
     return { ok: false, message: `${result.command} never returned, so whether the machine is suspending is unknown` };

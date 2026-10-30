@@ -2,6 +2,7 @@ package com.x1f4r.legioncontrol.ui
 
 import android.content.Context
 import android.content.Intent
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -27,8 +29,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.x1f4r.legioncontrol.BuildConfig
 import com.x1f4r.legioncontrol.agent.MachineSystem
 import com.x1f4r.legioncontrol.data.DeviceBindings
@@ -219,44 +223,110 @@ private fun ThisDeviceBlock(app: AppModel, bindings: DeviceBindings, actions: Bi
 
 // MARK: - Notifications
 
+/**
+ * The setting, and Android's permission beside it, because the second can be taken back in the
+ * system settings at any time without this app being told. The permission is read again every time
+ * the app comes back to the front, which is where somebody returns from those settings.
+ */
 @Composable
 private fun NotificationsBlock(app: AppModel) {
     val context = LocalContext.current
     var enabled by remember { mutableStateOf(app.notificationsEnabled) }
+    var permitted by remember { mutableStateOf(app.notificationsPermitted()) }
+    // Android answered no. Asked again, it may not even show its question, so this says where the
+    // answer can be changed instead of leaving a switch that does nothing.
+    var refused by remember { mutableStateOf(false) }
+    LifecycleResumeEffect(Unit) {
+        permitted = app.notificationsPermitted()
+        onPauseOrDispose { }
+    }
     val request = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
+        permitted = granted
+        refused = !granted
         enabled = granted
         app.notificationsEnabled = granted
+    }
+    val state = NotificationState.of(enabled, permitted)
+
+    fun turn(wanted: Boolean) {
+        when {
+            !wanted -> {
+                enabled = false
+                app.notificationsEnabled = false
+            }
+
+            permitted -> {
+                enabled = true
+                app.notificationsEnabled = true
+            }
+
+            else -> request.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
 
     SectionHeading("Telling you when it is done")
     ExplanationText(
         "An update, a restart or an action you asked for can take minutes. With this on, the app " +
-            "says how it ended even if you have put the phone away. Nothing else is ever announced.",
+            "says how it ended if you have put the phone away. Nothing else is ever announced.",
     )
+    // One element, a switch with its name and its state, the same as every other switch here.
     Row(
-        Modifier.fillMaxWidth().defaultMinSize(minHeight = 60.dp).padding(vertical = 8.dp),
+        Modifier
+            .fillMaxWidth()
+            .defaultMinSize(minHeight = 60.dp)
+            .toggleable(value = state == NotificationState.ON, role = Role.Switch, onValueChange = ::turn)
+            .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
             Text("Finished changes", style = MaterialTheme.typography.bodyLarge)
             QuietText(
-                if (enabled) "On." else "Off. Turning it on asks Android for permission once.",
+                when {
+                    state == NotificationState.ON -> "On."
+                    state == NotificationState.BLOCKED -> "On here, but Android is not letting this app post them."
+                    refused -> "Off. Android did not allow it."
+                    else -> "Off. Turning it on asks Android for permission once."
+                },
                 Modifier.padding(top = 2.dp),
             )
         }
         Spacer(Modifier.width(12.dp))
-        Switch(
-            checked = enabled,
-            onCheckedChange = { wanted ->
-                if (!wanted) {
-                    enabled = false
-                    app.notificationsEnabled = false
-                } else {
-                    request.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                }
-            },
+        Switch(checked = state == NotificationState.ON, onCheckedChange = null)
+    }
+    if (state == NotificationState.BLOCKED || refused) {
+        Actions {
+            PlainAction("Open notification settings", enabled = true) { openNotificationSettings(context) }
+        }
+    }
+}
+
+/** What the notification setting comes to once Android has had its say. */
+internal enum class NotificationState {
+    OFF,
+    ON,
+
+    /** On here, and refused by Android, so nothing is posted until it is allowed again there. */
+    BLOCKED,
+    ;
+
+    companion object {
+        fun of(enabled: Boolean, permitted: Boolean): NotificationState = when {
+            !enabled -> OFF
+            permitted -> ON
+            else -> BLOCKED
+        }
+    }
+}
+
+/** This app's page in the system's notification settings, the one place a refusal is undone. */
+private fun openNotificationSettings(context: Context) {
+    runCatching {
+        context.startActivity(
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
         )
     }
 }
@@ -436,7 +506,29 @@ private fun SetupBlock(app: AppModel, onEdit: () -> Unit = app::openEditor) {
             "same way. Neither can quietly undo the other.",
     )
 
+    // The document in force stays in force with these, and is published nowhere until they are fixed.
+    app.setupErrors.firstOrNull()?.let { problem ->
+        Spacer(Modifier.height(8.dp))
+        StatusLine(Mark.Bad, "This setup has an error, so it is not sent to any machine until it is fixed")
+        QuietText(problem.message, Modifier.padding(top = 2.dp))
+    }
     app.advisories.forEach { QuietText(it, Modifier.padding(top = 4.dp)) }
+
+    // The badge stays while anything waits, whether or not the review was put off for now.
+    val review = app.launchReview.collectAsStateSafely()
+    if (review.isNotEmpty()) {
+        Spacer(Modifier.height(8.dp))
+        StatusLine(
+            Mark.Attention,
+            if (review.size == 1) {
+                "A command from the shared setup waits for approval on this device"
+            } else {
+                "${review.size} commands from the shared setup wait for approval on this device"
+            },
+        )
+        Actions { PlainAction("Review", enabled = true, emphasis = true) { app.openLaunchReview() } }
+    }
+    app.launchProblem.collectAsStateSafely()?.let { StatusLine(Mark.Bad, it) }
 
     Actions {
         PlainAction(
@@ -512,6 +604,7 @@ private fun HistoryBlock(app: AppModel) {
  *
  * Every machine carries the document, so one address is enough to get all of it. The key is this
  * phone's own and has to be authorised on that system already, exactly as for every other command.
+ * What comes back is shown, every command in it, and applied only once it is confirmed.
  */
 @Composable
 fun FetchSetupBlock(app: AppModel) {
@@ -548,6 +641,7 @@ fun FetchSetupBlock(app: AppModel) {
         ) { app.fetchSetup() }
     }
     app.fetchOutcome?.let { QuietText(it, Modifier.padding(top = 2.dp)) }
+    EnrolmentSummary(app)
 }
 
 /** The systems by name, or a general word for them when there is no configuration yet. */

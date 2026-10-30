@@ -16,6 +16,7 @@ struct MachineSection: View {
                 VStack(alignment: .leading, spacing: 12) { heading; deviceActions }
             }
             hostKeyBlock
+            launchBlock
             if case .conflict = model.setupSharing { setupVerdict }
             unresolvedBlock
             operationsBlock
@@ -86,6 +87,51 @@ struct MachineSection: View {
         }
     }
 
+    /// Which of this machine's commands are waiting for approval here, and what runs meanwhile.
+    ///
+    /// The machine's own state line says what it is doing, and from that alone a system nothing is
+    /// sent to looks like one that is simply not answering.
+    @ViewBuilder
+    private var launchBlock: some View {
+        let waiting = app.launchReview.filter { $0.location.machineId == model.id }
+        if !waiting.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(waiting) { entry in
+                    StatusText(symbol: "exclamationmark.shield", text: Self.launchLine(entry, on: model.machine), tint: .orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Button("Review…") { app.reviewLaunch() }
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    /// The line for one of `machine`'s waiting values, which says what runs meanwhile. `machine` is
+    /// the gated one the section draws.
+    static func launchLine(_ entry: LaunchReviewEntry, on machine: Machine) -> String {
+        switch entry.location {
+        case .system(_, let systemId):
+            // The entry is read from the document's bytes and the machine from its typed reading.
+            // When the two disagree about a system, a repeated key say, the gate has nothing of that
+            // id to drive, so nothing is sent to it, and the line names it as the document does.
+            guard let system = machine.system(id: systemId) else {
+                return "The command for \(LaunchValues.visible(systemId)) is waiting for approval. Nothing is sent to it from this device."
+            }
+            let prefix = machine.systems.count > 1 ? "\(system.name): " : ""
+            switch system.launchState {
+            case .approvedWithChangeWaiting:
+                return prefix + "Runs the approved command. A changed one is waiting for approval."
+            case .approved, .notDriven:
+                return prefix + "Not driven from this device until its command is approved."
+            }
+        case .identityFile:
+            return "Its identity file is waiting for approval. This device offers the one it approved, or none."
+        case .repo, .local:
+            // Neither belongs to a machine, so the block never draws one; said plainly all the same.
+            return "A value from the shared setup is waiting for approval on this device."
+        }
+    }
+
     private var deviceState: String {
         if let reboot = model.rebootInProgress, !model.isAwake { return "Restarting into \(reboot.target.name)" }
         switch model.link {
@@ -128,7 +174,7 @@ struct MachineSection: View {
                 Button("Sleep") { model.requestSleep() }.disabled(model.isWorking || model.commandableSystem == nil)
             } else if model.canWake {
                 Button(model.isWaking ? "Waking…" : "Wake") { model.wake() }
-                    .disabled(model.isWorking || model.wakePlan.isEmpty)
+                    .disabled(model.isWorking || !model.canTryWaking)
             }
             if !model.bootTargets.isEmpty || (!model.isAwake && model.canWake) {
                 Menu(model.isAwake ? "Restart" : "Wake into") {
@@ -139,7 +185,7 @@ struct MachineSection: View {
                         }
                     } else {
                         ForEach(model.machine.systems) { system in
-                            Button(system.name) { model.wake(into: system) }.disabled(model.isWorking || model.wakePlan.isEmpty)
+                            Button(system.name) { model.wake(into: system) }.disabled(model.isWorking || !model.canTryWaking)
                         }
                     }
                 }.fixedSize()
@@ -234,6 +280,12 @@ struct MachineSection: View {
             Text("not shared: this agent cannot carry the setup").foregroundStyle(.secondary)
         case .failed(let sentence):
             StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
+        case .held(let sentence):
+            VStack(alignment: .leading, spacing: 8) {
+                StatusText(symbol: "pause.circle", text: sentence, tint: .secondary)
+                Button("Try again") { model.tryAgainSharingSetup() }
+                    .controlSize(.small)
+            }
         case .conflict(let sentence):
             VStack(alignment: .leading, spacing: 8) {
                 StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
@@ -256,7 +308,7 @@ struct MachineSection: View {
         if let route = model.lastRoute { parts.append(route.label) }
         else if let target = model.machine.sshTarget { parts.append(target.display) }
         if let site = model.machine.site.flatMap({ app.config.config?.site(id: $0) }) { parts.append(site.name) }
-        if let wake = model.machine.wake { parts.append(wake.mac) }
+        if let mac = model.machine.wake?.mac { parts.append(mac) }
         return parts.isEmpty ? "not known" : parts.joined(separator: ", ")
     }
 
@@ -497,11 +549,11 @@ struct MachineSection: View {
             FlowRow(spacing: 10) {
                 if model.canWake {
                     Button(model.isWaking ? "Waking" : "Wake") { model.wake() }
-                        .disabled(model.isWorking || model.isAwake || model.wakePlan.isEmpty)
+                        .disabled(model.isWorking || model.isAwake || !model.canTryWaking)
                     ForEach(model.machine.systems) { system in
                         if !model.isAwake {
                             Button("Wake into \(system.name)") { model.wake(into: system) }
-                                .disabled(model.isWorking || model.wakePlan.isEmpty)
+                                .disabled(model.isWorking || !model.canTryWaking)
                         }
                     }
                 }
@@ -541,33 +593,47 @@ struct MachineSection: View {
                         Text("\(index + 1). Send the packet from this device to \(broadcasts.joined(separator: ", ")).")
                             .font(.callout)
                             .foregroundStyle(.secondary)
-                    case .helper(let helper, let machineName):
+                    case .helper(let helper, let machineName, _):
                         Text("\(index + 1). Ask \(machineName) to run \(helper.action).")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
                 }
 
-                ForEach(plan.unavailable) { unavailable in
+                ForEach(plan.skipped) { skip in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("\(unavailable.what): \(unavailable.reason)")
+                        Text("\(skip.what): \(skip.why)")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        if let first = unavailable.wakeableFirst,
-                           let helper = helperModel(named: first) {
-                            Button("Wake \(first) first") { helper.wake() }
+                        if skip.reason == .asleep, let id = skip.machine, plan.offerWakeFirst.contains(id),
+                           let helper = app.machine(id: id) {
+                            Button("Wake \(helper.name) first") { helper.wake() }
                                 .controlSize(.small)
+                                .disabled(helper.isWorking)
                         }
                     }
+                }
+
+                // A hold is released by evidence, or by a person who has looked and decided. With
+                // another helper to ask, the way past is asking it; with none, it is running the held
+                // command again, after a question that says it may then run twice.
+                switch model.wakeHoldOffer {
+                case .otherHelpers:
+                    Button("Try the other helpers") { model.requestTryOtherHelpers() }
+                        .controlSize(.small)
+                        .disabled(model.isWorking)
+                        .help("A helper may still be running its command for \(model.name). The others are asked, and that one is not run again.")
+                case .runAgain(let label, _):
+                    Button(label) { model.requestRunHeldAgain() }
+                        .controlSize(.small)
+                        .disabled(model.isWorking)
+                case nil:
+                    EmptyView()
                 }
             }
             .padding(.top, 10)
         }
-    }
-
-    private func helperModel(named name: String) -> MachineModel? {
-        app.machines.first { $0.name == name }
     }
 
     private var powerNote: String {
@@ -641,9 +707,16 @@ struct MachineSection: View {
                                restricted: model.commandableSystem?.isRestricted == true || model.status?.isRestrictedSession == true,
                                send: { try await model.serviceConfig($0) })
             if AgentBundle.shared != nil {
-                Button("Install agent \(AgentBundle.shared?.version ?? "")") { afterSheet { model.installBundledAgent() } }
-                    .disabled(model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true
-                              || model.status?.isRestrictedSession == true || model.legacyInstallRefusal != nil)
+                // An older agent is never offered as an install. Going back is its own question,
+                // offered only where the agent can be told it is meant.
+                if model.bundledAgentGoesBack == nil {
+                    Button("Install agent \(AgentBundle.shared?.version ?? "")") { afterSheet { model.installBundledAgent() } }
+                        .disabled(model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true
+                                  || model.status?.isRestrictedSession == true || model.legacyInstallRefusal != nil)
+                } else if model.canGoBackToBundledAgent {
+                    Button("Go back to agent \(AgentBundle.shared?.version ?? "")…") { afterSheet { model.requestBundledAgentDowngrade() } }
+                        .disabled(model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true)
+                }
             } else {
                 Button("Install agent") { }
                     .disabled(true)
@@ -655,6 +728,8 @@ struct MachineSection: View {
             QuietNote(text: AgentBundle.unavailableReason).padding(.top, 12)
         } else if let refusal = model.legacyInstallRefusal {
             QuietNote(text: refusal).padding(.top, 12)
+        } else if let goesBack = model.bundledAgentGoesBack, !model.canGoBackToBundledAgent {
+            QuietNote(text: "\(goesBack), so it is not installed from here.").padding(.top, 12)
         }
 
         if let doctor = model.doctor {

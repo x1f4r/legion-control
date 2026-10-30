@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.data
 
 import android.content.Context
+import com.x1f4r.legioncontrol.agent.Contract
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,7 +60,7 @@ class BindingsStore(context: Context) {
     /** Null clears it, which puts the app back to working the site out from the addresses. */
     fun setCurrentSite(siteId: String?) {
         prefs.edit().apply {
-            if (siteId.isNullOrBlank()) remove(KEY_CURRENT_SITE) else putString(KEY_CURRENT_SITE, siteId)
+            if (siteId == null || !keepsCurrentSite(siteId)) remove(KEY_CURRENT_SITE) else putString(KEY_CURRENT_SITE, siteId)
         }.apply()
         _bindings.value = read()
     }
@@ -69,8 +70,17 @@ class BindingsStore(context: Context) {
         currentSite = prefs.getString(KEY_CURRENT_SITE, null)?.takeIf { it.isNotBlank() },
     )
 
-    private companion object {
-        const val KEY_DEVICE_NAME = "device-name"
-        const val KEY_CURRENT_SITE = "current-site"
+    companion object {
+        private const val KEY_DEVICE_NAME = "device-name"
+        private const val KEY_CURRENT_SITE = "current-site"
+
+        /**
+         * Whether [name] is a device name this store keeps: the bindings schema's non-empty string,
+         * once trimmed as [setDeviceName] trims it.
+         */
+        fun keepsDeviceName(name: String): Boolean = name.trim().isNotEmpty()
+
+        /** Whether [siteId] is a site choice this store keeps: a token, as the bindings schema has it. */
+        fun keepsCurrentSite(siteId: String): Boolean = Contract.isToken(siteId)
     }
 }

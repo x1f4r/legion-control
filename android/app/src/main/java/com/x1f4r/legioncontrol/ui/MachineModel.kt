@@ -7,10 +7,15 @@ import androidx.compose.runtime.setValue
 import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentAction
 import com.x1f4r.legioncontrol.agent.AgentDeploymentPath
+import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.AgentStatus
+import com.x1f4r.legioncontrol.agent.SetupPeerState
 import com.x1f4r.legioncontrol.agent.Contract
 import com.x1f4r.legioncontrol.agent.DoctorReport
 import com.x1f4r.legioncontrol.agent.EndpointDiagnosis
+import com.x1f4r.legioncontrol.agent.FailureKind
+import com.x1f4r.legioncontrol.agent.HelperState
+import com.x1f4r.legioncontrol.agent.HoldChoice
 import com.x1f4r.legioncontrol.agent.InterruptRequest
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.MachineSystem
@@ -19,34 +24,40 @@ import com.x1f4r.legioncontrol.agent.OpSummary
 import com.x1f4r.legioncontrol.agent.OperationIntent
 import com.x1f4r.legioncontrol.agent.OperationRecord
 import com.x1f4r.legioncontrol.agent.PolicyPatch
+import com.x1f4r.legioncontrol.agent.RetryRequest
+import com.x1f4r.legioncontrol.agent.ServiceNaming
 import com.x1f4r.legioncontrol.agent.ServiceStatus
 import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.UpdateRequest
-import com.x1f4r.legioncontrol.agent.WakeHelper
+import com.x1f4r.legioncontrol.agent.WakeHold
 import com.x1f4r.legioncontrol.agent.WakePlan
-import com.x1f4r.legioncontrol.agent.helperFailure
-import com.x1f4r.legioncontrol.agent.planWake
+import com.x1f4r.legioncontrol.agent.isHeld
+import com.x1f4r.legioncontrol.agent.otherHelpers
 import com.x1f4r.legioncontrol.agent.resolveSystem
+import com.x1f4r.legioncontrol.agent.retryRequest
+import com.x1f4r.legioncontrol.agent.runAgain
+import com.x1f4r.legioncontrol.agent.runsAgain
 import com.x1f4r.legioncontrol.data.SiteConfig
-import com.x1f4r.legioncontrol.net.SiteMatch
+import com.x1f4r.legioncontrol.net.LocalAddress
+import com.x1f4r.legioncontrol.net.onNetwork
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.util.UUID
 
 /**
  * One machine, as the screen knows it, and the only thing that talks to that machine's agent.
  *
- * It polls while the screen is on and not one moment longer. A phone is not a desk: there is no
- * service, no worker, no alarm and nothing left running in the background. When the app is put away
- * these stop dead, which is why [startPolling] and [stopPolling] are driven straight from the
- * activity's resume and pause rather than from a composable that might outlive the visible screen.
+ * It polls while the screen is on and not one moment longer. A phone is not a desk: nothing polls,
+ * no worker and no alarm, once the app is put away. Polling stops dead then, which is why
+ * [startPolling] and [stopPolling] are driven straight from the activity's resume and pause rather
+ * than from a composable that might outlive the visible screen.
  *
  * Changes are the exception, and deliberately so: an update the user asked for runs on the
- * application scope through [OperationCenter], because locking the phone is not withdrawing the
- * request. What stops is the asking, not the doing.
+ * application scope through [OperationCenter], held in the foreground by [ChangeService] until it
+ * settles, because locking the phone is not withdrawing the request. What stops is the asking, not
+ * the doing.
  */
 @Stable
 class MachineModel(
@@ -97,6 +108,7 @@ class MachineModel(
         data class OfferForceBoot(val target: MachineSystem, override val message: String) : Dialog {
             override val title get() = "Switch to ${target.name} anyway?"
             override val confirmLabel get() = "Switch anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         data class ConfirmRestart(
@@ -120,6 +132,7 @@ class MachineModel(
         ) : Dialog {
             override val title get() = "Restart ${service.displayName} anyway?"
             override val confirmLabel get() = "Restart anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         data class OfferForceUpdate(
@@ -128,6 +141,7 @@ class MachineModel(
         ) : Dialog {
             override val title get() = "Update ${service.displayName} anyway?"
             override val confirmLabel get() = "Update anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         data class ConfirmSleep(val machineName: String, val busyReason: String?) : Dialog {
@@ -144,6 +158,7 @@ class MachineModel(
         data class OfferForceSleep(override val message: String) : Dialog {
             override val title get() = "Put it to sleep anyway?"
             override val confirmLabel get() = "Sleep anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         data class ConfirmRun(val action: AgentAction, override val message: String) : Dialog {
@@ -154,6 +169,7 @@ class MachineModel(
         data class OfferForceRun(val action: AgentAction, override val message: String) : Dialog {
             override val title get() = "${action.displayName} anyway?"
             override val confirmLabel get() = "Run it anyway"
+            override val alternativeLabel get() = "When it is idle"
         }
 
         /**
@@ -213,6 +229,30 @@ class MachineModel(
                     "separate decision."
             override val confirmLabel get() = "Wake $helperName"
         }
+
+        /**
+         * Asking the other helpers past the wake holds on a machine (contract section 10.2). A held
+         * command may still be running, so the other helpers' commands run beside it; the held one
+         * is not run again. Only a person ever decides that.
+         */
+        data class ConfirmTryOtherHelpers(val targetName: String, val helperNames: List<String>) : Dialog {
+            override val title get() = "Try the other helpers for $targetName?"
+            override val message
+                get() = "A wake command asked of ${helperNames.joinToString(" and ")} has not said how it " +
+                    "ended, so it may still be running. Trying the other helpers runs their commands, and " +
+                    "does not run that one again."
+            override val confirmLabel get() = "Try them"
+        }
+
+        /**
+         * Running a held command again because no other helper could be asked (contract section
+         * 10.2). The first run may still be going, and this can make it two.
+         */
+        data class ConfirmRunHeldAgain(val targetName: String, val label: String, val warning: String) : Dialog {
+            override val title get() = "$label for $targetName?"
+            override val message get() = warning
+            override val confirmLabel get() = "Run it again"
+        }
     }
 
     private var pollJob: Job? = null
@@ -244,13 +284,12 @@ class MachineModel(
 
     private var messageGeneration = 0L
     private var lastMessage by mutableStateOf(MachineMessage())
-    private var operationRecords by mutableStateOf(operations.records.value)
 
-    init {
-        scope.launch {
-            operations.records.collect { operationRecords = it }
-        }
-    }
+    /**
+     * Every record, read through the state the screen observes. Everything this model says about
+     * changes is derived from this one read, so what draws it follows the records as they move.
+     */
+    private val operationRecords: List<OperationRecord> get() = operations.observed
 
     var statusLine: String
         get() = lastMessage.resolve(operationRecords).line
@@ -279,13 +318,18 @@ class MachineModel(
     var bundleText: String? by mutableStateOf(null)
         private set
 
-    /** What this machine says about waking, worked out from where this device is standing. */
-    var wakeExplanation: String by mutableStateOf("")
+    /**
+     * A helper that could itself be woken, by machine id: one the last wake skipped as asleep that
+     * has a wake of its own. Offered as a separate press, and never pressed on anybody's behalf.
+     */
+    var wakeableHelper: String? by mutableStateOf(null)
         private set
 
-    /** A helper that could itself be woken, offered as a separate press after a failed wake. */
-    var wakeableHelper: WakeHelper? by mutableStateOf(null)
-        private set
+    /**
+     * How the last status read of this machine failed, when it did: what decides whether it is
+     * asleep or of no use as a wake helper (contract section 10.2). Null after an answer.
+     */
+    private var lastFailure: FailureKind? = null
 
     var knownServices: List<RememberedService> by mutableStateOf(settings.services(client.machine.id))
         private set
@@ -303,8 +347,12 @@ class MachineModel(
     private var rebootUntil: Long = 0L
     private var sleepUntil: Long = 0L
 
-    /** The setup hashes already asked about, so a diverged machine is not interrogated on a loop. */
-    private val askedAboutSetup = mutableSetOf<String>()
+    /**
+     * What this device remembers about this machine's copy of the setup: the guardrails and the meta
+     * it filed (contract section 9.5). Kept by the setup sync rather than here, so it outlives this
+     * model when a new document rebuilds every machine.
+     */
+    private val setupState: SetupPeerState = setup.state(machine.id)
 
     val isWorking: Boolean get() = activity != null
 
@@ -337,9 +385,7 @@ class MachineModel(
 
     // Read Compose state here so a skipped child row observes the same refresh as the main pane.
     val abilities: AgentAbilities
-        get() = status?.takeIf { it.ok != false }?.let {
-            AgentAbilities.of(it).copy(verbs = client.abilities.verbs)
-        } ?: client.abilities
+        get() = status?.takeIf { it.ok != false }?.let { AgentAbilities.of(it) } ?: client.abilities
 
     /** Whether this machine's agent speaks the contract this build was written against. */
     val speaksV3: Boolean get() = abilities.speaksV3
@@ -349,12 +395,21 @@ class MachineModel(
     /** What this machine's last handover of the setup did, while that is still news. */
     val setupNote: String? get() = setup.noteFor(machine.id, now)
 
+    /** Why this device's setup is not being sent to this machine, while it is not. */
+    val setupHold: String? get() = setup.holdFor(machine.id)
+
+    /** "Try again" on a held setup: sent once more on the next check. */
+    fun retrySetup() {
+        setup.retry(machine.id)
+        refreshNow()
+    }
+
     val actions: List<AgentAction> get() = runnableActions(status?.actions)
 
     /** Every change this app has asked this machine for, newest first. */
-    val history: List<OperationRecord> get() = operations.forMachine(machine.id)
+    val history: List<OperationRecord> get() = operationRecords.filter { it.machineId == machine.id }
 
-    val pending: List<OperationRecord> get() = operations.pendingFor(machine.id)
+    val pending: List<OperationRecord> get() = history.filter { it.isPending }
 
     /** What the agent says it is running or has queued, which may include other devices' work. */
     val agentOperations: List<OpSummary>
@@ -440,6 +495,7 @@ class MachineModel(
             isRefreshingVisibly = true
         }
         try {
+            val sentAt = System.currentTimeMillis()
             val result = client.status()
             replyGeneration = messageGeneration
             if (lastMessage.operationId != null || duringAction || startedGeneration != replyGeneration) {
@@ -452,12 +508,13 @@ class MachineModel(
                 onSuccess = { reply ->
                     if (reply.ok == false) {
                         status = reply
+                        lastFailure = null
                         link = LinkState.Offline(reply.message ?: "the agent reported a failure")
                         statusLine = "The control agent reported a problem."
                         statusIsError = true
                         statusDetail = reply.message ?: reply.error
                     } else {
-                        applyReading(reply)
+                        applyReading(reply, sentAt)
                         reconcileSetup(reply)
                         if (userInitiated && startedGeneration == messageGeneration) {
                             statusLine = "Status refreshed."
@@ -475,7 +532,15 @@ class MachineModel(
         }
     }
 
-    private fun applyReading(reply: AgentStatus) {
+    private fun applyReading(reply: AgentStatus, sentAt: Long) {
+        lastFailure = null
+        // An authenticated answer from this machine, asked for after a wake hold on it was recorded,
+        // is the one thing about the machine itself that releases the hold (contract section 10.2).
+        operations.releaseWakeHolds(
+            machine.id,
+            before = sentAt,
+            reason = "${machine.name} answered, so no wake of it is waiting on this any more.",
+        )
         val system = machine.resolveSystem(reply.systemId, reply.systemName, reply.osName)
             ?: currentSystem
         if (system == null) {
@@ -510,15 +575,11 @@ class MachineModel(
      *
      * Every peer edits, so every poll is also a reconciliation. Only two things happen without
      * asking, and both are along strict descent: push when this device's copy was made from theirs,
-     * fetch when theirs was made from this device's. Everything else stops at a person.
+     * fetch when theirs was made from this device's. Everything else stops at a person. Nothing is
+     * pushed while this device has an action in flight here or the status lists one running.
      */
     private suspend fun reconcileSetup(reply: AgentStatus) {
-        val note = setup.reconcile(
-            client = client,
-            reportedHash = reply.controller?.hash,
-            speaksV3 = reply.speaksV3,
-            asked = askedAboutSetup,
-        )
+        val note = setup.reconcile(client, reply, localMutation = isWorking, state = setupState)
         if (note != null) setup.remember(machine.id, note)
     }
 
@@ -535,6 +596,7 @@ class MachineModel(
 
     private fun describeFailure(error: Throwable) {
         val state = error.toLinkState()
+        lastFailure = (error as? AgentFailure)?.kind
         link = state
         status = null
         statusDetail = error.rawDetail
@@ -577,191 +639,192 @@ class MachineModel(
     // MARK: - Waking
 
     /**
-     * Wakes this machine, from here if that is possible and through a helper if it is not.
+     * What this machine's last status read says about it as a wake helper (contract section 10.2):
+     * not driven when no system of it is approved here, unknown until it has been read this
+     * session, ready with the kinds of the actions it listed after an answer, and asleep or of no
+     * use after a failure, by the kind of failure.
+     */
+    val helperState: HelperState
+        get() = HelperState.of(
+            driven = machine.problem == null && machine.systems.any { it.isDriven },
+            read = lastChecked != null,
+            answer = status?.takeIf { link is LinkState.Online },
+            failure = lastFailure,
+        )
+
+    /**
+     * Reads this machine once, for a wake that is about to ask it to help, and says what it found.
+     * A read already under way is waited for rather than doubled.
+     */
+    internal suspend fun readForWake(): HelperState {
+        while (isRefreshing) delay(READ_WAIT_MS)
+        refresh(userInitiated = false, duringAction = true)
+        return helperState
+    }
+
+    /** The wake holds on this machine: helper actions run to wake it whose results are not known. */
+    val wakeHolds: List<OperationRecord>
+        get() = operationRecords.filter { it.wakeTarget == machine.id && it.holdsWake }.sortedBy { it.startedAt }
+
+    /**
+     * Wakes this machine: directly when this device is on its network, then through its helpers in
+     * order (contract section 10.2).
      *
-     * W2. The order is fixed and the failures are explained rather than retried: a packet sent at
-     * the wrong house is not a packet that will work if sent again, and a helper that is itself
-     * asleep is a second machine somebody has to decide to start.
+     * The failures are explained rather than retried: a packet sent at the wrong house is not a
+     * packet that will work if sent again, and a helper that is itself asleep is a second machine
+     * somebody has to decide to start.
      */
     private var wakeTarget: MachineSystem? = null
 
-    fun wake(target: MachineSystem? = null) {
+    fun wake(target: MachineSystem? = null, choice: HoldChoice = HoldChoice.STAND) {
         if (isWorking) return
+        if (machine.wake == null) {
+            statusLine = "${machine.name} has no wake configuration."
+            statusIsError = true
+            return
+        }
         wakeTarget = target
-        val plan = planWake(
-            target = machine,
-            sites = fleet.sites,
-            siteMatch = fleet.siteMatch,
-            machines = fleet.machines,
-            localAddresses = fleet.localAddresses,
-        )
-        when (plan) {
-            WakePlan.NotConfigured -> {
-                statusLine = "${machine.name} has no wake configuration."
+        wakeableHelper = null
+        runTask(Task.WAKE, "Waking ${machine.name}") {
+            // Held for the whole walk rather than step by step: a phone locked between a packet and
+            // the readiness polls after it would come back to a walk that stopped halfway, and then
+            // carry on asking the next helper long after anybody wanted the machine up.
+            val ending = operations.held {
+                WakeWalk(
+                    target = client,
+                    fleet = fleet,
+                    operations = operations,
+                    poll = {
+                        refreshQuietly()
+                        isAwake
+                    },
+                    progress = { statusLine = it },
+                ).run(choice)
+            }
+            if (ending.answered) {
+                awoke()
+            } else if (ending.refusal != null) {
+                statusLine = ending.refusal
                 statusIsError = true
-            }
-
-            is WakePlan.Impossible -> {
-                statusLine = "Cannot wake ${machine.name} from here."
+                statusDetail = null
+            } else {
+                statusLine = if (ending.tried) "${machine.name} did not come up." else "Cannot wake ${machine.name} from here."
                 statusIsError = true
-                statusDetail = plan.reasons.joinToString(" ")
-                wakeableHelper = null
-            }
-
-            is WakePlan.Direct -> runTask(Task.WAKE, "Waking ${machine.name}") {
-                statusLine = "Wake packet sent. ${plan.why} Waiting for ${machine.name} to answer."
-                val problem = client.sendWakePacket(plan.broadcasts, plan.prefixes)
-                if (problem != null) {
-                    statusLine = "The wake packet could not be sent."
-                    statusIsError = true
-                    statusDetail = problem
-                }
-                val answered = problem == null && awaitWake()
-                if (!answered && machine.wake?.helpers.orEmpty().isNotEmpty()) {
-                    statusLine = "Direct wake did not produce an authenticated reply. Trying the configured helpers."
-                    wakeViaHelpers(machine.wake?.helpers.orEmpty())
-                }
-            }
-
-            is WakePlan.ViaHelpers -> runTask(Task.WAKE, "Waking ${machine.name}") {
-                statusLine = "${plan.why} Asking ${plan.helpers.size} helper" +
-                    (if (plan.helpers.size == 1) "" else "s") + "."
-                wakeViaHelpers(plan.helpers)
+                statusDetail = ending.lines.joinToString("\n")
+                wakeableHelper = ending.offerWakeFirst.firstOrNull()
             }
         }
+    }
+
+    /** Asks before [tryOtherHelpers], because nothing but a person ever releases a hold. */
+    fun requestTryOtherHelpers() {
+        val holds = wakeHolds
+        if (isWorking || holds.isEmpty()) return
+        val names = holds.map { hold -> nameOf(hold.machineId) ?: hold.machineName }
+        dialog = Dialog.ConfirmTryOtherHelpers(machine.name, names.distinct())
     }
 
     /**
-     * Walks the helpers in order.
-     *
-     * A helper whose reply is lost is not simply tried again, and that distinction matters: a `wol`
-     * action is the agent sending a UDP packet, which is the same however many times it happens, but
-     * a `command` action is somebody's script and running it twice is running it twice. So an
-     * ambiguous general command stops the walk until its recorded outcome is known.
+     * "Try the other helpers": a person's decision to wake this machine through the helpers its
+     * wake holds keep back, other than the held ones, whose commands are not run again. The holds
+     * are released, so the next wake asks every helper; the held records stay and are still
+     * followed. With no other helper to ask, nothing is released and the line says so.
      */
-    private suspend fun wakeViaHelpers(helpers: List<WakeHelper>) {
-        val attempts = mutableListOf<String>()
-        for (helper in helpers) {
-            val helperClient = fleet.client(helper.machineId)
-            val helperName = fleet.machines.firstOrNull { it.id == helper.machineId }?.name
-                ?: helper.machineId
-            if (helperClient == null) {
-                attempts += "$helperName is not in this setup."
-                continue
-            }
-            if (fleet.helperAwake(helper.machineId) == false) {
-                attempts += "$helperName is asleep or unreachable."
-                continue
-            }
-            statusLine = "Asking $helperName to wake ${machine.name}."
-            val operationId = UUID.randomUUID().toString()
-            val helperAction = fleet.action(helper.machineId, helper.actionId)
-            val outcome = helperClient.run(
-                actionId = helper.actionId,
-                request = InterruptRequest(),
-                operationId = operationId,
-            )
-            val result = outcome.getOrNull()
-            if (result?.effectiveAction == "ran") {
-                statusLine = "$helperName sent the packet. Waiting for ${machine.name}."
-                statusDetail = result.effectiveOutput
-                if (awaitWake()) return
-                attempts += "$helperName sent the packet, but ${machine.name} did not answer."
-                continue
-            }
+    fun tryOtherHelpers() {
+        if (isWorking) return
+        wake(wakeTarget, HoldChoice.OTHER_HELPERS)
+    }
 
-            val failure = outcome.exceptionOrNull()
-            if (failure?.dispatchStage?.mayHaveRun == true ||
-                (result != null && (result.op?.state in listOf("queued", "running") || result.effectiveAction == null))) {
-                val settled = if (helperClient.abilities.speaksV3) {
-                    helperClient.operation(operationId, waitSeconds = 20).getOrNull()
+    /** Asks before [runHeldAgain], with what running a held command a second time can cost. */
+    fun requestRunHeldAgain() {
+        val offer = wakeHoldOffer as? WakeHoldOffer.RunAgain ?: return
+        if (isWorking) return
+        dialog = Dialog.ConfirmRunHeldAgain(machine.name, offer.label, offer.warning)
+    }
+
+    /**
+     * Runs the held commands again because a person chose to, knowing the first run may still be
+     * going. Only ever when no other helper could be asked instead.
+     */
+    fun runHeldAgain() {
+        if (isWorking) return
+        wake(wakeTarget, HoldChoice.RUN_AGAIN)
+    }
+
+    /** The way past the wake holds a person is offered, as every client offers it (contract section 10.2). */
+    sealed interface WakeHoldOffer {
+        /** Another helper could be asked: asking it is the way past. */
+        data object OtherHelpers : WakeHoldOffer
+
+        /** None could: running the held command again is, after a warning. */
+        data class RunAgain(val label: String, val warning: String) : WakeHoldOffer
+    }
+
+    /**
+     * What a person may do about the holds that keep a helper back now, or null when none does, or
+     * when no way past them would ask anybody.
+     */
+    val wakeHoldOffer: WakeHoldOffer?
+        get() {
+            machine.wake ?: return null
+            val holds = wakeHolds.map { hold -> WakeHold(hold.machineId, hold.intent.actionId.orEmpty()) }
+            if (holds.isEmpty()) return null
+            val walk = WakeWalk(client, fleet, operations, poll = { false }, progress = {})
+            val held = walk.plan(holds)
+            if (!held.isHeld) return null
+            val unheld = walk.plan(emptyList())
+            if (otherHelpers(held, unheld, holds) != null) return WakeHoldOffer.OtherHelpers
+            val again = runAgain(held, unheld, holds) ?: return null
+            val names = again.runsAgain(holds).map { nameOf(it) ?: it }
+            return WakeHoldOffer.RunAgain(runAgainLabel(names), runAgainWarning(names, machine.name))
+        }
+
+    private fun nameOf(machineId: String): String? = fleet.machines.firstOrNull { it.id == machineId }?.name
+
+    /**
+     * The plan a press of Wake would follow now, for the sentence beside the button. The holds come
+     * from [wakeHolds], so the sentence follows a hold being recorded or released.
+     */
+    val wakePlan: WakePlan?
+        get() = machine.wake?.let {
+            WakeWalk(client, fleet, operations, poll = { false }, progress = {})
+                .plan(wakeHolds.map { hold -> WakeHold(hold.machineId, hold.intent.actionId.orEmpty()) })
+        }
+
+    /** The machine answered after a wake, and a boot that was asked for with it goes ahead. */
+    private fun awoke() {
+        statusLine = "${machine.name} is awake."
+        statusIsError = false
+        statusDetail = null
+        rebootTarget = null
+        sleepUntil = 0L
+        wakeTarget?.let { target ->
+            if (currentSystem?.id != target.id) {
+                if (currentSystem != null) {
+                    requestBoot(target)
                 } else {
-                    null
+                    statusLine = "${machine.name} answered, but its running system is unknown."
+                    statusIsError = true
                 }
-                when {
-                    settled?.result?.action == "ran" -> {
-                        statusLine = "$helperName sent the packet. Waiting for ${machine.name}."
-                        statusDetail = settled.result.output
-                        if (awaitWake()) return
-                        attempts += "$helperName sent the packet, but ${machine.name} did not answer."
-                    }
-
-                    settled?.isFinished == true -> attempts +=
-                        "$helperName's wake action finished as ${settled.result?.action ?: "failed"}."
-
-                    helperAction?.isIdempotent == true -> attempts +=
-                        "$helperName may have sent its idempotent wake packet, but the result is not known."
-
-                    else -> {
-                        statusLine = "$helperName may have run \"${helper.actionId}\"."
-                        statusIsError = true
-                        statusDetail = "Its operation $operationId could not be reconciled. A general " +
-                            "helper command is not run again and no later helper is tried until its " +
-                            "outcome is known."
-                        return
-                    }
-                }
-                continue
-            }
-
-            if (failure != null) {
-                attempts += "$helperName ${failure.sentence.removeSuffix(".")}."
-            } else {
-                attempts += "$helperName ran \"${helper.actionId}\" and it " +
-                    "${result?.effectiveAction ?: "did not report success"}."
             }
         }
-
-        if (attempts.isNotEmpty()) {
-            // Even a lost reply may have sent a packet, so it is worth looking before giving up.
-            if (awaitWake()) return
-            val failure = helperFailure(machine, attempts, fleet.machines, helpers)
-            statusLine = "Cannot wake ${machine.name} from here."
-            statusIsError = true
-            statusDetail = failure.reasons.joinToString(" ")
-            wakeableHelper = helpers.firstOrNull { helper ->
-                fleet.machines.firstOrNull { it.id == helper.machineId }?.wake != null
-            }
-        }
+        wakeTarget = null
     }
 
-    /** Whether the machine started answering. A packet leaving is not a machine waking. */
-    private suspend fun awaitWake(): Boolean {
-        val answered = client.waitForWake()
-        if (answered) {
-            statusLine = "${machine.name} is awake."
-            statusIsError = false
-            rebootTarget = null
-            sleepUntil = 0L
-            refreshQuietly()
-            wakeTarget?.let { target ->
-                if (currentSystem?.id != target.id) {
-                    if (currentSystem != null) requestBoot(target)
-                    else {
-                        statusLine = "${machine.name} answered, but its running system is unknown."
-                        statusIsError = true
-                    }
-                }
-            }
-            wakeTarget = null
-            return true
-        }
-        statusLine = "${machine.name} has not answered yet."
-        statusIsError = true
-        statusDetail = client.wakeProbeAddress?.let { "Nothing on $it within the wait." }
-        return false
-    }
+    /** Whether this machine is on this device's network: the test route order and direct wake share. */
+    private val isOnNetwork: Boolean
+        get() = onNetwork(machine.siteId, machine.wake?.lanPrefix, fleet.sites, fleet.localAddresses, fleet.currentSite).on
 
     /** Offers to wake the helper that could have woken this machine. Always a separate decision. */
     fun requestWakeHelper() {
         val helper = wakeableHelper ?: return
-        val name = fleet.machines.firstOrNull { it.id == helper.machineId }?.name ?: helper.machineId
+        val name = fleet.machines.firstOrNull { it.id == helper }?.name ?: helper
         dialog = Dialog.ConfirmWakeHelper(name, machine.name)
     }
 
     fun wakeHelper() {
         val helper = wakeableHelper ?: return
-        fleet.wakeMachine(helper.machineId)
+        fleet.wakeMachine(helper)
         wakeableHelper = null
     }
 
@@ -773,15 +836,27 @@ class MachineModel(
 
     fun sleep(force: Boolean = false, whenIdle: Boolean = false) {
         val request = InterruptRequest(force = force, whenIdle = whenIdle, expires = QUEUE_EXPIRY)
-        change(
-            task = Task.SLEEP,
-            label = "Putting ${machine.name} to sleep",
-            intent = OperationIntent(
+        sendSleep(
+            request,
+            OperationIntent(
                 kind = OpKind.SLEEP,
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
+        )
+    }
+
+    /**
+     * A sleep as the button asks for it and Try again asks for it again: the request, and then the
+     * grace in which a machine that stops answering reads as one that may be asleep.
+     */
+    private fun sendSleep(request: InterruptRequest, intent: OperationIntent) {
+        change(
+            task = Task.SLEEP,
+            label = "Putting ${machine.name} to sleep",
+            intent = intent,
             subjectName = machine.name,
         ) { id ->
             client.sleep(request, id)
@@ -795,16 +870,30 @@ class MachineModel(
 
     fun boot(target: MachineSystem, force: Boolean = false, whenIdle: Boolean = false) {
         val request = InterruptRequest(force = force, whenIdle = whenIdle, expires = QUEUE_EXPIRY)
-        change(
-            task = Task.BOOT,
-            label = "Switching to ${target.name}",
-            intent = OperationIntent(
+        sendBoot(
+            target,
+            request,
+            OperationIntent(
                 kind = OpKind.BOOT,
                 target = target.id,
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
+        )
+    }
+
+    /**
+     * A boot into [target] as the button asks for it and Try again asks for it again: the request,
+     * and then what the page expects of a machine that is rebooting, so a dead link reads as waiting
+     * for [target] and the next status is dialled where [target] answers.
+     */
+    private fun sendBoot(target: MachineSystem, request: InterruptRequest, intent: OperationIntent) {
+        change(
+            task = Task.BOOT,
+            label = "Switching to ${target.name}",
+            intent = intent,
             subjectName = target.name,
             subjectId = target.id,
         ) { id ->
@@ -813,11 +902,8 @@ class MachineModel(
         rebootTarget = target
         rebootUntil = System.currentTimeMillis() + REBOOT_GRACE_MS
         // W4. The route that answered belonged to the system that is on its way out. Prefer the
-        // requested system's endpoint, then a LAN endpoint only when this device is on that site.
-        val onSite = machine.siteId?.let { fleet.siteMatch.site?.id == it }
-            ?: machine.wake?.lanPrefix?.let { prefix -> fleet.localAddresses.any { it.startsWith(prefix) } }
-            ?: false
-        fleet.prepareRoute(machine.id, target.id, onSite)
+        // requested system's endpoint, then a LAN endpoint only when this device is on its network.
+        fleet.prepareRoute(machine.id, target.id, isOnNetwork)
     }
 
     fun requestRestart(service: ServiceStatus) {
@@ -840,6 +926,7 @@ class MachineModel(
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
             subjectName = service.displayName,
             subjectId = service.id,
@@ -877,6 +964,7 @@ class MachineModel(
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
             subjectName = service.displayName,
             subjectId = service.id,
@@ -907,6 +995,7 @@ class MachineModel(
                 force = force,
                 whenIdle = whenIdle,
                 expires = QUEUE_EXPIRY.takeIf { whenIdle },
+                repeatable = true,
             ),
             subjectName = action.displayName,
             subjectId = id,
@@ -920,12 +1009,12 @@ class MachineModel(
         change(
             task = Task.AUTO_UPDATE,
             label = "Saving the update schedule",
-            intent = OperationIntent(kind = OpKind.UPDATE, service = serviceId),
+            intent = OperationIntent.policyWrite(serviceId),
             subjectName = serviceId ?: on.name,
             subjectId = serviceId ?: on.id,
             track = false,
-        ) { id ->
-            client.setAutoUpdate(enabled, serviceId, id)
+        ) { _ ->
+            client.setAutoUpdate(enabled, serviceId)
         }
     }
 
@@ -933,12 +1022,12 @@ class MachineModel(
         change(
             task = Task.POLICY,
             label = "Pausing updates",
-            intent = OperationIntent(kind = OpKind.UPDATE, service = serviceId),
+            intent = OperationIntent.policyWrite(serviceId),
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
-        ) { id ->
-            client.pauseUpdates(duration, serviceId, id)
+        ) { _ ->
+            client.pauseUpdates(duration, serviceId)
         }
     }
 
@@ -946,12 +1035,12 @@ class MachineModel(
         change(
             task = Task.POLICY,
             label = "Resuming updates",
-            intent = OperationIntent(kind = OpKind.UPDATE, service = serviceId),
+            intent = OperationIntent.policyWrite(serviceId),
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
-        ) { id ->
-            client.resumeUpdates(serviceId, id)
+        ) { _ ->
+            client.resumeUpdates(serviceId)
         }
     }
 
@@ -959,12 +1048,12 @@ class MachineModel(
         change(
             task = Task.POLICY,
             label = "Saving the update policy",
-            intent = OperationIntent(kind = OpKind.UPDATE, service = serviceId),
+            intent = OperationIntent.policyWrite(serviceId),
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
-        ) { id ->
-            client.writePolicy(patch, serviceId, id)
+        ) { _ ->
+            client.writePolicy(patch, serviceId)
         }
     }
 
@@ -1014,52 +1103,58 @@ class MachineModel(
         operations.cancel(client, record)
     }
 
-    /** Sends a change again, but only one that is known not to have happened. */
+    /**
+     * Asks again for a change that is over, as a new request with a new id (contract section 5.6).
+     *
+     * Only for one that ended in a way a second request cannot double: nothing reached the machine,
+     * or the agent refused, held back or finished it. The old id is never sent again: the agent
+     * answers a known id with what it stored for it, so a refused change re-sent under its own id
+     * came back refused for as long as anybody kept pressing. An outcome nobody knows is never
+     * offered at all; it is only ever read again, with [checkAgain].
+     *
+     * What is sent is [tryAgainFor]'s answer and nothing else, the same answer that decides whether
+     * the button can be pressed, so a record the screen offers nothing for cannot be sent here either.
+     * A boot and a sleep go through the buttons' own senders, so the page then waits for the reboot
+     * or the sleep it asked for, exactly as it does after the first press.
+     */
     fun retry(record: OperationRecord) {
-        if (!record.retryable) return
+        val again = tryAgainFor(record, machine, status, detach = speaksV3) ?: return
+        val intent = record.intent
+
+        fun resend(task: Task, dispatch: suspend (String) -> Result<com.x1f4r.legioncontrol.agent.AgentActionResult>) =
+            change(
+                task = task,
+                label = "${intent.kind.label} on ${record.subjectName}",
+                intent = intent,
+                subjectName = record.subjectName,
+                subjectId = intent.service ?: intent.actionId,
+                dispatch = dispatch,
+            )
+
+        when (again) {
+            is RetryRequest.Update -> resend(Task.UPDATE) { id -> client.update(again.request, id) }
+            is RetryRequest.Restart -> resend(Task.RESTART) { id -> client.restart(again.service, again.request, id) }
+            is RetryRequest.Run -> resend(Task.RUN) { id -> client.run(again.actionId, again.request, id) }
+            is RetryRequest.Boot -> sendBoot(machine.system(again.target) ?: return, again.request, intent)
+            is RetryRequest.Sleep -> sendSleep(again.request, intent)
+        }
+    }
+
+    /** Whether Try again on [record] can be pressed now: [tryAgainFor], from the reading on screen. */
+    fun canTryAgain(record: OperationRecord): Boolean =
+        !isWorking && tryAgainFor(record, machine, status, detach = speaksV3) != null
+
+    /**
+     * Reads an unresolved change again by its own id, and sends nothing (contract section 5.6).
+     *
+     * For a change whose reply was lost and whose watch has given up. The same id is a question the
+     * agent answers from its record, never a second request.
+     */
+    fun checkAgain(record: OperationRecord) {
+        if (record.isOver || !record.trackable) return
         messageGeneration++
         lastMessage = MachineMessage.forOperation(record)
-        val intent = record.intent
-        operations.retry(client, record) { id ->
-            when (intent.kind) {
-                OpKind.UPDATE -> client.update(
-                    UpdateRequest(
-                        serviceId = intent.service,
-                        force = intent.force,
-                        whenIdle = intent.whenIdle,
-                        expires = intent.expires,
-                        detach = speaksV3,
-                    ),
-                    id,
-                )
-
-                OpKind.RESTART -> client.restart(
-                    intent.service,
-                    InterruptRequest(intent.force, intent.whenIdle, intent.expires, speaksV3),
-                    id,
-                )
-
-                OpKind.BOOT -> client.boot(
-                    intent.target.orEmpty(),
-                    InterruptRequest(intent.force, intent.whenIdle, intent.expires),
-                    noReboot = false,
-                    operationId = id,
-                )
-
-                OpKind.SLEEP -> client.sleep(
-                    InterruptRequest(intent.force, intent.whenIdle, intent.expires),
-                    id,
-                )
-
-                OpKind.RUN -> client.run(
-                    intent.actionId.orEmpty(),
-                    InterruptRequest(intent.force, intent.whenIdle, intent.expires, speaksV3),
-                    id,
-                )
-
-                else -> Result.failure(IllegalStateException("that change cannot be sent again"))
-            }
-        }
+        operations.follow(client, record.id)
     }
 
     // MARK: - Diagnostics
@@ -1109,8 +1204,8 @@ class MachineModel(
         scope.launch {
             client.logs(lines = 100, operationId = null).fold(
                 onSuccess = { reply ->
-                    recentLog = reply.entries.mapNotNull { line ->
-                        line.text?.takeIf { it.isNotBlank() }
+                    recentLog = reply.entries.mapNotNull { entry ->
+                        entry.line?.takeIf { it.isNotBlank() }
                     }
                     if (recentLog.isEmpty()) statusLine = "The agent's log is empty."
                 },
@@ -1205,7 +1300,7 @@ class MachineModel(
      * why when it cannot. The wiring decides again from its own last status before anything is sent.
      */
     val agentDeployment: AgentDeploymentPath
-        get() = agentDeploymentFor(machine, abilities, status, link)
+        get() = agentDeploymentFor(machine, abilities, status, link, fleet.agentBundle?.version)
 
     fun requestAgentInstall(version: String) {
         if (refuseAgentInstall()) return
@@ -1286,11 +1381,8 @@ class MachineModel(
             try {
                 while (isActive) {
                     val current = operations.get(record.id) ?: break
+                    // A change held back for a decision is over too, and the question is asked here.
                     if (current.isOver || current.state == TrackedState.QUEUED) {
-                        offerForce(current)
-                        break
-                    }
-                    if (current.state == TrackedState.AWAITING_DECISION) {
                         offerForce(current)
                         break
                     }
@@ -1388,6 +1480,9 @@ class MachineModel(
         private const val SLEEP_GRACE_MS = 600_000L
         private const val FOLLOW_INTERVAL_MS = 500L
 
+        /** How often a wake checks whether a read of this machine already under way has finished. */
+        private const val READ_WAIT_MS = 200L
+
         /** How long a queued change waits for an idle moment before it gives up. */
         const val QUEUE_EXPIRY = "4h"
     }
@@ -1404,8 +1499,12 @@ class MachineModel(
 interface FleetContext {
     val machines: List<Machine>
     val sites: List<SiteConfig>
-    val siteMatch: SiteMatch
-    val localAddresses: List<String>
+
+    /** This device's candidate addresses, each with its network (contract section 10.1). */
+    val localAddresses: List<LocalAddress>
+
+    /** The site the person said this device is at, from the private bindings, or null. */
+    val currentSite: String?
 
     /** What to call this device in an operation record. */
     val deviceName: String
@@ -1416,11 +1515,11 @@ interface FleetContext {
 
     fun client(machineId: String): MachineClient?
 
-    /** The helper's cached state; null before it has been checked. */
-    fun helperAwake(machineId: String): Boolean?
+    /** What a helper's last status read this session says of it; unknown before it has been read. */
+    fun helperState(machineId: String): HelperState
 
-    /** The helper action as last reported, including whether an ambiguous retry is idempotent. */
-    fun action(machineId: String, actionId: String): AgentAction?
+    /** Reads a helper once, just before a wake step that asks it, and says what it found. */
+    suspend fun readHelper(machineId: String): HelperState
 
     /** Drops the remembered route, after a boot or an observed system change. */
     fun forgetRoute(machineId: String)
@@ -1438,20 +1537,31 @@ interface FleetContext {
  * the model that earned a line is thrown away by the very change it made.
  */
 interface SetupSync {
+    /** What this device remembers about one machine's copy, which outlives the model of it. */
+    fun state(machineId: String): SetupPeerState
+
     /**
      * R1 for one machine: decide from the status, ask for the ancestry when that is not enough, and
-     * act only along strict descent. Returns a line worth showing, or null.
+     * act only along strict descent and only when the guardrails allow (contract section 9.5).
+     * [localMutation] is whether this device has an action in flight on it. Returns a line worth
+     * showing, or null.
      */
     suspend fun reconcile(
         client: MachineClient,
-        reportedHash: String?,
-        speaksV3: Boolean,
-        asked: MutableSet<String>,
+        reply: AgentStatus,
+        localMutation: Boolean,
+        state: SetupPeerState,
     ): String?
 
     fun remember(machineId: String, line: String)
 
     fun noteFor(machineId: String, now: Long): String?
+
+    /** Why pushes to the machine are held for the document in force, or null when they are not. */
+    fun holdFor(machineId: String): String?
+
+    /** "Try again" on a held push. */
+    fun retry(machineId: String)
 }
 
 /** How old a reading is, in words. Nothing polls while the app is away, so this has to be visible. */
@@ -1488,12 +1598,36 @@ internal fun agentDeploymentFor(
     abilities: AgentAbilities,
     status: AgentStatus?,
     link: LinkState,
+    bundled: String? = null,
 ): AgentDeploymentPath {
     val system = status?.let { machine.resolveSystem(it.systemId, it.systemName, it.osName) }
     if (system != null && link !is LinkState.Online) {
         return AgentDeploymentPath.Unavailable(AgentDeploymentPath.READ_STATUS_FIRST)
     }
-    return AgentDeploymentPath.decide(abilities, status, system)
+    return AgentDeploymentPath.decide(abilities, status, system, bundled)
+}
+
+/**
+ * What Try again sends for [record] to [machine] from the reading on screen, [status], or null when
+ * it sends nothing now.
+ *
+ * The button is enabled from this and the press sends it, so neither goes further than the other,
+ * and neither goes further than the buttons the change was first asked for with. A service is named
+ * the way [status] says this agent takes one, and nothing that names a service is rebuilt while there
+ * is no reading that says, which is after any failed read and before the first: an update sent then
+ * without `--service` would stop and reinstall the first service instead. A boot is only asked for
+ * into a system this setup still has, the only kind the button offers and the only kind the page
+ * can then wait for.
+ */
+internal fun tryAgainFor(
+    record: OperationRecord,
+    machine: Machine,
+    status: AgentStatus?,
+    detach: Boolean,
+): RetryRequest? {
+    val again = record.retryRequest(detach, ServiceNaming.of(status)) ?: return null
+    if (again is RetryRequest.Boot && machine.system(again.target) == null) return null
+    return again
 }
 
 /**

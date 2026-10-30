@@ -4,7 +4,8 @@
 // stdout: stdout carries exactly one JSON object per invocation.
 
 import fs from 'node:fs';
-import { basePath, logPath } from './config.mjs';
+import { basePath, logPath } from './paths.mjs';
+import { ensurePrivateDir } from './state.mjs';
 
 const MAX_BYTES = 1024 * 1024;
 
@@ -25,11 +26,13 @@ function rotateIfNeeded(file) {
  */
 export function log(message, command = '-') {
   try {
-    fs.mkdirSync(basePath(), { recursive: true });
+    ensurePrivateDir(basePath());
     const file = logPath();
     rotateIfNeeded(file);
     const line = `${new Date().toISOString()} [${command}] ${String(message).replace(/\s*\n\s*/g, ' | ')}\n`;
-    fs.appendFileSync(file, line, 'utf8');
+    // The log quotes configured commands and their output, so it is created
+    // readable by this user only.
+    fs.appendFileSync(file, line, { encoding: 'utf8', mode: 0o600 });
   } catch {
     /* never let logging break a command */
   }

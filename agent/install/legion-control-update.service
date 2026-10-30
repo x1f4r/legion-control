@@ -16,16 +16,18 @@
 
 [Unit]
 Description=Legion Control: run one update cycle
-After=network-online.target
-Wants=network-online.target
+# Nothing here orders on network-online.target. That is a unit of the system
+# manager, and a user manager has none of that name, so After= and Wants= on it
+# did nothing at all. The timer waits five minutes after boot instead.
 
 [Service]
 Type=oneshot
 
 # A login shell is never sourced by systemd, so nothing about PATH can be
 # assumed here. Spell it out, including the npm bin directory, so a service
-# installed with npm can be found and driven.
-Environment=PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin
+# installed with npm can be found and driven. Quoted, because that directory is
+# in the home directory, and a space there would end the assignment.
+Environment="PATH=@NPM_BIN@:/usr/local/bin:/usr/bin:/bin"
 
 # The update cycle drives services with "systemctl --user stop/start", which
 # needs a session bus to talk to. When a unit is started by the timer there is
@@ -35,6 +37,12 @@ Environment=XDG_RUNTIME_DIR=/run/user/@UID@
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
 
 ExecStart="@LAUNCHER@" cycle
+
+# What the cycle writes is this user's alone: the agent's configuration, the
+# setup, the operation records and the log. The agent asks for that itself,
+# and this is the floor under it. It holds for what the cycle runs as well, so
+# a package a service update installs is this user's alone too.
+UMask=0077
 
 # Worst case is several services, each with a cold package cache plus the 120 s
 # health wait plus a rollback, so leave real headroom. A run killed here leaves

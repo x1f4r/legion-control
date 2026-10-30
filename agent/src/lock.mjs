@@ -34,9 +34,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath } from './config.mjs';
 import { REASON } from './contract.mjs';
 import { acquireMutex, mutexPath, probeMutex } from './mutex.mjs';
+import { basePath } from './paths.mjs';
 import { processIsAlive } from './state.mjs';
 
 /**
@@ -116,16 +116,29 @@ function describeHolder(holder) {
   return `${what}${on} (${who}${phase})`;
 }
 
+/** An ISO 8601 date and time ending in `Z` or an offset from UTC. */
+const ZONED_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i;
+
 /**
  * Whether a WATCHDOG lock file may be taken over.
  *
  * This applies only to the per-service compatibility file, which is written by
  * something outside this agent and identifies its owner by pid. The agent's own
  * locks are not judged this way at all — the operating system holds those.
+ *
+ * A pid is checked against the time the file says it was taken, where it says
+ * one: a process that holds that id now and started after it did not take it,
+ * and a file it named would otherwise stay held for as long as the id was in
+ * use by somebody else. Only a time that names its zone counts, the shape this
+ * agent writes. Nothing pins down what the watchdog writes, and a time with no
+ * zone is read as local time: written in UTC on a machine east of it, it would
+ * date a live watchdog's file before its own process started, and the agent
+ * would take the lock from under it. Any other time leaves the pid check alone,
+ * as before there was one.
  */
 export function holderIsStale(holder) {
   if (!holder) return true;
-  if (Number.isInteger(holder.pid)) return !processIsAlive(holder.pid);
+  if (Number.isInteger(holder.pid)) return !processIsAlive(holder.pid, { startedAt: ZONED_TIME.test(holder.started ?? '') ? holder.started : null });
   return holder.ageMs > LEGACY_LOCK_STALE_MS;
 }
 
@@ -193,6 +206,18 @@ export function acquireServiceLock(file, target) {
       try { fs.rmSync(compat.file, { force: true }); } catch { /* a dead owner can be recovered */ }
     },
   };
+}
+
+/** How many holds on the machine lock this process has, which is never more than one at a time. */
+let heldHere = 0;
+
+/**
+ * Whether this process holds the machine lock. The kernel lets one process
+ * hold it at a time, so while this one does, no other can: what recovery
+ * knows, from inside the cycle that holds it, about every other process.
+ */
+export function holdsOperationLock() {
+  return heldHere > 0;
 }
 
 /**
@@ -273,12 +298,15 @@ export function acquireOperationLock({
   }
 
   let released = false;
+  heldHere += 1;
   return {
     ok: true,
     conflict: false,
     message: null,
     lock: {
       file,
+      /** The operation the sidecar names as holding the lock, which a record notes as its evidence of life. */
+      opId,
       compatFile: compat.held ? compat.file : null,
       compatWarning: compat.held || !compat.message ? null : compat.message,
       /** Record the phase in the sidecar so a reader can name what is running. */
@@ -303,6 +331,7 @@ export function acquireOperationLock({
         } catch {
           /* the sidecar carries no authority; a leftover is harmless */
         }
+        heldHere -= 1;
         taken.release();
       },
     },
@@ -310,24 +339,33 @@ export function acquireOperationLock({
 }
 
 /**
- * Who holds the machine lock right now, or null.
+ * What the mutex says about the machine lock, `held`, `free` or `unknown`,
+ * with the sidecar as it stands, or null where there is none.
  *
  * Read-only in the strictest sense: it never creates the lock database, so a
  * status poll on a machine that has never run an operation leaves no trace.
+ */
+export function probeOperationLock() {
+  const file = operationLockPath();
+  const probe = probeMutex(mutexPath(file));
+  return { state: probe.state, sidecar: readHolder(file), error: probe.error ?? null, hint: probe.hint ?? null };
+}
+
+/**
+ * Who holds the machine lock right now, or null.
+ *
  * `held` comes from the mutex, which is the truth; the sidecar only supplies the
  * detail. A sidecar with no lock behind it is a leftover, and says so.
  */
 export function currentHolder() {
-  const file = operationLockPath();
-  const probe = probeMutex(mutexPath(file));
-  const sidecar = readHolder(file);
-  if (!sidecar && probe.state !== 'held') return null;
+  const { state, sidecar, error, hint } = probeOperationLock();
+  if (!sidecar && state !== 'held') return null;
   return {
     ...(sidecar ?? {}),
-    held: probe.state === 'held',
-    stale: Boolean(sidecar) && probe.state === 'free',
-    lockError: probe.error ?? null,
-    lockHint: probe.hint ?? null,
+    held: state === 'held',
+    stale: Boolean(sidecar) && state === 'free',
+    lockError: error,
+    lockHint: hint,
   };
 }
 

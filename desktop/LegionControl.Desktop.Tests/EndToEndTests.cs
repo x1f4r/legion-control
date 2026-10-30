@@ -10,10 +10,11 @@ namespace LegionControl.Desktop.Tests;
 /// script where ssh would be and lets the app launch it, so the process plumbing, the argument
 /// quoting, the exit codes and the pipe draining are all exercised by the code that ships. It is
 /// the closest thing to the real run root does against the Pi that can happen on a laptop.
+///
+/// The script is a node program, so the same one stands in for ssh on every platform, Windows
+/// included, and each test says it needs node on PATH.
 public class EndToEndTests
 {
-    private static bool CanRunAScript => !OperatingSystem.IsWindows();
-
     private const string Setup = """
         {
           "version": 1,
@@ -34,24 +35,32 @@ public class EndToEndTests
 
     private static string WriteFakeSsh(TempHome home, string replyPath, string? mutationReply = null)
     {
-        if (OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
         var mutation = mutationReply ?? "{\"ok\":false,\"contract\":3,\"reasonCode\":\"bad-argument\"}";
-        var script = $"""
-            #!/bin/sh
-            # Stands in for ssh: prints what the agent would have printed. The client cannot tell
-            # the difference, which is the point of running it this way.
-            for arg in "$@"; do last="$arg"; done
-            case "$last" in
-              *" status"*) cat '{replyPath}' ;;
-              *) printf '%s\n' '{mutation}' ;;
-            esac
-            """;
-        var path = home.Write("fake-ssh.sh", script);
+        return WriteSsh(home, $$"""
+            // Stands in for ssh: prints what the agent would have printed. The client cannot tell
+            // the difference, which is the point of running it this way.
+            import { readFileSync } from 'node:fs';
+            const line = process.argv.at(-1);
+            process.stdout.write(line.includes(' status') ? readFileSync({{Literal(replyPath)}}) : {{Literal(mutation)}} + '\n');
+            """);
+    }
+
+    /// An ssh made of [program], a node program that finds ssh's arguments in process.argv. The
+    /// app starts it by the path this returns: the program itself where a script can carry its own
+    /// interpreter, and on Windows a .cmd beside it, which hands node the command line exactly as
+    /// the app quoted it.
+    private static string WriteSsh(TempHome home, string program)
+    {
+        var path = home.Write("fake-ssh.mjs", "#!/usr/bin/env node\n" + program + "\n");
+        if (OperatingSystem.IsWindows()) return home.Write("fake-ssh.cmd", "@node \"%~dp0fake-ssh.mjs\" %*\r\n");
         File.SetUnixFileMode(path,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
             | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
         return path;
     }
+
+    /// [text] as a JavaScript string literal.
+    private static string Literal(string text) => System.Text.Json.JsonSerializer.Serialize(text);
 
     private static IDisposable Environment(TempHome home, string ssh)
     {
@@ -69,10 +78,9 @@ public class EndToEndTests
         }
     }
 
-    [Fact]
+    [NodeFact]
     public async Task TheSmokeModeReadsARealReplyThroughARealProcess()
     {
-        if (!CanRunAScript) return;
         using var home = new TempHome();
         File.WriteAllText(home.ConfigPath, Setup);
         var ssh = WriteFakeSsh(home, Path.Combine(Repo.Fixtures, "status.full.json"));
@@ -94,27 +102,19 @@ public class EndToEndTests
         Assert.Contains("queued", text);
     }
 
-    [Fact]
+    [NodeFact]
     public async Task AMachineThatDoesNotAnswerIsReportedRatherThanCountedAsFine()
     {
-        if (!CanRunAScript) return;
         using var home = new TempHome();
         File.WriteAllText(home.ConfigPath, Setup);
         // ssh writes why it gave up to the file named by -E, not to stderr, and only that file is
         // read as evidence that nothing ran.
-        var script = home.Write("fake-ssh.sh", """
-            #!/bin/sh
-            while [ $# -gt 0 ]; do
-              if [ "$1" = "-E" ]; then log="$2"; fi
-              shift
-            done
-            echo "ssh: connect to host beacon.example port 22: No route to host" >> "$log"
-            exit 255
+        var script = WriteSsh(home, """
+            import { appendFileSync } from 'node:fs';
+            const args = process.argv.slice(2);
+            appendFileSync(args[args.indexOf('-E') + 1], 'ssh: connect to host beacon.example port 22: No route to host\n');
+            process.exit(255);
             """);
-        if (!OperatingSystem.IsWindows())
-        {
-            File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        }
         using var _ = Environment(home, script);
 
         var output = new StringWriter();
@@ -123,10 +123,9 @@ public class EndToEndTests
         Assert.Contains("did not answer", output.ToString());
     }
 
-    [Fact]
+    [NodeFact]
     public async Task AStatusCommandReportsThroughTheSameTransport()
     {
-        if (!CanRunAScript) return;
         using var home = new TempHome();
         File.WriteAllText(home.ConfigPath, Setup);
         var ssh = WriteFakeSsh(home, Path.Combine(Repo.Fixtures, "status.full.json"));
@@ -139,10 +138,9 @@ public class EndToEndTests
         Assert.Contains("\"monitored\"", output.ToString());
     }
 
-    [Fact]
+    [NodeFact]
     public async Task ARefusalFromTheMachineIsAnExitCodeOfItsOwn()
     {
-        if (!CanRunAScript) return;
         using var home = new TempHome();
         File.WriteAllText(home.ConfigPath, Setup);
         var ssh = WriteFakeSsh(home, Path.Combine(Repo.Fixtures, "status.full.json"),
@@ -156,10 +154,9 @@ public class EndToEndTests
         Assert.Contains("working", output.ToString());
     }
 
-    [Fact]
+    [NodeFact]
     public async Task ReconcileOnceSaysWhatEachMachineIsDoingWithTheSetup()
     {
-        if (!CanRunAScript) return;
         using var home = new TempHome();
         File.WriteAllText(home.ConfigPath, Setup);
         var ssh = WriteFakeSsh(home, Path.Combine(Repo.Fixtures, "status.full.json"),

@@ -30,6 +30,11 @@ public sealed record MachineRequest
     public bool DryRun { get; init; }
     /// Reuse this id rather than minting one. Set when retrying a request whose reply was lost.
     public string? OperationId { get; init; }
+    /// The machine a helper's wake action is run for, when that action is not a declared wol. The
+    /// operation is then a wake hold for that machine from before it is sent (contract section
+    /// 10.2): if its run ends without a terminal record, no other helper's command runs for the
+    /// same machine until one is read.
+    public string? WakeTarget { get; init; }
 
     public OperationIntent Intent => new(
         Kind switch
@@ -216,7 +221,7 @@ public abstract record CommandOutcome
 
     /// Whether the thing asked for is known to have happened. Deliberately false for everything
     /// ambiguous: nothing in this app turns a lost connection into a success.
-    public bool IsKnownSuccess => this is Done { Outcome: OperationOutcome.Succeeded or OperationOutcome.Noop };
+    public bool IsKnownSuccess => this is Done { Outcome: OperationOutcome.Succeeded };
 }
 
 /// What a machine looks like after a reboot or a sleep was acknowledged.

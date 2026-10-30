@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { DEFAULT_VERSION_PATTERN, LEGACY_DEFAULTS, normalizeConfig } from '../src/config.mjs';
+import { DEFAULT_VERSION_PATTERN, LEGACY_DEFAULTS, normalizeConfig } from '../src/config-schema.mjs';
 import { fresh, withHome } from './helpers.mjs';
 
 const BASE = '/tmp/legionctl-test-base';

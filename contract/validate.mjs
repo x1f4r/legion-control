@@ -2101,9 +2101,12 @@ const INDEPENDENT = {
     for (const entry of groups.get('merges') ?? []) checkMergeCase(`${where}/merges/${entry.name}`, entry);
     for (const entry of groups.get('bases') ?? []) {
       const { mineLineage = [], theirsLineage = [], kept = {} } = entry.input ?? {};
-      const usable = (hash) => theirsLineage.includes(hash) && typeof kept[hash] === 'string' && hashAgain(kept[hash]) === hash;
+      // Kept bytes that hash to their name and that peer intake accepts: a refused revision is
+      // skipped like one that is not kept (section 9.8).
+      const usable = (hash) => theirsLineage.includes(hash) && typeof kept[hash] === 'string' && hashAgain(kept[hash]) === hash
+        && checkDocument(kept[hash], { intake: 'peer' }).errors.length === 0;
       const base = mineLineage.find(usable) ?? null;
-      if (base !== entry.expect?.base) fail(`${where}/bases/${entry.name}`, `the newest hash of mine's lineage in theirs' with kept bytes that hash to it is ${base}, and the case says ${entry.expect?.base}`);
+      if (base !== entry.expect?.base) fail(`${where}/bases/${entry.name}`, `the newest hash of mine's lineage in theirs' with kept bytes that hash to it and that peer intake accepts is ${base}, and the case says ${entry.expect?.base}`);
       else pass();
     }
     for (const entry of groups.get('numbers') ?? []) {

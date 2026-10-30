@@ -1,4 +1,5 @@
 import Foundation
+@testable import LegionControlCore
 
 /// A JSON value as the conformance vectors compare it (`comparison` in `contract/vectors/index.json`).
 ///
@@ -42,6 +43,19 @@ indirect enum VectorJSON: Decodable, Equatable, Sendable {
     var object: [String: VectorJSON]? { if case .object(let value) = self { value } else { nil } }
     var isNull: Bool { self == .null }
 
+    /// The value as `JSONSerialization` would have handed it over, for code that works on parsed
+    /// JSON rather than on a typed model: a bool stays a bool and never turns into a number.
+    var foundation: Any {
+        switch self {
+        case .null: NSNull()
+        case .bool(let value): value
+        case .number(let value): value.rounded() == value && abs(value) < 9_007_199_254_740_992 ? Int(value) : value
+        case .string(let value): value
+        case .array(let values): values.map(\.foundation)
+        case .object(let members): members.mapValues(\.foundation)
+        }
+    }
+
     /// The value as an integer, when it is a number with no fraction.
     var int: Int? {
         guard let number, number.rounded() == number, abs(number) < 9_007_199_254_740_992 else { return nil }
@@ -78,11 +92,33 @@ indirect enum VectorJSON: Decodable, Equatable, Sendable {
         }
     }
 
-    /// Two JSON documents held in strings, compared parsed.
+    /// Two JSON documents held in strings, compared parsed: object key order ignored, array order
+    /// exact, number lexemes exact. They are read with `SetupJSON`, because a double would call `22`
+    /// and `22.0` the same, and keeping `22.0` as it was written is what a merge is held to.
     private static func documentDifferences(_ expected: String, _ actual: String, at path: String) -> [String] {
-        guard let left = try? parse(Data(expected.utf8)) else { return ["\(path) in the vector is not a JSON document"] }
-        guard let right = try? parse(Data(actual.utf8)) else { return ["\(path) is not a JSON document"] }
-        return left.differences(from: right, at: path)
+        guard let left = try? SetupJSON.parse(expected) else { return ["\(path) in the vector is not a JSON document"] }
+        guard let right = try? SetupJSON.parse(actual) else { return ["\(path) is not a JSON document"] }
+        return lexicalDifferences(left, right, at: path)
+    }
+
+    private static func lexicalDifferences(_ expected: SetupJSON, _ actual: SetupJSON, at path: String) -> [String] {
+        switch (expected, actual) {
+        case (.object(let left), .object(let right)):
+            let names = Set(left.map(\.name)), others = Set(right.map(\.name))
+            let missing = names.subtracting(others).sorted().map { "\(path).\($0) is missing" }
+            let extra = others.subtracting(names).sorted().map { "\(path).\($0) is not expected" }
+            let common = left.filter { others.contains($0.name) }.flatMap { member in
+                lexicalDifferences(member.value, actual[member.name]!, at: "\(path).\(member.name)")
+            }
+            return missing + extra + common
+        case (.array(let left), .array(let right)):
+            guard left.count == right.count else { return ["\(path) has \(right.count) elements, not \(left.count)"] }
+            return zip(left, right).enumerated().flatMap { index, pair in lexicalDifferences(pair.0, pair.1, at: "\(path)[\(index)]") }
+        case (.string(let left), .string(let right)):
+            return SetupJSON.same(left, right) ? [] : ["\(path) is \(actual.compactText), not \(expected.compactText)"]
+        default:
+            return expected == actual ? [] : ["\(path) is \(actual.compactText), not \(expected.compactText)"]
+        }
     }
 
     private static func show(_ value: VectorJSON) -> String {
@@ -112,4 +148,6 @@ extension VectorJSON: ExpressibleByStringLiteral, ExpressibleByBooleanLiteral, E
     init(_ value: String?) { self = value.map(VectorJSON.string) ?? .null }
     /// A number, or null when there is none.
     init(_ value: Int?) { self = value.map { .number(Double($0)) } ?? .null }
+    /// A boolean, or null when there is none.
+    init(_ value: Bool?) { self = value.map(VectorJSON.bool) ?? .null }
 }

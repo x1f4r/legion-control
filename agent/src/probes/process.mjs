@@ -15,21 +15,17 @@
 // command        three argv arrays.
 // none           nothing to start or stop.
 
-import { deadline, describeFailure, detectPlatform, runArgv, runCommand, runCommandAsync } from '../config.mjs';
+import { detectPlatform } from '../paths.mjs';
+import { deadline, describeFailure, powerShellLiteral as psLiteral, runArgv, runCommand, runCommandAsync, runMutation, runMutationArgv } from '../process-runner.mjs';
 import * as appProvider from '../providers/app.mjs';
 import { packageRoot } from '../providers/npm.mjs';
 
-/** Single-quoted PowerShell literal; a literal quote is doubled. */
-function psLiteral(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
+function powerShellArgs(script) {
+  return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script];
 }
 
 export function runPowerShell(script, timeoutMs = 30000) {
-  return runCommand(
-    'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-    { timeoutMs },
-  );
+  return runCommand('powershell.exe', powerShellArgs(script), { timeoutMs });
 }
 
 /** PowerShell can prepend warnings, so pick the line that actually looks like JSON. */
@@ -59,14 +55,22 @@ export function taskMatch(service, { readOnly = false } = {}) {
   return service.name;
 }
 
-function systemctl(service, verb, timeoutMs) {
+/** The systemctl argv for one verb on the service's unit. */
+function systemctlArgv(service, verb) {
   const unit = service.process.unit;
-  if (service.process.type === 'systemd-system') {
-    // Non-interactive sudo on purpose: an ssh session has nowhere to type a
-    // password and a prompt would hang here until the timeout.
-    return runCommand('sudo', ['-n', 'systemctl', verb, unit], { timeoutMs });
-  }
-  return runCommand('systemctl', ['--user', verb, unit], { timeoutMs });
+  // Non-interactive sudo on purpose: an ssh session has nowhere to type a
+  // password and a prompt would hang here until the timeout.
+  if (service.process.type === 'systemd-system') return ['sudo', '-n', 'systemctl', verb, unit];
+  return ['systemctl', '--user', verb, unit];
+}
+
+function systemctl(service, verb, timeoutMs) {
+  return runArgv(systemctlArgv(service, verb), { timeoutMs });
+}
+
+/** A systemctl verb that changes the unit, through the mutation runner. */
+export function systemctlMutation(service, verb, timeoutMs) {
+  return runMutationArgv(systemctlArgv(service, verb), { timeoutMs });
 }
 
 function systemdProbe(service) {
@@ -111,8 +115,10 @@ export function processStartedAt(service) {
     }
 
     if (type === 'scheduled-task') {
+      // A failed query says nothing, which is why it stops the script rather
+      // than leaving an empty answer that reads like a process with no start.
       const script = [
-        "$ErrorActionPreference = 'SilentlyContinue'",
+        "$ErrorActionPreference = 'Stop'",
         `$needle = ${psLiteral(taskMatch(service))}`,
         "$procs = @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and " +
           "$_.CommandLine.ToLower().Replace('\\\\', '\\').Contains($needle.ToLower().Replace('\\\\', '\\')) })",
@@ -142,12 +148,20 @@ export function processStartedAt(service) {
   return null;
 }
 
-function windowsTaskScript(service, { includeRelay, readOnly = false }) {
+/**
+ * The one PowerShell script that looks for a scheduled task's process, for
+ * status and for everything that decides whether a service may be stopped.
+ *
+ * It stops at the first error. It used to carry on silently, so a process query
+ * that was denied left an empty list behind it and the script reported, quite
+ * correctly for that list, that nothing was running.
+ */
+function windowsTaskScript(service, { includeRelay, readOnly = false, startedAt = false }) {
   const needle = psLiteral(taskMatch(service, { readOnly }));
   const port = service.health?.type === 'http' ? service.health.port : null;
   const portFlag = port ? psLiteral(`--port ${port}`) : null;
   const lines = [
-    "$ErrorActionPreference = 'SilentlyContinue'",
+    "$ErrorActionPreference = 'Stop'",
     `$needle = ${needle}`,
     // The command line is matched with its runs of backslashes collapsed. An npm
     // cmd shim builds the script path as "%dp0%\node_modules\<pkg>\..." and
@@ -171,8 +185,11 @@ function windowsTaskScript(service, { includeRelay, readOnly = false }) {
       '$relayCommand = Get-Command cloudflared.exe -ErrorAction SilentlyContinue',
     );
   }
+  if (startedAt) {
+    lines.push("$started = if ($procs.Count -gt 0) { ($procs | Sort-Object CreationDate | Select-Object -First 1).CreationDate.ToUniversalTime().ToString('o') } else { $null }");
+  }
   lines.push(
-    '[pscustomobject]@{ running = ($procs.Count -gt 0); pids = (($procs | ForEach-Object { [string]$_.ProcessId }) -join \',\')' +
+    `[pscustomobject]@{ ${startedAt ? 'startedAt = $started; ' : ''}running = ($procs.Count -gt 0); pids = (($procs | ForEach-Object { [string]$_.ProcessId }) -join ',')` +
       (includeRelay
         ? '; relayConfigured = (($relayCommand -ne $null) -or ($relay.Count -gt 0)); relayRunning = ($relay.Count -gt 0)'
         : '') +
@@ -181,25 +198,52 @@ function windowsTaskScript(service, { includeRelay, readOnly = false }) {
   return lines.join('\n');
 }
 
-function windowsTaskProbe(service, { includeRelay }) {
-  const result = runPowerShell(windowsTaskScript(service, { includeRelay }), 30000);
-  const parsed = parsePowerShellJson(result.stdout);
-  if (!parsed) {
-    return { running: false, unitState: 'unknown', pids: [], error: describeFailure(result) };
+/** An ISO timestamp from a probe's text, or null when the text is not one. */
+function timestamp(text) {
+  const value = Date.parse(String(text ?? '').trim().replace(/^[A-Za-z]{3}\s+/, ''));
+  return Number.isNaN(value) ? null : new Date(value).toISOString();
+}
+
+/**
+ * What the scheduled-task script answered, read the same way by `status` and by
+ * the stop loop, the busy gate and recovery, which all act on it.
+ *
+ * Only a script that succeeded and printed a typed Boolean is a reading. The
+ * synchronous probe used to parse whatever was printed, so a PowerShell that
+ * exited 1 after an access-denied query, having printed a perfectly
+ * well-formed "running": false, made the service read as stopped with no error
+ * at all: the stop loop let an installer at its files, and the busy gate retired
+ * the turns it was running. A failed, timed-out or malformed answer is unknown
+ * (contract section 6), and unknown is never stopped.
+ */
+export function readTaskProbe(result) {
+  const parsed = result.ok ? parsePowerShellJson(result.stdout) : null;
+  if (!parsed || typeof parsed.running !== 'boolean') {
+    const error = result.ok ? 'PowerShell printed no process reading' : describeFailure(result);
+    return { probe: { running: false, unitState: 'unknown', pids: [], startedAt: null, error }, parsed: null };
   }
   const pids = String(parsed.pids ?? '')
     .split(',')
     .map((value) => Number(value.trim()))
     .filter((value) => Number.isInteger(value) && value > 0);
-
-  const probe = {
-    running: Boolean(parsed.running),
-    unitState: parsed.running ? 'running' : 'stopped',
-    pids,
-    error: null,
+  return {
+    probe: {
+      running: parsed.running,
+      unitState: parsed.running ? 'running' : 'stopped',
+      pids,
+      startedAt: parsed.running ? timestamp(parsed.startedAt) : null,
+      error: null,
+    },
+    parsed,
   };
-  if (includeRelay) {
-    probe.relay = { configured: Boolean(parsed.relayConfigured), running: Boolean(parsed.relayRunning) };
+}
+
+function windowsTaskProbe(service, { includeRelay }) {
+  const reading = readTaskProbe(runPowerShell(windowsTaskScript(service, { includeRelay }), 30000));
+  // The synchronous probe has never reported a start time; processStartedAt does.
+  const { startedAt, ...probe } = reading.probe;
+  if (includeRelay && reading.parsed) {
+    probe.relay = { configured: Boolean(reading.parsed.relayConfigured), running: Boolean(reading.parsed.relayRunning) };
   }
   return probe;
 }
@@ -256,11 +300,7 @@ export async function probeProcessAsync(service, { clock = deadline(15000), incl
     if (timeoutMs <= 0) return Promise.resolve({ ok: false, code: null, stdout: '', stderr: '', timedOut: true, command: file });
     return runner(file, args, { timeoutMs });
   };
-  const timestamp = (text) => {
-    const value = Date.parse(String(text ?? '').trim().replace(/^[A-Za-z]{3}\s+/, ''));
-    return Number.isNaN(value) ? null : new Date(value).toISOString();
-  };
-  const powershell = (script) => run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], 30000);
+  const powershell = (script) => run('powershell.exe', powerShellArgs(script), 30000);
   const type = service.process?.type;
   let probe;
   if (type === 'systemd-user' || type === 'systemd-system') {
@@ -277,18 +317,9 @@ export async function probeProcessAsync(service, { clock = deadline(15000), incl
           startedAt: fields.ActiveState === 'active' ? timestamp(fields.ActiveEnterTimestamp) : null, error: null }
       : unknown(describeFailure(result));
   } else if (type === 'scheduled-task') {
-    const script = windowsTaskScript(service, { includeRelay, readOnly: true }).replace("$ErrorActionPreference = 'SilentlyContinue'", "$ErrorActionPreference = 'Stop'").replace(
-      '[pscustomobject]@{ running =',
-      "$started = if ($procs.Count -gt 0) { ($procs | Sort-Object CreationDate | Select-Object -First 1).CreationDate.ToUniversalTime().ToString('o') } else { $null }\n[pscustomobject]@{ startedAt = $started; running =",
-    );
-    const result = await powershell(script);
-    const parsed = result.ok ? parsePowerShellJson(result.stdout) : null;
-    probe = parsed && typeof parsed.running === 'boolean'
-      ? { running: parsed.running, unitState: parsed.running ? 'running' : 'stopped',
-          pids: String(parsed.pids ?? '').split(',').map(Number).filter((pid) => Number.isInteger(pid) && pid > 0),
-          startedAt: parsed.running ? timestamp(parsed.startedAt) : null, error: null }
-      : unknown(describeFailure(result));
-    if (includeRelay && parsed) probe.relay = { configured: true, running: parsed.relayRunning === true };
+    const reading = readTaskProbe(await powershell(windowsTaskScript(service, { includeRelay, readOnly: true, startedAt: true })));
+    probe = reading.probe;
+    if (includeRelay && reading.parsed) probe.relay = { configured: true, running: reading.parsed.relayRunning === true };
   } else if (type === 'app') {
     if (!service.path) return unknown('no app path is configured for this service');
     const result = await run('/bin/ps', ['-Ao', 'pid=,comm=']);
@@ -333,60 +364,92 @@ export async function probeProcessAsync(service, { clock = deadline(15000), incl
 }
 
 /**
+ * What the process probe can say about whether the service is up: `running`,
+ * `stopped`, or `unknown` with the reason it could not say (contract section
+ * 6). Unknown is never read as either of the others. Each caller turns it into
+ * the answer that is safe for what it is about to do, and the two that act on
+ * it want opposite answers: the stop loop may let an installer at the files
+ * only on a positive "stopped", and recovery may drop its obligation to put a
+ * service back only on a positive "running" (section 5.5).
+ */
+export function processEvidence(service) {
+  const type = service.process?.type;
+  if (type === 'systemd-user' || type === 'systemd-system') {
+    const active = systemctl(service, 'is-active', 10000);
+    const state = active.stdout.trim();
+    // An empty answer means systemctl told us nothing at all.
+    if (!state) return { state: 'unknown', error: describeFailure(active) };
+    if (state === 'inactive' || state === 'failed' || state === 'unknown') return { state: 'stopped', error: null };
+    if (state === 'active' || state === 'reloading') return { state: 'running', error: null };
+    // Activating, deactivating: on its way to one or the other, and neither yet.
+    return { state: 'unknown', error: `${service.process.unit} is ${state}` };
+  }
+  if (type === 'app') {
+    const { pids, error } = appProvider.appPids(service);
+    if (error) return { state: 'unknown', error };
+    return { state: pids.length > 0 ? 'running' : 'stopped', error: null };
+  }
+  const probe = probeProcess(service);
+  if (probe.error) return { state: 'unknown', error: probe.error };
+  // A command process with no running command reads as running, so that the
+  // stop loop never takes it for stopped, but nothing has looked at it.
+  if (probe.unitState === 'unknown') return { state: 'unknown', error: `${service.name} has no running command, so nothing here can say whether it is up` };
+  return { state: probe.running ? 'running' : 'stopped', error: null };
+}
+
+/**
  * Just "is it up", and it FAILS CLOSED. The stop loop uses this to decide when
  * it is safe to let an installer rewrite files underneath the service, so a
  * probe we could not complete has to read as "still running": timing out costs
  * one deferred update, guessing "stopped" corrupts a live service.
  */
 export function isRunning(service) {
-  const type = service.process?.type;
-  if (type === 'systemd-user' || type === 'systemd-system') {
-    const active = systemctl(service, 'is-active', 10000);
-    const state = active.stdout.trim();
-    if (!state) return true;
-    return state !== 'inactive' && state !== 'failed' && state !== 'unknown';
-  }
-  // isAppRunning already fails closed on a probe it could not complete.
-  if (type === 'app') return appProvider.isAppRunning(service);
-  const probe = probeProcess(service);
-  if (probe.error) return true;
-  return probe.running;
+  return processEvidence(service).state !== 'stopped';
 }
 
-export function startProcess(service) {
+/** How long a start or a stop command gets. */
+export const PROCESS_COMMAND_MS = 60000;
+
+/**
+ * Start and stop go through the mutation runner, which answers only once the
+ * command has ended or its whole tree has been stopped. A start command is done
+ * when it exits, and the daemon it leaves running is the whole point of it, so
+ * it is never stopped for outliving the command that started it.
+ */
+export async function startProcess(service) {
   const type = service.process?.type;
   if (type === 'systemd-user' || type === 'systemd-system') {
-    const result = systemctl(service, 'start', 60000);
+    const result = await systemctlMutation(service, 'start', PROCESS_COMMAND_MS);
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'scheduled-task') {
-    const result = runPowerShell(`Start-ScheduledTask -TaskName ${psLiteral(service.process.task)}`, 60000);
+    const result = await runMutation('powershell.exe', powerShellArgs(`Start-ScheduledTask -TaskName ${psLiteral(service.process.task)}`), { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'app') return appProvider.launchApp(service);
   if (type === 'command') {
     if (!service.process.start) return { ok: false, message: `${service.name} has no start command configured` };
-    const result = runArgv(service.process.start, { timeoutMs: 60000 });
+    const result = await runMutationArgv(service.process.start, { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   return { ok: true, message: `${service.name} has nothing to start` };
 }
 
-export function stopProcess(service) {
+export async function stopProcess(service) {
   const type = service.process?.type;
   if (type === 'systemd-user' || type === 'systemd-system') {
-    const result = systemctl(service, 'stop', 60000);
+    const result = await systemctlMutation(service, 'stop', PROCESS_COMMAND_MS);
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   if (type === 'scheduled-task') {
-    const result = runPowerShell(`Stop-ScheduledTask -TaskName ${psLiteral(service.process.task)}`, 60000);
+    const result = await runMutation('powershell.exe', powerShellArgs(`Stop-ScheduledTask -TaskName ${psLiteral(service.process.task)}`), { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   // Asking is all we ever do to an app. There is no forced stop here.
   if (type === 'app') return appProvider.askAppToQuit(service);
   if (type === 'command') {
     if (!service.process.stop) return { ok: false, message: `${service.name} has no stop command configured` };
-    const result = runArgv(service.process.stop, { timeoutMs: 60000 });
+    const result = await runMutationArgv(service.process.stop, { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
   return { ok: true, message: `${service.name} has nothing to stop` };

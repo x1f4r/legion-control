@@ -2,9 +2,10 @@
 //
 // Writing the controller config once on each device is one time too many, so
 // every agent keeps a copy at <base>/controller.json and serves it to whoever
-// asks. The document is opaque here: the agent never reads what is in it, it
-// only stores and returns the bytes it was given, and the clients do all the
-// interpreting.
+// asks. It stores and returns the bytes it was given, and the clients do all
+// the interpreting: the agent checks the document's structure on `config set`
+// (contract section 9.4) and, in a restricted session, its launch values
+// (section 9.9). It never merges and never picks a winner.
 //
 // TWO THINGS MAKE THIS WORK, and both were broken before.
 //
@@ -29,8 +30,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { basePath } from './config.mjs';
-import { REASON } from './contract.mjs';
+import { jsonParseProblem } from './config-store.mjs';
+import { REASON, SETUP_ID_PATTERN } from './contract.mjs';
+import { approvalsFrom, launchProjection, launchReview } from './launch.mjs';
+import { basePath } from './paths.mjs';
+import { findRepeatedMember, validateSetupDocument } from './setup-document.mjs';
+import { ensurePrivateDir, retryWindowsSharing } from './state.mjs';
 
 /** Room for far more machines than anyone has, and small enough to refuse a mistake. */
 export const MAX_CONTROLLER_BYTES = 1024 * 1024;
@@ -38,8 +43,12 @@ export const MAX_CONTROLLER_BYTES = 1024 * 1024;
 /** How many ancestors a document carries. Deep enough for weeks of edits. */
 export const MAX_LINEAGE = 32;
 
-const HASH_PATTERN = /^[0-9a-f]{64}$/;
-const SETUP_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+/** How many problems a refusal lists, and how many notes a push returns (contract section 9.4). */
+const MAX_PROBLEMS = 50;
+
+/** Every hash on the wire: lowercase hex sha256. */
+export const HASH_PATTERN = /^[0-9a-f]{64}$/;
+export { SETUP_ID_PATTERN };
 const CONTROLLER_SOURCES = ['mac', 'desktop', 'phone', 'cli', 'legacy'];
 
 export function controllerPath() {
@@ -121,25 +130,9 @@ export function canonicalHash(input) {
 // Crash-consistent commit
 // ---------------------------------------------------------------------------
 
-const publicationWait = new Int32Array(new SharedArrayBuffer(4));
-
-function retryWindowsSharing(operation) {
-  const deadline = performance.now() + 1000;
-  let pauseMs = 10;
-  for (;;) {
-    try { return operation(); }
-    catch (error) {
-      const remaining = deadline - performance.now();
-      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
-      // A reader or antivirus scanner can briefly deny Windows replacement.
-      // Retry the same atomic operation; deleting its destination first would
-      // expose a missing document and destroy the recoverable committed pair.
-      Atomics.wait(publicationWait, 0, 0, Math.min(pauseMs, remaining));
-      pauseMs = Math.min(pauseMs * 2, 100);
-    }
-  }
-}
-
+// A reader or an antivirus scanner can briefly deny a replacement on Windows,
+// and deleting the destination first would expose a missing document and
+// destroy the recoverable committed pair (state.mjs retryWindowsSharing).
 function replaceAtomic(source, target) {
   return retryWindowsSharing(() => fs.renameSync(source, target));
 }
@@ -147,7 +140,8 @@ function replaceAtomic(source, target) {
 function writeFileAtomic(file, contents) {
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
   try {
-    const fd = fs.openSync(tmp, 'wx');
+    // Created private, so the rename puts a private file in place (T8).
+    const fd = fs.openSync(tmp, 'wx', 0o600);
     try {
       fs.writeFileSync(fd, contents);
       fs.fsyncSync(fd);
@@ -258,7 +252,7 @@ function documentSnapshot(bytes, meta, { requireMatch = false } = {}) {
     if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('not a JSON object');
   } catch (error) {
     return { document: null, raw, text: null, hash, meta: requireMatch ? legacyMeta() : meta, consistent: !requireMatch,
-      error: error.message === 'not a JSON object' ? 'controller.json is not a JSON object' : `controller.json does not parse: ${error.message}` };
+      error: error.message === 'not a JSON object' ? 'controller.json is not a JSON object' : `controller.json does not parse: ${jsonParseProblem(error, text)}` };
   }
   if (requireMatch) {
     const block = readControllerBlock(document);
@@ -364,32 +358,13 @@ export function readControllerMeta() {
 // Writing
 // ---------------------------------------------------------------------------
 
-/** Why this text is not a controller config, or null when it is one. */
-function reject(bytes) {
-  if (bytes.length > MAX_CONTROLLER_BYTES) {
-    return `the document is larger than ${MAX_CONTROLLER_BYTES} bytes`;
-  }
-  if (!isValidUtf8(bytes)) return 'the document is not valid UTF-8';
-
-  let parsed;
-  try {
-    parsed = JSON.parse(bytes.toString('utf8'));
-  } catch (error) {
-    return `the document does not parse: ${error.message}`;
-  }
-
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'the document is not a JSON object';
-  if (typeof parsed.version !== 'number') return 'the document has no "version" number';
-  if (!Array.isArray(parsed.machines)) return 'the document has no "machines" array';
-  return null;
-}
-
 /**
  * The `controller` block inside the document, validated.
  *
- * This is the one part of the document the agent reads. It still never looks at
- * `machines`: what it needs is the identity and the ancestry, because those are
- * what decide whether accepting this document would throw away somebody's work.
+ * This is the part of the document that decides acceptance: the identity and
+ * the ancestry, because those are what decide whether accepting this document
+ * would throw away somebody's work. The rest is only checked for its structure
+ * (setup-document.mjs).
  */
 export function readControllerBlock(parsed) {
   const problems = [];
@@ -559,6 +534,44 @@ export function judgeIncoming(held, incoming) {
   return { ok: true, action: 'replaced' };
 }
 
+/** The most launch paths a restricted refusal lists, and names in its message. */
+const MAX_LAUNCH_CHANGES = 100;
+const NAMED_LAUNCH_CHANGES = 5;
+
+/**
+ * Why a restricted session may not store `parsed` over `current`, or null when
+ * it may (contract section 9.4).
+ *
+ * A restricted key may publish the setup, and a client runs only launch
+ * values it approved itself, so this is defence in depth: the values this
+ * machine already holds count as approved, and a push carrying any other is
+ * refused. A key that can rename and reroute but never introduce a command
+ * cannot make a client's review the only thing standing between a stolen
+ * phone and every machine. A held copy that cannot be read is refused too: its
+ * launch values are unknown, so nothing can be shown to be one of them. With
+ * nothing held the ordinary rules apply.
+ *
+ * The message names paths and never values: what a system runs is not for a
+ * restricted key to read back out of an error.
+ */
+function restrictedRefusal(current, parsed) {
+  // A copy that is not UTF-8 has no hash and is held all the same.
+  const holdsCopy = current.hash !== null || Boolean(current.error);
+  if (!holdsCopy) return null;
+  if (current.document === null) {
+    return {
+      error: 'this machine holds a setup copy it cannot read, so a restricted key cannot replace it; publish from a device whose key is not restricted',
+    };
+  }
+  const paths = launchReview(approvalsFrom(current.document), launchProjection(parsed)).map((entry) => entry.path);
+  if (paths.length === 0) return null;
+  const named = paths.slice(0, NAMED_LAUNCH_CHANGES).join(', ') + (paths.length > NAMED_LAUNCH_CHANGES ? ', …' : '');
+  return {
+    launchChanges: paths.slice(0, MAX_LAUNCH_CHANGES),
+    error: `this key is restricted, and the document carries a launch value this machine does not hold (${named}); publish it from a device whose key is not restricted`,
+  };
+}
+
 /**
  * Store a controller config.
  *
@@ -566,8 +579,26 @@ export function judgeIncoming(held, incoming) {
  * round trip through JSON.stringify. Canonical because that is the one form
  * every side hashes; not re-serialized because reformatting somebody's document
  * would change it into a document they did not write.
+ *
+ * The checks run in the order contract section 9.4 gives, and the first one
+ * that fails answers with nothing written:
+ *
+ *   1. size and UTF-8                         bad-argument
+ *   2. the canonical bytes (section 12)
+ *   3. the canonical text is a JSON object    bad-argument
+ *   4. no member written twice                config-invalid
+ *   5. the controller block and the flags
+ *   6. the lineage rules of judgeIncoming
+ *   7. the same bytes already held            noop, and nothing else is checked
+ *   8. the document's structure               config-invalid
+ *   9. a restricted session's launch values   restricted
+ *  10. the write
+ *
+ * The structure comes after the lineage so that a push this machine would turn
+ * away anyway is answered by why it is turned away, and a byte-identical retry
+ * is a noop whatever an older agent let through.
  */
-export function storeController(input, { id = null, revision = null, source = null, replace = false } = {}) {
+export function storeController(input, { id = null, revision = null, source = null, replace = false, restricted = false } = {}) {
   const failed = (error, reasonCode = REASON.badArgument, extra = {}) => ({
     ok: false,
     hash: null,
@@ -594,21 +625,34 @@ export function storeController(input, { id = null, revision = null, source = nu
     return failed(`the document is larger than ${MAX_CONTROLLER_BYTES} bytes once it ends in a single newline (contract section 12)`);
   }
 
+  // The canonical text is what is parsed, as it is what is served: a document
+  // a person saved with a byte order mark is the same document without one.
+  const text = body.toString('utf8');
   let parsed;
   try {
-    parsed = JSON.parse(raw.toString('utf8'));
+    parsed = JSON.parse(text);
   } catch (error) {
-    return failed(`the document does not parse: ${error.message}`);
+    return failed(`the document does not parse: ${jsonParseProblem(error, text)}`);
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return failed('the document is not a JSON object');
-  if (typeof parsed.version !== 'number') return failed('the document has no "version" number');
-  if (!Array.isArray(parsed.machines)) return failed('the document has no "machines" array');
+
+  // Refused in every session, before anything reads a value: which of two
+  // copies of a member counts depends on the parser, so no later check can
+  // know which one the next device will act on.
+  const repeated = findRepeatedMember(text);
+  if (repeated !== null) {
+    const path = repeated.path || 'the document';
+    return failed(`${path} is written twice in one object, and parsers disagree about which copy counts, so nothing was written`, REASON.configInvalid, {
+      problems: [{ path, message: 'is written twice in one object, and parsers disagree about which copy counts' }],
+    });
+  }
 
   const block = readControllerBlock(parsed);
   if (block.problems.length > 0) {
     return failed(
       `the document's controller block is not usable: ${block.problems.map((p) => `${p.path}: ${p.message}`).join('; ')}`,
       REASON.configInvalid,
+      { problems: block.problems.slice(0, MAX_PROBLEMS) },
     );
   }
 
@@ -672,6 +716,25 @@ export function storeController(input, { id = null, revision = null, source = nu
     return { ok: true, action: 'noop', hash, bytes: body.length, meta: held, error: null };
   }
 
+  // The structure, which every client checks before it uses a document, and
+  // which agents before 3.1.0 never looked at. What a client can use but would
+  // say something about comes back as notes rather than a refusal.
+  const checked = validateSetupDocument(parsed);
+  if (checked.errors.length > 0) {
+    const count = checked.errors.length;
+    return failed(
+      `the document breaks ${count} rule${count === 1 ? '' : 's'} of the setup document, so nothing was written; the first is ${checked.errors[0].path || 'the document'}`,
+      REASON.configInvalid,
+      { problems: checked.errors.slice(0, MAX_PROBLEMS).map(({ path, message }) => ({ path: path || 'the document', message })) },
+    );
+  }
+  const notes = checked.warnings.slice(0, MAX_PROBLEMS).map(({ path, message }) => `${path}: ${message}`);
+
+  if (restricted) {
+    const refusal = restrictedRefusal(current, parsed);
+    if (refusal !== null) return { ok: false, hash: null, bytes: 0, reasonCode: REASON.restricted, current: held, ...refusal };
+  }
+
   const meta = {
     id: effectiveId,
     revision: effectiveRevision ?? 0,
@@ -684,7 +747,7 @@ export function storeController(input, { id = null, revision = null, source = nu
   };
 
   try {
-    fs.mkdirSync(basePath(), { recursive: true });
+    ensurePrivateDir(basePath());
     // 1. Stage the document beside its destination.
     const staged = `${controllerPath()}.staged`;
     writeFileAtomic(staged, body);
@@ -700,5 +763,5 @@ export function storeController(input, { id = null, revision = null, source = nu
     return failed(`controller.json could not be written: ${error.message}`, REASON.internal);
   }
 
-  return { ok: true, hash, bytes: body.length, action: verdict.action, meta, error: null };
+  return { ok: true, hash, bytes: body.length, action: verdict.action, meta, notes, error: null };
 }

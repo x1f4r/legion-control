@@ -11,30 +11,33 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { lastGoodInfo, readJsonDocument } from './config-store.mjs';
 import {
   AGENT_TREE,
   AGENT_VERSION,
   basePath,
   configPath,
   detectPlatform,
-  lastGoodInfo,
+  lastGoodConfigPath,
   operationsDir,
-  readJsonDocument,
-  runCommand,
   stateDir,
   userHome,
-} from './config.mjs';
+} from './paths.mjs';
+import { describeFailure, runCommand } from './process-runner.mjs';
 import { CONTRACT_VERSION } from './contract.mjs';
 import { carriesSignedManifest } from './archive.mjs';
 import { selectSleepCommand } from './boot.mjs';
 import { readController } from './controller.mjs';
+import { isRestrictedSession } from './dispatch.mjs';
 import { checkEndpoint } from './endpoint.mjs';
 import { effectiveFloor, floorPath, isOlder } from './floor.mjs';
 import { currentHolder } from './lock.mjs';
 import { checkServiceBusy } from './probes/busy.mjs';
 import { checkHealth } from './probes/health.mjs';
 import { listOperations } from './operations.mjs';
+import { redactConfig, redactReply, valueRedactor } from './redact.mjs';
 import { describeSystemUpdates, scheduledEligibility } from './policy.mjs';
+import { SCHEDULER_LIMIT_MS } from './scheduler.mjs';
 import { livenessOf, probeService } from './service.mjs';
 import { trustFingerprint } from './trust.mjs';
 import * as commandProvider from './providers/command.mjs';
@@ -128,6 +131,131 @@ function configChecks(loaded) {
   return checks;
 }
 
+/**
+ * The files under the base that the agent writes and that hold what it was
+ * configured with or did: the configuration and its last good copy, the setup
+ * and its commit, the version floor and the log. Operation records and service
+ * state are the JSON files in ops/ and state/. Lock databases hold nothing.
+ */
+const PRIVATE_FILES = [
+  'config.json', 'config.last-good.json', 'controller.json', 'controller.json.staged', 'controller.meta.json',
+  'controller.commit.json', 'agent-floor.json', 'legionctl.log', 'legionctl.log.1',
+];
+
+/**
+ * Every agent directory and file under `base` that its group or anybody else
+ * may read or enter, as `{ path, mode }` with the mode in octal (POSIX).
+ */
+export function exposedFiles(base = basePath()) {
+  const exposed = [];
+  const look = (file) => {
+    try {
+      const mode = fs.statSync(file).mode & 0o777;
+      if ((mode & 0o077) !== 0) exposed.push({ path: file, mode: mode.toString(8).padStart(3, '0') });
+    } catch { /* not there, which exposes nothing */ }
+  };
+  look(base);
+  for (const dir of [path.join(base, 'ops'), path.join(base, 'state')]) {
+    look(dir);
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { /* not created yet */ }
+    for (const name of names.filter((entry) => entry.endsWith('.json')).sort()) look(path.join(dir, name));
+  }
+  for (const name of PRIVATE_FILES) look(path.join(base, name));
+  return exposed;
+}
+
+/** Well-known groups whose access to the base lets any other account read it, by SDDL alias and by SID. */
+const BROAD_GROUPS = {
+  WD: 'Everyone', 'S-1-1-0': 'Everyone',
+  BU: 'Users', 'S-1-5-32-545': 'Users',
+  AU: 'Authenticated Users', 'S-1-5-11': 'Authenticated Users',
+};
+
+/**
+ * The broad groups an allow entry of an SDDL descriptor's DACL names. SDDL
+ * spells them the same in every Windows language, which icacls output does
+ * not: a German machine lists Users as "VORDEFINIERT\Benutzer".
+ */
+export function broadAclGroups(sddl) {
+  const dacl = /D:[^(]*((?:\([^)]*\))*)/.exec(String(sddl ?? ''))?.[1] ?? '';
+  const groups = new Set();
+  for (const [, ace] of dacl.matchAll(/\(([^)]*)\)/g)) {
+    const fields = ace.split(';');
+    if (fields[0] === 'A' && BROAD_GROUPS[fields[5]]) groups.add(BROAD_GROUPS[fields[5]]);
+  }
+  return [...groups];
+}
+
+/**
+ * Whether only this user can read what the agent keeps (T8). The base holds
+ * every configured command, the setup and the record of every operation.
+ */
+export function privateFilesCheck({ platform = process.platform, base = basePath(), run = runCommand } = {}) {
+  if (platform === 'win32') {
+    // Read through .NET rather than Get-Acl. A restricted session starts
+    // PowerShell without PSModulePath, and finding Get-Acl then means looking
+    // through every module installed, which on a machine with many of them
+    // outlasts the timeout. The class needs no module at all.
+    const script = '$s = [System.Security.AccessControl.AccessControlSections]::Access; '
+      + '[System.IO.Directory]::GetAccessControl($env:LEGIONCTL_DOCTOR_PATH, $s).GetSecurityDescriptorSddlForm($s)';
+    const acl = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      timeoutMs: 20000, env: { ...process.env, LEGIONCTL_DOCTOR_PATH: base },
+    });
+    if (!acl.ok) {
+      return check('files.private', 'warn', `who may read ${base} could not be read`, describeFailure(acl), 're-run agent/install/install-windows.ps1, which gives the base to your account alone');
+    }
+    const groups = broadAclGroups(acl.stdout.trim());
+    return groups.length === 0
+      ? check('files.private', 'ok', `only named accounts may read ${base}`, 'Everyone, Users and Authenticated Users have no access', null)
+      : check(
+          'files.private',
+          'warn',
+          `${groups.join(', ')} may read ${base}`,
+          'the base holds every configured command, the setup and the record of every operation',
+          `re-run agent/install/install-windows.ps1, or run: icacls "${base}" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"`,
+        );
+  }
+  const exposed = exposedFiles(base);
+  return exposed.length === 0
+    ? check('files.private', 'ok', 'only this user can read what the agent keeps', `${base} is 0700 and the agent's files are 0600`, null)
+    : check(
+        'files.private',
+        'warn',
+        `${exposed.length} of the agent's directories and files can be read by other users`,
+        exposed.slice(0, 10).map((entry) => `${entry.path} (${entry.mode})`).join(', ') + (exposed.length > 10 ? ', …' : ''),
+        `chmod -R go-rwx "${base}"`,
+      );
+}
+
+/**
+ * Which shell this Windows account's OpenSSH runs (contract section 15.1).
+ * A system with no `shell` in the setup is driven with cmd, which is what a
+ * stock install runs; an account whose OpenSSH runs PowerShell needs the setup
+ * to say so, or every command it is sent fails to parse.
+ */
+export function sshShellCheck(result) {
+  const value = /^\s*DefaultShell\s+REG_(?:EXPAND_)?SZ\s+(.*?)\s*$/im.exec(result.stdout ?? '')?.[1] ?? null;
+  if (value === null) {
+    // reg query exits 1 with an error on stderr when the value is not there.
+    return result.error
+      ? check('ssh.shell', 'warn', 'the shell OpenSSH runs could not be read', `reg query failed: ${result.error}`, 'read HKLM\\SOFTWARE\\OpenSSH DefaultShell by hand; a system without "shell" in the setup is driven with cmd')
+      : check('ssh.shell', 'ok', 'OpenSSH runs cmd.exe, the default', 'HKLM\\SOFTWARE\\OpenSSH sets no DefaultShell, so a system without "shell" in the setup is driven with cmd', null);
+  }
+  const name = value.split(/[\\/]/).at(-1).toLowerCase();
+  if (name === 'cmd.exe') return check('ssh.shell', 'ok', 'OpenSSH runs cmd.exe', value, null);
+  if (name === 'powershell.exe' || name === 'pwsh.exe') {
+    return check('ssh.shell', 'ok', `OpenSSH runs ${name}`, `${value}; set "shell": "powershell" on this system in the setup, or every command sent to it is quoted for cmd`, null);
+  }
+  return check(
+    'ssh.shell',
+    'warn',
+    `OpenSSH runs ${value}`,
+    'clients quote commands for cmd or PowerShell, and for no other shell',
+    'set HKLM\\SOFTWARE\\OpenSSH DefaultShell to cmd.exe or powershell.exe, or remove it',
+  );
+}
+
 function environmentChecks() {
   const checks = [];
   const base = basePath();
@@ -135,7 +263,8 @@ function environmentChecks() {
   let writable = false;
   let writeError = null;
   try {
-    fs.mkdirSync(base, { recursive: true });
+    // Created as the agent creates it, so asking leaves nothing more readable.
+    fs.mkdirSync(base, { recursive: true, mode: 0o700 });
     const probe = path.join(base, `.doctor-${process.pid}`);
     fs.writeFileSync(probe, 'x');
     fs.rmSync(probe, { force: true });
@@ -154,6 +283,7 @@ function environmentChecks() {
           'the agent keeps its state, operation records and locks here; fix the ownership or permissions of that directory',
         ),
   );
+  checks.push(privateFilesCheck({ base }));
 
   const major = nodeMajor();
   checks.push(
@@ -192,7 +322,7 @@ function environmentChecks() {
   const unwritable = [];
   for (const dir of [operationsDir(), stateDir()]) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       fs.accessSync(dir, fs.constants.W_OK);
     } catch {
       unwritable.push(dir);
@@ -248,7 +378,7 @@ function environmentChecks() {
     check(
       'session.restricted',
       'ok',
-      process.env.LEGIONCTL_RESTRICTED === '1' ? 'this is a restricted session' : 'this is an ordinary session',
+      isRestrictedSession() ? 'this is a restricted session' : 'this is an ordinary session',
       [
         process.env.LEGIONCTL_CLIENT ? `client: ${process.env.LEGIONCTL_CLIENT}` : null,
         `signed bundles are verified against release key ${trustFingerprint().slice(0, 8)} and nothing else`,
@@ -258,6 +388,10 @@ function environmentChecks() {
       null,
     ),
   );
+
+  if (process.platform === 'win32') {
+    checks.push(sshShellCheck(runCommand('reg', ['query', 'HKLM\\SOFTWARE\\OpenSSH', '/v', 'DefaultShell'], { timeoutMs: 10000 })));
+  }
 
   // A clock that is badly wrong makes every timestamp, every expiry and every
   // maintenance window meaningless, and it is invisible until it bites.
@@ -387,6 +521,65 @@ export function linuxSchedulerCommand(unit, { base = basePath(), node = process.
   return { ok: stable || legacy, execLine };
 }
 
+const SPAN_UNITS = {
+  us: 0.001, ms: 1, s: 1000, sec: 1000, second: 1000, seconds: 1000, m: 60000, min: 60000, minute: 60000, minutes: 60000,
+  h: 3600000, hr: 3600000, hour: 3600000, hours: 3600000, d: 86400000, day: 86400000, days: 86400000,
+};
+
+/**
+ * How long a scheduler lets a cycle run, in milliseconds, from the text it
+ * keeps that in: a Windows task's ExecutionTimeLimit, an ISO 8601 duration
+ * such as PT15M, which is 72 hours when the task names none; or a systemd
+ * unit's TimeoutStartSec, in seconds or a span such as "30min". No limit at
+ * all (PT0S, infinity, 0) is Infinity, and anything else null: nothing here
+ * can say.
+ */
+export function schedulerTimeLimitMs(text, { kind }) {
+  if (kind === 'task') {
+    const limit = /<ExecutionTimeLimit>\s*([^<]*?)\s*<\/ExecutionTimeLimit>/.exec(String(text ?? ''));
+    if (!limit) return 72 * SPAN_UNITS.h;
+    const iso = /^P(?:([0-9]+)D)?(?:T(?:([0-9]+)H)?(?:([0-9]+)M)?(?:([0-9]+)S)?)?$/.exec(limit[1]);
+    if (!iso || limit[1] === 'P' || limit[1].endsWith('T')) return null;
+    const [days, hours, minutes, seconds] = iso.slice(1).map((value) => Number(value ?? 0));
+    const ms = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+    return ms === 0 ? Infinity : ms;
+  }
+  const value = [...String(text ?? '').matchAll(/^\s*TimeoutStartSec\s*=\s*(.*?)\s*$/gm)].at(-1)?.[1];
+  if (value === undefined) return null;
+  if (value === 'infinity') return Infinity;
+  if (!/^(?:[0-9]+(?:\.[0-9]+)?\s*[a-z]*\s*)+$/.test(value)) return null;
+  let ms = 0;
+  for (const [, amount, unit] of value.matchAll(/([0-9]+(?:\.[0-9]+)?)\s*([a-z]*)/g)) {
+    const scale = unit === '' ? SPAN_UNITS.s : SPAN_UNITS[unit];
+    if (scale === undefined) return null;
+    ms += Number(amount) * scale;
+  }
+  return ms === 0 ? Infinity : ms;
+}
+
+/**
+ * Whether the scheduler lets a cycle run as long as a cycle budgets for
+ * (scheduler.mjs). One that ends it sooner can cut an update off part way, and
+ * the service stays down until the next cycle puts it back; an install from
+ * before agent 3.1.0 that nobody has run the installer for since is the usual
+ * one. A limit nothing can read adds no check.
+ */
+export function schedulerTimeLimitCheck(limitMs, fix) {
+  if (limitMs === null) return null;
+  const budget = `${SCHEDULER_LIMIT_MS / 60000} min`;
+  if (limitMs >= SCHEDULER_LIMIT_MS) {
+    const summary = limitMs === Infinity ? 'the scheduler lets a cycle run as long as it needs' : `the scheduler lets a cycle run for ${Math.floor(limitMs / 60000)} min`;
+    return check('scheduler.timeLimit', 'ok', summary, null, null);
+  }
+  return check(
+    'scheduler.timeLimit',
+    'warn',
+    `the scheduler ends a cycle after ${Math.max(1, Math.floor(limitMs / 60000))} min, sooner than the ${budget} a cycle may take`,
+    'an update it ends part way leaves its service down until the next cycle puts it back',
+    fix,
+  );
+}
+
 /** Check the scheduler's cycle command and when it last ran. */
 function schedulerChecks(config) {
   const checks = [];
@@ -409,6 +602,8 @@ function schedulerChecks(config) {
     const unit = runCommand('systemctl', ['--user', 'cat', 'legion-control-update.service'], { timeoutMs: 10000 });
     const scheduled = linuxSchedulerCommand(unit.stdout);
     const execLine = scheduled.execLine;
+    const unitLimit = unit.ok ? schedulerTimeLimitCheck(schedulerTimeLimitMs(unit.stdout, { kind: 'unit' }), 're-run agent/install/install-linux.sh, which sets TimeoutStartSec=1800') : null;
+    if (unitLimit) checks.push(unitLimit);
     checks.push(
       unit.ok && scheduled.ok
         ? check('scheduler.command', 'ok', 'the timer runs this agent\'s cycle', execLine.trim(), null)
@@ -434,6 +629,8 @@ function schedulerChecks(config) {
             'run agent/install/install-windows.ps1',
           ),
     );
+    const taskLimit = task.ok ? schedulerTimeLimitCheck(schedulerTimeLimitMs(task.stdout, { kind: 'task' }), 're-run agent/install/install-windows.ps1 to give the task a longer time limit') : null;
+    if (taskLimit) checks.push(taskLimit);
     checks.push(
       !task.ok
         ? check('scheduler.command', 'fail', 'not reached', 'the task has to exist first', 'run agent/install/install-windows.ps1')
@@ -698,7 +895,9 @@ async function serviceChecks(config, service, { deep }) {
 export async function runDoctor(loaded, { service = null, deep = false } = {}) {
   const startedAt = Date.now();
   const raw = readJsonDocument(loaded.path ?? configPath());
-  const sanitize = diagnosticRedactor(loaded.config, raw.state === 'ok' ? raw.value : null);
+  // The last copy that loaded cleanly as well: a config.json that stopped
+  // parsing still has its old values quoted in records and log lines.
+  const sanitize = valueRedactor(loaded.config, raw.state === 'ok' ? raw.value : null, readJsonDocument(lastGoodConfigPath()).value);
   const checks = [...configChecks(loaded), ...environmentChecks(), ...agentChecks()];
 
   const config = loaded.config;
@@ -790,114 +989,12 @@ export async function runDoctor(loaded, { service = null, deep = false } = {}) {
   };
 }
 
-const REDACTED = '<redacted>';
-const sensitiveKey = (key) => /token|secret|password|passwd|apikey|authorization|credential|identityfile|privatekey|^auth$|^key$/i.test(key.replace(/[_-]/g, ''));
-
-/** Collect configured values only; this cannot identify arbitrary output secrets. */
-function diagnosticRedactor(...configs) {
-  const values = new Set();
-  const remember = (value) => {
-    if (typeof value === 'string' && value.length > 0) {
-      values.add(value);
-      // Both raw text and JSON-escaped echoes can occur in captured output.
-      values.add(JSON.stringify(value).slice(1, -1));
-    }
-  };
-  const collect = (value, sensitive = false) => {
-    if (typeof value === 'string') {
-      if (sensitive) remember(value);
-      try {
-        const url = new URL(value);
-        for (const credential of [url.username, url.password]) {
-          remember(credential);
-          try { remember(decodeURIComponent(credential)); } catch { /* retain encoded value */ }
-        }
-        for (const [key, inner] of url.searchParams) if (sensitiveKey(key)) remember(inner);
-        for (const pair of url.search.slice(1).split('&')) {
-          const separator = pair.indexOf('=');
-          if (separator < 0) continue;
-          try {
-            if (sensitiveKey(decodeURIComponent(pair.slice(0, separator).replace(/\+/g, ' ')))) remember(pair.slice(separator + 1));
-          } catch { /* malformed query encoding is retained as unknown text */ }
-        }
-      } catch { /* most config strings are not URLs */ }
-    } else if (Array.isArray(value)) {
-      const argv = value.every((item) => typeof item === 'string');
-      value.forEach((item, index) => {
-        collect(item, sensitive || (argv && index > 0));
-        if (argv && index > 0) {
-          const assignment = /^[^=\s]+=(.*)$/s.exec(item);
-          if (assignment) remember(assignment[1]);
-        }
-      });
-    } else if (value && typeof value === 'object') {
-      for (const [key, inner] of Object.entries(value)) collect(inner, sensitive || sensitiveKey(key));
-    }
-  };
-  configs.forEach((config) => collect(config));
-  const escaped = [...values].sort((a, b) => b.length - a.length).map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const pattern = escaped.length ? new RegExp(escaped.join('|'), 'g') : null;
-  const walk = (value) => {
-    if (typeof value === 'string') return pattern ? value.split(REDACTED).map((part) => part.replace(pattern, () => REDACTED)).join(REDACTED) : value;
-    if (Array.isArray(value)) return value.map(walk);
-    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, walk(inner)]));
-    return value;
-  };
-  return walk;
-}
-
-/**
- * Keys whose values a client decodes rather than reads: identifiers, enum
- * words, versions, timestamps, hashes and the names a reply is about. A
- * configured argument that happens to be a word like "restart" or "busy" is
- * still redacted wherever it appears in prose, but rewriting it inside these
- * turned an operation's kind into "re<redacted>" and a reason code into
- * something no schema allows, and the bundle into a reply no client decodes.
- */
-const VERBATIM_KEYS = new Set([
-  'agentVersion', 'system', 'reasonCode', 'deferredReason', 'action', 'outcome', 'state', 'phase', 'kind', 'mode', 'evidence', 'level', 'disposition',
-  'id', 'opId', 'service', 'target', 'actionId', 'systemId', 'hash', 'keyFingerprint', 'lineage', 'source', 'version', 'from', 'to',
-  'installed', 'latest', 'nightly', 'staged', 'channel', 'pendingVersion', 'replaced', 'floor', 'signed',
-  'requestedAt', 'startedAt', 'updatedAt', 'finishedAt', 'expiresAt', 'checkedAt', 'at', 'nextWindow', 'pauseUntil', 'generatedAt', 'days',
-  'controller', 'raw', 'meta', 'current', 'command', 'argument', 'accepts', 'name', 'os', 'node', 'unit', 'capabilities', 'launchChanges', 'path',
-]);
-
-/** Redact the free text of a reply with `redact`, leaving every value under VERBATIM_KEYS as it is. */
-export function redactReply(value, redact, key = null) {
-  if (key !== null && VERBATIM_KEYS.has(key)) return value;
-  if (Array.isArray(value)) return value.map((item) => redactReply(item, redact));
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([name, inner]) => [name, redactReply(inner, redact, name)]));
-  }
-  return redact(value);
-}
-
-/** Keep executable names for diagnosis; every subsequent argument is private. */
-export function redactConfig(config) {
-  if (!config) return null;
-  const walk = (value, key = '') => {
-    if (sensitiveKey(key)) return REDACTED;
-    if (Array.isArray(value)) {
-      if (value.every((item) => typeof item === 'string')) return value.map((item, index) => index === 0 ? item : REDACTED);
-      return value.map((item) => walk(item));
-    }
-    if (value && typeof value === 'object') {
-      const out = {};
-      for (const [name, inner] of Object.entries(value)) out[name] = walk(inner, name);
-      return out;
-    }
-    return value;
-  };
-
-  return diagnosticRedactor(config)(walk(config));
-}
-
 /** The diagnostic bundle: doctor, status, history, logs and a sanitized config. */
 export async function buildBundle({ doctor, status, history, logs, config, rawConfig = null }) {
   void AGENT_VERSION;
   void CONTRACT_VERSION;
   void os;
-  const sanitize = diagnosticRedactor(config, rawConfig);
+  const sanitize = valueRedactor(config, rawConfig, readJsonDocument(lastGoodConfigPath()).value);
   const evidence = redactReply({ doctor, status, history, logs }, sanitize);
   return {
     generatedAt: new Date().toISOString(),

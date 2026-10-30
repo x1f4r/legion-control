@@ -1,18 +1,12 @@
 import SwiftUI
 
-/// This device's own business: the services that run here rather than over ssh, this device's
-/// private settings, and Legion Control itself.
+/// This device's own business: the services that run here rather than over ssh and this device's
+/// private settings. Legion Control itself has its own page (`AppSection`).
 struct MacSection: View {
     let model: AppModel
     let mac: MacModel
 
-    // Read once and after every change rather than inside the body: the status comes from launchd,
-    // and the body runs again on every poll while this section is open.
-    @State private var startsAtLogin = LoginItem.isEnabled
-    @State private var needsLoginApproval = LoginItem.needsApproval
-    @State private var loginProblem: String?
     @State private var editProblem: String?
-    @State private var exportingDiagnostics = false
     @State private var exportProblem: String?
     @State private var panel: String?
     @State private var selectedService: ServiceStatus?
@@ -59,7 +53,7 @@ struct MacSection: View {
         .sheet(isPresented: Binding(get: { panel != nil }, set: { if !$0 { panel = nil } }), onDismiss: { sheetActions.didDismiss() }) {
             ControlSheet(title: panel ?? "Details") {
                 switch panel {
-                case "Settings": deviceSection; appSettings
+                case "Settings": deviceSection
                 case "Schedule": schedule
                 case "Result":
                     if let note = mac.note { Text(note).textSelection(.enabled) }
@@ -77,10 +71,6 @@ struct MacSection: View {
                     appDiagnostics
                 }
             }
-        }
-        .onAppear {
-            startsAtLogin = LoginItem.isEnabled
-            needsLoginApproval = LoginItem.needsApproval
         }
     }
 
@@ -438,8 +428,10 @@ struct MacSection: View {
             }
 
             if let problem = model.config.problem {
-                QuietNote(text: "The setup file was edited into something that could not be read, so the machines above are the ones from before it. \(problem)")
-                    .padding(.top, 12)
+                QuietNote(text: problem).padding(.top, 12)
+            }
+            if !model.setupErrors.isEmpty {
+                SetupErrorsNote(errors: model.setupErrors).padding(.top, 12)
             }
             if let problem = model.bindings.problem {
                 QuietNote(text: problem).padding(.top, 12)
@@ -478,6 +470,11 @@ struct MacSection: View {
             Text("the local agent cannot carry the setup").foregroundStyle(.secondary)
         case .failed(let sentence):
             StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
+        case .held(let sentence):
+            VStack(alignment: .leading, spacing: 8) {
+                StatusText(symbol: "pause.circle", text: sentence, tint: .secondary)
+                Button("Try again") { mac.tryAgainSharingSetup() }.controlSize(.small)
+            }
         case .conflict(let sentence):
             VStack(alignment: .leading, spacing: 8) {
                 StatusText(symbol: "exclamationmark.triangle", text: sentence, tint: .orange)
@@ -513,9 +510,9 @@ struct MacSection: View {
             Text(model.placement.description(sites: model.sites))
                 .fixedSize(horizontal: false, vertical: true)
             if !model.sites.isEmpty {
-                Picker("", selection: Binding(
+                Picker("Site", selection: Binding(
                     get: { model.bindings.bindings.currentSite ?? "" },
-                    set: { model.confirmSite($0.isEmpty ? nil : $0) }
+                    set: { editProblem = model.confirmSite($0.isEmpty ? nil : $0) }
                 )) {
                     Text("Work it out from the addresses").tag("")
                     ForEach(model.sites) { site in
@@ -551,42 +548,6 @@ struct MacSection: View {
         }
     }
 
-    // MARK: - Legion Control itself
-
-    private var appSettings: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            SectionHeading(title: "Legion Control")
-
-            DetailRow(label: "Version") {
-                VersionText(value: Self.appVersion, placeholder: "not known")
-            }
-            .padding(.bottom, 14)
-
-            updateBlock
-                .padding(.bottom, 14)
-
-            Toggle(isOn: Binding(
-                get: { startsAtLogin },
-                set: { wanted in
-                    loginProblem = LoginItem.set(wanted)
-                    startsAtLogin = LoginItem.isEnabled
-                    needsLoginApproval = LoginItem.needsApproval
-                }
-            )) {
-                Text("Start Legion Control at login")
-            }
-            .toggleStyle(.switch)
-
-            if let loginProblem {
-                QuietNote(text: loginProblem).padding(.top, 8)
-            } else if needsLoginApproval {
-                QuietNote(text: "Waiting for approval in System Settings, under General and then Login Items.")
-                    .padding(.top, 8)
-            }
-
-        }
-    }
-
     private var appDiagnostics: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionHeading(title: "Diagnostics")
@@ -599,17 +560,25 @@ struct MacSection: View {
                 ServiceSetupButton(enabled: !mac.isWorking && mac.dialect.supportsDoctor,
                                    restricted: mac.status?.isRestrictedSession == true,
                                    send: { try await mac.serviceConfig($0) })
-                Button("Install agent\(AgentBundle.shared.map { " " + $0.version } ?? "")") { afterSheet { mac.installBundledAgent() } }
-                    .disabled(AgentBundle.shared == nil || mac.isWorking || mac.status?.ok != true || mac.status?.isRestrictedSession == true)
-                    .help(AgentBundle.shared == nil ? AgentBundle.unavailableReason : "Upgrade the authenticated local agent.")
-                Button("Export all diagnostics") { exportDiagnostics() }.disabled(exportingDiagnostics)
+                if let goesBack = mac.bundledAgentGoesBack {
+                    // Never offered as an upgrade. Going back is its own question, and only where the
+                    // agent can be told it is meant.
+                    if mac.canGoBackToBundledAgent {
+                        Button("Go back to agent\(AgentBundle.shared.map { " " + $0.version } ?? "")…") { afterSheet { mac.requestBundledAgentDowngrade() } }
+                            .disabled(mac.isWorking || mac.status?.ok != true)
+                            .help(goesBack + ".")
+                    }
+                } else {
+                    Button("Install agent\(AgentBundle.shared.map { " " + $0.version } ?? "")") { afterSheet { mac.installBundledAgent() } }
+                        .disabled(AgentBundle.shared == nil || mac.isWorking || mac.status?.ok != true || mac.status?.isRestrictedSession == true)
+                        .help(AgentBundle.shared == nil ? AgentBundle.unavailableReason : "Upgrade the authenticated local agent.")
+                }
                 Button("Export operation history") { exportHistory() }
                 if !model.operations.records.isEmpty {
                     Button("Clear the history") { model.operations.clearHistory() }
                 }
             }
 
-            if exportingDiagnostics { Text("Collecting diagnostics…").font(.caption).foregroundStyle(.secondary) }
             if let exportProblem { Text(exportProblem).foregroundStyle(.orange).textSelection(.enabled) }
 
             if let problem = model.operations.persistenceProblem {
@@ -641,103 +610,9 @@ struct MacSection: View {
         .padding(.top, 14)
     }
 
-    /// The same shape as a service block one section up, because it is the same question: what is
-    /// installed, what is newer, and one button that closes the gap.
-    private var updateBlock: some View {
-        let updates = model.appUpdates
-        return VStack(alignment: .leading, spacing: 12) {
-            DetailRow(label: "Update") { updateVerdict }
-
-            FlowRow(spacing: 10) {
-                if let version = updates.availableVersion {
-                    PrimaryActionButton(
-                        title: updates.phase == .idle ? "Install \(version)" : updates.summary,
-                        isHighlighted: updates.installBlockedReason == nil,
-                        isEnabled: !updates.phase.isWorking && updates.installBlockedReason == nil
-                    ) { afterSheet { updates.install() } }
-                }
-
-                Button("Check now") { updates.checkNow() }
-                    .disabled(updates.phase.isWorking)
-
-                if let rollback = updates.rollbackVersion {
-                    Button("Go back to \(rollback)") { afterSheet { updates.rollBack() } }
-                        .disabled(updates.phase.isWorking)
-                }
-
-                if updates.phase.isWorking {
-                    ProgressView().controlSize(.small)
-                }
-            }
-
-            if let blocked = updates.installBlockedReason {
-                QuietNote(text: blocked)
-            }
-            if let note = updates.note {
-                QuietNote(text: note)
-            }
-            DisclosureGroup("Update details") { QuietNote(text: cadenceNote) }
-        }
-    }
-
-    /// Where it looks, how often, and how old the answer on screen is.
-    private var cadenceNote: String {
-        let repo = model.config.config?.updateRepo ?? ControllerConfig.AppUpdatesConfig.defaultRepo
-        let age = AppModel.freshness(of: model.appUpdates.lastChecked)
-        return "Releases of \(repo) are checked at startup, on foreground entry after 15 minutes, and every six hours while the app runs. Last check: \(age). Installation verifies the signed release and retains the previous version."
-
-    }
-
-    @ViewBuilder
-    private var updateVerdict: some View {
-        let updates = model.appUpdates
-        if updates.phase.isWorking {
-            StatusText(symbol: "arrow.down.circle", text: updates.summary, tint: .orange)
-        } else if let version = updates.availableVersion {
-            StatusText(symbol: "arrow.down.circle", text: "Version \(version) is available", tint: .orange)
-        } else {
-            switch updates.check {
-            case .upToDate:
-                StatusText(symbol: "checkmark.circle", text: "Up to date", tint: .green)
-            case .failed:
-                StatusText(symbol: "wifi.exclamationmark", text: "Not checked", tint: .orange)
-            default:
-                Text("not checked yet").foregroundStyle(.secondary)
-            }
-        }
-    }
-
     // MARK: - Exports
 
-    private func exportDiagnostics() {
-        exportingDiagnostics = true
-        Task { @MainActor in
-            let text = await model.diagnosticsBundle()
-            exportProblem = Self.save(text, suggestedName: "legion-control-diagnostics.txt")
-            exportingDiagnostics = false
-        }
-    }
-
     private func exportHistory() {
-        exportProblem = Self.save(model.operations.exportText(), suggestedName: "legion-control-operations.txt")
-    }
-
-    /// Writes the text somewhere the user chose. A save panel rather than a fixed path: a
-    /// diagnostic bundle is something you attach to a message, not something you go looking for.
-    @discardableResult static func save(_ text: String, suggestedName: String) -> String? {
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = suggestedName
-        panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        do { try Data(text.utf8).write(to: url, options: .atomic); return nil }
-        catch { return error.localizedDescription }
-    }
-
-    private static var appVersion: String? {
-        guard let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String else { return nil }
-        if let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String, build != short {
-            return "\(short) (\(build))"
-        }
-        return short
+        exportProblem = DiagnosticsExport.save(model.operations.exportText(), suggestedName: "legion-control-operations.txt")
     }
 }

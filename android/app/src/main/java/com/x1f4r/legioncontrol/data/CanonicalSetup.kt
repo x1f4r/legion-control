@@ -78,6 +78,47 @@ object CanonicalSetup {
     fun canonicalTextOrNull(bytes: ByteArray): String? =
         runCatching { canonicalText(decodeStrictly(bytes)) }.getOrNull()
 
+    /** The most a setup document may be, counted on the bytes as given. */
+    const val MAX_DOCUMENT_BYTES = 1_048_576
+
+    /**
+     * Why a document is refused before anything is stored or sent, or null when it is not (contract
+     * section 12): `too-large`, `invalid-utf8`, `empty` or `not-a-json-object`, the first that applies.
+     *
+     * Size is judged on the bytes as given, because that is what was read off the wire; everything
+     * after it on the canonical text, so a byte order mark or a blank line around the document never
+     * makes it unparseable. A second byte order mark is content rather than decoration: exactly one is
+     * stripped, the text then starts with U+FEFF, and no JSON reader takes that. Used before a paste,
+     * an adoption and a push, so a document is refused here for the same reasons a machine would.
+     */
+    fun rejectionOf(bytes: ByteArray): String? {
+        if (bytes.size > MAX_DOCUMENT_BYTES) return "too-large"
+        val text = canonicalTextOrNull(bytes) ?: return "invalid-utf8"
+        return rejectionOfCanonical(text)
+    }
+
+    /** The same, for text that is already a string. A lone surrogate has no UTF-8 form, so it is `invalid-utf8`. */
+    fun rejectionOf(text: String): String? {
+        val bytes = try {
+            encode(text)
+        } catch (_: NotUtf8) {
+            return "invalid-utf8"
+        }
+        if (bytes.size > MAX_DOCUMENT_BYTES) return "too-large"
+        return rejectionOfCanonical(canonicalText(text))
+    }
+
+    private fun rejectionOfCanonical(canonical: String): String? {
+        if (canonical == "\n") return "empty"
+        val root = try {
+            SetupJsonParser.parseAllowingRepeats(canonical).root
+        } catch (_: SetupJsonParser.Malformed) {
+            return "not-a-json-object"
+        }
+        val isDocument = root is SetupJson.Object && root["version"] is SetupJson.Number && root["machines"] is SetupJson.Array
+        return if (isDocument) null else "not-a-json-object"
+    }
+
     private fun Char.isTrimmable(): Boolean {
         for (candidate in TRIM) if (this == candidate) return true
         return false

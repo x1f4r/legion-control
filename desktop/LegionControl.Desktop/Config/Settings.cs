@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -33,6 +34,15 @@ public sealed record DesktopSettings
 
     public bool CheckForAppUpdates { get; init; } = true;
 
+    /// How long a new build has, after an update, to draw its window before the helper stops it
+    /// and puts the build before it back. A minute by default; a slow machine may need more.
+    public int UpdateHealthSeconds { get; init; } = (int)Updates.AppInstaller.DefaultHealthWindow.TotalSeconds;
+
+    /// [UpdateHealthSeconds] as the helper is given it: never so short that a working build is
+    /// undone for taking a moment, nor so long that a broken one leaves nothing open for an hour.
+    [JsonIgnore]
+    public TimeSpan UpdateHealthWindow => TimeSpan.FromSeconds(Math.Clamp(UpdateHealthSeconds, 10, 600));
+
     public static DesktopSettings Default => new();
 
     private static readonly JsonSerializerOptions Options = new()
@@ -42,37 +52,59 @@ public sealed record DesktopSettings
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
+    /// Settings that cannot be read are settings at their defaults. There is nothing here worth
+    /// refusing to start over, but a file that is not settings is moved aside before the next
+    /// change is written, never written over (see [Change]).
     public static DesktopSettings Load(string? path = null)
     {
-        path ??= AppPaths.SettingsFile;
         try
         {
-            if (!File.Exists(path)) return Default;
-            return JsonSerializer.Deserialize<DesktopSettings>(File.ReadAllText(path), Options) ?? Default;
+            return Read(path ?? AppPaths.SettingsFile).Settings;
         }
         catch (Exception)
         {
-            // Settings that cannot be read are settings at their defaults. There is nothing here
-            // worth refusing to start over.
             return Default;
         }
     }
 
-    /// Returns null on success, or a sentence to show. Settings that could not be saved are worth
-    /// saying out loud: silently forgetting a preference is worse than not offering it.
-    public string? Save(string? path = null)
+    /// The settings [path] holds, and why they are not settings when the file is there but holds
+    /// none. Throws when it cannot be read at all, which is not the same thing.
+    private static (DesktopSettings Settings, string? Corrupt) Read(string path)
+    {
+        if (!File.Exists(path)) return (Default, null);
+        var text = File.ReadAllText(path);
+        try
+        {
+            return JsonSerializer.Deserialize<DesktopSettings>(text, Options) is { } settings
+                ? (settings, null)
+                : (Default, "it holds no settings");
+        }
+        catch (JsonException error)
+        {
+            return (Default, error.Message);
+        }
+    }
+
+    /// Applies [change] to the settings as the file holds them now, under its lock, and writes the
+    /// result: the window and the command line both keep preferences here, and a change made in one
+    /// never writes the other's back to what it was when this process started. Returns the settings
+    /// now in force, and a sentence when they could not be saved: silently forgetting a preference
+    /// is worse than not offering it.
+    public static (DesktopSettings Settings, string? Problem) Change(Func<DesktopSettings, DesktopSettings> change, string? path = null)
     {
         path ??= AppPaths.SettingsFile;
         try
         {
-            var directory = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-            AtomicWrite.Text(path, JsonSerializer.Serialize(this, Options));
-            return null;
+            using var held = StateFile.Lock(path);
+            var (current, corrupt) = Read(path);
+            var next = change(current);
+            if (corrupt is not null) StateFile.SetAside(path, corrupt);
+            AtomicWrite.Text(path, JsonSerializer.Serialize(next, Options));
+            return (next, null);
         }
         catch (Exception error)
         {
-            return $"Could not save settings to {path}: {error.Message}";
+            return (change(Load(path)), $"Could not save settings to {path}: {error.Message}");
         }
     }
 }
@@ -95,12 +127,39 @@ public static class AtomicWrite
         File.WriteAllBytes(temporary, contents);
         try
         {
-            File.Move(temporary, path, overwrite: true);
+            Replace(temporary, path);
         }
         catch (Exception)
         {
             try { File.Delete(temporary); } catch (Exception) { }
             throw;
+        }
+    }
+
+    /// Windows refuses a rename over a file another process has open without delete sharing: the
+    /// other copy of this app reading it, the search indexer or an antivirus scanner looking at it
+    /// for a moment. Deleting the file first would leave a moment with no file at all, so the same
+    /// rename is tried again for up to three seconds, as the agent does with its own state. Anywhere
+    /// else the first error stands.
+    private static void Replace(string source, string destination)
+    {
+        var deadline = Stopwatch.GetTimestamp() + 3 * Stopwatch.Frequency;
+        var pause = 10;
+        while (true)
+        {
+            try
+            {
+                File.Move(source, destination, overwrite: true);
+                return;
+            }
+            catch (Exception error) when (OperatingSystem.IsWindows()
+                                          && error is UnauthorizedAccessException or IOException
+                                          && error is not FileNotFoundException and not DirectoryNotFoundException
+                                          && Stopwatch.GetTimestamp() < deadline)
+            {
+                Thread.Sleep(pause);
+                pause = Math.Min(pause * 2, 100);
+            }
         }
     }
 }

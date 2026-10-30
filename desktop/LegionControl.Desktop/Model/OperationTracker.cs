@@ -62,10 +62,20 @@ public sealed record TrackedOperation
     public string? Output { get; init; }
     public string? ReasonCode { get; init; }
     public DateTimeOffset? ExpiresAt { get; init; }
-    /// True once the outcome is something other than "we are still waiting to find out".
-    public bool IsResolved => Outcome is not (OperationOutcome.Pending or OperationOutcome.Unresolved);
+    /// True once asking again can tell nothing new: a terminal outcome, or a record the agent
+    /// finished without saying how it went. Pending work is followed, and an unknown outcome with
+    /// no finished record behind it is read again by the same id, never sent again.
+    public bool IsResolved => Outcome is OperationOutcome.Succeeded or OperationOutcome.Failed or OperationOutcome.Deferred
+        || (Outcome == OperationOutcome.Unknown && State == OperationState.Finished);
     /// True when the link went away and nothing has resolved it since. The amber row.
     public bool OutcomeUnknown { get; init; }
+    /// The machine this helper action was run to wake, while it is a wake hold for it. Never
+    /// published: holds are this device's own.
+    public string? WakeTarget { get; init; }
+    /// A wake hold: an action run for [WakeTarget] whose terminal record has not been read. Only
+    /// that record, the agent saying it has no such operation, the target answering, the helper
+    /// leaving the setup or a person releases it; never time, a restart or the helper being away.
+    public bool IsWakeHold => WakeTarget is not null && State != OperationState.Finished;
 
     public TrackedOperation WithRecord(OperationRecord record) => this with
     {
@@ -86,16 +96,43 @@ public sealed record TrackedOperation
 /// Written through a temporary file and a rename, like everything else this app persists, so a
 /// crash in the middle of an update leaves either the old list or the new one and never half of
 /// either.
+///
+/// The window and the command line keep the same list, and a wake hold in it is what stops a
+/// helper command from running on two helpers. So every change takes `operations.json.lock`, folds
+/// in what the other process wrote since this one last read or wrote the file, applies its one
+/// change and writes the whole, the way [Config.LaunchApprovals] does; a hold the command line
+/// recorded while the window was open is never written away by the window. The holds for a machine
+/// are read again whenever the file changed, so a wake planned here sees one recorded there.
+///
+/// A file that is there but is not a list is moved aside before the next change is written over it,
+/// so the operations it held can still be read by a person, and the log says where it went. One
+/// that could not be opened for a change, as when a virus scanner holds it, is not written over at
+/// all: what the other process wrote there is not in this list, so the change waits here and is
+/// written with the next change, or check, that can read the file.
 public sealed class OperationTracker
 {
     private readonly string _path;
+    private readonly bool _readOnly;
     private readonly object _gate = new();
     private readonly Dictionary<string, TrackedOperation> _operations = new(StringComparer.Ordinal);
+    /// The file's time and size when this tracker last read or wrote it, and the ids it held then.
+    private string? _signature;
+    private HashSet<string> _onDisk = new(StringComparer.Ordinal);
+    /// Why the file could not be read when this tracker last tried, or null.
+    private string? _unreadable;
+    /// True when the last read could not open the file at all, which says nothing about what it
+    /// holds.
+    private bool _unread;
+    /// True while a change made when the file could not be opened has not been written.
+    private bool _unsaved;
 
-    public OperationTracker(string? path = null)
+    /// [readOnly] is for a run that changes nothing on disk, as a smoke run does: changes are made
+    /// to the list in memory, and nothing is written or locked.
+    public OperationTracker(string? path = null, bool readOnly = false)
     {
         _path = path ?? AppPaths.OperationsFile;
-        Load();
+        _readOnly = readOnly;
+        ReloadIfChanged();
     }
 
     public event Action? Changed;
@@ -124,10 +161,12 @@ public sealed class OperationTracker
     /// The conflict case is the point: an id whose stored intent is not the intent being asked for
     /// is refused here, before anything is sent, because the agent would answer about the other
     /// request and this client would draw the wrong thing.
-    public (TrackedOperation Operation, bool IsReplay) Begin(string id, string machineId, string? systemId, OperationIntent intent)
+    public (TrackedOperation Operation, bool IsReplay) Begin(
+        string id, string machineId, string? systemId, OperationIntent intent, string? wakeTarget = null)
     {
         lock (_gate)
         {
+            using var held = Fresh();
             if (_operations.TryGetValue(id, out var existing))
             {
                 if (existing.Intent.Key != intent.Key)
@@ -143,6 +182,7 @@ public sealed class OperationTracker
                 MachineId = machineId,
                 SystemId = systemId,
                 Intent = intent,
+                WakeTarget = wakeTarget,
             };
             _operations[id] = operation;
             Save();
@@ -155,7 +195,9 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
-            _operations[operation.Id] = operation;
+            using var held = Fresh();
+            // Stamped here, so a change made in this process wins over the older copy in another.
+            _operations[operation.Id] = operation with { UpdatedAt = DateTimeOffset.UtcNow };
             Prune();
             Save();
         }
@@ -171,13 +213,17 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
+            using var held = Fresh();
             if (!_operations.TryGetValue(id, out var existing)) return null;
             if (!existing.Intent.Matches(record))
             {
+                // This request is not that record, and an agent refuses an id that already names
+                // another request: whatever this app asked for under it is not in effect there.
                 var conflicted = existing with
                 {
                     UpdatedAt = DateTimeOffset.UtcNow,
-                    Outcome = OperationOutcome.Conflict,
+                    State = OperationState.Finished,
+                    Outcome = OperationOutcome.Failed,
                     Message = $"The machine has an operation {id} that is a {record.Describe()}, not the {existing.Intent.Describe()} this app asked for.",
                     OutcomeUnknown = false,
                 };
@@ -201,6 +247,7 @@ public sealed class OperationTracker
     {
         lock (_gate)
         {
+            using var held = Fresh();
             if (!_operations.TryGetValue(id, out var existing)) return;
             _operations[id] = existing with
             {
@@ -214,10 +261,72 @@ public sealed class OperationTracker
         Changed?.Invoke();
     }
 
+    /// The wake holds recorded for [target], oldest first, with any the other process recorded or
+    /// released since this one last looked.
+    public IReadOnlyList<TrackedOperation> WakeHoldsFor(string target)
+    {
+        ReloadIfChanged();
+        return All.Where(operation => operation.IsWakeHold && operation.WakeTarget == target).Reverse().ToList();
+    }
+
+    /// Folds in what the other process wrote, when the file's time or size changed since this one
+    /// last read or wrote it, as when the command line ran something while the window was open.
+    /// Returns whether it read the file.
+    public bool ReloadIfChanged()
+    {
+        lock (_gate)
+        {
+            // A change still waiting is written by this check even when the file is as this side
+            // last read it, as it is after a change that opened the file and found nothing to do.
+            if (Signature() == _signature && !_unsaved) return false;
+            // Read under the lock as well: a reader holding the file open can make another
+            // process's rename over it fail on Windows, and that write would be lost.
+            using var held = Lock();
+            var read = Merge();
+            // A change that waited for the file to open is written once it does.
+            if (_unsaved && !_unread) Save();
+            return read;
+        }
+    }
+
+    /// Releases every hold for [target] recorded before [before]: the target answered an
+    /// authenticated status asked for after them, or a person chose to try the other helpers. The
+    /// operations stay, still asked about; they only stop holding anything back.
+    public void ReleaseWakeHolds(string target, DateTimeOffset before)
+    {
+        var released = false;
+        lock (_gate)
+        {
+            using var held = Fresh();
+            foreach (var operation in _operations.Values.Where(operation =>
+                         operation.IsWakeHold && operation.WakeTarget == target && operation.StartedAt < before).ToList())
+            {
+                _operations[operation.Id] = operation with { WakeTarget = null, UpdatedAt = DateTimeOffset.UtcNow };
+                released = true;
+            }
+            if (released) Save();
+        }
+        if (released) Changed?.Invoke();
+    }
+
+    /// Releases one hold: its helper left the setup.
+    public void ReleaseWakeHold(string id)
+    {
+        lock (_gate)
+        {
+            using var held = Fresh();
+            if (!_operations.TryGetValue(id, out var operation) || operation.WakeTarget is null) return;
+            _operations[id] = operation with { WakeTarget = null, UpdatedAt = DateTimeOffset.UtcNow };
+            Save();
+        }
+        Changed?.Invoke();
+    }
+
     public void Forget(string id)
     {
         lock (_gate)
         {
+            using var held = Fresh();
             _operations.Remove(id);
             Save();
         }
@@ -230,15 +339,16 @@ public sealed class OperationTracker
     private void Prune()
     {
         var cutoff = DateTimeOffset.UtcNow - TimeSpan.FromDays(14);
+        // A hold is never pruned: only what releases it may end it.
         var stale = _operations.Values
-            .Where(operation => operation.IsResolved && operation.UpdatedAt < cutoff)
+            .Where(operation => operation.IsResolved && !operation.IsWakeHold && operation.UpdatedAt < cutoff)
             .Select(operation => operation.Id)
             .ToList();
         foreach (var id in stale) _operations.Remove(id);
 
         if (_operations.Count <= 400) return;
         foreach (var id in _operations.Values
-                     .Where(operation => operation.IsResolved)
+                     .Where(operation => operation.IsResolved && !operation.IsWakeHold)
                      .OrderBy(operation => operation.UpdatedAt)
                      .Take(_operations.Count - 400)
                      .Select(operation => operation.Id)
@@ -248,18 +358,101 @@ public sealed class OperationTracker
         }
     }
 
-    private void Load()
+    /// Takes the lock every process that writes the list takes, and folds in the file as it is now,
+    /// for one change made while the lock is held.
+    private FileStream? Fresh()
+    {
+        var held = Lock();
+        Merge();
+        return held;
+    }
+
+    /// Folds in what the other process wrote since this one last read or wrote the list. The side
+    /// that changed an entry later wins; an entry only the file has is taken, unless the file held
+    /// it already when this side last read or wrote it, which makes it one this side forgot or
+    /// pruned since and has not written yet; one the file held then and holds no more was forgotten
+    /// or pruned there. A file that is not there changes nothing here, and the next write puts this
+    /// list back; one that could not be opened changes nothing either, and nothing is written until
+    /// it can be (see [Save]).
+    private bool Merge()
+    {
+        // Taken before the read: a write that lands in between is then read again next time.
+        _signature = Signature();
+        if (Read() is not { } stored) return false;
+        _unreadable = null;
+        foreach (var (id, theirs) in stored)
+        {
+            // A removal waiting to be written is a change like any other: a request forgotten
+            // because it was never sent would otherwise come back as one nobody knows the end of.
+            if (_operations.TryGetValue(id, out var ours) ? theirs.UpdatedAt > ours.UpdatedAt : !_onDisk.Contains(id))
+                _operations[id] = theirs;
+        }
+        foreach (var id in _onDisk.Where(id => !stored.ContainsKey(id))) _operations.Remove(id);
+        _onDisk = stored.Keys.ToHashSet(StringComparer.Ordinal);
+        return true;
+    }
+
+    /// The exclusive handle that serialises writers across processes. The file is never unlinked,
+    /// so two processes can never each hold a lock on a different file of the same name. Null when
+    /// it cannot be had within ten seconds: the change is then made without it rather than not at
+    /// all, as it was before there was one.
+    private FileStream? Lock()
+    {
+        if (_readOnly) return null;
+        var until = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (true)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_path) ?? ".");
+                return new FileStream(_path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException) when (DateTimeOffset.UtcNow < until)
+            {
+                Thread.Sleep(50);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+    }
+
+    /// Modification time and size together, as [Config.LaunchApprovals] watches its file.
+    private string? Signature()
     {
         try
         {
-            if (!File.Exists(_path)) return;
+            var info = new FileInfo(_path);
+            return info.Exists ? $"{info.LastWriteTimeUtc.Ticks}:{info.Length}" : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// The list as the file holds it, or null when there is no file or it is not a list. A file
+    /// that is there and holds no list is noted in [_unreadable], so the next write sets it aside.
+    private Dictionary<string, TrackedOperation>? Read()
+    {
+        _unread = false;
+        try
+        {
+            if (!File.Exists(_path)) return null;
             var json = Value.Parse(File.ReadAllText(_path));
+            if (!json["operations"].IsArray)
+            {
+                _unreadable = json.Exists ? "it holds no operations list" : "it is not JSON";
+                return null;
+            }
+            var stored = new Dictionary<string, TrackedOperation>(StringComparer.Ordinal);
             foreach (var entry in json["operations"].AsArray())
             {
                 var id = entry["id"].AsText();
                 var machineId = entry["machineId"].AsText();
                 if (id is null || machineId is null) continue;
-                _operations[id] = new TrackedOperation
+                stored[id] = new TrackedOperation
                 {
                     Id = id,
                     MachineId = machineId,
@@ -275,29 +468,65 @@ public sealed class OperationTracker
                     UpdatedAt = entry["updatedAt"].AsInstant() ?? DateTimeOffset.UtcNow,
                     State = OperationRecord.ReadState(entry["state"].AsText(), null, entry["finishedAt"].AsInstant()),
                     Phase = entry["phase"].AsText(),
-                    Outcome = Enum.TryParse<OperationOutcome>(entry["outcome"].AsText(), out var outcome)
-                        ? outcome
-                        : OperationOutcome.Pending,
+                    Outcome = ReadOutcome(entry["outcome"].AsText()),
                     Message = entry["message"].AsText(),
                     Output = entry["output"].AsText(),
-                    ReasonCode = entry["reasonCode"].AsText(),
+                    // An earlier build kept a cancelled request as a word of its own and no code.
+                    ReasonCode = entry["reasonCode"].AsText() ?? (entry["outcome"].AsText() == "Cancelled" ? ReasonCode.Cancelled : null),
                     ExpiresAt = entry["expiresAt"].AsInstant(),
                     OutcomeUnknown = entry["outcomeUnknown"].AsBool() ?? false,
+                    WakeTarget = entry["wakeTarget"].AsText(),
                 };
             }
+            return stored;
         }
-        catch (Exception)
+        catch (Exception error)
         {
-            // A list that cannot be read is a list this app has to start again. Nothing here is
-            // worth refusing to start over, and the machines are asked about what they are running
-            // on the next status anyway.
+            // A list that cannot be read this time is read again on the next check, not taken for
+            // read until the file changes. Nothing here is worth refusing to start over, and the
+            // machines are asked about what they are running on the next status anyway. One that
+            // could not be opened is not written over meanwhile (see [Save]); one that opened and
+            // could still not be read as a list is set aside like any other that is not one.
+            _signature = null;
+            if (error is IOException or UnauthorizedAccessException) _unread = true;
+            else _unreadable = $"it could not be read as a list ({error.Message})";
+            return null;
         }
     }
 
+    /// An outcome as this list stores it. Builds before contract 3.1 wrote eleven words where the
+    /// contract has five, and each of the others is read as the one section 5.6 gives that ending:
+    /// nothing to do succeeded, a conflict, a cancelled or an expired request was deferred, an
+    /// interruption is unknown, and a queued request is still pending. A word nobody wrote is
+    /// pending, which is asked about again rather than believed.
+    internal static OperationOutcome ReadOutcome(string? stored) => stored switch
+    {
+        "Succeeded" or "Noop" => OperationOutcome.Succeeded,
+        "Failed" => OperationOutcome.Failed,
+        "Deferred" or "Conflict" or "Cancelled" or "Expired" => OperationOutcome.Deferred,
+        "Unknown" or "Unresolved" or "Interrupted" => OperationOutcome.Unknown,
+        _ => OperationOutcome.Pending,
+    };
+
     private void Save()
     {
+        if (_readOnly) return;
+        // The file could not be opened for this change, so whatever the other process wrote there
+        // since this one last read it is not in this list, and writing the list would write it
+        // away. The change stays here until a read succeeds.
+        if (_unread)
+        {
+            if (!_unsaved) AppLog.Write($"{_path} could not be opened, so a change to it waits until it can be read again");
+            _unsaved = true;
+            return;
+        }
         try
         {
+            if (_unreadable is { } why && File.Exists(_path))
+            {
+                StateFile.SetAside(_path, why);
+                _unreadable = null;
+            }
             var payload = new
             {
                 version = 1,
@@ -325,9 +554,13 @@ public sealed class OperationTracker
                     reasonCode = operation.ReasonCode,
                     expiresAt = operation.ExpiresAt?.ToString("o"),
                     outcomeUnknown = operation.OutcomeUnknown,
+                    wakeTarget = operation.WakeTarget,
                 }).ToList(),
             };
             AtomicWrite.Text(_path, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+            _signature = Signature();
+            _onDisk = _operations.Keys.ToHashSet(StringComparer.Ordinal);
+            _unsaved = false;
         }
         catch (Exception)
         {

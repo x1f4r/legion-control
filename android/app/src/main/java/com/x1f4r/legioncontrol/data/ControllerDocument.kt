@@ -1,7 +1,5 @@
 package com.x1f4r.legioncontrol.data
 
-import com.x1f4r.legioncontrol.agent.Contract
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -10,7 +8,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.longOrNull
 import java.util.Locale
 import java.util.UUID
 
@@ -29,9 +26,22 @@ import java.util.UUID
 class ControllerDocument private constructor(
     /** The parsed tree, which is the source of truth for an edit. */
     val root: JsonObject,
+    /**
+     * The canonical text this document was read from, until it is edited.
+     *
+     * A document that came off a machine is those bytes and no others: their hash is the one the
+     * machine reports and the one every other peer compares against. Printing the tree again would
+     * give another peer's spacing, escaping or key order this device's spelling of them, and a
+     * document whose hash changes on the way in can never be verified or found in step (C1).
+     */
+    private val sourceText: String?,
 ) {
-    /** The exact text a machine would store and hash. */
-    val canonicalText: String by lazy { CanonicalSetup.canonicalText(Pretty.encodeToString(JsonObject.serializer(), root)) }
+    /**
+     * The exact text a machine would store and hash: the text it was read from, or, once edited, the
+     * tree printed the way `JSON.stringify(document, null, 2)` prints it, with every number spelled
+     * as it was read.
+     */
+    val canonicalText: String by lazy { sourceText ?: CanonicalSetup.canonicalText(SetupJson.of(root).print()) }
 
     val hash: String by lazy { CanonicalSetup.hashOf(canonicalText) }
 
@@ -45,8 +55,8 @@ class ControllerDocument private constructor(
     /** Everything this build understands, for the UI and the validator. */
     fun typed(): Result<ControllerConfig> = readControllerConfig(canonicalText)
 
-    /** The same document with a different tree. Used by every edit below. */
-    private fun with(tree: JsonObject) = ControllerDocument(tree)
+    /** The same document with a different tree. Used by every edit below; it has no source text any more. */
+    private fun with(tree: JsonObject) = ControllerDocument(tree, null)
 
     /**
      * A new revision of this document, descending from it.
@@ -63,11 +73,14 @@ class ControllerDocument private constructor(
         val baseIdentity = base.identity
         val id = baseIdentity?.id?.takeIf { it.isNotBlank() } ?: newSetupId()
         val lineage = (listOf(base.hash) + base.lineage).distinct().take(MAX_LINEAGE)
+        // At the largest Long, which is as far as a revision is read, it stays there rather than
+        // wrapping round to a negative one.
+        val higher = maxOf(base.revision, revision)
         return withIdentity(
             DocumentIdentity(
                 id = id,
                 name = baseIdentity?.name ?: identity?.name,
-                revision = maxOf(base.revision, revision) + 1L,
+                revision = if (higher == Long.MAX_VALUE) higher else higher + 1L,
                 updatedAt = now,
                 source = CLIENT_KIND,
                 device = deviceName,
@@ -146,12 +159,15 @@ class ControllerDocument private constructor(
     fun removeMachine(id: String): ControllerDocument =
         withMachines(machinesArray().filterNot { it.text("id") == id })
 
+    /**
+     * A new site, with nothing but its id and name. An empty `lanPrefixes` or `broadcast` is never
+     * written: a site with no prefixes is one the person names as where they are, and writing an
+     * empty list says the same thing with one more way to read it.
+     */
     fun addSite(id: String, name: String): ControllerDocument = withSites(
         sitesArray() + buildJsonObject {
             put("id", JsonPrimitive(id))
             put("name", JsonPrimitive(name))
-            put("lanPrefixes", JsonArray(emptyList()))
-            put("broadcast", JsonArray(emptyList()))
         },
     )
 
@@ -203,40 +219,29 @@ class ControllerDocument private constructor(
         /** This client's kind, on the wire. Fixed by the contract's controllerSource enum. */
         const val CLIENT_KIND = "phone"
 
-        private val Lenient = Json {
-            ignoreUnknownKeys = true
-            isLenient = true
-        }
-
-        private val Pretty = Json {
-            prettyPrint = true
-            prettyPrintIndent = "  "
-        }
-
-        /** Reads a document, or explains in one sentence why it is not one. */
+        /**
+         * Reads a document, or explains in one sentence why it is not one.
+         *
+         * The text is read the way `JSON.parse` reads it, which is what every peer and the agent do,
+         * and kept: until it is edited, its canonical form is what this document is.
+         */
         fun parse(text: String): Result<ControllerDocument> {
-            val canonical = try {
-                CanonicalSetup.canonicalText(text)
-            } catch (failure: CanonicalSetup.NotUtf8) {
-                return Result.failure(IllegalArgumentException(failure.message))
-            }
+            val canonical = CanonicalSetup.canonicalText(text)
             val tree = try {
-                Lenient.parseToJsonElement(canonical)
-            } catch (failure: Exception) {
+                SetupJsonParser.parseAllowingRepeats(canonical).root
+            } catch (failure: SetupJsonParser.Malformed) {
                 return Result.failure(
-                    IllegalArgumentException(
-                        "That is not a configuration this app can read: " +
-                            (failure.message?.lineSequence()?.firstOrNull()?.trim() ?: "unreadable"),
-                    ),
+                    IllegalArgumentException("That is not a configuration this app can read: ${failure.message}"),
                 )
             }
-            if (tree !is JsonObject) {
+            if (tree !is SetupJson.Object) {
                 return Result.failure(IllegalArgumentException("A setup has to be a JSON object."))
             }
-            return Result.success(ControllerDocument(tree))
+            return Result.success(ControllerDocument(tree.toElement() as JsonObject, canonical))
         }
 
-        fun of(root: JsonObject): ControllerDocument = ControllerDocument(root)
+        /** A document made from a tree, which has no text until it is printed. */
+        fun of(root: JsonObject): ControllerDocument = ControllerDocument(root, null)
 
         /** A fresh setup id. A uuid, because two peers must never independently pick the same one. */
         fun newSetupId(): String = "setup-" + UUID.randomUUID().toString().lowercase(Locale.ROOT)
@@ -262,11 +267,16 @@ data class DocumentIdentity(
 
     companion object {
         fun from(block: JsonObject?): DocumentIdentity? {
-            val id = block?.text("id")?.takeIf { it.isNotBlank() && Contract.isToken(it) } ?: return null
+            // Any id the block holds is its id, valid or not: whether it is one a machine takes is
+            // section 9.7's to say, and a document whose id is wrong keeps it until somebody fixes
+            // it, rather than quietly becoming a document with no identity and getting a new one.
+            val id = block?.text("id") ?: return null
             return DocumentIdentity(
                 id = id,
                 name = block.text("name"),
-                revision = block.long("revision") ?: 0L,
+                // The revision the agent reads, however it is spelled: a document that says 7.0 is
+                // pushed as revision 7, which is the only one the agent takes for it.
+                revision = wholeNumberOf(block["revision"]?.let(SetupJson::of)) ?: 0L,
                 updatedAt = block.text("updatedAt"),
                 source = block.text("source"),
                 device = block.text("device"),
@@ -281,10 +291,6 @@ data class DocumentIdentity(
 
 internal fun JsonObject.text(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.contentOrNull?.takeIf { it.isNotBlank() }
-
-internal fun JsonObject.long(key: String): Long? = (this[key] as? JsonPrimitive)?.let {
-    it.longOrNull ?: it.contentOrNull?.toLongOrNull()
-}
 
 internal fun JsonArray?.orEmpty(): List<JsonElement> = this ?: emptyList()
 
@@ -302,6 +308,13 @@ internal fun JsonObject.withList(
     val existing = (this[key] as? JsonArray).orEmpty().filterIsInstance<JsonObject>()
     return JsonObject(this + (key to JsonArray(transform(existing))))
 }
+
+/**
+ * Sets a list of strings, or removes the key when there are none: an editor never writes an empty
+ * `lanPrefixes` or `broadcast` (contract section 10.1).
+ */
+internal fun JsonObject.withStrings(key: String, values: List<String>): JsonObject =
+    if (values.isEmpty()) JsonObject(this - key) else JsonObject(this + (key to JsonArray(values.map(::JsonPrimitive))))
 
 /** Edits the wake block, creating it if a machine did not have one. */
 internal fun JsonObject.withWake(transform: (JsonObject) -> JsonObject): JsonObject {

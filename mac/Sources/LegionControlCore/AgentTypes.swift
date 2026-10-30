@@ -85,9 +85,8 @@ struct BusyStatus: Decodable, Sendable, Equatable {
     var unknown: Bool?
     var threads: [BusyThread]?
     var threadsTruncated: Int?
-    /// False when the service declares no busy probe at all. The distinction matters more than it
-    /// looks: an unmonitored service is not an idle one, and treating the two the same is how a
-    /// disruptive action gets through while work is running.
+    /// What the agent says about whether a probe watches the service. Kept as it was sent; whether
+    /// anything watches is `isMonitored`'s to say, from the evidence.
     var monitored: Bool?
     /// t3-sqlite | command | http | none | unmonitored | probe-error | timed-out
     var evidence: String?
@@ -100,8 +99,17 @@ struct BusyStatus: Decodable, Sendable, Equatable {
     /// Whether the answer is "we do not know", which blocks disruptive work exactly as busy does.
     var isUnknown: Bool { unknown == true }
 
-    /// Whether the service says anything at all about being busy.
-    var isMonitored: Bool { monitored ?? (evidence != "unmonitored") }
+    /// Whether anything watches the service: false only when the agent's evidence is `unmonitored`,
+    /// which is what a service with no busy probe configured reads as.
+    ///
+    /// The distinction matters more than it looks: an unmonitored service is not an idle one, and
+    /// treating the two the same is how a disruptive action gets through while work is running. But
+    /// only the evidence says so. A service configured `busy.type: "none"` is declared never busy,
+    /// which is an answer rather than a gap (section 6), and agents before 3.1.0 send it, and a
+    /// machine with no services, with `monitored: false` beside `evidence: "none"`. Read off that
+    /// flag, every such service was drawn as not monitored and every action on it asked to be
+    /// forced past a setting somebody chose (C2).
+    var isMonitored: Bool { evidence != "unmonitored" }
 
     var summary: String {
         if let reason, !reason.isEmpty { return reason }
@@ -497,6 +505,9 @@ struct AgentActionResult: Decodable, Sendable {
     var children: [AgentOperation.Child]?
     /// The effective policy, on an `auto-update` or `policy set` reply.
     var updates: AgentUpdatePolicy?
+    /// What became of it, as agent 3.1.0 states it (section 5.6). Read through `Outcome.of`, which
+    /// reduces it from `ok`, `action` and `reasonCode` when an older agent did not say.
+    var outcome: String?
 
     var didInstallAgent: Bool { ok == true && action == "installed" }
 
@@ -506,13 +517,22 @@ struct AgentActionResult: Decodable, Sendable {
     var operationId: String? { op?.id.isEmpty == false ? op?.id : nil }
 
     /// True when the reply is "I have started it, ask me later". The client then polls `op`.
-    var isAccepted: Bool { action == "accepted" }
+    ///
+    /// A replay of a request that is still running says `already-running` rather than `accepted`
+    /// from agent 3.1.0 on, and is followed in exactly the same way: it is the same work, under the
+    /// same id, still in the agent's hands.
+    var isAccepted: Bool { action == "accepted" || action == "already-running" }
 
     /// True when the far side refused because something else is already running.
     var isConflict: Bool { action == "conflict" }
 
     /// True when the request was taken and is being held for an idle moment.
     var isQueued: Bool { action == "queued" }
+
+    /// True when the agent took a reboot or a suspend and is on its way down. Pending like an
+    /// accepted request, but nothing can be asked about it until the machine is back: it is settled
+    /// by seeing what comes back, not by polling.
+    var isTransition: Bool { action == "rebooting" || action == "sleeping" }
 
     /// `true`, or the id of what was replaced.
     struct ReplacedMarker: Decodable, Sendable, Equatable {
@@ -559,6 +579,12 @@ struct AgentConfigResult: Decodable, Sendable {
     /// True on a refusal where neither side descends from the other, as opposed to one where this
     /// device is simply behind.
     var divergent: Bool?
+    /// What a `config-invalid` refusal found wrong with the document, at most fifty.
+    var problems: [DocumentProblem]?
+    /// The launch values a restricted push carried that the machine does not hold, by path.
+    var launchChanges: [String]?
+    /// What became of a `config set`, as agent 3.1.0 states it (section 5.6).
+    var outcome: String?
     /// `stored`, `noop` or `replaced`.
     var action: String?
     /// How big the stored document is.
@@ -575,6 +601,11 @@ struct AgentConfigResult: Decodable, Sendable {
         if let meta { return meta.identity }
         if let current { return current.identity }
         return ControllerIdentity(id: id, revision: revision, updatedAt: updatedAt, source: source)
+    }
+
+    struct DocumentProblem: Decodable, Sendable, Equatable {
+        var path: String?
+        var message: String?
     }
 
     /// True when the machine took the document.
@@ -596,6 +627,26 @@ struct AgentOperationResult: Decodable, Sendable {
     var id: String?
     var kind: String?
     var state: String?
+    /// Whether the reply carried an `op` key at all, null included. Only a present `op: null` is
+    /// the agent saying it has no record; a reply without the key is some other refusal.
+    var carriesOperation = false
+
+    private enum CodingKeys: String, CodingKey {
+        case ok, contract, message, reasonCode, op, id, kind, state
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try container.decodeIfPresent(Bool.self, forKey: .ok)
+        contract = try container.decodeIfPresent(Int.self, forKey: .contract)
+        message = try container.decodeIfPresent(String.self, forKey: .message)
+        reasonCode = try container.decodeIfPresent(String.self, forKey: .reasonCode)
+        op = try container.decodeIfPresent(AgentOperation.self, forKey: .op)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind)
+        state = try container.decodeIfPresent(String.self, forKey: .state)
+        carriesOperation = container.contains(.op)
+    }
 
     var reason: AgentReason? { AgentReason(code: reasonCode) }
 
@@ -606,18 +657,14 @@ struct AgentOperationResult: Decodable, Sendable {
     /// the echoed id would turn that answer into a phantom operation.
     var operation: AgentOperation? { op }
 
-    /// True when the agent answered and has no record of that id.
+    /// True when the agent answered and has no record of that id: `op` is there and null.
     ///
     /// That is itself an answer, and the whole reason an id is carried: an agent that files every
-    /// operation it starts and has no record of this one never started it. Anything else — a
-    /// restricted key, a broken config — leaves the question open rather than settling it wrongly.
-    var isUnknownOperation: Bool {
-        guard op == nil else { return false }
-        switch reason {
-        case nil, .notConfigured: return true
-        default: return false
-        }
-    }
+    /// operation it starts and has no record of this one never started it. Agent 3.1.0 says so
+    /// with `not-configured`, and 3.0.x said it with `bad-argument`, so the code does not decide
+    /// (section 4). A reply without the key — a restricted key, a broken config — is not that
+    /// answer and leaves the question open rather than settling it wrongly.
+    var isUnknownOperation: Bool { carriesOperation && op == nil }
 }
 
 // MARK: - Systems as the app draws them

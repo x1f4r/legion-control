@@ -5,7 +5,8 @@
 // configured is not unhealthy for the lack of one: plenty of machines are only
 // ever reached over a VPN, and absence there is the normal state, not a fault.
 
-import { detectPlatform, runCommand } from '../config.mjs';
+import { detectPlatform } from '../paths.mjs';
+import { runCommand } from '../process-runner.mjs';
 import { runPowerShell, parsePowerShellJson } from './process.mjs';
 
 export const NO_RELAY = { configured: false, running: false };

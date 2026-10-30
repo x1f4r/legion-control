@@ -100,6 +100,9 @@ enum CompactServicePresentation {
         if service.pendingVersion != nil || service.pendingRestart == true { return "Queued" }
         if service.health?.ok == false || service.healthy == false { return "Needs attention" }
         if service.canUpdate != false, service.upToDate == false { return "Update available" }
+        // A probe that failed says nothing about the process, and its `running: false` is no
+        // evidence that it stopped.
+        if service.process?.isUnknown == true { return "Not known" }
         if service.process?.running == false || service.running == false { return "Stopped" }
         if service.process?.running == true || service.running == true { return "Running" }
         return "Not checked"

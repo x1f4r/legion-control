@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { cli, fixtureConfig, fixtureData, readFixture, withHome, writeConfig } from './helpers.mjs';
-import { acquireOperationLock } from '../src/lock.mjs';
+import { cli, commandService, deadPid, fixtureConfig, fixtureData, readFixture, withHome, writeConfig } from './helpers.mjs';
+import { outcomeOf } from '../src/contract.mjs';
+import { acquireOperationLock, holderIsStale } from '../src/lock.mjs';
 import {
   beginOperation, deriveState, judgeInterrupted, operationPath,
   readOperation, recoverOperations, updateOperation,
@@ -143,7 +144,30 @@ test('pre-dispatch, arm-only, same-boot, and unknown-identity records never prov
   assert.equal(judgeInterrupted(record, { systemId: 'other', bootId: null }).action, 'interrupted');
   assert.equal(judgeInterrupted({ ...record, phase: 'arming' }, { systemId: 'other', bootId: 'after' }).action, 'interrupted');
   assert.equal(judgeInterrupted({ ...record, noReboot: true }, { systemId: 'other', bootId: 'after' }).action, 'interrupted');
-  assert.equal(judgeInterrupted(record, { systemId: 'wrong', bootId: 'after' }).action, 'failed');
+  // A new boot into some other system is no evidence either way: the target
+  // may well have come up and been left again before this system judged it.
+  const elsewhere = judgeInterrupted(record, { systemId: 'wrong', bootId: 'after' });
+  assert.equal(elsewhere.action, 'interrupted');
+  assert.equal(outcomeOf(elsewhere), 'unknown');
+});
+
+test('a reboot into another system, judged once the machine is back, reads as unknown rather than failed', async () => {
+  await withHome(async (home) => {
+    powerFixture(home);
+    const id = 'boot-cross-system-001';
+    // Written by this system's agent before a reboot into `other`, which keeps
+    // records of its own; the machine is back on `test` with a new boot.
+    beginOperation({ id, kind: 'boot', target: 'other', systemId: 'test' });
+    updateOperation(id, { phase: 'rebooting', bootId: 'boot-before-the-switch', pid: deadPid() });
+    const observed = cli(['op', id], { home }).payload;
+    assert.equal(observed.op.state, 'finished');
+    assert.equal(observed.op.result.action, 'interrupted');
+    assert.equal(observed.op.outcome, 'unknown');
+    assert.match(observed.op.result.message, /running test now; whether it reached other in between cannot be told/);
+    const cycled = cli(['cycle'], { home }).payload;
+    assert.deepEqual(cycled.recovered.map((entry) => [entry.opId, entry.action]), [[id, 'interrupted']]);
+    assert.equal(readOperation(id).result.outcome, 'unknown');
+  });
 });
 
 test('unobserved power acknowledgements expire into unknown outcomes rather than success', async () => {
@@ -220,6 +244,27 @@ test('cycle children honor live watchdog locks, even with force, and preserve th
   });
 });
 
+test('a watchdog lock whose pid another process holds now is stale, and one without a zoned time is judged as before', async () => {
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  await new Promise((resolve) => child.once('spawn', resolve));
+  try {
+    const taken = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    assert.equal(holderIsStale({ pid: child.pid, started: taken, ageMs: 0 }), true, 'that pid was handed out again after the file was written');
+    const hoursEast = new Date(Date.now() + 60 * 60 * 1000).toISOString().replace(/\.\d+Z$/, '+02:00');
+    assert.equal(holderIsStale({ pid: child.pid, started: hoursEast, ageMs: 0 }), true, 'an hour ago, written two hours east of UTC');
+    assert.equal(holderIsStale({ pid: child.pid, started: new Date().toISOString(), ageMs: 0 }), false);
+    assert.equal(holderIsStale({ pid: child.pid, ageMs: 0 }), false, 'a file naming no time keeps the pid check alone');
+    assert.equal(holderIsStale({ pid: child.pid, started: 'whenever', ageMs: 0 }), false);
+    // A time with no zone could be UTC or local time, and read as the wrong
+    // one it dates a live watchdog's file before its own process.
+    assert.equal(holderIsStale({ pid: child.pid, started: '2000-01-01T00:00:00', ageMs: 0 }), false, 'a time with no zone keeps the pid check alone');
+    assert.equal(holderIsStale({ pid: deadPid(), started: new Date().toISOString(), ageMs: 0 }), true);
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
+
 test('a fresh busy response returns a claimed request to its queue with the original expiry', async () => {
   await withHome(async (home) => {
     const dir = fixtureData(home);
@@ -275,5 +320,81 @@ test('a queued arm-only request keeps its intent through op-run and replays its 
     assert.equal(replay.action, 'armed');
     assert.equal(replay.replayed, true);
     assert.equal(replay.op.state, 'finished');
+  });
+});
+
+test('a detached worker finishes a record whose service or action was removed, rather than leaving it running', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home);
+    const config = fixtureConfig(dir, { actions: [{ id: 'hello', name: 'Hello', command: [process.execPath, '-e', ''] }] });
+    writeConfig(home, config);
+    // Opened as `--detach` opens them, and then the setup lost what they name.
+    for (const [id, input] of [['detached-gone-service', { kind: 'restart', service: 'gone' }], ['detached-gone-action', { kind: 'run', actionId: 'gone' }]]) {
+      beginOperation({ id, ...input, systemId: 'test', detached: true });
+      updateOperation(id, { launchPendingUntil: new Date(Date.now() + 30000).toISOString() });
+    }
+    const service = cli(['op-run', 'detached-gone-service'], { home }).payload;
+    assert.equal(service.action, 'failed');
+    assert.equal(service.reasonCode, 'unknown-service');
+    assert.equal(service.op.state, 'finished');
+    const action = cli(['op-run', 'detached-gone-action'], { home }).payload;
+    assert.equal(action.reasonCode, 'unknown-action');
+    for (const id of ['detached-gone-service', 'detached-gone-action']) {
+      const record = readOperation(id);
+      assert.equal(record.state, 'finished', id);
+      assert.equal(record.result.outcome, 'failed');
+      assert.equal(record.workerClaimed, true, 'taken up like any other, so a second worker would find it taken');
+    }
+    assert.equal(cli(['op-run', 'detached-gone-service'], { home }).payload.action, 'conflict');
+
+    // A queued run whose action went is finished by the cycle that finds it,
+    // not taken up and dropped every quarter of an hour until it expires.
+    assert.equal(cli(['run', 'hello', '--when-idle', '--op', 'queued-gone-action'], { home }).payload.action, 'queued');
+    writeConfig(home, { ...config, actions: [] });
+    const cycled = cli(['cycle'], { home }).payload;
+    assert.deepEqual(cycled.queued.map((entry) => [entry.opId, entry.action, entry.reasonCode]), [['queued-gone-action', 'failed', 'unknown-action']]);
+    assert.equal(readOperation('queued-gone-action').state, 'finished');
+  });
+});
+
+test('a forced cycle overrides the busy gate and nothing else', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0', busy: 'on' });
+    writeConfig(home, fixtureConfig(dir, {
+      services: [commandService(dir), commandService(dir, { id: 'paused', name: 'Paused', updates: { automatic: false } })],
+    }));
+    const busy = cli(['cycle'], { home }).payload;
+    assert.deepEqual(busy.children.map((child) => [child.service, child.action, child.reasonCode]), [['demo', 'deferred', 'busy'], ['paused', 'deferred', 'policy-off']]);
+    const forced = cli(['cycle', '--force'], { home }).payload;
+    assert.deepEqual(forced.children.map((child) => [child.service, child.opId === null, child.action, child.reasonCode]), [
+      ['demo', false, 'updated', null],
+      ['paused', true, 'deferred', 'policy-off'],
+    ]);
+    assert.equal(readFixture(dir, 'update-runs'), '1', 'the paused service was not updated as well');
+  });
+});
+
+test('an update killed part way whose pid another process holds now is recovered, and its service put back', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { running: 'off' });
+    writeConfig(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    const { spawn } = await import('node:child_process');
+    const other = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    await new Promise((resolve) => other.once('spawn', resolve));
+    try {
+      const id = 'killed-update-reused-pid';
+      beginOperation({ id, kind: 'update', service: 'demo', systemId: 'test' });
+      // Its own process started an hour ago and is gone; the id is somebody else's now.
+      updateOperation(id, { phase: 'stopping', pid: other.pid, ownerStartedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() });
+      const observed = cli(['op', id], { home }).payload;
+      assert.equal(observed.op.state, 'finished');
+      assert.equal(observed.op.result.action, 'interrupted');
+      const cycled = cli(['cycle'], { home }).payload;
+      assert.deepEqual(cycled.recovered.map((entry) => [entry.opId, entry.action]), [[id, 'interrupted']]);
+      assert.equal(readFixture(dir, 'running'), 'on', 'the service it had stopped is running again');
+      assert.equal(readOperation(id).recoveryPending, false);
+    } finally {
+      other.kill('SIGKILL');
+    }
   });
 });

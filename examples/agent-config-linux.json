@@ -62,7 +62,7 @@
       "id": "wake-tower",
       "name": "Wake the tower",
       "wol": {
-        "mac": "AA:BB:CC:DD:EE:FF",
+        "mac": "02:00:00:00:00:01",
         "broadcast": ["192.168.50.255"],
         "ports": [9, 7],
         "repeats": 3

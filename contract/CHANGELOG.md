@@ -36,6 +36,10 @@ documents the 3.0 schema allowed are refused (see Changed).
 - `problems: [{path, message}]` on a `config-invalid` refusal of `config set`.
 - `config set` refusal codes `lock-held` and `internal`, which the agent
   already sent and the schema did not allow.
+- `interrupted` among the actions of `boot` and `sleep` (section 5.3), which
+  recovery already wrote on a record whose owner was gone, as section 5.5 says
+  of every kind, and a replay of that record answered with. A reboot judged
+  after a return from another system is now one too, rather than `failed`.
 - The guard grammars in `common.schema.json`: `sshHostGuard`, `sshUser`,
   `agentArgItem`, `githubRepo` and `launchPath`.
 - **`restricted` and `launchChanges` on `config set`.** A restricted session's
@@ -110,7 +114,19 @@ not, the agent now answers as they say.
   `ok: true`, `replayed: true` and the record's `detached`, never `accepted`.
 - A lock `conflict` answers `ok: true`.
 - A finished record's `result.ok` is true exactly when its `reasonCode` is
-  null. A failed cycle carries the code of its first failed service.
+  null. A failed cycle in which every service's ending is known carries the
+  code of its first failed service.
+- A cycle that ran a service whose ending is unknown (an interrupted update, one
+  that ran out of time, or one that may have changed the machine before it
+  failed) states `outcome: "unknown"` and takes the reason code of the first
+  such service, even when one before it failed with a known ending, rather than
+  `cycled` or a `failed` that reads as a known state. Its message counts such
+  services apart from the ones that failed.
+- A queued request the agent cancelled because it could not safely replace the
+  one before it (`cancelled` with `internal`) reduces to `unknown`, not
+  `succeeded`: section 5.6 reads `cancelled` by its reason code, with null
+  `succeeded`, `cancelled` `deferred`, `internal` `unknown` and any other
+  `failed`.
 - `cancel` of a running operation answers `conflict` with
   `reasonCode: "already-running"`, not `operation-in-progress`.
 - `--detach` replies carry every key of their command's shape, and a fresh
@@ -157,8 +173,10 @@ not, the agent now answers as they say.
   repository for `githubRepo`), or nothing, and a recorded value that could not
   run itself counts as none. Approve, a local edit, enrolment after a summary of
   every launch value, and the first start of a 1.4 client approve; replication
-  never does. The launcher migration under the same base and grammar is
-  accepted without asking.
+  never does. A setup file whose `controller` block is missing or has no `id`,
+  written on a device that applies no setup yet, is a local edit of nothing and
+  approves what it holds; put over an applied setup it approves nothing. The
+  launcher migration under the same base and grammar is accepted without asking.
 - **Command lines and retry safety** (section 15). The grammar is `dispatch`
   when the system is restricted on the route, else its `shell`, else `posix`, or
   `cmd` on Windows; it is never inferred and a line is never retried in another
@@ -193,7 +211,11 @@ not, the agent now answers as they say.
   that begins with `"`, `controller.`, `sites[` or `machines[` is an entry
   written inside double quotes, so a difference's `entry` may be quoted. A
   device whose applied document breaks only `unknown-site` or a `helper-` rule
-  still merges, and only a result section 9.7 accepts is written.
+  still merges, and only a result section 9.7 accepts is written. The base is
+  the newest revision both lineages share whose kept bytes hash to it and which
+  peer intake accepts; a kept revision peer intake refuses is skipped like one
+  that is not kept, and with no base every difference is asked about. A device
+  whose applied document has a section 9.7 error never sends `--replace`.
 - **A client older than its agent** keeps using the highest contract it
   implements and says so once (section 1, rule 9). Nothing on the wire changes.
 - **Sites and wake are normative** (sections 10.1 and 10.2), with one
@@ -226,7 +248,12 @@ not, the agent now answers as they say.
   `wakeTarget`. While a hold exists no non-`wol` helper runs for that target. It
   is released only by a finished record, an answer that the operation is
   unknown, the target answering, the helper leaving the setup, or a person
-  choosing to try the other helpers.
+  taking one of the two ways past it.
+- **Going past a hold** has two forms, the same on every client. Try the other
+  helpers asks only the helpers the holds kept back, never a held command again,
+  and is offered only while one of them could be asked. With none, Run the held
+  command again is offered instead, after a warning that the command may then
+  run twice beside the first.
 - **Helpers are never woken automatically.** "Wake it first" is offered only for
   a helper skipped as asleep that has a wake block of its own.
 - **Android** tracks every network that is not a VPN, with an address book per

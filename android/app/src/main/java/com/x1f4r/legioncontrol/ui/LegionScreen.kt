@@ -5,7 +5,6 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,6 +24,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -57,11 +58,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
 import com.x1f4r.legioncontrol.ui.theme.LocalStatusColors
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -117,6 +120,12 @@ sealed interface Page {
         override val summary get() = "One machine belongs to another setup"
     }
 
+    /** Commands the shared setup changed, which this device does not run until it approves them. */
+    data object LaunchReview : Page {
+        override val title get() = "Approve commands"
+        override val summary get() = "What the shared setup asks this device to run"
+    }
+
     data object Editor : Page {
         override val title get() = "Edit the setup"
         override val summary get() = "Machines, addresses, systems, sites and wake helpers"
@@ -129,7 +138,7 @@ sealed interface Page {
 }
 
 /** The pages there are right now, which follows the setup and the services it found. */
-private fun pagesOf(app: AppModel): List<Page> {
+private fun pagesOf(app: AppModel, review: List<LaunchReviewEntry>): List<Page> {
     val machines = app.machines
     return buildList {
         // A question the app cannot answer on its own goes first, because it is holding everything
@@ -140,6 +149,9 @@ private fun pagesOf(app: AppModel): List<Page> {
         machines.forEach { model ->
             add(Page.OneMachine(model))
         }
+        // After the machines, because it holds nothing up: the setup is in force, and the
+        // approved commands keep running until somebody decides.
+        if (app.showsLaunchReview(review)) add(Page.LaunchReview)
         if (app.editorOpen) add(Page.Editor)
         add(Page.Device)
     }
@@ -157,7 +169,8 @@ fun LegionApp(app: AppModel, updates: AppUpdateModel) {
 
 @Composable
 private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
-    val pages = pagesOf(app)
+    val review = app.launchReview.collectAsStateSafely()
+    val pages = pagesOf(app, review)
     val pager = rememberPagerState(pageCount = { pages.size })
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -170,6 +183,29 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
             .distinctUntilChanged()
             .drop(1)
             .collect { haptics.tick() }
+    }
+
+    // Review, wherever it was pressed, moves to the page it brought back. Taken once, so a screen
+    // built later, after a configuration change or Back, does not move there again; taken however
+    // the move ends, since a swipe that interrupts it is the person choosing another page.
+    LaunchedEffect(app.launchReviewRequested) {
+        if (!app.launchReviewRequested) return@LaunchedEffect
+        try {
+            val index = pages.indexOf(Page.LaunchReview)
+            if (index >= 0) pager.animateScrollToPage(index)
+        } finally {
+            app.openedLaunchReview()
+        }
+    }
+
+    // A tapped notification opens the page of the machine its change was on. Taken once, so the
+    // pages changing afterwards does not pull the screen back to it.
+    LaunchedEffect(app.requestedMachine, pages) {
+        val wanted = app.requestedMachine ?: return@LaunchedEffect
+        val index = pages.indexOfMachine(wanted)
+        if (index < 0) return@LaunchedEffect
+        pager.scrollToPage(index)
+        app.openedMachine()
     }
 
     LaunchedEffect(pager, pages) {
@@ -244,7 +280,7 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                     val wide = maxWidth >= 840.dp
                     Row(Modifier.fillMaxSize()) {
                         if (wide) {
-                            Column(Modifier.width(208.dp).fillMaxHeight().verticalScroll(rememberScrollState()).padding(horizontal = 12.dp)) {
+                            Column(Modifier.width(208.dp).fillMaxHeight().verticalScroll(rememberScrollState()).padding(horizontal = 12.dp).selectableGroup()) {
                                 pages.forEachIndexed { index, page ->
                                     DrawerRow(page, index == pager.currentPage) { scope.launch { pager.animateScrollToPage(index) } }
                                 }
@@ -265,6 +301,7 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
                             Page.NoMachines -> NoMachinesSection(app)
                             Page.Divergence -> DivergenceSection(app)
                             Page.IdentityClash -> IdentityClashSection(app)
+                            Page.LaunchReview -> LaunchReviewSection(app)
                             Page.Editor -> SetupEditorSection(app)
                             Page.Device, null ->
                                 ThisDeviceSection(app, updates, bindings, app.bindingsActions)
@@ -326,23 +363,26 @@ private fun LegionScreen(app: AppModel, updates: AppUpdateModel) {
  * Never forced from the first question, however busy the last reading looked: force is the agent's
  * own check being skipped, and it is only ever offered back after the agent has looked at the
  * machine as it is now and said no. [whenIdle] is the quieter answer to the same question, which
- * queues the change rather than interrupting anything.
+ * queues the change rather than interrupting anything; after a refusal it is the "later" a held-back
+ * change is offered, as a new request (contract section 5.6).
  */
 private fun perform(model: MachineModel, dialog: MachineModel.Dialog, whenIdle: Boolean) {
     when (dialog) {
         is MachineModel.Dialog.ConfirmBoot -> model.boot(dialog.target, whenIdle = whenIdle)
-        is MachineModel.Dialog.OfferForceBoot -> model.boot(dialog.target, force = true)
+        is MachineModel.Dialog.OfferForceBoot -> model.boot(dialog.target, force = !whenIdle, whenIdle = whenIdle)
         is MachineModel.Dialog.ConfirmSleep -> model.sleep(whenIdle = whenIdle)
-        is MachineModel.Dialog.OfferForceSleep -> model.sleep(force = true)
+        is MachineModel.Dialog.OfferForceSleep -> model.sleep(force = !whenIdle, whenIdle = whenIdle)
         is MachineModel.Dialog.ConfirmRestart -> model.restart(dialog.service, whenIdle = whenIdle)
-        is MachineModel.Dialog.OfferForceRestart -> model.restart(dialog.service, force = true)
-        is MachineModel.Dialog.OfferForceUpdate -> model.update(dialog.service, force = true)
+        is MachineModel.Dialog.OfferForceRestart -> model.restart(dialog.service, force = !whenIdle, whenIdle = whenIdle)
+        is MachineModel.Dialog.OfferForceUpdate -> model.update(dialog.service, force = !whenIdle, whenIdle = whenIdle)
         is MachineModel.Dialog.ConfirmRun -> model.runAction(dialog.action, whenIdle = whenIdle)
-        is MachineModel.Dialog.OfferForceRun -> model.runAction(dialog.action, force = true)
+        is MachineModel.Dialog.OfferForceRun -> model.runAction(dialog.action, force = !whenIdle, whenIdle = whenIdle)
         is MachineModel.Dialog.ConfirmTrustHostKey -> Unit
 
         is MachineModel.Dialog.ConfirmAgentInstall -> model.installAgent()
         is MachineModel.Dialog.ConfirmWakeHelper -> model.wakeHelper()
+        is MachineModel.Dialog.ConfirmTryOtherHelpers -> model.tryOtherHelpers()
+        is MachineModel.Dialog.ConfirmRunHeldAgain -> model.runHeldAgain()
     }
 }
 
@@ -465,9 +505,11 @@ private fun PageDrawer(
             Spacer(Modifier.height(4.dp))
             Spacer(Modifier.height(20.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            pages.forEachIndexed { index, page ->
-                DrawerRow(page, index == current) { onSelect(index) }
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Column(Modifier.selectableGroup()) {
+                pages.forEachIndexed { index, page ->
+                    DrawerRow(page, index == current) { onSelect(index) }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                }
             }
         }
     }
@@ -475,7 +517,8 @@ private fun PageDrawer(
 
 /**
  * A name and a line about it, on a row a thumb can hit. What marks the current one is a short rule
- * on the leading edge and the ink getting darker, not a filled capsule behind the text.
+ * on the leading edge and the ink getting darker, not a filled capsule behind the text, and for a
+ * screen reader the row says it is the selected one: a rule and a weight are nothing it can hear.
  */
 @Composable
 private fun DrawerRow(page: Page, isSelected: Boolean, onSelect: () -> Unit) {
@@ -492,7 +535,7 @@ private fun DrawerRow(page: Page, isSelected: Boolean, onSelect: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .defaultMinSize(minHeight = 48.dp)
-            .clickable { onSelect() }
+            .selectable(selected = isSelected, role = Role.Tab, onClick = onSelect)
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -592,6 +635,10 @@ private fun ConfirmationDialog(
         },
     )
 }
+
+/** Where the page of the machine [machineId] is, or -1 when this setup has no such machine. */
+internal fun List<Page>.indexOfMachine(machineId: String): Int =
+    indexOfFirst { it is Page.OneMachine && it.model.machine.id == machineId }
 
 /** Reads a flow into composition without dragging a lifecycle dependency into every call site. */
 @Composable

@@ -7,7 +7,11 @@ The README covers what the project is and how to install it; `configuration.md` 
 of all three config files; `security.md` covers keys, signing and privileges.
 
 Paths below use `<base>` for the agent's install base: `~/.legion-control` on Linux and macOS,
-`C:\Users\<user>\.legion-control` on Windows.
+`C:\Users\<user>\.legion-control` on Windows. `legionctl` stands for the launcher the installers
+put in `<base>/bin`, which is not on `PATH`: `<base>/bin/legionctl` on Linux and macOS, and
+`powershell -NoProfile -ExecutionPolicy Bypass -File <base>\bin\legionctl.ps1` on Windows. The
+bypass is needed because Windows client editions refuse to run scripts by default, and the
+installer changes no execution policy.
 
 ## Operations
 
@@ -27,6 +31,12 @@ A long operation is dispatched detached: the agent writes the record, starts the
 that is not a child of the ssh session, and answers immediately that it accepted the request. The
 client then polls the record until it finishes. If the link drops in between, nothing is lost — the
 work is still running on the machine, and the next poll picks it up where it is.
+
+On Linux the worker runs in a transient scope of the user's systemd manager
+(`systemd-run --user --scope`) wherever one answers, so logind's `KillUserProcesses=yes` does not
+end it together with the ssh session. That relies on linger, which the installer already asks for.
+Without a user manager it starts in a session of its own, as before. On Windows it is a process
+created through CIM, outside the session's job.
 
     legionctl update --service dashboard --detach     # -> accepted, with the operation id
     legionctl op <id> --wait 20                       # long-poll until it finishes
@@ -58,38 +68,73 @@ resolve it from the operation record when the machine comes back.
 
 ### The operation lock
 
-One machine-wide lock, `<base>/op.lock`, is taken by every operation that changes anything,
-for the whole of it. Updates used to take a lock and restarts, boots, sleeps and actions did not,
-which meant a controller could restart a service while the scheduler was replacing its files, or
-reboot the machine mid-install.
+One machine-wide lock is taken by every operation that changes anything, for the whole of it.
+Updates used to take a lock and restarts, boots, sleeps and actions did not, which meant a
+controller could restart a service while the scheduler was replacing its files, or reboot the
+machine mid-install.
 
 A second change while the lock is held is a **conflict**: it is refused, and the refusal names the
 operation holding the lock, its kind, its service and its phase, so the app can say what is
 already happening rather than "try again". `--force` does not break the lock. Force overrides the
 busy gate and nothing else.
 
-The lock records its owner's pid. It becomes free when that process is gone — never on age alone
-while the owner is alive, because a long install is exactly what the lock exists to protect. There
-is a one hour hard ceiling for a holder that left no usable pid.
+The lock itself is an operating system lock on `<base>/op.lock.sqlite`, held by the process doing
+the work and released by the kernel the moment that process ends, however it ends. Nothing judges
+it stale by age or by a pid written in a file, because a long install is exactly what it exists to
+protect. `<base>/op.lock` beside it is a text note of who holds it, for a person reading it over
+ssh and for `doctor`; removing it frees nothing, and leaving it behind holds nothing. Never delete
+a `.sqlite` lock file: one removed while it is held makes a second lock, which is the failure the
+design exists to prevent. Only a per-service lock file an older watchdog wrote is judged by age,
+and only when its owner is gone: it is taken over after twenty minutes.
 
-Boot and sleep hold the lock through the transition. The pid is dead once the machine goes down,
-which makes the lock free, and the recovery pass below closes the record.
+Boot and sleep give the lock back once the transition is dispatched, and keep their record for a
+grace of two minutes, in which the machine is expected to go down. The recovery pass below closes
+the record afterwards.
 
 ### Recovery
 
 Every operation left `running` by a process that is no longer there is reconciled before any new
 work starts — and before any network lookup, so a registry that is down cannot stop recovery from
-happening. A scheduler killing a cycle at its time limit, a power cut mid-install, an ssh session
+happening. A record is live exactly while the machine lock it took is held, judged together with
+its owner's start time and never by a pid alone, so a pid the system has since given to another
+process keeps nothing alive. Recovery reads every running record, not only the newest. A scheduler killing a cycle at its time limit, a power cut mid-install, an ssh session
 dropping during a reboot: all of them used to leave a record that said an update was in progress
 forever. All of them now come back as **interrupted**, naming the phase they reached.
 
 For an update interrupted between stopping and starting, recovery puts the service back up, and
 where the installed version is neither the one it started from nor the one it was going to,
-attempts the rollback. A cycle never ends with the service left stopped.
+attempts the rollback. A cycle never ends with the service left stopped. When more than one record
+owes the same service its recovery, they are weighed oldest first by when each run started, not
+when it was asked for: a queued update taken up after an interrupted one counts as the later of
+the two, so the version it was installing is a whole install and is never rolled back.
 
 Boot and sleep are the honest cases. Uptime alone does not prove a machine rebooted when it was
 asked to — it proves only that it rebooted. Where the target can be observed, the record says
-`rebooted`; where it cannot, the outcome stays unknown rather than being upgraded to success.
+`rebooted`; where it cannot, the outcome stays unknown rather than being upgraded to success. A
+boot record read on a system that is not its target, after the boot identity changed, is
+`interrupted` with an unknown outcome rather than failed: the machine went somewhere, and nobody
+can say why it is not where it was sent.
+
+### Commands that may still be running
+
+A command a mutation starts is written into `<base>/state/unsettled.json` before it starts and
+taken out once it has been seen to end, so what is left in that ledger is a command nobody saw
+end: one that ran out of time and could not be seen to stop, or one whose agent died with it, for
+example when the ssh session was killed. Every mutation except `self-update` asks the ledger first,
+after it takes the machine lock, and is refused while an entry may still be at work. The refusal
+names the command and, when it belonged to an operation, that operation.
+
+On Linux and macOS a command that ended by itself releases whatever it left behind. On Windows the
+whole process tree a command started is judged, because Windows cannot tell an unfinished helper
+from a daemon a start command launched or an app an action opened. So an entry for a command whose
+agent died mid-command holds every mutation except `self-update` for as long as anything that
+command started is still running. The ways out are to stop that leftover process by hand, or to
+restart the machine: a new boot clears the ledger. `self-update` always goes ahead, as the way to
+replace an agent that is holding the machine.
+
+A ledger that cannot be read, for example after a bad hand edit, refuses every mutation except
+`self-update` until the file is fixed or removed. An operation already running when the file
+breaks keeps the ending its own work reached.
 
 `status` reports interrupted records without writing anything, so looking never changes anything.
 
@@ -103,10 +148,17 @@ The agent writes a queued record and answers that it is queued. The next cycle r
 busy gate is clear. There is at most one queued request per thing — a second "restart media when
 idle" replaces the first and the reply says which one it replaced.
 
-The expiry is not optional — four hours by default, seven days at the most. A "restart when idle"
-still waiting three days later is not a request anybody remembers making, and acting on it then is
-worse than dropping it. An expired request is retired with a result that says so, and it appears in
-history like any other outcome.
+The expiry is not optional — four hours by default, at least one minute and seven days at the most.
+`--expires` takes a duration or a timestamp and is held to that range; one already in the past is
+refused with `bad-argument`, and the request waiting in its place is not replaced. A "restart when
+idle" still waiting three days later is not a request anybody remembers making, and acting on it
+then is worse than dropping it. An expired request is retired with a result that says so, and it
+appears in history like any other outcome.
+
+`--when-idle` with `--force` is refused: one asks to wait for the machine and the other not to.
+Boot and sleep share one place in the queue, because a machine makes one power transition at a
+time, so a newer request of either replaces the older one. A queued request whose service or action
+was removed from the config before it ran is finished as failed, with that reason.
 
     legionctl cancel <id>
 
@@ -125,7 +177,28 @@ The cycle takes the operation lock, reconciles interrupted operations, expires a
 queued requests in order while the machine is idle, and then walks the services in their
 configured order, updating each one that is eligible. One deferred or failed service never stops
 the others, and a failed install for one service never rolls back another. Every service gets its
-own child record with its own outcome, under one parent record for the cycle.
+own child record with its own outcome, under one parent record for the cycle. A cycle whose
+service has an unknown ending is unknown itself, and says how many services may or may not have
+updated. Its recovery also removes temporary `*.tmp-*` files that a write left behind more than ten
+minutes ago.
+
+`cycle --force` overrides the busy gate and nothing else: the policy still decides which services
+the cycle may touch, and the pause it reads is the one `config.json` holds, which `auto-update pause`
+and `policy set` write.
+
+**A cycle fits in its scheduler's time limit.** The shortest limit a scheduler gives a cycle is 30
+minutes, systemd's `TimeoutStartSec` and the Windows task's `ExecutionTimeLimit`, and the cycle
+keeps one minute of that back, so it plans with 29. Nothing that can leave a service down starts
+unless its worst case fits in the time left: an update, checked before npm's cache download and
+again before its drain; the restart of a current service that is not answering; a queued request;
+and every recovery put-back but the first, which always runs. What does not fit is deferred with
+`timed-out`. An update the cycle has no time for gets its own child record and leaves its version
+noted as pending; a queued request keeps its place and its expiry; a recovery still owed is said to
+be owed. Work whose worst case is longer than the whole budget is never started by a cycle, and has
+to be asked for directly. Before an update decides, the only things it does are start a service it
+finds down and wait for it, look up the version, and check busy, none of which leaves anything
+down. `doctor`'s `scheduler.timeLimit` warns about a scheduler that allows less than 30 minutes;
+re-running the installer sets it.
 
     legionctl cycle --dry-run
 
@@ -164,6 +237,10 @@ to actually do. It covers, roughly:
 | `service.<id>.latest` | can the newest version be resolved (deep only) |
 | `service.<id>.endpoint` | can anything outside the machine reach it (deep only) |
 | `scheduler.present`, `scheduler.command`, `scheduler.lastRun` | does the job exist, does its command point at this agent and at the cycle, and when did it last fire |
+| `scheduler.timeLimit` | does the scheduler give a cycle the 30 minutes it plans with |
+| `files.private` | can only this user read the base: `0700` and `0600` on Linux and macOS, no group access on Windows |
+| `agent.signed`, `agent.floor` | does the running agent carry its signed manifest, and which version floor is in effect |
+| `ssh.shell` | Windows only: which shell OpenSSH runs commands with, which decides the setup's `shell` |
 | `privileges.sudo`, `privileges.boot`, `sleep.tool` | the elevation the configured boot and sleep methods need, and whether the sleep tool exists |
 | `controller.copy` | is a controller document stored, and with what identity and revision |
 | `session.restricted` | did this session arrive through the dispatcher |
@@ -194,20 +271,17 @@ itself is broken, pause that service rather than turning the whole machine's sch
 
     legionctl auto-update pause 2d --service dashboard
 
-**A failure with the service down is the case that needs hands.** The likely cause is a lock left
-behind by an operation killed mid-install. The lock records its owner's pid and is taken over
-automatically once that process is gone; a lock written by something else on the machine is only
-judged by age. Check what holds it, then clear it:
+**A failure with the service down is the case that needs hands.** The next cycle's recovery puts a
+service it finds down back up, so first see whether something is still holding the machine:
 
-    legionctl doctor            # the "locks" check names the holder
-    # Linux
-    rm -f ~/.legion-control/op.lock
-    systemctl --user restart <unit>
-    # Windows
-    Remove-Item C:\Users\<user>\.legion-control\op.lock -Force
-    Start-ScheduledTask -TaskName "<the task from config.json>"
+    legionctl doctor            # the "locks" check names what holds the lock, if anything does
+    legionctl history --limit 5
 
-Then `restart --force` and `status` to confirm it is healthy again.
+The machine lock is released when the process holding it ends, so a lock that is held belongs to
+something still running. Let it finish, or end that process. Removing `op.lock` frees nothing, and
+the `.sqlite` lock files must never be deleted. A refusal that names a command which may still be
+running is the ledger above: stop that process, or restart the machine. Then `restart --force` and
+`status` to confirm the service is healthy again.
 
 **A postcondition failure means the update command did not do what it said.** The service is
 reported as failed rather than updated, with the version actually read, and the configured
@@ -254,6 +328,24 @@ it.
 
 Do not reach for the replace override to make this go away. It is there for genuinely different
 setups, and using it here is exactly the data loss the lineage exists to prevent.
+
+**Merge and Keep mine are not offered.** Theirs and the shared base have to pass the checks every
+device holds a setup to under peer intake. This device's own copy may carry only an unknown site or
+a broken wake helper, which taking theirs' side of that entry repairs; any other error in it has to
+be fixed in the editor first. Take theirs is always offered. A kept revision this device refuses is
+skipped as a base like one that is not kept, so with no usable base every difference is asked about.
+
+**A push is held and not retried.** A machine that refused a revision with `restricted` (this
+device's key there is restricted and the revision changes a command) or `config-invalid` is not
+sent that revision again until the setup here changes or a person asks; a device with an
+unrestricted key publishes it on its next reading. A device whose own setup has an error publishes
+nothing and replaces nothing until it is fixed, though it still reads, fetches and merges. A failed
+request backs off for a minute per applied hash, and one machine has one setup request in flight at
+a time.
+
+**A command from the setup does not run.** A changed command, key, update repository or local agent
+waits for approval on each device before it runs there; until then the one approved there runs, or
+nothing does. `configuration.md` describes the review.
 
 **Everything conflicts after upgrading.** A machine holding a document written before lineage
 existed has no ancestry to check against. The first device that remembers that document's hash can
@@ -562,6 +654,20 @@ because it runs `launchctl enable` before the bootstrap.
 job does not get the Homebrew prefix on PATH. If node is reinstalled somewhere else, the job starts
 failing quietly. Re-run the installer, or point it somewhere stable with `LEGION_NODE_BIN`.
 
+## Removing the agent
+
+    bash ~/legion-control/agent/install/install-linux.sh --uninstall
+    powershell -NoProfile -ExecutionPolicy Bypass -File <checkout>\agent\install\install-windows.ps1 -Uninstall
+
+take away the scheduled cycle (the timer and its units, or the task), the launchers in `<base>/bin`
+and the agent trees, and keep `config.json`, the stored setup and the operation records, so a
+reinstall picks up where it left off. `--uninstall --purge` and `-Uninstall -Purge` remove those as
+well. Both refuse to change anything while a cycle or an operation is running, and both refuse a
+base that is the home directory or holds it. On the Mac, `./mac/install-mac.sh --uninstall-updater` removes the
+job (above) and prints the line that removes the base; when the base also holds the release signing
+key, the Android release key or the private terms of the private-data check, it names them so they
+can be moved out first.
+
 ## What lives where
 
 ### On every controlled system
@@ -576,9 +682,13 @@ failing quietly. Re-run the installer, or point it somewhere stable with `LEGION
 | `<base>/ops/<id>.json` | one file per operation: running, queued and recent history | yes |
 | `<base>/controller.json` | the stored setup document, with its identity, revision and lineage beside it | yes |
 | `<base>/legionctl.log` | the agent's own log, plus `.1` after rotation | yes |
+| `<base>/state/unsettled.json` | commands a mutation started that nobody has seen end yet | until each is seen to end, or the next boot |
 | `<base>/agent/` | the agent source | no, replaced on every install |
 | `<base>/agent.prev/` | the previous agent tree, kept for rollback after a self-update | until the next one |
-| `<base>/op.lock` | the machine-wide operation lock | transient |
+| `<base>/agent-floor.json` | the version floor this machine keeps, outside the replaceable tree | yes |
+| `<base>/bin/` | the stable launchers (`legionctl` or `legionctl.ps1`, `launcher.mjs`) and the restricted dispatcher | yes, refreshed by every install |
+| `<base>/op.lock.sqlite` | the machine-wide operation lock, held by the operating system | never delete it |
+| `<base>/op.lock` | a note of who holds that lock, for people and `doctor` | transient |
 | `<base>/update.lock` | the per-service maintenance lock, unless `lockFile` points elsewhere | transient |
 
 Reconstructible state is kept separate from state that records what happened, and one operation is
@@ -589,7 +699,15 @@ could lose each other's records — including pending versions and failure count
 into the new layout on the first 3.x run. Deleting `state/cache.json` costs one extra registry
 lookup and nothing else. `config.json` is the only file worth backing up.
 
-Operation records are pruned to two hundred, or thirty days, whichever comes first.
+Operation records are pruned by kind of ending. Only scheduled updates and cycles can repeat one
+another: a record repeats an earlier one when it changed nothing (a no-op, or a deferral, a lock or
+an operation in progress included; a cycle when every service it walked was one of those) or when
+it failed or its outcome is unknown, and its kind, service, action, reason, and from and to versions
+are the same. Of each repeated ending only the first and the newest three are kept. Of what remains,
+the newest two hundred are kept whatever they say, and a record that failed or whose outcome is
+unknown is kept for seven days however many come after it. Nothing is kept past thirty days, and a
+record that still owes a service its recovery is never pruned. `history`'s `retained` counts every
+record the machine holds.
 
 ### Around the agent
 
@@ -614,9 +732,14 @@ clearly labelled with when it was read. Nothing depends on them being right.
 
 ## Quick reference
 
-    ssh <host> /usr/bin/node /home/<user>/.legion-control/agent/src/index.mjs status
-    ssh <host> node C:\\Users\\<user>\\.legion-control\\agent\\src\\index.mjs status
-    node ~/.legion-control/agent/src/index.mjs status
+    ssh <host> '~/.legion-control/bin/legionctl status'
+    ssh <host> /usr/bin/node /home/<user>/.legion-control/bin/launcher.mjs status
+    ssh <host> "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\<user>\.legion-control\bin\legionctl.ps1 status"
+    ~/.legion-control/bin/legionctl status
+
+A key forced through the restricted dispatcher (`<base>/bin/dispatch.sh`, or `dispatch.ps1` on
+Windows) runs the same commands through it; `security.md` describes what it allows. Older installs
+may still have the agent at `<base>/agent/src/index.mjs`.
 
 Piping through `jq` makes the output readable, since the agent always prints exactly one object.
 

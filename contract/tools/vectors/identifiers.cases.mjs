@@ -55,7 +55,7 @@ export default {
       valid('configured-id-word', 'demo', 'A service, action or boot target id: a plain word.'),
       valid('configured-id-mixed-punctuation', 'Demo_2.1-beta', 'Upper case, digits, underscore, dot and hyphen are the whole of what follows the first character.'),
       valid('configured-id-short', 't3', 'Two characters, a letter and a digit: short ids are ordinary ids.'),
-      invalid('configured-id-colon', 'demo:blue', 'A colon is in the generic token grammar but not in a configured id, which the agent matches against config.mjs ID_PATTERN.'),
+      invalid('configured-id-colon', 'demo:blue', 'A colon is in the generic token grammar but not in a configured id, which the agent matches against contract.mjs CONFIGURED_ID_PATTERN.'),
       invalid('configured-id-slash', 'demo/path', 'A slash is a path, not an id; the token grammar would accept it and the agent refuses it.'),
       invalid('configured-id-at', 'demo@host', 'An at sign is a user and host, not an id; the token grammar would accept it and the agent refuses it.'),
       invalid('configured-id-leading-dash', '-demo', 'A leading hyphen would read as an option, so a configured id starts with a letter or digit.', ['shell-metacharacter']),

@@ -485,6 +485,8 @@ const A1 = keptText(1);
 const A2 = keptText(2);
 const A3 = keptText(3);
 const M4 = keptText(4);
+// Revision 2 as an older build might have kept it: a source no client writes, which peer intake refuses.
+const R2 = documentText({ ...copyOf(TOWER_DOC), controller: { ...TOWER_DOC.controller, revision: 2, source: 'android' } });
 const hashOf = (text) => canonicalHash(text);
 const kept = (...texts) => Object.fromEntries(texts.map((text) => [hashOf(text), text]));
 
@@ -506,6 +508,16 @@ const bases = [
     mineLineage: [hashOf(A3), hashOf(A2), hashOf(A1)], theirsLineage: [standIn('theirs 3 parent'), hashOf(A2), hashOf(A1)],
     kept: { ...kept(A3, A1), [hashOf(A2)]: A3 },
   }, hashOf(A1)),
+  based('kept-revision-refused', 'The revision kept under the newest common hash is one peer intake refuses, kept by an older build, so it is skipped like one that is not kept and the next common one is the base.', {
+    mineHash: hashOf(M4), theirsHash: standIn('theirs 3'),
+    mineLineage: [hashOf(A3), hashOf(R2), hashOf(A1)], theirsLineage: [standIn('theirs 3 parent'), hashOf(R2), hashOf(A1)],
+    kept: kept(A3, R2, A1),
+  }, hashOf(A1)),
+  based('only-common-revision-refused', 'The only revision both sides descend from is one peer intake refuses: there is no base, and every difference is asked about.', {
+    mineHash: hashOf(M4), theirsHash: standIn('theirs 3'),
+    mineLineage: [hashOf(A3), hashOf(R2)], theirsLineage: [standIn('theirs 3 parent'), hashOf(R2)],
+    kept: kept(A3, R2),
+  }, null),
   based('no-common-ancestor', 'Nothing in common: there is no base, and every difference is noBase.', {
     mineHash: hashOf(M4), theirsHash: standIn('theirs 3'),
     mineLineage: [hashOf(A3), hashOf(A2), hashOf(A1)], theirsLineage: [standIn('theirs 3 parent'), standIn('theirs 3 grandparent')],
@@ -547,7 +559,7 @@ export default {
     'merges: differences lists every entry where mine and theirs differ, in code-point order of the key, with its kind: mine or theirs (with a base, the side that changed it), both (with a base, both changed it, a deletion against an edit included) or noBase.',
     'merges: resultText is the merged document, or null when section 9.7 refuses it under peer intake; error is then the first of its error codes in code-point order. Compare resultText as a parsed document: object key order ignored, array order exact, number lexemes exact.',
     'Entry keys: <key> for a top-level key other than controller, machines and sites, written "<key>" (inside double quotes, nothing escaped) when it begins with ", controller., sites[ or machines[; controller.<key> for a controller key other than id, revision, updatedAt, source, device and lineage; sites[<id>]; machines[<id>] when only one side has the machine; machines[<id>].fields, .wake, .systems[<id>], .endpoints[<id>] and .endpoints[] (the endpoints without an id, in order, as one value) when both have it.',
-    'bases: kept maps a hash to the text this device kept for it. The base is the first hash of mineLineage that is in theirsLineage and whose kept text hashes to it, or null.',
+    'bases: kept maps a hash to the text this device kept for it. The base is the first hash of mineLineage that is in theirsLineage, whose kept text hashes to it and which peer intake accepts, or null.',
     'numbers: a and b are JSON number lexemes, equal when they are the same decimal value.',
   ],
   consumers: { merges: CLIENTS, bases: CLIENTS, numbers: CLIENTS },

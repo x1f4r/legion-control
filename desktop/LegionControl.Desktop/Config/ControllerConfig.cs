@@ -26,7 +26,6 @@ public sealed record ControllerConfig
     public LocalConfig? Local { get; init; }
     public ControllerIdentity Identity { get; init; } = new();
     public string? UpdateRepo { get; init; }
-    private IReadOnlyList<string> InputProblems { get; init; } = Array.Empty<string>();
 
     public const string DefaultUpdateRepo = "x1f4r/legion-control";
 
@@ -38,29 +37,7 @@ public sealed record ControllerConfig
         Local = LocalConfig.From(json["local"]),
         Identity = ControllerIdentity.From(json["controller"]),
         UpdateRepo = json["appUpdates"]["githubRepo"].AsText(),
-        InputProblems = ValidateInput(json),
     };
-
-    private static IReadOnlyList<string> ValidateInput(Value json)
-    {
-        var problems = new List<string>();
-        if (!json["machines"].IsArray) problems.Add("machines must be an array.");
-        if (json["sites"].Exists && !json["sites"].IsArray) problems.Add("sites must be an array.");
-        if (json.Properties().Any(p => p.Key == "controller"))
-        {
-            var identity = json["controller"];
-            if (!identity.IsObject || identity["id"].Raw.ValueKind != System.Text.Json.JsonValueKind.String
-                || !CommandSurface.IsValidToken(identity["id"].AsText()))
-                problems.Add("controller must contain a nonempty string id.");
-            if (identity["revision"].Raw.ValueKind != System.Text.Json.JsonValueKind.Number
-                || !identity["revision"].Raw.TryGetInt64(out var revision) || revision < 0)
-                problems.Add("controller.revision must be a nonnegative integer.");
-            if (identity.Properties().Any(p => p.Key == "lineage") && (!identity["lineage"].IsArray
-                || identity["lineage"].AsArray().Any(item => item.Raw.ValueKind != System.Text.Json.JsonValueKind.String)))
-                problems.Add("controller.lineage must be an array of hash strings.");
-        }
-        return problems;
-    }
 
     public string Repo => string.IsNullOrWhiteSpace(UpdateRepo) ? DefaultUpdateRepo : UpdateRepo!;
 
@@ -70,184 +47,31 @@ public sealed record ControllerConfig
 
     public bool IsEmpty => Machines.Count == 0;
 
-    /// What is wrong with the document, in the words of the thing that has to change.
-    ///
-    /// A document that fails this never replaces one that did: a machine with no systems, or an
-    /// unparseable hardware address, has no sensible default to fall back to.
-    public IReadOnlyList<string> Problems()
-    {
-        var problems = new List<string>(Identity.Problems());
-        problems.AddRange(InputProblems);
-        if (Version != 1) problems.Add("The shared setup must use document version 1.");
-        var seenSites = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var site in Sites)
-        {
-            if (!CommandSurface.IsValidToken(site.Id)) problems.Add("A site has an invalid id.");
-            else if (!seenSites.Add(site.Id)) problems.Add($"Two sites share the id \"{site.Id}\".");
-        }
-
-        var seenMachines = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var machine in Machines)
-        {
-            if (!CommandSurface.IsValidToken(machine.Id))
-            {
-                problems.Add("A machine has an empty id.");
-                continue;
-            }
-            if (!seenMachines.Add(machine.Id))
-            {
-                problems.Add($"Two machines share the id \"{machine.Id}\". Ids have to be unique.");
-            }
-            if (machine.Site is { } site && Site(site) is null)
-            {
-                problems.Add($"Machine \"{machine.Id}\" names the site \"{site}\", which is not in sites.");
-            }
-
-            var seenSystems = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var system in machine.Systems)
-            {
-                if (!CommandSurface.IsValidToken(system.Id))
-                {
-                    problems.Add($"A system on machine \"{machine.Id}\" has an empty id.");
-                    continue;
-                }
-                if (!seenSystems.Add(system.Id))
-                {
-                    problems.Add($"Machine \"{machine.Id}\" has two systems with the id \"{system.Id}\".");
-                }
-            }
-
-            var seenEndpoints = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var endpoint in machine.Endpoints)
-            {
-                if (!seenEndpoints.Add(endpoint.Id)) problems.Add($"Machine {machine.Id} has duplicate endpoint ids.");
-                if (endpoint.Host.Length == 0 || endpoint.Host.StartsWith('-') || endpoint.Host.Any(char.IsWhiteSpace))
-                    problems.Add($"Endpoint {endpoint.Id} needs a valid host or SSH alias.");
-                if (endpoint.Port is < 1 or > 65535) problems.Add($"Endpoint {endpoint.Id} has an invalid port.");
-            }
-
-            if (machine.Wake is { } wake)
-            {
-                if (wake.MacBytes is null)
-                {
-                    problems.Add($"The wake address \"{wake.Mac}\" on machine \"{machine.Id}\" is not a six byte hardware address.");
-                }
-                problems.AddRange(HelperProblems(machine));
-            }
-        }
-        return problems;
-    }
-
-    /// What is worth saying about the document without refusing it.
-    ///
-    /// The line between this and [Problems] is what a person can still do. A machine with no
-    /// systems yet is half-written, not broken, and refusing the whole document over it would take
-    /// away the very screen where the systems are added. A helper cycle, on the other hand, cannot
-    /// be acted on at all.
-    public IReadOnlyList<string> Warnings()
-    {
-        var warnings = new List<string>();
-        foreach (var machine in Machines)
-        {
-            if (machine.Systems.Count == 0)
-            {
-                warnings.Add($"Machine \"{machine.Id}\" lists no systems, so nothing can be run on it yet.");
-            }
-            if (machine.Routes.Count == 0)
-            {
-                warnings.Add($"Machine \"{machine.Id}\" has no address, so there is no way to reach it yet.");
-            }
-            foreach (var system in machine.Systems.Where(system => system.Agent.Count == 0))
-            {
-                warnings.Add($"System \"{system.Id}\" on machine \"{machine.Id}\" has no agent command, so it cannot be driven.");
-            }
-            if (machine.Wake is not { } wake) continue;
-            foreach (var helper in wake.EffectiveHelpers)
-            {
-                var helperMachine = Machine(helper.Machine);
-                if (helperMachine is null) continue;
-                if (helperMachine.Site is not null && machine.Site is not null && helperMachine.Site != machine.Site)
-                {
-                    warnings.Add(
-                        $"The helper \"{helper.Machine}\" for \"{machine.Id}\" is at another site. That only works if its action reaches the target's network another way, through a router or a VPN.");
-                }
-                if (helperMachine.AlwaysOn != true)
-                {
-                    warnings.Add(
-                        $"The helper \"{helper.Machine}\" for \"{machine.Id}\" is not marked as always on, so it may be asleep when it is needed.");
-                }
-            }
-            if (wake.EffectiveHelpers.Count == 0 && machine.Site is null && wake.LanPrefix is null)
-            {
-                warnings.Add(
-                    $"Machine \"{machine.Id}\" can only be woken by a device that is already on its network: it names no site, no lanPrefix and no helper.");
-            }
-        }
-        return warnings;
-    }
-
-    /// Helper rules that block the editor: the helper has to exist, must not be the machine itself,
-    /// and must not take part in a cycle of helpers.
-    private IEnumerable<string> HelperProblems(MachineConfig machine)
-    {
-        var wake = machine.Wake!;
-        // A client from before the ordered list reads only the singular key. Writing a different
-        // machine there than the list starts with would send those clients to a helper this
-        // document does not actually prefer, which is worse than having no list at all.
-        if (wake.Helpers.Count > 0 && wake.Helper is { } alias && alias != wake.Helpers[0])
-        {
-            yield return $"The wake helper alias on \"{machine.Id}\" names {alias.Machine}/{alias.Action}, but the ordered list starts with {wake.Helpers[0].Machine}/{wake.Helpers[0].Action}. They have to agree.";
-        }
-        foreach (var helper in machine.Wake!.EffectiveHelpers)
-        {
-            if (string.IsNullOrWhiteSpace(helper.Machine) || string.IsNullOrWhiteSpace(helper.Action))
-            {
-                yield return $"A wake helper on \"{machine.Id}\" is missing a machine or an action.";
-                continue;
-            }
-            if (!CommandSurface.IsValidToken(helper.Action))
-            {
-                yield return $"The wake action \"{helper.Action}\" on \"{machine.Id}\" is not a plain token.";
-            }
-            if (helper.Machine == machine.Id)
-            {
-                yield return $"Machine \"{machine.Id}\" lists itself as its own wake helper.";
-                continue;
-            }
-            if (Machine(helper.Machine) is null)
-            {
-                yield return $"The wake helper \"{helper.Machine}\" for \"{machine.Id}\" is not a machine in this document.";
-                continue;
-            }
-            if (HelperCycle(machine.Id, helper.Machine, new HashSet<string>(StringComparer.Ordinal) { machine.Id }))
-            {
-                yield return $"The wake helpers for \"{machine.Id}\" form a cycle through \"{helper.Machine}\".";
-            }
-        }
-    }
-
-    private bool HelperCycle(string origin, string current, HashSet<string> seen)
-    {
-        if (current == origin) return true;
-        if (!seen.Add(current)) return false;
-        var machine = Machine(current);
-        foreach (var helper in machine?.Wake?.EffectiveHelpers ?? Array.Empty<WakeHelper>())
-        {
-            if (helper.Machine == origin) return true;
-            if (HelperCycle(origin, helper.Machine, seen)) return true;
-        }
-        return false;
-    }
+    /// The configuration without the machines at [indexes] in the document's `machines`: the ones a
+    /// section 9.7 error is inside, which an applied document keeps but this device neither dials
+    /// nor runs (contract section 9.7, applied intake). What is wrong with a document is
+    /// [DocumentAcceptance]'s to say, never this model's: it reads leniently and cannot see a
+    /// member written twice or a number spelled as a string.
+    public ControllerConfig WithoutMachinesAt(IReadOnlySet<int> indexes) =>
+        indexes.Count == 0 ? this : this with { Machines = Machines.Where((_, index) => !indexes.Contains(index)).ToList() };
 }
 
 /// Where a group of machines physically is, and which addresses a device on that network has.
 public sealed record SiteConfig(string Id, string Name, IReadOnlyList<string> LanPrefixes, IReadOnlyList<string> Broadcast)
 {
+    /// The prefixes and broadcast addresses are the strings the lists hold, as the placement and the
+    /// wake plan of contract section 10 read them: a number or a blank entry is no prefix, rather
+    /// than one this reader made up out of it.
     public static SiteConfig From(Value json) => new(
         json["id"].AsText() ?? "",
         json["name"].AsText() ?? json["id"].AsText() ?? "",
-        json["lanPrefixes"].AsStringList(),
-        json["broadcast"].AsStringList());
+        Strings(json["lanPrefixes"]),
+        Strings(json["broadcast"]));
+
+    private static IReadOnlyList<string> Strings(Value list) => list.AsArray()
+        .Where(entry => entry.Raw.ValueKind == System.Text.Json.JsonValueKind.String)
+        .Select(entry => entry.Raw.GetString()!)
+        .ToList();
 }
 
 /// One physical box: one network card, one hardware address, one thing to wake.
@@ -455,65 +279,75 @@ public sealed record EndpointConfig
 }
 
 /// A machine that can send a magic packet on the target's own network, and the action on it that
-/// does so.
+/// does so. Both are read as the strings the document holds, the empty one included, exactly as
+/// the wake plan of contract section 10.2 reads them: an entry the plan would skip as missing is
+/// not dropped here first.
 public sealed record WakeHelper(string Machine, string Action)
 {
     public static WakeHelper? From(Value json)
     {
         if (!json.IsObject) return null;
-        var machine = json["machine"].AsText();
-        var action = json["action"].AsText();
+        var machine = json["machine"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["machine"].Raw.GetString() : null;
+        var action = json["action"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["action"].Raw.GetString() : null;
         return machine is null || action is null ? null : new WakeHelper(machine, action);
     }
 }
 
 /// Wake on LAN. A machine without this block simply has no wake action.
+///
+/// Read as the document says it and nothing more. Where the block names no broadcast address, no
+/// usable port or no helper, the wake plan decides what that means (contract section 10.2), not
+/// this reader: a default filled in here was how the site's own broadcast address never got used.
 public sealed record WakeConfig
 {
-    public string Mac { get; init; } = "";
-    public IReadOnlyList<string> Broadcast { get; init; } = new[] { "255.255.255.255" };
-    public IReadOnlyList<int> Ports { get; init; } = new[] { 9, 7 };
-    public WakeProbe? Probe { get; init; }
-    /// Used only when the machine names no site. A prefix a device's own address starts with when
-    /// it is on this machine's network.
+    /// The hardware address a magic packet carries, or null when the block names none. A block
+    /// without one is still a wake block: nothing can wake the machine directly, and its helpers
+    /// still can (contract section 9.7, `wake-no-mac`).
+    public string? Mac { get; init; }
+    /// The strings of `wake.broadcast`. Only the dotted IPv4 ones are ever sent to.
+    public IReadOnlyList<string> Broadcast { get; init; } = Array.Empty<string>();
+    /// The whole numbers of `wake.ports`. Only those from 1 to 65535 are ever sent to.
+    public IReadOnlyList<long> Ports { get; init; } = Array.Empty<long>();
+    /// Used only when the machine names no site in sites[]: a prefix of section 10.1 that one of
+    /// this device's addresses is inside when it is on this machine's network.
     public string? LanPrefix { get; init; }
     /// The compatibility alias for the first helper, kept so a 1.2 client that only knows the
     /// singular key still has one.
     public WakeHelper? Helper { get; init; }
     /// Helpers in the order to try them.
     public IReadOnlyList<WakeHelper> Helpers { get; init; } = Array.Empty<WakeHelper>();
+    /// Whether `helpers` is a list with anything in it, readable entries or not. Only then does it
+    /// replace the singular alias.
+    public bool ListsHelpers { get; init; }
     /// Which system to boot into once the machine is awake, when the document asks for one.
     public string? BootTarget { get; init; }
 
     public static WakeConfig? From(Value json)
     {
         if (!json.IsObject) return null;
-        var mac = json["mac"].AsText();
-        if (mac is null) return null;
-        var broadcast = json["broadcast"].AsStringList();
-        var ports = json["ports"].Map(port => port.AsInt()).Where(port => port is not null).Select(port => port!.Value).ToList();
         return new WakeConfig
         {
-            Mac = mac,
-            Broadcast = broadcast.Count > 0 ? broadcast : new[] { "255.255.255.255" },
-            Ports = ports.Count > 0 ? ports : new[] { 9, 7 },
-            Probe = WakeProbe.From(json["probe"]),
-            LanPrefix = json["lanPrefix"].AsText(),
+            Mac = Text(json["mac"]),
+            Broadcast = json["broadcast"].AsArray().Select(Text).Where(entry => entry is not null).Select(entry => entry!).ToList(),
+            Ports = json["ports"].AsArray().Select(Whole).Where(port => port is not null).Select(port => port!.Value).ToList(),
+            LanPrefix = Text(json["lanPrefix"]),
             Helper = WakeHelper.From(json["helper"]),
             Helpers = json["helpers"].Map(WakeHelper.From).Where(helper => helper is not null).Select(helper => helper!).ToList(),
+            ListsHelpers = json["helpers"].AsArray().Count > 0,
             BootTarget = json["bootTarget", "boot"].AsText(),
         };
     }
 
     /// The helpers to walk, in order: the list when there is one, and the singular alias otherwise.
     public IReadOnlyList<WakeHelper> EffectiveHelpers =>
-        Helpers.Count > 0 ? Helpers : (Helper is null ? Array.Empty<WakeHelper>() : new[] { Helper });
+        ListsHelpers ? Helpers : (Helper is null ? Array.Empty<WakeHelper>() : new[] { Helper });
 
-    /// The six bytes of the hardware address, or null when it is not one.
+    /// The six bytes of the hardware address, or null when there is none or it is not one.
     public byte[]? MacBytes
     {
         get
         {
+            if (Mac is null) return null;
             var parts = Mac.Split(':', '-');
             if (parts.Length != 6) return null;
             var bytes = new byte[6];
@@ -527,15 +361,17 @@ public sealed record WakeConfig
             return bytes;
         }
     }
-}
 
-public sealed record WakeProbe(string Host, int Port)
-{
-    public static WakeProbe? From(Value json)
+    /// A JSON string as itself, empty included; anything else is no string.
+    private static string? Text(Value value) =>
+        value.Raw.ValueKind == System.Text.Json.JsonValueKind.String ? value.Raw.GetString() : null;
+
+    /// A JSON number that is a whole number, as one. `9.0` is the port 9 to every reader; `9.5`
+    /// and the string "9" are no port at all.
+    private static long? Whole(Value value)
     {
-        if (!json.IsObject) return null;
-        var host = json["host"].AsText();
-        return host is null ? null : new WakeProbe(host, json["port"].AsInt() ?? 22);
+        if (value.Raw.ValueKind != System.Text.Json.JsonValueKind.Number || !value.Raw.TryGetDouble(out var number)) return null;
+        return Math.Floor(number) == number && Math.Abs(number) <= 1e15 ? (long)number : null;
     }
 }
 
@@ -545,14 +381,31 @@ public sealed record SystemConfig
 {
     public string Id { get; init; } = "";
     public string Name { get; init; } = "";
+    /// The platform, read leniently: a document that says `win` still finds the Windows system to
+    /// boot into. Never what decides a grammar for a system read from a document; see
+    /// [PlatformAsWritten].
     public Platform Platform { get; init; } = Platform.Linux;
-    /// The exact argv run over ssh, quoted for that system's shell on the way out.
+    /// The `platform` the document names, exactly as it is written, or null when it names none or
+    /// names it with anything but a string. A system built here, from a form or a template, has
+    /// none either, and its grammar is worked out from [Platform].
+    ///
+    /// The grammar reads this rather than [Platform] because to every client only the string
+    /// "windows" is Windows. Reading `win` or ` Windows ` as Windows here would quote for cmd a
+    /// line that every other client, and this device's own launch record, writes for a POSIX
+    /// shell.
+    public string? PlatformAsWritten { get; init; }
+    /// The exact argv run over ssh, quoted for that system's shell on the way out. In the model the
+    /// machines are driven from, this is the argv [LaunchGate] approved, and empty when there is none.
     public IReadOnlyList<string> Agent { get; init; } = Array.Empty<string>();
     public string? Symbol { get; init; }
-    /// The `shell` the document names, exactly as it is written, or null when it names none.
+    /// The `shell` the document names, exactly as it is written, or null when it names none. A
+    /// value that is not a string is kept as its JSON text, which can never spell one of the three
+    /// shell names.
     ///
     /// Kept raw rather than parsed, because a value this app does not know is not a shell to
-    /// guess at: the system's grammar is then refused (`unknown-shell`) and it is not driven. The
+    /// guess at: the system's grammar is then refused (`unknown-shell`) and it is not driven. That
+    /// goes for `shell: 5` as much as for `shell: "pwsh"`; reading the number as no shell at all
+    /// would quote for the platform's default shell a system every other client refuses. The
     /// only system that needs one at all is a Windows one whose OpenSSH DefaultShell has been
     /// pointed at PowerShell.
     public string? Shell { get; init; }
@@ -563,6 +416,9 @@ public sealed record SystemConfig
     /// dispatcher, which parses an argv grammar of its own. So the command is serialised for the
     /// dispatcher whatever platform the far side runs.
     public bool Restricted { get; init; }
+    /// How this device drives the system, as [LaunchGate] decided it. Never read from a document:
+    /// a system built here, from a form or a template, runs what it was given.
+    public LaunchState LaunchState { get; init; } = LaunchState.Approved;
 
     private CommandGrammar? _grammar;
 
@@ -571,7 +427,7 @@ public sealed record SystemConfig
     /// grammar it approved here, and without one it is worked out from the fields above.
     public CommandGrammar Grammar
     {
-        get => _grammar ?? RemoteShells.Resolve(Platform.Wire(), Shell, Restricted, restrictedSession: false, Agent.Count);
+        get => _grammar ?? RemoteShells.Resolve(PlatformAsWritten ?? Platform.Wire(), Shell, Restricted, restrictedSession: false, Agent.Count);
         init => _grammar = value;
     }
 
@@ -581,17 +437,27 @@ public sealed record SystemConfig
         ? RemoteShells.Resolve(null, null, restricted: true, restrictedSession: true, Agent.Count)
         : Grammar;
 
+    /// A system as the document writes it. The three fields a grammar is worked out from go in the
+    /// way [LaunchProjection] reads them, so a system that is not gated is quoted exactly as the
+    /// launch record would have it: only the string "windows" is Windows, only true is
+    /// restricted, and a shell that is there but not a string is no shell this app knows.
     public static SystemConfig From(Value json)
     {
-        var platform = Platforms.Parse(json["platform"].AsText()) ?? Platform.Linux;
+        var written = json["platform"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["platform"].Raw.GetString() : null;
+        // Anything but a string is no platform, and Linux, whose default grammar is the one the
+        // contract gives a system that names none.
+        var platform = Platforms.Parse(written) ?? Platform.Linux;
+        var shell = json["shell"];
         return new SystemConfig
         {
             Id = json["id"].AsText() ?? "",
             Platform = platform,
+            PlatformAsWritten = written,
             Name = json["name"].AsText() ?? platform.DefaultName(),
             Agent = AgentArgv(json["agent"]),
             Symbol = json["symbol"].AsText(),
-            Shell = json["shell"].Raw.ValueKind == System.Text.Json.JsonValueKind.String ? json["shell"].Raw.GetString() : null,
+            Shell = !shell.Exists ? null
+                : shell.Raw.ValueKind == System.Text.Json.JsonValueKind.String ? shell.Raw.GetString() : shell.Raw.GetRawText(),
             Restricted = json["restricted"].Raw.ValueKind == System.Text.Json.JsonValueKind.True,
         };
     }

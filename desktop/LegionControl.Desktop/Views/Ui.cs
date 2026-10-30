@@ -1,7 +1,9 @@
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
+using LegionControl.Desktop.Config;
 
 namespace LegionControl.Desktop.Views;
 
@@ -13,6 +15,24 @@ namespace LegionControl.Desktop.Views;
 /// hundred pixels of chrome per machine and say nothing at all.
 public static class Ui
 {
+    /// What tells a control apart from others of its shape when the window lays a new build over
+    /// the one shown (see [LiveTree]): a service's row from another's, one notice from the next.
+    public static readonly AttachedProperty<string?> KeyProperty =
+        AvaloniaProperty.RegisterAttached<Control, string?>("Key", typeof(Ui));
+
+    /// What a button or a menu item does when pressed. Kept as a value of the control, rather than
+    /// in its Click event, so that a control kept on screen across a rebuild does what the latest
+    /// build says and never what an older reading did.
+    public static readonly AttachedProperty<Action?> HandlerProperty =
+        AvaloniaProperty.RegisterAttached<Control, Action?>("Handler", typeof(Ui));
+
+    /// [control], keyed.
+    public static T Keyed<T>(T control, string key) where T : Control
+    {
+        control.SetValue(KeyProperty, key);
+        return control;
+    }
+
     public static FontFamily NativeFont => new(OperatingSystem.IsWindows() ? "Segoe UI"
         : OperatingSystem.IsMacOS() ? ".AppleSystemUIFont" : "sans-serif");
     private static IBrush Brush(string key, string fallback) =>
@@ -88,6 +108,9 @@ public static class Ui
         Margin = new Thickness(0, 18, 0, 4),
     };
 
+    /// A button. [explanation] says what it does while it can be pressed, in a tooltip, and why it
+    /// cannot be while it is disabled: a disabled control shows no tooltip, so [Actions] then puts
+    /// the reason beside it as text. A screen reader is given it either way.
     public static Button Action(string text, Action handler, bool enabled = true, string? explanation = null, bool primary = false)
     {
         var button = new Button
@@ -98,20 +121,44 @@ public static class Ui
             Padding = new Thickness(10, 4, 10, 4),
         };
         if (primary && enabled) button.Classes.Add("primary");
-        if (explanation is not null) ToolTip.SetTip(button, explanation);
-        button.Click += (_, _) => handler();
+        if (explanation is not null)
+        {
+            if (enabled) ToolTip.SetTip(button, explanation);
+            AutomationProperties.SetHelpText(button, explanation);
+        }
+        button.SetValue(HandlerProperty, handler);
+        button.Click += (_, _) => button.GetValue(HandlerProperty)?.Invoke();
         return button;
     }
 
+    /// A row of buttons, and why those that are disabled cannot be pressed, where they have a reason
+    /// to give. Buttons that share a reason, as everything an older agent cannot do does, are
+    /// followed by it once, after the last of them; a screen reader is given it on each.
     public static Panel Actions(params Control?[] controls)
     {
         var panel = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
-        foreach (var control in controls)
+        var shown = controls.OfType<Control>().ToList();
+        var last = new Dictionary<string, Control>();
+        foreach (var control in shown)
+            if (Reason(control) is { } reason) last[reason] = control;
+        foreach (var control in shown)
         {
-            if (control is not null) panel.Children.Add(control);
+            panel.Children.Add(control);
+            if (Reason(control) is { } reason && last[reason] == control)
+            {
+                var note = Note(reason);
+                note.VerticalAlignment = VerticalAlignment.Center;
+                note.Margin = new Thickness(0, 0, 12, 6);
+                panel.Children.Add(note);
+            }
         }
         return panel;
     }
+
+    /// Why a disabled button or menu item cannot be used, when it says.
+    private static string? Reason(Control control) =>
+        control is Button or MenuItem && !control.IsEnabled && AutomationProperties.GetHelpText(control) is { Length: > 0 } reason
+            ? reason : null;
 
     public static StackPanel Column(double spacing = 0) => new()
     {
@@ -119,23 +166,87 @@ public static class Ui
         Spacing = spacing,
     };
 
+    /// A menu item. [explanation] is a tooltip while it can be chosen; while it cannot, it is a
+    /// second line of the item, since a disabled item shows no tooltip either. [MenuButton] keeps
+    /// that line only under the last of the items in a row that give the same one.
     public static MenuItem MenuAction(string text, Action handler, bool enabled = true, string? explanation = null)
     {
         var item = new MenuItem { Header = text, IsEnabled = enabled };
-        item.Click += (_, _) => handler();
-        if (explanation is not null) ToolTip.SetTip(item, explanation);
+        item.SetValue(HandlerProperty, handler);
+        item.Click += (_, _) => item.GetValue(HandlerProperty)?.Invoke();
+        if (explanation is null) return item;
+        AutomationProperties.SetHelpText(item, explanation);
+        if (enabled)
+        {
+            ToolTip.SetTip(item, explanation);
+            return item;
+        }
+        var header = Column(1);
+        header.Children.Add(new TextBlock { Text = text });
+        var reason = Note(explanation);
+        reason.Margin = new Thickness(0);
+        reason.MaxWidth = 320;
+        header.Children.Add(reason);
+        item.Header = header;
+        AutomationProperties.SetName(item, text);
         return item;
     }
 
+    /// A button that opens a menu. Its own text is a symbol or a word, so [accessibleName] says
+    /// what the menu is for, to a screen reader and in a tooltip.
     public static Button MenuButton(string text, IEnumerable<MenuItem> items, string accessibleName)
     {
-        var menu = new ContextMenu { ItemsSource = items.ToArray() };
         var button = Action(text, () => { });
-        button.ContextMenu = menu;
-        button.Click += (_, _) => menu.Open(button);
-        Avalonia.Automation.AutomationProperties.SetName(button, accessibleName);
+        var shown = items.ToArray();
+        ShareReasons(shown);
+        button.ContextMenu = new ContextMenu { ItemsSource = shown };
+        // The menu the button holds when pressed, which a rebuild may have brought up to date.
+        button.Click += (_, _) => button.ContextMenu?.Open(button);
+        AutomationProperties.SetName(button, accessibleName);
         ToolTip.SetTip(button, accessibleName);
         return button;
+    }
+
+    /// Items next to each other that are disabled for the same reason say it once, under the last
+    /// of them, in this menu and every submenu. Each keeps it for a screen reader.
+    private static void ShareReasons(IEnumerable<object> items)
+    {
+        var list = items.ToList();
+        for (var index = 0; index < list.Count; index++)
+        {
+            if (list[index] is not MenuItem item) continue;
+            if (item.ItemsSource is { } inside) ShareReasons(inside.Cast<object>());
+            if (Reason(item) is { } reason && index + 1 < list.Count && list[index + 1] is MenuItem next && Reason(next) == reason
+                && item.Header is Panel && AutomationProperties.GetName(item) is { } label)
+                item.Header = label;
+        }
+    }
+
+    /// Runs one thing a person started, to its end, from the window's thread.
+    ///
+    /// Every button and menu item that awaits anything goes through here. Whatever it throws is
+    /// written to the log and shown in a sheet that says what was being done, rather than ending
+    /// the process, which is what an exception out of an `async void` handler does, or vanishing.
+    /// [quiet] is for what runs without anybody having asked, like the update check on activation:
+    /// that is logged and not shown.
+    public static void Run(Window owner, string what, Func<Task> task, bool quiet = false) =>
+        _ = UiTask.RunAsync(what, task, error =>
+        {
+            if (!quiet) Failed(owner, what, error);
+        });
+
+    /// The sheet for something that stopped on an error nobody planned for.
+    public static void Failed(Window owner, string what, Exception error)
+    {
+        try
+        {
+            Sheets.Text(owner, what, UiTask.Sentence(what, error));
+        }
+        catch (Exception shown)
+        {
+            // A window that has closed has nowhere to show it. The log has it either way.
+            AppLog.Write($"{what}, while saying so", shown);
+        }
     }
 
     public static void ShowDetails(Window owner, string title, Control content)
@@ -151,4 +262,37 @@ public static class Ui
         };
         window.Show(owner);
     }
+}
+
+/// What [Ui.Run] does, apart from the window, so that it can be checked without one.
+public static class UiTask
+{
+    /// Runs [task] and hands whatever it throws to [report], after writing it to the log. Never
+    /// throws itself, so the task this returns never faults and nothing awaits it in vain.
+    public static async Task RunAsync(string what, Func<Task> task, Action<Exception> report)
+    {
+        try
+        {
+            await task();
+        }
+        catch (Exception error)
+        {
+            AppLog.Write(what, error);
+            try
+            {
+                report(error);
+            }
+            catch (Exception shown)
+            {
+                AppLog.Write($"{what}, while saying so", shown);
+            }
+        }
+    }
+
+    /// What stopped, for an error the window's own thread met outside every [Ui.Run], where
+    /// nothing a person started can be named.
+    public const string Window = "The window";
+
+    public static string Sentence(string what, Exception error) =>
+        $"{what} stopped on an error this app did not expect: {error.Message}\n\nThe details are in {AppLog.Path}.";
 }

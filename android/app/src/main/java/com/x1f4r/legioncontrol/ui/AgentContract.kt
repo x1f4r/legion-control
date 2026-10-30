@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.ui
 
+import android.net.Network
 import com.x1f4r.legioncontrol.agent.AgentAbilities
 import com.x1f4r.legioncontrol.agent.AgentActionResult
 import com.x1f4r.legioncontrol.agent.AgentFailure
@@ -12,6 +13,7 @@ import com.x1f4r.legioncontrol.agent.DoctorReport
 import com.x1f4r.legioncontrol.agent.EndpointDiagnosis
 import com.x1f4r.legioncontrol.agent.HistoryReply
 import com.x1f4r.legioncontrol.agent.InterruptRequest
+import com.x1f4r.legioncontrol.agent.LaunchGate
 import com.x1f4r.legioncontrol.agent.LogsReply
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.MachineSystem
@@ -23,12 +25,16 @@ import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.data.ControllerConfig
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
+import com.x1f4r.legioncontrol.data.DocumentAcceptance
 import com.x1f4r.legioncontrol.data.KeyChange
+import com.x1f4r.legioncontrol.data.LaunchReviewEntry
 import com.x1f4r.legioncontrol.data.SetupDivergence
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.SetupSource
+import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.net.RouteKind
+import com.x1f4r.legioncontrol.net.WakeSend
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -39,7 +45,7 @@ import kotlinx.coroutines.flow.StateFlow
  * layer that parses it and the layer that draws it. A second copy over here would only be a second
  * thing to keep in step, and the first field that drifted would be invisible until it was wrong on
  * screen. What this file does add is the handful of ideas that only exist for the sake of the
- * screen: what the link looks like, which address answered, and whether waking is possible at all.
+ * screen: what the link looks like and which address answered.
  */
 
 /** Which address answered. The user is told, because it changes what the app can do. */
@@ -109,12 +115,6 @@ sealed interface LinkState {
     data class PhoneKeyUnavailable(val reason: String) : LinkState
 }
 
-/** Whether a wake packet can reach a machine right now, and in one sentence why not. */
-data class WakeReadiness(
-    val possible: Boolean,
-    val explanation: String,
-)
-
 /**
  * One machine's transport, as the screen sees it.
  *
@@ -124,11 +124,8 @@ data class WakeReadiness(
 interface MachineClient {
     val machine: Machine
 
-    /** What the last reply said the far side is: which contract, which version, which verbs. */
+    /** What the last reply said the far side is: which contract and which version. */
     val abilities: AgentAbilities
-
-    /** Follows the network, so the wake action can be enabled and disabled while the app is open. */
-    fun wakeReadiness(): Flow<WakeReadiness>
 
     /** Which address answered last. Null until one has. */
     val route: Route?
@@ -143,25 +140,14 @@ interface MachineClient {
         operationId: String?,
     ): Result<AgentActionResult>
 
-    suspend fun setAutoUpdate(
-        on: Boolean,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult>
+    // The schedule and policy writes take no operation id: the agent takes none for them.
+    suspend fun setAutoUpdate(on: Boolean, serviceId: String?): Result<AgentActionResult>
 
-    suspend fun pauseUpdates(
-        duration: String,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult>
+    suspend fun pauseUpdates(duration: String, serviceId: String?): Result<AgentActionResult>
 
-    suspend fun resumeUpdates(serviceId: String?, operationId: String?): Result<AgentActionResult>
+    suspend fun resumeUpdates(serviceId: String?): Result<AgentActionResult>
 
-    suspend fun writePolicy(
-        patch: PolicyPatch,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult>
+    suspend fun writePolicy(patch: PolicyPatch, serviceId: String?): Result<AgentActionResult>
 
     suspend fun readPolicy(serviceId: String?): Result<AgentActionResult>
 
@@ -230,20 +216,12 @@ interface MachineClient {
      */
     suspend fun fetchSetup(): Result<ControllerFetch>
 
-    /** Sends the magic packet from this phone through the selected site interface. */
-    suspend fun sendWakePacket(broadcasts: List<String>, prefixes: List<String>): String?
-
-    /** Waits for an authenticated agent status. False when the machine never provided one. */
-    suspend fun waitForWake(): Boolean
-
-    /** Where the wait is watching, so a failure can name the address that never answered. */
-    val wakeProbeAddress: String?
-
-    /** Asks this machine to send a magic packet at another one on its own network. */
-    suspend fun wakeProxyFor(machineId: String, operationId: String?): Result<AgentActionResult>
-
-    /** Whether this machine's agent actually offers the wake verb. Reads `help` once. */
-    suspend fun hasWakeProxy(): Boolean
+    /**
+     * Sends this machine's magic packets from this phone, as a direct wake step says: to every one of
+     * [broadcasts] on every one of [ports], bound to [via], the network of the address that placed
+     * the machine on this device's network.
+     */
+    suspend fun sendWakePacket(broadcasts: List<String>, ports: List<Int>, via: Network?): WakeSend
 
     /** Puts a signed agent bundle on the machine and installs it. */
     suspend fun installAgent(tarball: SignedTarball, operationId: String?): Result<AgentActionResult>
@@ -280,8 +258,17 @@ interface ControlServices {
      */
     suspend fun replaceUnreadableKey()
 
-    /** The configuration in force, or null when there is none. */
+    /** The configuration in force, or null when there is none. What it says, for the screen. */
     val config: StateFlow<ControllerConfig?>
+
+    /**
+     * What machines are driven from: the configuration in force with every command as this device
+     * approved it (contract section 9.9), and each launch value that waits for approval.
+     */
+    val launch: StateFlow<LaunchGate.Effective>
+
+    /** Why the record of approved commands could not be read, when it could not. */
+    val launchProblem: StateFlow<String?>
 
     /** Exactly the text that was applied, so the field on screen starts where the user left it. */
     val configText: StateFlow<String>
@@ -298,8 +285,11 @@ interface ControlServices {
     /** A machine carrying an entirely different setup. */
     val identityClash: StateFlow<SetupIdentityClash?>
 
-    /** Every IPv4 address this device holds, so the site can be worked out. */
-    fun networkAddresses(): Flow<List<String>>
+    /**
+     * Every address this device could send a wake packet from, each with its network, so the site
+     * can be worked out and a packet bound to the right network.
+     */
+    fun networkAddresses(): Flow<List<LocalAddress>>
 
     /** What to call this device in a revision it writes. */
     fun deviceName(): String
@@ -322,47 +312,53 @@ interface ControlServices {
     /** Puts an edit of the applied document in force, as a revision descending from it. */
     fun applyEdit(document: ControllerDocument, deviceName: String?): String?
 
-    /** Takes a copy off a machine. Only ever called when it descends from this device's copy. */
-    fun adoptFromMachine(text: String, expectedHash: String?, machineName: String): SetupOutcome
+    /**
+     * Puts a fetched setup in force after a person was shown all of its launch values. Approves them
+     * on a device that applied no setup before, and nothing on one that did.
+     */
+    fun applyEnrolment(text: String, deviceName: String?): String?
 
-    fun recordDivergence(
-        machineName: String,
-        reason: String,
-        theirText: String,
-        theirProvenance: SetupProvenance,
-    )
+    /** Records exactly the values [entries] showed as approved on this device. Returns null, or why not. */
+    fun approveLaunch(entries: List<LaunchReviewEntry>): String?
 
-    fun recordIdentityClash(
-        machineName: String,
-        reason: String,
-        theirText: String,
-        theirProvenance: SetupProvenance,
-    )
+    /**
+     * What contract section 9.7 says of the document in force: its warnings and, when an earlier
+     * build stored it under other rules, its errors. While it has one, nothing is published.
+     */
+    val acceptance: StateFlow<DocumentAcceptance.Verdict?>
+
+    /** The hash of the document in force as storage has it, which every adoption is compared against. */
+    fun appliedHash(): String?
+
+    /**
+     * Takes a copy off a machine, stored exactly as read, if it hashes to [expectedRemoteHash] and
+     * the document in force is still [expectedLocalHash]. See [com.x1f4r.legioncontrol.data.ConfigStore.adoptFromMachine].
+     */
+    fun adoptFromMachine(text: String, expectedRemoteHash: String?, expectedLocalHash: String?, machineName: String): SetupOutcome
+
+    /** A copy of the same setup that neither side descends from, from the verified bytes of the machine [machineId]. */
+    fun recordDivergence(machineId: String, machineName: String, reason: String, theirText: String)
+
+    /** The machine [machineId] carrying another setup entirely, from its verified bytes. */
+    fun recordIdentityClash(machineId: String, machineName: String, reason: String, theirText: String)
 
     fun clearDivergence()
 
     fun clearIdentityClash()
 
-    /** Takes the other side of a divergence wholesale. */
-    fun adoptDivergent(divergence: SetupDivergence): String?
+    /** Takes the other side of a divergence wholesale, if this device's copy is still the one it was built from. */
+    fun adoptDivergent(divergence: SetupDivergence): SetupOutcome
 
     /**
-     * Keeps this device's copy, as a revision that descends from both sides.
+     * Puts the result of Merge or Keep mine in force, if this device's copy is still [expectedHead].
      *
      * Not `--replace`: a revision whose ancestry contains the other machine's hash is one that every
      * machine on either branch accepts as an ordinary fast-forward, so nothing has to be overridden.
      */
-    fun keepMineOver(divergence: SetupDivergence, deviceName: String?): String?
+    fun applyMerge(mergedText: String, expectedHead: String?): SetupOutcome
 
-    /** Merges the two sides with a decision per differing entry. */
-    fun applyMerge(
-        merged: ControllerDocument,
-        theirProvenance: SetupProvenance,
-        deviceName: String?,
-    ): String?
-
-    /** Drops this device's setup and follows the other one. */
-    fun adoptOtherSetup(clash: SetupIdentityClash): String?
+    /** Drops this device's setup and follows the other one, if this device's copy is still the one it was asked about. */
+    fun adoptOtherSetup(clash: SetupIdentityClash): SetupOutcome
 
     /** The document with that hash, when this device kept a copy. The base for a three-way merge. */
     fun revision(hash: String?): String?
@@ -386,8 +382,8 @@ interface ControlServices {
     /** Drops every key for one address, so the next connection asks about whatever is offered. */
     fun forgetHostKeys(address: String)
 
-    /** One client per machine the configuration describes, in the order it lists them. */
-    fun clients(configuration: ControllerConfig?): List<MachineClient>
+    /** One client per machine the gate's configuration describes, in the order it lists them. */
+    fun clients(launch: LaunchGate.Effective): List<MachineClient>
 }
 
 // MARK: - Reading a failure

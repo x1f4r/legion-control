@@ -47,6 +47,12 @@ enum class RemoteShell(val wire: String) {
             "powershell" -> POWERSHELL
             else -> null
         }
+
+        /**
+         * A grammar as a launch tuple records it (contract section 9.9), the dispatcher included, or
+         * null for `refused:<code>` and anything else section 15.2 does not write lines in.
+         */
+        fun fromGrammar(value: String?): RemoteShell? = entries.firstOrNull { it.wire == value }
     }
 }
 

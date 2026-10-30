@@ -139,8 +139,8 @@ test('version --check fails when an imported module is missing', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-module-check-'));
   try {
     copyAgentSource(root);
-    const entry = path.join(root, 'src', 'index.mjs');
-    fs.writeFileSync(entry, fs.readFileSync(entry, 'utf8').replace("'http.mjs', 'lock.mjs'", "'missing-check-module.mjs', 'lock.mjs'"));
+    const list = path.join(root, 'src', 'selftest-modules.mjs');
+    fs.writeFileSync(list, fs.readFileSync(list, 'utf8').replace("'launch.mjs', 'lock.mjs'", "'missing-check-module.mjs', 'lock.mjs'"));
     const result = spawnSync(process.execPath, [path.join(root, 'src', 'index.mjs'), 'version', '--check'], {
       encoding: 'utf8', env: { ...process.env, LEGIONCTL_HOME: path.join(root, 'data') }, timeout: 5_000,
     });
@@ -296,6 +296,8 @@ test('staged signed bootstrap installs the intended base, replays, and refuses i
     assert.equal(fs.readFileSync(path.join(base, 'bin', 'launcher.mjs'), 'utf8'), fs.readFileSync(path.join(incoming, 'install', 'launcher.mjs'), 'utf8'));
     const wrapper = path.join(base, 'bin', process.platform === 'win32' ? 'legionctl.ps1' : 'legionctl');
     assert.equal(fs.readFileSync(wrapper, 'utf8').includes('@NODE_'), false);
+    // Windows PowerShell 5.1 reads a script without a byte order mark in the ANSI code page.
+    if (process.platform === 'win32') assert.deepEqual([...fs.readFileSync(wrapper).subarray(0, 3)], [0xef, 0xbb, 0xbf]);
     assert.equal(JSON.parse(fs.readFileSync(path.join(base, 'agent.prev', 'package.json'))).version, '2.1.0');
 
     const replay = spawnSync(process.execPath, [entry, 'self-update', '--install', '--op', 'bootstrap-install-0001'], {

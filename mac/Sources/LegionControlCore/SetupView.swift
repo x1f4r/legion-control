@@ -64,6 +64,17 @@ struct SetupView: View {
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                // A setup can be applied and still have nothing here to show: a local agent waiting
+                // for approval has no section of its own to say so.
+                if LaunchWaitingNotice.isNeeded(model) {
+                    SectionHeading(title: "Commands from the shared setup")
+                    LaunchWaitingNotice(model: model)
+                }
+
+                // There is no sidebar yet, so the app's own page is drawn here: an update, a roll
+                // back and a diagnostics export are needed most when nothing is set up.
+                AppSection(model: model, isPage: false)
             }
             .padding(.horizontal, 32)
             .padding(.top, 30)

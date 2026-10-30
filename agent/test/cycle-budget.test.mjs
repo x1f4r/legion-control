@@ -1,0 +1,241 @@
+// The cycle's deadline: nothing that can leave a service down is started unless
+// it can be over before the scheduler ends the cycle.
+
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { pathToFileURL } from 'node:url';
+import { loadConfig } from '../src/config-store.mjs';
+import { beginOperation, queueOperation, readOperation, updateOperation } from '../src/operations.mjs';
+import { WARM_ATTEMPT_MS, WARM_ATTEMPTS } from '../src/providers/npm.mjs';
+import { CYCLE_BUDGET_MS, cycleBudget, runCycle, SCHEDULER_LIMIT_MS } from '../src/scheduler.mjs';
+import { serviceState } from '../src/state.mjs';
+import { recoveryWorstCaseMs, restartWorstCaseMs, runUpdate, updateWorstCaseMs } from '../src/update.mjs';
+import {
+  commandService, deadPid, fakeNpm, fixtureConfig, fixtureData, npmCalls, npmPackageVersion, npmService, readFixture, REPO, SRC, withHome,
+  writeConfig, writeFixture,
+} from './helpers.mjs';
+
+const minute = 60 * 1000;
+
+/** Write the document and read it back the way the agent does, so services carry their defaults. */
+function configured(home, document) {
+  writeConfig(home, document);
+  const loaded = loadConfig();
+  assert.equal(loaded.ok, true, loaded.error);
+  return loaded.config;
+}
+
+/**
+ * A cycle run with `options`, in a Node of its own that finds the stand-in npm
+ * rather than the one beside it, which only a process started with
+ * hide-node-npm.mjs loaded can do.
+ */
+function cycleWithFakeNpm(home, npm, options) {
+  const href = (name) => JSON.stringify(pathToFileURL(path.join(SRC, name)).href);
+  const source = `import { loadConfig } from ${href('config.mjs')};
+    import { runCycle } from ${href('scheduler.mjs')};
+    process.stdout.write(JSON.stringify(await runCycle(loadConfig().config, ${JSON.stringify(options)})));`;
+  const result = spawnSync(process.execPath, [...npm.nodeArgs, '--input-type=module', '-e', source], {
+    encoding: 'utf8',
+    env: { ...process.env, LEGIONCTL_HOME: home },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test('a cycle budgets for the shortest scheduler limit, and the Linux unit allows that long', () => {
+  assert.equal(SCHEDULER_LIMIT_MS, 30 * minute);
+  assert.ok(CYCLE_BUDGET_MS < SCHEDULER_LIMIT_MS, 'some of it is kept back for the reply');
+  const unit = fs.readFileSync(path.join(REPO, 'agent', 'install', 'legion-control-update.service'), 'utf8');
+  const limit = Number(/^TimeoutStartSec=(\d+)$/m.exec(unit)?.[1]) * 1000;
+  assert.ok(limit >= SCHEDULER_LIMIT_MS, `systemd ends a cycle after ${limit} ms`);
+});
+
+test('the worst case of an update counts its drain, and fits in a cycle as configured by default', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home);
+    const config = configured(home, fixtureConfig(dir, {
+      services: [
+        commandService(dir),
+        commandService(dir, { id: 'drained', name: 'Drained', drain: { command: [process.execPath, '-e', ''], timeoutSeconds: 600 } }),
+      ],
+    }));
+    const [plain, drained] = config.services;
+    const plainMs = updateWorstCaseMs(plain);
+    const npm = configured(home, fixtureConfig(dir, { services: [npmService(dir, { pkg: 'demo-pkg', prefix: path.join(home, 'npm-prefix') })] })).services[0];
+    assert.ok(updateWorstCaseMs(npm) > 10 * minute, 'an npm install may run for ten minutes');
+    assert.ok(updateWorstCaseMs(npm) < CYCLE_BUDGET_MS, 'and still fits in a cycle that has just begun');
+    assert.ok(WARM_ATTEMPTS * WARM_ATTEMPT_MS < updateWorstCaseMs(npm), 'a download begun where its update fits is over before the cycle has to end');
+    assert.ok(plainMs > 10 * minute, 'the update command alone may run for ten minutes');
+    assert.ok(plainMs < CYCLE_BUDGET_MS, 'or no scheduled update could ever start');
+    assert.ok(updateWorstCaseMs(drained) >= plainMs + 10 * minute, 'a ten minute drain is ten minutes more');
+    assert.ok(restartWorstCaseMs(plain) < plainMs);
+    assert.ok(recoveryWorstCaseMs(plain, { rollback: true }) > recoveryWorstCaseMs(plain));
+  });
+});
+
+test('the budget says what waits and why, and lets through what fits', () => {
+  const budget = cycleBudget({ budgetMs: 20 * minute, startedAt: Date.now() - 15.5 * minute });
+  assert.equal(budget.refuses(4 * minute, 'the update of Demo'), null);
+  assert.equal(budget.refuses(6 * minute + 1, 'the update of Demo'), 'the update of Demo can take up to 7 min, and this cycle has 4 min left, so it waits for the next cycle');
+  assert.match(budget.refuses(25 * minute, 'the update of Demo'), /longer than a whole cycle has \(20 min\), so no cycle starts it/);
+  const spent = cycleBudget({ budgetMs: 20 * minute, startedAt: Date.now() - 21 * minute });
+  assert.match(spent.refuses(1, 'the restart of Demo'), /this cycle has no time left/);
+});
+
+test('a cycle without the time for an update stops it short of its drain, and the next one runs it', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const config = configured(home, fixtureConfig(dir));
+
+    const short = await runCycle(config, { budgetMs: 1000 });
+    assert.equal(short.action, 'cycled');
+    assert.deepEqual(short.children.map((child) => [child.service, child.action, child.reasonCode, child.to]), [['demo', 'deferred', 'timed-out', '2.0.0']]);
+    assert.match(short.children[0].message, /the update of Demo to 2\.0\.0 can take up to \d+ min, longer than a whole cycle has/);
+    assert.equal(readOperation(short.children[0].opId).result.outcome, 'deferred');
+    assert.equal(readFixture(dir, 'installed'), '1.0.0');
+    assert.equal(readFixture(dir, 'stop-runs'), '');
+
+    const full = await runCycle(config);
+    assert.deepEqual(full.children.map((child) => [child.service, child.action]), [['demo', 'updated']]);
+    assert.equal(readFixture(dir, 'installed'), '2.0.0');
+  });
+});
+
+test('a service already current reads as current in a cycle that has run out of time', async () => {
+  await withHome(async (home) => {
+    const current = fixtureData(home, { installed: '2.0.0', latest: '2.0.0' });
+    const behind = path.join(home, 'behind');
+    fs.cpSync(current, behind, { recursive: true });
+    writeFixture(behind, 'installed', '1.0.0');
+    const config = configured(home, fixtureConfig(current, {
+      services: [commandService(behind, { id: 'behind', name: 'Behind' }), commandService(current)],
+    }));
+
+    // The time a long update before them took is spent: what is current says
+    // so, and only what has something to install waits for the next cycle.
+    const spent = await runCycle(config, { budgetMs: 1 });
+    assert.deepEqual(spent.children.map((child) => [child.service, child.action, child.reasonCode]), [
+      ['behind', 'deferred', 'timed-out'],
+      ['demo', 'noop', 'already-on-target'],
+    ]);
+    assert.equal(readFixture(behind, 'stop-runs'), '');
+    assert.equal(readFixture(behind, 'installed'), '1.0.0');
+  });
+});
+
+test('an npm update a cycle has no time for downloads nothing, and waits with the version it found', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const npm = fakeNpm(home, dir);
+    writeConfig(home, fixtureConfig(dir, { services: [npmService(dir, npm)] }));
+
+    // The download can take minutes against a slow registry, and in a cycle
+    // with no time left would only push it past the scheduler's limit.
+    const spent = cycleWithFakeNpm(home, npm, { budgetMs: 1 });
+    assert.deepEqual(spent.children.map((child) => [child.service, child.action, child.reasonCode, child.to]), [['demo', 'deferred', 'timed-out', '2.0.0']]);
+    assert.match(spent.children[0].message, /the update of Demo to 2\.0\.0 can take up to/);
+    assert.equal(readOperation(spent.children[0].opId).result.outcome, 'deferred');
+    assert.deepEqual(npmCalls(dir).filter((call) => call.startsWith('cache ')), [], 'nothing was downloaded');
+    assert.equal(readFixture(dir, 'stop-runs'), '');
+    assert.equal(npmPackageVersion(npm.prefix, npm.pkg), '1.0.0');
+
+    const full = cycleWithFakeNpm(home, npm, {});
+    assert.deepEqual(full.children.map((child) => [child.service, child.action]), [['demo', 'updated']]);
+    assert.ok(npmCalls(dir).includes('cache add demo-pkg@2.0.0'));
+    assert.equal(npmPackageVersion(npm.prefix, npm.pkg), '2.0.0');
+  });
+});
+
+test('a current service that is not answering is restarted only by a cycle with the time', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { installed: '2.0.0', latest: '2.0.0' });
+    const silent = { type: 'command', command: [process.execPath, '-e', 'process.exit(1)'] };
+    const config = configured(home, fixtureConfig(dir, { services: [commandService(dir, { health: silent })] }));
+    const spent = await runCycle(config, { budgetMs: 1 });
+    assert.deepEqual(spent.children.map((child) => [child.service, child.action, child.reasonCode]), [['demo', 'deferred', 'timed-out']]);
+    assert.match(spent.children[0].message, /already on 2\.0\.0 but unhealthy; the restart of Demo can take up to/);
+    assert.equal(readOperation(spent.children[0].opId).result.outcome, 'deferred');
+    assert.equal(readFixture(dir, 'stop-runs'), '', 'nothing was stopped');
+    assert.equal(readFixture(dir, 'start-runs'), '');
+  });
+});
+
+test('an update whose time runs out on the way to its stop waits, with the version it found', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const config = configured(home, fixtureConfig(dir));
+    const [service] = config.services;
+    const result = await runUpdate(config, service, { mode: 'scheduled', budget: cycleBudget({ budgetMs: 5 * minute }) });
+    assert.equal(result.action, 'deferred');
+    assert.equal(result.reasonCode, 'timed-out');
+    assert.equal(result.to, '2.0.0');
+    assert.match(result.message, /the update of Demo to 2\.0\.0 can take up to/);
+    const record = readOperation(result.opId);
+    assert.equal(record.result.outcome, 'deferred');
+    assert.equal(serviceState(service).pendingVersion, '2.0.0', 'what waits is noted as waiting');
+    assert.equal(readFixture(dir, 'stop-runs'), '', 'nothing was stopped');
+    assert.equal(readFixture(dir, 'installed'), '1.0.0');
+  });
+});
+
+test('a queued request a cycle has no time for keeps its place, and its expiry', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const config = configured(home, fixtureConfig(dir, { updates: { automatic: false } }));
+    const restart = 'queued-budget-restart-01';
+    assert.equal(queueOperation({ id: restart, kind: 'restart', service: 'demo', ttlMs: 60 * minute }).ok, true);
+    const expiresAt = readOperation(restart).expiresAt;
+
+    const short = await runCycle(config, { budgetMs: 1000 });
+    assert.deepEqual(short.queue.map((entry) => [entry.opId, entry.action, entry.reasonCode]), [[restart, 'queued', 'timed-out']]);
+    assert.equal(readOperation(restart).state, 'queued');
+    assert.equal(readOperation(restart).expiresAt, expiresAt);
+    assert.equal(readFixture(dir, 'stop-runs'), '');
+
+    // Taken up, and then found short of time at its stop, an update goes back
+    // to the queue just as one the machine was too busy for.
+    const update = 'queued-budget-update-01';
+    queueOperation({ id: update, kind: 'update', service: 'demo', ttlMs: 60 * minute });
+    const deferred = await runUpdate(config, config.services[0], { existingOpId: update, mode: 'queued', budget: cycleBudget({ budgetMs: 5 * minute }) });
+    assert.equal(deferred.action, 'queued');
+    assert.equal(readOperation(update).state, 'queued');
+    assert.equal(readOperation(update).pid, null);
+
+    const full = await runCycle(config);
+    assert.deepEqual(full.queue.map((entry) => [entry.opId, entry.action]).sort(), [[restart, 'restarted'], [update, 'updated']].sort());
+    assert.equal(readFixture(dir, 'installed'), '2.0.0');
+  });
+});
+
+test('recovery always puts back the first service, and what it has no time for waits', async () => {
+  await withHome(async (home) => {
+    const first = fixtureData(home, { running: 'off' });
+    const second = path.join(home, 'second');
+    fs.cpSync(first, second, { recursive: true });
+    const config = configured(home, fixtureConfig(first, {
+      updates: { automatic: false },
+      services: [commandService(first), commandService(second, { id: 'other', name: 'Other' })],
+    }));
+    for (const [id, service] of [['budget-recovery-first', 'demo'], ['budget-recovery-other', 'other']]) {
+      beginOperation({ id, kind: 'update', service, systemId: 'test' });
+      updateOperation(id, { pid: deadPid(), phase: 'stopping' });
+    }
+
+    const short = await runCycle(config, { budgetMs: 1000 });
+    const restored = short.recovery.restored.map((entry) => [entry.service, entry.action, entry.settled]);
+    assert.deepEqual(restored, [['demo', 'started', true], ['other', 'deferred', false]]);
+    assert.equal(readFixture(first, 'running'), 'on');
+    assert.equal(readFixture(second, 'running'), 'off');
+    assert.equal(readOperation('budget-recovery-other').recoveryPending, true);
+    assert.match(readOperation('budget-recovery-other').log.at(-1).line, /recovery is still owed: putting Other back can take up to \d+ min/);
+    assert.match(short.message, /recovery is still owed/);
+
+    await runCycle(config);
+    assert.equal(readFixture(second, 'running'), 'on');
+    assert.equal(readOperation('budget-recovery-other').recoveryPending, false);
+  });
+});

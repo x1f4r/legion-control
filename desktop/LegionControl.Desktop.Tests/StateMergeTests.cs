@@ -1,0 +1,232 @@
+using LegionControl.Desktop.Cli;
+using LegionControl.Desktop.Config;
+using LegionControl.Desktop.Model;
+using Xunit;
+
+namespace LegionControl.Desktop.Tests;
+
+/// The window and the command line keep the same files, and neither writes back what it read at
+/// its start over what the other changed since. A file that is not what it should be is moved
+/// aside, never written over in silence.
+public class StateMergeTests
+{
+    private static string[] SetAside(string path) =>
+        Directory.EnumerateFiles(Path.GetDirectoryName(path)!, Path.GetFileName(path) + ".corrupt-*").ToArray();
+
+    [Fact]
+    public void APreferenceChangedInOneProcessSurvivesAChangeMadeInTheOther()
+    {
+        using var home = new TempHome();
+        // The window started, and read the preferences as they were then.
+        using var window = new AppModel(configStore: new ConfigStore(home.ConfigPath, watch: false), runner: FakeRunner.Replying("{}"));
+        Assert.False(window.Settings.NotifyOnOperationFinished);
+
+        // Another process changes one of them.
+        Assert.Null(DesktopSettings.Change(settings => settings with { NotifyOnOperationFinished = true }).Problem);
+
+        // The window changes another, and the first stays as the other process set it.
+        Assert.Null(window.UpdateSettings(settings => settings with { KeepMetricsHistory = true }));
+        var stored = DesktopSettings.Load();
+        Assert.True(stored.NotifyOnOperationFinished);
+        Assert.True(stored.KeepMetricsHistory);
+        Assert.True(window.Settings.NotifyOnOperationFinished);
+    }
+
+    [Fact]
+    public void PreferencesThatCannotBeReadAreSetAsideBeforeTheNextChange()
+    {
+        using var home = new TempHome();
+        File.WriteAllText(AppPaths.SettingsFile, "{ not settings");
+        Assert.Equal(DesktopSettings.Default.PollSeconds, DesktopSettings.Load().PollSeconds);
+
+        var (settings, problem) = DesktopSettings.Change(current => current with { KeepMetricsHistory = true });
+        Assert.Null(problem);
+        Assert.True(settings.KeepMetricsHistory);
+        Assert.True(DesktopSettings.Load().KeepMetricsHistory);
+        Assert.Equal("{ not settings", File.ReadAllText(Assert.Single(SetAside(AppPaths.SettingsFile))));
+        Assert.Contains("could not be read", File.ReadAllText(AppPaths.LogFile));
+    }
+
+    [Fact]
+    public async Task AnAliasTheCommandLineSetSurvivesTheWindowSavingSomethingElse()
+    {
+        using var home = new TempHome();
+        using var window = new AppModel(configStore: new ConfigStore(home.ConfigPath, watch: false), runner: FakeRunner.Replying("{}"));
+
+        Assert.Equal(Runner.Ok, await Runner.RunAsync(new[] { "--command", "bindings", "--machine", "pi", "--alias", "beacon" }, new StringWriter()));
+
+        // The window's editor opened on the bindings before the alias, and changed only the name.
+        var opened = window.Bindings;
+        var saved = opened with { DeviceName = "Desk tower" };
+        Assert.Null(window.UpdateBindings(current => current.WithChanges(opened, saved)));
+
+        var stored = Bindings.Load();
+        Assert.Equal("Desk tower", stored.DeviceName);
+        Assert.Equal("beacon", stored.AliasFor("pi"));
+        Assert.Equal("beacon", window.Bindings.AliasFor("pi"));
+    }
+
+    [Fact]
+    public void AnEditorChangesOnlyTheFieldsAPersonChanged()
+    {
+        var opened = new Bindings { DeviceName = "Laptop", CurrentSite = "flat", IdentityFile = "~/.ssh/one" };
+        var now = opened with { CurrentSite = "office", Self = new SelfBinding("tower", "linux"), LocalAgent = new[] { "node", "/x" } };
+        var saved = opened with { IdentityFile = "~/.ssh/two" };
+        var merged = now.WithChanges(opened, saved);
+        Assert.Equal("~/.ssh/two", merged.IdentityFile);
+        Assert.Equal("office", merged.CurrentSite);
+        Assert.Equal("tower", merged.Self?.Machine);
+        Assert.Equal(new[] { "node", "/x" }, merged.LocalAgent);
+        Assert.Equal("Laptop", merged.DeviceName);
+
+        // Clearing a field is a change too.
+        Assert.Null(now.WithChanges(opened, opened with { CurrentSite = null }).CurrentSite);
+    }
+
+    [Fact]
+    public void BindingsThatCannotBeReadAreSetAsideBeforeTheNextChange()
+    {
+        using var home = new TempHome();
+        File.WriteAllText(Bindings.DefaultPath, "[1, 2, 3]");
+        Assert.Null(Bindings.Load().DeviceName);
+
+        Assert.Null(Bindings.Change(current => current with { DeviceName = "Desk tower" }).Problem);
+        Assert.Equal("Desk tower", Bindings.Load().DeviceName);
+        Assert.Equal("[1, 2, 3]", File.ReadAllText(Assert.Single(SetAside(Bindings.DefaultPath))));
+    }
+
+    [Fact]
+    public void AnOperationsListThatCannotBeReadIsSetAsideNotWrittenOver()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        File.WriteAllText(path, "{\"version\": 1, \"operations\": ");
+
+        var tracker = new OperationTracker(path);
+        Assert.Empty(tracker.All);
+        tracker.Begin("abcdefab-1234-4567-8901-abcdefabcdef", "pi", "linux", new OperationIntent("update", "t3"));
+
+        Assert.Equal("{\"version\": 1, \"operations\": ", File.ReadAllText(Assert.Single(SetAside(path))));
+        Assert.Equal("abcdefab-1234-4567-8901-abcdefabcdef", Assert.Single(new OperationTracker(path).All).Id);
+        // Set aside once, not again on every change after it.
+        tracker.Update(tracker.All[0] with { Phase = "installing" });
+        Assert.Single(SetAside(path));
+    }
+
+    [Fact]
+    public void ASetupFileThatCouldNotBeReadOnceIsReadAgainOnTheNextCheck()
+    {
+        using var home = new TempHome();
+        File.WriteAllBytes(home.ConfigPath, Documents.Make("setup-a", 1, Array.Empty<string>()).Bytes);
+        ConfigStore store;
+        // Held open by something else while the store first looks, as an editor saving it or a
+        // virus scanner reading it can.
+        using (new FileStream(home.ConfigPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            store = new ConfigStore(home.ConfigPath, watch: false);
+            Assert.Null(store.Document);
+        }
+        // Same time, same size: only a store that never took that failed read for a read sees it.
+        store.ReloadIfChanged();
+        Assert.Equal("setup-a", store.Document?.Identity.Id);
+        store.Dispose();
+    }
+
+    [Fact]
+    public void AnOperationsListThatCouldNotBeOpenedOnceIsReadAgainOnTheNextCheck()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        new OperationTracker(path).Begin("abcdefab-1234-4567-8901-abcdefabcdef", "pi", "linux", new OperationIntent("update", "t3"));
+        OperationTracker tracker;
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            tracker = new OperationTracker(path);
+            Assert.Empty(tracker.All);
+        }
+        Assert.True(tracker.ReloadIfChanged());
+        Assert.Single(tracker.All);
+    }
+
+    [Fact]
+    public void AChangeMadeWhileTheOperationsListCannotBeOpenedWaitsRatherThanWriteAwayTheOtherProcesses()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var window = new OperationTracker(path);
+        var (first, _) = window.Begin("op-window-0001", "pi", "linux", new OperationIntent("update", "t3"));
+        // A request the window records, and forgets below because it was never sent.
+        window.Begin("op-window-0003", "pi", "linux", new OperationIntent("restart", "agent"));
+        // The command line records an operation of its own while the window is open.
+        new OperationTracker(path).Begin("op-command-0001", "pi", "linux", new OperationIntent("restart", "t3"));
+
+        // Something else holds the file open while the window changes the list three times.
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            window.Begin("op-window-0002", "pi", "linux", new OperationIntent("update", "agent"));
+            window.Update(first with { Message = "still running" });
+            window.Forget("op-window-0003");
+        }
+        // Nothing was written over what the command line recorded.
+        var meanwhile = new OperationTracker(path);
+        Assert.NotNull(meanwhile.Find("op-command-0001"));
+        Assert.Null(meanwhile.Find("op-window-0002"));
+        Assert.NotNull(meanwhile.Find("op-window-0003"));
+        Assert.Empty(SetAside(path));
+
+        // What the window changed is written once the next check can read the file, beside it,
+        // and what it forgot is not taken back from the file that still held it.
+        Assert.True(window.ReloadIfChanged());
+        Assert.Null(window.Find("op-window-0003"));
+        var after = new OperationTracker(path);
+        Assert.NotNull(after.Find("op-command-0001"));
+        Assert.NotNull(after.Find("op-window-0002"));
+        Assert.Null(after.Find("op-window-0003"));
+        Assert.Equal("still running", after.Find("op-window-0001")!.Message);
+    }
+
+    [Fact]
+    public void AChangeThatWaitedIsWrittenByTheNextCheckAfterAChangeThatHadNothingToWrite()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "operations.json");
+        var window = new OperationTracker(path);
+        window.Begin("op-window-0001", "pi", "linux", new OperationIntent("restart", "agent"));
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            window.Forget("op-window-0001");
+        }
+        // Reads the file, now it opens, and finds no hold to release, so writes nothing.
+        window.ReleaseWakeHolds("pi", DateTimeOffset.UtcNow);
+        Assert.Null(window.Find("op-window-0001"));
+        Assert.NotNull(new OperationTracker(path).Find("op-window-0001"));
+
+        // The file is as the window last read it, and the forgotten request is written away all the same.
+        Assert.True(window.ReloadIfChanged());
+        Assert.Null(new OperationTracker(path).Find("op-window-0001"));
+        Assert.False(window.ReloadIfChanged());
+    }
+
+    [Fact]
+    public void ApprovalsThatCouldNotBeOpenedOnceAreReadAgainAndNeverSetAside()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "approved-launch.json");
+        var document = Documents.Make("setup-a", 1, Array.Empty<string>());
+        Assert.Null(new LaunchApprovals(path).SeedIfMissing(document));
+        var seeded = File.ReadAllText(path);
+
+        LaunchApprovals approvals;
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            approvals = new LaunchApprovals(path);
+            Assert.Null(approvals.Record);
+            // Unread is not unreadable: an approval made now writes nothing and moves nothing aside.
+            Assert.NotNull(approvals.ApproveAll(document));
+        }
+        Assert.Empty(SetAside(path));
+        Assert.Equal(seeded, File.ReadAllText(path));
+        Assert.True(approvals.ReloadIfChanged());
+        Assert.NotNull(approvals.Record);
+    }
+}
