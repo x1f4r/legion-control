@@ -4,15 +4,19 @@ using System.Text.Json.Nodes;
 using Avalonia;
 using Avalonia.Automation;
 using Avalonia.Controls;
+using Avalonia.Controls.Documents;
 using Avalonia.Controls.Primitives;
+using Avalonia.Controls.Selection;
 using Avalonia.Data;
 using Avalonia.Diagnostics;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Layout;
 using Avalonia.LogicalTree;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Model;
 using LegionControl.Desktop.Transport;
@@ -347,8 +351,9 @@ public class LiveTreeTests
     }
 
     /// Every property a value can be set on, styled or attached: each is a public static field of
-    /// the class that registers it. Direct properties are left out, since they hold no value of
-    /// their own for [LiveTree] to carry over.
+    /// the class that registers it. A direct property is not among them. [LiveTree] goes by
+    /// whether a property is set, which a direct one never is, so it carries none of them over, and
+    /// [NotCarried] checks those on their own.
     private static readonly Lazy<IReadOnlyList<AvaloniaProperty>> Properties = new(() => AppDomain.CurrentDomain.GetAssemblies()
         .Where(assembly => !assembly.IsDynamic
             && assembly.GetName().Name is { } name && (name.StartsWith("Avalonia") || name == typeof(Ui).Assembly.GetName().Name))
@@ -360,45 +365,169 @@ public class LiveTreeTests
         .Where(property => !property.IsDirect)
         .Distinct().ToList());
 
-    /// Every property set on a control under [root], or on an item of a menu it holds, with what it
-    /// is set on.
-    private static IEnumerable<(AvaloniaProperty Property, AvaloniaObject Target)> SetUnder(Control root)
+    /// Everything [LiveTree] walks to as it lays a new build over [control]: the control, what it
+    /// merges inside it, the menu it holds, and the menu's items and their headers.
+    private static void Reach(Control control, ICollection<AvaloniaObject> reached)
     {
-        IEnumerable<AvaloniaObject> Items(IEnumerable? items) =>
-            (items?.Cast<object>() ?? Enumerable.Empty<object>()).OfType<MenuItem>().SelectMany(item => Items(item.ItemsSource).Prepend(item));
-        var controls = root.GetLogicalDescendants().OfType<Control>().ToList();
-        var menus = controls.Select(control => control.ContextMenu).OfType<ContextMenu>().ToList();
-        var everything = controls.Cast<AvaloniaObject>()
-            .Concat(menus)
-            .Concat(menus.SelectMany(menu => menu.GetLogicalDescendants().OfType<AvaloniaObject>()))
-            .Concat(menus.SelectMany(menu => Items(menu.ItemsSource)))
-            .Distinct();
-        foreach (var target in everything)
+        reached.Add(control);
+        switch (control)
+        {
+            case Panel panel:
+                foreach (var child in panel.Children) Reach(child, reached);
+                break;
+            case Decorator { Child: { } child }:
+                Reach(child, reached);
+                break;
+            case ContentControl { Content: Control content }:
+                Reach(content, reached);
+                break;
+        }
+        if (control.ContextMenu is { } menu) ReachItems(menu, reached);
+    }
+
+    private static void ReachItems(ItemsControl menu, ICollection<AvaloniaObject> reached)
+    {
+        reached.Add(menu);
+        foreach (var item in (menu.ItemsSource ?? Array.Empty<object>()).OfType<MenuItem>())
+        {
+            if (item.Header is Control header) Reach(header, reached);
+            ReachItems(item, reached);
+        }
+    }
+
+    /// Whether a kept [target] takes [property] from the next build. A menu takes only its items;
+    /// an item what [LiveTree.Synced] lists, its header and its submenu; and any other control what
+    /// [LiveTree.Synced] lists, the key it is matched by, its menu, and the child or content it
+    /// holds if it is a decorator or a content control.
+    private static bool Carried(AvaloniaProperty property, AvaloniaObject target) => target switch
+    {
+        ContextMenu => property == ItemsControl.ItemsSourceProperty,
+        MenuItem => LiveTree.Synced.Contains(property)
+            || property == ItemsControl.ItemsSourceProperty || property == HeaderedSelectingItemsControl.HeaderProperty,
+        _ => LiveTree.Synced.Contains(property) || property == Ui.KeyProperty || property == Control.ContextMenuProperty
+            || (target is ContentControl && property == ContentControl.ContentProperty)
+            || (target is Decorator && property == Decorator.ChildProperty),
+    };
+
+    /// Whether a direct property reads the same on a page as on a control just made: a list, or a
+    /// selection, is the same when it holds the same.
+    private static bool Same(object? shown, object? made) => Equals(shown, made) || (shown, made) switch
+    {
+        (ISelectionModel selection, ISelectionModel other) => selection.SelectedIndexes.SequenceEqual(other.SelectedIndexes),
+        (IEnumerable items, IEnumerable others) => items.Cast<object?>().SequenceEqual(others.Cast<object?>()),
+        _ => false,
+    };
+
+    /// What a kept part of [page], which is shown in a window, would not take from the page's next
+    /// build, one line each. [seen] gathers every property found set, to show what was looked at.
+    private static SortedSet<string> NotCarried(Control page, ISet<AvaloniaProperty>? seen = null)
+    {
+        static string Named(AvaloniaProperty property) => $"{property.OwnerType.Name}.{property.Name}";
+        var found = new SortedSet<string>();
+        var reached = new List<AvaloniaObject>();
+        Reach(page, reached);
+        var known = reached.ToHashSet(ReferenceEqualityComparer.Instance);
+
+        // A control [LiveTree] never reaches keeps what the first build gave it, as the items of a
+        // list or the header of an expander would. What the presenter of a content control makes
+        // of the text it holds comes and goes with the text.
+        foreach (var parent in reached.OfType<Control>())
+            foreach (var control in parent.GetLogicalChildren().OfType<Control>())
+                if (!known.Contains(control) && !(parent is ContentControl { Content: not Control, Presenter: { } presenter } && presenter.Child == control))
+                    found.Add($"{control.GetType().Name} under {parent.GetType().Name} is never reached");
+
+        foreach (var target in reached)
             foreach (var property in Properties.Value)
-                if (target.GetDiagnostic(property).Priority == BindingPriority.LocalValue)
-                    yield return (property, target);
+            {
+                if (target.GetDiagnostic(property).Priority != BindingPriority.LocalValue) continue;
+                seen?.Add(property);
+                if (!Carried(property, target)) found.Add($"{target.GetType().Name} sets {Named(property)}");
+            }
+
+        // [LiveTree] carries no direct property over, so each has to read as it does on a control
+        // just made: one a screen set would keep its first value for good.
+        var made = new Dictionary<Type, AvaloniaObject>();
+        foreach (var target in reached)
+        {
+            if (!made.TryGetValue(target.GetType(), out var fresh))
+                made[target.GetType()] = fresh = (AvaloniaObject)Activator.CreateInstance(target.GetType())!;
+            foreach (var property in AvaloniaPropertyRegistry.Instance.GetRegistered(target.GetType()).Where(property => property.IsDirect && !property.IsReadOnly))
+                if (!Same(target.GetValue(property), fresh.GetValue(property))) found.Add($"{target.GetType().Name} sets {Named(property)}, a direct property");
+        }
+
+        // Text typed, an item picked, a box ticked: what a person gives a control is theirs, and
+        // a refresh would write the build's over it, or, held in a direct property, the first
+        // build's. So on a page only buttons and selectable text take the focus.
+        foreach (var element in page.GetVisualDescendants().OfType<InputElement>().Where(element => element.Focusable))
+        {
+            if (known.Contains(element) && (element.GetType() == typeof(Button) || element.GetType() == typeof(SelectableTextBlock))) continue;
+            found.Add(known.Contains(element) ? $"{element.GetType().Name} can take the focus"
+                : $"{element.GetType().Name} in {element.GetVisualAncestors().First(known.Contains).GetType().Name} can take the focus");
+        }
+        return found;
+    }
+
+    [AvaloniaFact]
+    public void TheCheckFindsWhatAKeptControlWouldNotTakeFromTheNextBuild()
+    {
+        // What the screens are built from, a menu with a disabled item and its explanation
+        // included, is all carried over.
+        var carried = Ui.Column(0);
+        carried.Children.Add(Ui.Keyed(Ui.Actions(
+            Ui.Action("Update", () => { }, enabled: false, explanation: "The agent is too old"),
+            Ui.MenuButton("⋯", new[]
+            {
+                Ui.MenuAction("Restart", () => { }, enabled: false, explanation: "The agent is too old"),
+                new MenuItem { Header = "More", ItemsSource = new[] { Ui.MenuAction("Stop", () => { }, enabled: false, explanation: "Not running") } },
+            }, "t3 actions")), "service:t3"));
+        carried.Children.Add(new Border { Child = new SelectableTextBlock { Text = "node /opt/launcher.mjs" } });
+        carried.Children.Add(Ui.DetailRow("Version", "1.0.0", Ui.Good));
+        var window = new Window { Content = carried, Width = 800, Height = 600 };
+        window.Show();
+        Dispatcher.UIThread.RunJobs();
+        var seen = new HashSet<AvaloniaProperty>();
+        var none = NotCarried(carried, seen);
+        Assert.True(none.Count == 0, string.Join('\n', none));
+        // The header under the disabled items was looked at too.
+        Assert.Contains(Layoutable.MaxWidthProperty, seen);
+
+        // And what a kept control would not take is found: the items and header LiveTree does not
+        // walk into, text in a direct property, and what a person types, picks or ticks.
+        var other = Ui.Column(0);
+        var items = new ItemsControl();
+        items.Items.Add(new TextBlock { Text = "Inside" });
+        other.Children.Add(items);
+        other.Children.Add(new ItemsControl { ItemsSource = new[] { "t3", "web" } });
+        other.Children.Add(new Expander { Header = new TextBlock { Text = "More" }, Content = "Inside" });
+        var rich = new TextBlock();
+        rich.Inlines!.Add(new Run("Running"));
+        other.Children.Add(rich);
+        other.Children.Add(new ListBox { ItemsSource = new[] { "t3", "web" }, SelectedIndex = 1 });
+        other.Children.Add(new TextBox());
+        other.Children.Add(new CheckBox { Content = "Wake first" });
+        window.Content = other;
+        Dispatcher.UIThread.RunJobs();
+        var found = NotCarried(other);
+        window.Close();
+        Assert.Contains("TextBlock under ItemsControl is never reached", found);
+        Assert.Contains("ItemsControl sets ItemsControl.ItemsSource", found);
+        Assert.Contains("TextBlock under Expander is never reached", found);
+        Assert.Contains("Expander sets HeaderedContentControl.Header", found);
+        Assert.Contains("TextBlock sets TextBlock.Inlines, a direct property", found);
+        Assert.Contains("ListBox sets SelectingItemsControl.SelectedIndex, a direct property", found);
+        Assert.Contains("TextBox can take the focus", found);
+        Assert.Contains("CheckBox can take the focus", found);
+        Assert.Contains(found, line => line.EndsWith("in Expander can take the focus"));
     }
 
     [AvaloniaFact]
     public async Task EveryPropertyAScreenSetsIsOneAKeptControlTakesFromTheNextBuild()
     {
-        // What a kept control takes from the next build, and what [LiveTree] matches controls by or
-        // carries over by itself.
-        var handled = LiveTree.Synced.Concat(new AvaloniaProperty[]
-        {
-            Ui.KeyProperty, ContentControl.ContentProperty, Decorator.ChildProperty, Control.ContextMenuProperty,
-            ItemsControl.ItemsSourceProperty, HeaderedSelectingItemsControl.HeaderProperty,
-        }).ToHashSet();
+        // [LiveTree] goes by whether a property is set, which a direct one never is.
+        Assert.DoesNotContain(LiveTree.Synced, property => property.IsDirect);
         var seen = new HashSet<AvaloniaProperty>();
-        var unsynced = new SortedSet<string>();
-        void Check(Control root)
-        {
-            foreach (var (property, target) in SetUnder(root))
-            {
-                seen.Add(property);
-                if (!handled.Contains(property)) unsynced.Add($"{property.OwnerType.Name}.{property.Name} on a {target.GetType().Name}");
-            }
-        }
+        var notCarried = new SortedSet<string>();
+        void Check(Control root) => notCarried.UnionWith(NotCarried(root, seen));
 
         // Every page of the window, wide and narrow, over a full reading, an older agent's, and a
         // machine that does not answer.
@@ -457,7 +586,7 @@ public class LiveTreeTests
         Assert.Contains(TextBlock.TextProperty, seen);
         Assert.Contains(AutomationProperties.HelpTextProperty, seen);
         Assert.Contains(Ui.HandlerProperty, seen);
-        Assert.Empty(unsynced);
+        Assert.True(notCarried.Count == 0, string.Join('\n', notCarried));
     }
 
     private static AppModel Device(TempHome home, IProcessRunner runner)

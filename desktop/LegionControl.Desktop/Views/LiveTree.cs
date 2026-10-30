@@ -24,10 +24,14 @@ namespace LegionControl.Desktop.Views;
 /// matched, so focus on one service's button never ends up on another's.
 public static class LiveTree
 {
-    /// What a kept control takes from the new build: everything the screens set on a control, and
-    /// nothing a control keeps for itself while it is shown. A property a screen sets that is not
-    /// here would keep its first value on a kept control for good, so a test builds every screen
-    /// and fails on any it sets that this does not list.
+    /// What a kept control or menu item takes from the new build: everything the screens set on
+    /// one, and nothing a control keeps for itself while it is shown. A property a screen sets that
+    /// is neither here nor carried by [Merge] itself would keep its first value on a kept control
+    /// for good. So a test builds every screen, walks it as this does, and fails on any such
+    /// property on what it is set on; on a control this never reaches; on any direct property a
+    /// screen sets, since none is carried ([Sync] goes by IsSet, which a direct property never
+    /// is); and on a control a person types, picks or ticks a value in, which a refresh would
+    /// write over.
     public static readonly IReadOnlyList<AvaloniaProperty> Synced = new AvaloniaProperty[]
     {
         Layoutable.MarginProperty, Layoutable.WidthProperty, Layoutable.HeightProperty,
