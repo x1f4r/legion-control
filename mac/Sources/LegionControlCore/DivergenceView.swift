@@ -61,11 +61,17 @@ struct DivergenceView: View {
 
             SectionHeading(title: "Settle it")
 
+            // While a Replace is out the sheet waits for its answer, which closes it or says here
+            // why the copy was not replaced. Taking theirs meanwhile would race it.
+            let replacing = model.replacingSetupOn == divergence.machineId
             FlowRow(spacing: 10) {
                 if divergence.isDifferentSetup {
-                    Button("Replace its copy with mine") { model.replaceSetupOnPeer(divergence) }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(divergence.replaceBlocker != nil)
+                    Button("Replace its copy with mine") {
+                        problem = nil
+                        model.replaceSetupOnPeer(divergence) { problem = $0 }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(divergence.replaceBlocker != nil || replacing)
                 } else {
                     Button("Merge") { apply(choices) }
                         .buttonStyle(.borderedProminent)
@@ -74,6 +80,7 @@ struct DivergenceView: View {
                         .disabled(divergence.mergeBlocker != nil)
                 }
                 Button("Take theirs") { problem = model.takeTheirs(divergence) }
+                    .disabled(replacing)
                 Button("Not now") { model.divergence = nil }
             }
 

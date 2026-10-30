@@ -24,6 +24,9 @@ final class AppModel {
     var dialog: PendingDialog?
     /// The setup disagreement waiting to be settled, when there is one.
     var divergence: SetupDivergence?
+    /// The machine a Replace from the divergence sheet is out to, while it is. The sheet waits for
+    /// it: the reply to a second press could come back after the first one's.
+    private(set) var replacingSetupOn: String?
 
     let config: ConfigStore
     /// This device's own settings, which are never published to anyone.
@@ -348,12 +351,37 @@ final class AppModel {
         }
     }
 
-    func replaceSetupOnPeer(_ divergence: SetupDivergence) {
-        self.divergence = nil
+    /// Replace the peer's different setup with this device's, from the divergence sheet.
+    ///
+    /// The sheet stays up while the request is out and closes on what settles the question: the
+    /// agent took the document, or the question turned out to be out of date, which the device's
+    /// line says and the device's row asks again. A refusal, a push the lock held back and a write
+    /// whose result is unknown leave it open, with `said` hearing why, as every client leaves it.
+    func replaceSetupOnPeer(_ divergence: SetupDivergence, said: @escaping @MainActor (String) -> Void = { _ in }) {
         if let machine = machine(id: divergence.machineId) {
-            machine.replaceSetup(over: divergence.theirsHash, from: divergence.mine.hash)
-        } else if mac?.historyMachineId == divergence.machineId {
-            mac?.replaceSetup(over: divergence.theirsHash, from: divergence.mine.hash)
+            replaceSetup(on: machine, for: divergence, said: said)
+        } else if let mac, mac.historyMachineId == divergence.machineId {
+            replaceSetup(on: mac, for: divergence, said: said)
+        }
+    }
+
+    /// The same, on the device the sheet was raised for, found or given.
+    func replaceSetup(on device: some AgentDevice, for divergence: SetupDivergence,
+                      said: @escaping @MainActor (String) -> Void = { _ in }) {
+        guard replacingSetupOn == nil else { return }
+        replacingSetupOn = divergence.machineId
+        device.replaceSetup(over: divergence.theirsHash, from: divergence.mine.hash) { [weak self] ending in
+            guard let self else { return }
+            self.replacingSetupOn = nil
+            switch ending {
+            case .replaced, .outdated:
+                // Closed only if it is still the sheet on screen: another may have come up meanwhile.
+                if self.divergence?.machineId == divergence.machineId, self.divergence?.theirsHash == divergence.theirsHash {
+                    self.divergence = nil
+                }
+            case .notReplaced(let sentence):
+                said(sentence)
+            }
         }
     }
 

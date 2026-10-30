@@ -10,6 +10,19 @@ enum SetupTaking: Sendable, Equatable {
     case refused(String)
 }
 
+/// What a Replace a person asked for came to, for the question it was asked on.
+enum SetupReplacement: Sendable, Equatable {
+    /// The agent holds this device's document now, and the question is answered.
+    case replaced
+    /// Nothing was sent, because the question is no longer the one either side would ask: it closes,
+    /// the device's line says why, and it is asked again from what both hold now.
+    case outdated(String)
+    /// Not replaced, or not known to be, so the question stays open with this said on it: a refusal,
+    /// a push the lock held back, a write whose result is unknown, or another action holding the
+    /// device.
+    case notReplaced(String)
+}
+
 /// Everything the divergence sheet needs.
 ///
 /// Built only from bytes that hash to what the agent reports and pass section 9.7, after the
@@ -214,85 +227,106 @@ extension AgentDevice {
     /// when it showed none, and `mine` the hash of this device's document it was asked over. Nothing
     /// is sent once either has moved on: `--replace` overwrites whatever the agent holds when it
     /// arrives, and a newer copy nobody here has seen must not go on a decision about an older one.
-    func replaceSetup(over theirs: String?, from mine: String) {
+    ///
+    /// `ended` hears what it came to, once, so the question it was asked on can close or stay.
+    func replaceSetup(over theirs: String?, from mine: String,
+                      then ended: @escaping @MainActor (SetupReplacement) -> Void = { _ in }) {
         // A hand edit of the file that waits for its revision leaves no document here to send, and
         // returning without a word, once the question was answered, looked like a Replace that went.
         guard let local = controllerConfig?() else {
-            setStatus("The setup here changed since that was shown, so nothing was sent.", isError: true)
+            let sentence = "The setup here changed since that was shown, so nothing was sent."
+            setStatus(sentence, isError: true)
+            ended(.outdated(sentence))
             return
         }
         // Asked of the setup as it is now, not only of the one a sheet was built over.
         if let problem = local.replaceBlocker {
             setStatus(problem, isError: true)
+            ended(.notReplaced(problem))
             return
         }
         guard local.hash == mine else {
-            setStatus("The setup here changed since that was shown, so nothing was sent. It is compared again.", isError: true)
+            let sentence = "The setup here changed since that was shown, so nothing was sent. It is compared again."
+            setStatus(sentence, isError: true)
             compareSetupAgain()
+            ended(.outdated(sentence))
             return
         }
         if let holds = status?.controller?.hash, holds != theirs {
             if holds == local.hash {
-                setStatus("Nothing needed sending: \(setupHolder) holds this device's setup already.")
+                let sentence = "Nothing needed sending: \(setupHolder) holds this device's setup already."
+                setStatus(sentence)
+                ended(.outdated(sentence))
             } else {
-                setStatus("Nothing was sent: \(setupHolder) holds another document now, not the one shown. Read it again first.",
-                          isError: true)
+                let sentence = "Nothing was sent: \(setupHolder) holds another document now, not the one shown. Read it again first."
+                setStatus(sentence, isError: true)
+                ended(.outdated(sentence))
             }
             return
         }
         let generation = core.agentGeneration
-        perform("Replacing the setup on \(name)", kind: .shareSetup, subject: "setup") { _ in
-            do {
-                let result = try await self.configSet(local, replace: true)
-                // Decided on the outcome, not on `ok`: a push the lock held back is a later
-                // attempt, not a refusal, and one the agent failed on while it wrote may have
-                // replaced the copy or not.
-                let said = result.error ?? result.message
-                switch Outcome.of(result) {
-                case .succeeded where result.hash == local.hash:
-                    break
-                case .succeeded:
-                    // Done is what every client counts as done, and what an automatic push reads as
-                    // one: a success that names the document sent. One naming another, or none,
-                    // leaves the agent holding something nobody here can vouch for.
-                    let sentence = result.hash == nil
-                        ? "its agent did not say which document it holds now."
-                        : "its agent answered with a document other than the one sent."
-                    self.setStatus("The setup may or may not have been replaced: \(sentence)", isError: true)
-                    return .init(state: .unknown, summary: "The setup on \(self.setupHolder) may or may not have been replaced: \(sentence)",
-                                 refresh: true, unresolved: true)
-                case .deferred:
-                    let sentence = said ?? result.reason?.sentence(subject: "the setup", message: nil) ?? "\(self.name) is busy."
-                    self.setStatus("The setup was not replaced yet: \(sentence)")
-                    return .init(state: .deferred, summary: "The setup on \(self.setupHolder) was not replaced yet. \(sentence)",
-                                 refresh: true)
-                case .unknown, .pending:
-                    let sentence = said ?? "\(self.name) could not say."
-                    self.setStatus("The setup may or may not have been replaced: \(sentence)", isError: true)
-                    return .init(state: .unknown, summary: "The setup on \(self.setupHolder) may or may not have been replaced. \(sentence)",
-                                 refresh: true, unresolved: true)
-                case .failed:
-                    let sentence = said ?? "the agent refused the document."
-                    self.setStatus("The setup was not replaced: \(sentence)", isError: true)
-                    return .init(state: .failed, summary: "The setup on \(self.setupHolder) was not replaced. \(sentence)")
-                }
-                // A push noted against an agent that has since been replaced is not the new one's.
-                if self.core.agentGeneration == generation { self.core.setup.didReplace(with: local.hash) }
-                self.setStatus("Replaced the setup \(self.setupHolder) was holding with this device's.")
-                return .init(state: .succeeded,
-                             summary: "\(self.name) now holds revision \(local.identity.revisionNumber).",
+        let started = perform("Replacing the setup on \(name)", kind: .shareSetup, subject: "setup") { _ in
+            let resolution = await self.sendReplacement(of: local, generation: generation)
+            ended(resolution.state == .succeeded ? .replaced : .notReplaced(resolution.summary))
+            return resolution
+        }
+        if !started {
+            ended(.notReplaced("Nothing was sent while \(name) is busy with another action. Try again once it has finished."))
+        }
+    }
+
+    /// One `config set --replace` of `local`, and what it came to, said on the device's line.
+    private func sendReplacement(of local: ControllerDocument, generation: Int) async -> ActionResolution {
+        do {
+            let result = try await configSet(local, replace: true)
+            // Decided on the outcome, not on `ok`: a push the lock held back is a later attempt,
+            // not a refusal, and one the agent failed on while it wrote may have replaced the copy
+            // or not.
+            let said = result.error ?? result.message
+            switch Outcome.of(result) {
+            case .succeeded where result.hash == local.hash:
+                break
+            case .succeeded:
+                // Done is what every client counts as done, and what an automatic push reads as
+                // one: a success that names the document sent. One naming another, or none, leaves
+                // the agent holding something nobody here can vouch for.
+                let sentence = result.hash == nil
+                    ? "its agent did not say which document it holds now."
+                    : "its agent answered with a document other than the one sent."
+                setStatus("The setup may or may not have been replaced: \(sentence)", isError: true)
+                return .init(state: .unknown, summary: "The setup on \(setupHolder) may or may not have been replaced: \(sentence)",
+                             refresh: true, unresolved: true)
+            case .deferred:
+                let sentence = said ?? result.reason?.sentence(subject: "the setup", message: nil) ?? "\(name) is busy."
+                setStatus("The setup was not replaced yet: \(sentence)")
+                return .init(state: .deferred, summary: "The setup on \(setupHolder) was not replaced yet. \(sentence)",
                              refresh: true)
-            } catch let failure as AgentFailure {
-                return self.reportFailure(failure, verb: "Replacing the setup")
-            } catch let invalid as AgentRequest.Invalid {
-                self.setStatus(invalid.message, isError: true)
-                return .init(state: .failed, summary: invalid.message)
-            } catch {
-                return self.reportFailure(
-                    AgentFailure(.unreadableOutput, detail: error.localizedDescription, dispatch: .unknown),
-                    verb: "Replacing the setup"
-                )
+            case .unknown, .pending:
+                let sentence = said ?? "\(name) could not say."
+                setStatus("The setup may or may not have been replaced: \(sentence)", isError: true)
+                return .init(state: .unknown, summary: "The setup on \(setupHolder) may or may not have been replaced. \(sentence)",
+                             refresh: true, unresolved: true)
+            case .failed:
+                let sentence = said ?? "the agent refused the document."
+                setStatus("The setup was not replaced: \(sentence)", isError: true)
+                return .init(state: .failed, summary: "The setup on \(setupHolder) was not replaced. \(sentence)")
             }
+            // A push noted against an agent that has since been replaced is not the new one's.
+            if core.agentGeneration == generation { core.setup.didReplace(with: local.hash) }
+            setStatus("Replaced the setup \(setupHolder) was holding with this device's.")
+            return .init(state: .succeeded,
+                         summary: "\(name) now holds revision \(local.identity.revisionNumber).",
+                         refresh: true)
+        } catch let failure as AgentFailure {
+            return reportFailure(failure, verb: "Replacing the setup")
+        } catch let invalid as AgentRequest.Invalid {
+            setStatus(invalid.message, isError: true)
+            return .init(state: .failed, summary: invalid.message)
+        } catch {
+            return reportFailure(
+                AgentFailure(.unreadableOutput, detail: error.localizedDescription, dispatch: .unknown),
+                verb: "Replacing the setup"
+            )
         }
     }
 

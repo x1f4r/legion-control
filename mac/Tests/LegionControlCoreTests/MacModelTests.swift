@@ -577,6 +577,72 @@ struct MacModelTests {
         #expect(!store.newestFirst.contains { $0.kind == .shareSetup })
     }
 
+    @Test("the different-setup sheet stays up until a Replace settles it, and says why when it does not")
+    func setupReplacementFromTheSheet() async throws {
+        // The sheet closed before anything was sent, so a refusal, a push the lock held back and a
+        // write nobody can say the end of were said only on a line behind it, and the question the
+        // configuration guide says they leave open was gone.
+        let shown = String(repeating: "a", count: 64)
+        let newer = String(repeating: "b", count: 64)
+        let holding: (String) -> String = { hash in
+            Self.status.replacingOccurrences(of: #""updates":"#, with: #""controller": { "hash": "\#(hash)", "id": "setup-other", "revision": 4 }, "updates":"#)
+        }
+        let runner = FakeRunner()
+        runner.answer("status", json: holding(shown))
+        runner.answer("config", json: String(decoding: try ContractCorpus.data("fixtures/config.set.locked.json"), as: UTF8.self), exit: 1)
+        runner.answer("status", json: holding(shown))
+        runner.answer("config", json: #"{ "ok": true, "contract": 3, "action": "replaced", "hash": "0123456789abcdef" }"#)
+        runner.answer("status", json: holding(Self.document.hash))
+        runner.answer("status", json: holding(newer))
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let home = try AppModelTests.home()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let app = try AppModelTests.app(AppModelTests.twoMachines, in: home)
+        let document = Self.document
+        model.controllerConfig = { document }
+        let divergence = SetupDivergence(machineId: model.historyMachineId, machineName: "This Mac", mine: document,
+                                         theirsBytes: Data("{}\n".utf8), theirsHash: shown,
+                                         theirsIdentity: ControllerIdentity(id: "setup-other", revision: 4, lineage: []),
+                                         baseBytes: nil, differences: [], isDifferentSetup: true, mergeBlocker: nil)
+        var said: [String] = []
+        let replaces = { runner.sent.filter { $0.contains("--replace") }.count }
+        await model.refresh()
+
+        // Held back by the lock: the sheet stays and says so. A second press while the first is out
+        // sends nothing more.
+        app.divergence = divergence
+        app.replaceSetup(on: model, for: divergence) { said.append($0) }
+        #expect(app.replacingSetupOn == model.historyMachineId)
+        app.replaceSetup(on: model, for: divergence) { said.append($0) }
+        await Self.settle(model)
+        #expect(replaces() == 1)
+        #expect(app.replacingSetupOn == nil)
+        #expect(app.divergence != nil)
+        #expect(said.count == 1)
+        #expect(said.first?.contains("was not replaced yet") == true)
+
+        // The agent's latest status names the copy the sheet showed, so `--replace` goes, and the
+        // agent taking the document is what closes the sheet.
+        app.replaceSetup(on: model, for: divergence) { said.append($0) }
+        await Self.settle(model)
+        #expect(replaces() == 2)
+        #expect(app.divergence == nil)
+        #expect(said.count == 1)
+        #expect(model.note == "Replaced the setup the local agent was holding with this device's.")
+
+        // A question out of date closes without sending, the device's line saying why, and the
+        // device's row asks it again from what both hold now.
+        await model.refresh()
+        app.divergence = divergence
+        app.replaceSetup(on: model, for: divergence) { said.append($0) }
+        #expect(app.divergence == nil)
+        #expect(app.replacingSetupOn == nil)
+        #expect(model.note == "Nothing was sent: the local agent holds another document now, not the one shown. Read it again first.")
+        #expect(replaces() == 2)
+        #expect(said.count == 1)
+    }
+
     @Test("a local action that never reached the agent is followed by a fresh read straight away")
     func localNeverDispatchedRereads() async throws {
         // A failure that proves nothing ran asks for no read over ssh. Here the read costs one local
