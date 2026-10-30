@@ -244,16 +244,21 @@ test('cycle children honor live watchdog locks, even with force, and preserve th
   });
 });
 
-test('a watchdog lock whose pid another process holds now is stale, and one without a time is judged as before', async () => {
+test('a watchdog lock whose pid another process holds now is stale, and one without a zoned time is judged as before', async () => {
   const { spawn } = await import('node:child_process');
   const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   await new Promise((resolve) => child.once('spawn', resolve));
   try {
     const taken = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     assert.equal(holderIsStale({ pid: child.pid, started: taken, ageMs: 0 }), true, 'that pid was handed out again after the file was written');
+    const hoursEast = new Date(Date.now() + 60 * 60 * 1000).toISOString().replace(/\.\d+Z$/, '+02:00');
+    assert.equal(holderIsStale({ pid: child.pid, started: hoursEast, ageMs: 0 }), true, 'an hour ago, written two hours east of UTC');
     assert.equal(holderIsStale({ pid: child.pid, started: new Date().toISOString(), ageMs: 0 }), false);
     assert.equal(holderIsStale({ pid: child.pid, ageMs: 0 }), false, 'a file naming no time keeps the pid check alone');
     assert.equal(holderIsStale({ pid: child.pid, started: 'whenever', ageMs: 0 }), false);
+    // A time with no zone could be UTC or local time, and read as the wrong
+    // one it dates a live watchdog's file before its own process.
+    assert.equal(holderIsStale({ pid: child.pid, started: '2000-01-01T00:00:00', ageMs: 0 }), false, 'a time with no zone keeps the pid check alone');
     assert.equal(holderIsStale({ pid: deadPid(), started: new Date().toISOString(), ageMs: 0 }), true);
   } finally {
     child.kill('SIGKILL');

@@ -116,6 +116,9 @@ function describeHolder(holder) {
   return `${what}${on} (${who}${phase})`;
 }
 
+/** An ISO 8601 date and time ending in `Z` or an offset from UTC. */
+const ZONED_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i;
+
 /**
  * Whether a WATCHDOG lock file may be taken over.
  *
@@ -126,11 +129,16 @@ function describeHolder(holder) {
  * A pid is checked against the time the file says it was taken, where it says
  * one: a process that holds that id now and started after it did not take it,
  * and a file it named would otherwise stay held for as long as the id was in
- * use by somebody else.
+ * use by somebody else. Only a time that names its zone counts, the shape this
+ * agent writes. Nothing pins down what the watchdog writes, and a time with no
+ * zone is read as local time: written in UTC on a machine east of it, it would
+ * date a live watchdog's file before its own process started, and the agent
+ * would take the lock from under it. Any other time leaves the pid check alone,
+ * as before there was one.
  */
 export function holderIsStale(holder) {
   if (!holder) return true;
-  if (Number.isInteger(holder.pid)) return !processIsAlive(holder.pid, { startedAt: holder.started ?? null });
+  if (Number.isInteger(holder.pid)) return !processIsAlive(holder.pid, { startedAt: ZONED_TIME.test(holder.started ?? '') ? holder.started : null });
   return holder.ageMs > LEGACY_LOCK_STALE_MS;
 }
 
