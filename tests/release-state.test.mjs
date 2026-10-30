@@ -33,6 +33,17 @@ test('CI is green only when every workflow that ran on the commit last passed', 
   }
 });
 
+test("a run GitHub starts on its own, such as Dependabot's, neither holds a release back nor stands in for CI", () => {
+  const dependabot = (fields) => run({ workflowName: 'Dependabot Updates', event: 'dynamic', ...fields });
+  const checks = run({ event: 'push' });
+  for (const other of [dependabot({ status: 'in_progress', conclusion: '' }), dependabot({ conclusion: 'failure' })]) {
+    assert.deepEqual(ciVerdict([checks, other], SHA), { ok: true, message: `CI passed on ${SHA.slice(0, 12)} (Checks).` });
+  }
+  assert.match(ciVerdict([dependabot({})], SHA).message, /^CI has not run on a{12}\./);
+  // A workflow of the repository's own still counts, whatever started it.
+  assert.match(ciVerdict([checks, run({ workflowName: 'CodeQL', event: 'schedule', conclusion: 'failure' })], SHA).message, /\(CodeQL: failure\)/);
+});
+
 test('a release of the version is none, a draft or published', () => {
   const releases = [{ tagName: 'v1.3.4', isDraft: false }, { tagName: 'v1.4.0', isDraft: true }];
   assert.equal(releaseState(releases, '1.4.0'), 'draft');
