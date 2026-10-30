@@ -94,6 +94,9 @@ test('on Windows doctor reads the base ACL by SID, in every language', () => {
   // The path travels in the environment, never inside the script text.
   assert.equal(asked[0].path, base);
   assert.equal(asked[0].args.join(' ').includes(base), false);
+  // And it reads the list through .NET, so no module has to be found first.
+  assert.match(asked[0].args.at(-1), /\[System\.IO\.Directory\]::GetAccessControl/);
+  assert.equal(asked[0].args.at(-1).includes('Get-Acl'), false);
   const closed = privateFilesCheck({ platform: 'win32', base, run: () => ({ ok: true, stdout: 'O:S-1-5-21-9G:S-1-5-21-9D:P(A;OICI;FA;;;S-1-5-21-9)', stderr: '', error: null }) });
   assert.equal(closed.level, 'ok');
   const failed = privateFilesCheck({ platform: 'win32', base, run: () => ({ ok: false, code: 1, stdout: '', stderr: 'Get-Acl: denied', error: null, command: 'powershell.exe', timedOut: false }) });

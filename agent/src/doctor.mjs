@@ -193,7 +193,13 @@ export function broadAclGroups(sddl) {
  */
 export function privateFilesCheck({ platform = process.platform, base = basePath(), run = runCommand } = {}) {
   if (platform === 'win32') {
-    const acl = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '(Get-Acl -LiteralPath $env:LEGIONCTL_DOCTOR_PATH).Sddl'], {
+    // Read through .NET rather than Get-Acl. A restricted session starts
+    // PowerShell without PSModulePath, and finding Get-Acl then means looking
+    // through every module installed, which on a machine with many of them
+    // outlasts the timeout. The class needs no module at all.
+    const script = '$s = [System.Security.AccessControl.AccessControlSections]::Access; '
+      + '[System.IO.Directory]::GetAccessControl($env:LEGIONCTL_DOCTOR_PATH, $s).GetSecurityDescriptorSddlForm($s)';
+    const acl = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
       timeoutMs: 20000, env: { ...process.env, LEGIONCTL_DOCTOR_PATH: base },
     });
     if (!acl.ok) {
