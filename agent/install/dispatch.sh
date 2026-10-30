@@ -29,7 +29,7 @@ set -eu
 # Installers copy this beside the stable launcher. Keeping the forced command
 # outside the replaceable agent tree means a crash during self-update cannot
 # strand the restricted key at a missing path.
-INSTALL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+INSTALL_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 LAUNCHER="$INSTALL_DIR/legionctl"
 if [ ! -x "$LAUNCHER" ]; then
   printf '{"ok":false,"contract":3,"reasonCode":"internal","message":"the stable agent launcher is not installed at %s"}\n' "$LAUNCHER"
