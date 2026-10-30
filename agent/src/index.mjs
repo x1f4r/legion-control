@@ -44,7 +44,7 @@ import { reportedFloor } from './floor.mjs';
 import { acquireOperationLock } from './lock.mjs';
 import { log, readLogLines } from './log.mjs';
 import { redactReply, restrictedRedactor } from './redact.mjs';
-import { finishUnrunnable } from './operate.mjs';
+import { finishUnrunnable, replayOf } from './operate.mjs';
 import {
   beginOperation,
   cancelOperation,
@@ -439,12 +439,16 @@ function queueTtl(options) {
   return { ok: true, ttlMs: null, expiresAt: resolved.at };
 }
 
-/** The keys a mutating reply carries whatever its outcome, per command. */
-function queuedShape(kind, { service, target, actionId }) {
-  if (kind === 'update') return { service, from: null, to: null };
+/**
+ * The keys a mutating reply carries whatever its outcome, per command, with
+ * what the work reported where it has reported anything: a request that is
+ * only queued has not, and a replay has what its record kept.
+ */
+function commandShape(kind, { service, target, actionId }, result = null) {
+  if (kind === 'update') return { service, from: result?.from ?? null, to: result?.to ?? null };
   if (kind === 'restart') return { service };
-  if (kind === 'boot') return { target, armed: false };
-  if (kind === 'run') return { id: actionId, exitCode: null, output: '' };
+  if (kind === 'boot') return { target, armed: ['armed', 'rebooting', 'rebooted'].includes(result?.action) };
+  if (kind === 'run') return { id: actionId, exitCode: result?.exitCode ?? null, output: result?.output ?? '' };
   return {};
 }
 
@@ -487,26 +491,7 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
   }
   if (queued.replay) {
     const record = queued.record;
-    return mutationReply({
-      ...(record.state === 'finished' ? record.result : record.state === 'queued' ? {
-        ok: true,
-        action: 'queued',
-        message: `this request is already queued as ${record.id}`,
-      } : {
-        ok: true,
-        action: 'already-running',
-        reasonCode: REASON.alreadyRunning,
-        detached: record.detached === true,
-        message: `this request is already running as ${record.id}; it was not started a second time`,
-      }),
-      replayed: true,
-    }, {
-      ...queuedShape(kind, { service, target, actionId }),
-      ...(kind === 'boot' ? { armed: ['armed', 'rebooting', 'rebooted'].includes(record.result?.action) } : {}),
-      ...(kind === 'update' ? { from: record.result?.from ?? null, to: record.result?.to ?? null } : {}),
-      ...(kind === 'run' ? { exitCode: record.result?.exitCode ?? null, output: record.result?.output ?? '' } : {}),
-      op: wireRecord(record),
-    });
+    return mutationReply(replayOf(record), { ...commandShape(kind, { service, target, actionId }, record.result), op: wireRecord(record) });
   }
 
   const what = service ?? target ?? actionId ?? kind;
@@ -516,7 +501,7 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
     message: `${what} will be ${verb} on the next idle cycle, or dropped at ${queued.record.expiresAt}`,
     // Every mutating reply keeps its command's shape, whatever the answer is, so
     // a client decodes one thing per verb rather than one per outcome.
-    ...queuedShape(kind, { service, target, actionId }),
+    ...commandShape(kind, { service, target, actionId }),
     op: wireRecord(queued.record),
     ...(queued.replaced ? { replaced: queued.replaced } : {}),
   });
@@ -624,7 +609,6 @@ async function commandUpdate(config, flags, options) {
     to: result.to ?? null,
     op: result.op ? wireRecord(readOperation(result.opId)) : null,
     ...(result.verified !== undefined ? { verified: result.verified } : {}),
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -644,7 +628,6 @@ async function commandRestart(config, flags, options) {
   return mutationReply(result, {
     service: service.id,
     op: result.opId ? wireRecord(readOperation(result.opId)) : null,
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -672,7 +655,6 @@ async function commandBoot(config, positional, flags, options) {
     target: result.target ?? target ?? null,
     armed: result.armed === true,
     op: result.opId ? wireRecord(readOperation(result.opId)) : null,
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -683,7 +665,6 @@ async function commandSleep(config, flags, options) {
   const result = await runSleep(config, operationOptions(flags, options));
   return mutationReply(result, {
     op: result.opId ? wireRecord(readOperation(result.opId)) : null,
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -712,7 +693,6 @@ async function commandRun(config, positional, flags, options) {
     output: result.output ?? '',
     detached: false,
     op: result.opId ? wireRecord(readOperation(result.opId)) : null,
-    ...(result.replayed ? { replayed: true } : {}),
     ...(result.conflict ? { conflict: result.conflict } : {}),
   });
 }
@@ -1339,13 +1319,13 @@ async function commandSelfUpdate(config, flags, options) {
 /**
  * Open the record, hand it to a detached worker, and answer `accepted`.
  *
- * Every answer keeps the command's own shape (`queuedShape`), whatever it is,
+ * Every answer keeps the command's own shape (`commandShape`), whatever it is,
  * so a client decodes one thing per verb: `--detach` is a way of asking, not a
  * different reply.
  */
 async function detachedRun(config, { kind, service = null, target = null, actionId = null, opId, force, mode }) {
   const id = opId ?? newOperationId();
-  const shape = queuedShape(kind, { service, target, actionId });
+  const shape = commandShape(kind, { service, target, actionId });
   const opened = beginOperation({ id, kind, service, target, actionId, force, mode,
     systemId: config.system.id, detached: true, queueRequested: false });
   // An id already bound to another request is a bad --op (contract section 5.5).
@@ -1357,19 +1337,7 @@ async function detachedRun(config, { kind, service = null, target = null, action
   }
   if (opened.replay) {
     const existing = opened.record;
-    if (existing.state === 'finished') {
-      return mutationReply({ ...existing.result, action: existing.result?.action ?? 'failed' }, {
-        ...shape,
-        ...(kind === 'update' ? { from: existing.result?.from ?? null, to: existing.result?.to ?? null } : {}),
-        ...(kind === 'run' ? { exitCode: existing.result?.exitCode ?? null, output: existing.result?.output ?? '' } : {}),
-        op: wireRecord(existing), replayed: true,
-      });
-    }
-    // Still running: the client follows it exactly as it would `accepted`, and
-    // `accepted` would claim this request started it.
-    return mutationReply({ ok: true, action: 'already-running', reasonCode: REASON.alreadyRunning, detached: existing.detached === true,
-      message: `operation ${id} is already ${existing.state}; it was not started a second time` }, {
-      ...shape, op: wireRecord(existing), replayed: true });
+    return mutationReply(replayOf(existing), { ...commandShape(kind, { service, target, actionId }, existing.result), op: wireRecord(existing) });
   }
 
   updateOperation(id, { launchPendingUntil: new Date(Date.now() + 30000).toISOString() });
@@ -1624,13 +1592,7 @@ async function answer(command, positional, flags, options) {
     } else {
       ran = await runAction(loaded.config, fallback.actionId, shared);
     }
-    return mutationReply(ran, {
-      ...queuedShape(fallback.kind, fallback),
-      ...(fallback.kind === 'update' ? { from: ran.from ?? null, to: ran.to ?? null } : {}),
-      ...(fallback.kind === 'run' ? { exitCode: ran.exitCode ?? null, output: ran.output ?? '' } : {}),
-      detached: false,
-      op: wireRecord(readOperation(fallback.id)),
-    });
+    return mutationReply(ran, { ...commandShape(fallback.kind, fallback, ran), detached: false, op: wireRecord(readOperation(fallback.id)) });
   }
 
   return result;

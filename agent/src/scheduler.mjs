@@ -38,7 +38,6 @@ import { log, note } from './log.mjs';
 import {
   appendLog,
   beginOperation,
-  cancelOperation,
   dueQueue,
   expireQueue,
   finishOperation,
@@ -53,7 +52,7 @@ import {
   summarize,
   updateOperation,
 } from './operations.mjs';
-import { finishUnrunnable, stillAtWork } from './operate.mjs';
+import { finishUnrunnable, replayOf, stillAtWork } from './operate.mjs';
 import { orderServices, scheduledEligibility } from './policy.mjs';
 import { unsettledWork, withOperationContext } from './process-runner.mjs';
 import { busyReasonCode, checkAllBusy } from './probes/busy.mjs';
@@ -415,15 +414,7 @@ export async function runCycle(config, options = {}) {
       children: [],
     };
   }
-  if (opened.replay) {
-    if (opened.record.state === 'finished') {
-      return { ...opened.record.result, children: opened.record.children ?? [], opId: id, op: summarize(opened.record), replayed: true };
-    }
-    return {
-      ok: true, action: 'already-running', reasonCode: REASON.alreadyRunning, opId: id, op: summarize(opened.record), replayed: true,
-      detached: opened.record.detached === true, children: opened.record.children ?? [], message: `cycle ${id} is already ${opened.record.state}; it was not started again`,
-    };
-  }
+  if (opened.replay) return { ...replayOf(opened.record), children: opened.record.children ?? [] };
 
   // A cycle record must carry its children from the moment it exists, because a
   // client can read it while it is still running.

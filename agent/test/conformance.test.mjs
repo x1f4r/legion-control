@@ -349,9 +349,12 @@ test('update conforms through every ending a fixture service can produce', async
     assert.equal(reused.outcome, 'failed');
 
     assert.equal(invoke(home, ['update', '--service', 'nowhere']).reasonCode, 'unknown-service');
-    const queued = invoke(home, ['update', '--when-idle', '--expires', '30m']);
+    const queued = invoke(home, ['update', '--when-idle', '--expires', '30m', '--op', 'conform-queued-0001']);
     assert.equal(queued.outcome, 'pending');
     assert.equal(queued.op.outcome, 'pending');
+    // Asked again while it waits, it is the same request, still queued.
+    const waiting = invoke(home, ['update', '--when-idle', '--expires', '30m', '--op', 'conform-queued-0001']);
+    assert.deepEqual([waiting.action, waiting.replayed, waiting.outcome, waiting.op.id], ['queued', true, 'pending', queued.op.id]);
   });
 
   await withHome(async (home) => {
@@ -851,11 +854,15 @@ test('cycle conforms with a deferred child, as a dry run, and against a lock', a
     const dry = invoke(home, ['cycle', '--dry-run']);
     assert.equal(dry.action, 'skipped', 'a preview is not a cycle that ran');
 
-    const cycled = invoke(home, ['cycle']);
+    const cycled = invoke(home, ['cycle', '--op', 'conform-cycle-0001']);
     assert.equal(cycled.action, 'cycled');
     const deferredChild = cycled.children.find((child) => child.service === 'paused');
     assert.equal(deferredChild.opId, null);
     assert.equal(deferredChild.action, 'deferred');
+    // A cycle asked again with its id answers as it did, and does nothing twice.
+    const again = invoke(home, ['cycle', '--op', 'conform-cycle-0001']);
+    assert.equal(again.replayed, true);
+    assert.deepEqual([again.action, again.outcome, again.children], [cycled.action, cycled.outcome, cycled.children]);
 
     await whileLocked(async () => {
       assert.equal(invoke(home, ['cycle']).action, 'conflict');

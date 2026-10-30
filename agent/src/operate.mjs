@@ -68,6 +68,33 @@ export function stillAtWork(result, unsettled) {
 }
 
 /**
+ * What a mutation answers when its --op id already names a record (contract
+ * section 5.5), whichever way it was asked for: a finished record's own
+ * result, `queued` while it waits for an idle cycle, and `already-running`
+ * while it runs, never `accepted`, which would claim this request started it.
+ * `detached` is copied from the record, so a client follows it exactly as it
+ * follows `accepted`. Every verb and the cycle answer a replay through this,
+ * so they cannot drift apart again.
+ */
+export function replayOf(record) {
+  const replayed = { opId: record.id, op: summarize(record), replayed: true };
+  if (record.state === 'finished') {
+    return { ...record.result, action: record.result?.action ?? 'failed', reasonCode: record.result?.reasonCode ?? null, ...replayed };
+  }
+  if (record.state === 'queued') {
+    return { ok: true, action: 'queued', reasonCode: null, message: `this request is already queued as ${record.id}`, ...replayed };
+  }
+  return {
+    ok: true,
+    action: 'already-running',
+    reasonCode: REASON.alreadyRunning,
+    detached: record.detached === true,
+    message: `operation ${record.id} is already ${record.state}${record.phase ? ` (${record.phase})` : ''}; it was not started a second time`,
+    ...replayed,
+  };
+}
+
+/**
  * Finish a record whose request can no longer be run at all, because the
  * service or action it names was removed from the setup after it was asked
  * for. Whoever takes it up, a cycle or a detached worker, finishes it with
@@ -182,31 +209,7 @@ export async function withOperation(options, body) {
 
     // The same id asked twice. This is the whole point of --op: a client whose
     // link dropped retries, and gets the first answer rather than a second run.
-    if (opened.replay) {
-      const record = opened.record;
-      if (record.state === 'finished') {
-        return {
-          ...record.result,
-          action: record.result?.action ?? 'failed',
-          reasonCode: record.result?.reasonCode ?? null,
-          opId: record.id,
-          op: summarize(record),
-          replayed: true,
-        };
-      }
-      // Still running: the client follows it exactly as it follows `accepted`,
-      // but `accepted` would claim this request started something.
-      return {
-        ok: true,
-        action: 'already-running',
-        reasonCode: REASON.alreadyRunning,
-        opId: record.id,
-        op: summarize(record),
-        replayed: true,
-        detached: record.detached === true,
-        message: `operation ${record.id} is already ${record.state}${record.phase ? ` (${record.phase})` : ''}; it was not started a second time`,
-      };
-    }
+    if (opened.replay) return replayOf(opened.record);
   }
 
   let lock = existingLock;
