@@ -18,6 +18,9 @@ public sealed class AppModel : IDisposable
     private CancellationTokenSource? _polling;
     /// The revisions whose launch review a person put off with "Not now" in this run.
     private readonly HashSet<string> _deferredReviews = new(StringComparer.Ordinal);
+    /// Where ssh writes its own log for each attempt in a run that changes nothing on disk, or
+    /// null for the state directory's.
+    private readonly string? _readOnlySshLogs;
 
     /// [readOnly] makes the stores this builds for itself write nothing at all, for a run that
     /// reads everything and changes nothing on disk, as a smoke run does.
@@ -33,6 +36,10 @@ public sealed class AppModel : IDisposable
         bool readOnly = false)
     {
         _runner = runner ?? new ProcessRunner();
+        // ssh will not start without a file for its own log, and a run that changes nothing on
+        // disk keeps even that out of the state directory: it gets a directory of its own under
+        // the system's temporary one, which goes when the run does.
+        if (readOnly) _readOnlySshLogs = Path.Combine(Path.GetTempPath(), $"legion-control-smoke-{Guid.NewGuid():N}");
         Bindings = bindings ?? Bindings.Load();
         // The record before the document: the first read of the setup can already be an edit made
         // on this device, and that edit approves what it changed.
@@ -126,6 +133,7 @@ public sealed class AppModel : IDisposable
                 var model = new MachineModel(configured, _runner, Tracker, Settings, Bindings)
                 {
                     Presence = Presence,
+                    SshLogDirectory = _readOnlySshLogs,
                 };
                 model.Changed += () => Changed?.Invoke();
                 kept.Add(model);
@@ -555,5 +563,9 @@ public sealed class AppModel : IDisposable
     {
         StopPolling();
         Config.Dispose();
+        if (_readOnlySshLogs is not null)
+        {
+            try { Directory.Delete(_readOnlySshLogs, recursive: true); } catch (Exception) { }
+        }
     }
 }

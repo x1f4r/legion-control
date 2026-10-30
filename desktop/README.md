@@ -49,8 +49,9 @@ An error the command line did not plan for still ends in one of the three: 1 for
 only reads, 2 for one that may have changed something, with the details in the log.
 
 `--smoke` changes nothing on disk: a setup with no controller block is not given one, a first
-start's approvals are evaluated without being recorded, and no wake hold is released. With
-`--json` it prints the JSON report and nothing else.
+start's approvals are evaluated without being recorded, no wake hold is released, and ssh's own log
+for each attempt goes to a directory of the run's own under the system's temporary one, removed
+when the run ends. With `--json` it prints the JSON report and nothing else.
 
 ## Where things live
 

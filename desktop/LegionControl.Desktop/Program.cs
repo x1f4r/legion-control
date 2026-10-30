@@ -31,7 +31,7 @@ internal static class Program
 
         // Every copy holds this until it exits, the window and the command line alike, so an
         // update helper never renames the installation while one runs from it.
-        using var instance = InstanceLock.Share(TimeSpan.FromSeconds(30));
+        using var instance = InstanceLock.ForRun(args);
 
         // A bare verb is part of the documented CLI too. Treat an unknown bare verb as a CLI
         // error rather than quietly opening a window and ignoring it.

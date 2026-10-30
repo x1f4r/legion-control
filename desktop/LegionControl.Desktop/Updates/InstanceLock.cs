@@ -39,7 +39,9 @@ public static class InstanceLock
     /// [patience]. That is an update helper in the middle of a swap, which takes seconds, or a
     /// directory this account cannot write. Either way the app runs without it: refusing to start
     /// over a lock is worse than an update that waits a little less for this copy.
-    public static FileStream? Share(TimeSpan patience, string? path = null)
+    ///
+    /// Without [create], a lock file that is not there yet is not made, and nothing is held.
+    public static FileStream? Share(TimeSpan patience, string? path = null, bool create = true)
     {
         path ??= SharedPath;
         var until = DateTimeOffset.UtcNow + patience;
@@ -47,7 +49,7 @@ public static class InstanceLock
         {
             try
             {
-                return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+                return new FileStream(path, create ? FileMode.OpenOrCreate : FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
             }
             catch (IOException error) when (IsHeldElsewhere(error) && DateTimeOffset.UtcNow < until)
             {
@@ -59,6 +61,11 @@ public static class InstanceLock
             }
         }
     }
+
+    /// The shared lock as a run with [args] takes it. A smoke run changes nothing on disk, so it
+    /// holds the lock only when the file is there already.
+    public static FileStream? ForRun(IReadOnlyList<string> args, string? path = null) =>
+        Share(TimeSpan.FromSeconds(30), path, create: !args.Contains("--smoke"));
 
     /// The window's own lock, held until it is disposed, or null when another window holds it. A
     /// state directory this account cannot write, or one on a disk that is read-only, full or

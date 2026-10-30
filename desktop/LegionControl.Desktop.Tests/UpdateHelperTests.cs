@@ -427,6 +427,25 @@ public class UpdateHelperTests
     }
 
     [Fact]
+    public void ASmokeRunHoldsTheLockOnlyWhenItIsThereAlready()
+    {
+        using var home = new TempHome();
+        var path = Path.Combine(home.Path, "legion-control.lock");
+        using (var smoke = InstanceLock.ForRun(new[] { "--smoke", "--json" }, path))
+        {
+            Assert.Null(smoke);
+            Assert.False(File.Exists(path), "a smoke run makes no lock file");
+        }
+        using (var command = InstanceLock.ForRun(new[] { "--command", "status" }, path))
+        {
+            Assert.NotNull(command);
+            Assert.True(File.Exists(path));
+        }
+        using var again = InstanceLock.ForRun(new[] { "--smoke" }, path);
+        Assert.NotNull(again);
+    }
+
+    [Fact]
     public void OnlyOneWindowOpensOnAStateDirectory()
     {
         using var home = new TempHome();

@@ -43,6 +43,9 @@ public sealed class MachineModel
     /// Where this device is, as far as anything can tell. Set by the app, used for route order and
     /// for whether a magic packet from here could reach this machine.
     public SitePresence Presence { get; set; } = new();
+    /// Where ssh writes its own log for each attempt, when not in the state directory's. Set by
+    /// the app for a run that changes nothing on disk.
+    public string? SshLogDirectory { get; init; }
 
     /// The last complete reading, or null when there has never been one.
     public AgentStatus? Status { get; private set; }
@@ -908,6 +911,7 @@ public sealed class MachineModel
         {
             KnownHostsFile = Bindings.KnownHosts,
             RestrictedSessions = Routes.RestrictedSessions,
+            SshLogDirectory = SshLogDirectory ?? AppPaths.SshLogDirectory,
         };
     }
 

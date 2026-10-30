@@ -46,9 +46,14 @@ public class CommandLineSafetyTests
         }
         """;
 
+    /// Every file under [root] with what it holds, and every directory, as an empty one is
+    /// something a run left behind too.
     private static Dictionary<string, string> Files(string root) =>
         Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
-            .ToDictionary(path => Path.GetRelativePath(root, path), path => Convert.ToHexString(File.ReadAllBytes(path)), StringComparer.Ordinal);
+            .Select(path => KeyValuePair.Create(Path.GetRelativePath(root, path), Convert.ToHexString(File.ReadAllBytes(path))))
+            .Concat(Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories)
+                .Select(path => KeyValuePair.Create(Path.GetRelativePath(root, path) + Path.DirectorySeparatorChar, "directory")))
+            .ToDictionary(StringComparer.Ordinal);
 
     [Fact]
     public async Task ASmokeRunChangesNothingOnDiskAndItsJsonIsOnlyJson()
@@ -61,6 +66,8 @@ public class CommandLineSafetyTests
         try
         {
             var before = Files(home.Path);
+            string[] SmokeLogs() => Directory.GetDirectories(Path.GetTempPath(), "legion-control-smoke-*").Order().ToArray();
+            var smokeLogs = SmokeLogs();
 
             var output = new StringWriter();
             await Runner.RunAsync(new[] { "--smoke" }, output);
@@ -72,8 +79,16 @@ public class CommandLineSafetyTests
             var report = Assert.IsType<JsonArray>(JsonNode.Parse(json.ToString()));
             Assert.Equal("pi", report.Single()!["machine"]!.GetValue<string>());
 
-            // Not stamped, not seeded, nothing recorded as applied or kept, no hold released, no lock.
+            // Not stamped, not seeded, nothing recorded as applied or kept, no hold released, no
+            // lock, and not even a directory for ssh's own log.
             Assert.Equal(before, Files(home.Path));
+            // ssh's log went to a directory of the run's own, and that went with the run.
+            Assert.Equal(smokeLogs, SmokeLogs());
+
+            // ssh was tried all the same: a run that may write makes that directory for its first
+            // attempt.
+            await Runner.RunAsync(new[] { "--command", "status", "--machine", "pi" }, new StringWriter());
+            Assert.True(Directory.Exists(AppPaths.SshLogDirectory));
         }
         finally
         {
