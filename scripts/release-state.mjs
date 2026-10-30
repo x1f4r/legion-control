@@ -21,13 +21,15 @@ const STABLE = /^\d+\.\d+\.\d+$/;
 /**
  * Whether CI passed on `sha`. A workflow that ran on the commit more than once, a re-run or a run
  * for another event, counts by its newest run; every workflow that ran has to have passed, and one
- * at least has to have run.
+ * at least has to have run. A run GitHub starts on its own, with the event `dynamic` (Dependabot's
+ * update jobs, for one), is left out: it checks nothing about the commit, and it may still be going,
+ * or have failed over a registry, long after the checks passed.
  */
 export function ciVerdict(runs, sha) {
   const commit = sha.slice(0, 12);
   const newest = new Map();
   for (const run of Array.isArray(runs) ? runs : []) {
-    if (run?.headSha !== sha) continue;
+    if (run?.headSha !== sha || run.event === 'dynamic') continue;
     const workflow = run.workflowName || run.name || 'an unnamed workflow';
     if (!newest.has(workflow) || String(run.createdAt) > String(newest.get(workflow).createdAt)) newest.set(workflow, run);
   }

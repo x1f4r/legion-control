@@ -411,7 +411,7 @@ if [ "$RESUME" -eq 1 ]; then
 				esac
 			done < <(git -C "$ROOT" diff --name-only "$CUT_FROM" HEAD)
 		fi
-		RUNS="$(gh run list --commit "$CUT_FROM" --limit 100 --json workflowName,headSha,status,conclusion,createdAt)" \
+		RUNS="$(gh run list --commit "$CUT_FROM" --limit 100 --json workflowName,headSha,status,conclusion,createdAt,event)" \
 			|| die "gh could not list the CI runs of $CUT_FROM."
 		CI="$(printf '%s' "$RUNS" | node "$RELEASE_STATE" ci "$CUT_FROM")" || die "$CI"
 		say "$CI"
@@ -550,7 +550,7 @@ else
 fi
 
 if [ "$HAVE_GH" -eq 1 ]; then
-	if RUNS="$(gh run list --commit "$HEAD_SHA" --limit 100 --json workflowName,headSha,status,conclusion,createdAt)"; then
+	if RUNS="$(gh run list --commit "$HEAD_SHA" --limit 100 --json workflowName,headSha,status,conclusion,createdAt,event)"; then
 		if CI="$(printf '%s' "$RUNS" | node "$RELEASE_STATE" ci "$HEAD_SHA")"; then say "$CI"; else refuse "$CI"; fi
 	else
 		refuse "gh could not list the CI runs of $HEAD_SHA."
