@@ -533,8 +533,10 @@ function queueRequest({ kind, service = null, target = null, actionId = null, fl
  *
  * Windows sshd kills the children of a session when the session ends, so a
  * detached spawn there has to go through WMI, which creates the process outside
- * the session's job. If either route fails the work is run synchronously instead
- * and the reply says `detached: false` — a slow answer beats a lost one.
+ * the session's job. Linux can end a session's processes too, so the worker
+ * starts in a scope of the user's systemd manager wherever there is one. If
+ * the launch fails the work is run synchronously instead and the reply says
+ * `detached: false` — a slow answer beats a lost one.
  */
 function detachOperation(record) {
   return spawnDetached({ entry: fileURLToPath(new URL('./index.mjs', import.meta.url)), id: record.id, home: basePath() });
