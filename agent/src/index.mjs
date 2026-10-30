@@ -21,7 +21,7 @@
 
 import { spawnDetached } from './detached.mjs';
 import { fileURLToPath } from 'node:url';
-import { checkWorkerModules } from './selftest-modules.mjs';
+import { checkWorkerModules, importModules, WORKER_ENTRIES } from './selftest-modules.mjs';
 import { loadConfig, readJsonDocument, saveConfig } from './config-store.mjs';
 import { AGENT_METADATA_PROBLEM, AGENT_VERSION, basePath, configPath, isSupportedPlatform, platformName } from './paths.mjs';
 import {
@@ -1373,28 +1373,12 @@ async function commandVersion(flags, loaded) {
     // cannot start is exactly what this catches, while the working agent is
     // still in place — which is why self-update runs it on the staged tree
     // before swapping anything.
-    const modules = [
-      'actions.mjs', 'agent-swap.mjs', 'archive.mjs', 'args.mjs', 'boot.mjs', 'config-schema.mjs', 'config-store.mjs', 'config.mjs',
-      'contract.mjs', 'controller.mjs',
-      'dispatch.mjs', 'doctor.mjs', 'endpoint.mjs', 'floor.mjs', 'http.mjs', 'launch.mjs', 'lock.mjs', 'log.mjs', 'mutex.mjs',
-      'operate.mjs', 'operations.mjs', 'paths.mjs', 'policy.mjs', 'power.mjs', 'probes/busy.mjs',
-      'probes/health.mjs', 'probes/process.mjs', 'probes/relay.mjs', 'probes/t3-sqlite.mjs', 'process-runner.mjs',
-      'providers/app.mjs', 'providers/command.mjs', 'providers/npm.mjs', 'redact.mjs', 'scheduler.mjs',
-      'selfupdate.mjs', 'service.mjs', 'setup-document.mjs', 'state.mjs', 'status.mjs', 'trust.mjs', 'update.mjs',
-    ];
-    const failed = [];
-    let loadedCount = 0;
-    for (const name of modules) {
-      try {
-        await import(`./${name}`);
-        loadedCount += 1;
-      } catch (err) {
-        failed.push(`${name}: ${err.message}`);
-      }
-    }
+    const imported = await importModules();
+    const failed = imported.failed;
+    let loadedCount = imported.loaded;
     const workers = checkWorkerModules(fileURLToPath(new URL('.', import.meta.url)));
     if (!workers.ok) failed.push(`worker modules: ${workers.error}`);
-    else loadedCount += 2;
+    else loadedCount += WORKER_ENTRIES.length;
     // The version every reply carries comes from package.json. A tree that
     // cannot say which version it is must not replace one that can.
     if (AGENT_METADATA_PROBLEM) failed.push(`package.json: ${AGENT_METADATA_PROBLEM}`);
