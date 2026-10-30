@@ -25,6 +25,7 @@ public sealed class MainWindow : Window
     private bool _updatingNavigation;
     private string _page = "machine";
     private bool _rebuildQueued;
+    private bool _closed;
     private readonly StackPanel _updateNotice = Ui.Column(0);
     private readonly CancellationTokenSource _updateLifetime = new();
     private readonly DispatcherTimer _updateTimer = new() { Interval = AppUpdateSuggestions.PeriodicInterval };
@@ -101,9 +102,12 @@ public sealed class MainWindow : Window
         Content = root;
 
         _app.Changed += QueueRebuild;
+        PropertyChanged += (_, change) =>
+        {
+            if (change.Property == IsVisibleProperty || change.Property == WindowStateProperty) FollowVisibility();
+        };
         Opened += (_, _) =>
         {
-            _app.StartPolling();
             SuggestAppUpdate();
             _updateTimer.Start();
             Rebuild();
@@ -112,11 +116,21 @@ public sealed class MainWindow : Window
         _updateTimer.Tick += (_, _) => { if (IsActive) SuggestAppUpdate(); };
         Closed += (_, _) =>
         {
+            _closed = true;
             _updateTimer.Stop();
             _updateLifetime.Cancel();
             _app.Changed -= QueueRebuild;
             _app.StopPolling();
         };
+    }
+
+    /// Polls only while somebody can see the window: never while it is hidden in the tray or
+    /// minimised. Shown again, it reads every machine at once.
+    private void FollowVisibility()
+    {
+        if (_closed) return;
+        if (IsVisible && WindowState != WindowState.Minimized) _app.StartPolling();
+        else _app.PausePolling();
     }
 
     private void QueueRebuild()

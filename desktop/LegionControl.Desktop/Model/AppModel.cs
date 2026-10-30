@@ -16,6 +16,13 @@ public sealed class AppModel : IDisposable
     private readonly IProcessRunner _runner;
     private readonly List<MachineModel> _machines = new();
     private CancellationTokenSource? _polling;
+    /// Guards [_pollingPaused] and [_pollWake], which the window's thread changes while the poll
+    /// reads them on its own.
+    private readonly object _pollGate = new();
+    private bool _pollingPaused;
+    /// Cancelled to end the poll's wait at once, when polling resumes.
+    private CancellationTokenSource _pollWake = new();
+    private readonly TimeSpan? _pollInterval;
     /// The revisions whose launch review a person put off with "Not now" in this run.
     private readonly HashSet<string> _deferredReviews = new(StringComparer.Ordinal);
     /// Where ssh writes its own log for each attempt in a run that changes nothing on disk, or
@@ -23,7 +30,8 @@ public sealed class AppModel : IDisposable
     private readonly string? _readOnlySshLogs;
 
     /// [readOnly] makes the stores this builds for itself write nothing at all, for a run that
-    /// reads everything and changes nothing on disk, as a smoke run does.
+    /// reads everything and changes nothing on disk, as a smoke run does. [pollInterval] replaces
+    /// the one the settings give, for a test that cannot wait five seconds between two readings.
     public AppModel(
         ConfigStore? configStore = null,
         IProcessRunner? runner = null,
@@ -33,9 +41,11 @@ public sealed class AppModel : IDisposable
         Bindings? bindings = null,
         AppUpdateSuggestions? updateSuggestions = null,
         LaunchApprovals? approvals = null,
-        bool readOnly = false)
+        bool readOnly = false,
+        TimeSpan? pollInterval = null)
     {
         _runner = runner ?? new ProcessRunner();
+        _pollInterval = pollInterval;
         // ssh will not start without a file for its own log, and a run that changes nothing on
         // disk keeps even that out of the state directory: it gets a directory of its own under
         // the system's temporary one, which goes when the run does.
@@ -493,47 +503,92 @@ public sealed class AppModel : IDisposable
 
     // MARK: polling
 
-    /// Starts reading the machines on a timer. Only ever called while something is looking: a poll
-    /// nobody sees is a machine woken for nothing, every fifteen seconds, forever.
+    /// How long the poll waits between two readings.
+    public TimeSpan PollInterval => _pollInterval ?? TimeSpan.FromSeconds(Math.Max(5, Settings.PollSeconds));
+
+    /// Whether the machines are being read on the timer now: started, and not paused.
+    public bool IsPolling
+    {
+        get { lock (_pollGate) return _polling is not null && !_pollingPaused; }
+    }
+
+    /// Starts reading the machines on a timer, or resumes a poll that was paused, with a reading
+    /// at once. Only ever called while something is looking: a poll nobody sees is a machine woken
+    /// for nothing, every fifteen seconds, forever.
     public void StartPolling()
     {
-        if (_polling is not null) return;
-        var source = new CancellationTokenSource();
-        _polling = source;
+        CancellationToken token;
+        lock (_pollGate)
+        {
+            if (_polling is not null)
+            {
+                if (!_pollingPaused) return;
+                _pollingPaused = false;
+                _pollWake.Cancel();
+                _pollWake = new CancellationTokenSource();
+                return;
+            }
+            _polling = new CancellationTokenSource();
+            token = _polling.Token;
+        }
         _ = Task.Run(async () =>
         {
-            while (!source.IsCancellationRequested)
+            while (!token.IsCancellationRequested)
             {
+                bool paused;
+                CancellationToken wake;
+                lock (_pollGate) (paused, wake) = (_pollingPaused, _pollWake.Token);
+                if (!paused)
+                {
+                    try
+                    {
+                        await RefreshAllAsync(token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                    catch (Exception)
+                    {
+                        // A poll that threw is a poll that is tried again. Every failure worth
+                        // showing has already been turned into a row on the machine it belongs to.
+                    }
+                }
+                // The interval, or for as long as the pause lasts. Resuming ends either at once.
+                using var wait = CancellationTokenSource.CreateLinkedTokenSource(token, wake);
                 try
                 {
-                    await RefreshAllAsync(source.Token);
+                    await Task.Delay(paused ? Timeout.InfiniteTimeSpan : PollInterval, wait.Token);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (!token.IsCancellationRequested)
                 {
-                    return;
-                }
-                catch (Exception)
-                {
-                    // A poll that threw is a poll that is tried again. Every failure worth showing
-                    // has already been turned into a row on the machine it belongs to.
-                }
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Max(5, Settings.PollSeconds)), source.Token);
                 }
                 catch (OperationCanceledException)
                 {
                     return;
                 }
             }
-        }, source.Token);
+        }, token);
     }
 
+    /// Stops reading the machines on the timer until [StartPolling] is called again, as while the
+    /// window is hidden in the tray or minimised. A reading under way is left to finish: it may be
+    /// settling the setup with a machine, and hiding a window is no reason to cut that off.
+    public void PausePolling()
+    {
+        lock (_pollGate) _pollingPaused = true;
+    }
+
+    /// Ends the poll, and whatever reading it has under way, for good.
     public void StopPolling()
     {
-        _polling?.Cancel();
-        _polling?.Dispose();
-        _polling = null;
+        lock (_pollGate)
+        {
+            _polling?.Cancel();
+            _polling?.Dispose();
+            _polling = null;
+            _pollingPaused = false;
+        }
     }
 
     // MARK: this app's own updates
