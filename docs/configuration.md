@@ -1149,12 +1149,13 @@ copy of the previous bytes, rewrites only the `controller` block to bump the rev
 lineage, and publishes on the next poll. Change the `id` by hand and you have declared a new setup,
 which the machines will ask you about.
 
-A document with no `controller` block at all — a hand-written file, or the pasted example — gets a
-fresh setup id, revision 1 and an empty lineage before anything is applied or published, and the app
-tells you the id it assigned. Put over a setup that is already applied, such a file becomes a setup
-of its own and approves none of the commands it changed: they wait for review on that device (see
-"Commands from the shared setup"). On a device that applies no setup yet, every client takes it as
-the first setup there and approves what it holds, as it would the same text pasted into the editor.
+A document whose `controller` block is missing or has no `id` — a hand-written file, or the pasted
+example — gets a fresh setup id, revision 1 and an empty lineage before anything is applied or
+published, and the app tells you the id it assigned. Put over a setup that is already applied, such
+a file becomes a setup of its own and approves none of the commands it changed: they wait for review
+on that device (see "Commands from the shared setup"). On a device that applies no setup yet, every
+client takes it as the first setup there and approves what it holds, as it would the same text
+pasted into the editor.
 
 ### Commands from the shared setup
 
@@ -1179,11 +1180,11 @@ anywhere in the setup, a value that runs nothing (no argv, no key, the built-in 
 
 What approves, and nothing else does: **Approve** in the review; an edit made on this device, in an
 editor, by pasting, or by hand in the file with its `controller` block kept, for the values it
-changed; a file with no `controller` block written on a device that applies no setup yet, for
-everything it holds; importing a setup into a device that applies none, in the import or fetch flow, after
-showing every launch value it holds; and, once, the first start of a 1.4 client, which records what
-the setup it already applies runs. Fetching automatically, Take theirs, Merge, Keep mine, following
-a different setup and restoring a kept revision approve nothing.
+changed; a file whose `controller` block is missing or has no `id`, written on a device that applies
+no setup yet, for everything it holds; importing a setup into a device that applies none, in the
+import or fetch flow, after showing every launch value it holds; and, once, the first start of a 1.4
+client, which records what the setup it already applies runs. Fetching automatically, Take theirs,
+Merge, Keep mine, following a different setup and restoring a kept revision approve nothing.
 
 The review shows each waiting value beside the one approved at that place, and offers **Approve**,
 **Revert** (an ordinary edit back to the approved value, which reaches the other devices like any

@@ -114,7 +114,8 @@ not, the agent now answers as they say.
   `ok: true`, `replayed: true` and the record's `detached`, never `accepted`.
 - A lock `conflict` answers `ok: true`.
 - A finished record's `result.ok` is true exactly when its `reasonCode` is
-  null. A failed cycle carries the code of its first failed service.
+  null. A failed cycle in which every service's ending is known carries the
+  code of its first failed service.
 - A cycle that ran a service whose ending is unknown (an interrupted update, one
   that ran out of time, or one that may have changed the machine before it
   failed) states `outcome: "unknown"` and takes the reason code of the first
@@ -172,10 +173,10 @@ not, the agent now answers as they say.
   repository for `githubRepo`), or nothing, and a recorded value that could not
   run itself counts as none. Approve, a local edit, enrolment after a summary of
   every launch value, and the first start of a 1.4 client approve; replication
-  never does. A setup file with no `controller` block written on a device that
-  applies no setup yet is a local edit of nothing and approves what it holds;
-  put over an applied setup it approves nothing. The launcher migration under
-  the same base and grammar is accepted without asking.
+  never does. A setup file whose `controller` block is missing or has no `id`,
+  written on a device that applies no setup yet, is a local edit of nothing and
+  approves what it holds; put over an applied setup it approves nothing. The
+  launcher migration under the same base and grammar is accepted without asking.
 - **Command lines and retry safety** (section 15). The grammar is `dispatch`
   when the system is restricted on the route, else its `shell`, else `posix`, or
   `cmd` on Windows; it is never inferred and a line is never retried in another
@@ -247,7 +248,7 @@ not, the agent now answers as they say.
   `wakeTarget`. While a hold exists no non-`wol` helper runs for that target. It
   is released only by a finished record, an answer that the operation is
   unknown, the target answering, the helper leaving the setup, or a person
-  choosing to try the other helpers.
+  taking one of the two ways past it.
 - **Going past a hold** has two forms, the same on every client. Try the other
   helpers asks only the helpers the holds kept back, never a held command again,
   and is offered only while one of them could be asked. With none, Run the held
