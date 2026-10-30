@@ -109,11 +109,28 @@ export function parseCommandLine(line) {
   return { ok: true, tokens, error: null };
 }
 
+/**
+ * A path as the file system names it: through symlinks and, on Windows, with
+ * every 8.3 short name (C:\Users\RUNNER~1) written out in full. Node's portable
+ * realpath leaves short names as they are, so the same file reached through a
+ * short name and a long one would compare unequal, and a forced command whose
+ * client sent the other spelling would be refused. The native call asks the
+ * file system for the final name; a drive that cannot answer it gets the
+ * portable one. Either way it throws for a path that does not exist.
+ */
+function realPath(value) {
+  try {
+    return fs.realpathSync.native(value);
+  } catch {
+    return fs.realpathSync(value);
+  }
+}
+
 /** This agent's own entry point, resolved through symlinks. */
 export function ownEntry() {
   const entry = fileURLToPath(new URL('./index.mjs', import.meta.url));
   try {
-    return fs.realpathSync(entry);
+    return realPath(entry);
   } catch {
     return entry;
   }
@@ -122,13 +139,13 @@ export function ownEntry() {
 /** The stable launcher is an alias for routing, never a requested executable. */
 function stableEntryAlias(entry) {
   try {
-    const resolvedEntry = fs.realpathSync(entry);
+    const resolvedEntry = realPath(entry);
     const agent = path.dirname(path.dirname(resolvedEntry));
     if (path.basename(agent) !== 'agent' || path.basename(path.dirname(resolvedEntry)) !== 'src' || path.basename(resolvedEntry) !== 'index.mjs') return null;
     const base = path.dirname(agent);
     const launcher = path.join(base, 'bin', 'launcher.mjs');
     if (!fs.lstatSync(launcher).isFile()) return null;
-    const resolved = fs.realpathSync(launcher);
+    const resolved = realPath(launcher);
     return path.dirname(resolved) === path.join(base, 'bin') ? resolved : null;
   } catch { return null; }
 }
@@ -255,7 +272,7 @@ export function authorize(commandLine, { entry = ownEntry() } = {}) {
   const interpreter = tokens[0];
   const resolve = (value) => {
     try {
-      return fs.realpathSync(value);
+      return realPath(value);
     } catch {
       return path.resolve(value);
     }
@@ -273,7 +290,7 @@ export function authorize(commandLine, { entry = ownEntry() } = {}) {
   // prefix is validated and discarded; it is never imported or executed.
   let requested;
   try {
-    requested = fs.realpathSync(tokens[1]);
+    requested = realPath(tokens[1]);
   } catch {
     requested = path.resolve(tokens[1]);
   }
