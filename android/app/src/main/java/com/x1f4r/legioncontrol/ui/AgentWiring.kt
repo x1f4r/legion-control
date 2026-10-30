@@ -208,28 +208,17 @@ private class WiredMachineClient(
         operationId: String?,
     ): Result<AgentActionResult> = attempt { wiring.agent.restart(serviceId, request, operationId) }
 
-    override suspend fun setAutoUpdate(
-        on: Boolean,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult> = attempt { wiring.agent.setAutoUpdate(on, serviceId, operationId) }
+    override suspend fun setAutoUpdate(on: Boolean, serviceId: String?): Result<AgentActionResult> =
+        attempt { wiring.agent.setAutoUpdate(on, serviceId) }
 
-    override suspend fun pauseUpdates(
-        duration: String,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult> = attempt { wiring.agent.pauseUpdates(duration, serviceId, operationId) }
+    override suspend fun pauseUpdates(duration: String, serviceId: String?): Result<AgentActionResult> =
+        attempt { wiring.agent.pauseUpdates(duration, serviceId) }
 
-    override suspend fun resumeUpdates(
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult> = attempt { wiring.agent.resumeUpdates(serviceId, operationId) }
+    override suspend fun resumeUpdates(serviceId: String?): Result<AgentActionResult> =
+        attempt { wiring.agent.resumeUpdates(serviceId) }
 
-    override suspend fun writePolicy(
-        patch: PolicyPatch,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult> = attempt { wiring.agent.writePolicy(patch, serviceId, operationId) }
+    override suspend fun writePolicy(patch: PolicyPatch, serviceId: String?): Result<AgentActionResult> =
+        attempt { wiring.agent.writePolicy(patch, serviceId) }
 
     override suspend fun readPolicy(serviceId: String?): Result<AgentActionResult> =
         attempt { wiring.agent.readPolicy(serviceId) }

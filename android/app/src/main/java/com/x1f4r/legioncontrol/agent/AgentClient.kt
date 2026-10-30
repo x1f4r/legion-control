@@ -297,17 +297,18 @@ class AgentClient(
      * On stdin rather than in flags because the patch has three shapes of value in it, one of which
      * is a list of objects, and none of that belongs on a command line under any quoting rules. It
      * is also what lets the restricted dispatcher allow this command at all.
+     *
+     * No `--op`: `policy` and `auto-update` take only `--service` (contract section 4), and an
+     * agent refuses any other flag on them, so these four are never tracked by an id.
      */
     suspend fun writePolicy(
         patch: PolicyPatch,
         serviceId: String? = null,
-        operationId: String? = null,
     ): AgentReply<AgentActionResult> = call(
         buildList {
             add("policy")
             add("set")
             addService(serviceId)
-            addOperationId(operationId)
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
@@ -359,13 +360,11 @@ class AgentClient(
     suspend fun setAutoUpdate(
         enabled: Boolean,
         serviceId: String? = null,
-        operationId: String? = null,
     ): AgentReply<AgentActionResult> = call(
         buildList {
             add("auto-update")
             add(if (enabled) "on" else "off")
             addService(serviceId)
-            addOperationId(operationId)
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),
@@ -376,7 +375,6 @@ class AgentClient(
     suspend fun pauseUpdates(
         duration: String,
         serviceId: String? = null,
-        operationId: String? = null,
     ): AgentReply<AgentActionResult> {
         if (!Contract.isDuration(duration)) refuse("A pause is written like 30m, 4h or 2d, not \"$duration\".")
         return call(
@@ -385,7 +383,6 @@ class AgentClient(
                 add("pause")
                 add(duration)
                 addService(serviceId)
-                addOperationId(operationId)
             },
             SHORT_TIMEOUT_MILLIS,
             AgentActionResult.serializer(),
@@ -395,13 +392,11 @@ class AgentClient(
 
     suspend fun resumeUpdates(
         serviceId: String? = null,
-        operationId: String? = null,
     ): AgentReply<AgentActionResult> = call(
         buildList {
             add("auto-update")
             add("resume")
             addService(serviceId)
-            addOperationId(operationId)
         },
         SHORT_TIMEOUT_MILLIS,
         AgentActionResult.serializer(),

@@ -140,25 +140,14 @@ interface MachineClient {
         operationId: String?,
     ): Result<AgentActionResult>
 
-    suspend fun setAutoUpdate(
-        on: Boolean,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult>
+    // The schedule and policy writes take no operation id: the agent takes none for them.
+    suspend fun setAutoUpdate(on: Boolean, serviceId: String?): Result<AgentActionResult>
 
-    suspend fun pauseUpdates(
-        duration: String,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult>
+    suspend fun pauseUpdates(duration: String, serviceId: String?): Result<AgentActionResult>
 
-    suspend fun resumeUpdates(serviceId: String?, operationId: String?): Result<AgentActionResult>
+    suspend fun resumeUpdates(serviceId: String?): Result<AgentActionResult>
 
-    suspend fun writePolicy(
-        patch: PolicyPatch,
-        serviceId: String?,
-        operationId: String?,
-    ): Result<AgentActionResult>
+    suspend fun writePolicy(patch: PolicyPatch, serviceId: String?): Result<AgentActionResult>
 
     suspend fun readPolicy(serviceId: String?): Result<AgentActionResult>
 

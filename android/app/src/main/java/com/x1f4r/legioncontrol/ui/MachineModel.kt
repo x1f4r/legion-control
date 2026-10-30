@@ -951,8 +951,8 @@ class MachineModel(
             subjectName = serviceId ?: on.name,
             subjectId = serviceId ?: on.id,
             track = false,
-        ) { id ->
-            client.setAutoUpdate(enabled, serviceId, id)
+        ) { _ ->
+            client.setAutoUpdate(enabled, serviceId)
         }
     }
 
@@ -964,8 +964,8 @@ class MachineModel(
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
-        ) { id ->
-            client.pauseUpdates(duration, serviceId, id)
+        ) { _ ->
+            client.pauseUpdates(duration, serviceId)
         }
     }
 
@@ -977,8 +977,8 @@ class MachineModel(
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
-        ) { id ->
-            client.resumeUpdates(serviceId, id)
+        ) { _ ->
+            client.resumeUpdates(serviceId)
         }
     }
 
@@ -990,8 +990,8 @@ class MachineModel(
             subjectName = serviceId ?: machine.name,
             subjectId = serviceId,
             track = false,
-        ) { id ->
-            client.writePolicy(patch, serviceId, id)
+        ) { _ ->
+            client.writePolicy(patch, serviceId)
         }
     }
 
