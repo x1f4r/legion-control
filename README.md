@@ -21,17 +21,20 @@ charge, and a device can be both a thing you control from and a thing you contro
 Four clients, one agent, one contract, and the only thing between them is ssh:
 
     Mac, phone, Linux or Windows desktop      a machine you control (whichever system is up)
-    Legion Control  ──────────ssh──────────▶  node ~/.legion-control/agent/src/index.mjs <command>
+    Legion Control  ──────────ssh──────────▶  node ~/.legion-control/bin/launcher.mjs <command>
        │                                        └─▶ the services on it
        │                                        └─▶ systemd / Task Scheduler / an app bundle
        │                                        └─▶ efibootmgr / bcdedit / grub-reboot
        │
-       └──local──▶ node ~/.legion-control/agent/src/index.mjs <command>
+       └──local──▶ node ~/.legion-control/bin/launcher.mjs <command>
                    └─▶ the services on the device the app is running on
 
 There is no daemon, no open port, no credential store and no polling service. Every action is one
-`ssh <host> <interpreter> <path to index.mjs> <command>` round trip that prints one JSON object and
-exits; every action against the device the app runs on is the same thing without the ssh. Machine
+`ssh <host> <interpreter> <base>/bin/launcher.mjs <command>` round trip that prints one JSON object
+and exits; every action against the device the app runs on is the same thing without the ssh. The
+launcher verifies a signed agent and its version floor before it runs it, and a key
+forced through the restricted dispatcher, `<base>/bin/dispatch.sh` or `dispatch.ps1`, reaches the
+same launcher through it. Machine
 polling stops when its interface closes. App release checks have a separate schedule, described
 below. If ssh works, Legion Control works.
 
@@ -81,7 +84,7 @@ Every command prints exactly one JSON object to stdout and nothing else, includi
 | `doctor`, `bundle` | is this machine set up correctly, and one object to attach to a bug report |
 | `config` | read or replace the stored controller document |
 | `service-config` | administrator-only service and AI tool setup, with validation and a conflict-checked save |
-| `self-update` | replace the agent from a signed bundle, keeping the previous tree |
+| `self-update` | replace the agent from a signed bundle, keeping the previous tree; never below the version floor without `--allow-downgrade` |
 | `version`, `help` | |
 
 Service updates, restarts, configured actions and power operations support `--force` to override
@@ -103,6 +106,13 @@ does not stops and asks, with a per-entry difference and a merge that keeps both
 
 What is true of one device only — which machine it is, its keys, its ssh aliases, which network it
 is sitting on — lives in a separate bindings file that is never shared.
+
+What a device runs with its own key is not taken from the shared copy alone. When a peer changes a
+system's agent command, a machine's key path, the update repository or the Mac's local agent, the
+change applies with the rest of the document but runs on a device only once that device approved
+it; until then the command approved there before keeps running, or nothing does. Each app shows
+what waits beside what it replaces, with Approve and Revert, and the desktop also from its command
+line. `docs/configuration.md` has the rules.
 
 ### Places, and waking things up
 
@@ -150,7 +160,8 @@ but cannot create arbitrary commands. See [the profile reference](docs/configura
 ### Mac (`mac/`)
 
 SwiftUI inside an AppKit window, SwiftPM, Swift 6 language mode. Ad hoc signed, which is enough for
-a locally built app.
+a locally built app. Because releases are ad hoc signed too, macOS may ask for Local Network access
+again after a rebuild or a self-update, and allowing it again is expected.
 
 It lives in the menu bar. Click the icon, with either button, and everything is in the panel under
 it: the state of every machine, Wake / Sleep / Boot into another system, each service's versions,
@@ -238,10 +249,14 @@ cannot write.
     scp -r legion-control <host>:~/
     ssh <host> 'bash ~/legion-control/agent/install/install-linux.sh'
 
-It checks Node, copies the agent to `~/.legion-control/agent`, renders and enables
-`legion-control-update.service` and `legion-control-update.timer` pointing at the maintenance
-cycle, and prints the state. It is safe to re-run, and it rewrites an older scheduler entry that
-still points at the single-service command.
+It checks Node, stages and self-checks the agent before it replaces `~/.legion-control/agent`, puts
+the launchers in `~/.legion-control/bin`, installs `legion-control-update.service` and enables
+`legion-control-update.timer`, which runs that service for each maintenance cycle (the service is
+not enabled on its own), and prints the state. It works under `umask 077` and makes the base `0700`,
+because the base holds every configured command. It is safe to re-run, and it rewrites an older
+scheduler entry that still points at the single-service command. `--uninstall` removes the timer,
+its units, the launchers and the agent and keeps the config and records; `--uninstall --purge`
+removes those too. Neither changes anything while a cycle or an operation is running.
 
 It does not write `config.json`, on purpose: an installer that stamped a fresh config over the top
 would silently flip settings back every time it ran. Copy one from `examples/` and edit it.
@@ -256,12 +271,15 @@ instead of several.
     scp -r legion-control <host>:C:/Users/<user>/
     ssh <host> "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\<user>\legion-control\agent\install\install-windows.ps1"
 
-It copies the agent to `C:\Users\<user>\.legion-control\agent` and creates a scheduled task, "Legion
-Control Update", that runs the maintenance cycle every fifteen minutes as the current user. If a
-task of that name already exists, its action and interval are rewritten and its principal is kept.
-Registering a task that runs as SYSTEM needs elevation; the script writes the task XML either way
-and, when the session is not elevated, prints the exact one line command to paste into an elevated
-PowerShell.
+It gives the base, `C:\Users\<user>\.legion-control`, to your account alone, stages and
+self-checks the agent before it replaces the live one, and creates a scheduled task, "Legion Control
+Update", that runs the maintenance cycle every fifteen minutes as the account installing it, with a
+30 minute time limit. If a task of that name already exists, its action, repetition and time limit
+are rewritten and the rest is left as found, but a task that runs as any other account or a group is
+refused before anything changes. `-AllowSystemPrincipal` keeps a SYSTEM task only from an elevated
+session with node and the base outside every profile; `docs/security.md` gives the terms. At the end
+it says which shell OpenSSH runs commands with, which decides what the setup's `shell` has to say
+for this system. `-Uninstall` and `-Uninstall -Purge` work as on Linux.
 
 Worth knowing: an ssh login as a member of Administrators is elevated on Windows, because OpenSSH
 does not apply UAC filtering to it. That is what lets `bcdedit` succeed over ssh, and it also means
@@ -277,6 +295,12 @@ to `~/.legion-control/agent` and installs the launchd job `com.x1f4r.legion-cont
 runs the maintenance cycle every fifteen minutes, never at login. `--skip-updater`,
 `--updater-only` and `--uninstall-updater` do what they say. Run it as your own user, never under
 sudo.
+
+The release zip, `Legion-Control-macos-arm64.zip`, holds the same ad hoc signed app. Unzip it into
+`/Applications`. The first time, macOS refuses to open an app it cannot check: open it once from
+**System Settings → Privacy & Security → Open Anyway**, or remove the quarantine flag with
+`xattr -dr com.apple.quarantine "/Applications/Legion Control.app"`. Its own updates after that need
+neither.
 
 Then write `~/.config/legion-control/config.json`, or let the app's setup page write the example for
 you.
@@ -390,8 +414,8 @@ Anything else is a `command` target with its own arm and verify.
 
 Arming is always read back and verified before anything reboots. Rebooting an unarmed machine just
 returns to the same system, and reporting that as success would send the apps off waiting for one
-that never appears. A reboot is scheduled three seconds out so the JSON reply can be printed and the
-ssh session can close first.
+that never appears. A reboot is scheduled three seconds out on Linux and Windows, and one minute out
+on macOS (`shutdown -r +1`), so the JSON reply can be printed and the ssh session can close first.
 
 And a reboot that was asked for is not a reboot that happened. Uptime alone proves only that a
 machine rebooted, not that it rebooted because you asked. Where the result cannot be observed, the
@@ -418,9 +442,13 @@ and what to do if the signing key is lost.
     ./scripts/check.sh              # agent, Mac, Android and desktop
     ./scripts/check.sh agent
 
-The same script CI runs. `docs/testing.md` says what each component's checks cover, what a pass
-looks like, and which real-hardware scenarios exist — kept separate from the evidence that they
-were actually run.
+The same script CI runs. Beside the tests, the agent leg checks that every script parses, that no
+file in the checkout holds an invisible or bidirectional character, and that none names a private
+home directory, network or term, because the repository is public. CI adds ShellCheck,
+PSScriptAnalyzer, every component on its own platforms and three release dry runs. `docs/testing.md`
+says what each check covers, what a pass looks like, which manual checks a release needs, and which
+real-hardware scenarios exist — kept separate from the evidence that they were actually run.
+`CONTRIBUTING.md` is the short version for a change.
 
     ./scripts/release.sh 1.3.0            # bump, build, tag, publish
     ./scripts/release.sh 1.3.0 --dry-run  # everything except commit, tag, push and publish
@@ -437,7 +465,13 @@ The assets are `Legion-Control-macos-arm64.zip`, `Legion-Control-android-arm64.a
 `Legion-Control-linux-x64.tar.gz`, `Legion-Control-linux-arm64.tar.gz`,
 `Legion-Control-windows-x64.zip`, the agent tarball, and the
 signed manifest. Each client selects its own asset by exact name. `dist/` holds them on the way out
-and is gitignored.
+and is gitignored. Every build is made with `--require-agent`, so none ships without the signed
+agent bundle.
+
+The Mac releases are cut on keeps the release signing key, the Android release keystore and its
+password, and the private terms of the private-data check under `~/.legion-control`, beside the
+agent. Move them out before running `rm -rf ~/.legion-control` on that Mac; the Mac uninstaller
+names them when they are there.
 
 ## Layout
 
@@ -445,11 +479,18 @@ and is gitignored.
       src/
         index.mjs        command dispatch, argument parsing
         contract.mjs     the wire contract: version, reason codes, states, phases, token grammar
-        config.mjs       strict config loading, validation, paths, the shared process runner
+        paths.mjs        platform, owning home, base dir and file paths, agent version
+        config-schema.mjs  what config.json may say, normalizeConfig
+        config-store.mjs   loading and saving config.json, the last good copy
+        config.mjs       re-exports the three config modules for the release tooling
+        process-runner.mjs the read runners, runMutation, the PowerShell literal, the command ledger
+        selftest-modules.mjs what version --check loads
         state.mjs        locked, atomic per-service state and cache writes
         operations.mjs   operation records, the queue, recovery
         operate.mjs      running one operation through its phases
         lock.mjs         the machine-wide operation lock
+        mutex.mjs        the operating system lock behind it
+        launch.mjs       the launch values a restricted push may not change
         policy.mjs       scheduled eligibility, maintenance windows, service ordering
         scheduler.mjs    the maintenance cycle
         trust.mjs        the release key and signature verification
@@ -460,7 +501,8 @@ and is gitignored.
         update.mjs       the update cycle and the restart
         controller.mjs   the stored controller document, its identity and canonical hash
         log.mjs          the append-only log, rotated at 1 MB
-      install/           platform installers, scheduler units, the restricted dispatcher
+      install/           platform installers, scheduler units, the launchers, the restricted dispatcher
+      scripts/           the agent's own checks
       test/              node:test unit tests
     contract/            schemas, fixtures, hash vectors, canonical form, the release trust key
     mac/                 the Mac app, its installers and its tests
@@ -468,6 +510,8 @@ and is gitignored.
     desktop/             the Avalonia client for Linux and Windows, and its tests
     scripts/
       check.sh           the checks, per component
+      check-private-data.mjs  no private home, network or term in the checkout
+      check-invisible.mjs     no invisible or bidirectional character in it
       release.sh         one command from a version number to a published release
       package-agent.mjs  build and sign the agent bundle
       sign-release.mjs   write and sign the release manifest
