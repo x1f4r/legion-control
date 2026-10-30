@@ -69,6 +69,13 @@ public sealed record AgentCapabilities
     public bool SupportsSetupLineage => SpeaksV3;
     public bool SupportsConfigMeta => SpeaksV3;
 
+    /// Why a control that needs contract 3 is disabled, in a sentence the window shows beside it,
+    /// or null when it is not. A 2.x agent sends no contract number at all, so its version is what
+    /// says it answered.
+    public string? UnsupportedReason => SpeaksV3 ? null
+        : IsUnknown && AgentVersion is null ? "Waits for this machine's agent to answer."
+        : $"Needs agent 3.0 or later; this machine runs {AgentVersion ?? "an older one"}.";
+
     /// Whether `self-update --allow-downgrade` may be sent: only to an agent that reports a version
     /// floor, which every agent that knows the flag does, and never over a restricted key, which the
     /// dispatcher refuses it from. An older agent has no floor to cross and has never heard of the

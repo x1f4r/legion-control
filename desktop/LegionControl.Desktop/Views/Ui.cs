@@ -1,4 +1,5 @@
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -107,6 +108,9 @@ public static class Ui
         Margin = new Thickness(0, 18, 0, 4),
     };
 
+    /// A button. [explanation] says what it does while it can be pressed, in a tooltip, and why it
+    /// cannot be while it is disabled: a disabled control shows no tooltip, so [Actions] then puts
+    /// the reason beside it as text. A screen reader is given it either way.
     public static Button Action(string text, Action handler, bool enabled = true, string? explanation = null, bool primary = false)
     {
         var button = new Button
@@ -117,18 +121,31 @@ public static class Ui
             Padding = new Thickness(10, 4, 10, 4),
         };
         if (primary && enabled) button.Classes.Add("primary");
-        if (explanation is not null) ToolTip.SetTip(button, explanation);
+        if (explanation is not null)
+        {
+            if (enabled) ToolTip.SetTip(button, explanation);
+            AutomationProperties.SetHelpText(button, explanation);
+        }
         button.SetValue(HandlerProperty, handler);
         button.Click += (_, _) => button.GetValue(HandlerProperty)?.Invoke();
         return button;
     }
 
+    /// A row of buttons, each disabled one followed by why, where it has a reason to give.
     public static Panel Actions(params Control?[] controls)
     {
         var panel = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
         foreach (var control in controls)
         {
-            if (control is not null) panel.Children.Add(control);
+            if (control is null) continue;
+            panel.Children.Add(control);
+            if (control is Button { IsEnabled: false } button && AutomationProperties.GetHelpText(button) is { Length: > 0 } reason)
+            {
+                var note = Note(reason);
+                note.VerticalAlignment = VerticalAlignment.Center;
+                note.Margin = new Thickness(0, 0, 12, 6);
+                panel.Children.Add(note);
+            }
         }
         return panel;
     }
@@ -139,12 +156,28 @@ public static class Ui
         Spacing = spacing,
     };
 
+    /// A menu item. [explanation] is a tooltip while it can be chosen; while it cannot, it is a
+    /// second line of the item, since a disabled item shows no tooltip either.
     public static MenuItem MenuAction(string text, Action handler, bool enabled = true, string? explanation = null)
     {
         var item = new MenuItem { Header = text, IsEnabled = enabled };
         item.SetValue(HandlerProperty, handler);
         item.Click += (_, _) => item.GetValue(HandlerProperty)?.Invoke();
-        if (explanation is not null) ToolTip.SetTip(item, explanation);
+        if (explanation is null) return item;
+        AutomationProperties.SetHelpText(item, explanation);
+        if (enabled)
+        {
+            ToolTip.SetTip(item, explanation);
+            return item;
+        }
+        var header = Column(1);
+        header.Children.Add(new TextBlock { Text = text });
+        var reason = Note(explanation);
+        reason.Margin = new Thickness(0);
+        reason.MaxWidth = 320;
+        header.Children.Add(reason);
+        item.Header = header;
+        AutomationProperties.SetName(item, text);
         return item;
     }
 
@@ -156,7 +189,7 @@ public static class Ui
         button.ContextMenu = new ContextMenu { ItemsSource = items.ToArray() };
         // The menu the button holds when pressed, which a rebuild may have brought up to date.
         button.Click += (_, _) => button.ContextMenu?.Open(button);
-        Avalonia.Automation.AutomationProperties.SetName(button, accessibleName);
+        AutomationProperties.SetName(button, accessibleName);
         ToolTip.SetTip(button, accessibleName);
         return button;
     }

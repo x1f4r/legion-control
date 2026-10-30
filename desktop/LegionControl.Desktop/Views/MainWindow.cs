@@ -262,7 +262,7 @@ public sealed class MainWindow : Window
             {
                 var problem = _app.Config.WriteExample();
                 if (problem is not null) Sheets.Text(this, "Could not write it", problem);
-            }, _app.Config.IsMissing)), "empty:actions"));
+            }, _app.Config.IsMissing, _app.Config.IsMissing ? null : "There is a setup document there already.")), "empty:actions"));
     }
 
     private void BuildMachine(MachineModel machine)
@@ -420,10 +420,10 @@ public sealed class MainWindow : Window
             if (service.CanUpdate != false)
             {
                 items.Add(Ui.MenuAction("Update", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id })));
-                items.Add(Ui.MenuAction("Update when idle", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id, WhenIdle = true, Expires = "4h" }), machine.Capabilities.SupportsQueueUntilIdle));
-                items.Add(Ui.MenuAction("Schedule", () => EditPolicy(machine, service.Id), machine.Capabilities.SupportsPolicy));
-                items.Add(Ui.MenuAction("Pause a day", () => Policy(machine, service.Id, PolicyPatch.PauseFor(TimeSpan.FromDays(1))), machine.Capabilities.SupportsPolicy));
-                items.Add(Ui.MenuAction("Resume", () => Policy(machine, service.Id, PolicyPatch.Resume()), machine.Capabilities.SupportsPolicy));
+                items.Add(Ui.MenuAction("Update when idle", () => Request(machine, new MachineRequest { Kind = RequestKind.Update, Service = service.Id, WhenIdle = true, Expires = "4h" }), machine.Capabilities.SupportsQueueUntilIdle, machine.Capabilities.UnsupportedReason));
+                items.Add(Ui.MenuAction("Schedule", () => EditPolicy(machine, service.Id), machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason));
+                items.Add(Ui.MenuAction("Pause a day", () => Policy(machine, service.Id, PolicyPatch.PauseFor(TimeSpan.FromDays(1))), machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason));
+                items.Add(Ui.MenuAction("Resume", () => Policy(machine, service.Id, PolicyPatch.Resume()), machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason));
             }
             if (service.CanRestart == true || service.CanUpdate != false)
                 items.Insert(1, Ui.MenuAction("Restart", () => Request(machine, new MachineRequest { Kind = RequestKind.Restart, Service = service.Id })));
@@ -494,11 +494,12 @@ public sealed class MainWindow : Window
                     new MachineRequest { Kind = RequestKind.Update, Service = id, WhenIdle = true, Expires = "4h" }),
                 machine.Capabilities.SupportsQueueUntilIdle,
                 machine.Capabilities.SupportsQueueUntilIdle ? null : "This agent cannot hold a request until the machine is idle."),
-            Ui.Action("Edit schedule", () => EditPolicy(machine, id), machine.Capabilities.SupportsPolicy),
+            Ui.Action("Edit schedule", () => EditPolicy(machine, id), machine.Capabilities.SupportsPolicy,
+                machine.Capabilities.UnsupportedReason),
             Ui.Action("Pause a day", () => Policy(machine, id, PolicyPatch.PauseFor(TimeSpan.FromDays(1))),
-                machine.Capabilities.SupportsPolicy),
+                machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason),
             Ui.Action("Resume", () => Policy(machine, id, PolicyPatch.Resume()),
-                machine.Capabilities.SupportsPolicy)));
+                machine.Capabilities.SupportsPolicy, machine.Capabilities.UnsupportedReason)));
     }
     private void BuildOperations(MachineModel machine, StackPanel? destination = null, bool includeRecent = false)
     {
@@ -510,9 +511,10 @@ public sealed class MainWindow : Window
             if (id is not null && !seen.Add(id)) return;
             var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,auto"), Margin = new Thickness(0, 2, 0, 2) };
             row.Children.Add(Ui.Note(title + " · " + state));
+            const string noId = "The machine gave this no id to ask it about.";
             var actions = Ui.Actions(
-                queued ? Ui.Action("Cancel", () => Cancel(machine, id!), id is not null) : null,
-                Ui.Action("Details", () => OperationDetails(machine, id!), id is not null));
+                queued ? Ui.Action("Cancel", () => Cancel(machine, id!), id is not null, id is null ? noId : null) : null,
+                Ui.Action("Details", () => OperationDetails(machine, id!), id is not null, id is null ? noId : null));
             actions.Margin = new Thickness(8, 0, 0, 0); Grid.SetColumn(actions, 1); row.Children.Add(actions);
             rows.Children.Add(Ui.Keyed(row, $"operation:{id ?? title}"));
         }
@@ -540,7 +542,8 @@ public sealed class MainWindow : Window
     {
         var section = Ui.Column(2);
         BuildOperations(machine, section, includeRecent: true);
-        section.Children.Add(Ui.Actions(Ui.Action("Operation history", () => History(machine), machine.Capabilities.SupportsHistory)));
+        section.Children.Add(Ui.Actions(Ui.Action("Operation history", () => History(machine), machine.Capabilities.SupportsHistory,
+            machine.Capabilities.UnsupportedReason)));
         Ui.ShowDetails(this, machine.Name + " activity", section);
     }
 
@@ -549,14 +552,16 @@ public sealed class MainWindow : Window
         var status = machine.Status;
         var live = status is not null && machine.Failure is null;
         var boot = (status?.BootTargets ?? Array.Empty<BootTarget>()).Select(target => Ui.MenuAction("Boot into " + target.DisplayName,
-            () => Request(machine, new MachineRequest { Kind = RequestKind.Boot, Target = target.Id }), live && target.Id is not null)).ToArray();
+            () => Request(machine, new MachineRequest { Kind = RequestKind.Boot, Target = target.Id }), live && target.Id is not null,
+            !live ? "Waits for the machine to answer." : target.Id is null ? "The machine gave this system no id to boot it by." : null)).ToArray();
         var items = new List<MenuItem>
         {
             Ui.MenuAction("Device details", () => ShowMachineDetails(machine)),
             Ui.MenuAction("Activity", () => ShowActivity(machine)),
         };
         var configuredActions = (status?.Actions ?? Array.Empty<AgentAction>()).Select(action => Ui.MenuAction(action.DisplayName,
-            () => Request(machine, new MachineRequest { Kind = RequestKind.Run, ActionId = action.Id }), action.Id is not null)).ToList();
+            () => Request(machine, new MachineRequest { Kind = RequestKind.Run, ActionId = action.Id }), action.Id is not null,
+            action.Id is null ? "The machine gave this action no id to run it by." : null)).ToList();
         if (machine.Capabilities.SupportsCycle)
             configuredActions.Add(Ui.MenuAction("Run the cycle", () => Request(machine, new MachineRequest { Kind = RequestKind.Cycle })));
         if (configuredActions.Count > 0) items.Add(new MenuItem { Header = "Actions", ItemsSource = configuredActions });
@@ -581,8 +586,9 @@ public sealed class MainWindow : Window
         }
         var restricted = status?.Agent?.RestrictedSession == true || machine.Machine.Systems.All(system => system.Restricted);
         items.Add(Ui.MenuAction("Service setup", () => EditServices(machine), machine.Capabilities.SpeaksV3 && !restricted,
-            restricted ? "Requires an administrator SSH key" : null));
-        items.Add(Ui.MenuAction("Machine schedule", () => EditPolicy(machine, null), machine.Capabilities.SupportsPolicy));
+            restricted ? "Requires an administrator SSH key" : machine.Capabilities.UnsupportedReason));
+        items.Add(Ui.MenuAction("Machine schedule", () => EditPolicy(machine, null), machine.Capabilities.SupportsPolicy,
+            machine.Capabilities.UnsupportedReason));
         var (bundle, bundleProblem) = AgentBundle.Load();
         if (status is not null && (bundle is null || status.AgentVersion != bundle.Version))
         {
@@ -597,10 +603,10 @@ public sealed class MainWindow : Window
         }
         items.Add(new MenuItem { Header = "Diagnostics", ItemsSource = new[]
         {
-            Ui.MenuAction("Check agent", () => Doctor(machine), machine.Capabilities.SupportsDoctor),
-            Ui.MenuAction("Deep diagnostics", () => Doctor(machine, true), machine.Capabilities.SupportsDoctor),
-            Ui.MenuAction("Recent log", () => Logs(machine), machine.Capabilities.SupportsLogs),
-            Ui.MenuAction("Export diagnostics", () => Bundle(machine), machine.Capabilities.SupportsBundle),
+            Ui.MenuAction("Check agent", () => Doctor(machine), machine.Capabilities.SupportsDoctor, machine.Capabilities.UnsupportedReason),
+            Ui.MenuAction("Deep diagnostics", () => Doctor(machine, true), machine.Capabilities.SupportsDoctor, machine.Capabilities.UnsupportedReason),
+            Ui.MenuAction("Recent log", () => Logs(machine), machine.Capabilities.SupportsLogs, machine.Capabilities.UnsupportedReason),
+            Ui.MenuAction("Export diagnostics", () => Bundle(machine), machine.Capabilities.SupportsBundle, machine.Capabilities.UnsupportedReason),
         }});
         return Ui.Actions(
             live ? Ui.Action("Sleep", () => Request(machine, new MachineRequest { Kind = RequestKind.Sleep }))
