@@ -1109,6 +1109,11 @@ rule is not written, and the app says which rule.
 A different setup on a machine is a different question with two answers: replace that machine's
 copy with yours, or follow its setup here. Replacing is the one place the replace override is ever
 sent, after a preview of what it overwrites, and never from a device whose own setup has an error.
+Every client sends nothing when the machine's latest status names another document than the one
+the preview was built from, or when its own setup changed since, and asks again instead: the
+override takes whatever the machine holds when it arrives. And every client decides on the reply's
+outcome: a refusal, a push the machine's lock held back and a write whose result is unknown each
+leave the question open.
 
 Each device keeps the last thirty documents it has applied, filed by hash, which is what makes the
 three-way merge possible and what lets you look at what the setup used to be.

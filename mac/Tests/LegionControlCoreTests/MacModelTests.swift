@@ -475,19 +475,68 @@ struct MacModelTests {
         model.controllerConfig = { document }
         await model.refresh()
 
-        model.replaceSetup()
+        model.replaceSetup(over: nil, from: document.hash)
         await Self.settle(model)
         let held = try #require(store.newestFirst.first { $0.kind == .shareSetup })
         #expect(held.state == .deferred)
         #expect(held.summary.contains("was not replaced yet"))
         #expect(!model.noteIsError)
 
-        model.replaceSetup()
+        model.replaceSetup(over: nil, from: document.hash)
         await Self.settle(model)
         let unknown = try #require(store.newestFirst.first { $0.kind == .shareSetup })
         #expect(unknown.id != held.id)
         #expect(unknown.state == .unknown)
         #expect(model.note == "The setup may or may not have been replaced: ENOSPC")
+    }
+
+    @Test("a replacement goes only over the copy the question showed, from the setup it was asked over")
+    func setupReplacementOverTheCopyShown() async throws {
+        // The desktop's rule: `--replace` overwrites whatever the agent holds when it arrives, so a
+        // copy written there since the question was drawn, which nobody here has seen, is not sent
+        // over on a decision about the one before it.
+        let shown = String(repeating: "a", count: 64)
+        let newer = String(repeating: "b", count: 64)
+        let holding: (String) -> String = { hash in
+            Self.status.replacingOccurrences(of: #""updates":"#, with: #""controller": { "hash": "\#(hash)", "id": "setup-other", "revision": 4 }, "updates":"#)
+        }
+        let runner = FakeRunner()
+        runner.answer("status", json: holding(shown))
+        runner.answer("status", json: holding(newer))
+        runner.answer("status", json: holding(Self.document.hash))
+        runner.answer("status", json: holding(shown))
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = Self.document
+        model.controllerConfig = { document }
+        var asked: PendingDialog?
+        model.ask = { asked = $0 }
+
+        await model.refresh()
+        model.core.setup.verdict = SetupSync.Verdict(.differentSetup)
+        model.requestSetupReplacement()
+        let question = try #require(asked)
+        await model.refresh()
+        question.perform()
+        await Self.settle(model)
+        #expect(model.note == "Nothing was sent: the local agent holds another document now, not the one shown. Read it again first.")
+        #expect(model.noteIsError)
+
+        await model.refresh()
+        model.replaceSetup(over: shown, from: document.hash)
+        #expect(model.note == "Nothing needed sending: the local agent holds this device's setup already.")
+
+        // And not from a setup here that changed since the question was asked.
+        await model.refresh()
+        var edited = document
+        edited.hash = "fedcba9876543210"
+        model.controllerConfig = { edited }
+        model.replaceSetup(over: shown, from: document.hash)
+        #expect(model.note?.hasPrefix("The setup here changed since that was shown") == true)
+
+        await Self.settle(model)
+        #expect(!runner.sent.contains { $0.contains("--replace") })
+        #expect(!store.newestFirst.contains { $0.kind == .shareSetup })
     }
 
     @Test("a local action that never reached the agent is followed by a fresh read straight away")
@@ -585,7 +634,7 @@ struct MacModelTests {
         #expect(model.noteIsError)
         #expect(model.note?.contains("the helper names no machine") == true)
 
-        model.replaceSetup()
+        model.replaceSetup(over: nil, from: broken.hash)
         await Self.settle(model)
         #expect(!runner.sent.contains { $0.contains("--replace") })
 

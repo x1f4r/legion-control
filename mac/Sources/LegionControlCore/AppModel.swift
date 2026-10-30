@@ -348,9 +348,9 @@ final class AppModel {
     func replaceSetupOnPeer(_ divergence: SetupDivergence) {
         self.divergence = nil
         if let machine = machine(id: divergence.machineId) {
-            machine.replaceSetup()
+            machine.replaceSetup(over: divergence.theirsHash, from: divergence.mine.hash)
         } else if mac?.historyMachineId == divergence.machineId {
-            mac?.replaceSetup()
+            mac?.replaceSetup(over: divergence.theirsHash, from: divergence.mine.hash)
         }
     }
 

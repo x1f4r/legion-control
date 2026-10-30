@@ -191,28 +191,48 @@ extension AgentDevice {
 
     func requestSetupReplacement() {
         guard case .conflict(let reason) = setupSharing else { return }
-        if let problem = controllerConfig?()?.replaceBlocker {
+        guard let local = controllerConfig?() else { return }
+        if let problem = local.replaceBlocker {
             setStatus(problem, isError: true)
             return
         }
+        // The question is about the two documents as they are now, and so is the answer.
+        let shown = status?.controller?.hash
         ask?(PendingDialog(
             id: "replace-setup-\(historyMachineId)",
             title: "Replace the setup \(setupHolder) is holding?",
             message: "\(reason)\n\nReplacing it overwrites the copy the agent has with the document this app is running on.",
             confirmTitle: "Replace it",
-            perform: { [weak self] in self?.replaceSetup() }
+            perform: { [weak self] in self?.replaceSetup(over: shown, from: local.hash) }
         ))
     }
 
     /// Overwrite the agent's copy with this device's, because the user decided to.
     ///
     /// The only place `--replace` is ever sent, and only after a question with both revisions and
-    /// their authors in it.
-    func replaceSetup() {
+    /// their authors in it. `theirs` is the hash of the agent's document the question showed, nil
+    /// when it showed none, and `mine` the hash of this device's document it was asked over. Nothing
+    /// is sent once either has moved on: `--replace` overwrites whatever the agent holds when it
+    /// arrives, and a newer copy nobody here has seen must not go on a decision about an older one.
+    func replaceSetup(over theirs: String?, from mine: String) {
         guard let local = controllerConfig?() else { return }
         // Asked of the setup as it is now, not only of the one a sheet was built over.
         if let problem = local.replaceBlocker {
             setStatus(problem, isError: true)
+            return
+        }
+        guard local.hash == mine else {
+            setStatus("The setup here changed since that was shown, so nothing was sent. It is compared again.", isError: true)
+            compareSetupAgain()
+            return
+        }
+        if let holds = status?.controller?.hash, holds != theirs {
+            if holds == local.hash {
+                setStatus("Nothing needed sending: \(setupHolder) holds this device's setup already.")
+            } else {
+                setStatus("Nothing was sent: \(setupHolder) holds another document now, not the one shown. Read it again first.",
+                          isError: true)
+            }
             return
         }
         let generation = core.agentGeneration
