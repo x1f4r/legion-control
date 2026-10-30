@@ -37,7 +37,7 @@ public static class InstanceLock
                 Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
                 return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
             }
-            catch (IOException) when (DateTimeOffset.UtcNow < until)
+            catch (IOException error) when (IsHeldElsewhere(error) && DateTimeOffset.UtcNow < until)
             {
                 Thread.Sleep(100);
             }
@@ -49,8 +49,9 @@ public static class InstanceLock
     }
 
     /// The window's own lock, held until it is disposed, or null when another window holds it. A
-    /// state directory this account cannot write holds no lock for anyone, so the window then
-    /// opens without one rather than not at all.
+    /// state directory this account cannot write, or one on a disk that is read-only, full or
+    /// failing, holds no lock for anyone, so the window then opens without one rather than not at
+    /// all.
     public static IDisposable? Window(string? path = null)
     {
         path ??= WindowPath;
@@ -59,7 +60,7 @@ public static class InstanceLock
             Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
             return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         }
-        catch (IOException)
+        catch (IOException error) when (IsHeldElsewhere(error))
         {
             return null;
         }
@@ -83,15 +84,7 @@ public static class InstanceLock
             using var held = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
             return false;
         }
-        catch (FileNotFoundException)
-        {
-            return false;
-        }
-        catch (DirectoryNotFoundException)
-        {
-            return false;
-        }
-        catch (IOException)
+        catch (IOException error) when (IsHeldElsewhere(error))
         {
             return true;
         }
@@ -100,4 +93,13 @@ public static class InstanceLock
             return false;
         }
     }
+
+    /// Whether opening a lock failed because another process holds it, rather than for anything
+    /// else. A read-only, full or failing disk fails with an IOException too, and holds no lock
+    /// for anyone: taken for one, it would keep the window shut and every update refused.
+    public static bool IsHeldElsewhere(IOException error) => OperatingSystem.IsWindows()
+        // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION, as an HRESULT.
+        ? error.HResult is unchecked((int)0x80070020) or unchecked((int)0x80070021)
+        // EWOULDBLOCK from the flock .NET takes for a FileShare, which it gives as the error.
+        : error.HResult == (OperatingSystem.IsLinux() ? 11 : 35);
 }

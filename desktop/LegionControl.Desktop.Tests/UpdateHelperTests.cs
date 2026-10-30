@@ -403,7 +403,8 @@ public class UpdateHelperTests
         Assert.NotNull(window);
         Assert.NotNull(commandLine);
         // What the update helper asks for, and cannot have while either runs.
-        Assert.Throws<IOException>(() => new FileStream(InstanceLock.SharedPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
+        var refused = Assert.ThrowsAny<IOException>(() => new FileStream(InstanceLock.SharedPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
+        Assert.True(InstanceLock.IsHeldElsewhere(refused));
     }
 
     [Fact]
@@ -420,6 +421,27 @@ public class UpdateHelperTests
         Assert.False(InstanceLock.IsWindowOpen());
         using var again = InstanceLock.Window();
         Assert.NotNull(again);
+    }
+
+    [Fact]
+    public void AStateDirectoryThatCannotHoldALockIsNoWindowHoldingIt()
+    {
+        using var home = new TempHome();
+        // A state directory that is a file: opening anything in it fails, and not because a
+        // window holds it, as on a disk that is read-only, full or failing.
+        var notADirectory = home.Write("state", "");
+        var path = Path.Combine(notADirectory, "window.lock");
+        Assert.False(InstanceLock.IsWindowOpen(path));
+        using var window = InstanceLock.Window(path);
+        Assert.NotNull(window);
+        // Nor is it waited for as if an update helper held it.
+        var clock = Stopwatch.StartNew();
+        Assert.Null(InstanceLock.Share(TimeSpan.FromSeconds(30), Path.Combine(notADirectory, "legion-control.lock")));
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(10), $"given up after {clock.Elapsed}");
+
+        Assert.False(InstanceLock.IsHeldElsewhere(new IOException("Read-only file system", 30)));
+        Assert.False(InstanceLock.IsHeldElsewhere(new IOException("No space left on device", 28)));
+        Assert.False(InstanceLock.IsHeldElsewhere(new FileNotFoundException()));
     }
 
     private static void SetMode(string path, UnixFileMode mode)
