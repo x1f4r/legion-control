@@ -273,8 +273,9 @@ bootstrap is limited to recognized layouts or an explicitly supplied `--base` di
 
 The window checks at startup and when it becomes active, with a fifteen-minute throttle. A timer
 also checks every six hours while the window is active; an unfocused window catches up when
-activated, and one hidden in the tray checks nothing until it is shown. Quitting stops this timer. The local `checkForAppUpdates` preference in
-`desktop-settings.json` defaults to `true`; a manual check is always available in **This device**.
+activated, and one hidden in the tray checks nothing until it is shown. Quitting stops this timer.
+The local `checkForAppUpdates` preference in `desktop-settings.json` defaults to `true`; a manual
+check is always available in **This device**.
 
 An available release appears above machine navigation as **Review update**, so it remains reachable
 while scrolling or switching machines. A transient failure keeps the previous verified offer
