@@ -111,7 +111,7 @@ export function parseCommandLine(line) {
 
 /**
  * A path as the file system names it: through symlinks and, on Windows, with
- * every 8.3 short name (C:\Users\RUNNER~1) written out in full. Node's portable
+ * every 8.3 short name (PROGRA~1 for Program Files) written out in full. Node's portable
  * realpath leaves short names as they are, so the same file reached through a
  * short name and a long one would compare unequal, and a forced command whose
  * client sent the other spelling would be refused. The native call asks the
