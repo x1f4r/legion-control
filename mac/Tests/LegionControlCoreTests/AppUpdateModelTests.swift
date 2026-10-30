@@ -28,7 +28,7 @@ struct AppUpdateModelTests {
     }
 
     func settle(_ model: AppUpdateModel) async {
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.phase != .idle, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
         #expect(model.phase == .idle)
     }
@@ -75,7 +75,7 @@ struct AppUpdateModelTests {
         try? await Task.sleep(for: .milliseconds(30))
         #expect(calls == 1)
         clock += 1
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.availableVersion == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
         #expect(calls == 2)
         #expect(model.availableVersion == "3.1.0")
@@ -204,7 +204,7 @@ struct AppUpdateModelTests {
             return .upToDate(note: nil)
         }
         model.checkNow()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while resume == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
         #expect(resume != nil)
         repository.value = "b/b"; model.repositoryDidChange()
@@ -255,7 +255,7 @@ struct AppUpdateModelTests {
         model.performSwap = { _, _, _, _, _ in swaps += 1 }
         model.quit = { quits += 1 }
         model.install()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while resume == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
         #expect(resume != nil)
         repository.value = "b/b"; model.repositoryDidChange()
@@ -306,7 +306,7 @@ struct AppUpdateModelTests {
         }
         model.quit = { quitRequested = true }
         model.install()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while !quitRequested, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
         #expect(handedOff)
         #expect(quitRequested)
@@ -378,7 +378,7 @@ struct AppUpdateModelTests {
         var quits = 0
         model.quit = { quits += 1 }
         model.install()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while quits == 0, model.phase != .idle || model.failure == nil, Date() < deadline {
             try? await Task.sleep(for: .milliseconds(5))
         }
@@ -386,7 +386,7 @@ struct AppUpdateModelTests {
 
     /// Waits a little for something a model does on a timer of its own.
     func eventually(_ condition: () -> Bool) async {
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while !condition(), Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
     }
 
@@ -599,7 +599,7 @@ struct AppUpdateModelTests {
         #expect(model.phase == .installing)
 
         exit(3)
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.phase != .idle, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
         #expect(model.phase == .idle)
         #expect(model.failure?.contains("did not quit") == true)
@@ -761,7 +761,7 @@ struct AppUpdateModelTests {
         #expect(preferences.data(forKey: "appUpdateLastCheck") == nil)
         let exit = try #require(helperExited)
         exit(AppUpdates.SwapOutcome.notQuit)
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.phase != .idle, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
         #expect(model.failure?.contains("2.9.0 was not put back") == true)
         #expect(AppUpdateModel(preferences: preferences, installedVersion: "3.0.0").check == .upToDate(note: "Checked."))

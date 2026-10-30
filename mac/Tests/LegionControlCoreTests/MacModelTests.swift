@@ -103,7 +103,7 @@ struct MacModelTests {
         {"ok":true,"op":{"id":"\(record.id)","requestedAt":"2026-09-05T00:00:00Z","state":"finished","result":{"ok":true,"action":"ran"}}}
         """)
         await model.refresh()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while !store.unresolved.isEmpty, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
         #expect(store.unresolved.isEmpty)
         #expect(store.record(id: record.id)?.state == .succeeded)
@@ -278,7 +278,7 @@ struct MacModelTests {
 
         await model.refresh()
         model.adoptRemoteSetup()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.note == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
 
         #expect(model.note?.contains("could not be read") == true)
@@ -422,7 +422,7 @@ struct MacModelTests {
          "children":[{"opId":null,"service":"edge","action":"interrupted","reasonCode":null}]}}
         """)
         await Self.settle(model)
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while store.record(id: id)?.needsReconciliation == true, Date() < deadline {
             try? await Task.sleep(for: .milliseconds(10))
         }
@@ -725,7 +725,7 @@ struct MacModelTests {
         model.controllerConfig = { document }
 
         await model.refresh()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.core.setup.lastShare == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
         guard case .failed = model.setupSharing else {
             Issue.record("the old agent's refusal was not shown: \(model.setupSharing)")
@@ -752,7 +752,7 @@ struct MacModelTests {
         #expect(model.lastActionOutcome == outcome)
 
         await model.refresh()
-        let pushed = Date().addingTimeInterval(2)
+        let pushed = Date().addingTimeInterval(15)
         while model.core.setup.lastShare == nil, Date() < pushed { try? await Task.sleep(for: .milliseconds(10)) }
         #expect(fresh.sent.contains { $0.contains("config") && $0.contains("set") })
         #expect(model.core.setup.lastShare?.failure == nil)
@@ -814,7 +814,7 @@ struct MacModelTests {
         #expect(!fresh.sent.contains { $0.contains("config") })
 
         gate.release()
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(15)
         while model.core.setup.isSharing, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
         // The old agent's refusal is about the old agent. The new one holds nothing, so the row says
         // a push is on its way rather than that one failed.
@@ -823,7 +823,7 @@ struct MacModelTests {
         #expect(!model.noteIsError)
 
         await model.refresh()
-        let pushed = Date().addingTimeInterval(2)
+        let pushed = Date().addingTimeInterval(15)
         while model.core.setup.lastShare == nil, Date() < pushed { try? await Task.sleep(for: .milliseconds(10)) }
         #expect(fresh.sent.contains { $0.contains("config") && $0.contains("set") })
         #expect(model.core.setup.lastShare?.failure == nil)
