@@ -161,6 +161,33 @@ test('an update whose state could not be saved after it ran is unknown', { skip:
   });
 });
 
+test('a cycle with a service nobody can say the end of is unknown, and counts it apart from the failures', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const state = path.join(home, 'state');
+    // The same update as above, which ran but could not be written down: its
+    // record is failed with internal and states unknown, while a child on the
+    // wire carries only failed and internal, which reduce to failed.
+    const update = [process.execPath, '-e', [
+      `const fs = require('node:fs');`,
+      `fs.writeFileSync(${JSON.stringify(path.join(dir, 'installed'))}, '2.0.0');`,
+      `fs.chmodSync(${JSON.stringify(state)}, 0o500);`,
+    ].join(' ')];
+    writeConfig(home, fixtureConfig(dir, { services: [commandService(dir, { update })] }));
+    try {
+      const { payload, exitCode } = cli(['cycle'], { home });
+      assert.equal(payload.action, 'failed', JSON.stringify(payload));
+      assert.equal(payload.outcome, 'unknown', 'a cycle that may have updated a service must not read as failed or as done');
+      assert.equal(payload.op.outcome, 'unknown');
+      assert.deepEqual(payload.children.map((child) => [child.action, child.reasonCode]), [['failed', 'internal']]);
+      assert.match(payload.message, /0 updated, 0 left alone, 0 failed, 1 may or may not have updated/);
+      assert.equal(exitCode, 1);
+    } finally {
+      fs.chmodSync(state, 0o700);
+    }
+  });
+});
+
 test('the reducer copy here and the reference have the same tables', async () => {
   const reference = await import(new URL('../../contract/tools/outcome.mjs', import.meta.url).href);
   const { OK_REPLY_ACTIONS } = await import('../src/contract.mjs');

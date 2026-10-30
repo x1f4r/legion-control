@@ -32,7 +32,7 @@
 // what does not fit waits for the next cycle, a quarter of an hour later,
 // rather than being cut off half way.
 
-import { REASON } from './contract.mjs';
+import { producedOutcome, REASON } from './contract.mjs';
 import { acquireOperationLock, acquireServiceLock, clearStaleLocks } from './lock.mjs';
 import { log, note } from './log.mjs';
 import {
@@ -527,6 +527,9 @@ export async function runCycle(config, options = {}) {
         message: result.message,
         from: result.from ?? null,
         to: result.to ?? null,
+        // Kept for the cycle's own ending and never sent: a child on the wire
+        // has only its action and reason code.
+        outcome: result.outcome ?? null,
       });
     }
 
@@ -544,12 +547,17 @@ export async function runCycle(config, options = {}) {
       })),
     });
 
-    const failed = report.children.filter((child) => child.action === 'failed');
+    // A service whose ending nobody can say (an interrupted update, one that
+    // ran out of time, or one that may have changed the machine before it
+    // failed) is counted apart from the ones that failed and left it as it was.
+    const uncertain = report.children.filter((child) => producedOutcome(child) === 'unknown');
+    const failed = report.children.filter((child) => child.action === 'failed' && !uncertain.includes(child));
     const updated = report.children.filter((child) => child.action === 'updated');
+    const unclear = uncertain.length > 0 ? `, ${uncertain.length} may or may not have updated` : '';
     const walked =
       report.children.length === 0
         ? 'no services on this machine are eligible for a scheduled update'
-        : `${updated.length} updated, ${report.children.length - updated.length - failed.length} left alone, ${failed.length} failed`;
+        : `${updated.length} updated, ${report.children.length - updated.length - failed.length - uncertain.length} left alone, ${failed.length} failed${unclear}`;
     // A service recovery could not put back is named in the cycle's own answer
     // too, which is what a client shows, with what it is waiting for.
     const owed = report.recovery.restored.filter((entry) => entry.settled === false);
@@ -557,13 +565,18 @@ export async function runCycle(config, options = {}) {
 
     // A failed cycle says why with the reason of the first service that failed,
     // so it is never the failure with no code that contract 3 exists to remove.
-    // And a cycle whose own recovery left a start command that could not be
-    // seen to stop ends as any operation does in that case (operate.mjs).
+    // A service nobody can say the end of makes the whole cycle unknown, the
+    // one move a producer may make from failed (section 5.6), so no client
+    // reads it as done or as safe to send again. And a cycle whose own
+    // recovery left a start command that could not be seen to stop ends as
+    // any operation does in that case (operate.mjs).
+    const first = failed[0] ?? uncertain[0] ?? null;
     const concluded = {
-      ok: failed.length === 0,
-      action: failed.length === 0 ? 'cycled' : 'failed',
-      reasonCode: failed.length === 0 ? null : failed[0].reasonCode ?? REASON.internal,
+      ok: first === null,
+      action: first === null ? 'cycled' : 'failed',
+      reasonCode: first === null ? null : first.reasonCode ?? (failed.length > 0 ? REASON.internal : REASON.interrupted),
       message,
+      ...(uncertain.length > 0 ? { outcome: 'unknown' } : {}),
     };
     const ownUnsettled = await unsettledWork({ opId: id });
     const ending = ownUnsettled ? stillAtWork(concluded, ownUnsettled) : concluded;
