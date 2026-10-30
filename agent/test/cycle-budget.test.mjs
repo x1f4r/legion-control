@@ -10,7 +10,7 @@ import { beginOperation, queueOperation, readOperation, updateOperation } from '
 import { CYCLE_BUDGET_MS, cycleBudget, runCycle, SCHEDULER_LIMIT_MS } from '../src/scheduler.mjs';
 import { serviceState } from '../src/state.mjs';
 import { recoveryWorstCaseMs, restartWorstCaseMs, runUpdate, updateWorstCaseMs } from '../src/update.mjs';
-import { commandService, deadPid, fixtureConfig, fixtureData, npmService, readFixture, REPO, withHome, writeConfig } from './helpers.mjs';
+import { commandService, deadPid, fixtureConfig, fixtureData, npmService, readFixture, REPO, withHome, writeConfig, writeFixture } from './helpers.mjs';
 
 const minute = 60 * 1000;
 
@@ -61,21 +61,44 @@ test('the budget says what waits and why, and lets through what fits', () => {
   assert.match(spent.refuses(1, 'the restart of Demo'), /this cycle has no time left/);
 });
 
-test('a cycle without the time for an update does not begin it, and the next one does', async () => {
+test('a cycle without the time for an update stops it short of its drain, and the next one runs it', async () => {
   await withHome(async (home) => {
     const dir = fixtureData(home, { latest: '2.0.0' });
     const config = configured(home, fixtureConfig(dir));
 
     const short = await runCycle(config, { budgetMs: 1000 });
     assert.equal(short.action, 'cycled');
-    assert.deepEqual(short.children.map((child) => [child.service, child.opId, child.action, child.reasonCode]), [['demo', null, 'deferred', 'timed-out']]);
-    assert.match(short.children[0].message, /the update of Demo can take up to \d+ min, longer than a whole cycle has/);
+    assert.deepEqual(short.children.map((child) => [child.service, child.action, child.reasonCode, child.to]), [['demo', 'deferred', 'timed-out', '2.0.0']]);
+    assert.match(short.children[0].message, /the update of Demo to 2\.0\.0 can take up to \d+ min, longer than a whole cycle has/);
+    assert.equal(readOperation(short.children[0].opId).result.outcome, 'deferred');
     assert.equal(readFixture(dir, 'installed'), '1.0.0');
     assert.equal(readFixture(dir, 'stop-runs'), '');
 
     const full = await runCycle(config);
     assert.deepEqual(full.children.map((child) => [child.service, child.action]), [['demo', 'updated']]);
     assert.equal(readFixture(dir, 'installed'), '2.0.0');
+  });
+});
+
+test('a service already current reads as current in a cycle that has run out of time', async () => {
+  await withHome(async (home) => {
+    const current = fixtureData(home, { installed: '2.0.0', latest: '2.0.0' });
+    const behind = path.join(home, 'behind');
+    fs.cpSync(current, behind, { recursive: true });
+    writeFixture(behind, 'installed', '1.0.0');
+    const config = configured(home, fixtureConfig(current, {
+      services: [commandService(behind, { id: 'behind', name: 'Behind' }), commandService(current)],
+    }));
+
+    // The time a long update before them took is spent: what is current says
+    // so, and only what has something to install waits for the next cycle.
+    const spent = await runCycle(config, { budgetMs: 1 });
+    assert.deepEqual(spent.children.map((child) => [child.service, child.action, child.reasonCode]), [
+      ['behind', 'deferred', 'timed-out'],
+      ['demo', 'noop', 'already-on-target'],
+    ]);
+    assert.equal(readFixture(behind, 'stop-runs'), '');
+    assert.equal(readFixture(behind, 'installed'), '1.0.0');
   });
 });
 

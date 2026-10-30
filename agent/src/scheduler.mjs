@@ -496,21 +496,26 @@ export async function runCycle(config, options = {}) {
       // forced cycle still leaves alone what the policy says is not to be
       // updated now, as the update itself would.
       const eligibility = scheduledEligibility(config, service, {});
-      // One the cycle could not finish even if everything before its stop took
-      // no time at all is not begun. The update checks again at its stop,
-      // with the time it took to get there spent.
-      const late = eligibility.eligible ? budget.refuses(updateWorstCaseMs(service), `the update of ${service.name}`) : null;
-      if (!eligibility.eligible || late) {
+      if (!eligibility.eligible) {
         report.children.push({
           opId: null,
           service: service.id,
           name: service.name,
           action: 'deferred',
-          reasonCode: late ? REASON.timedOut : eligibility.reasonCode,
-          message: late ?? eligibility.reason,
+          reasonCode: eligibility.reasonCode,
+          message: eligibility.reason,
         });
         continue;
       }
+      // Whether the cycle still has the time is the update's to decide, at its
+      // drain (update.mjs), and not here before it has looked: a service that
+      // is already current needs none, and deferring it would report it as
+      // waiting when there is nothing to wait for. What it costs is a version
+      // lookup, which leaves nothing down if the scheduler ends the cycle in
+      // the middle of it. The services keep their order whatever an earlier
+      // cycle ran out of time for: `after` is a dependency, and an update that
+      // fails slowly ahead of another, cycle after cycle, says so in its own
+      // record, where a person can see it and update the other by hand.
       lock.phase(`services:${service.id}`);
       const result = await runUpdate(config, service, {
         mode: 'scheduled',
