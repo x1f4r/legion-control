@@ -146,6 +146,24 @@ public class UpdateHelperTests
         return helper.ExitCode;
     }
 
+    /// Waits for the helper and checks how it ended. Its log goes into the failure, since that is
+    /// the only place a runner elsewhere says why.
+    private static void Exits(int expected, Rig rig, AppInstaller installer)
+    {
+        var code = Finish(installer);
+        Assert.True(code == expected, $"the helper exited {code}, not {expected}. Its log:\n{rig.Log(installer)}");
+    }
+
+    /// The [count]th start once there are that many, with the starts and the helper's log in the
+    /// failure when there are fewer.
+    private static string NthStart(Rig rig, AppInstaller installer, int count)
+    {
+        var starts = rig.StartsWhen(count);
+        Assert.True(starts.Count >= count,
+            $"{starts.Count} starts, not {count}: [{string.Join(" | ", starts)}]. The helper's log:\n{rig.Log(installer)}");
+        return starts[count - 1];
+    }
+
     private static bool Runs(int pid)
     {
         try { return !Process.GetProcessById(pid).HasExited; }
@@ -168,7 +186,7 @@ public class UpdateHelperTests
 
         var (started, problem) = installer.Apply();
         Assert.True(started, problem);
-        Assert.Equal(0, Finish(installer));
+        Exits(0, rig, installer);
 
         Assert.Equal("1.4.1", rig.Version(rig.Install));
         // Renamed, never copied over: a file the new release dropped went with the old build.
@@ -191,7 +209,7 @@ public class UpdateHelperTests
         ARelease(rig, installer, "1.4.1", "hangs");
 
         Assert.True(installer.Apply().Started);
-        Assert.Equal(1, Finish(installer));
+        Exits(1, rig, installer);
 
         Assert.Equal("1.4.0", rig.Version(rig.Install));
         // The broken build is gone rather than kept to roll forward to.
@@ -232,11 +250,11 @@ public class UpdateHelperTests
             Assert.Equal("1.4.1", rig.Version(rig.Install));
             Assert.DoesNotContain("put the build before back", rig.Log(installer));
         }
-        Assert.Equal(1, Finish(installer));
+        Exits(1, rig, installer);
 
         Assert.Equal("1.4.0", rig.Version(rig.Install));
         Assert.False(Directory.Exists(installer.PreviousDirectory));
-        Assert.Equal("1.4.0", rig.StartsWhen(2)[1]);
+        Assert.Equal("1.4.0", NthStart(rig, installer, 2));
         var log = rig.Log(installer);
         Assert.Contains("put the build before back", log);
         Assert.Contains("finished: nothing changed", log);
@@ -255,7 +273,7 @@ public class UpdateHelperTests
         using (var commandLine = InstanceLock.Share(TimeSpan.Zero, rig.Lock))
         {
             Assert.NotNull(commandLine);
-            Assert.Equal(1, Finish(installer));
+            Exits(1, rig, installer);
         }
 
         // Renamed and deleted, the new build would have gone from under the copy still running it.
@@ -263,7 +281,7 @@ public class UpdateHelperTests
         Assert.Equal("1.4.0", rig.Version(installer.PreviousDirectory));
         Assert.False(Directory.Exists(installer.AsideDirectory));
         // And the app is started again, as on every way out that leaves it closed.
-        Assert.Equal("1.4.1", rig.StartsWhen(2)[1]);
+        Assert.Equal("1.4.1", NthStart(rig, installer, 2));
         var log = rig.Log(installer);
         Assert.Contains("another copy of the app still runs after 2s, so the build that did not draw its window stays installed", log);
         Assert.Contains("finished: changed", log);
@@ -279,11 +297,11 @@ public class UpdateHelperTests
 
         var clock = Stopwatch.StartNew();
         Assert.True(installer.Apply().Started);
-        Assert.Equal(1, Finish(installer));
+        Exits(1, rig, installer);
         Assert.True(clock.Elapsed < TimeSpan.FromSeconds(45), $"undone after {clock.Elapsed}");
         Assert.Equal("1.4.0", rig.Version(rig.Install));
         Assert.Contains("exited before drawing its window", rig.Log(installer));
-        Assert.Equal("1.4.0", rig.StartsWhen(2)[1]);
+        Assert.Equal("1.4.0", NthStart(rig, installer, 2));
     }
 
     [Fact]
@@ -295,7 +313,7 @@ public class UpdateHelperTests
         rig.Build(installer.PreviousDirectory, "1.4.0", "healthy");
 
         Assert.Null(installer.Rollback());
-        Assert.Equal(0, Finish(installer));
+        Exits(0, rig, installer);
         Assert.Equal("1.4.0", rig.Version(rig.Install));
         Assert.Equal("1.4.1", rig.Version(installer.PreviousDirectory));
 
@@ -317,10 +335,10 @@ public class UpdateHelperTests
         rig.Build(installer.PreviousDirectory, "1.4.0", "crashes");
 
         Assert.Null(installer.Rollback());
-        Assert.Equal(1, Finish(installer));
+        Exits(1, rig, installer);
         Assert.Equal("1.4.1", rig.Version(rig.Install));
         Assert.Equal("1.4.0", rig.Version(installer.PreviousDirectory));
-        Assert.Equal("1.4.1", rig.StartsWhen(2)[1]);
+        Assert.Equal("1.4.1", NthStart(rig, installer, 2));
     }
 
     [Fact]
@@ -345,7 +363,7 @@ public class UpdateHelperTests
             ARelease(rig, installer, "1.4.1", "healthy");
 
             Assert.True(installer.Apply().Started);
-            Assert.Equal(1, Finish(installer));
+            Exits(1, rig, installer);
             Assert.Equal("1.4.0", rig.Version(rig.Install));
             Assert.False(Directory.Exists(installer.PreviousDirectory));
             // The app is still open, so nothing is started beside it.
@@ -375,7 +393,7 @@ public class UpdateHelperTests
         using (InstanceLock.Share(TimeSpan.Zero, rig.Lock))
         {
             Assert.True(installer.Apply().Started);
-            Assert.Equal(1, Finish(installer));
+            Exits(1, rig, installer);
         }
         Assert.Equal("1.4.0", rig.Version(rig.Install));
         Assert.False(Directory.Exists(installer.PreviousDirectory));
@@ -452,7 +470,7 @@ public class UpdateHelperTests
             // The helper has its environment by now, and nothing else here should find that mv.
             Environment.SetEnvironmentVariable("PATH", path);
         }
-        Assert.Equal(1, Finish(installer));
+        Exits(1, rig, installer);
 
         // The installation was moved aside and moved back, whole, and started again.
         Assert.Equal("1.4.0", rig.Version(rig.Install));
