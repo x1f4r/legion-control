@@ -116,11 +116,12 @@ public partial class App : Application
         {
             if (!MainWindow.HidesInsteadOfClosing(closing.CloseReason, closing.IsProgrammatic)) return;
             closing.Cancel = true;
-            Ui.Run(window, "Closing the window", async () =>
+            // Once the close has been turned down, rather than from inside it.
+            Dispatcher.UIThread.Post(() => Ui.Run(window, "Closing the window", async () =>
             {
                 if (await TrayHost.IsShownAsync()) window.Hide();
                 else desktop.Shutdown();
-            });
+            }));
         };
     }
 
