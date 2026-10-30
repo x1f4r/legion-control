@@ -259,6 +259,75 @@ fun helperSkip(
 }
 
 /**
+ * What a person chose to do about the wake holds on a target (contract section 10.2). Only a person
+ * ever chooses anything but [STAND]: a hold is what keeps a command from running twice, and every
+ * other release is evidence.
+ */
+enum class HoldChoice {
+    /** The holds stand, and the wake walks around them. */
+    STAND,
+
+    /**
+     * Ask the helpers a hold keeps back other than the held ones. The held commands are not run
+     * again in that walk, but their holds are released, so the next wake asks every helper.
+     */
+    OTHER_HELPERS,
+
+    /**
+     * With no other helper to ask, run the held commands again, knowing the first run may still be
+     * going. A helper that keeps no records would otherwise hold until the target answers.
+     */
+    RUN_AGAIN,
+}
+
+/** Whether a wake hold is what keeps a helper from running. */
+val WakePlan.isHeld: Boolean get() = skipped.any { it.reason == WakeSkip.Reason.HELD }
+
+/**
+ * This plan without the helper steps [holds] are on: what a person asking for the other helpers
+ * walks. Each step taken out is skipped as held. Releasing a hold is not a reason to run its own
+ * command a second time while the first run may still be going.
+ */
+fun WakePlan.without(holds: List<WakeHold>): WakePlan {
+    if (holds.isEmpty()) return this
+    val passed = steps.filterIsInstance<WakeStep.Helper>().filter { WakeHold(it.machine, it.action) in holds }
+    return copy(
+        steps = steps.filterNot { it in passed },
+        skipped = skipped + passed.map { WakeSkip(WakeSkip.Kind.HELPER, it.machine, it.action, WakeSkip.Reason.HELD) },
+    )
+}
+
+/**
+ * What trying the other helpers walks: [unheld], the plan as if nothing were held, without the
+ * helper steps of [holds]. Null unless that asks a helper [held], the plan as it stands, skips for a
+ * hold. With the held helper the only one, going past its hold would ask nobody new, and the next
+ * ordinary press would run the held command a second time.
+ */
+fun otherHelpers(held: WakePlan, unheld: WakePlan, holds: List<WakeHold>): WakePlan? {
+    if (holds.isEmpty()) return null
+    val others = unheld.without(holds)
+    val heldBack = held.skipped.filter { it.reason == WakeSkip.Reason.HELD }
+        .map { WakeHold(it.machine.orEmpty(), it.action.orEmpty()) }
+        .toSet()
+    return others.takeIf { plan ->
+        plan.steps.any { it is WakeStep.Helper && WakeHold(it.machine, it.action) in heldBack }
+    }
+}
+
+/**
+ * What running the held commands again walks: [unheld], the plan as if nothing were held. Null
+ * unless [held] skips a helper for a hold and no other helper could be asked instead: with one,
+ * asking it is the way past, and that frees the held command for the next press without running it
+ * twice now.
+ */
+fun runAgain(held: WakePlan, unheld: WakePlan, holds: List<WakeHold>): WakePlan? =
+    unheld.takeIf { held.isHeld && otherHelpers(held, unheld, holds) == null }
+
+/** The helpers whose command this plan runs a second time while the first run may still be going, by id, in plan order. */
+fun WakePlan.runsAgain(holds: List<WakeHold>): List<String> =
+    steps.filterIsInstance<WakeStep.Helper>().filter { WakeHold(it.machine, it.action) in holds }.map { it.machine }.distinct()
+
+/**
  * Where direct wake sends: the dotted entries of `wake.broadcast`; else those of the machine's site;
  * else the directed broadcast of the placing address when its prefix length is known and at most
  * 30; else 255.255.255.255. A device that guesses the limited broadcast first wakes nothing behind a

@@ -428,8 +428,18 @@ private fun WakeHoldLine(model: MachineModel, app: AppModel) {
         "A wake command on ${helpers.joinToString(" and ")} may still be running. Other command helpers " +
             "wait until it is known.",
     )
-    Actions {
-        PlainAction("Try the other helpers anyway", enabled = !model.isWorking) { model.requestTryOtherHelpers() }
+    // With another helper to ask, the way past is asking it; with none, it is running the held
+    // command again, after a question that says it may then run twice.
+    when (val offer = model.wakeHoldOffer) {
+        MachineModel.WakeHoldOffer.OtherHelpers -> Actions {
+            PlainAction("Try the other helpers", enabled = !model.isWorking) { model.requestTryOtherHelpers() }
+        }
+
+        is MachineModel.WakeHoldOffer.RunAgain -> Actions {
+            PlainAction(offer.label, enabled = !model.isWorking) { model.requestRunHeldAgain() }
+        }
+
+        null -> Unit
     }
 }
 

@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.ui
 
 import com.x1f4r.legioncontrol.agent.HelperState
+import com.x1f4r.legioncontrol.agent.HoldChoice
 import com.x1f4r.legioncontrol.agent.InterruptRequest
 import com.x1f4r.legioncontrol.agent.OpAction
 import com.x1f4r.legioncontrol.agent.OpKind
@@ -12,8 +13,11 @@ import com.x1f4r.legioncontrol.agent.WakePlan
 import com.x1f4r.legioncontrol.agent.WakeSkip
 import com.x1f4r.legioncontrol.agent.WakeStep
 import com.x1f4r.legioncontrol.agent.helperSkip
+import com.x1f4r.legioncontrol.agent.isHeld
+import com.x1f4r.legioncontrol.agent.otherHelpers
 import com.x1f4r.legioncontrol.agent.planWake
 import com.x1f4r.legioncontrol.agent.readinessSchedule
+import com.x1f4r.legioncontrol.agent.runAgain
 import kotlinx.coroutines.delay
 
 /**
@@ -57,6 +61,11 @@ internal class WakeWalk(
          * "it did not come up".
          */
         val tried: Boolean = true,
+        /**
+         * Why a person's way past the holds was not taken, when it would have asked nobody: nothing
+         * was tried and nothing was released.
+         */
+        val refusal: String? = null,
     )
 
     private val machine get() = target.machine
@@ -64,9 +73,40 @@ internal class WakeWalk(
     /** Whether a step got as far as sending a packet or asking a helper. */
     private var tried = false
 
-    suspend fun run(): Ending {
+    /** The holds a person chose to go past by asking the other helpers: their steps are not taken. */
+    private var passed: List<WakeHold> = emptyList()
+
+    /**
+     * Walks the plan. [choice] is a person's decision about the holds still standing once their
+     * records were read, and nothing else ever makes one on their behalf. Either way past releases
+     * those holds. [HoldChoice.OTHER_HELPERS] does not ask the helpers the holds were on in this walk,
+     * and with no other helper to ask it walks nothing and the holds stand: releasing them would ask
+     * nobody new, and leave the held command free to run again on the next press without anyone
+     * having chosen that. [HoldChoice.RUN_AGAIN] is choosing exactly that, and is taken only when no
+     * other helper could be asked instead.
+     */
+    suspend fun run(choice: HoldChoice = HoldChoice.STAND): Ending {
         settleHolds()
-        val plan = plan()
+        var plan = plan()
+        if (choice != HoldChoice.STAND && plan.isHeld) {
+            val holds = holds()
+            val past = if (choice == HoldChoice.RUN_AGAIN) runAgain(plan, plan(emptyList()), holds) else otherHelpers(plan, plan(emptyList()), holds)
+            if (past == null) {
+                val refusal = if (choice == HoldChoice.RUN_AGAIN) otherHelperFirst(machine.name) else noOtherHelper(machine.name)
+                return Ending(false, listOf(refusal), emptyList(), tried = false, refusal = refusal)
+            }
+            operations.releaseWakeHolds(
+                machine.id,
+                before = Long.MAX_VALUE,
+                reason = if (choice == HoldChoice.RUN_AGAIN) {
+                    "Released by hand, to run the held command for ${machine.name} again."
+                } else {
+                    "Released by hand, to try the other helpers for ${machine.name}."
+                },
+            )
+            if (choice == HoldChoice.OTHER_HELPERS) passed = holds
+            plan = past
+        }
         val lines = mutableListOf<String>()
         val offer = plan.offerWakeFirst.toMutableList()
 
@@ -233,9 +273,36 @@ internal class WakeWalk(
             WakeSkip.Reason.ASLEEP -> "$name is asleep or out of reach."
             WakeSkip.Reason.UNUSABLE -> "$name cannot be asked from this device."
             WakeSkip.Reason.NO_ACTION -> "$name has no action \"${skip.action}\"."
-            WakeSkip.Reason.HELD -> "$name was not asked: a wake command for ${machine.name} may still be " +
-                "running, and only a declared wol action runs until that is known."
+            WakeSkip.Reason.HELD -> if (WakeHold(skip.machine.orEmpty(), skip.action.orEmpty()) in passed) {
+                "$name was not asked again: its \"${skip.action}\" was run to wake ${machine.name} earlier and may " +
+                    "still be going, so only the other helpers were asked."
+            } else {
+                "$name was not asked: a wake command for ${machine.name} may still be running, and only a declared " +
+                    "wol action runs until that is known."
+            }
             WakeSkip.Reason.NONE -> "No wake helper is configured for ${machine.name}."
         }
     }
 }
+
+/** What to say when a person asks for the other helpers and there is none to ask. */
+internal fun noOtherHelper(targetName: String): String =
+    "No other helper could be asked to wake $targetName. The helper command run for it earlier may still be going, so " +
+        "it is not run again, and its hold stands."
+
+/** What to say when a person asks to run a held command again while another helper could be asked instead. */
+internal fun otherHelperFirst(targetName: String): String =
+    "Another helper could be asked to wake $targetName, so the command held for it is not run again. Trying the other " +
+        "helpers releases its hold, and the next wake asks every helper."
+
+/** What running the held commands of [helpers] again is called where a person chooses it. */
+internal fun runAgainLabel(helpers: List<String>): String =
+    helpers.singleOrNull()?.let { "Run $it's command again" } ?: "Run the held commands again"
+
+/** What a person is told before running the held commands again: that a run may still be going, and this can make it two. */
+internal fun runAgainWarning(helpers: List<String>, targetName: String): String =
+    helpers.singleOrNull()?.let {
+        "$it's command to wake $targetName has not reported how it ended, so it may still be running, and no other " +
+            "helper could be asked instead. Running it again can run it a second time beside the first."
+    } ?: ("The commands run to wake $targetName have not reported how they ended, so they may still be running, and " +
+        "no other helper could be asked instead. Running them again can run each a second time beside the first.")

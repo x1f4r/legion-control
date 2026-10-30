@@ -6,6 +6,7 @@ import com.x1f4r.legioncontrol.agent.AgentActionResult
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.DispatchStage
 import com.x1f4r.legioncontrol.agent.HelperState
+import com.x1f4r.legioncontrol.agent.HoldChoice
 import com.x1f4r.legioncontrol.agent.InterruptRequest
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.OpRecord
@@ -195,6 +196,52 @@ class WakeWalkTest {
         assertTrue(restarted.wakeHolds("tower").isEmpty())
         assertEquals(listOf("wake-tower", "wake-tower"), nas.runs)
         assertFalse(third.answered)
+    }
+
+    @Test
+    fun `trying the other helpers asks only the others, and does not run the held command again`() = runBlocking {
+        // The button said the other helpers, and the phone used to release every hold and walk the
+        // whole plan, so the pi's command ran again beside the first: with a command that toggles a
+        // smart plug, the second run undoes the first.
+        pi.answer = { Result.failure(AgentFailure.Unreachable("Pi", "connection reset", stage = DispatchStage.AMBIGUOUS)) }
+        val operations = center()
+        walk(operations).run()
+        assertEquals(1, operations.wakeHolds("tower").size)
+        pi.answer = { id -> Result.success(ran(id)) }
+
+        // Running the held command again is not offered while another helper could be asked.
+        val refused = walk(operations).run(HoldChoice.RUN_AGAIN)
+        assertEquals(otherHelperFirst("Tower"), refused.refusal)
+        assertEquals(1, operations.wakeHolds("tower").size)
+
+        val ending = walk(operations).run(HoldChoice.OTHER_HELPERS)
+        assertEquals("the held command is not run a second time", listOf("wake-tower"), pi.runs)
+        assertEquals(listOf("wake-tower"), nas.runs)
+        assertTrue("the next wake asks every helper", operations.wakeHolds("tower").isEmpty())
+        assertTrue(ending.lines.toString(), ending.lines.any { it.startsWith("Pi was not asked again: its \"wake-tower\" was run to wake Tower earlier") })
+    }
+
+    @Test
+    fun `with no other helper the hold stands, and only running the held command again goes past it`() = runBlocking {
+        pi.answer = { Result.failure(AgentFailure.Unreachable("Pi", "connection reset", stage = DispatchStage.AMBIGUOUS)) }
+        val operations = center()
+        walk(operations).run()
+        pi.answer = { id -> Result.success(ran(id)) }
+        fleet.states["nas"] = HelperState(HelperState.Kind.ASLEEP)
+
+        // Asking for the other helpers asks nobody new, so nothing is released.
+        val refused = walk(operations).run(HoldChoice.OTHER_HELPERS)
+        assertEquals(noOtherHelper("Tower"), refused.refusal)
+        assertFalse(refused.tried)
+        assertEquals(1, operations.wakeHolds("tower").size)
+        assertEquals(listOf("wake-tower"), pi.runs)
+        assertEquals("Run Pi's command again", runAgainLabel(listOf("Pi")))
+        assertTrue(runAgainWarning(listOf("Pi"), "Tower").contains("can run it a second time beside the first"))
+
+        walk(operations).run(HoldChoice.RUN_AGAIN)
+        assertEquals("run again, because a person chose it knowing that", listOf("wake-tower", "wake-tower"), pi.runs)
+        assertEquals(emptyList<String>(), nas.runs)
+        assertTrue(operations.wakeHolds("tower").isEmpty())
     }
 
     @Test

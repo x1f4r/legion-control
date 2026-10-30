@@ -15,6 +15,7 @@ import com.x1f4r.legioncontrol.agent.DoctorReport
 import com.x1f4r.legioncontrol.agent.EndpointDiagnosis
 import com.x1f4r.legioncontrol.agent.FailureKind
 import com.x1f4r.legioncontrol.agent.HelperState
+import com.x1f4r.legioncontrol.agent.HoldChoice
 import com.x1f4r.legioncontrol.agent.InterruptRequest
 import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.agent.MachineSystem
@@ -30,8 +31,12 @@ import com.x1f4r.legioncontrol.agent.TrackedState
 import com.x1f4r.legioncontrol.agent.UpdateRequest
 import com.x1f4r.legioncontrol.agent.WakeHold
 import com.x1f4r.legioncontrol.agent.WakePlan
+import com.x1f4r.legioncontrol.agent.isHeld
+import com.x1f4r.legioncontrol.agent.otherHelpers
 import com.x1f4r.legioncontrol.agent.resolveSystem
 import com.x1f4r.legioncontrol.agent.retryRequest
+import com.x1f4r.legioncontrol.agent.runAgain
+import com.x1f4r.legioncontrol.agent.runsAgain
 import com.x1f4r.legioncontrol.data.SiteConfig
 import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.net.onNetwork
@@ -226,17 +231,27 @@ class MachineModel(
         }
 
         /**
-         * Releasing the wake holds on a machine and waking it again (contract section 10.2). A held
-         * command may still be running, so the commands asked for now may run beside it, the held
-         * helper's own included. Only a person ever decides that.
+         * Asking the other helpers past the wake holds on a machine (contract section 10.2). A held
+         * command may still be running, so the other helpers' commands run beside it; the held one
+         * is not run again. Only a person ever decides that.
          */
         data class ConfirmTryOtherHelpers(val targetName: String, val helperNames: List<String>) : Dialog {
             override val title get() = "Try the other helpers for $targetName?"
             override val message
                 get() = "A wake command asked of ${helperNames.joinToString(" and ")} has not said how it " +
-                    "ended, so it may still be running. Trying again runs the helpers' commands as well, " +
-                    "and a command that is still going can end up running twice."
+                    "ended, so it may still be running. Trying the other helpers runs their commands, and " +
+                    "does not run that one again."
             override val confirmLabel get() = "Try them"
+        }
+
+        /**
+         * Running a held command again because no other helper could be asked (contract section
+         * 10.2). The first run may still be going, and this can make it two.
+         */
+        data class ConfirmRunHeldAgain(val targetName: String, val label: String, val warning: String) : Dialog {
+            override val title get() = "$label for $targetName?"
+            override val message get() = warning
+            override val confirmLabel get() = "Run it again"
         }
     }
 
@@ -661,7 +676,7 @@ class MachineModel(
      */
     private var wakeTarget: MachineSystem? = null
 
-    fun wake(target: MachineSystem? = null) {
+    fun wake(target: MachineSystem? = null, choice: HoldChoice = HoldChoice.STAND) {
         if (isWorking) return
         if (machine.wake == null) {
             statusLine = "${machine.name} has no wake configuration."
@@ -684,10 +699,14 @@ class MachineModel(
                         isAwake
                     },
                     progress = { statusLine = it },
-                ).run()
+                ).run(choice)
             }
             if (ending.answered) {
                 awoke()
+            } else if (ending.refusal != null) {
+                statusLine = ending.refusal
+                statusIsError = true
+                statusDetail = null
             } else {
                 statusLine = if (ending.tried) "${machine.name} did not come up." else "Cannot wake ${machine.name} from here."
                 statusIsError = true
@@ -701,23 +720,66 @@ class MachineModel(
     fun requestTryOtherHelpers() {
         val holds = wakeHolds
         if (isWorking || holds.isEmpty()) return
-        val names = holds.map { hold -> fleet.machines.firstOrNull { it.id == hold.machineId }?.name ?: hold.machineName }
+        val names = holds.map { hold -> nameOf(hold.machineId) ?: hold.machineName }
         dialog = Dialog.ConfirmTryOtherHelpers(machine.name, names.distinct())
     }
 
     /**
-     * "Try the other helpers anyway": a person's decision to release every wake hold on this
-     * machine and wake it again. The held records stay and are still followed.
+     * "Try the other helpers": a person's decision to wake this machine through the helpers its
+     * wake holds keep back, other than the held ones, whose commands are not run again. The holds
+     * are released, so the next wake asks every helper; the held records stay and are still
+     * followed. With no other helper to ask, nothing is released and the line says so.
      */
     fun tryOtherHelpers() {
         if (isWorking) return
-        operations.releaseWakeHolds(
-            machine.id,
-            before = Long.MAX_VALUE,
-            reason = "Released by hand, to try the other helpers for ${machine.name}.",
-        )
-        wake(wakeTarget)
+        wake(wakeTarget, HoldChoice.OTHER_HELPERS)
     }
+
+    /** Asks before [runHeldAgain], with what running a held command a second time can cost. */
+    fun requestRunHeldAgain() {
+        val offer = wakeHoldOffer as? WakeHoldOffer.RunAgain ?: return
+        if (isWorking) return
+        dialog = Dialog.ConfirmRunHeldAgain(machine.name, offer.label, offer.warning)
+    }
+
+    /**
+     * Runs the held commands again because a person chose to, knowing the first run may still be
+     * going. Only ever when no other helper could be asked instead.
+     */
+    fun runHeldAgain() {
+        if (isWorking) return
+        wake(wakeTarget, HoldChoice.RUN_AGAIN)
+    }
+
+    /** The way past the wake holds a person is offered, as every client offers it (contract section 10.2). */
+    sealed interface WakeHoldOffer {
+        /** Another helper could be asked: asking it is the way past. */
+        data object OtherHelpers : WakeHoldOffer
+
+        /** None could: running the held command again is, after a warning. */
+        data class RunAgain(val label: String, val warning: String) : WakeHoldOffer
+    }
+
+    /**
+     * What a person may do about the holds that keep a helper back now, or null when none does, or
+     * when no way past them would ask anybody.
+     */
+    val wakeHoldOffer: WakeHoldOffer?
+        get() {
+            machine.wake ?: return null
+            val holds = wakeHolds.map { hold -> WakeHold(hold.machineId, hold.intent.actionId.orEmpty()) }
+            if (holds.isEmpty()) return null
+            val walk = WakeWalk(client, fleet, operations, poll = { false }, progress = {})
+            val held = walk.plan(holds)
+            if (!held.isHeld) return null
+            val unheld = walk.plan(emptyList())
+            if (otherHelpers(held, unheld, holds) != null) return WakeHoldOffer.OtherHelpers
+            val again = runAgain(held, unheld, holds) ?: return null
+            val names = again.runsAgain(holds).map { nameOf(it) ?: it }
+            return WakeHoldOffer.RunAgain(runAgainLabel(names), runAgainWarning(names, machine.name))
+        }
+
+    private fun nameOf(machineId: String): String? = fleet.machines.firstOrNull { it.id == machineId }?.name
 
     /**
      * The plan a press of Wake would follow now, for the sentence beside the button. The holds come
