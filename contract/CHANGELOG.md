@@ -117,9 +117,10 @@ not, the agent now answers as they say.
   null. A failed cycle carries the code of its first failed service.
 - A cycle that ran a service whose ending is unknown (an interrupted update, one
   that ran out of time, or one that may have changed the machine before it
-  failed) states `outcome: "unknown"` and takes that service's reason code,
-  rather than `cycled` or a `failed` that reads as a known state. Its message
-  counts such services apart from the ones that failed.
+  failed) states `outcome: "unknown"` and takes the reason code of the first
+  such service, even when one before it failed with a known ending, rather than
+  `cycled` or a `failed` that reads as a known state. Its message counts such
+  services apart from the ones that failed.
 - A queued request the agent cancelled because it could not safely replace the
   one before it (`cancelled` with `internal`) reduces to `unknown`, not
   `succeeded`: section 5.6 reads `cancelled` by its reason code, with null

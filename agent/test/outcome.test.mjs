@@ -188,6 +188,35 @@ test('a cycle with a service nobody can say the end of is unknown, and counts it
   });
 });
 
+test('a cycle that is unknown takes the reason of a service whose ending is unknown, even after one that failed', async () => {
+  const { concludeCycle } = await import('../src/scheduler.mjs');
+  const refused = { service: 'first', action: 'failed', reasonCode: 'bad-argument', outcome: 'failed' };
+  const ranOut = { service: 'second', action: 'failed', reasonCode: 'timed-out' };
+  const unsaved = { service: 'third', action: 'failed', reasonCode: 'internal', outcome: 'unknown' };
+  const current = { service: 'fourth', action: 'noop', reasonCode: null };
+
+  // The failure whose end is known comes first, and still does not explain the unknown.
+  const mixed = concludeCycle([refused, ranOut, current]);
+  assert.equal(mixed.action, 'failed');
+  assert.equal(mixed.outcome, 'unknown');
+  assert.equal(mixed.reasonCode, 'timed-out');
+  assert.equal(mixed.message, '0 updated, 1 left alone, 1 failed, 1 may or may not have updated');
+  assert.equal(producedOutcome(mixed), 'unknown');
+
+  // A stated unknown counts as much as one the reducer reaches, and the first one decides.
+  assert.equal(concludeCycle([refused, unsaved, ranOut]).reasonCode, 'internal');
+  // An unknown with no code of its own is an interrupted one, and a failure with none an internal one.
+  assert.equal(concludeCycle([{ action: 'interrupted', reasonCode: null }, refused]).reasonCode, 'interrupted');
+  assert.equal(concludeCycle([{ action: 'failed', reasonCode: null, outcome: 'failed' }]).reasonCode, 'internal');
+
+  // With no unknown, the first failed service explains the failure.
+  const failed = concludeCycle([current, refused]);
+  assert.deepEqual([failed.action, failed.reasonCode, failed.outcome, producedOutcome(failed)], ['failed', 'bad-argument', undefined, 'failed']);
+  const cycled = concludeCycle([current], ['demo was left stopped']);
+  assert.deepEqual([cycled.ok, cycled.action, cycled.reasonCode], [true, 'cycled', null]);
+  assert.equal(cycled.message, '0 updated, 1 left alone, 0 failed; recovery is still owed: demo was left stopped');
+});
+
 test('the reducer copy here and the reference have the same tables', async () => {
   const reference = await import(new URL('../../contract/tools/outcome.mjs', import.meta.url).href);
   const { OK_REPLY_ACTIONS } = await import('../src/contract.mjs');
