@@ -87,6 +87,10 @@ public class ReleaseDownloadTests
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
+    /// [bytes] with spaces after them up to exactly [length].
+    private static byte[] Padded(byte[] bytes, int length) =>
+        bytes.Concat(Enumerable.Repeat((byte)' ', length - bytes.Length)).ToArray();
+
     private static byte[] Manifest() => File.ReadAllBytes(Path.Combine(Repo.TrustFixtures, "manifest.json"));
 
     private static byte[] Signature() => File.ReadAllBytes(Path.Combine(Repo.TrustFixtures, "manifest.json.sig"));
@@ -95,15 +99,22 @@ public class ReleaseDownloadTests
     private static Host ARelease(Func<HttpContent>? manifest = null, Func<HttpContent>? signature = null, Func<HttpContent>? list = null)
     {
         var host = new Host();
-        var assets = new JsonArray(
-            new JsonObject { ["name"] = AppUpdates.ManifestAsset, ["browser_download_url"] = ManifestUrl },
-            new JsonObject { ["name"] = AppUpdates.SignatureAsset, ["browser_download_url"] = SignatureUrl },
-            new JsonObject { ["name"] = AppUpdates.AssetForThisPlatform() ?? "none", ["browser_download_url"] = "https://example.invalid/app" });
-        var release = Encoding.UTF8.GetBytes(new JsonObject { ["tag_name"] = "v9.0.0", ["assets"] = assets }.ToJsonString());
+        var release = AReleaseList();
         host.Bodies[ReleaseList] = list ?? (() => new Unannounced(release));
         host.Bodies[ManifestUrl] = manifest ?? (() => new Unannounced(Manifest()));
         host.Bodies[SignatureUrl] = signature ?? (() => new Unannounced(Signature()));
         return host;
+    }
+
+    /// GitHub's description of a release that names a manifest, its signature and this
+    /// platform's archive.
+    private static byte[] AReleaseList()
+    {
+        var assets = new JsonArray(
+            new JsonObject { ["name"] = AppUpdates.ManifestAsset, ["browser_download_url"] = ManifestUrl },
+            new JsonObject { ["name"] = AppUpdates.SignatureAsset, ["browser_download_url"] = SignatureUrl },
+            new JsonObject { ["name"] = AppUpdates.AssetForThisPlatform() ?? "none", ["browser_download_url"] = "https://example.invalid/app" });
+        return Encoding.UTF8.GetBytes(new JsonObject { ["tag_name"] = "v9.0.0", ["assets"] = assets }.ToJsonString());
     }
 
     private static async Task<string> Check(Host host, string repository = Repository) =>
@@ -146,8 +157,25 @@ public class ReleaseDownloadTests
         Assert.Contains("The signed manifest could not be read: it is larger than 262144 bytes", manifest);
         var signature = await Check(ARelease(signature: () => new Unannounced(new byte[AppUpdates.SignatureLimit + 1])));
         Assert.Contains("The signed manifest could not be read: it is larger than 4096 bytes", signature);
-        // At the limits themselves the release is read, and the fixture names no archive for here.
-        Assert.Contains("has no", await Check(ARelease()));
+
+        // At the limits themselves each is read whole, said up front or not, and whatever refuses
+        // the release then is what it holds.
+        foreach (var announce in new[] { false, true })
+        {
+            HttpContent Exactly(byte[] bytes, int limit) => new Unannounced(Padded(bytes, limit), announce ? limit : null);
+            var list = await Check(ARelease(list: () => Exactly(AReleaseList(), AppUpdates.ReleaseLimit)));
+            // The fixture names no archive for here: the list was read to its last byte and past it.
+            Assert.Contains("has no", list);
+            foreach (var atTheLimit in new[]
+                     {
+                         await Check(ARelease(manifest: () => Exactly(Manifest(), AppUpdates.ManifestLimit))),
+                         await Check(ARelease(signature: () => Exactly(Signature(), AppUpdates.SignatureLimit))),
+                     })
+            {
+                Assert.DoesNotContain("could not be read", atTheLimit);
+                Assert.DoesNotContain("larger than", atTheLimit);
+            }
+        }
     }
 
     [Fact]
