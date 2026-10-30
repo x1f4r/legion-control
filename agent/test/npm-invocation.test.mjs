@@ -20,7 +20,7 @@ test('Windows PATH npm is called through its JavaScript entry with literal prefi
   const invocation = npmInvocation(null, { platform: 'win32', nodePath: path.join(home, 'bundled', 'node.exe'), searchPath: `"${directory}"` });
   assert.equal(invocation.shell, false);
   assert.deepEqual(invocation.lead, [entry]);
-  const prefix = 'C:\\Users\\A & B\\npm prefix';
+  const prefix = 'C:\\Users\\me\\A & B\\npm prefix';
   const args = ['install', '--prefix', prefix, '@scope/package@1.0.0&echo unexpected', '%PATH%', 'a"b', 'tail\\'];
   const result = runCommand(process.execPath, [...invocation.lead, ...args], { shell: invocation.shell });
   assert.equal(result.ok, true, result.error);

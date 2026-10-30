@@ -46,7 +46,7 @@ test('WSL memory accounting requires a VM owner and the system VM worker in the 
   for (const replacement of [{ ownerSid: 'S-1-5-21-1-2-3-4-5' }, { ownerSid: 'S-1-5-83-0' }, { sessionId: 1 }, { parentPid: 300 }, { name: 'node.exe' }]) {
     assert.equal(verdict([{ ...vm, ...replacement }, parent]).unknown, true);
   }
-  assert.equal(verdict([vm, { ...parent, executablePath: 'C:\\Users\\someone\\vmwp.exe' }]).unknown, true);
+  assert.equal(verdict([vm, { ...parent, executablePath: 'C:\\Users\\me\\vmwp.exe' }]).unknown, true);
   assert.equal(verdict([vm, { ...parent, executablePath: null }]).unknown, true);
 });
 
@@ -100,7 +100,7 @@ test('Windows Hello and Software Protection require their specific service ident
     for (const change of [{ sessionId: 1 }, { parentPid: 999 }, { name: 'unknown-user.exe' }]) {
       assert.equal(verdict([{ ...child, ...change }, parent]).unknown, true);
     }
-    for (const change of [{ name: 'user-host.exe' }, { sessionId: 1 }, { executablePath: 'C:\\Users\\someone\\' + parent.name }]) {
+    for (const change of [{ name: 'user-host.exe' }, { sessionId: 1 }, { executablePath: 'C:\\Users\\me\\' + parent.name }]) {
       assert.equal(verdict([child, { ...parent, ...change }]).unknown, true, 'a mismatched parent cannot establish identity');
     }
     assert.equal(verdict([child]).unknown, true);

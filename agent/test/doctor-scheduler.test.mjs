@@ -16,7 +16,7 @@ test('doctor accepts the installed same-base stable launcher cycle', () => {
   assert.equal(inspect(`"${base}/bin/legionctl" cycle`).ok, true);
   assert.equal(inspect(`${base}/bin/legionctl cycle`).ok, true);
   const template = fs.readFileSync(new URL('../install/legion-control-update.service', import.meta.url), 'utf8');
-  const escapedBase = '/home/user/Legion "test" \\ 100%';
+  const escapedBase = '/home/me/Legion "test" \\ 100%';
   const launcher = `${escapedBase}/bin/legionctl`.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('%', '%%');
   assert.equal(linuxSchedulerCommand(template.replaceAll('@LAUNCHER@', launcher), { base: escapedBase, node }).ok, true);
 });

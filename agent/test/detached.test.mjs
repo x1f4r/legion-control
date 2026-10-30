@@ -27,10 +27,10 @@ test('Windows detached launcher carries the private base and treats paths as lit
 });
 
 test('Windows detached launcher keeps a typographic quote in a path inside its literal', () => {
-  const script = windowsWorkerScript({ node: 'C:\\Program Files\\node.exe', entry: 'C:\\Users\\O\u2019Brien\\agent\\index.mjs', id: 'test-operation', home: 'C:\\Users\\O\u2019Brien\\state', environment: {} });
-  assert.match(script, /\$env:LEGIONCTL_HOME = 'C:\\Users\\O\u2019\u2019Brien\\state'/);
-  assert.match(script, /Set-Location -LiteralPath 'C:\\Users\\O\u2019\u2019Brien\\state'/);
-  assert.match(script, /'C:\\Users\\O\u2019\u2019Brien\\agent\\index.mjs' 'op-run'/);
+  const script = windowsWorkerScript({ node: 'C:\\Program Files\\node.exe', entry: 'C:\\Users\\me\\O\u2019Brien\\agent\\index.mjs', id: 'test-operation', home: 'C:\\Users\\me\\O\u2019Brien\\state', environment: {} });
+  assert.match(script, /\$env:LEGIONCTL_HOME = 'C:\\Users\\me\\O\u2019\u2019Brien\\state'/);
+  assert.match(script, /Set-Location -LiteralPath 'C:\\Users\\me\\O\u2019\u2019Brien\\state'/);
+  assert.match(script, /'C:\\Users\\me\\O\u2019\u2019Brien\\agent\\index.mjs' 'op-run'/);
 });
 
 test('a Linux worker starts in a scope of the user\'s systemd manager, and in place without one', () => {

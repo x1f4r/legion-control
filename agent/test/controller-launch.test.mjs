@@ -111,7 +111,7 @@ test('the grammar is part of the launch value, the raw fields are not', async ()
 test('the launcher migration of a held tuple is accepted, and nothing else like it is', async () => {
   stored(await pushOver((document) => { system(document, 'tower', 'linux').agent = ['/usr/bin/node', LAUNCHER]; }));
   refused(await pushOver((document) => { system(document, 'tower', 'linux').agent = ['/usr/local/bin/node', LAUNCHER]; }), ['machines[tower].systems[linux]']);
-  refused(await pushOver((document) => { system(document, 'tower', 'linux').agent = ['/usr/bin/node', '/home/other/.legion-control/bin/launcher.mjs']; }), ['machines[tower].systems[linux]']);
+  refused(await pushOver((document) => { system(document, 'tower', 'linux').agent = ['/usr/bin/node', '/home/me/other/.legion-control/bin/launcher.mjs']; }), ['machines[tower].systems[linux]']);
   // Back from the launcher to the entry is never a migration.
   refused(await pushOver((document) => { system(document, 'pi', 'linux').agent = ['node', OLD_ENTRY]; }), ['machines[pi].systems[linux]']);
   assert.equal(isLauncherMigration({ agent: ['node', '/a/../b/agent/src/index.mjs'], grammar: 'posix' }, { agent: ['node', '/a/../b/bin/launcher.mjs'], grammar: 'posix' }), false);
