@@ -6,7 +6,8 @@ import test from 'node:test';
 // What CI does cannot run here, but what it is told to do can be read. These hold the workflow to
 // the rules its comments state, so a change that breaks one fails on the desk and not in the run.
 const repository = path.resolve(import.meta.dirname, '..');
-const read = (file) => fs.readFileSync(path.join(repository, file), 'utf8');
+// A Windows checkout may give the workflow CRLF line endings; every rule below is read per line.
+const read = (file) => fs.readFileSync(path.join(repository, file), 'utf8').replaceAll('\r\n', '\n');
 const workflows = fs.readdirSync(path.join(repository, '.github', 'workflows')).filter(name => /\.ya?ml$/.test(name)).map(name => `.github/workflows/${name}`);
 const checks = read('.github/workflows/checks.yml');
 
