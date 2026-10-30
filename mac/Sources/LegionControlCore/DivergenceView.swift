@@ -65,6 +65,7 @@ struct DivergenceView: View {
                 if divergence.isDifferentSetup {
                     Button("Replace its copy with mine") { model.replaceSetupOnPeer(divergence) }
                         .buttonStyle(.borderedProminent)
+                        .disabled(divergence.replaceBlocker != nil)
                 } else {
                     Button("Merge") { apply(choices) }
                         .buttonStyle(.borderedProminent)
@@ -77,7 +78,7 @@ struct DivergenceView: View {
             }
 
             QuietNote(text: divergence.isDifferentSetup
-                ? "Replacing is the explicit decision to put this setup id on that peer. Taking theirs keeps this device's current document in the revision history first."
+                ? divergence.replaceBlocker ?? "Replacing is the explicit decision to put this setup id on that peer. Taking theirs keeps this device's current document in the revision history first."
                 : "Merging and \"keep mine\" both produce a new revision that descends from both sides, so every machine accepts it without anything being overwritten. \"Take theirs\" keeps the version it replaces in the revision history.")
                 .padding(.top, 12)
 

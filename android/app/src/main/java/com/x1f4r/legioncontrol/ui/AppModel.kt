@@ -226,6 +226,9 @@ class AppModel(
     val setupErrors: List<DocumentProblem>
         get() = services.acceptance.value?.errors.orEmpty()
 
+    /** Why this device's setup cannot replace another machine's copy, or null when it can. */
+    val replaceProblem: String? get() = whyNotReplace(setupErrors)
+
     private val fleet = object : FleetContext {
         override val machines: List<Machine> get() = clients.map { it.machine }
         override val sites: List<SiteConfig> get() = this@AppModel.sites
@@ -652,6 +655,11 @@ class AppModel(
     fun replaceTheirSetup() {
         val clash = identityClash ?: return
         val client = clients.firstOrNull { it.machine.id == clash.machineId } ?: return
+        // Asked of the setup as it is now, not only when the page was drawn.
+        replaceProblem?.let {
+            configError = it
+            return
+        }
         val document = services.document.value ?: return
         val identity = document.identity ?: return
         scope.launch {
@@ -892,4 +900,15 @@ class NotificationSettings(context: Context) {
     private companion object {
         const val KEY = "operation-notifications"
     }
+}
+
+/**
+ * Why a setup with [errors] cannot be sent over another machine's copy with `--replace`, or null
+ * when it can. A device whose setup has a section 9.7 error pushes nothing until it is fixed
+ * (contract section 9.5), and a replacement least of all: an agent before 3.1.0 stores whatever it
+ * is sent.
+ */
+internal fun whyNotReplace(errors: List<DocumentProblem>): String? {
+    val first = errors.firstOrNull() ?: return null
+    return "This device's setup has an error to fix in the editor before it can replace another copy: ${first.message}"
 }

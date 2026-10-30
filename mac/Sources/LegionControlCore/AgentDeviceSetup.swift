@@ -35,6 +35,11 @@ struct SetupDivergence: Sendable, Identifiable {
 
     var id: String { machineId }
 
+    /// Why this device's setup cannot be sent over the peer's, when it cannot: a document with a
+    /// section 9.7 error pushes nothing until it is fixed (section 9.5), and a replacement least of
+    /// all, because an agent before 3.1.0 stores whatever it is sent.
+    var replaceBlocker: String? { mine.replaceBlocker }
+
     /// What the sheet says about the common ancestor. With a blocker nothing is decided entry by
     /// entry, so it says only whether one was found: the blocker says why the two cannot be
     /// compared, and that may be this very ancestor, kept here but refused by peer intake.
@@ -45,6 +50,15 @@ struct SetupDivergence: Sendable, Identifiable {
         case (false, true): "not kept on this device"
         case (true, true): "found"
         }
+    }
+}
+
+extension ControllerDocument {
+    /// Why this document cannot be sent over a peer's setup with `--replace`, as the sentence to
+    /// show, or nil when it can.
+    var replaceBlocker: String? {
+        guard let error = errors.first else { return nil }
+        return "This device's setup has an error to fix in the editor before it can replace another copy: \(error.message)"
     }
 }
 
@@ -177,6 +191,10 @@ extension AgentDevice {
 
     func requestSetupReplacement() {
         guard case .conflict(let reason) = setupSharing else { return }
+        if let problem = controllerConfig?()?.replaceBlocker {
+            setStatus(problem, isError: true)
+            return
+        }
         ask?(PendingDialog(
             id: "replace-setup-\(historyMachineId)",
             title: "Replace the setup \(setupHolder) is holding?",
@@ -192,6 +210,11 @@ extension AgentDevice {
     /// their authors in it.
     func replaceSetup() {
         guard let local = controllerConfig?() else { return }
+        // Asked of the setup as it is now, not only of the one a sheet was built over.
+        if let problem = local.replaceBlocker {
+            setStatus(problem, isError: true)
+            return
+        }
         let generation = core.agentGeneration
         perform("Replacing the setup on \(name)", kind: .shareSetup, subject: "setup") { _ in
             do {

@@ -686,11 +686,11 @@ fun IdentityClashSection(app: AppModel) {
 
     SectionHeading("Settle it")
     Actions {
-        PlainAction("Replace ${clash.machineName}'s copy", enabled = true, destructive = true) {
+        PlainAction("Replace ${clash.machineName}'s copy", enabled = app.replaceProblem == null, destructive = true) {
             app.replaceTheirSetup()
         }
         PlainAction("Follow their setup instead", enabled = true) { app.adoptTheirSetup() }
         PlainAction("Leave it", enabled = true) { app.dismissIdentityClash() }
     }
-    app.configError?.let { QuietText(it, Modifier.padding(top = 4.dp)) }
+    (app.configError ?: app.replaceProblem)?.let { QuietText(it, Modifier.padding(top = 4.dp)) }
 }

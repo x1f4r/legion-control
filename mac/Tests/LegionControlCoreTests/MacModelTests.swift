@@ -562,6 +562,42 @@ struct MacModelTests {
         #expect(runner.sent.contains { $0.contains("config") && $0.contains("--replace") })
     }
 
+    @Test("a setup with an error replaces nothing, asked from the sheet or straight away")
+    func setupWithErrorReplacesNothing() async throws {
+        // Section 9.5: a device whose setup has a section 9.7 error pushes nothing until it is
+        // fixed, and a replacement least of all, because an agent before 3.1.0 stores whatever it
+        // is sent.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.status)
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var broken = Self.document
+        broken.errors = [DocumentAcceptance.Problem(code: "helper-unknown", path: "machines[0].wake.helpers[0]",
+                                                    message: "the helper names no machine")]
+        model.controllerConfig = { broken }
+        var asked: PendingDialog?
+        model.ask = { asked = $0 }
+
+        await model.refresh()
+        model.core.setup.verdict = SetupSync.Verdict(.diverged)
+        model.requestSetupReplacement()
+        #expect(asked == nil)
+        #expect(model.noteIsError)
+        #expect(model.note?.contains("the helper names no machine") == true)
+
+        model.replaceSetup()
+        await Self.settle(model)
+        #expect(!runner.sent.contains { $0.contains("--replace") })
+
+        let divergence = SetupDivergence(machineId: "mac", machineName: "This Mac", mine: broken, theirsBytes: Data("{}\n".utf8),
+                                         theirsHash: "fedcba9876543210", theirsIdentity: ControllerIdentity(id: "setup-other", revision: 4, lineage: []),
+                                         baseBytes: nil, differences: [], isDifferentSetup: true, mergeBlocker: nil)
+        #expect(divergence.replaceBlocker?.contains("the helper names no machine") == true)
+        var fixed = divergence
+        fixed.mine = Self.document
+        #expect(fixed.replaceBlocker == nil)
+    }
+
     // MARK: - A different agent
 
     /// A setup with an identity, so it takes part in reconciliation (section 9.5, rule 3).
