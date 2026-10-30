@@ -294,7 +294,15 @@ export function authorize(commandLine, { entry = ownEntry() } = {}) {
   } catch {
     requested = path.resolve(tokens[1]);
   }
-  if (requested !== entry && requested !== stableEntryAlias(entry)) {
+  // The entry it is compared with is named the same way, whatever spelling the
+  // caller handed in.
+  let named;
+  try {
+    named = realPath(entry);
+  } catch {
+    named = entry;
+  }
+  if (requested !== named && requested !== stableEntryAlias(entry)) {
     return refuse(`this key may only run ${entry}, and ${JSON.stringify(tokens[1])} is not it`, tokens[1]);
   }
 
