@@ -72,8 +72,15 @@ enum Outcome: String, Sendable, Equatable, CaseIterable {
         if successActions.contains(action) { return .succeeded }
         if deferredActions.contains(action) { return .deferred }
         switch action {
-        // A cancelled request was itself deferred; a cancel that worked succeeded.
-        case "cancelled": return x.reasonCode == "cancelled" ? .deferred : .succeeded
+        // A cancelled request was itself deferred, and a cancel that worked succeeded. One the agent
+        // could not safely put in place of the request before it may or may not have.
+        case "cancelled":
+            switch x.reasonCode {
+            case nil: return .succeeded
+            case "cancelled": return .deferred
+            case "internal": return .unknown
+            default: return .failed
+            }
         // The old version is back and running: a success only when nothing went wrong.
         case "rolled-back": return x.reasonCode == nil ? .succeeded : .failed
         case "interrupted": return .unknown

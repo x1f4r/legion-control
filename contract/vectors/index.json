@@ -118,12 +118,12 @@
       "groups": [
         {
           "group": "reduce",
-          "cases": 59,
+          "cases": 61,
           "consumers": {
-            "agent": 59,
-            "mac": 59,
-            "desktop": 59,
-            "android": 59
+            "agent": 61,
+            "mac": 61,
+            "desktop": 61,
+            "android": 61
           }
         },
         {

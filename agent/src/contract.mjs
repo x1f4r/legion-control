@@ -197,7 +197,11 @@ export function outcomeOf(x) {
   if (PENDING_ACTIONS.has(action)) return 'pending';
   if (SUCCESS_ACTIONS.has(action)) return 'succeeded';
   if (DEFERRED_ACTIONS.has(action)) return 'deferred';
-  if (action === 'cancelled') return reasonCode === REASON.cancelled ? 'deferred' : 'succeeded';
+  if (action === 'cancelled') {
+    if (reasonCode == null) return 'succeeded';
+    if (reasonCode === REASON.cancelled) return 'deferred';
+    return reasonCode === REASON.internal ? 'unknown' : 'failed';
+  }
   if (action === 'rolled-back') return reasonCode == null ? 'succeeded' : 'failed';
   if (action === 'interrupted') return 'unknown';
   if (action === 'failed') return reasonCode === REASON.timedOut || reasonCode === REASON.interrupted ? 'unknown' : 'failed';

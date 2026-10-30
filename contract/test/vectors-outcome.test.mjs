@@ -20,9 +20,14 @@ referenceDefect('already-running read as a success', 'tools/outcome.mjs',
   /already-running: tools\/outcome\.mjs gives \{"outcome":"succeeded"\}/);
 
 referenceDefect('a cancel that ignores its reason code', 'tools/outcome.mjs',
-  "if (action === 'cancelled') return reasonCode === 'cancelled' ? 'deferred' : 'succeeded';",
-  "if (action === 'cancelled') return 'succeeded';",
-  /cancelled-request: tools\/outcome\.mjs gives \{"outcome":"succeeded"\}/);
+  "    if (reasonCode === 'cancelled') return 'deferred';\n",
+  '',
+  /cancelled-request: tools\/outcome\.mjs gives \{"outcome":"failed"\}/);
+
+referenceDefect('a cancellation the agent could not finish read as a success', 'tools/outcome.mjs',
+  "return reasonCode === 'internal' ? 'unknown' : 'failed';",
+  "return 'succeeded';",
+  /cancelled-internal: tools\/outcome\.mjs gives \{"outcome":"succeeded"\}/);
 
 referenceDefect('a stated outcome passed through whatever it says', 'tools/outcome.mjs',
   "if (typeof x.outcome === 'string') return OUTCOMES.includes(x.outcome) ? x.outcome : 'unknown';",

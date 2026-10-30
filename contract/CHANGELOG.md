@@ -115,6 +115,11 @@ not, the agent now answers as they say.
 - A lock `conflict` answers `ok: true`.
 - A finished record's `result.ok` is true exactly when its `reasonCode` is
   null. A failed cycle carries the code of its first failed service.
+- A queued request the agent cancelled because it could not safely replace the
+  one before it (`cancelled` with `internal`) reduces to `unknown`, not
+  `succeeded`: section 5.6 reads `cancelled` by its reason code, with null
+  `succeeded`, `cancelled` `deferred`, `internal` `unknown` and any other
+  `failed`.
 - `cancel` of a running operation answers `conflict` with
   `reasonCode: "already-running"`, not `operation-in-progress`.
 - `--detach` replies carry every key of their command's shape, and a fresh

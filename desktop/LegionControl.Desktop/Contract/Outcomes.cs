@@ -102,8 +102,15 @@ public static class Outcomes
         if (DeferredActions.Contains(word)) return OperationOutcome.Deferred;
         return word switch
         {
-            // A cancelled request was itself deferred; a cancel that worked succeeded.
-            "cancelled" => code == "cancelled" ? OperationOutcome.Deferred : OperationOutcome.Succeeded,
+            // A cancelled request was itself deferred, and a cancel that worked succeeded. One the
+            // agent could not safely put in place of the request before it may or may not have.
+            "cancelled" => code switch
+            {
+                null => OperationOutcome.Succeeded,
+                "cancelled" => OperationOutcome.Deferred,
+                "internal" => OperationOutcome.Unknown,
+                _ => OperationOutcome.Failed,
+            },
             // The old version is back and running: success only when nothing went wrong.
             "rolled-back" => code is null ? OperationOutcome.Succeeded : OperationOutcome.Failed,
             "interrupted" => OperationOutcome.Unknown,
