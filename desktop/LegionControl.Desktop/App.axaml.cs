@@ -41,6 +41,15 @@ public partial class App : Application
         {
             _model = new AppModel();
             _window = new MainWindow(_model);
+            try
+            {
+                _window.Icon = AppIcon.Icon(256);
+            }
+            catch (Exception error)
+            {
+                // The title bar then shows the platform's own icon, which is no reason not to start.
+                AppLog.Write("drawing the window's icon", error);
+            }
             desktop.MainWindow = _window;
             // Exit runs for both ordinary closing and forced Shutdown (updates/debug flags),
             // before Avalonia stops its dispatcher. D-Bus tray observers need that dispatcher
@@ -82,7 +91,7 @@ public partial class App : Application
     {
         try
         {
-            _tray = new TrayIcon { ToolTipText = "Legion Control", Menu = BuildTrayMenu(desktop), IsVisible = true };
+            _tray = new TrayIcon { Icon = AppIcon.Icon(64), ToolTipText = "Legion Control", Menu = BuildTrayMenu(desktop), IsVisible = true };
             _tray.Clicked += (_, _) => ShowWindow();
             TrayIcon.SetIcons(this, new TrayIcons { _tray });
             _trayChanged = () => Dispatcher.UIThread.Post(() =>
