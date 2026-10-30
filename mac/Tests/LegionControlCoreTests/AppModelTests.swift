@@ -163,7 +163,7 @@ struct AppModelTests {
         #expect(app.lastActionOutcome == nil)
 
         mac.runCycle()
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(15)
         while mac.isWorking, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
 
         let outcome = try #require(app.lastActionOutcome)

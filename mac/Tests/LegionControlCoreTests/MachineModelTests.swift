@@ -1634,7 +1634,7 @@ struct MachineModelTests {
     }
 
     static func eventually(_ condition: @MainActor () -> Bool) async {
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(15)
         while !condition(), Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
     }
 

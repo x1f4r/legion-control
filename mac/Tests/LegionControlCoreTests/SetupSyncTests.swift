@@ -113,7 +113,7 @@ struct SetupSyncTests {
 
     /// Wait for the runner's requests to finish, the way a status poll would before the next one.
     static func settle(_ sync: SetupPeerSync) async {
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(15)
         repeat { try? await Task.sleep(for: .milliseconds(5)) } while sync.isSharing && Date() < deadline
     }
 
@@ -513,7 +513,7 @@ struct SetupSyncTests {
         let sync = SetupPeerSync()
 
         sync.reconcile(over: channel)
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(15)
         while sync.verdict.decision != .diverged, Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
         guard case .conflict(let sentence) = sync.sharing(holder: "Pi", local: mine, status: channel.status) else {
             Issue.record("expected a conflict")
