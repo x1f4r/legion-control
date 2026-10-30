@@ -38,6 +38,7 @@ import {
   resolveDeadline,
 } from './contract.mjs';
 import { runAction } from './actions.mjs';
+import { windowsPowerShellModulePath } from './process-runner.mjs';
 import { MAX_CONTROLLER_BYTES, readController, readControllerMeta, storeController } from './controller.mjs';
 import { buildBundle, runDoctor } from './doctor.mjs';
 import { reportedFloor } from './floor.mjs';
@@ -1657,6 +1658,11 @@ async function commandDispatch() {
 }
 
 async function main() {
+  // Every powershell.exe this agent starts inherits this, and one that finds
+  // PowerShell 7's module folders first cannot load the modules it needs.
+  if (process.platform === 'win32' && process.env.PSModulePath) {
+    process.env.PSModulePath = windowsPowerShellModulePath(process.env.PSModulePath);
+  }
   const argv = process.argv.slice(2);
   const { payload, exitCode } = argv[0] === 'dispatch' ? await commandDispatch() : await execute(argv);
   emit(payload, exitCode);

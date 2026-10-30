@@ -94,6 +94,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Windows PowerShell started by a program PowerShell 7 started inherits
+# PowerShell 7's PSModulePath, which names PowerShell 7's own copies of the
+# built-in modules first. Windows PowerShell cannot load those, and Get-Acl
+# then fails with "the module could not be loaded". So this process looks for
+# modules only where Windows PowerShell keeps them.
+if ($PSVersionTable.PSEdition -ne 'Core' -and $env:PSModulePath) {
+    $env:PSModulePath = (@($env:PSModulePath -split ';') |
+        Where-Object { $_ -and $_ -notmatch '\\PowerShell\\(7[^\\]*\\)?Modules\\?$' }) -join ';'
+}
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------

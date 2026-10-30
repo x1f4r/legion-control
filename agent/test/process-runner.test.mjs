@@ -16,7 +16,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { producedOutcome } from '../src/contract.mjs';
 import { withOperation } from '../src/operate.mjs';
 import { beginOperation, bootIdentity, readOperation, updateOperation, wireRecord } from '../src/operations.mjs';
-import { describeFailure, ledgerPath, powerShellLiteral, runMutation, unsettledWork, withOperationContext } from '../src/process-runner.mjs';
+import { describeFailure, ledgerPath, powerShellLiteral, runMutation, unsettledWork, windowsPowerShellModulePath, withOperationContext } from '../src/process-runner.mjs';
 import { parseProcessStart } from '../src/state.mjs';
 import { deadPid, withHome } from './helpers.mjs';
 import { CONTRACT } from './vectors.mjs';
@@ -540,4 +540,19 @@ test('a PowerShell literal quotes every element as the contract\'s PowerShell co
   const lines = vectors.groups.commandLines.filter((entry) => entry.input.grammar === 'powershell' && entry.expect.line !== null);
   assert.ok(lines.some((entry) => /[\u2018-\u201b]/.test(entry.input.argv.join(''))), 'the corpus covers the typographic quotes');
   for (const entry of lines) assert.equal(`& ${entry.input.argv.map(powerShellLiteral).join(' ')}`, entry.expect.line, entry.name);
+});
+
+test('Windows PowerShell is never handed the module folders PowerShell 7 puts first', () => {
+  const windows = 'C:\\Program Files\\WindowsPowerShell\\Modules;C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\Modules';
+  const seven = [
+    'C:\\Users\\me\\Documents\\PowerShell\\Modules',
+    'C:\\Program Files\\PowerShell\\Modules',
+    'c:\\program files\\powershell\\7\\Modules',
+    'C:\\Program Files\\PowerShell\\7-preview\\Modules\\',
+  ];
+  assert.equal(windowsPowerShellModulePath([...seven, windows].join(';')), windows);
+  // Anything else stays where it was, a folder of one's own included.
+  assert.equal(windowsPowerShellModulePath(`D:\\Tools\\Modules;${windows};`), `D:\\Tools\\Modules;${windows}`);
+  assert.equal(windowsPowerShellModulePath(windows), windows);
+  assert.equal(windowsPowerShellModulePath(undefined), undefined);
 });

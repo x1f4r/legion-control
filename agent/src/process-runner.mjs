@@ -81,6 +81,19 @@ export function powerShellLiteral(value) {
  * command started, which a probe can live with and a mutation cannot: every
  * command that changes the machine goes through runMutation, below, instead.
  */
+/**
+ * PSModulePath as Windows PowerShell needs it, without the folders PowerShell 7
+ * puts first in its own sessions. Windows PowerShell started by a program that
+ * PowerShell 7 started inherits that value, finds PowerShell 7's copies of the
+ * built-in modules before its own, and cannot load them: Get-Acl and
+ * Get-CimInstance then fail with "the module could not be loaded". PowerShell 7
+ * puts its folders back whenever it starts, so nothing it runs loses them.
+ */
+export function windowsPowerShellModulePath(value) {
+  if (typeof value !== 'string') return value;
+  return value.split(';').filter((entry) => entry && !/\\PowerShell\\(?:7[^\\]*\\)?Modules\\?$/i.test(entry)).join(';');
+}
+
 export function runCommand(file, args = [], options = {}) {
   const result = spawnSync(file, args, {
     encoding: 'utf8',

@@ -6,7 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { checkoutFiles } from '../scripts/checkout-files.mjs';
-import { powerShellLiteral } from '../agent/src/process-runner.mjs';
+import { powerShellLiteral, windowsPowerShellModulePath } from '../agent/src/process-runner.mjs';
 
 const repository = path.resolve(import.meta.dirname, '..');
 // Without carriage returns, so a checkout with Windows line endings reads the same.
@@ -24,6 +24,16 @@ test('Windows installer stages before moving live and uses the stable cycle laun
   assert.match(installer, /New-ScheduledTaskAction -Execute \$NodeExe -Argument \$LauncherArguments/);
   assert.match(installer, /inert defaults apply \(no services, no boot targets, automatic maintenance off\)/);
   assert.doesNotMatch(installer, /contract requires space free paths/i);
+});
+
+test('the Windows installer looks for modules only where Windows PowerShell keeps them', () => {
+  // The same folders the agent leaves out of every powershell.exe it starts.
+  const pattern = /-notmatch '([^']+)'/.exec(installer)?.[1];
+  assert.ok(pattern, 'the installer filters PSModulePath');
+  assert.match(installer, /\$PSVersionTable\.PSEdition -ne 'Core' -and \$env:PSModulePath/);
+  const agent = fs.readFileSync(path.join(repository, 'agent', 'src', 'process-runner.mjs'), 'utf8');
+  const theirs = /!\/([^/]+)\/i\.test\(entry\)/.exec(agent)?.[1];
+  assert.equal(pattern, theirs?.replace('(?:', '('));
 });
 
 test('scheduler template invokes only the stable launcher and cycles all services', () => {
@@ -313,8 +323,13 @@ function assertSays(result, ...phrases) {
 
 // What Windows PowerShell answers to `script`, read as JSON. Values reach it through the
 // environment, so nothing has to be quoted for it.
+// The installer is left the environment it was given, PowerShell 7's module folders included when
+// CI runs this from PowerShell 7, since it has to cope with that; these checks only have to answer.
 function powershellJson(script, env) {
-  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 60000, env: { ...process.env, ...env } });
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8', timeout: 60000,
+    env: { ...process.env, PSModulePath: windowsPowerShellModulePath(process.env.PSModulePath), ...env },
+  });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   return JSON.parse(result.stdout);
 }
