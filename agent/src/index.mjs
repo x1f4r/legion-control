@@ -88,6 +88,15 @@ const always = () => true;
  * what a broken config.json refuses. `changes` says whether one invocation
  * asks for a change, and so states an outcome (contract section 5.6): a dry
  * run, a bundle check and a read of a mutating command's setting do not.
+ *
+ * Three more say how a mutating command's invocation meets config.json.
+ * `readOnly` names the ones that promise to change nothing, so loading the
+ * file leaves even its last good copy alone; a command that cannot mutate
+ * promises that always. `withoutConfig` names the ones that still answer when
+ * the file cannot be used, because what they do never reads it. `prepare`
+ * settles what has to be settled before anything is read at all, and a reply
+ * from it answers the invocation there and then.
+ *
  * `run` answers a validated invocation, given the loaded configuration.
  */
 const COMMANDS = {
@@ -142,6 +151,7 @@ const COMMANDS = {
   cycle: {
     flags: ['dry-run', 'force'], options: ['op'], mutates: true, summary: 'the scheduled maintenance cycle over every eligible service',
     changes: (positional, flags) => !flags.has('dry-run'),
+    readOnly: (positional, flags) => flags.has('dry-run'),
     run: ({ config, flags, options }) => commandCycle(config, flags, options),
   },
   'auto-update': {
@@ -152,6 +162,7 @@ const COMMANDS = {
   policy: {
     flags: [], options: ['service'], mutates: true, summary: 'read the update policy; "policy set" reads a JSON patch from stdin',
     changes: (positional) => positional[0] === 'set',
+    readOnly: (positional) => positional[0] === undefined,
     run: ({ config, positional, options }) => commandPolicy(config, positional, options),
   },
   'service-config': {
@@ -197,6 +208,10 @@ const COMMANDS = {
     options: ['controller-id', 'revision'],
     mutates: true,
     changes: (positional) => positional[0] === 'set',
+    // The setup document is a file of its own, which a broken config.json
+    // leaves readable; only a replacement waits for a usable one.
+    readOnly: (positional) => positional[0] !== 'set',
+    withoutConfig: (positional) => positional[0] !== 'set',
     summary: 'the stored setup document; "config set" replaces it from stdin, "config meta" reads its identity',
     run: ({ positional, flags, options }) => commandConfig(positional, flags, options),
   },
@@ -205,6 +220,12 @@ const COMMANDS = {
     options: ['from', 'op'],
     mutates: true,
     changes: (positional, flags) => !flags.has('check'),
+    // A bundle check reads only the bundle. The bootstrap install takes over
+    // from an older agent, whose config.json this one may not accept yet, and
+    // runs from the tree it was unpacked to, which says where it is to live.
+    readOnly: (positional, flags) => flags.has('check'),
+    withoutConfig: (positional, flags) => flags.has('check') || flags.has('install'),
+    prepare: ({ flags }) => (flags.has('install') ? settleBootstrapBase() : null),
     summary: 'replace this agent from a signed bundle',
     run: ({ config, flags, options }) => commandSelfUpdate(config, flags, options),
   },
@@ -1232,6 +1253,18 @@ async function commandBundle(loaded) {
 // Self-update
 // ---------------------------------------------------------------------------
 
+/**
+ * Point this process at the base the bootstrap install belongs to, which is
+ * the one it was unpacked into, before config.json or anything else is read
+ * from there. A refusal when the tree is not where an install has to run from.
+ */
+function settleBootstrapBase() {
+  const layout = resolveBootstrapLayout(import.meta.url, process.env.LEGIONCTL_HOME ?? null);
+  if (!layout.ok) return badArgument(layout.error, { command: 'self-update', argument: '--install' });
+  process.env.LEGIONCTL_HOME = layout.base;
+  return null;
+}
+
 async function commandSelfUpdate(config, flags, options) {
   const modes = ['check', 'rollback', 'install'].filter((flag) => flags.has(flag));
   if (modes.length > 1 || (flags.has('install') && (flags.has('stdin') || options.has('from')))) {
@@ -1535,12 +1568,8 @@ async function answer(command, positional, flags, options) {
 
   if (meta.beforeConfig) return meta.run({ positional, flags, options });
 
-  const bootstrapInstall = command === 'self-update' && flags.has('install');
-  if (bootstrapInstall) {
-    const layout = resolveBootstrapLayout(import.meta.url, process.env.LEGIONCTL_HOME ?? null);
-    if (!layout.ok) return badArgument(layout.error, { command: 'self-update', argument: '--install' });
-    process.env.LEGIONCTL_HOME = layout.base;
-  }
+  const prepared = meta.prepare?.({ positional, flags, options }) ?? null;
+  if (prepared) return prepared;
 
   // Everything except version and help touches a real machine, so refuse early
   // and clearly on a platform this agent was never written for.
@@ -1552,19 +1581,14 @@ async function answer(command, positional, flags, options) {
     );
   }
 
-  // Read-only commands promise to change nothing, including the last-good copy.
-  const controllerRead = command === 'config' && positional[0] !== 'set';
-  const bundleCheck = command === 'self-update' && flags.has('check');
-  const readOnlyInvocation = !meta.mutates || controllerRead || bundleCheck ||
-    (command === 'policy' && positional[0] === undefined) ||
-    (command === 'cycle' && flags.has('dry-run'));
-  const loaded = loadConfig({ readOnly: readOnlyInvocation });
+  // Read-only invocations promise to change nothing, including the last-good copy.
+  const loaded = loadConfig({ readOnly: meta.readOnly?.(positional, flags) ?? !meta.mutates });
   if (loaded.config) systemIdentity = loaded.config.system;
 
   // A machine whose configuration cannot be read can still be inspected, and
   // every inspection says why the rest is refused. Nothing that would change it
   // runs on a configuration nobody can read.
-  if (meta.mutates && !controllerRead && !bundleCheck && !loaded.ok && !bootstrapInstall) {
+  if (meta.mutates && !loaded.ok && !meta.withoutConfig?.(positional, flags)) {
     const problems = loaded.problems ?? [];
     // The file is there and unusable. `config-missing` is reserved for a machine
     // that has no config at all, and that machine is inert rather than broken —
