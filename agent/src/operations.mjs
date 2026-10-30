@@ -31,11 +31,13 @@ import { acquireMutex, mutexPath } from './mutex.mjs';
 import { ownStartTime, processIsAlive, processStartTicks, writeJsonAtomic } from './state.mjs';
 
 /**
- * How many finished records are kept whatever they say, how long one that
- * failed or whose outcome is unknown is kept however many came after it, and
- * the longest any record is kept (pruneOperations).
+ * How many finished records are kept whatever they say, how many of those a
+ * cycle writes saying the same thing again are kept besides the first, how
+ * long one that failed or whose outcome is unknown is kept however many came
+ * after it, and the longest any record is kept (pruneOperations).
  */
 export const HISTORY_LIMIT = 200;
+export const REPEAT_LIMIT = 3;
 export const FAILURE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** A queued request with no expiry of its own, and the bounds of any it names. */
@@ -1079,17 +1081,53 @@ export function servicesNeedingRecovery(records) {
 // Retention
 // ---------------------------------------------------------------------------
 
+/** How a scheduled update ends when it left the service as it was: nothing new, or not now. */
+const ROUTINE_ACTIONS = new Set(['noop', 'deferred']);
+
+/**
+ * What a record says again, or null when it is news.
+ *
+ * A quarter-hourly cycle writes a record of its own and one for every service
+ * it looks at, and most of them say what the one before said: nothing was new,
+ * the machine was busy, the registry did not answer. Only what the scheduler
+ * did can repeat; what a person asked for is news however often they ask. Of
+ * that, only a record that changed nothing or failed is a repeat, told by how
+ * it ended: the kind, the service, the action, the reason and the versions.
+ * An update that installed something never repeats, and neither does a cycle
+ * that ran one.
+ */
+function repeatOf(record) {
+  if (record.mode !== 'scheduled') return null;
+  const result = record.result ?? {};
+  const routine =
+    record.kind === 'cycle'
+      ? result.action === 'cycled' && Array.isArray(record.children) && record.children.every((child) => ROUTINE_ACTIONS.has(child?.action))
+      : record.kind === 'update' && ROUTINE_ACTIONS.has(result.action);
+  if (!routine && !['failed', 'unknown'].includes(recordOutcome(record))) return null;
+  return JSON.stringify([record.kind, record.service ?? null, result.action ?? null, result.reasonCode ?? null, record.from ?? null, record.to ?? null]);
+}
+
 /**
  * Let go of finished records nobody needs any more.
  *
- * The newest HISTORY_LIMIT are kept, whatever they say. That alone was a
- * count, and a quarter-hourly cycle writes a record of its own and one for
- * every service it looks at, so two services filled it in about seventeen
- * hours: a failure on Friday night was gone before anybody looked on Saturday.
- * So a record that failed, or whose outcome is unknown, is kept for a week
- * however many came after it; what that can add is bounded by the same clock,
- * at worst a week of cycles that all failed. Nothing is kept past thirty days,
- * and a record still owing a service its recovery is never let go.
+ * Retention was the newest HISTORY_LIMIT, whatever they said. Two services and
+ * their cycle filled that in about seventeen hours, almost every record of it
+ * a cycle saying nothing was new, so a failure on Friday night was gone before
+ * anybody looked on Saturday, and while it lasted it was listed behind them.
+ *
+ * So of the records that say again what an earlier one said (repeatOf), only
+ * the first, which says since when, and the newest REPEAT_LIMIT, which say it
+ * still is, are kept; the rest go however new they are. Of what is left, the
+ * newest HISTORY_LIMIT stay whatever they say, and a failure, or an outcome
+ * nobody knows, stays a week however many came after it. What that can add is
+ * bounded by how many different ways things failed in a week, as a failure
+ * that only repeats keeps four records. Nothing is kept past thirty days, and
+ * a record still owing a service its recovery is never let go.
+ *
+ * Letting a repeat go never changes what recovery reads. A later update that
+ * found the service on its target is what tells it not to roll the service
+ * back (update.mjs), and it asks only whether there is one: the newest of
+ * them is never a repeat that is let go.
  */
 export function pruneOperations({ now = Date.now() } = {}) {
   return withOperationsStore(() => pruneOperationsUnlocked({ now }));
@@ -1112,13 +1150,32 @@ function pruneOperationsUnlocked({ now = Date.now() } = {}) {
   }
   finished.sort((a, b) => String(b.finishedAt ?? b.requestedAt ?? '').localeCompare(String(a.finishedAt ?? a.requestedAt ?? '')));
 
-  const removed = [];
-  finished.forEach((record, index) => {
+  const ageOf = (record) => {
     const at = Date.parse(record.finishedAt ?? record.requestedAt ?? '');
-    const age = Number.isNaN(at) ? 0 : now - at;
-    if (age <= HISTORY_MAX_AGE_MS) {
-      if (index < HISTORY_LIMIT) return;
-      if (['failed', 'unknown'].includes(recordOutcome(record)) && age <= FAILURE_RETENTION_MS) return;
+    return Number.isNaN(at) ? 0 : now - at;
+  };
+  // Newest first, so the last record seen saying something is the first that
+  // said it, of those young enough to be kept at all.
+  const firsts = new Map();
+  for (const record of finished) {
+    const repeat = repeatOf(record);
+    if (repeat && ageOf(record) <= HISTORY_MAX_AGE_MS) firsts.set(repeat, record.id);
+  }
+
+  const removed = [];
+  const repeats = new Map();
+  let kept = 0;
+  for (const record of finished) {
+    const age = ageOf(record);
+    const repeat = repeatOf(record);
+    const seen = repeat && firsts.get(repeat) !== record.id ? (repeats.get(repeat) ?? 0) + 1 : 0;
+    if (seen > 0) repeats.set(repeat, seen);
+    if (age <= HISTORY_MAX_AGE_MS && seen <= REPEAT_LIMIT) {
+      if (kept < HISTORY_LIMIT) {
+        kept += 1;
+        continue;
+      }
+      if (['failed', 'unknown'].includes(recordOutcome(record)) && age <= FAILURE_RETENTION_MS) continue;
     }
     try {
       fs.rmSync(operationPath(record.id), { force: true });
@@ -1126,6 +1183,6 @@ function pruneOperationsUnlocked({ now = Date.now() } = {}) {
     } catch {
       /* it will be reconsidered next time */
     }
-  });
+  }
   return { removed };
 }

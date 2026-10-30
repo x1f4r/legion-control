@@ -626,7 +626,7 @@ test('a failure outlives the newest records by a week, and nothing outlives thir
     finished('aaaaaaa2-3333-4333-8333-333333333333', { ok: false, action: 'interrupted', reasonCode: 'interrupted', message: 'cut off' }, 6);
     finished('aaaaaaa3-3333-4333-8333-333333333333', failed, 8);
     finished('aaaaaaa4-3333-4333-8333-333333333333', { ok: true, action: 'noop', reasonCode: null, message: 'already there' }, 3);
-    // A quarter-hourly cycle's worth of routine records, every one newer.
+    // Two hundred newer records, every one of them news: a person asked for each.
     for (let index = 0; index < ops.HISTORY_LIMIT; index += 1) {
       finished(`${String(index).padStart(8, '0')}-3333-4333-8333-333333333333`, { ok: true, action: 'noop', reasonCode: null, message: 'nothing new' }, index / (4 * 24));
     }
@@ -645,6 +645,126 @@ test('a failure outlives the newest records by a week, and nothing outlives thir
     const history = cli(['history', '--limit', '5'], { home }).payload;
     assert.equal(history.returned, 5);
     assert.equal(history.retained, ops.HISTORY_LIMIT + 2, 'what the machine holds, past the newest it lists');
+  });
+});
+
+/**
+ * Finished records written straight to disk, as many as days of cycles leave,
+ * without a durable write for each. Each is the template with what it says
+ * and when.
+ */
+function plant(ops, template, id, fields, daysAgo) {
+  const at = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString();
+  const record = { ...template, id, ...fields, state: 'finished', phase: 'done', requestedAt: at, startedAt: at, updatedAt: at, finishedAt: at };
+  fs.writeFileSync(ops.operationPath(id), JSON.stringify(record));
+  return id;
+}
+
+/** One record opened and finished the way the agent does, to plant the rest from. */
+function template(ops) {
+  const { record } = ops.beginOperation({ id: 'template-0000-4000-8000-000000000000', ...base });
+  ops.finishOperation(record.id, { ok: true, action: 'noop', reasonCode: null, message: 'a template' });
+  const finished = ops.readOperation(record.id);
+  fs.rmSync(ops.operationPath(record.id));
+  return finished;
+}
+
+const noop = { ok: false, action: 'noop', reasonCode: 'already-on-target', message: 'already on 1.0.0 and healthy', outcome: 'succeeded' };
+const cycled = { ok: true, action: 'cycled', reasonCode: null, message: '0 updated, 1 left alone, 0 failed', outcome: 'succeeded' };
+const offline = { ok: false, action: 'failed', reasonCode: 'latest-unknown', message: 'could not resolve a valid latest version', outcome: 'failed' };
+
+test('what a cycle only says again is let go, so history lists a failure from days ago', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const shape = template(ops);
+    const scheduled = (id, kind, result, daysAgo, extra = {}) =>
+      plant(ops, shape, id, { kind, service: kind === 'cycle' ? null : 'demo', mode: 'scheduled', result, from: null, to: null, ...extra }, daysAgo);
+
+    // Nobody holds the id of a failure a cycle met in the night: history is
+    // the only way to it.
+    const failure = scheduled('fa11ed00-3333-4333-8333-333333333333', 'update', { ...offline, reasonCode: 'apply-failed', message: 'the install failed' }, 2.5, { from: '1.0.0', to: '2.0.0' });
+    const installed = scheduled('1a57a11d-3333-4333-8333-333333333333', 'update', { ok: true, action: 'updated', reasonCode: null, message: 'updated', outcome: 'succeeded' }, 2.2, { from: '0.9.0', to: '1.0.0' });
+    // Two days of cycles since, each with a record of its own and one for the
+    // service it found nothing new for: more than history can list.
+    const ticks = 2 * 24 * 3;
+    const children = [];
+    const cycles = [];
+    for (let tick = 0; tick < ticks; tick += 1) {
+      const daysAgo = (ticks - tick) / (24 * 3);
+      const child = scheduled(`${String(tick).padStart(8, '0')}-4444-4444-8444-444444444444`, 'update', noop, daysAgo, { from: '1.0.0', to: '1.0.0' });
+      children.push(child);
+      cycles.push(scheduled(`${String(tick).padStart(8, '0')}-5555-4555-8555-555555555555`, 'cycle', cycled, daysAgo - 0.001, {
+        children: [{ opId: child, service: 'demo', action: 'noop', reasonCode: 'already-on-target' }],
+      }));
+    }
+    // A person who asks for the same thing over and over is news every time.
+    const asked = [];
+    for (let index = 0; index < 5; index += 1) {
+      asked.push(plant(ops, shape, `a5ced00${index}-3333-4333-8333-333333333333`, { mode: 'manual', result: noop, from: '1.0.0', to: '1.0.0' }, 1 + index / 10));
+    }
+    const before = ops.listOperations({ limit: 200 }).map((record) => record.id);
+    assert.equal(before.length, 200);
+    assert.ok(!before.includes(failure), 'behind them, the failure was out of sight');
+
+    const pruned = ops.pruneOperations();
+    // The first of what repeats says since when, and the newest three that it still is.
+    const kept = (ids) => [ids[0], ...ids.slice(-ops.REPEAT_LIMIT)];
+    const left = [failure, installed, ...asked, ...kept(children), ...kept(cycles)];
+    assert.equal(pruned.removed.length, 2 * ticks - 2 * (ops.REPEAT_LIMIT + 1));
+    assert.deepEqual(ops.listOperations({ limit: 200 }).map((record) => record.id).sort(), left.sort());
+
+    for (const args of [['history', '--limit', '200'], ['history', '--limit', '200', '--kind', 'update', '--service', 'demo']]) {
+      const history = cli(args, { home }).payload;
+      assert.ok(history.operations.some((entry) => entry.id === failure), `${args.join(' ')} lists the failure`);
+    }
+    assert.equal(cli(['history', '--limit', '200'], { home }).payload.retained, left.length);
+    assert.equal(ops.readOperation(children.at(-1)).result.reasonCode, 'already-on-target', 'what recovery reads is kept');
+
+    // And what the next cycles write is let go the same way.
+    const next = scheduled('99999999-4444-4444-8444-444444444444', 'update', noop, 0, { from: '1.0.0', to: '1.0.0' });
+    assert.deepEqual(ops.pruneOperations().removed, [children.at(-ops.REPEAT_LIMIT)]);
+    assert.ok(ops.readOperation(next));
+    assert.ok(ops.readOperation(children[0]), 'the first is kept as long as it is young enough');
+  });
+});
+
+test('a failure that only repeats keeps its first and newest records, and one that differs stays a week beside it', async () => {
+  await withHome(async (home) => {
+    const ops = await fresh('operations.mjs');
+    const shape = template(ops);
+    const scheduled = (id, kind, result, daysAgo, extra = {}) =>
+      plant(ops, shape, id, { kind, service: kind === 'cycle' ? null : 'demo', mode: 'scheduled', result, from: null, to: null, ...extra }, daysAgo);
+
+    // An install that failed on its own, then a machine offline for five
+    // days: every cycle fails, and so does every service it looks at.
+    const different = scheduled('d1ffe7e0-3333-4333-8333-333333333333', 'update', { ...offline, reasonCode: 'apply-failed', message: 'the install failed' }, 6, { from: '1.0.0', to: '2.0.0' });
+    const ticks = 5 * 24 * 4;
+    const children = [];
+    const cycles = [];
+    for (let tick = 0; tick < ticks; tick += 1) {
+      const daysAgo = (ticks - tick) / (24 * 4);
+      children.push(scheduled(`${String(tick).padStart(8, '0')}-4444-4444-8444-444444444444`, 'update', offline, daysAgo, { from: '1.0.0' }));
+      cycles.push(scheduled(`${String(tick).padStart(8, '0')}-5555-4555-8555-555555555555`, 'cycle', { ...offline, message: '0 updated, 0 left alone, 1 failed' }, daysAgo - 0.001, {
+        children: [{ opId: children.at(-1), service: 'demo', action: 'failed', reasonCode: 'latest-unknown' }],
+      }));
+    }
+    // And a failure from before the week, kept only while it is among the newest.
+    const old = scheduled('01d00000-3333-4333-8333-333333333333', 'update', { ...offline, reasonCode: 'apply-failed', message: 'an older install failed' }, 8, { from: '0.9.0', to: '1.0.0' });
+
+    ops.pruneOperations();
+    const kept = (ids) => [ids[0], ...ids.slice(-ops.REPEAT_LIMIT)];
+    assert.deepEqual(ops.listOperations({ limit: 200 }).map((record) => record.id).sort(), [different, old, ...kept(children), ...kept(cycles)].sort());
+    const history = cli(['history', '--limit', '30'], { home }).payload;
+    assert.ok(history.operations.some((entry) => entry.id === different), 'the install that failed is listed beside what repeats');
+    assert.equal(history.retained, 2 + 2 * (ops.REPEAT_LIMIT + 1));
+
+    // Once two hundred newer records are news, a failure is kept for its week and no longer.
+    for (let index = 0; index < ops.HISTORY_LIMIT; index += 1) {
+      plant(ops, shape, `${String(index).padStart(8, '0')}-6666-4666-8666-666666666666`, { mode: 'manual', result: { ...noop, message: `asked ${index}` } }, index / 1000);
+    }
+    const past = ops.pruneOperations().removed;
+    assert.ok(past.includes(old), 'one from eight days ago goes');
+    assert.ok(!past.includes(different), 'one from six days ago does not');
   });
 });
 
