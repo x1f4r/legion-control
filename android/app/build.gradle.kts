@@ -201,6 +201,12 @@ dependencies {
     // Release signatures are checked with Bouncy Castle below, not with this.
     implementation(libs.eddsa)
     implementation(libs.bcprov)
+    constraints {
+        // Not used here, only brought along by sshj, and held to bcprov's release for the reason
+        // gradle/libs.versions.toml gives.
+        implementation(libs.bcpkix)
+        implementation(libs.bcutil)
+    }
     // sshj logs through slf4j. Without a binding, slf4j 2 falls back to a no-op and prints a warning
     // on first use; this sends the same lines to logcat instead, which is where they are useful.
     runtimeOnly(libs.slf4j.android)
