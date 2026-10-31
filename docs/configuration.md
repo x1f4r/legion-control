@@ -280,7 +280,7 @@ every disruptive action and it fails closed: a probe that cannot be read counts 
 | --- | --- | --- |
 | `command` | `command`, `staleHours` | exit code 0 means idle, anything else means busy. If stdout is a JSON object with `busy` and `reason`, those are used |
 | `http` | `port`, `path`, `host`, `busyWhen` | GET the URL; busy when the JSON body's `busyWhen` path (dotted) is truthy |
-| `t3-sqlite` | `home`, `staleHours` (default 6), `allowMissing` | counts running and pending turns and pending approvals in T3 Code's state database |
+| `t3-sqlite` | `home`, `staleHours` (default 6), `allowMissing` | counts running and pending turns, subagents and waiting approvals in T3 Code's state database, `userdata/statev2.sqlite`. The older `userdata/state.sqlite` counts only when it is the only one, or was written after it |
 | `none` | | declared never busy |
 
 **There is no default.** A service with no `busy` block at all is *unmonitored*, which is not the
