@@ -103,7 +103,11 @@ peer: the phone edits and publishes it exactly as the Mac and the desktop do, an
 device whose copy wins by rank. On first launch the Machines page asks for a host, a port and a
 user; **Fetch** runs `config` there with the phone's key and shows every machine's command, key
 file and update source in what comes back. **Confirm** applies it and approves those commands on
-this phone; **Cancel** applies nothing.
+this phone; **Cancel** applies nothing. Only bytes that hash to what the machine reports are shown,
+so a machine whose agent predates 3.1.0 and cannot reproduce its copy's hash has to be updated
+first. On a phone that already has the setup, Fetch catches up rather than edits: a copy made from
+the phone's is taken as the machine stores it, the same copy or an older one changes nothing, and
+one edited separately goes to be merged.
 
 After that it keeps itself in step on every poll. Two things happen without asking, and both
 only along strict descent: the phone pushes to a machine whose copy its own was made from, and
@@ -120,7 +124,10 @@ What passes is exactly what contract section 9.7 accepts, the same on every clie
 with no systems or addresses yet, an address with no id or no user and a wake block with no
 broadcast are warnings that say why something is not driven, never a reason to refuse the setup.
 The machines' endpoints are dialled directly by the app's own ssh client, in the order listed:
-a tunnel address first works from anywhere, a LAN address as the fallback works from home.
+a tunnel address first works from anywhere, a LAN address as the fallback works from home. A
+tailnet address (100.64.0.0/10 or a `*.ts.net` name) that goes unanswered while no VPN on the
+phone routes it is reported as the phone being off the tailnet, not as the machine being off,
+unless the phone is on that machine's own network and its LAN address went unanswered too.
 
 **The public key has to be authorised on every system.** The app generates its own ed25519
 keypair on the phone on first run and keeps the private half in app-private storage, wrapped by

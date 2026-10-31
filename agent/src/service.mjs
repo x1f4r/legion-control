@@ -4,8 +4,10 @@
 // Everything here takes a normalized service object. Nothing in this file knows
 // which product it is looking after.
 
+import { REASON } from './contract.mjs';
 import { detectPlatform } from './paths.mjs';
 import { describeFailure, runMutationArgv, sleep } from './process-runner.mjs';
+import { checkServiceBusy } from './probes/busy.mjs';
 import { checkHealth, describeHealth, healthPort } from './probes/health.mjs';
 import { isRunning, probeProcess, processEvidence, processStartedAt, startProcess, stopProcess, systemctlMutation } from './probes/process.mjs';
 import { NO_RELAY, probeRelay } from './probes/relay.mjs';
@@ -57,6 +59,17 @@ export function livenessOf(service) {
     /* no evidence is a valid answer; the probe keeps its protection */
   }
   return { serviceRunning, startedAt: serviceRunning === true ? processStartedAt(service) : null };
+}
+
+/**
+ * The same evidence for every service on the machine, for a gate that asks
+ * all of them. A state database's leftover row belongs to its own service,
+ * and only that service's liveness can retire it, so a gate that passed only
+ * the service it was about to act on kept every other service's dead rows
+ * blocking it.
+ */
+export function machineLiveness(config) {
+  return Object.fromEntries(config.services.map((service) => [service.id, livenessOf(service)]));
 }
 
 /**
@@ -147,8 +160,46 @@ export async function drainService(service) {
 }
 
 /**
+ * Wait for a service that has no process of its own to have nothing running.
+ *
+ * A CLI only ever runs as the sessions somebody starts, so there is nothing to
+ * stop, and the process probe answers "running" for it for ever: with nothing
+ * to start or stop, nothing can be down either. Waiting on that probe failed
+ * every such update 20 s after a stop nobody had asked for. What its profile
+ * promises instead is that every related process has exited, which is the
+ * question its busy probe answers, so that is asked until it says idle or the
+ * budget runs out. One still busy then is not a stop that failed, because
+ * nothing was asked to stop: `busy` carries the answer, and the update waits.
+ */
+async function waitUntilIdle(service, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const own = (service.busy?.timeoutSeconds ?? 8) * 1000;
+  for (;;) {
+    const busy = await checkServiceBusy(service, { timeoutMs: Math.min(own, Math.max(0, deadline - Date.now())), liveness: livenessOf(service) });
+    if (!busy.busy) return { ok: true, message: null };
+    // Another reading goes only where it has a second of its own to answer in.
+    // One asked with the last few milliseconds of the budget times out, and a
+    // plain "still running" would end as "could not be established".
+    if (Date.now() + 2000 >= deadline) {
+      const waited = Math.round(timeoutMs / 1000);
+      const state = busy.unknown ? 'whether anything related was still running could not be established' : 'something related was still running';
+      return { ok: false, busy, message: `${service.name} has nothing of its own to stop, and ${waited} s later ${state}: ${busy.error ?? busy.reason}` };
+    }
+    await sleep(1000);
+  }
+}
+
+/**
  * Stop and wait for the process to actually disappear. An installer must not
  * replace a service's files while a process still has them open.
+ *
+ * A stop that did not complete carries the reasonCode of what may follow it.
+ * One nothing could ask for is `not-configured`, and one refused while the
+ * service plainly kept running is `internal`: either way it is still up, as it
+ * was. One asked for and not seen through, still running at the deadline or
+ * never readable, may yet be under way, so it is `timed-out`, whose outcome is
+ * unknown. None of them is `busy`: every client words that as nothing having
+ * been touched, and a stop request is something.
  */
 export async function stopAndWait(service, timeoutMs = 20000) {
   // An app has its own budget and its own wording: quitting an app someone is
@@ -157,19 +208,32 @@ export async function stopAndWait(service, timeoutMs = 20000) {
   if (service.process?.type === 'app') {
     return appProvider.quitAndWait(service, Math.max(timeoutMs, appProvider.QUIT_WAIT_MS));
   }
+  if ((service.process?.type ?? 'none') === 'none') return waitUntilIdle(service, timeoutMs);
 
   const stopped = await stopService(service);
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isRunning(service)) return { ok: true, message: null };
+  let evidence = processEvidence(service);
+  while (evidence.state !== 'stopped') {
+    // Nothing was asked to stop, so nothing is going to.
+    if (stopped.notConfigured && evidence.state === 'running') break;
+    if (Date.now() + 1000 >= deadline) break;
     await sleep(1000);
+    evidence = processEvidence(service);
   }
-  return {
-    ok: false,
-    message: stopped.ok
-      ? `${service.name} was still running ${Math.round(timeoutMs / 1000)} s after the stop request`
-      : `stop failed: ${stopped.message}`,
-  };
+  if (evidence.state === 'stopped') return { ok: true, message: null };
+
+  const waited = Math.round(timeoutMs / 1000);
+  if (stopped.notConfigured) {
+    return { ok: false, reasonCode: REASON.notConfigured, message: `${stopped.message}, so it could not be stopped` };
+  }
+  if (!stopped.ok && evidence.state === 'running') {
+    return { ok: false, reasonCode: REASON.internal, message: `the stop request failed (${stopped.message}), and ${service.name} was still running ${waited} s later` };
+  }
+  if (evidence.state === 'running') {
+    return { ok: false, reasonCode: REASON.timedOut, message: `${service.name} was still running ${waited} s after the stop request` };
+  }
+  const asked = stopped.ok ? 'was asked to stop' : `was asked to stop, though the request failed (${stopped.message})`;
+  return { ok: false, reasonCode: REASON.timedOut, message: `${service.name} ${asked}, and ${waited} s later whether it had could not be established: ${evidence.error}` };
 }
 
 /** Start and give the service a moment to bind before anyone health-checks it. */

@@ -455,6 +455,38 @@ class OperationReducerTest {
         assertTrue("nothing ran, so asking again is safe", expired.retryable)
     }
 
+    /**
+     * Two sleeps queued for an idle moment still read "waiting for idle" on the Mac nine days later:
+     * their agents had expired and pruned them. Here such a change is expired once its expiry has
+     * passed, or once it has waited longer than any agent holds one, without claiming it never ran.
+     * Before then the agent let go of a request it was still meant to hold: a lost record.
+     */
+    @Test
+    fun `a queued change the agent has pruned is expired once its expiry has passed`() {
+        val hour = 3_600_000L
+        val queued = record(kind = OpKind.SLEEP, service = null, whenIdle = true)
+            .reduce(OperationEvent.Dispatched(true, at))
+            .reduce(OperationEvent.Replied(v3(state = "queued", phase = "queued"), at))
+            .copy(expiresAt = at + 4 * hour)
+        assertEquals(TrackedState.QUEUED, queued.state)
+
+        assertTrue(queued.reduce(OperationEvent.NotRecorded(at + hour)).summary.endsWith("how it ended is not known."))
+
+        val expired = queued.reduce(OperationEvent.NotRecorded(at + 5 * hour))
+        assertEquals(TrackedState.FINISHED, expired.state)
+        assertEquals(Outcome.UNKNOWN, expired.outcome)
+        assertFalse("it may have run before then, so it is not offered again", expired.retryable)
+        assertEquals(
+            "Sleep on Beacon expired while it was queued. Beacon no longer has a record of it, so whether it ran before then is not known.",
+            expired.summary,
+        )
+
+        // One that came back with no expiry is held seven days at the most.
+        val open = queued.copy(expiresAt = null)
+        assertTrue(open.reduce(OperationEvent.NotRecorded(at + 6 * 24 * hour)).summary.endsWith("how it ended is not known."))
+        assertTrue(open.reduce(OperationEvent.NotRecorded(at + 8 * 24 * hour)).summary.contains("expired while it was queued"))
+    }
+
     @Test
     fun `queued footer follows cancellation and ignores a late queued reply`() {
         val queued = record(whenIdle = true)

@@ -44,7 +44,7 @@ import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { appendLog, listOperations, recordPhase, updateOperation, whenStarted } from './operations.mjs';
 import { describeFailure, mutationWorstCaseMs, runMutationArgv, unsettledWork } from './process-runner.mjs';
-import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { aggregateBusy, BUSY_BUDGET_MS, busyReasonCode, checkAllBusy, heldBecause } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
 import { PROCESS_COMMAND_MS } from './probes/process.mjs';
 import { hasUpdatePath, scheduledEligibility } from './policy.mjs';
@@ -59,7 +59,7 @@ import {
   canRestart,
   drainService,
   isRunning,
-  livenessOf,
+  machineLiveness,
   recoveryEvidence,
   restartService,
   serviceHealth,
@@ -136,12 +136,12 @@ async function recoverService(service, opId) {
  * The busy state, with what the process probe already knows folded in.
  *
  * The liveness hint is what lets a state database's "running" row be retired
- * when the thing that would be running it is gone or has restarted since.
+ * when the thing that would be running it is gone or has restarted since. The
+ * gate asks every service, so every service's hint goes with it, as it does
+ * for status, boot, sleep and the queue.
  */
-async function busyNow(config, service) {
-  const liveness = {};
-  if (service) liveness[service.id] = livenessOf(service);
-  const { busy, entries } = await checkAllBusy(config, { liveness });
+async function busyNow(config) {
+  const { busy, entries } = await checkAllBusy(config, { liveness: machineLiveness(config) });
   return { busy, entries };
 }
 
@@ -156,6 +156,46 @@ function deferred({ service, from = null, to = null, busy, message }) {
     message,
     service: service?.id ?? null,
   };
+}
+
+/**
+ * Why the check immediately before the stop held. Work that started while the
+ * update was prepared is the usual answer, but a probe that could no longer
+ * be read is no evidence that anything started.
+ */
+function heldAtSecondCheck(busy) {
+  return busyReasonCode(busy) === REASON.busy
+    ? `work started while the update was being prepared (${busy.reason})`
+    : `${heldBecause(busy)} once the update was prepared`;
+}
+
+/**
+ * A stop that did not complete, before anything was installed or applied.
+ * Nothing is rolled back or started over it, and nothing about it failed while
+ * being applied. Its code is the stop's own (service.mjs), which says whether
+ * the service is still up as it was or may yet be going down. It was reported
+ * as not-running, which every client words as the opposite of what happened.
+ */
+function wouldNotStop({ service, from, to, stopped, nothing = 'nothing was installed' }) {
+  const message = `${stopped.message}; ${nothing}`;
+  log(message, 'update');
+  recordLastUpdate(service, 'failed', from, to, message);
+  return { ok: false, action: 'failed', reasonCode: stopped.reasonCode ?? REASON.internal, from, to, message };
+}
+
+/**
+ * A service with nothing of its own to stop that was still busy when its stop
+ * step gave up (service.mjs). Nothing was asked to stop and nothing was
+ * installed, so it waits for an idle window like any other deferral, --force
+ * included: what keeps it is a session nobody here can end, and installing
+ * under that is what the stop step is there to prevent.
+ */
+function stillBusyAtStop({ service, from, to, stopped, later }) {
+  saveServiceState(service, { pendingRestart: true, pendingVersion: to });
+  const message = `${stopped.message}; nothing was installed, and ${later} at the next idle window`;
+  log(message, 'update');
+  recordLastUpdate(service, 'deferred', from, to, message);
+  return deferred({ service, from, to, busy: aggregateBusy([{ service, busy: stopped.busy }]), message });
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +238,7 @@ function npmInstallWorstMs() {
 export function updateWorstCaseMs(service) {
   if (service.kind === 'app') return stopWorstMs(service) + startWorstMs(service) + HEALTH_WAIT_MS + appProvider.VERSION_WAIT_MS;
   const install = service.kind === 'npm'
-    ? npmInstallWorstMs()
+    ? npmInstallWorstMs() + (service.verify ? mutationWorstCaseMs(VERIFY_COMMAND_MS) : 0)
     : mutationWorstCaseMs(commandProvider.UPDATE_COMMAND_MS) + mutationWorstCaseMs(VERIFY_COMMAND_MS);
   return drainWorstMs(service) + stopWorstMs(service) + install + startWorstMs(service) + HEALTH_WAIT_MS;
 }
@@ -253,7 +293,9 @@ async function performRestart(service, { opId }) {
   if (!restarted.ok) {
     await ensureServiceUp(service);
     log(`restart failed: ${restarted.message}`, 'restart');
-    return { ok: false, action: 'failed', reasonCode: REASON.notRunning, message: restarted.message };
+    // A stop that did not complete carries its own code (service.mjs), and
+    // anything else that fails here is a start that did not.
+    return { ok: false, action: 'failed', reasonCode: restarted.reasonCode ?? REASON.notRunning, message: restarted.message };
   }
 
   recordPhase(opId, 'health');
@@ -290,13 +332,13 @@ export async function runRestart(config, service, options = {}) {
       ensureServiceStateWritable(service);
       lock.phase('checking-busy');
       recordPhase(opId, 'checking-busy');
-      const { busy } = await busyNow(config, service);
+      const { busy } = await busyNow(config);
       if (busy.busy && !options.force) {
         log(`restart of ${service.id} deferred: ${busy.reason}`, 'restart');
         return deferred({
           service,
           busy,
-          message: `the machine is busy (${busy.reason}); pass --force to restart anyway, or --when-idle to queue it`,
+          message: `${heldBecause(busy)}; pass --force to restart anyway, or --when-idle to queue it`,
         });
       }
       lock.phase('restarting');
@@ -329,6 +371,15 @@ async function performUpgrade(service, to, prefix, opId, lock, reached) {
   const onDisk = npmProvider.installedVersionAt(service, prefix);
   if (onDisk !== to) {
     throw new Error(`npm reported success but the installed version is ${onDisk ?? 'missing'}, not ${to}`);
+  }
+  // package.json proves npm wrote the package, and nothing about whether what
+  // it wrote runs. A package whose postinstall puts the real binary in place
+  // leaves a placeholder when npm skipped its scripts, and a health check of
+  // "none" passes on that. Where the service names a command that fails when
+  // the install does not run, as the profiles do, nothing starts until it passes.
+  if (service.verify) {
+    const verified = await runMutationArgv(service.verify, { timeoutMs: VERIFY_COMMAND_MS });
+    if (!verified.ok) throw new Error(`${to} was installed but does not run: ${describeFailure(verified)}`);
   }
 
   lock.phase('starting');
@@ -386,7 +437,7 @@ async function rollBack(service, previous, prefix, enter) {
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
   if (!stopped.ok) {
     await ensureServiceUp(service);
-    return { ok: false, message: `rollback skipped, ${service.name} would not stop: ${stopped.message}` };
+    return { ok: false, message: `rollback skipped: ${stopped.message}` };
   }
 
   const reinstalled = await npmProvider.installVersion(service, previous, prefix);
@@ -415,6 +466,26 @@ async function rollBack(service, previous, prefix, enter) {
  * the held lock, so it restarts directly rather than re-entering runRestart.
  */
 async function alreadyOnTarget(config, service, from, to, { force, opId, budget }) {
+  // An npm service with a verify command is asked first whether what is on
+  // disk runs. Its health cannot say: a CLI has none, and the process probe
+  // answers running for it whatever is installed. So an install that failed
+  // its verify and was not rolled back, because a session held the rollback
+  // off or there was no version to go back to, read as current and healthy on
+  // every run after the one that found it broken.
+  if (service.kind === 'npm' && service.verify) {
+    const late = budget?.refuses(mutationWorstCaseMs(VERIFY_COMMAND_MS), `checking that ${service.name} ${to} runs`);
+    if (late) {
+      return { ok: true, action: 'deferred', reasonCode: REASON.timedOut, from, to, message: `already on ${to}; ${late}`, service: service.id };
+    }
+    const verified = await runMutationArgv(service.verify, { timeoutMs: VERIFY_COMMAND_MS });
+    if (!verified.ok) {
+      const message = `already on ${to}, but it does not run: ${describeFailure(verified)}`;
+      log(message, 'update');
+      recordLastUpdate(service, 'failed', from, to, message);
+      return { ok: false, action: 'failed', reasonCode: REASON.applyFailed, from, to, message };
+    }
+  }
+
   const health = await serviceHealth(service);
   if (health.ok) {
     if (serviceState(service).pendingRestart) {
@@ -430,14 +501,14 @@ async function alreadyOnTarget(config, service, from, to, { force, opId, budget 
     };
   }
 
-  const { busy } = await busyNow(config, service);
+  const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     return deferred({
       service,
       from,
       to,
       busy,
-      message: `already on ${to} but unhealthy; the machine is busy (${busy.reason}), so the restart was deferred`,
+      message: `already on ${to} but unhealthy; ${heldBecause(busy)}, so the restart was deferred`,
     });
   }
 
@@ -500,10 +571,10 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
-  const { busy } = await busyNow(config, service);
+  const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `the machine is busy (${busy.reason}); ${to} will be installed at the next idle window`;
+    const message = `${heldBecause(busy)}; ${to} will be installed at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy, message });
@@ -545,22 +616,18 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
   // warm above can legitimately take minutes; anything that started during it,
   // or that the drain left running, would otherwise be destroyed by a decision
   // made before it existed.
-  const fresh = await busyNow(config, service);
+  const fresh = await busyNow(config);
   if (fresh.busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `work started while the update was being prepared (${fresh.busy.reason}); ${to} is downloaded and will be installed at the next idle window`;
+    const message = `${heldAtSecondCheck(fresh.busy)}; ${to} is downloaded and will be installed at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy: fresh.busy, message });
   }
 
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
-  if (!stopped.ok) {
-    const message = `${service.name} would not stop: ${stopped.message}`;
-    log(message, 'update');
-    recordLastUpdate(service, 'failed', from, to, message);
-    return { ok: false, action: 'failed', reasonCode: REASON.notRunning, from, to, message };
-  }
+  if (!stopped.ok && stopped.busy) return stillBusyAtStop({ service, from, to, stopped, later: `${to} will be installed` });
+  if (!stopped.ok) return wouldNotStop({ service, from, to, stopped });
 
   const reached = { installing: false };
   try {
@@ -681,10 +748,10 @@ async function runAppUpdate(config, service, { force, opId, lock, budget }) {
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
-  const { busy } = await busyNow(config, service);
+  const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: staged });
-    const message = `the machine is busy (${busy.reason}); ${staged} is downloaded and will be applied at the next idle window`;
+    const message = `${heldBecause(busy)}; ${staged} is downloaded and will be applied at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, staged, message);
     return deferred({ service, from, to: staged, busy, message });
@@ -701,6 +768,11 @@ async function runAppUpdate(config, service, { force, opId, lock, budget }) {
     const message = `${service.name} closed while the update was starting; ${staged} applies on that quit by itself`;
     log(message, 'update');
     return { ok: true, action: 'deferred', reasonCode: REASON.appClosed, from, to: staged, message };
+  }
+  // A quit that did not happen applied nothing, so it is not apply-failed. The
+  // staged build is still the updater's, and goes in on the next quit.
+  if (!restarted.ok && restarted.reasonCode) {
+    return wouldNotStop({ service, from, to: staged, stopped: restarted, nothing: `nothing was applied, and ${staged} applies by itself the next time ${service.name} quits` });
   }
   if (!restarted.ok) {
     log(`update to ${staged} failed: ${restarted.message}`, 'update');
@@ -943,10 +1015,10 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
-  const { busy } = await busyNow(config, service);
+  const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `the machine is busy (${busy.reason}); ${to ?? 'the update'} will be applied at the next idle window`;
+    const message = `${heldBecause(busy)}; ${to ?? 'the update'} will be applied at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy, message });
@@ -967,22 +1039,18 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
   }
 
   // One last look, immediately before the stop.
-  const fresh = await busyNow(config, service);
+  const fresh = await busyNow(config);
   if (fresh.busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `work started while the update was being prepared (${fresh.busy.reason}); it will be applied at the next idle window`;
+    const message = `${heldAtSecondCheck(fresh.busy)}; it will be applied at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy: fresh.busy, message });
   }
 
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
-  if (!stopped.ok) {
-    const message = `${service.name} would not stop: ${stopped.message}`;
-    log(message, 'update');
-    recordLastUpdate(service, 'failed', from, to, message);
-    return { ok: false, action: 'failed', reasonCode: REASON.notRunning, from, to, message };
-  }
+  if (!stopped.ok && stopped.busy) return stillBusyAtStop({ service, from, to, stopped, later: 'it will be applied' });
+  if (!stopped.ok) return wouldNotStop({ service, from, to, stopped });
 
   lock.phase('installing');
   recordPhase(opId, 'installing');
@@ -1203,15 +1271,15 @@ export async function rollBackInterrupted(config, service, owed, { running }) {
     message: `${found}, and the rollback to ${from} waits for an idle machine (${why}${busy.reason})`,
   });
   if (running && (service.kind === 'npm' || service.rollback)) {
-    const { busy } = await busyNow(config, service);
+    const { busy } = await busyNow(config);
     if (busy.busy) return waiting(busy);
     const drained = await drainService(service);
     if (!drained.ok) {
       return { settled: false, action: 'drain-refused', reasonCode: REASON.busy, message: `${found}, and ${service.name} was not rolled back to ${from}: ${drained.message}` };
     }
     if (drained.drained) appendLog(record.id, `recovery: ${drained.message}`);
-    const fresh = await busyNow(config, service);
-    if (fresh.busy.busy) return waiting(fresh.busy, 'work started while it was being prepared: ');
+    const fresh = await busyNow(config);
+    if (fresh.busy.busy) return waiting(fresh.busy, busyReasonCode(fresh.busy) === REASON.busy ? 'work started while it was being prepared: ' : '');
   }
   note(`${found} after an interrupted update; rolling it back`, 'recover');
   const enter = (phase, progress = null) => appendLog(record.id, `recovery: ${phase}${progress?.note ? `, ${progress.note}` : ''}`);

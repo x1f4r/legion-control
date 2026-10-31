@@ -33,6 +33,7 @@ import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.net.LocalAddress
+import com.x1f4r.legioncontrol.net.NetworkPaths
 import com.x1f4r.legioncontrol.net.RouteKind
 import com.x1f4r.legioncontrol.net.WakeSend
 import kotlinx.coroutines.flow.Flow
@@ -69,8 +70,14 @@ sealed interface LinkState {
     /** The agent answered and said which system it is. */
     data class Online(val system: MachineSystem) : LinkState
 
-    /** Nothing answered on any address. Asleep, off, or off the network. */
-    data class Offline(val reason: String) : LinkState
+    /**
+     * Nothing answered on any address. Asleep, off, or off the network.
+     *
+     * [noTunnel] when what went unanswered was a tailnet address no tunnel on this phone carries,
+     * which is the phone's to fix and not the machine's. Offline all the same, so a wake is still
+     * offered: the machine may be asleep as well.
+     */
+    data class Offline(val reason: String, val noTunnel: Boolean = false) : LinkState
 
     /**
      * A command was carried and did not finish inside its budget, or a reply was lost after dispatch.
@@ -291,6 +298,25 @@ interface ControlServices {
      */
     fun networkAddresses(): Flow<List<LocalAddress>>
 
+    /** The way out of this phone as it changes: its default network, and what each tunnel carries. */
+    fun networkPaths(): Flow<NetworkPaths>
+
+    /**
+     * Hands the transport the way out of this phone as it is now. A change lets every address be
+     * dialled again, and the tunnels decide whether a silent tailnet address is the phone's doing.
+     */
+    fun followPaths(paths: NetworkPaths)
+
+    /** A person asked to check again: every address held back is dialled on its machine's next call. */
+    fun retryAddresses()
+
+    /**
+     * Hands the transport the machines this phone is on the network of now, by id: the test route
+     * order and direct wake share. On one of them a silent LAN address is what is said, and not a
+     * tunnel that is off.
+     */
+    fun followPlacement(onSite: Set<String>)
+
     /** What to call this device in a revision it writes. */
     fun deviceName(): String
 
@@ -313,10 +339,12 @@ interface ControlServices {
     fun applyEdit(document: ControllerDocument, deviceName: String?): String?
 
     /**
-     * Puts a fetched setup in force after a person was shown all of its launch values. Approves them
-     * on a device that applied no setup before, and nothing on one that did.
+     * Puts a fetched setup in force after a person was shown all of its launch values, if it hashes
+     * to [servedHash] and the document in force is still [expectedHead]. Approves them on a device
+     * that applied no setup before, and nothing on one that did. See
+     * [com.x1f4r.legioncontrol.data.ConfigStore.applyEnrolment].
      */
-    fun applyEnrolment(text: String, deviceName: String?): String?
+    fun applyEnrolment(text: String, servedHash: String?, expectedHead: String?, servedBy: String, deviceName: String?): SetupOutcome
 
     /** Records exactly the values [entries] showed as approved on this device. Returns null, or why not. */
     fun approveLaunch(entries: List<LaunchReviewEntry>): String?
@@ -431,5 +459,6 @@ fun Throwable.toLinkState(): LinkState = when (this) {
         // the machine is asleep.
         if (dispatch.mayHaveRun) LinkState.Unsettled(summary) else LinkState.Offline(sentence)
 
+    is AgentFailure.NoTunnel -> LinkState.Offline(sentence, noTunnel = true)
     else -> LinkState.Offline(sentence)
 }

@@ -82,13 +82,30 @@ test('work that starts during the drain defers an npm update before the stop', a
   }, { initial: { 'drain-makes-busy': 'on' }, service: drain });
 });
 
+test('a probe that cannot be read after the drain defers an npm update as unknown, and claims no work started', async () => {
+  await withNpmService(async ({ dir, run, installed }) => {
+    const { payload, exitCode } = run(['update']);
+    assert.equal(exitCode, 0);
+    assert.equal(payload.action, 'deferred');
+    assert.equal(payload.reasonCode, 'busy-unknown');
+    assert.equal(payload.message, 'whether Demo is busy could not be established (busy state unknown) once the update was prepared; 2.0.0 is downloaded and will be installed at the next idle window');
+    assert.equal(readFixture(dir, 'stop-runs'), '');
+    assert.deepEqual(installs(dir), []);
+    assert.equal(installed(), '1.0.0');
+  }, { initial: { 'drain-makes-unknown': 'on' }, service: drain });
+});
+
 test('an npm service that will not stop is left running, with nothing installed or rolled back', async () => {
   await withNpmService(async ({ dir, run, installed }) => {
     const { payload, exitCode } = run(['update']);
     assert.equal(exitCode, 1);
     assert.equal(payload.action, 'failed');
-    assert.equal(payload.reasonCode, 'not-running');
-    assert.match(payload.message, /would not stop/);
+    // Not "not running", which is the opposite of what happened, nor a
+    // failure while it was applied: nothing was. Nor busy, which says nothing
+    // was touched: a stop was asked for, and refused.
+    assert.equal(payload.reasonCode, 'internal');
+    assert.equal(payload.outcome, 'failed');
+    assert.equal(payload.message, `the stop request failed (${path.basename(process.execPath)} failed (exit 1)), and Demo was still running 20 s later; nothing was installed`);
     // One stop was asked for. A rollback used to ask for a second one, wait
     // out its own budget, and start the service over itself.
     assert.equal(readFixture(dir, 'stop-runs'), '1');
@@ -97,6 +114,19 @@ test('an npm service that will not stop is left running, with nothing installed 
     assert.equal(readFixture(dir, 'running'), 'on');
     assert.equal(installed(), '1.0.0');
   }, { initial: { 'stop-refuses': 'on' } });
+});
+
+test('an npm service with no way to stop it is not configured for an update, and nothing is installed', async () => {
+  await withNpmService(async ({ dir, run, installed }) => {
+    const { payload, exitCode } = run(['update']);
+    assert.equal(exitCode, 1);
+    assert.equal(payload.action, 'failed');
+    assert.equal(payload.reasonCode, 'not-configured');
+    assert.equal(payload.outcome, 'failed');
+    assert.equal(payload.message, 'Demo has no stop command configured, so it could not be stopped; nothing was installed');
+    assert.deepEqual(installs(dir), []);
+    assert.equal(installed(), '1.0.0');
+  }, { service: (dir) => ({ process: { type: 'command', running: [process.execPath, FIXTURE, 'running', dir], start: [process.execPath, FIXTURE, 'start', dir] } }) });
 });
 
 test('an npm install that fails is rolled back to the version that was running, and started on it', async () => {
@@ -146,3 +176,18 @@ test('an npm update that cannot record its install starts the service again, and
     assert.equal(readFixture(dir, 'running'), 'on');
   });
 });
+
+test('the install script allowlist goes to every npm that knows it, 11.16 included, and to none before', async () => {
+  // npm 11.16.0 brought allow-scripts in, and under strict-allow-scripts an npm
+  // 11 install fails on any script the list does not cover, so waiting for npm
+  // 12 left a service's own allowlist out on the machines where it counted.
+  for (const [npmVersion, passed] of [['11.15.0', false], ['11.16.0', true], ['11.20.0', true], ['12.0.2', true]]) {
+    await withNpmService(async ({ dir, run }) => {
+      const { payload } = run(['update']);
+      assert.equal(payload.action, 'updated', `${npmVersion}: ${payload.message}`);
+      const [install] = installs(dir);
+      assert.equal(install.includes('--allow-scripts=demo-pkg,node-pty'), passed, `${npmVersion}: ${install}`);
+    }, { initial: { 'npm-version': npmVersion }, service: () => ({ allowScripts: ['demo-pkg', 'node-pty'] }) });
+  }
+});
+

@@ -4,9 +4,14 @@ import com.x1f4r.legioncontrol.contract.ContractCorpus
 import com.x1f4r.legioncontrol.data.CanonicalSetup
 import com.x1f4r.legioncontrol.data.readControllerConfig
 import com.x1f4r.legioncontrol.net.CommandOutcome
+import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
+import com.x1f4r.legioncontrol.net.LanPrefix
 import com.x1f4r.legioncontrol.net.RouteKind
+import com.x1f4r.legioncontrol.net.StdinSource
+import com.x1f4r.legioncontrol.net.TAILNET
 import kotlinx.coroutines.runBlocking
+import java.io.File
 import java.nio.file.Files
 import java.util.Base64
 import org.junit.Assert.assertSame
@@ -255,6 +260,31 @@ class ControllerSetupTest {
             assertSame(expected, actual)
             assertEquals(1, count)
         }
+    }
+
+    /**
+     * Fetch from a machine dials an address typed by hand, often a tailnet one. With Tailscale off it
+     * said the machine did not answer, as a machine in the setup used to.
+     */
+    @Test
+    fun `a typed tailnet address no tunnel carries says the phone is off the tailnet`() = runBlocking {
+        val endpoint = Endpoint("setup", RouteKind.REMOTE, "100.64.0.9", 22, "me", null, "100.64.0.9")
+        val silent = object : CommandTransport {
+            override suspend fun run(endpoint: Endpoint, command: String, timeoutMillis: Long, stdin: StdinSource?): CommandOutcome =
+                throw AgentFailure.Unreachable(null, "100.64.0.9:22 did not answer in time.")
+
+            override suspend fun upload(endpoint: Endpoint, source: File, remotePath: String, timeoutMillis: Long) = error("not used")
+        }
+        suspend fun fetchFailure(tunnels: List<LanPrefix>?): AgentFailure = try {
+            fetchController(silent, endpoint, tunnels)
+            error("Expected a failure")
+        } catch (failure: AgentFailure) { failure }
+
+        val failure = fetchFailure(tunnels = emptyList())
+        assertTrue("$failure", failure is AgentFailure.NoTunnel)
+        assertEquals("This phone is not connected to the tailnet. Is Tailscale on?", failure.summary)
+        assertTrue(fetchFailure(tunnels = listOf(TAILNET)) is AgentFailure.Unreachable)
+        assertTrue(fetchFailure(tunnels = null) is AgentFailure.Unreachable)
     }
 
     /**

@@ -259,12 +259,12 @@ export function warmCache(service, version, attempts = WARM_ATTEMPTS) {
   return { ok: false, attempts, message: last ? describeFailure(last) : 'npm cache add did not run' };
 }
 
-/** npm's own major version, or null when it cannot be determined. */
-function npmMajor(prefix) {
+/** npm's own major and minor version, or null when they cannot be determined. */
+function npmVersion(prefix) {
   const result = runNpm(['--version'], { timeoutMs: NPM_VERSION_MS, prefix });
   if (!result.ok) return null;
-  const match = /^(\d+)\./.exec(result.stdout.trim());
-  return match ? Number.parseInt(match[1], 10) : null;
+  const match = /^(\d+)\.(\d+)\./.exec(result.stdout.trim());
+  return match ? { major: Number.parseInt(match[1], 10), minor: Number.parseInt(match[2], 10) } : null;
 }
 
 /**
@@ -273,16 +273,18 @@ function npmMajor(prefix) {
  * and without the allowlist the install reports success and then every start
  * dies on the module it could not build.
  *
- * The flag does not exist before npm 12 and older npm treats an unknown flag as
- * a package name, so it is only added when npm is actually new enough. That is
- * why this is version-gated rather than passed unconditionally: one machine can
- * be on npm 12 while another is still on npm 11.
+ * The allowlist came before that: npm 11.16.0 brought in allow-scripts, with a
+ * notice for any script it does not cover, and a failed install instead where
+ * .npmrc sets strict-allow-scripts. 11.15 has no such setting. The flag is only
+ * added where npm knows it, and that is why this is version-gated rather than
+ * passed unconditionally: one machine can be on npm 12 while another is still
+ * on an npm 11 from before it.
  */
 function allowScriptsArgs(service, prefix) {
   const packages = Array.isArray(service.allowScripts) ? service.allowScripts.filter(Boolean) : [];
   if (packages.length === 0) return [];
-  const major = npmMajor(prefix);
-  if (major === null || major < 12) return [];
+  const version = npmVersion(prefix);
+  if (version === null || version.major < 11 || (version.major === 11 && version.minor < 16)) return [];
   return [`--allow-scripts=${packages.join(',')}`];
 }
 

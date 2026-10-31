@@ -46,7 +46,9 @@ character: a reader cannot see it, and `node scripts/check-invisible.mjs` refuse
 
 One change per commit. The subject is an imperative sentence in sentence case that says what the
 change does, such as "Skip a kept revision peer intake refuses when choosing a merge base". A short
-body, when the reason is not obvious, says why. Tests come with the change they test.
+body, when the reason is not obvious, says why. Tests come with the change they test. A message
+is as public as a file: before pushing, `node scripts/check-private-data.mjs --commits
+origin/main..HEAD` reads the messages of the branch's commits.
 
 ## Security problems
 

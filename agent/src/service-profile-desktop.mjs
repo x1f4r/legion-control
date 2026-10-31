@@ -3,6 +3,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+/** The applications behind each desktop profile, named as their bundles and executables are. */
+export const DESKTOP_APPLICATIONS = {
+  'claude-desktop': ['Claude'],
+  // Current Codex and ChatGPT desktop are one application.
+  'codex-desktop': ['ChatGPT', 'Codex'],
+  'chatgpt-desktop': ['ChatGPT'],
+  antigravity: ['Antigravity'],
+};
+
+/** Where the supported installers put these applications: bundles on a Mac, executables on Windows. */
+export function desktopLocations(names, { platform, home, env = {} }) {
+  if (platform === 'mac') return names.flatMap((app) => [path.posix.join('/Applications', `${app}.app`), path.posix.join(home, 'Applications', `${app}.app`)]);
+  if (platform !== 'windows') return [];
+  const locations = [env.LOCALAPPDATA, env.ProgramFiles, env['ProgramFiles(x86)']].filter(Boolean);
+  return names.flatMap((app) => locations.flatMap((location) => [path.win32.join(location, app, `${app}.exe`), path.win32.join(location, 'Programs', app, `${app}.exe`)]));
+}
+
 export function readDesktopMetadata(location, { platform = process.platform, io = fs, run = spawnSync } = {}) {
   try {
     if (typeof location !== 'string' || !path.isAbsolute(location)) return null;

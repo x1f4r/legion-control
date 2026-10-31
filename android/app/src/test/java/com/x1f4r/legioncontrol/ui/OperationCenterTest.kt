@@ -167,6 +167,30 @@ class OperationCenterTest {
         AgentJson.decodeFromString(AgentActionResult.serializer(), ContractCorpus.file("fixtures/$name").readText()),
     )
 
+    /**
+     * A change queued for an idle moment, long past its expiry, that the machine has since let go
+     * of. It is not left waiting for idle for good: the first read after the app comes back settles
+     * it as expired, and as one whose end is not known, because it may have run before the record
+     * went.
+     */
+    @Test
+    fun `a queued change the machine no longer has is settled on return, not left queued`() {
+        agent.op = { id -> Result.failure(AgentFailure.NoSuchOperation(id, "there is no operation $id on this machine")) }
+        val record = store.put(queued().copy(expiresAt = 1_700_000_000_000L + 4 * 3_600_000L))
+
+        center.resume(listOf(agent))
+
+        val stored = store.get(record.id)!!
+        assertEquals(listOf(record.id), agent.reads)
+        assertEquals(TrackedState.FINISHED, stored.state)
+        assertEquals(Outcome.UNKNOWN, stored.outcome)
+        assertFalse(stored.isCancellable)
+        assertEquals(
+            "Boot on Windows expired while it was queued. Tower no longer has a record of it, so whether it ran before then is not known.",
+            stored.summary,
+        )
+    }
+
     @Test
     fun `a cancel the machine has no record for leaves how the change ended unknown`() {
         // The refusal describes the cancel. Its outcome, failed, is not the boot's: the machine had

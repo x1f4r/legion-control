@@ -16,7 +16,7 @@ From the repository root:
 node --test contract/test/*.test.mjs
 ```
 
-`./scripts/check.sh` runs all four components on a configured Mac. Set `LEGION_ANDROID_JAVA_HOME` to select JDK 21 and `LEGION_DOTNET` to select a .NET 10 executable. For isolated Mac tests, set `LEGION_CONTROL_HOME` to a temporary directory. Desktop tests create their own temporary state.
+`./scripts/check.sh` runs all four components on a configured Mac. Set `LEGION_ANDROID_JAVA_HOME` to select JDK 21 and `LEGION_DOTNET` to select a .NET 10 executable. The Mac tests give themselves a temporary `LEGION_CONTROL_HOME` before the first test starts (`mac/Tests/TestHome`), and a test fails if anything the app writes would resolve outside it. Desktop tests create their own temporary state.
 
 The agent check runs, in order: the agent's own check, the syntax of every JavaScript file in the checkout, the invisible-character check, the version check, the agent tests, the release and installer tests in `tests/`, contract validation, the generated-file check and the contract tests, and last the private-data check, so a private value it finds never hides what the tests would have said. The Mac check runs Swift tests and a release build. Android runs debug/release unit tests and debug lint. Desktop runs its tests and release build.
 
@@ -31,6 +31,8 @@ The repository is public, and `node scripts/check-private-data.mjs` keeps it fre
 - private terms: the real names, user names, host names and addresses that would identify the maintainers, which a public check cannot spell out.
 
 The terms come from the `LEGION_PRIVATE_TERMS` environment variable, which CI fills from the repository secret of that name, and from `~/.legion-control/private/terms.txt`, outside the repository and never committed. Both have one format: one entry per line, or several separated by commas; a line starting with `#` is a comment; each term is at least three characters and matches case-insensitively in every line and file name. An entry may list the public places its term is allowed in after it, each after a `!`, such as `jdoe ! github.com/jdoe/ ! com.jdoe.`; each place must contain the term and cannot contain a comma. A finding prints the file, the line and the entry number, never the term. Without either source the check says it looked for no private terms and still checks homes and addresses.
+
+A commit message is published with its branch and stays in the history, and no file holds it. `node scripts/check-private-data.mjs --commits origin/main..HEAD` reads the messages of the commits a push would publish, line by line, for the same three things; the author is not read.
 
 Set the secret under **Settings → Secrets and variables → Actions**, or with `gh secret set LEGION_PRIVATE_TERMS < ~/.legion-control/private/terms.txt`. Until it exists, and on pull requests from forks, the CI job checks only homes and addresses.
 

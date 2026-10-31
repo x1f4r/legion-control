@@ -1,7 +1,7 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.1.0",
+  "agentVersion": "3.1.1",
   "system": {
     "id": "mac",
     "name": "macOS"
@@ -52,7 +52,7 @@
         "line": "staged 1.9.4 found in the pending directory"
       }
     ],
-    "agentVersion": "3.1.0",
+    "agentVersion": "3.1.1",
     "systemId": "mac",
     "from": "1.9.3",
     "to": "1.9.3",

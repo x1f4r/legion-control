@@ -70,6 +70,7 @@ struct WakeTests {
         #expect(placement.isAmbiguous)
         #expect(placement.effective == nil)
         #expect(placement.description(sites: try Self.config().allSites).contains("Overlapping private ranges"))
+        #expect(placement.description(sites: try Self.config().allSites).contains("unconfirmed"))
     }
 
     @Test("the user saying which site this is settles it, while the addresses agree")
@@ -94,12 +95,19 @@ struct WakeTests {
         #expect(nowhere.isAmbiguous)
     }
 
-    @Test("one matching site is enough to act on, and is still not called proof")
+    @Test("one matching site is enough to act on, says so, and is still not called proof")
     func singleMatch() throws {
         let sites = [Site(id: "home", name: "Home", lanPrefixes: ["10.0.0."], broadcast: ["10.0.0.255"])]
         let placement = SiteAwareness.placement(sites: sites, addresses: [LocalAddress("10.0.0.7/24")!], confirmed: nil)
         #expect(placement.effective == "home")
-        #expect(placement.description(sites: sites).contains("hint, not proof"))
+        let description = placement.description(sites: sites)
+        #expect(description.hasPrefix("On Home, from this device's addresses."))
+        #expect(description.contains("hint, not proof"))
+        // It is effective, so the packet goes out from here and the LAN is dialled first. Called
+        // "unconfirmed", it read as holding back while the app did the opposite (section 10.1).
+        #expect(!description.localizedCaseInsensitiveContains("unconfirmed"))
+        let pi = Machine(id: "pi", name: "Pi", site: "home")
+        #expect(SiteAwareness.network(of: pi, sites: sites, placement: placement).isOn)
     }
 
     @Test("a prefix matches on octet and bit boundaries, never as text")

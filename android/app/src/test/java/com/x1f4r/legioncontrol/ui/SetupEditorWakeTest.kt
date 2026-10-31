@@ -4,6 +4,8 @@ import com.x1f4r.legioncontrol.data.ConfigStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.LaunchDocuments
 import com.x1f4r.legioncontrol.data.LaunchDocuments.HELD
+import com.x1f4r.legioncontrol.data.SetupOutcome
+import com.x1f4r.legioncontrol.data.enrolAsFetched
 import com.x1f4r.legioncontrol.data.withText
 import com.x1f4r.legioncontrol.data.withWake
 import kotlinx.serialization.json.JsonArray
@@ -24,7 +26,7 @@ import org.junit.Test
  */
 class SetupEditorWakeTest {
 
-    private fun enrolled() = LaunchDocuments.store().also { assertNull(it.applyEnrolment(HELD, "Test phone")) }
+    private fun enrolled() = LaunchDocuments.store().also { assertTrue(it.enrolAsFetched(HELD) is SetupOutcome.Applied) }
 
     private fun editor(store: ConfigStore) = SetupEditorModel(servicesOver(store)).apply { startFresh() }
 

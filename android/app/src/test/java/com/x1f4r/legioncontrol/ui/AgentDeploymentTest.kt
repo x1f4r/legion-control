@@ -11,6 +11,7 @@ import com.x1f4r.legioncontrol.agent.RemoteShell
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.RouteKind
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -109,6 +110,20 @@ class AgentDeploymentTest {
             "3.1.0",
             current.agent?.floor,
         )
+    }
+
+    @Test
+    fun `an agent older than the one this build carries is said so beside the install action`() {
+        assertEquals("Older than control agent 3.1.1, which this build carries.", AgentDeploymentPath.behind("3.1.1", "3.0.1"))
+        assertEquals(
+            "compared as numbers, not as text",
+            "Older than control agent 3.10.0, which this build carries.",
+            AgentDeploymentPath.behind("3.10.0", "3.9.2"),
+        )
+        assertNull(AgentDeploymentPath.behind("3.1.1", "3.1.1"))
+        assertNull(AgentDeploymentPath.behind("3.1.1", "3.2.0"))
+        assertNull("a build that carries no agent says nothing", AgentDeploymentPath.behind(null, "3.0.1"))
+        assertNull("nor does a machine that has not said", AgentDeploymentPath.behind("3.1.1", null))
     }
 
     @Test

@@ -275,11 +275,13 @@ test('a task probe that fails is unknown in status, and the stop loop never take
 
     // Section 6: and the stop guard holds. The stop is asked for, and the
     // loop after it waits out its whole budget for evidence that never comes
-    // rather than install over a service that may still be running.
+    // rather than install over a service that may still be running. The task
+    // may yet stop, so the outcome is unknown (section 5.3).
     const update = invoke(home, ['update'], { env: powershell.env });
     assert.equal(update.action, 'failed');
-    assert.equal(update.reasonCode, 'not-running');
-    assert.match(update.message, /would not stop/);
+    assert.equal(update.reasonCode, 'timed-out');
+    assert.equal(update.outcome, 'unknown');
+    assert.match(update.message, /^Demo was asked to stop, though the request failed \(.*\), and 20 s later whether it had could not be established: .*; nothing was installed$/);
     assert.match(powershell.scripts(), /Stop-ScheduledTask -TaskName 'Demo'/);
     assert.equal(readFixture(dir, 'update-runs'), '', 'nothing was installed');
     assert.equal(readFixture(dir, 'installed'), '1.0.0');

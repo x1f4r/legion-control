@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.1.0",
+  "agentVersion": "3.1.1",
   "system": {
     "id": "mac",
     "name": "macOS"
@@ -124,7 +124,14 @@
         },
         "updates": {
           "automatic": false
-        }
+        },
+        "verify": [
+          "/opt/homebrew/bin/node",
+          "/example/base/agent/src/service-profile-probe.mjs",
+          "npm-verify",
+          "codex-cli",
+          "/opt/homebrew"
+        ]
       }
     },
     {

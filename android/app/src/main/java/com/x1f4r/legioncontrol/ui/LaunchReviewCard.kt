@@ -191,6 +191,10 @@ data class EnrolmentPreview(
     /** Exactly what the machine served, which is what Confirm applies. */
     val text: String,
     val host: String,
+    /** The hash the machine reported, which [text] was checked against and is stored only under. */
+    val servedHash: String,
+    /** The hash in storage when this was shown, null for none: Confirm replaces only that one. */
+    val head: String?,
     /** Whether confirming approves what is shown: only on a device that applies no setup yet. */
     val approves: Boolean,
     val machines: List<Machine>,
@@ -207,7 +211,7 @@ data class EnrolmentPreview(
          * The preview of [text], or why it would be refused. A document that could not be applied is
          * said so now rather than after somebody read through it and pressed Confirm.
          */
-        fun of(text: String, host: String, approves: Boolean): Result<EnrolmentPreview> {
+        fun of(text: String, host: String, servedHash: String, head: String?, approves: Boolean): Result<EnrolmentPreview> {
             val document = ControllerDocument.parse(text).getOrElse { return Result.failure(it) }
             readControllerConfig(document.canonicalText).exceptionOrNull()?.let { return Result.failure(it) }
             val projection = LaunchValues.projection(document.root)
@@ -216,6 +220,8 @@ data class EnrolmentPreview(
                 EnrolmentPreview(
                     text = text,
                     host = host,
+                    servedHash = servedHash,
+                    head = head,
                     approves = approves,
                     machines = projection.machines.map { machine ->
                         val raw = rawMachines.firstOrNull { it.text("id") == machine.id }

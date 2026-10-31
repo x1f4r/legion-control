@@ -411,8 +411,18 @@ test('a running npm service whose drain refuses is neither stopped nor reinstall
     assert.equal(readFixture(dir, 'stop-runs'), '');
     assert.equal(readOperation(id).recoveryPending, true);
 
+    // A probe that cannot be read at that second look is no evidence that
+    // work started, and the wait says only what is known.
     fs.writeFileSync(path.join(dir, 'drain-makes-busy'), 'off');
     fs.writeFileSync(path.join(dir, 'busy'), 'off');
+    fs.writeFileSync(path.join(dir, 'drain-makes-unknown'), 'on');
+    const unread = run().message;
+    assert.match(unread, /the rollback to 1\.0\.0 waits for an idle machine \(busy state unknown\)/);
+    assert.doesNotMatch(unread, /work started/);
+    assert.equal(readFixture(dir, 'stop-runs'), '');
+
+    fs.writeFileSync(path.join(dir, 'drain-makes-unknown'), 'off');
+    fs.writeFileSync(path.join(dir, 'busy-unknown'), 'off');
     assert.doesNotMatch(run().message, /still owed/);
     assert.deepEqual(npmCalls(dir).filter((call) => call.startsWith('install ')).map((call) => call.split(' ').pop()), ['demo-pkg@1.0.0']);
     assert.equal(npmPackageVersion(npm.prefix, npm.pkg), '1.0.0');

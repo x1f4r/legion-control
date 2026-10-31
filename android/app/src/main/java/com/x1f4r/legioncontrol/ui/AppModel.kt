@@ -36,6 +36,7 @@ import com.x1f4r.legioncontrol.data.advisories
 import com.x1f4r.legioncontrol.data.SiteConfig
 import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.net.SiteMatch
+import com.x1f4r.legioncontrol.net.machinesOnSite
 import com.x1f4r.legioncontrol.net.matchSite
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -313,6 +314,9 @@ class AppModel(
             }
         }
         scope.launch {
+            services.networkPaths().collect(services::followPaths)
+        }
+        scope.launch {
             bindings.bindings.collect { recomputeSite() }
         }
         scope.launch {
@@ -426,12 +430,19 @@ class AppModel(
         requestedMachine = null
     }
 
+    /**
+     * Pull to refresh, or the refresh button. Asked for by a person, so every address is dialled
+     * again, the ones held back after going unanswered included.
+     */
     fun refreshAll() {
+        services.retryAddresses()
         machines.forEach { it.refreshNow() }
     }
 
     private fun recomputeSite() {
-        siteMatch = matchSite(sites, addresses, bindings.bindings.value.currentSite)
+        val currentSite = bindings.bindings.value.currentSite
+        siteMatch = matchSite(sites, addresses, currentSite)
+        services.followPlacement(machinesOnSite(clients.map { it.machine }, sites, addresses, currentSite))
     }
 
     // MARK: - The setup
@@ -788,7 +799,7 @@ class AppModel(
      * file and update source in it, and only [confirmEnrolment] puts it in force.
      */
     private fun applyFetched(fetched: ControllerFetch, source: SetupSource): String = when (fetched) {
-        is ControllerFetch.Document -> enrolment.offer(fetched.text, source.host)
+        is ControllerFetch.Document -> enrolment.offer(fetched, source.host)
 
         ControllerFetch.NothingStored ->
             "That machine has no setup stored yet. Paste one here, or fetch from a machine that has one."

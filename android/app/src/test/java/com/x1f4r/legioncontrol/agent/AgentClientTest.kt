@@ -4,9 +4,11 @@ import com.x1f4r.legioncontrol.data.MachineHints
 import com.x1f4r.legioncontrol.net.CommandOutcome
 import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
+import com.x1f4r.legioncontrol.net.LanPrefix
 import com.x1f4r.legioncontrol.net.RouteKind
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.StdinSource
+import com.x1f4r.legioncontrol.net.TAILNET
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.awaitCancellation
@@ -99,10 +101,15 @@ class AgentClientTest {
         systems: List<MachineSystem> = listOf(linux, windows),
     ) = Machine(id = "tower", name = "Tower", endpoints = endpoints, systems = systems, wake = null)
 
-    private fun client(machine: Machine, transport: CommandTransport): Pair<AgentClient, RouteSelector> {
-        val hints = Hints()
+    private fun client(
+        machine: Machine,
+        transport: CommandTransport,
+        hints: Hints = Hints(),
+        tunnels: () -> List<LanPrefix>? = { null },
+        onSite: () -> Boolean = { false },
+    ): Pair<AgentClient, RouteSelector> {
         val routes = RouteSelector(machine, hints) { now }
-        return AgentClient(machine, transport, routes, hints) { now } to routes
+        return AgentClient(machine, transport, routes, hints, tunnels, onSite) { now } to routes
     }
 
     private val accepted = CommandOutcome(0, """{"ok":true,"contract":3,"action":"restarted"}""", "")
@@ -400,6 +407,53 @@ class AgentClientTest {
         val (agent, _) = client(machine(systems = listOf(linux)), transport)
         failsWith<AgentFailure.KeyUnavailable> { agent.status() }
         assertEquals(listOf("first", "second"), transport.sent.map { it.endpoint })
+    }
+
+    @Test
+    fun `a tailnet address no tunnel carries says the phone is off the tailnet, ahead of a silent LAN address`() = runBlocking<Unit> {
+        // The LAN address answered last time, so it leads, and it is silent too: from the other
+        // house, or a network that drops it. What wants doing is turning the tunnel on.
+        val tailnet = endpoint("tailnet", host = "100.64.0.9")
+        val lan = endpoint("lan").copy(kind = RouteKind.LAN)
+        val machine = machine(endpoints = listOf(tailnet, lan), systems = listOf(linux))
+        val transport = FakeTransport {
+            throw AgentFailure.Unreachable("Tower", "no answer", null, DispatchStage.NOT_STARTED, FailureKind.HOST_UNREACHABLE)
+        }
+        fun agent(tunnels: List<LanPrefix>?) =
+            client(machine, transport, Hints().apply { rememberRoute("tower", "lan") }, tunnels = { tunnels }).first
+
+        val failure = failsWith<AgentFailure.NoTunnel> { agent(tunnels = emptyList()).status() }
+        assertEquals(listOf("lan", "tailnet"), transport.sent.map { it.endpoint })
+        assertEquals(DispatchStage.NOT_STARTED, failure.dispatch)
+        assertEquals(DiagnosisStatus.NO_TUNNEL, agent(tunnels = emptyList()).diagnose(tailnet).status)
+
+        // With the tunnel up the same silence is the machine's, and with nothing known about
+        // tunnels yet nothing is put down to one.
+        failsWith<AgentFailure.Unreachable> { agent(tunnels = listOf(TAILNET)).status() }
+        failsWith<AgentFailure.Unreachable> { agent(tunnels = null).status() }
+    }
+
+    /**
+     * At home on the machine's own network, with Tailscale off on purpose, a machine that is asleep
+     * leaves its LAN address silent too. That is the thing to say: sent to look at Tailscale, a
+     * person would turn it on and find the machine just as silent.
+     */
+    @Test
+    fun `on the machine's own network a silent LAN address is said ahead of a missing tunnel`() = runBlocking<Unit> {
+        val tailnet = endpoint("tailnet", host = "100.64.0.9")
+        val lan = endpoint("lan").copy(kind = RouteKind.LAN)
+        val transport = FakeTransport {
+            throw AgentFailure.Unreachable("Tower", "no answer", null, DispatchStage.NOT_STARTED, FailureKind.HOST_UNREACHABLE)
+        }
+        fun agent(endpoints: List<Endpoint>) =
+            client(machine(endpoints = endpoints, systems = listOf(linux)), transport, tunnels = { emptyList() }, onSite = { true }).first
+
+        val failure = failsWith<AgentFailure.Unreachable> { agent(listOf(tailnet, lan)).status() }
+        assertEquals("Tower did not answer.", failure.summary)
+        assertEquals(listOf("tailnet", "lan"), transport.sent.map { it.endpoint })
+
+        // A machine this phone reaches only over the tailnet is still the tunnel's to explain.
+        failsWith<AgentFailure.NoTunnel> { agent(listOf(tailnet)).status() }
     }
 
     @Test

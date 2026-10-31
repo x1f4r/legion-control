@@ -6,9 +6,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { detectPlatform } from './paths.mjs';
 import { resolveClaudeUpdatePolicy, compareProfileVersions, nativeClaudeVersionAt } from './service-profile-claude.mjs';
-import { readDesktopMetadata } from './service-profile-desktop.mjs';
+import { DESKTOP_APPLICATIONS, desktopLocations, readDesktopMetadata } from './service-profile-desktop.mjs';
 
-const CLI = [
+/** The CLIs a profile can install with npm; service-profile-probe.mjs runs what each installs. */
+export const CLI_PRODUCTS = [
   { id: 'claude-code', name: 'Claude Code', executable: 'claude', package: '@anthropic-ai/claude-code' },
   { id: 'codex-cli', name: 'Codex CLI', executable: 'codex', package: '@openai/codex' },
   { id: 'opencode', name: 'OpenCode', executable: 'opencode', package: 'opencode-ai' },
@@ -71,10 +72,12 @@ function npmInstall(executable, packageName, platform, io) {
   return null;
 }
 
+const PROBE = path.join(import.meta.dirname, 'service-profile-probe.mjs');
+
 function baseService(id, name) {
   return {
     id, name, process: { type: 'none' }, health: { type: 'none' },
-    busy: { type: 'command', command: [process.execPath, path.join(import.meta.dirname, 'service-profile-probe.mjs'), 'busy', id], timeoutSeconds: 6 },
+    busy: { type: 'command', command: [process.execPath, PROBE, 'busy', id], timeoutSeconds: 6 },
     updates: { automatic: false },
   };
 }
@@ -89,13 +92,8 @@ function directNpmRuntime(prefix, io, npm) {
   ].some((candidate) => fileExists(candidate, io));
 }
 
-function desktopProfile(id, name, names, { platform, home, env, io, readDesktop = readDesktopMetadata }) {
-  let candidates = [];
-  if (platform === 'mac') candidates = names.flatMap((app) => [path.join('/Applications', `${app}.app`), path.join(home, 'Applications', `${app}.app`)]);
-  if (platform === 'windows') {
-    const locations = [env.LOCALAPPDATA, env.ProgramFiles, env['ProgramFiles(x86)']].filter(Boolean);
-    candidates = names.flatMap((app) => locations.flatMap((location) => [path.join(location, app, `${app}.exe`), path.join(location, 'Programs', app, `${app}.exe`)]));
-  }
+function desktopProfile(id, name, { platform, home, env, io, readDesktop = readDesktopMetadata }) {
+  const candidates = desktopLocations(DESKTOP_APPLICATIONS[id], { platform, home, env });
   const found = candidates.find((candidate) => platform === 'mac' ? directoryExists(candidate, io) : fileExists(candidate, io));
   const metadata = found ? readDesktop(found, { platform: platform === 'mac' ? 'darwin' : 'win32', io }) : null;
   return {
@@ -104,7 +102,7 @@ function desktopProfile(id, name, names, { platform, home, env, io, readDesktop 
     updateMethod: found ? 'application-updater' : null,
     service: metadata ? {
       ...baseService(id, name), kind: 'command',
-      installedVersion: [process.execPath, path.join(import.meta.dirname, 'service-profile-probe.mjs'), 'desktop-version', id, found, metadata.identity],
+      installedVersion: [process.execPath, PROBE, 'desktop-version', id, found, metadata.identity],
     } : null,
   };
 }
@@ -112,7 +110,7 @@ function desktopProfile(id, name, names, { platform, home, env, io, readDesktop 
 export function discoverServiceProfiles({ platform = detectPlatform(), home = os.homedir(), env = process.env, io = fs, configuration = {}, readDesktop = readDesktopMetadata } = {}) {
   if (!['mac', 'linux', 'windows'].includes(platform)) return [];
   const npm = findExecutable('npm', env, platform, io);
-  const profiles = CLI.map((product) => {
+  const profiles = CLI_PRODUCTS.map((product) => {
     const executable = findExecutable(product.executable, env, platform, io);
     const install = executable ? npmInstall(executable, product.package, platform, io) : null;
     const existing = (Array.isArray(configuration.services) ? configuration.services : []).find((service) => service?.kind === 'npm' && service.package === product.package && typeof service.npmPrefix === 'string' && install && real(service.npmPrefix, io) === real(install.prefix, io));
@@ -126,7 +124,7 @@ export function discoverServiceProfiles({ platform = detectPlatform(), home = os
       const policy = modern !== null && modern >= 0
         ? resolveClaudeUpdatePolicy({ home, executable, platform: platform === 'mac' ? 'darwin' : platform === 'windows' ? 'win32' : platform, env, io })
         : { ok: false, message: 'This native version predates the update policy rules supported by the profile.' };
-      const invoke = (verb) => [process.execPath, path.join(import.meta.dirname, 'service-profile-probe.mjs'), verb, product.id, executable, home, policy.hash];
+      const invoke = (verb) => [process.execPath, PROBE, verb, product.id, executable, home, policy.hash];
       return {
         id: product.id, name: product.name, platform, detected: true, availability: policy.ok ? 'available' : 'unavailable',
         message: policy.ok ? `Native ${policy.channel} channel resolved for the home directory. Automatic maintenance is off; all Claude processes must exit and the exact target version must be observed.` : policy.message,
@@ -144,14 +142,19 @@ export function discoverServiceProfiles({ platform = detectPlatform(), home = os
           : executable ? 'Executable detected, but its install method cannot be safely provisioned automatically. Keep its current package manager or official updater.'
             : 'This CLI was not found in the agent session PATH. Nothing will be installed automatically.',
       updateMethod: available ? 'npm' : nativeClaude ? 'claude-native' : null,
-      service: available ? { ...baseService(product.id, product.name), kind: 'npm', package: product.package, npmPrefix: install.prefix, channel, allowScripts: product.id === 'opencode' ? ['opencode-ai'] : [] } : null,
+      // With no process and no health check, nothing else would notice an
+      // install that does not run, so the update runs what it installed.
+      service: available ? {
+        ...baseService(product.id, product.name), kind: 'npm', package: product.package, npmPrefix: install.prefix, channel,
+        allowScripts: product.id === 'opencode' ? ['opencode-ai'] : [], verify: [process.execPath, PROBE, 'npm-verify', product.id, install.prefix],
+      } : null,
     };
   });
-  profiles.push(desktopProfile('claude-desktop', 'Claude desktop', ['Claude'], { platform, home, env, io, readDesktop }));
+  profiles.push(desktopProfile('claude-desktop', 'Claude desktop', { platform, home, env, io, readDesktop }));
   // Current Codex and ChatGPT desktop are one application. One catalog row
   // prevents two scheduled profiles from trying to update the same bundle.
-  profiles.push(desktopProfile('codex-desktop', 'Codex / ChatGPT desktop', ['ChatGPT', 'Codex'], { platform, home, env, io, readDesktop }));
-  profiles.push(desktopProfile('antigravity', 'Antigravity', ['Antigravity'], { platform, home, env, io, readDesktop }));
+  profiles.push(desktopProfile('codex-desktop', 'Codex / ChatGPT desktop', { platform, home, env, io, readDesktop }));
+  profiles.push(desktopProfile('antigravity', 'Antigravity', { platform, home, env, io, readDesktop }));
   profiles.push({ id: 'grok-cli', name: 'GrokCLI', platform, detected: false, availability: 'unavailable', message: 'Several unrelated tools use this name. Select the exact project and distribution before provisioning an updater.', updateMethod: null, service: null });
   return profiles;
 }

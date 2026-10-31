@@ -117,6 +117,11 @@ fun MachineSection(model: MachineModel, app: AppModel) {
                 DetailRow("Hostname") { ValueText(model.status?.hostname, "not known") }
                 DetailRow("System") { ValueText(model.currentSystem?.name, "not known") }
                 DetailRow("Agent") { VersionText(model.abilities.agentVersion, "not known") }
+                // Said where the version is first read, with the way to the install action beside it.
+                AgentDeploymentPath.behind(app.agentBundleVersion, model.abilities.agentVersion)?.let { behind ->
+                    QuietText(behind)
+                    Actions { PlainAction("Control agent", enabled = true) { sheet = null; agentDetails = true } }
+                }
                 DetailRow("Address") { ValueText(model.route?.label, "not known") }
                 model.lastChecked?.let { checked -> DetailRow("Checked") { QuietText(localTime(checked)) } }
                 DetailRow("Setup") { SetupRow(model, app) }
@@ -188,7 +193,7 @@ private fun compactMachineState(model: MachineModel): String = when (val state =
     is LinkState.Unsettled -> "Outcome unconfirmed"
     is LinkState.Misconfigured -> "Setup needs attention"
     is LinkState.PhoneKeyUnavailable -> "This phone's key could not be read"
-    is LinkState.Offline -> "Not reachable"
+    is LinkState.Offline -> if (state.noTunnel) "Phone not on the tailnet" else "Not reachable"
     LinkState.Unknown -> "Checking…"
 }
 
@@ -216,6 +221,7 @@ private fun AgentDetailsDialog(model: MachineModel, app: AppModel, onDismiss: ()
         text = {
             Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
                 DetailRow("Version") { VersionText(model.abilities.agentVersion, "not known") }
+                AgentDeploymentPath.behind(app.agentBundleVersion, model.abilities.agentVersion)?.let { QuietText(it) }
                 val contract = model.abilities.contract?.takeIf { it > 0 }
                 if (contract != null) QuietText("Protocol contract $contract.")
                 if (!model.speaksV3 && contract != null) {
@@ -588,7 +594,10 @@ private fun RunningNow(model: MachineModel) {
                 state is LinkState.PhoneKeyUnavailable ->
                     StatusLine(Mark.Attention, "This phone's key could not be read, so nothing was sent")
 
-                state is LinkState.Offline -> StatusLine(Mark.Attention, "Asleep or unreachable")
+                state is LinkState.Offline -> StatusLine(
+                    Mark.Attention,
+                    if (state.noTunnel) "This phone is not on the tailnet, so nothing reached it" else "Asleep or unreachable",
+                )
 
                 else -> StatusLine(Mark.Unknown, "Checking")
             }

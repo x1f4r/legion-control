@@ -149,7 +149,7 @@ struct AppUpdateModelTests {
         let app = AppModel(config: ConfigStore(url: directory.appending(path: "config.json")),
                            bindings: BindingsStore(url: directory.appending(path: "bindings.json")),
                            operations: OperationStore(url: directory.appending(path: "operations.json")),
-                           appUpdates: updates)
+                           appUpdates: updates, remembered: .inMemory())
         var redraws = 0
         app.onStateChange = { redraws += 1 }
         updates.fetchRelease = { _, _ in .available(Self.release) }
@@ -175,7 +175,8 @@ struct AppUpdateModelTests {
         try Data(#"{"version":1,"machines":[],"appUpdates":{"githubRepo":"a/a"}}"#.utf8).write(to: configURL)
         let app = AppModel(config: ConfigStore(url: configURL),
                            bindings: BindingsStore(url: directory.appending(path: "bindings.json")),
-                           operations: OperationStore(url: directory.appending(path: "operations.json")), appUpdates: updates)
+                           operations: OperationStore(url: directory.appending(path: "operations.json")), appUpdates: updates,
+                           remembered: .inMemory())
         updates.fetchRelease = { _, _ in .available(Self.release) }
         updates.checkNow()
         await settle(updates)

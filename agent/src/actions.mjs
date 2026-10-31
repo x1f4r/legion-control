@@ -15,8 +15,9 @@ import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { recordPhase } from './operations.mjs';
 import { mutationWorstCaseMs, runMutationArgv } from './process-runner.mjs';
-import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy, heldBecause } from './probes/busy.mjs';
 import { log, note } from './log.mjs';
+import { machineLiveness } from './service.mjs';
 
 const MAX_OUTPUT_LINES = 20;
 
@@ -174,7 +175,7 @@ export async function runAction(config, id, options = {}) {
       if (action.busyGated && !force) {
         lock.phase('checking-busy');
         recordPhase(opId, 'checking-busy');
-        const { busy } = await checkAllBusy(config);
+        const { busy } = await checkAllBusy(config, { liveness: machineLiveness(config) });
         if (busy.busy) {
           log(`action ${action.id} deferred: ${busy.reason}`, 'run');
           return {
@@ -184,7 +185,7 @@ export async function runAction(config, id, options = {}) {
             id: action.id,
             exitCode: null,
             output: '',
-            message: `the machine is busy (${busy.reason}); pass --force to run ${action.name} anyway, or --when-idle to queue it`,
+            message: `${heldBecause(busy)}; pass --force to run ${action.name} anyway, or --when-idle to queue it`,
             busy,
           };
         }

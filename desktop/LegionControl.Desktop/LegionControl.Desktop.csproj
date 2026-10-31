@@ -11,7 +11,7 @@
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
     <AssemblyName>legion-control</AssemblyName>
     <RootNamespace>LegionControl.Desktop</RootNamespace>
-    <Version>1.4.0</Version>
+    <Version>1.4.1</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
     <!-- The tree builds without a warning, and a new one is a mistake to fix before it ships.
          An advisory published against a package is news about that package rather than about

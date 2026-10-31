@@ -108,9 +108,10 @@ struct MenuBarPanel: View {
                     Menu(record.title) {
                         Text(record.summary)
                         Button("Open device") { openOperation(record) }
-                        Button("Check outcome") {
-                            if let machine = model.machine(id: record.machineId) { machine.reconcileNow() }
-                            else if let mac = model.mac, mac.historyMachineId == record.machineId { mac.reconcileNow() }
+                        if let reason = model.device(filing: record.machineId)?.checkUnavailableReason(for: record) {
+                            Text(reason)
+                        } else {
+                            Button("Check outcome") { model.device(filing: record.machineId)?.reconcileNow() }
                         }
                     }
                 }

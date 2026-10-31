@@ -1,7 +1,7 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.1.0",
+  "agentVersion": "3.1.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -60,7 +60,7 @@
         "line": "rolled back to 1.4.2, health 200"
       }
     ],
-    "agentVersion": "3.1.0",
+    "agentVersion": "3.1.1",
     "systemId": "linux",
     "from": "1.4.2",
     "to": "1.4.2",

@@ -121,8 +121,12 @@ how an update happens.
   // The global prefix the package lives under. Default: the platform's usual one, probed if
   // that is empty.
   "npmPrefix": null,
-  // Packages allowed to run install scripts on npm 12 and newer.
+  // Packages allowed to run install scripts, passed to npm 11.16 and newer, which know the setting.
   "allowScripts": ["node-pty"],
+  // Optional. A command that fails when what npm installed does not run, for a package whose
+  // postinstall puts the real binary in place. The CLI profiles set one that runs the package's
+  // command with --version.
+  "verify": ["/usr/local/bin/dashboard", "--version"],
   "process": { "type": "systemd-user", "unit": "dashboard.service" },
   "health": { "type": "http", "port": 8080, "path": "/healthz" },
   "busy": { "type": "http", "port": 8080, "path": "/status", "busyWhen": "jobs.running" }
@@ -132,9 +136,11 @@ how an update happens.
 The update cycle for this kind: resolve the tag, compare with the installed `package.json`
 version, check busy, pre-warm the npm cache, take the operation lock, **check busy again**, drain
 if a drain command is configured, stop the process and poll until it is really gone, install,
-verify the installed version, start, wait for health. Any failure reinstalls the previous version
-and reports a rollback. The second busy check is the one that matters: cache warming can take
-minutes, and the answer from before it is stale by the time anything is stopped.
+verify the installed version and run `verify` when there is one, start, wait for health. Any
+failure from the install on reinstalls the previous version and reports a rollback. The second
+busy check is the one that matters: cache warming can take minutes, and the answer from before it
+is stale by the time anything is stopped. An update that finds the service already on the target
+runs `verify` too, and reports a failed update rather than a current one when it fails.
 
 #### `app`: a desktop app that updates itself
 
@@ -223,6 +229,12 @@ methods and produce drafts with automatic updates disabled. Review the draft and
 only where the reported method fits your installation. The generic templates remain available
 when no profile applies.
 
+A profile's busy probe looks for the processes of the install its update would replace. For an npm
+service those are the ones whose program or script lies in the package under the service's prefix,
+so a second install of the same product elsewhere does not hold its updates back; for an
+application they are the ones inside its bundle. Only a process whose path cannot be read is
+matched by its name. The probes the agent runs beside it are left out.
+
 The command sequence is:
 
 1. `service-config get` returns `document`, an opaque `hash`, `templates`, and
@@ -253,7 +265,7 @@ separate operation against `controller.json`.
 | `scheduled-task` | `task`, `match` | Windows. `Start-/Stop-ScheduledTask`; running is decided by a process whose command line contains `match` (default: the npm package root) |
 | `app` | | macOS, implied for kind `app` |
 | `command` | `start`, `stop`, `running` | argv arrays, at least one required. `running` is judged by exit code 0 |
-| `none` | | nothing to start or stop, so nothing that can be down: reported as running, and not restartable |
+| `none` | | nothing to start or stop, so nothing that can be down: reported as running, and not restartable. An update stops nothing: it waits up to 20 s for the service's own busy probe to answer idle, and defers when it does not |
 
 **`drain`** is a service-level command run after the operation lock is taken and before the service
 is stopped, for a service that can be told to finish what it is doing and stop accepting new work.
@@ -278,9 +290,9 @@ every disruptive action and it fails closed: a probe that cannot be read counts 
 
 | type | fields | notes |
 | --- | --- | --- |
-| `command` | `command`, `staleHours` | exit code 0 means idle, anything else means busy. If stdout is a JSON object with `busy` and `reason`, those are used |
+| `command` | `command`, `staleHours` | exit code 0 means idle, anything else means busy. If stdout is a JSON object with `busy` and `reason`, those are used. The command runs with `LEGIONCTL_AGENT_PID` set to the agent that asked, and for an npm service `LEGIONCTL_NPM_PREFIX` and `LEGIONCTL_NPM_PACKAGE` |
 | `http` | `port`, `path`, `host`, `busyWhen` | GET the URL; busy when the JSON body's `busyWhen` path (dotted) is truthy |
-| `t3-sqlite` | `home`, `staleHours` (default 6), `allowMissing` | counts running and pending turns and pending approvals in T3 Code's state database |
+| `t3-sqlite` | `home`, `staleHours` (default 6), `allowMissing` | counts running and pending turns, the subagents, shells and monitors they left running, and waiting approvals in T3 Code's state database, `userdata/statev2.sqlite`. The older `userdata/state.sqlite` counts only when it is the only one, or was written after it |
 | `none` | | declared never busy |
 
 **There is no default.** A service with no `busy` block at all is *unmonitored*, which is not the
@@ -1213,7 +1225,8 @@ key runs there either.
 
 **This device → Configuration → Fetch from a machine** takes a host, a port and a user, runs the
 config command there with the device's own key (which has to be authorised on that system already,
-exactly as for any other command), and applies what comes back. It tries the standard install
+exactly as for any other command), and takes what comes back, on a device that applies no setup yet
+only once it has shown every launch value in it and you confirmed. It tries the standard install
 layouts in turn, so you do not have to know where the agent lives:
 
     /usr/bin/node /home/<user>/.legion-control/bin/launcher.mjs
@@ -1225,6 +1238,15 @@ preserved. Moving it to the stable launcher is a reviewed configuration edit tha
 interpreter and base; custom paths are not silently rewritten or used to guess an upload location.
 
 From then on the device reconciles like every other peer. Pasting the JSON by hand still works.
+
+On Android a fetched copy is the machine's revision and is taken only as the bytes the machine
+holds. A reply whose bytes do not hash to the `hash` it reports is refused until that machine's
+agent is updated: an agent before 3.1.0 sends no `raw`, and a document rebuilt from what it does
+send is spelled differently from one the desktop wrote. On a phone that already has the same setup
+it is decided by ancestry, as for a copy a status reports: the copy the phone has, or one its own
+was made from, changes nothing; a revision made from the phone's is taken exactly as served after
+Confirm; and one edited separately goes to the merge screen. Only a paste is an edit made on the
+phone.
 
 There is no discovery. Nothing on your network announces itself and no client listens for anything;
 the document lists your machines and any one of them will hand it over. The document also carries no

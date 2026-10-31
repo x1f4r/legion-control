@@ -354,7 +354,8 @@ struct FixtureTests {
         let status = try JSONDecoder().decode(AgentStatus.self, from: try Self.bytes("status.full.json"))
         #expect(status.contractVersion == 3)
         #expect(status.speaksRequiredContract)
-        #expect(status.version == "3.1.0")
+        // The fixtures are written from agent/package.json, the version this app bundles.
+        #expect(status.version == bundledAgentVersion)
         #expect(!status.resolvedServices.isEmpty)
         #expect(status.controllerHash != nil)
         #expect(status.controller?.identity.id != nil)

@@ -17,8 +17,8 @@ android {
         applicationId = "com.x1f4r.legioncontrol"
         minSdk = 30
         targetSdk = 36
-        versionCode = 15
-        versionName = "1.4.0"
+        versionCode = 16
+        versionName = "1.4.1"
 
         // The label lives here rather than in res/values/strings.xml so that the one string the
         // manifest needs cannot collide with the string table the UI owns.

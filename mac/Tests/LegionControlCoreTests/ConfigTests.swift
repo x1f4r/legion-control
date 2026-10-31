@@ -957,7 +957,9 @@ struct ConfigTests {
         let withoutBindings = AppModel(
             config: ConfigStore(url: configFile),
             bindings: BindingsStore(url: home.appending(path: "absent-bindings.json")),
-            operations: OperationStore(url: home.appending(path: "old-operations.json"))
+            operations: OperationStore(url: home.appending(path: "old-operations.json")),
+            appUpdates: AppUpdateModel(preferences: FilePreferences(url: home.appending(path: "preferences.json"))),
+            remembered: .inMemory()
         )
         #expect(withoutBindings.mac != nil)
 
@@ -966,7 +968,9 @@ struct ConfigTests {
         let withBindings = AppModel(
             config: ConfigStore(url: configFile),
             bindings: bindingStore,
-            operations: OperationStore(url: home.appending(path: "operations.json"))
+            operations: OperationStore(url: home.appending(path: "operations.json")),
+            appUpdates: AppUpdateModel(preferences: FilePreferences(url: home.appending(path: "preferences.json"))),
+            remembered: .inMemory()
         )
         #expect(withBindings.mac == nil)
     }
@@ -1017,7 +1021,9 @@ struct ConfigTests {
             $0.localAgent = .init(argv: ["/bin/echo", "first"])
         }
         let app = AppModel(config: ConfigStore(url: configFile), bindings: bindings,
-                           operations: OperationStore(url: home.appending(path: "operations.json")))
+                           operations: OperationStore(url: home.appending(path: "operations.json")),
+                           appUpdates: AppUpdateModel(preferences: FilePreferences(url: home.appending(path: "preferences.json"))),
+                           remembered: .inMemory())
         let before = try #require(app.mac)
         #expect(before.name == "My local name")
         #expect(app.machines.isEmpty)

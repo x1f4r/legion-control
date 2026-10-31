@@ -1,11 +1,18 @@
 // Conservative probes for explicitly enabled product profiles. Process rows
 // stay in this process; replies never include command lines or credentials.
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { resolveClaudeUpdatePolicy, claudeTargetAllowed, compareProfileVersions, nativeClaudeVersionAt } from './service-profile-claude.mjs';
-import { readDesktopMetadata } from './service-profile-desktop.mjs';
+import { DESKTOP_APPLICATIONS, desktopLocations, readDesktopMetadata } from './service-profile-desktop.mjs';
+import { CLI_PRODUCTS } from './service-profiles.mjs';
 
+// Each name belongs to one profile. Outside Windows a name is matched with its
+// case, so the claude CLI is not the Claude app and the codex CLI is not the
+// Codex app. Windows matches file names without case, and claude.exe is both
+// there; the applications are told apart by where they are installed.
 const NAMES = {
   'claude-code': ['claude', 'claude-code'],
   'claude-desktop': ['Claude', 'claude-desktop'],
@@ -61,83 +68,426 @@ function identifiedWindowsSystemProcess(row, rows, systemRoot) {
   return false;
 }
 
-export function processExitVerdict(profile, rows, ownPid = process.pid, { platform = process.platform, systemRoot = process.env.SystemRoot } = {}) {
+
+const RUNTIME = /^(?:node|nodejs|bun|electron)(?:\.exe)?$/i;
+const SCRIPT_EXTENSION = /\.(?:[cm]?js|[cm]?ts)$/i;
+const INLINE = new Set(['-e', '--eval', '-p', '--print']);
+// task_struct's PF_KTHREAD, in the flags field of /proc/<pid>/stat.
+const KERNEL_THREAD = 0x00200000;
+
+function firstWord(text) {
+  const match = /^\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+|$)/.exec(text);
+  return match ? { value: match[1] ?? match[2] ?? match[3], exact: match[3] === undefined, rest: text.slice(match[0].length) } : null;
+}
+
+/** The words after argv0. argv read from the kernel is exact; a command line printed by ps is not. */
+function words(rest) {
+  if (Array.isArray(rest)) return rest.map((value) => ({ value: String(value), exact: true }));
+  const list = [];
+  for (let text = rest, word; text && list.length < 64 && (word = firstWord(text)); text = word.rest) list.push(word);
+  return list;
+}
+
+/**
+ * The file a runtime's script is, resolved through its links: an npx server
+ * runs node_modules/.bin/<name>, a link to the package's own script. ps prints
+ * argv unquoted, so a script whose path has a space in it arrives as several
+ * words, and the shortest run of them that names a file is the script.
+ */
+function locateScript(list, index, { paths, cwd, file }) {
+  const first = list[index];
+  const candidates = [first.value];
+  for (let end = index + 1; !first.exact && end < list.length && end < index + 16 && !list[end].exact; end += 1) {
+    candidates.push(list.slice(index, end + 1).map((word) => word.value).join(' '));
+  }
+  const absolute = (candidate) => (paths.isAbsolute(candidate) ? candidate : typeof cwd === 'string' && paths.isAbsolute(cwd) ? paths.resolve(cwd, candidate) : null);
+  for (const [count, candidate] of candidates.entries()) {
+    const real = absolute(candidate) && file.real(absolute(candidate));
+    if (real && file.isFile(real)) return { value: candidate, path: real, resolved: true, words: count + 1 };
+  }
+  // node also runs a directory, by its package.json or index.js. A word that
+  // is exact still says where the script was when it cannot be resolved; one
+  // ps split might be only the start of it.
+  const start = absolute(first.value);
+  const real = start && file.real(start);
+  return { value: first.value, path: real || (first.exact && start ? paths.normalize(start) : null), resolved: Boolean(real), words: 1 };
+}
+
+const inlineCode = (list, index) => {
+  const { value } = list[index];
+  if (INLINE.has(value)) return { inline: list.slice(index + 1).map((word) => word.value).join(' ') };
+  if (/^--(?:eval|print)=/.test(value)) return { inline: value.slice(value.indexOf('=') + 1) };
+  return null;
+};
+
+/**
+ * The scripts a runtime may run. An option in one word, --name=value, says
+ * nothing about where the script is and is passed over. Any other option may
+ * take the next word as its value, as --require and --import do, or take none,
+ * as --test and --inspect do, so after one every word that is no option is a
+ * candidate: `node --test a.test.mjs` is as plain as `node a.test.mjs`.
+ */
+function scriptOf(list, context) {
+  for (let index = 0; index < list.length; index += 1) {
+    const { value } = list[index];
+    const inline = inlineCode(list, index);
+    if (inline) return inline;
+    if (/^--[^=\s]+=/.test(value)) continue;
+    if (!value.startsWith('-')) return { scripts: [locateScript(list, index, context)] };
+    const scripts = [];
+    for (let next = index + 1; next < list.length; next += 1) {
+      // After a candidate, -p and -e may be the script's own: claude -p is.
+      const code = scripts.length === 0 && inlineCode(list, next);
+      if (code) return code;
+      if (list[next].value.startsWith('-')) continue;
+      const script = locateScript(list, next, context);
+      scripts.push(script);
+      next += script.words - 1;
+    }
+    return scripts.length > 0 ? { scripts } : null;
+  }
+  return null;
+}
+
+/**
+ * What one row says its process is: the names it goes by, and the absolute
+ * paths that say where its program lives. For node, bun and electron that
+ * program is the script they run, never the runtime itself.
+ *
+ * A runtime can rename itself: Claude Code's cli.js sets process.title, and
+ * Linux then shows the new name as comm and writes it over argv. The script is
+ * gone from the row, and the runtime's own path still says nothing about which
+ * install it runs, so such a row has only its name to go by.
+ */
+function identify(row, { paths, file, cwdOf }) {
+  const name = String(row.name ?? '');
+  const command = typeof row.command === 'string' ? row.command : '';
+  let uncertain = !name || !command;
+  let argv0;
+  let rest;
+  if (Array.isArray(row.argv) && row.argv.length > 0) [argv0, ...rest] = row.argv;
+  // ps cannot quote, so a space in the executable's own path reads like the
+  // one before its first argument. On a Mac comm is that path in full, and
+  // the command line starts with it.
+  else if (name && (command === name || command.startsWith(`${name} `))) [argv0, rest] = [name, command.slice(name.length)];
+  else ({ value: argv0 = '', rest = '' } = firstWord(command) ?? {});
+  const names = [name, argv0];
+  const located = [];
+  const runtime = (identity) => RUNTIME.test(String(identity ?? '').split(/[\\/]/).at(-1));
+  if ([name, argv0].some(runtime)) {
+    const found = scriptOf(words(rest), { paths, file, cwd: cwdOf?.(row.pid) });
+    if (!found) uncertain = true;
+    else if (found.inline !== undefined) names.push(found.inline);
+    else {
+      for (const script of found.scripts) names.push(script.value, ...(script.path ? [script.path] : []));
+      // Paths say where the program lives only when every candidate has one:
+      // the one without could be the script.
+      if (found.scripts.every((script) => script.path)) located.push(...found.scripts.map((script) => script.path));
+      if (!found.scripts.some((script) => script.resolved || SCRIPT_EXTENSION.test(script.value))) uncertain = true;
+    }
+  } else if (!runtime(row.executablePath)) {
+    for (const candidate of [row.executablePath, argv0]) if (typeof candidate === 'string' && paths.isAbsolute(candidate)) located.push(candidate);
+  }
+  return { names, located, uncertain };
+}
+
+/**
+ * The agent's process and everything it started: its other probes are no
+ * product session. `descends` says whether a row really is the child its
+ * parent id names. The tree counts only when this probe is in it, which is
+ * what shows the agent named is the one that started it.
+ */
+function agentTree(rows, agentPid, ownPid, descends) {
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const children = new Map();
+  for (const row of rows) if (Number.isInteger(row.parentPid) && row.parentPid !== row.pid) children.set(row.parentPid, [...(children.get(row.parentPid) ?? []), row]);
+  const tree = new Set([agentPid]);
+  for (const pid of tree) for (const child of children.get(pid) ?? []) if (descends(byPid.get(pid), child)) tree.add(child.pid);
+  return tree.has(ownPid) ? tree : new Set();
+}
+
+function realFiles(io) {
+  return {
+    real: (file) => { try { return io.realpathSync(file); } catch { return null; } },
+    isFile: (file) => { try { return io.statSync(file).isFile(); } catch { return false; } },
+  };
+}
+
+/**
+ * The verdict for one profile over one process snapshot.
+ *
+ * `install.owned` is where the install an update replaces lives: the npm
+ * package root and the bin links it owns, or the application bundle. When it
+ * is known, a process whose program has a path counts only when that path is
+ * inside it, whatever the process is called; a name decides only for a
+ * process whose path cannot be read. `install.foreign` is where other
+ * profiles' applications live, and a name never claims a process from there.
+ *
+ * `agentPid` is the agent that asked, and its whole tree is left out: the
+ * agent runs up to four probes at once, and each of them used to see the
+ * others, and their children, start and exit around it. Windows keeps a
+ * parent's id after the parent exits and gives it to the next process, so a
+ * parent id there proves descent only from a parent created before the child.
+ */
+export function processExitVerdict(profile, rows, ownPid = process.pid, { platform = process.platform, systemRoot = process.env.SystemRoot, agentPid = null, install = null, cwdOf = null, io = fs } = {}) {
   const names = NAMES[profile];
   if (!names || !Array.isArray(rows)) return { busy: true, unknown: true, reason: 'Process inspection is unavailable for this profile.' };
-  const patterns = names.map((name) => new RegExp(`(?:^|[\\s/\\\\"'])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.exe|\\.app)?(?:$|[\\s/\\\\"'])`, 'i'));
-  const firstWord = (text) => {
-    const match = /^\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+|$)/.exec(text);
-    return match ? { value: match[1] ?? match[2] ?? match[3], rest: text.slice(match[0].length) } : null;
-  };
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const fold = (value) => (platform === 'linux' ? value : value.toLowerCase());
+  const patterns = names.map((name) => new RegExp(`(?:^|[\\s/\\\\"'])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.exe|\\.app)?(?:$|[\\s/\\\\"'])`, platform === 'win32' ? 'i' : ''));
+  const file = realFiles(io);
+  const inside = (candidate, roots) => roots.some((root) => {
+    const base = fold(paths.normalize(root)).replace(/[\\/]+$/, '');
+    const target = fold(paths.normalize(candidate));
+    return target === base || target.startsWith(`${base}${paths.sep}`);
+  });
+  const owned = install?.owned?.length ? install.owned : null;
+  const links = new Set((install?.links ?? []).map((link) => fold(paths.normalize(link))));
+  const foreign = install?.foreign ?? [];
+  const descends = platform === 'win32'
+    ? (parent, child) => typeof parent?.createdAt === 'string' && typeof child.createdAt === 'string' && parent.createdAt < child.createdAt
+    : () => true;
+  const excluded = Number.isInteger(agentPid) ? agentTree(rows, agentPid, ownPid, descends) : new Set();
   let uncertain = false;
   for (const row of rows) {
     if (platform === 'win32' && identifiedWindowsSystemProcess(row, rows, systemRoot)) continue;
     if (!Number.isInteger(row.pid) || row.pid <= 0) { uncertain = true; continue; }
-    if (row.pid === ownPid) continue;
-    const name = String(row.name ?? '');
-    const command = typeof row.command === 'string' ? row.command : '';
-    if (!name || !command) uncertain = true;
-    const executable = firstWord(command);
-    const identities = [name, executable?.value ?? ''];
-    const runtime = [name, executable?.value ?? ''].some((identity) => /^(node|bun|electron)(\.exe)?$/i.test(identity.split(/[\\/]/).at(-1)));
-    if (runtime) {
-      const scriptTail = command.startsWith(`${name} `) ? command.slice(name.length).trimStart() : executable?.rest;
-      const script = scriptTail && firstWord(scriptTail);
-      if (!script || script.value.startsWith('-')) uncertain = true;
-      else {
-        identities.push(script.value);
-        if (!/\.(?:[cm]?js|[cm]?ts)$/i.test(script.value)) uncertain = true;
-      }
-    }
-    if (patterns.some((pattern) => identities.some((identity) => pattern.test(identity)))) {
-      return { busy: true, unknown: false, reason: 'A related application or CLI session is still running.' };
-    }
-    if (!command && runtime) uncertain = true;
+    if (row.pid === ownPid || excluded.has(row.pid)) continue;
+    // A zombie has exited: it runs nothing and holds no file open.
+    if (platform !== 'win32' && typeof row.state === 'string' && row.state.startsWith('Z')) continue;
+    const identity = identify(row, { paths, file, cwdOf });
+    const where = identity.located.flatMap((candidate) => [candidate, file.real(candidate)]).filter(Boolean);
+    let related;
+    if (owned && where.length > 0) related = where.some((candidate) => inside(candidate, owned) || links.has(fold(paths.normalize(candidate))));
+    else if (where.some((candidate) => inside(candidate, foreign))) related = false;
+    else related = patterns.some((pattern) => identity.names.some((value) => pattern.test(value)));
+    if (related) return { busy: true, unknown: false, reason: 'A related application or CLI session is still running.' };
+    if (identity.uncertain) uncertain = true;
   }
   return uncertain
     ? { busy: true, unknown: true, reason: 'Some process identities could not be inspected; waiting for a reliable idle result.' }
     : { busy: false, unknown: false, reason: 'No related application or CLI session is running.' };
 }
 
-export function inspectProfileProcesses(profile, { platform = process.platform, run = spawnSync } = {}) {
+function readJson(file, io) {
+  try {
+    if (io.statSync(file).size > 1024 * 1024) return null;
+    return JSON.parse(io.readFileSync(file, 'utf8'));
+  } catch { return null; }
+}
+
+/**
+ * Where the install a profile's update replaces lives, and where the other
+ * profiles' applications live. An npm service's prefix and package come from
+ * the agent that runs this probe: npm replaces <prefix>/lib/node_modules/<package>
+ * (<prefix>\node_modules\<package> on Windows) and the bin links into it, and
+ * nothing else. An application is the bundle its installer put in place.
+ */
+export function profileInstall(profile, { platform = process.platform, env = process.env, home = os.homedir(), io = fs } = {}) {
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const file = realFiles(io);
+  const owned = [];
+  const links = [];
+  const prefix = env.LEGIONCTL_NPM_PREFIX;
+  const packageName = env.LEGIONCTL_NPM_PACKAGE;
+  if (typeof prefix === 'string' && paths.isAbsolute(prefix) && typeof packageName === 'string' && /^(?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+$/i.test(packageName)) {
+    const root = platform === 'win32' ? paths.join(prefix, 'node_modules', packageName) : paths.join(prefix, 'lib', 'node_modules', packageName);
+    const realRoot = file.real(root);
+    owned.push(root, ...(realRoot && realRoot !== root ? [realRoot] : []));
+    const bin = readJson(paths.join(root, 'package.json'), io)?.bin;
+    const commands = typeof bin === 'string' ? [packageName.split('/').at(-1)] : bin && typeof bin === 'object' ? Object.keys(bin) : [];
+    for (const command of commands.filter((entry) => /^[A-Za-z0-9._-]+$/.test(entry))) {
+      // A Windows shim is a script of its own that starts node on the package;
+      // a POSIX link is the package's own only while it still points into it.
+      if (platform === 'win32') links.push(...['', '.cmd', '.ps1'].map((suffix) => paths.join(prefix, `${command}${suffix}`)).filter((shim) => file.isFile(shim)));
+      else {
+        const link = paths.join(prefix, 'bin', command);
+        const target = file.real(link);
+        if (target && [root, realRoot].some((base) => base && (target === base || target.startsWith(`${base}/`)))) links.push(link);
+      }
+    }
+  }
+  const system = platform === 'darwin' ? 'mac' : platform === 'win32' ? 'windows' : platform;
+  const bundles = (id) => desktopLocations(DESKTOP_APPLICATIONS[id], { platform: system, home, env })
+    .filter((location) => (system === 'mac' ? file.real(location) && !file.isFile(location) : file.isFile(location)))
+    .map((location) => (system === 'mac' ? location : paths.dirname(location)));
+  const own = DESKTOP_APPLICATIONS[profile] ? bundles(profile) : [];
+  owned.push(...own);
+  const foreign = Object.keys(DESKTOP_APPLICATIONS).flatMap(bundles).filter((bundle) => !own.includes(bundle));
+  // Every packaged Windows application runs from under WindowsApps, where
+  // discovery does not look, and no CLI does. So a CLI profile never claims a
+  // process from there: not the Store's ChatGPT for codex, nor Claude for claude.
+  if (system === 'windows' && !DESKTOP_APPLICATIONS[profile] && typeof env.ProgramFiles === 'string' && paths.isAbsolute(env.ProgramFiles)) {
+    foreign.push(paths.join(env.ProgramFiles, 'WindowsApps'));
+  }
+  return { owned, links, foreign: [...new Set(foreign)] };
+}
+
+/** The agent that asked, when it started this probe and says so. */
+function requestingAgent(env, parentPid) {
+  const pid = Number(env.LEGIONCTL_AGENT_PID);
+  return Number.isInteger(pid) && pid > 1 && pid === parentPid ? pid : null;
+}
+
+function readPs(run, columns, pids = null) {
+  const result = run('/bin/ps', ['-ww', ...(pids ? ['-p', pids.join(',')] : ['-ax']), ...columns.flatMap((column) => ['-o', `${column}=`])], { encoding: 'utf8', timeout: 2000, maxBuffer: 4 * 1024 * 1024 });
+  const text = String(result.stdout ?? '').trim();
+  // ps -p exits 1 when none of the processes asked about is left, which is an answer.
+  if (result.error || (result.status !== 0 && !(pids && result.status === 1 && !text)) || (!text && !pids)) return null;
+  const pattern = columns.length > 2 ? /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/ : /^\s*(\d+)\s+(.*)$/;
+  const entries = new Map();
+  for (const line of text ? text.split('\n') : []) {
+    const found = pattern.exec(line);
+    if (!found || entries.has(Number(found[1]))) return null;
+    entries.set(Number(found[1]), columns.length > 2 ? { parentPid: Number(found[2]), state: found[3], name: found[4] } : { command: found[2] });
+  }
+  // Each short-lived ps child exists in its own snapshot only. Its PID comes
+  // from spawnSync, so excluding it cannot hide a product session.
+  if (Number.isInteger(result.pid)) entries.delete(result.pid);
+  return entries;
+}
+
+/**
+ * A Mac's processes, from two ps reads: comm with the parent and state, then
+ * the command line, since ps cannot quote and comm keeps its spaces only as
+ * the last column. A process both reads saw, with a command line that starts
+ * with its comm, is one consistent row. One that only the first read saw had
+ * exited by the second. One that started, or replaced its program, between
+ * them is read again on its own, and dropped if it has gone by then.
+ */
+function darwinRows(run) {
+  const NAME_COLUMNS = ['pid', 'ppid', 'stat', 'comm'];
+  const consistent = (seen, command) => seen && command !== undefined && (command === seen.name || command.startsWith(`${seen.name} `));
+  const names = readPs(run, NAME_COLUMNS);
+  const commands = readPs(run, ['pid', 'args']);
+  if (!names || !commands) return null;
+  const rows = [];
+  const unsettled = [];
+  for (const pid of new Set([...names.keys(), ...commands.keys()])) {
+    const seen = names.get(pid);
+    const command = commands.get(pid)?.command;
+    if (consistent(seen, command)) rows.push({ pid, ...seen, command });
+    else if (!seen || command !== undefined) unsettled.push(pid);
+  }
+  if (unsettled.length === 0) return rows;
+  const namesAgain = readPs(run, NAME_COLUMNS, unsettled);
+  const commandsAgain = readPs(run, ['pid', 'args'], unsettled);
+  if (!namesAgain || !commandsAgain) return null;
+  for (const pid of unsettled) {
+    const seen = namesAgain.get(pid);
+    const command = commandsAgain.get(pid)?.command;
+    if (command === undefined) continue;
+    rows.push(consistent(seen, command) ? { pid, ...seen, command } : { pid, parentPid: seen?.parentPid, state: seen?.state, name: null, command });
+  }
+  return rows;
+}
+
+/**
+ * One Linux process from /proc: stat carries comm, the parent, the state and
+ * the flags in one read, and cmdline is argv exactly, NUL between the words.
+ * A process gone in the middle of the read is gone, and so are zombies and
+ * kernel threads, which run no program. A process with no argv that is none of
+ * those is between exit and zombie, or hides its argv; it is read once more.
+ */
+function linuxProcess(pid, io) {
+  const gone = (error) => error?.code === 'ENOENT' || error?.code === 'ESRCH';
+  const readStat = () => {
+    const stat = String(io.readFileSync(`/proc/${pid}/stat`, 'utf8'));
+    const open = stat.indexOf('(');
+    const close = stat.lastIndexOf(')');
+    if (open < 0 || close < open) return null;
+    const [state, parentPid, , , , , flags] = stat.slice(close + 1).trim().split(/\s+/);
+    return { name: stat.slice(open + 1, close), state, parentPid: Number(parentPid), flags: Number(flags) };
+  };
+  let stat;
+  let argv;
+  try {
+    stat = readStat();
+    argv = String(io.readFileSync(`/proc/${pid}/cmdline`)).split('\0');
+  } catch (error) { return gone(error) ? null : { pid, name: null, command: null }; }
+  if (!stat) return { pid, name: null, command: null };
+  if (/^[ZXx]/.test(stat.state) || (stat.flags & KERNEL_THREAD) !== 0) return null;
+  if (argv.at(-1) === '') argv.pop();
+  if (argv.length === 0) {
+    try { const again = readStat(); if (!again || /^[ZXx]/.test(again.state)) return null; } catch (error) { if (gone(error)) return null; }
+  }
+  let executablePath = null;
+  try { executablePath = String(io.readlinkSync(`/proc/${pid}/exe`)).replace(/ \(deleted\)$/, ''); } catch { /* another user's process, or gone */ }
+  return { pid, parentPid: stat.parentPid, state: stat.state, name: stat.name, argv, command: argv.join(' '), executablePath };
+}
+
+function linuxRows(io) {
+  return io.readdirSync('/proc').filter((entry) => /^\d+$/.test(entry)).map((entry) => linuxProcess(Number(entry), io)).filter(Boolean);
+}
+
+export function inspectProfileProcesses(profile, { platform = process.platform, run = spawnSync, io = fs, env = process.env, home = os.homedir(), parentPid = process.ppid } = {}) {
   if (!NAMES[profile]) return processExitVerdict(profile, null);
   try {
     let rows;
+    let cwdOf = null;
     if (platform === 'win32') {
       const ownerCandidates = [...WINDOWS_SYSTEM_NAMES, ...WINDOWS_KERNEL_NAMES, ...WINDOWS_ISOLATED_SERVICE_IDENTITIES.keys(), 'vmmem', 'vmmemwsl'];
       const script = `$ErrorActionPreference='Stop'; $names=@(${ownerCandidates.map((name) => `'${name}'`).join(',')}); ` +
-        `@(Get-CimInstance Win32_Process | ForEach-Object { $sid=$null; ` +
+        `@(Get-CimInstance Win32_Process | ForEach-Object { $sid=$null; $created=$null; ` +
+        `if ($_.CreationDate) { $created=$_.CreationDate.ToUniversalTime().ToString('o') }; ` +
         `if ([string]::IsNullOrEmpty($_.CommandLine) -and $names -contains $_.Name) { ` +
         `try { $owner=Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid; if ($owner.ReturnValue -eq 0) { $sid=$owner.Sid } } catch {} }; ` +
-        `[PSCustomObject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;SessionId=$_.SessionId;Name=$_.Name;CommandLine=$_.CommandLine;ExecutablePath=$_.ExecutablePath;OwnerSid=$sid} }) | ConvertTo-Json -Compress`;
+        `[PSCustomObject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;SessionId=$_.SessionId;Name=$_.Name;CommandLine=$_.CommandLine;ExecutablePath=$_.ExecutablePath;OwnerSid=$sid;CreatedAt=$created} }) | ConvertTo-Json -Compress`;
       const result = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 4000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
       if (result.status !== 0 || result.error) return processExitVerdict(profile, null);
       const entries = JSON.parse(result.stdout);
       if (!Array.isArray(entries)) return processExitVerdict(profile, null);
-      rows = entries.map((row) => ({ pid: row.ProcessId, parentPid: row.ParentProcessId, sessionId: row.SessionId, name: row.Name, command: row.CommandLine, executablePath: row.ExecutablePath, ownerSid: row.OwnerSid }));
-    } else if (platform === 'darwin' || platform === 'linux') {
-      // ps does not quote fields. Separate PID-prefixed reads preserve spaces
-      // in comm instead of guessing where one column ends and another begins.
-      const readColumn = (column) => {
-        const result = run('/bin/ps', ['-ww', '-ax', '-o', 'pid=', '-o', `${column}=`], { encoding: 'utf8', timeout: 2000, maxBuffer: 4 * 1024 * 1024 });
-        if (result.status !== 0 || result.error || !String(result.stdout).trim()) return null;
-        const entries = new Map();
-        for (const line of String(result.stdout).trim().split('\n')) {
-          const found = /^\s*(\d+)\s+(.*)$/.exec(line);
-          if (!found || entries.has(Number(found[1]))) return null;
-          entries.set(Number(found[1]), found[2]);
-        }
-        // Each short-lived ps child exists in its own snapshot only. Its PID
-        // comes from spawnSync, so excluding it cannot hide a product session.
-        if (Number.isInteger(result.pid)) entries.delete(result.pid);
-        return entries;
-      };
-      const names = readColumn('comm'); const commands = readColumn('args');
-      if (!names || !commands) return processExitVerdict(profile, null);
-      rows = [...new Set([...names.keys(), ...commands.keys()])].map((pid) => ({ pid, name: names.get(pid), command: commands.get(pid) }));
+      // CreatedAt is the round-trip format, UTC to the tick, so creation times compare as text.
+      rows = entries.map((row) => ({ pid: row.ProcessId, parentPid: row.ParentProcessId, sessionId: row.SessionId, name: row.Name, command: row.CommandLine, executablePath: row.ExecutablePath, ownerSid: row.OwnerSid, createdAt: row.CreatedAt }));
+    } else if (platform === 'darwin') rows = darwinRows(run);
+    else if (platform === 'linux') {
+      rows = linuxRows(io);
+      cwdOf = (pid) => { try { return String(io.readlinkSync(`/proc/${pid}/cwd`)); } catch { return null; } };
     } else return processExitVerdict(profile, null);
-    return processExitVerdict(profile, rows, process.pid, { platform });
+    if (!rows) return processExitVerdict(profile, null);
+    return processExitVerdict(profile, rows, process.pid, { platform, agentPid: requestingAgent(env, parentPid), install: profileInstall(profile, { platform, env, home, io }), cwdOf, io });
   } catch { return processExitVerdict(profile, null); }
+}
+
+/** How long the command an npm install left behind gets to say its version. */
+export const NPM_VERIFY_MS = 15000;
+
+function firstLine(file) {
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(file, 'r');
+    const head = Buffer.alloc(256);
+    return head.subarray(0, fs.readSync(descriptor, head, 0, head.length, 0)).toString('latin1').split('\n')[0];
+  } catch { return ''; } finally { if (descriptor !== null) fs.closeSync(descriptor); }
+}
+
+/**
+ * Whether the command an npm install of a profile's CLI left behind runs.
+ *
+ * package.json only proves npm wrote the package. A package whose postinstall
+ * puts the real binary in place, as OpenCode's does, leaves a placeholder that
+ * cannot run when npm skipped its scripts, which npm 12 does unless they are
+ * allowlisted. The command is the one the package's own bin entry names, run
+ * the way npm's shims run it: a Node script through the running Node, anything
+ * else directly. Only the first line it printed comes back, and only on failure.
+ */
+export function npmCommandRuns(profile, prefix, { run = spawnSync, platform = process.platform } = {}) {
+  const product = CLI_PRODUCTS.find((entry) => entry.id === profile);
+  if (!product || typeof prefix !== 'string' || !path.isAbsolute(prefix)) return { ok: false, message: 'Unsupported profile probe.' };
+  const root = path.join(prefix, ...(platform === 'win32' ? [] : ['lib']), 'node_modules', ...product.package.split('/'));
+  let metadata = null;
+  try { metadata = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')); } catch { /* answered below */ }
+  const entry = typeof metadata?.bin === 'string' ? metadata.bin : metadata?.bin?.[product.executable];
+  if (typeof entry !== 'string' || path.isAbsolute(entry) || entry.split(/[\\/]/).includes('..')) {
+    return { ok: false, message: `${product.package} names no ${product.executable} command under ${root}.` };
+  }
+  const file = path.join(root, entry);
+  const script = /\.[cm]?js$/i.test(file) || /^#!.*\bnode\b/.test(firstLine(file));
+  const result = run(script ? process.execPath : file, script ? [file, '--version'] : ['--version'], { encoding: 'utf8', timeout: NPM_VERIFY_MS, maxBuffer: 64 * 1024, windowsHide: true });
+  if (result.status === 0 && !result.error) return { ok: true, message: null };
+  const said = String(result.stderr || result.stdout || '').trim().split('\n')[0].slice(0, 200);
+  const how = result.error?.code === 'ETIMEDOUT' ? `did not answer within ${NPM_VERIFY_MS / 1000} s` : result.error ? `could not be run (${result.error.code ?? result.error.message})` : `exited ${result.status ?? result.signal}`;
+  return { ok: false, message: `${product.executable} --version ${how}${said ? `: ${said}` : ''}` };
 }
 
 export function readProfileVersion(executable, { run = spawnSync, cwd } = {}) {
@@ -215,6 +565,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const result = await runNativeClaudeProbe(verb, { executable, home, expectedPolicy });
     if (!result.ok) { process.stderr.write(`${result.message}\n`); process.exitCode = 1; }
     else if (result.version) process.stdout.write(`${result.version}\n`);
+  } else if (verb === 'npm-verify' && extra.length === 1) {
+    const result = npmCommandRuns(profile, extra[0]);
+    if (!result.ok) { process.stderr.write(`${result.message}\n`); process.exitCode = 1; }
   } else if (verb !== 'busy' || extra.length || !NAMES[profile]) {
     process.stderr.write('Unsupported profile probe.\n'); process.exitCode = 1;
   } else process.stdout.write(`${JSON.stringify(inspectProfileProcesses(profile))}\n`);

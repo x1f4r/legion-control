@@ -196,6 +196,77 @@ struct MachineModelTests {
         #expect(model.legacyInstallRefusal == nil)
     }
 
+    @Test("an agent older than the one this app carries says so where the machine's state is read")
+    func olderAgentIsSaid() async throws {
+        // A 3.0 agent speaks contract 3, so nothing said it was a release behind: the install was a
+        // button under Diagnostics, and the whole fleet stayed on 3.0 after 3.1 shipped.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        let (model, _, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.bundledAgentVersion = "3.1.0"
+        #expect(model.newerBundledAgent == nil)
+
+        await model.refresh(userInitiated: false)
+        #expect(!model.needsAgentUpgrade)
+        #expect(model.newerBundledAgent == "3.1.0")
+        #expect(model.newerBundledAgentLine == "Agent 3.0.0 is older than the 3.1.0 this app carries.")
+        #expect(model.sidebarSummary == "Linux, agent 3.1.0 available")
+
+        // The same agent, or a build that carries none, has nothing to offer.
+        model.core.bundledAgentVersion = "3.0.0"
+        #expect(model.newerBundledAgent == nil)
+        #expect(model.sidebarSummary == "Linux")
+        model.core.bundledAgentVersion = nil
+        #expect(model.newerBundledAgentLine == nil)
+    }
+
+    @Test("an agent too old for the contract says that first, with the install beside it")
+    func legacyAgentIsOfferedTheBundle() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: """
+        { "ok": true, "agentVersion": "2.1.0", "os": "linux",
+          "t3": { "installed": "1", "nightly": "2", "upToDate": false } }
+        """)
+        let (model, _, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.bundledAgentVersion = "3.1.0"
+
+        await model.refresh(userInitiated: false)
+        #expect(model.sidebarSummary == "Linux, agent too old")
+        #expect(model.newerBundledAgentLine == "Agent 2.1.0 is too old for operations, policy and queue controls. This app carries 3.1.0.")
+    }
+
+    @Test("the install beside an older agent says why it cannot be pressed, as Diagnostics does")
+    func olderAgentInstallSaysWhyNot() async throws {
+        // Greyed out with the reason drawn only under Diagnostics, it read as broken where the
+        // machine's state is read.
+        let runner = FakeRunner()
+        let (legacy, legacyDirectory) = Self.legacyCmdModel(runner)
+        defer { try? FileManager.default.removeItem(at: legacyDirectory) }
+        legacy.core.bundledAgentVersion = "3.1.0"
+        await legacy.refresh(userInitiated: false)
+        #expect(legacy.newerBundledAgent == "3.1.0")
+        #expect(legacy.agentInstallRefusal == legacy.legacyInstallRefusal)
+        #expect(legacy.agentInstallRefusal?.contains("cmd") == true)
+
+        let restricted = FakeRunner()
+        restricted.answer("status", json: Self.onlineStatus.replacingOccurrences(
+            of: #""agent": { "version": "3.0.0", "contract": 3 }"#,
+            with: #""agent": { "version": "3.0.0", "contract": 3, "restrictedSession": true }"#))
+        let (model, _, directory) = Self.model(restricted)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.bundledAgentVersion = "3.1.0"
+        await model.refresh(userInitiated: false)
+        #expect(model.newerBundledAgent == "3.1.0")
+        #expect(model.agentInstallRefusal == "The agent is installed from here only over an administrator connection, and this device reaches Pi with a restricted key.")
+
+        // An administrator connection has nothing to say.
+        restricted.answer("status", json: Self.onlineStatus)
+        await model.refresh(userInitiated: false)
+        #expect(model.agentInstallRefusal == nil)
+    }
+
     /// A machine whose 2.x agent sits behind a cmd login, which the upgrade cannot be sent to.
     static func legacyCmdModel(_ runner: FakeRunner) -> (MachineModel, URL) {
         let windows = Machine(
@@ -442,6 +513,175 @@ struct MachineModelTests {
         #expect(model.statusLine.contains("may or may not have happened"))
     }
 
+    // MARK: - Queued requests
+
+    /// A sleep this app saw queued on the Pi's Linux, until `expiry`.
+    static func queuedSleep(in store: OperationStore, expiry: Date?, system: String = "linux") -> OperationRecord {
+        let record = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: system,
+                                     kind: .sleep, subject: "Pi", summary: "Putting Pi to sleep.", agentTracked: true)
+        store.begin(record)
+        store.markQueued(record.id, expiresAt: expiry, summary: "The sleep is queued and runs the next time Pi is idle.")
+        return record
+    }
+
+    static func status(listing operation: String) -> String {
+        onlineStatus.replacingOccurrences(of: #""controller": null"#, with: #""operations": \#(operation), "controller": null"#)
+    }
+
+    static func waitWhile(_ condition: @MainActor () -> Bool, timeout: TimeInterval = 15) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while condition(), Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+    }
+
+    @Test("a queued request its machine has pruned is asked about by id once the machine answers, and expires")
+    func prunedQueuedRequestExpires() async throws {
+        // Two sleeps queued on 22 October read "waiting for idle" nine days later. Both agents had
+        // expired and pruned them, and nothing ever asked: the records were tracked and owed nothing.
+        let runner = FakeRunner()
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let expiry = Date().addingTimeInterval(-9 * 24 * 60 * 60)
+        let record = Self.queuedSleep(in: store, expiry: expiry)
+
+        // While the machine cannot be reached it is left exactly as it is.
+        await model.refresh(userInitiated: false)
+        #expect(!model.isAwake)
+        #expect(store.record(id: record.id)?.state == .queued)
+        #expect(!runner.sentCommands.contains { $0.contains(record.id) })
+
+        // Agent 3.0.x says it has no record with bad-argument and op null.
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"bad-argument","command":"op","op":null}"#, exit: 1)
+        model.allowRedial()
+        await model.refresh(userInitiated: false)
+        await Self.waitWhile { store.record(id: record.id)?.state == .queued }
+
+        #expect(runner.sentCommands.contains { $0.contains("op") && $0.contains(record.id) })
+        let settled = try #require(store.record(id: record.id))
+        #expect(settled.state == .expired)
+        #expect(!settled.needsReconciliation)
+        #expect(settled.finishedAt == expiry)
+        #expect(settled.summary.hasSuffix("Pi no longer has a record of it, so whether it ran before then is not known."))
+    }
+
+    @Test("a queued request the status lists is settled from it, and never asked of another system")
+    func queuedRequestFromTheStatus() async throws {
+        let runner = FakeRunner()
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let waiting = Self.queuedSleep(in: store, expiry: Date().addingTimeInterval(3600))
+        let ran = Self.queuedSleep(in: store, expiry: Date().addingTimeInterval(-60))
+        // Queued on the other system, which is not the one answering: Linux has never heard of it.
+        let elsewhere = Self.queuedSleep(in: store, expiry: Date().addingTimeInterval(-60), system: "other")
+
+        runner.answer("status", json: Self.status(listing: """
+        { "queued": [ { "id": "\(waiting.id)", "kind": "sleep", "state": "queued", "outcome": "pending" } ],
+          "recent": [ { "id": "\(ran.id)", "kind": "sleep", "state": "finished", "phase": "done",
+                        "action": "expired", "reasonCode": "expired", "outcome": "deferred" } ] }
+        """))
+        runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#, exit: 1)
+        await model.refresh(userInitiated: false)
+        // Long enough for a read by id to have gone out, had one been started.
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(store.record(id: waiting.id)?.state == .queued)
+        #expect(store.record(id: ran.id)?.state == .expired)
+        #expect(store.record(id: ran.id)?.summary == "The queued request for Pi expired before the machine was idle.")
+        #expect(store.record(id: elsewhere.id)?.state == .queued)
+        #expect(!runner.sentCommands.contains { $0.contains("op ") })
+    }
+
+    @Test("a queued request the status shows running reads as running, and is asked about once it is not listed")
+    func queuedRequestThatStarts() async throws {
+        // Reconciled to running, it was owed an answer like a lost one: the section drew it under
+        // "Outcome not known" beside its running row, still saying it waited for idle, and the
+        // sidebar read "outcome not known yet".
+        let runner = FakeRunner()
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sleep = Self.queuedSleep(in: store, expiry: Date().addingTimeInterval(3600))
+        // Lost after it and owed as well. A running record the status listed stood first in line
+        // and was read from the status again on every poll, and this one was never asked.
+        let lost = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "linux",
+                                   kind: .update, subject: "Demo", summary: "Updating Demo.", agentTracked: true)
+        store.begin(lost)
+        store.finish(lost.id, state: .unknown, summary: "The update of Demo may or may not have happened.")
+
+        runner.answer("status", json: Self.status(listing: """
+        { "running": [ { "id": "\(sleep.id)", "kind": "sleep", "state": "running", "phase": "suspending", "outcome": "pending" } ] }
+        """))
+        runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#, exit: 1)
+        await model.refresh(userInitiated: false)
+        await Self.waitWhile { store.record(id: lost.id)?.needsReconciliation == true }
+
+        let running = try #require(store.record(id: sleep.id))
+        #expect(running.state == .running)
+        #expect(running.summary == "Sleep: Pi left the queue and started on Pi.")
+        #expect(running.needsReconciliation)
+        #expect(model.isShownRunning(running))
+        #expect(model.unresolvedOperations.isEmpty)
+        #expect(model.sidebarSummary == "Linux")
+        #expect(runner.sentCommands.contains { $0.contains("op") && $0.contains(lost.id) })
+        #expect(!runner.sentCommands.contains { $0.contains(sleep.id) })
+
+        // No longer listed, it is owed again and asked about by id. The agent ran it, so a record
+        // it has pruned since is no sign that it never started.
+        runner.answer("status", json: Self.onlineStatus)
+        await model.refresh(userInitiated: false)
+        #expect(model.unresolvedOperations.map(\.id) == [sleep.id])
+        model.reconcileNow()
+        await Self.waitWhile { store.record(id: sleep.id)?.needsReconciliation == true }
+        #expect(runner.sentCommands.contains { $0.contains("op") && $0.contains(sleep.id) })
+        let pruned = try #require(store.record(id: sleep.id))
+        #expect(pruned.state == .unknown)
+        #expect(!pruned.needsReconciliation)
+        #expect(pruned.summary == "Sleep: Pi reached Pi, which no longer has a record of it, so how it ended is not known.")
+    }
+
+    @Test("an unknown outcome is never settled by a system it was not sent to, and the section says so")
+    func unknownOutcomeWaitsForItsSystem() async throws {
+        // A boot from Linux whose answer was lost, read after the machine came up in the other
+        // system: that agent has never heard of the id, which is no sign the boot never started.
+        let runner = FakeRunner()
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "other",
+                                     systemName: "Other", kind: .boot, subject: "Linux", summary: "Switching to Linux.",
+                                     agentTracked: true)
+        store.begin(record)
+        store.finish(record.id, state: .unknown, summary: "The switch to Linux may or may not have happened.")
+        // An agent installation sent there too, whose outcome is just as unknown.
+        let install = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "other",
+                                      systemName: "Other", kind: .appUpdate, subject: "control agent",
+                                      summary: "Installing agent 3.1.0 on Pi.", agentTracked: true)
+        store.begin(install)
+        store.finish(install.id, state: .unknown, summary: "The agent installation may or may not have happened.")
+
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#, exit: 1)
+        await model.refresh(userInitiated: false)
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(!runner.sentCommands.contains { $0.contains("op ") })
+        #expect(store.record(id: record.id)?.state == .unknown)
+        #expect(store.record(id: record.id)?.needsReconciliation == true)
+        // "Check now" asked nothing and said nothing. What it would ask is said instead.
+        #expect(model.checkUnavailableReason(for: record)
+                == "Sent to Other, which is the only one that can say what became of it. It is asked once Other answers.")
+        // And an installation only Other can account for holds back none on Linux, which said to
+        // check a result that no check could read.
+        #expect(model.owedAgentInstall == nil)
+
+        // Sent to the system answering, it is asked, and holds the next installation back.
+        let here = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "linux",
+                                   systemName: "Linux", kind: .appUpdate, subject: "control agent",
+                                   summary: "Installing agent 3.1.0 on Pi.", agentTracked: true)
+        store.begin(here)
+        store.finish(here.id, state: .unknown, summary: "The agent installation may or may not have happened.")
+        #expect(model.checkUnavailableReason(for: here) == nil)
+        #expect(model.owedAgentInstall?.id == here.id)
+    }
+
     // MARK: - Update semantics
 
     @Test("an update that did nothing says which of the reasons it was")
@@ -667,6 +907,34 @@ struct MachineModelTests {
         #expect(model.statusLine.contains("may or may not have taken effect"))
         #expect(model.statusLine.contains("may not be back"))
         #expect(runner.sentCommands.filter { $0.contains(" update") }.count == 1)
+    }
+
+    @Test("an update that failed at its stop step says it would not stop, never that the service is not running")
+    func stopFailureIsWordedFromTheReply() async throws {
+        // Agent 3.1.0 answers a stop that did not take with not-running, the code for a service in
+        // the wrong state either way, and its sentence alone said the opposite of what happened.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("update", json: """
+        { "ok": false, "contract": 3, "action": "failed", "reasonCode": "not-running", "outcome": "failed", "from": "1", "to": "2",
+          "message": "Demo would not stop: Demo was still running 20 s after the stop request" }
+        """, exit: 1)
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh(userInitiated: false)
+        let service = try #require(model.services.first)
+        model.update(service, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        let record = try #require(store.newestFirst.first { $0.kind == .update })
+        #expect(record.state == .failed)
+        #expect(record.summary == "Demo would not stop: Demo was still running 20 s after the stop request")
+        #expect(!record.summary.contains("is not running"))
+        #expect(model.lastActionOutcome?.isError == true)
+        // With nothing more to go on, the code still says what it means.
+        #expect(AgentReason.notRunning.sentence(subject: "Demo", message: nil) == "Demo is not running.")
+        #expect(AgentReason.notRunning.sentence(subject: "Demo", message: "") == "Demo is not running.")
     }
 
     @Test("a cancel that finds the request already running cancels nothing, though ok is true")
@@ -1433,6 +1701,126 @@ struct MachineModelTests {
         #expect(saved["pi/linux"]?.checkedAt != nil)
         #expect(pi.autoUpdateCheckedAt(for: Self.machine().systems[0]) != nil)
         #expect(tower.autoUpdateValue(for: towerMachine.systems[0]) == true)
+    }
+
+    /// Every address one launch dialled, in order.
+    final class Dialled: @unchecked Sendable {
+        let lock = NSLock()
+        var destinations: [String] = []
+        func note(_ destination: String?) { lock.withLock { destinations.append(destination ?? "") } }
+        var first: String? { lock.withLock { destinations.first } }
+    }
+
+    @Test("the route that worked is dialled first at the next launch, and not once the machine's endpoints change")
+    func rememberedRouteOutlivesALaunch() async throws {
+        // Kept in memory alone, every launch dialled the dead addresses first again, a connect
+        // timeout each: eight to sixteen seconds a machine before the one that answers.
+        var machine = Self.machine()
+        machine.endpoints = [Endpoint(id: "old", kind: "remote", host: "192.0.2.10", user: "me"),
+                             Endpoint(id: "new", kind: "remote", host: "192.0.2.20", user: "me")]
+        var saved: [String: RememberedSystem] = [:]
+        let remembered = RememberedSettings(systems: [:], save: { saved = $0 })
+        let logs = FakeSSH.logDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
+
+        let status = Self.onlineStatus
+        func launch(_ machine: Machine) async -> (MachineModel, Dialled) {
+            let dialled = Dialled()
+            var agent = RemoteAgent(machine: machine)
+            agent.logDirectory = logs
+            agent.runner = { _, arguments, _, _ in
+                let destination = FakeSSH.destination(arguments)
+                dialled.note(destination)
+                guard destination == "me@192.0.2.20" else {
+                    FakeSSH.writeLog("ssh: connect to host 192.0.2.10 port 22: Operation timed out\n", for: arguments)
+                    return FakeSSH.result(exit: 255)
+                }
+                return FakeSSH.result(out: status)
+            }
+            let model = MachineModel(machine: machine, agent: agent, remembered: remembered)
+            await model.refresh(userInitiated: false)
+            return (model, dialled)
+        }
+
+        let (first, dialledFirst) = await launch(machine)
+        #expect(first.isAwake)
+        #expect(dialledFirst.first == "me@192.0.2.10")
+        #expect(saved["pi/linux"]?.route == "new")
+
+        // The next launch knows nothing yet about which system is up, and starts where the last
+        // one finished.
+        let (second, dialledSecond) = await launch(machine)
+        #expect(second.isAwake)
+        #expect(dialledSecond.destinations == ["me@192.0.2.20"])
+
+        // A setup that reaches the machine some other way now walks its list as it stands.
+        machine.endpoints.append(Endpoint(id: "spare", kind: "remote", host: "192.0.2.30", user: "me"))
+        let (_, dialledThird) = await launch(machine)
+        #expect(dialledThird.first == "me@192.0.2.10")
+
+        // What an earlier build remembered, with no route at all, still reads.
+        let older = try JSONDecoder().decode([String: RememberedSystem].self, from: Data(#"{"pi/linux":{"autoUpdate":true}}"#.utf8))
+        #expect(older["pi/linux"]?.autoUpdate == true)
+        #expect(older["pi/linux"]?.route == nil)
+    }
+
+    @Test("a LAN route remembered on the machine's network is not dialled first from anywhere else")
+    func rememberedRouteKeepsToItsNetwork() async throws {
+        // A laptop last opened at home and opened again somewhere else dialled the home address
+        // first: a whole connect timeout a machine, on a range that may be somebody else's.
+        var machine = Self.machine()
+        machine.endpoints = [Endpoint(id: "lan", kind: "lan", host: "192.168.1.10", user: "me"),
+                             Endpoint(id: "tailnet", kind: "remote", host: "192.0.2.20", user: "me")]
+        machine.wake = WakeConfig(mac: nil, lanPrefix: "192.168.1.")
+        let home = SiteAwareness.placement(sites: [], addresses: [LocalAddress("192.168.1.7/24")!], confirmed: nil)
+        let remembered = RememberedSettings.inMemory()
+        let logs = FakeSSH.logDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
+
+        let status = Self.onlineStatus
+        func launch(at placement: SiteAwareness.Placement) async -> [String] {
+            let dialled = Dialled()
+            let atHome = placement == home
+            var agent = RemoteAgent(machine: machine)
+            agent.logDirectory = logs
+            agent.runner = { _, arguments, _, _ in
+                let destination = FakeSSH.destination(arguments)
+                dialled.note(destination)
+                // Away from home the LAN address reaches nothing.
+                guard atHome || destination != "me@192.168.1.10" else {
+                    FakeSSH.writeLog("ssh: connect to host 192.168.1.10 port 22: Operation timed out\n", for: arguments)
+                    return FakeSSH.result(exit: 255)
+                }
+                return FakeSSH.result(out: status)
+            }
+            let model = MachineModel(machine: machine, agent: agent, remembered: remembered)
+            model.placement = { placement }
+            await model.refresh(userInitiated: false)
+            #expect(model.isAwake)
+            return dialled.lock.withLock { dialled.destinations }
+        }
+
+        #expect(await launch(at: home) == ["me@192.168.1.10"])
+        #expect(await launch(at: .nowhere) == ["me@192.0.2.20"])
+        // And the tailnet route that answered away from home does not stand in front of the LAN
+        // once the laptop is back.
+        #expect(await launch(at: home) == ["me@192.168.1.10"])
+        #expect(await launch(at: home) == ["me@192.168.1.10"])
+    }
+
+    @Test("a remembered route belongs to one system, and at launch to whichever answered last")
+    func rememberedRouteIsPerSystem() {
+        let now = Date()
+        let remembered = RememberedSettings(systems: [
+            "pi/linux": RememberedSystem(checkedAt: now.addingTimeInterval(-60), route: "lan", routes: "these"),
+            "pi/other": RememberedSystem(checkedAt: now, route: "tailnet", routes: "these"),
+            "pi-2/linux": RememberedSystem(checkedAt: now.addingTimeInterval(60), route: "elsewhere", routes: "these"),
+        ], save: { _ in })
+        // After a reboot the system it is heading for has a route of its own.
+        #expect(remembered.route(machine: "pi", system: "linux", routes: "these") == "lan")
+        #expect(remembered.route(machine: "pi", system: nil, routes: "these") == "tailnet")
+        #expect(remembered.route(machine: "pi", system: "linux", routes: "others") == nil)
+        #expect(remembered.route(machine: "pi", system: "windows", routes: "these") == nil)
     }
 
     @Test("a refused automatic-update switch is not remembered as saved")
