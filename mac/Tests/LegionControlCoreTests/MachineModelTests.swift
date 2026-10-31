@@ -769,6 +769,34 @@ struct MachineModelTests {
         #expect(runner.sentCommands.filter { $0.contains(" update") }.count == 1)
     }
 
+    @Test("an update that failed at its stop step says it would not stop, never that the service is not running")
+    func stopFailureIsWordedFromTheReply() async throws {
+        // Agent 3.1.0 answers a stop that did not take with not-running, the code for a service in
+        // the wrong state either way, and its sentence alone said the opposite of what happened.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("update", json: """
+        { "ok": false, "contract": 3, "action": "failed", "reasonCode": "not-running", "outcome": "failed", "from": "1", "to": "2",
+          "message": "Demo would not stop: Demo was still running 20 s after the stop request" }
+        """, exit: 1)
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        await model.refresh(userInitiated: false)
+        let service = try #require(model.services.first)
+        model.update(service, force: false, whenIdle: false)
+        await Self.settle(model)
+
+        let record = try #require(store.newestFirst.first { $0.kind == .update })
+        #expect(record.state == .failed)
+        #expect(record.summary == "Demo would not stop: Demo was still running 20 s after the stop request")
+        #expect(!record.summary.contains("is not running"))
+        #expect(model.lastActionOutcome?.isError == true)
+        // With nothing more to go on, the code still says what it means.
+        #expect(AgentReason.notRunning.sentence(subject: "Demo", message: nil) == "Demo is not running.")
+        #expect(AgentReason.notRunning.sentence(subject: "Demo", message: "") == "Demo is not running.")
+    }
+
     @Test("a cancel that finds the request already running cancels nothing, though ok is true")
     func cancelThatFindsItRunning() async throws {
         // The reply is `conflict` with `ok: true`, and the cancel used to read ok alone: the queued
