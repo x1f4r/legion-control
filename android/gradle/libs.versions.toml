@@ -1,7 +1,9 @@
 [versions]
-# The toolchain is pinned on purpose and the pieces are not independent. AGP 8.13 calls into a Gradle
-# internal that Gradle 9.6 removed, so the wrapper stays on the 9.5 line; the Kotlin plugin has to be
-# a 2.3 release because that is the first line that supports Gradle 9. See android/README.md.
+# The toolchain is pinned on purpose and the pieces are not independent. AGP 9.5 refuses a Gradle older
+# than 9.6, so the wrapper moves with it. AGP 9 compiles Kotlin itself and brings a Kotlin Gradle
+# plugin of its own, older than this one; the root build puts this version on the classpath instead,
+# because the Compose and serialization compiler plugins have to match the compiler exactly. See
+# android/README.md.
 agp = "9.5.0"
 kotlin = "2.4.21"
 
@@ -52,12 +54,13 @@ slf4j-android = { group = "uk.uuid.slf4j", name = "slf4j-android", version.ref =
 
 desugar-jdk-libs = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugar" }
 
+kotlin-gradle-plugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }
+
 # The unit tests are plain JVM tests of the parsing, the validation and the packet building: no
 # Android, no Compose, nothing that needs a device.
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

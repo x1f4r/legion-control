@@ -132,14 +132,14 @@ test('the APK build stops before Gradle unless it has a JDK 21, and says how to 
   fs.rmSync(path.join(absent, 'jdk'), { recursive: true });
   const missing = build(absent);
   assert.equal(missing.status, 1);
-  assert.equal(missing.stderr.trim(), `ERROR: no JDK 21 at ${path.join(absent, 'jdk')}. Install Temurin 21, or point LEGION_ANDROID_JAVA_HOME at your own copy; AGP 8.13 refuses a newer JDK.`);
+  assert.equal(missing.stderr.trim(), `ERROR: no JDK 21 at ${path.join(absent, 'jdk')}. Install Temurin 21, or point LEGION_ANDROID_JAVA_HOME at your own copy; the Android build is pinned to 21.`);
   assert.equal(fs.existsSync(path.join(absent, 'gradle-arguments')), false);
 
   const newer = checkout(t);
   fs.writeFileSync(path.join(newer, 'jdk', 'bin', 'java'), "#!/bin/sh\necho '    java.specification.version = 25' >&2\n");
   const refused = build(newer);
   assert.equal(refused.status, 1);
-  assert.equal(refused.stderr.trim(), `ERROR: ${path.join(newer, 'jdk')} is Java 25, not 21. AGP 8.13 needs 21.`);
+  assert.equal(refused.stderr.trim(), `ERROR: ${path.join(newer, 'jdk')} is Java 25, not 21. The Android build is pinned to 21.`);
   assert.equal(fs.existsSync(path.join(newer, 'gradle-arguments')), false);
 
   // A folder with no java in it used to end the script under set -e without a word.
@@ -147,12 +147,12 @@ test('the APK build stops before Gradle unless it has a JDK 21, and says how to 
   fs.rmSync(path.join(empty, 'jdk', 'bin', 'java'));
   const nothing = build(empty);
   assert.equal(nothing.status, 1);
-  assert.equal(nothing.stderr.trim(), `ERROR: ${path.join(empty, 'jdk')} is Java unknown, not 21. AGP 8.13 needs 21.`);
+  assert.equal(nothing.stderr.trim(), `ERROR: ${path.join(empty, 'jdk')} is Java unknown, not 21. The Android build is pinned to 21.`);
   assert.equal(fs.existsSync(path.join(empty, 'gradle-arguments')), false);
 });
 
 test('the APK build stops without the Gradle wrapper and never runs a gradle from PATH instead', { skip: process.platform === 'win32' }, (t) => {
-  // The wrapper is what pins the Gradle AGP 8.13 runs on. Whatever gradle a machine has on PATH is
+  // The wrapper is what pins the Gradle AGP 9.5 runs on. Whatever gradle a machine has on PATH is
   // not looked at, and the message says what the build needs without guessing which one that is.
   const unwrapped = checkout(t);
   fs.rmSync(path.join(unwrapped, 'android', 'gradlew'));
@@ -161,6 +161,6 @@ test('the APK build stops without the Gradle wrapper and never runs a gradle fro
   const result = buildWith(unwrapped, { PATH: `${path.join(unwrapped, 'bin')}${path.delimiter}${process.env.PATH}` });
   assert.equal(result.status, 1);
   // The script names its own folder as pwd -P has it, through any symlink above the scratch checkout.
-  assert.equal(result.stderr.trim(), `ERROR: no Gradle wrapper at ${path.join(fs.realpathSync(unwrapped), 'android', 'gradlew')}. The wrapper is what pins Gradle 9.5; do not fall back to a gradle on PATH, AGP 8.13 fails on 9.6 and later.`);
+  assert.equal(result.stderr.trim(), `ERROR: no Gradle wrapper at ${path.join(fs.realpathSync(unwrapped), 'android', 'gradlew')}. The wrapper is what pins Gradle 9.6; do not fall back to a gradle on PATH, AGP 9.5 refuses one older than that.`);
   assert.equal(fs.existsSync(path.join(unwrapped, 'gradle-arguments')), false);
 });

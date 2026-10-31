@@ -20,11 +20,8 @@ updates:
       android:
         patterns: ['*']
     ignore:
-      # android/gradle/libs.versions.toml says why both are held where they are. AGP 8.13 calls into
-      # a Gradle internal that 9.6 removed, which CI would catch; sshj 0.40 moves ed25519 onto a JCE
-      # provider Android ships only part of, which shows up on a phone and in no unit test.
-      - dependency-name: gradle-wrapper
-        versions: ['>= 9.6']
+      # android/gradle/libs.versions.toml says why sshj is held where it is: 0.40 moves ed25519 onto
+      # a JCE provider Android ships only part of, which shows up on a phone and in no unit test.
       - dependency-name: com.hierynomus:sshj
         versions: ['>= 0.40']
 
