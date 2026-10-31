@@ -188,7 +188,7 @@ private fun compactMachineState(model: MachineModel): String = when (val state =
     is LinkState.Unsettled -> "Outcome unconfirmed"
     is LinkState.Misconfigured -> "Setup needs attention"
     is LinkState.PhoneKeyUnavailable -> "This phone's key could not be read"
-    is LinkState.Offline -> "Not reachable"
+    is LinkState.Offline -> if (state.noTunnel) "Phone not on the tailnet" else "Not reachable"
     LinkState.Unknown -> "Checking…"
 }
 
@@ -589,7 +589,10 @@ private fun RunningNow(model: MachineModel) {
                 state is LinkState.PhoneKeyUnavailable ->
                     StatusLine(Mark.Attention, "This phone's key could not be read, so nothing was sent")
 
-                state is LinkState.Offline -> StatusLine(Mark.Attention, "Asleep or unreachable")
+                state is LinkState.Offline -> StatusLine(
+                    Mark.Attention,
+                    if (state.noTunnel) "This phone is not on the tailnet, so nothing reached it" else "Asleep or unreachable",
+                )
 
                 else -> StatusLine(Mark.Unknown, "Checking")
             }

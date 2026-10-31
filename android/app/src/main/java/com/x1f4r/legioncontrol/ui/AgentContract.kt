@@ -70,8 +70,14 @@ sealed interface LinkState {
     /** The agent answered and said which system it is. */
     data class Online(val system: MachineSystem) : LinkState
 
-    /** Nothing answered on any address. Asleep, off, or off the network. */
-    data class Offline(val reason: String) : LinkState
+    /**
+     * Nothing answered on any address. Asleep, off, or off the network.
+     *
+     * [noTunnel] when what went unanswered was a tailnet address no tunnel on this phone carries,
+     * which is the phone's to fix and not the machine's. Offline all the same, so a wake is still
+     * offered: the machine may be asleep as well.
+     */
+    data class Offline(val reason: String, val noTunnel: Boolean = false) : LinkState
 
     /**
      * A command was carried and did not finish inside its budget, or a reply was lost after dispatch.
@@ -453,5 +459,6 @@ fun Throwable.toLinkState(): LinkState = when (this) {
         // the machine is asleep.
         if (dispatch.mayHaveRun) LinkState.Unsettled(summary) else LinkState.Offline(sentence)
 
+    is AgentFailure.NoTunnel -> LinkState.Offline(sentence, noTunnel = true)
     else -> LinkState.Offline(sentence)
 }
