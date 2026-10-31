@@ -38,16 +38,25 @@ class SetupEnrolment(private val services: ControlServices) {
      * device's copy goes to be merged, as one a machine carries does. Anything else waits for
      * Confirm. A document that would be refused is said so now, rather than after somebody read
      * through it.
+     *
+     * Confirm is held to the hash in storage, the head every compare-and-swap is made against, and
+     * not to the document loaded: a stored copy that cannot be read loads as none, and fetching is
+     * how a phone in that state is put right.
      */
     fun offer(fetched: ControllerFetch.Document, host: String): String {
         preview = null
         val served = fetched.replyHash
         if (served == null || CanonicalSetup.hashOf(fetched.text) != served) return unverifiable(host, "used")
-        val head = services.document.value
-        val found = EnrolmentPreview.of(text = fetched.text, host = host, servedHash = served, head = head?.hash)
-            .getOrElse { return "The setup from $host was refused. ${it.message}" }
+        val applied = services.document.value
+        val found = EnrolmentPreview.of(
+            text = fetched.text,
+            host = host,
+            servedHash = served,
+            head = services.appliedHash(),
+            approves = applied == null,
+        ).getOrElse { return "The setup from $host was refused. ${it.message}" }
         val document = ControllerDocument.parse(fetched.text).getOrNull()
-        when (document?.let { FetchedCopy.of(head, it) }) {
+        when (document?.let { FetchedCopy.of(applied, it) }) {
             FetchedCopy.SAME -> return "This device already has the setup $host holds."
             FetchedCopy.ANCESTOR ->
                 return "This device's setup was made from the one $host holds, so there is nothing newer to take."

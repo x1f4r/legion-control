@@ -242,6 +242,29 @@ class SetupEnrolmentTest {
         assertEquals(hashOf(mine), divergence.mineProvenance?.hash)
     }
 
+    /**
+     * A stored copy this build cannot read loads as no setup at all, while its hash is still in
+     * storage. Confirm was held to the document loaded, which the store's compare-and-swap never
+     * agreed with, so it said the setup here had changed on every try and a fetch could never put
+     * such a phone right.
+     */
+    @Test
+    fun `a fetch puts right a phone whose stored setup cannot be read`() {
+        val prefs = MemoryPreferences().apply {
+            values["controller-config"] = "{ not json"
+            values["controller-hash"] = "a".repeat(64)
+        }
+        val store = LaunchDocuments.store(prefs)
+        assertNull(store.document.value)
+        val enrolment = SetupEnrolment(servicesOver(store))
+
+        assertEquals("Check what the setup from $host runs before using it.", enrolment.offer(served(HELD), host))
+        assertTrue(enrolment.preview!!.approves)
+        assertEquals("The setup came from $host: 2 machines.", enrolment.confirm())
+        assertEquals(hashOf(HELD), store.appliedHash())
+        assertTrue(store.launch.value.toMachines().flatMap { it.systems }.all { it.isDriven })
+    }
+
     @Test
     fun `Confirm after the setup here changed applies nothing`() {
         val store = LaunchDocuments.store().also { it.enrolAsFetched(HELD) }

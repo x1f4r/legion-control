@@ -319,8 +319,7 @@ class LaunchGateTest {
                     ("local" to buildJsonObject { put("agent", "/Users/me/.legion-control/agent/src/index.mjs") }),
             )
         }
-        val preview = EnrolmentPreview.of(everything, "desk-tower.local", CanonicalSetup.hashOf(everything), head = null).getOrThrow()
-        assertTrue(preview.approves)
+        val preview = EnrolmentPreview.of(everything, "desk-tower.local", CanonicalSetup.hashOf(everything), head = null, approves = true).getOrThrow()
         assertEquals(listOf("Tower", "Beacon"), preview.machines.map { it.name })
         assertEquals(
             listOf(tuple(LINUX, "posix"), tuple(WINDOWS, "cmd"), tuple(PI, "dispatch")),

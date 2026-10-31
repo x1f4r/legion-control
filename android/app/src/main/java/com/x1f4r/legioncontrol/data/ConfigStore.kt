@@ -87,7 +87,7 @@ sealed interface SetupOutcome {
  * diverged from it.
  */
 enum class FetchedCopy {
-    /** This device applies no setup yet: enrolment, which approves everything it showed. */
+    /** This device applies no setup, or none it can read: enrolment, which approves everything it showed. */
     FIRST,
 
     /** The document in force, byte for byte. */
@@ -263,8 +263,10 @@ class ConfigStore internal constructor(
      *
      * [text] is what [servedBy] served, taken only if it hashes to [servedHash], the hash the machine
      * reported: bytes that do not are a document no machine holds, and every machine would diverge
-     * from them (C1). It replaces the document in force only if that is still [expectedHead], the
-     * one the summary was built against, null meaning none.
+     * from them (C1). It replaces the document in force only if the hash in storage is still
+     * [expectedHead], the [appliedHash] the summary was built against, null meaning none. That and
+     * not the document loaded is the head: a stored copy that cannot be read loads as no document at
+     * all, and a fetch is how such a phone is put right.
      *
      * What it does is decided by ancestry ([FetchedCopy]), never by the setup id alone: a copy that
      * came off a machine is that machine's revision, not an edit made here. On a device that applies
@@ -296,8 +298,8 @@ class ConfigStore internal constructor(
                 "$servedBy served a setup whose contents do not match the hash it reported. Nothing was applied.",
             )
         }
+        if (appliedHash() != expectedHead) return SetupOutcome.HeadMoved
         val applied = _document.value
-        if (applied?.hash != expectedHead) return SetupOutcome.HeadMoved
         // A document that names no setup gets one before it is applied, as a paste does.
         val identified = if (verdict.assignsIdentity) parsed.withFreshIdentity(deviceName, now()) else parsed
         val (document, approving) = when (FetchedCopy.of(applied, parsed)) {

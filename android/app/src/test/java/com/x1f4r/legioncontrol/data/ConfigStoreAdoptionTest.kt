@@ -193,6 +193,26 @@ class ConfigStoreAdoptionTest {
         assertEquals(third, store.text.value)
     }
 
+    /**
+     * The head is the hash in storage, as for every other compare-and-swap here. A stored copy this
+     * build cannot read loads as no document, and holding a fetch to that turned every Confirm on
+     * such a phone into "the setup here changed".
+     */
+    @Test
+    fun `a fetched copy replaces a stored one that cannot be read, held to the hash in storage`() {
+        val prefs = MemoryPreferences().apply {
+            values["controller-config"] = "{ not json"
+            values["controller-hash"] = "a".repeat(64)
+        }
+        val store = LaunchDocuments.store(prefs)
+        assertNull(store.document.value)
+
+        assertEquals(SetupOutcome.HeadMoved, enrol(store, LaunchDocuments.HELD, head = null))
+        assertTrue(enrol(store, LaunchDocuments.HELD) is SetupOutcome.Applied)
+        assertEquals(hashOf(LaunchDocuments.HELD), store.appliedHash())
+        assertEquals(hashOf(LaunchDocuments.HELD), store.document.value?.hash)
+    }
+
     @Test
     fun `a hand paste of the same setup is still an edit of the copy here`() {
         val store = enrolled()

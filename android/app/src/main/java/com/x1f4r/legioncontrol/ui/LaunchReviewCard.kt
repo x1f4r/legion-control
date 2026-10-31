@@ -193,16 +193,15 @@ data class EnrolmentPreview(
     val host: String,
     /** The hash the machine reported, which [text] was checked against and is stored only under. */
     val servedHash: String,
-    /** The hash of the document in force when this was shown, null for none: Confirm replaces only that one. */
+    /** The hash in storage when this was shown, null for none: Confirm replaces only that one. */
     val head: String?,
+    /** Whether confirming approves what is shown: only on a device that applies no setup yet. */
+    val approves: Boolean,
     val machines: List<Machine>,
     /** A repository other than the built-in one, or null. */
     val repo: String?,
     val local: LaunchProjection.Local?,
 ) {
-    /** Whether confirming approves what is shown: only on a device that applies no setup yet. */
-    val approves: Boolean get() = head == null
-
     data class Machine(val name: String, val systems: List<System>, val identityFile: String?)
 
     data class System(val name: String, val tuple: LaunchTuple)
@@ -212,7 +211,7 @@ data class EnrolmentPreview(
          * The preview of [text], or why it would be refused. A document that could not be applied is
          * said so now rather than after somebody read through it and pressed Confirm.
          */
-        fun of(text: String, host: String, servedHash: String, head: String?): Result<EnrolmentPreview> {
+        fun of(text: String, host: String, servedHash: String, head: String?, approves: Boolean): Result<EnrolmentPreview> {
             val document = ControllerDocument.parse(text).getOrElse { return Result.failure(it) }
             readControllerConfig(document.canonicalText).exceptionOrNull()?.let { return Result.failure(it) }
             val projection = LaunchValues.projection(document.root)
@@ -223,6 +222,7 @@ data class EnrolmentPreview(
                     host = host,
                     servedHash = servedHash,
                     head = head,
+                    approves = approves,
                     machines = projection.machines.map { machine ->
                         val raw = rawMachines.firstOrNull { it.text("id") == machine.id }
                         val rawSystems = (raw?.get("systems") as? JsonArray).orEmpty().filterIsInstance<JsonObject>()
