@@ -420,7 +420,7 @@ function linuxRows(io) {
   return io.readdirSync('/proc').filter((entry) => /^\d+$/.test(entry)).map((entry) => linuxProcess(Number(entry), io)).filter(Boolean);
 }
 
-export function inspectProfileProcesses(profile, { platform = process.platform, run = spawnSync, io = fs, env = process.env, home = os.homedir(), parentPid = process.ppid } = {}) {
+export function inspectProfileProcesses(profile, { platform = process.platform, run = spawnSync, io = fs, env = process.env, home = os.homedir(), parentPid = process.ppid, ownPid = process.pid } = {}) {
   if (!NAMES[profile]) return processExitVerdict(profile, null);
   try {
     let rows;
@@ -445,7 +445,7 @@ export function inspectProfileProcesses(profile, { platform = process.platform, 
       cwdOf = (pid) => { try { return String(io.readlinkSync(`/proc/${pid}/cwd`)); } catch { return null; } };
     } else return processExitVerdict(profile, null);
     if (!rows) return processExitVerdict(profile, null);
-    return processExitVerdict(profile, rows, process.pid, { platform, agentPid: requestingAgent(env, parentPid), install: profileInstall(profile, { platform, env, home, io }), cwdOf, io });
+    return processExitVerdict(profile, rows, ownPid, { platform, agentPid: requestingAgent(env, parentPid), install: profileInstall(profile, { platform, env, home, io }), cwdOf, io });
   } catch { return processExitVerdict(profile, null); }
 }
 
