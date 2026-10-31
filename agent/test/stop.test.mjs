@@ -48,7 +48,7 @@ test('a stop request that failed while the service kept running is a refusal, no
     const stopped = await stopAndWait(commandService(dir), 2000);
     assert.equal(stopped.ok, false);
     assert.equal(stopped.reasonCode, 'internal');
-    assert.equal(stopped.message, 'the stop request failed (node failed (exit 1)), and Demo was still running 2 s later');
+    assert.equal(stopped.message, `the stop request failed (${path.basename(process.execPath)} failed (exit 1)), and Demo was still running 2 s later`);
     assert.equal(readFixture(dir, 'stop-runs'), '1');
   });
 });

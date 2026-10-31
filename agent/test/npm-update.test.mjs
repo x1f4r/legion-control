@@ -105,7 +105,7 @@ test('an npm service that will not stop is left running, with nothing installed 
     // was touched: a stop was asked for, and refused.
     assert.equal(payload.reasonCode, 'internal');
     assert.equal(payload.outcome, 'failed');
-    assert.equal(payload.message, 'the stop request failed (node failed (exit 1)), and Demo was still running 20 s later; nothing was installed');
+    assert.equal(payload.message, `the stop request failed (${path.basename(process.execPath)} failed (exit 1)), and Demo was still running 20 s later; nothing was installed`);
     // One stop was asked for. A rollback used to ask for a second one, wait
     // out its own budget, and start the service over itself.
     assert.equal(readFixture(dir, 'stop-runs'), '1');
