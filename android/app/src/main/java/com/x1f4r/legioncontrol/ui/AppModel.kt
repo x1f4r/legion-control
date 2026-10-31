@@ -313,6 +313,9 @@ class AppModel(
             }
         }
         scope.launch {
+            services.networkPaths().collect(services::followPaths)
+        }
+        scope.launch {
             bindings.bindings.collect { recomputeSite() }
         }
         scope.launch {

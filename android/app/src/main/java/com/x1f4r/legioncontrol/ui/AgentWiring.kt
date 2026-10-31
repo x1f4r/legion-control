@@ -37,6 +37,7 @@ import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.net.LocalAddress
+import com.x1f4r.legioncontrol.net.NetworkPaths
 import com.x1f4r.legioncontrol.net.WakeSend
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
@@ -87,6 +88,10 @@ private class WiredServices(private val control: LegionControl) : ControlService
     override val identityClash: StateFlow<SetupIdentityClash?> get() = control.config.identityClash
 
     override fun networkAddresses(): Flow<List<LocalAddress>> = control.homeNetwork.observeAddresses()
+
+    override fun networkPaths(): Flow<NetworkPaths> = control.homeNetwork.observePaths()
+
+    override fun followPaths(paths: NetworkPaths) = control.follow(paths)
 
     override fun deviceName(): String = control.deviceName()
 

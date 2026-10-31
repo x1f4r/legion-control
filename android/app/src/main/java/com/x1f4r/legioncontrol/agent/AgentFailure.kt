@@ -87,6 +87,26 @@ sealed class AgentFailure(
         override val kind: FailureKind get() = reason
     }
 
+    /**
+     * A tailnet address went unanswered while no tunnel on this phone carries it.
+     *
+     * Kept apart from [Unreachable] because the fix is on this phone and not on the machine: a
+     * machine reached over the tailnet is silent whenever the phone's VPN is off, and "did not
+     * answer" sent people looking at machines that were up the whole time. Nothing was sent, so the
+     * walk goes on to the next address, exactly as it does after an address that did not answer.
+     */
+    class NoTunnel(
+        detail: String?,
+        cause: Throwable? = null,
+        private val reason: FailureKind = FailureKind.HOST_UNREACHABLE,
+    ) : AgentFailure(
+        "This phone is not connected to the tailnet. Is Tailscale on?",
+        detail,
+        cause,
+    ) {
+        override val kind: FailureKind get() = reason
+    }
+
     /** We reached sshd and it refused the key. On a fresh install this is the normal first result. */
     class NotAuthorised(
         val endpoint: Endpoint,

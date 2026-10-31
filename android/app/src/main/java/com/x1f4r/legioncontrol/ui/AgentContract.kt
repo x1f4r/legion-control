@@ -33,6 +33,7 @@ import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.net.LocalAddress
+import com.x1f4r.legioncontrol.net.NetworkPaths
 import com.x1f4r.legioncontrol.net.RouteKind
 import com.x1f4r.legioncontrol.net.WakeSend
 import kotlinx.coroutines.flow.Flow
@@ -290,6 +291,15 @@ interface ControlServices {
      * can be worked out and a packet bound to the right network.
      */
     fun networkAddresses(): Flow<List<LocalAddress>>
+
+    /** The way out of this phone as it changes: its default network, and what each tunnel carries. */
+    fun networkPaths(): Flow<NetworkPaths>
+
+    /**
+     * Hands the transport the way out of this phone as it is now. Its tunnels decide whether a silent
+     * tailnet address is the phone's doing.
+     */
+    fun followPaths(paths: NetworkPaths)
 
     /** What to call this device in a revision it writes. */
     fun deviceName(): String

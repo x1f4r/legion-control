@@ -12,10 +12,12 @@ import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.data.Settings
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.HomeNetwork
+import com.x1f4r.legioncontrol.net.NetworkPaths
 import com.x1f4r.legioncontrol.net.RouteKind
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.SshTransport
 import com.x1f4r.legioncontrol.net.WakeOnLan
+import com.x1f4r.legioncontrol.net.untunnelled
 
 /** One machine, wired up: how to reach it, how to wake it, and how to talk to its agent. */
 class MachineControl(
@@ -87,6 +89,18 @@ class LegionControl(context: Context) {
     private val built = mutableMapOf<String, MachineControl>()
 
     /**
+     * The way out of this phone as last seen, or null before anything has been said about it. Until
+     * then no address that went unanswered is put down to a missing tunnel.
+     */
+    @Volatile
+    private var paths: NetworkPaths? = null
+
+    /** Follows the way out of this phone. */
+    fun follow(paths: NetworkPaths) {
+        this.paths = paths
+    }
+
+    /**
      * Reads the setup off a machine that is not in the configuration, because there is none yet.
      *
      * The one call in this app that talks to an address nobody has been told about, and it is what
@@ -105,7 +119,11 @@ class LegionControl(context: Context) {
             label = source.host,
         )
         val transport = SshTransport(identity, hostKeys, source.host)
-        return fetchController(transport, endpoint)
+        return try {
+            fetchController(transport, endpoint)
+        } catch (failure: AgentFailure) {
+            throw untunnelled(endpoint, failure, paths?.tunnels)
+        }
     }
 
     /**
@@ -148,7 +166,7 @@ class LegionControl(context: Context) {
         return MachineControl(
             machine = machine,
             routes = routes,
-            agent = AgentClient(machine, transport, routes, settings),
+            agent = AgentClient(machine, transport, routes, settings, tunnels = { paths?.tunnels }),
             wake = machine.wake?.let(::WakeOnLan),
         )
     }
