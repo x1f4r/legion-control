@@ -49,7 +49,7 @@ public class AppIconTests
         int stride;
         using (var frame = copy.Lock())
         {
-            bitmap.CopyPixels(frame, AlphaFormat.Unpremul);
+            bitmap.CopyPixels(frame);
             stride = frame.RowBytes;
             bytes = new byte[stride * frame.Size.Height];
             Marshal.Copy(frame.Address, bytes, 0, bytes.Length);

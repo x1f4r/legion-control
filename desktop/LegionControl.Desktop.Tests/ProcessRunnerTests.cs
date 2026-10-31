@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using LegionControl.Desktop.Transport;
 using Xunit;
 
@@ -189,7 +190,9 @@ public class ProcessRunnerTests
 /// counted as a pass there. [needsNode] adds what [NodeFactAttribute] says.
 public sealed class UnixFactAttribute : FactAttribute
 {
-    public UnixFactAttribute(string reason, bool needsNode = false)
+    public UnixFactAttribute(string reason, bool needsNode = false,
+        [CallerFilePath] string? sourceFilePath = null, [CallerLineNumber] int sourceLineNumber = -1)
+        : base(sourceFilePath, sourceLineNumber)
     {
         if (OperatingSystem.IsWindows()) Skip = reason;
         else if (needsNode) Skip = Node.Missing;
@@ -199,7 +202,9 @@ public sealed class UnixFactAttribute : FactAttribute
 /// A fact only Windows can observe. Reported as skipped elsewhere, with the reason.
 public sealed class WindowsFactAttribute : FactAttribute
 {
-    public WindowsFactAttribute(string reason)
+    public WindowsFactAttribute(string reason,
+        [CallerFilePath] string? sourceFilePath = null, [CallerLineNumber] int sourceLineNumber = -1)
+        : base(sourceFilePath, sourceLineNumber)
     {
         if (!OperatingSystem.IsWindows()) Skip = reason;
     }
@@ -209,13 +214,15 @@ public sealed class WindowsFactAttribute : FactAttribute
 /// failing on a child that could not start, which reads like a fault in the runner.
 public sealed class NodeFactAttribute : FactAttribute
 {
-    public NodeFactAttribute() => Skip = Node.Missing;
+    public NodeFactAttribute([CallerFilePath] string? sourceFilePath = null, [CallerLineNumber] int sourceLineNumber = -1)
+        : base(sourceFilePath, sourceLineNumber) => Skip = Node.Missing;
 }
 
 /// A theory that starts node, reported the same way.
 public sealed class NodeTheoryAttribute : TheoryAttribute
 {
-    public NodeTheoryAttribute() => Skip = Node.Missing;
+    public NodeTheoryAttribute([CallerFilePath] string? sourceFilePath = null, [CallerLineNumber] int sourceLineNumber = -1)
+        : base(sourceFilePath, sourceLineNumber) => Skip = Node.Missing;
 }
 
 /// Whether this machine has node on PATH, as a child started by name finds it.

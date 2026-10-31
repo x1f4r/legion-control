@@ -8,18 +8,21 @@
     <!-- As in the app: a warning fails the build, an advisory against a package does not. -->
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+    <!-- xUnit v3 asks for its own cancellation token in every call that takes one. The tests call
+         the app's methods the way the app does, with none, and set no timeout for it to cancel. -->
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
     <RootNamespace>LegionControl.Desktop.Tests</RootNamespace>
-    <!-- The app is a WinExe; referencing it from a test project is fine, but the test host has to
-         stay a console application. -->
-    <OutputType>Library</OutputType>
+    <!-- xUnit v3 runs the tests as a program of their own. The app is a WinExe; referencing it from
+         here is fine, but this one has to be a console application. -->
+    <OutputType>Exe</OutputType>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
-    <PackageReference Include="xunit" Version="2.9.2" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
     <!-- The window, its tray and its icon, run in memory with no display. -->
-    <PackageReference Include="Avalonia.Headless.XUnit" Version="11.3.20" />
+    <PackageReference Include="Avalonia.Headless.XUnit" Version="12.1.4" />
   </ItemGroup>
 
   <ItemGroup>
