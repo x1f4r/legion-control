@@ -1213,7 +1213,8 @@ key runs there either.
 
 **This device → Configuration → Fetch from a machine** takes a host, a port and a user, runs the
 config command there with the device's own key (which has to be authorised on that system already,
-exactly as for any other command), and applies what comes back. It tries the standard install
+exactly as for any other command), and takes what comes back, on a device that applies no setup yet
+only once it has shown every launch value in it and you confirmed. It tries the standard install
 layouts in turn, so you do not have to know where the agent lives:
 
     /usr/bin/node /home/<user>/.legion-control/bin/launcher.mjs
@@ -1225,6 +1226,15 @@ preserved. Moving it to the stable launcher is a reviewed configuration edit tha
 interpreter and base; custom paths are not silently rewritten or used to guess an upload location.
 
 From then on the device reconciles like every other peer. Pasting the JSON by hand still works.
+
+On Android a fetched copy is the machine's revision and is taken only as the bytes the machine
+holds. A reply whose bytes do not hash to the `hash` it reports is refused until that machine's
+agent is updated: an agent before 3.1.0 sends no `raw`, and a document rebuilt from what it does
+send is spelled differently from one the desktop wrote. On a phone that already has the same setup
+it is decided by ancestry, as for a copy a status reports: the copy the phone has, or one its own
+was made from, changes nothing; a revision made from the phone's is taken exactly as served after
+Confirm; and one edited separately goes to the merge screen. Only a paste is an edit made on the
+phone.
 
 There is no discovery. Nothing on your network announces itself and no client listens for anything;
 the document lists your machines and any one of them will hand it over. The document also carries no
