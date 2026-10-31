@@ -117,6 +117,11 @@ fun MachineSection(model: MachineModel, app: AppModel) {
                 DetailRow("Hostname") { ValueText(model.status?.hostname, "not known") }
                 DetailRow("System") { ValueText(model.currentSystem?.name, "not known") }
                 DetailRow("Agent") { VersionText(model.abilities.agentVersion, "not known") }
+                // Said where the version is first read, with the way to the install action beside it.
+                AgentDeploymentPath.behind(app.agentBundleVersion, model.abilities.agentVersion)?.let { behind ->
+                    QuietText(behind)
+                    Actions { PlainAction("Control agent", enabled = true) { sheet = null; agentDetails = true } }
+                }
                 DetailRow("Address") { ValueText(model.route?.label, "not known") }
                 model.lastChecked?.let { checked -> DetailRow("Checked") { QuietText(localTime(checked)) } }
                 DetailRow("Setup") { SetupRow(model, app) }
