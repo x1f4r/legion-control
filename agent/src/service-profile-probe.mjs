@@ -292,6 +292,12 @@ export function profileInstall(profile, { platform = process.platform, env = pro
   const own = DESKTOP_APPLICATIONS[profile] ? bundles(profile) : [];
   owned.push(...own);
   const foreign = Object.keys(DESKTOP_APPLICATIONS).flatMap(bundles).filter((bundle) => !own.includes(bundle));
+  // Every packaged Windows application runs from under WindowsApps, where
+  // discovery does not look, and no CLI does. So a CLI profile never claims a
+  // process from there: not the Store's ChatGPT for codex, nor Claude for claude.
+  if (system === 'windows' && !DESKTOP_APPLICATIONS[profile] && typeof env.ProgramFiles === 'string' && paths.isAbsolute(env.ProgramFiles)) {
+    foreign.push(paths.join(env.ProgramFiles, 'WindowsApps'));
+  }
   return { owned, links, foreign: [...new Set(foreign)] };
 }
 

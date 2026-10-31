@@ -314,11 +314,12 @@ test('a Windows npm service is matched under <prefix>\\node_modules\\<package>, 
 test('Windows desktop applications are told from the CLIs of the same name by where they are installed', () => {
   const files = new Set(['C:\\Users\\me\\AppData\\Local\\Claude\\Claude.exe']);
   const io = { realpathSync: () => { throw new Error('missing'); }, statSync: (file) => { if (!files.has(file)) throw new Error('missing'); return { isFile: () => true }; } };
-  const env = { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' };
+  const env = { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local', ProgramFiles: 'C:\\Program Files' };
   const desktop = profileInstall('claude-desktop', { platform: 'win32', env, home: 'C:\\Users\\me', io });
   const cli = profileInstall('claude-code', { platform: 'win32', env, home: 'C:\\Users\\me', io });
   assert.deepEqual(desktop.owned, ['C:\\Users\\me\\AppData\\Local\\Claude']);
-  assert.deepEqual(cli, { owned: [], links: [], foreign: ['C:\\Users\\me\\AppData\\Local\\Claude'] });
+  assert.deepEqual(desktop.foreign, []);
+  assert.deepEqual(cli, { owned: [], links: [], foreign: ['C:\\Users\\me\\AppData\\Local\\Claude', 'C:\\Program Files\\WindowsApps'] });
   const app = { pid: 10, parentPid: 9, name: 'claude.exe', command: '"C:\\Users\\me\\AppData\\Local\\Claude\\app-1.0.0\\claude.exe"', executablePath: 'C:\\Users\\me\\AppData\\Local\\Claude\\app-1.0.0\\claude.exe' };
   const session = { pid: 11, parentPid: 9, name: 'claude.exe', command: '"C:\\Users\\me\\.local\\bin\\claude.exe" --print', executablePath: 'C:\\Users\\me\\.local\\bin\\claude.exe' };
   const verdict = (profile, install, rows) => processExitVerdict(profile, rows, 99999, { platform: 'win32', systemRoot: 'C:\\Windows', install, io });
@@ -326,6 +327,16 @@ test('Windows desktop applications are told from the CLIs of the same name by wh
   assert.deepEqual(verdict('claude-code', cli, [session]), BUSY);
   assert.deepEqual(verdict('claude-desktop', desktop, [app]), BUSY);
   assert.deepEqual(verdict('claude-desktop', desktop, [session]), IDLE);
+
+  // A packaged application lives where discovery does not look, and is no CLI.
+  const store = (name) => `C:\\Program Files\\WindowsApps\\Vendor.App_1.2.3.0_x64__abcdefghjkmnp\\app\\${name}`;
+  const packaged = (name) => ({ pid: 12, parentPid: 9, name, command: `"${store(name)}"`, executablePath: store(name) });
+  assert.deepEqual(verdict('claude-code', cli, [packaged('claude.exe')]), IDLE);
+  const codexCli = profileInstall('codex-cli', { platform: 'win32', env, home: 'C:\\Users\\me', io });
+  const codexApp = profileInstall('codex-desktop', { platform: 'win32', env, home: 'C:\\Users\\me', io });
+  assert.deepEqual(verdict('codex-cli', codexCli, [packaged('Codex.exe')]), IDLE);
+  assert.deepEqual(verdict('codex-cli', codexCli, [packaged('ChatGPT.exe')]), IDLE);
+  assert.deepEqual(verdict('codex-desktop', codexApp, [packaged('Codex.exe')]), BUSY, 'the application still knows itself by name');
 });
 
 test('a Mac desktop profile is matched by its bundle, and the CLIs and apps of one vendor no longer overlap', { skip: !posix && 'POSIX paths' }, () => withRoot((root) => {
