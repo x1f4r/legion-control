@@ -17,7 +17,7 @@ import org.junit.Test
 class ConfigStoreAdoptionTest {
 
     private fun enrolled(prefs: MemoryPreferences = MemoryPreferences()): ConfigStore =
-        LaunchDocuments.store(prefs).also { assertNull(it.applyEnrolment(LaunchDocuments.HELD, "Test phone")) }
+        LaunchDocuments.store(prefs).also { assertTrue(it.enrolAsFetched(LaunchDocuments.HELD) is SetupOutcome.Applied) }
 
     private fun newer(of: String, name: String) =
         LaunchDocuments.descendant(of) { root -> ControllerDocument.of(root).editMachine("pi") { it.withText("name", name) }.root }
@@ -140,6 +140,90 @@ class ConfigStoreAdoptionTest {
         assertEquals(text, store.text.value)
         assertEquals("tower.example", prefs.values["setup-source-host"])
         assertEquals(source, LaunchDocuments.store(prefs).source.value)
+    }
+
+    // MARK: - A setup a person fetched
+
+    private fun enrol(store: ConfigStore, text: String, servedHash: String? = hashOf(text), head: String? = store.appliedHash()) =
+        store.applyEnrolment(text, servedHash, head, "Pi", "Test phone")
+
+    @Test
+    fun `a fetched copy is taken only as the bytes the machine reported`() {
+        val prefs = MemoryPreferences()
+        val store = enrolled(prefs)
+        val head = store.appliedHash()
+        val copy = newer(store.text.value, "Beacon two")
+        val writes = prefs.writes.size
+
+        assertTrue(enrol(store, copy, servedHash = "0".repeat(64)) is SetupOutcome.Invalid)
+        assertTrue(enrol(store, copy, servedHash = null) is SetupOutcome.Invalid)
+        assertEquals(head, store.appliedHash())
+        assertEquals("nothing was written", writes, prefs.writes.size)
+    }
+
+    /**
+     * A copy fetched by hand is the machine's revision, not an edit made here. Stamped as one, a
+     * phone that fetched to catch up wrote a revision descending from neither side, and every
+     * machine diverged from it instead of being in step.
+     */
+    @Test
+    fun `a fetched copy of this setup is decided by its ancestry, and never stamped as an edit made here`() {
+        val prefs = MemoryPreferences()
+        val store = enrolled(prefs)
+        val first = store.text.value
+        val second = newer(first, "Beacon two")
+        val third = newer(second, "Beacon three")
+
+        // Two revisions ahead: a fast-forward, stored byte for byte with the machine's own lineage.
+        assertTrue(enrol(store, third) is SetupOutcome.Applied)
+        assertEquals(third, store.text.value)
+        assertEquals(listOf(hashOf(second), hashOf(first)), store.provenance.value!!.lineage)
+
+        // The same copy, and one this device's was made from, change nothing, and a branch is never
+        // put over this one.
+        val writes = prefs.writes.size
+        assertEquals(SetupOutcome.Unchanged, enrol(store, third))
+        assertEquals(SetupOutcome.Unchanged, enrol(store, second))
+        assertTrue(enrol(store, newer(second, "Elsewhere")) is SetupOutcome.Invalid)
+        assertEquals("nothing was written", writes, prefs.writes.size)
+        assertEquals(third, store.text.value)
+
+        // Nor is anything put over a document other than the one it was shown against.
+        assertEquals(SetupOutcome.HeadMoved, enrol(store, newer(third, "Beacon four"), head = hashOf(second)))
+        assertEquals(third, store.text.value)
+    }
+
+    /**
+     * The head is the hash in storage, as for every other compare-and-swap here. A stored copy this
+     * build cannot read loads as no document, and holding a fetch to that turned every Confirm on
+     * such a phone into "the setup here changed".
+     */
+    @Test
+    fun `a fetched copy replaces a stored one that cannot be read, held to the hash in storage`() {
+        val prefs = MemoryPreferences().apply {
+            values["controller-config"] = "{ not json"
+            values["controller-hash"] = "a".repeat(64)
+        }
+        val store = LaunchDocuments.store(prefs)
+        assertNull(store.document.value)
+
+        assertEquals(SetupOutcome.HeadMoved, enrol(store, LaunchDocuments.HELD, head = null))
+        assertTrue(enrol(store, LaunchDocuments.HELD) is SetupOutcome.Applied)
+        assertEquals(hashOf(LaunchDocuments.HELD), store.appliedHash())
+        assertEquals(hashOf(LaunchDocuments.HELD), store.document.value?.hash)
+    }
+
+    @Test
+    fun `a hand paste of the same setup is still an edit of the copy here`() {
+        val store = enrolled()
+        val before = store.document.value!!
+
+        assertNull(store.applyPasted(newer(store.text.value, "Pasted"), "Test phone"))
+
+        val pasted = store.document.value!!.identity!!
+        assertEquals(listOf(before.hash), pasted.lineage)
+        assertEquals(ControllerDocument.CLIENT_KIND, pasted.source)
+        assertEquals("Test phone", pasted.device)
     }
 
     @Test

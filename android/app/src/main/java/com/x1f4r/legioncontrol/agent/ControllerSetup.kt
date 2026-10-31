@@ -4,6 +4,8 @@ import com.x1f4r.legioncontrol.data.SetupJson
 import com.x1f4r.legioncontrol.net.CommandOutcome
 import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
+import com.x1f4r.legioncontrol.net.LanPrefix
+import com.x1f4r.legioncontrol.net.untunnelled
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -112,9 +114,17 @@ data class SetupCommand(val grammar: RemoteShell, val arguments: List<String>) {
  * failure that rules out the whole address (section 15.5, step 7): with one address there is
  * nowhere else to go. Anything else moves on to the next shape, which is safe because `config` is a
  * read.
+ *
+ * [tunnels] are the prefixes this phone's tunnels carry, null before anything has been said about
+ * them. A tailnet address typed here that does not answer while none of them carries it is said to
+ * be the phone off the tailnet ([untunnelled]), as it is of a machine in the setup.
  */
-suspend fun fetchController(transport: CommandTransport, endpoint: Endpoint): ControllerFetch =
-    fetchController { line -> transport.run(endpoint, line, FETCH_TIMEOUT_MILLIS) }
+suspend fun fetchController(transport: CommandTransport, endpoint: Endpoint, tunnels: List<LanPrefix>? = null): ControllerFetch =
+    try {
+        fetchController { line -> transport.run(endpoint, line, FETCH_TIMEOUT_MILLIS) }
+    } catch (failure: AgentFailure) {
+        throw untunnelled(endpoint, failure, tunnels)
+    }
 
 internal suspend fun fetchController(run: suspend (String) -> CommandOutcome): ControllerFetch {
     var detail: String? = null

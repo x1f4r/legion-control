@@ -7,6 +7,7 @@ import com.x1f4r.legioncontrol.data.LaunchDocuments.LINUX
 import com.x1f4r.legioncontrol.data.LaunchDocuments.descendant
 import com.x1f4r.legioncontrol.data.LaunchDocuments.tuple
 import com.x1f4r.legioncontrol.data.adoptAsFetched
+import com.x1f4r.legioncontrol.data.enrolAsFetched
 import com.x1f4r.legioncontrol.data.offered
 import com.x1f4r.legioncontrol.data.withSystemValue
 import org.junit.Assert.assertEquals
@@ -24,7 +25,7 @@ class SetupEditorLaunchTest {
 
     private fun editor(store: ConfigStore) = SetupEditorModel(servicesOver(store)).apply { startFresh() }
 
-    private fun enrolled() = LaunchDocuments.store().also { it.applyEnrolment(HELD, "Test phone") }
+    private fun enrolled() = LaunchDocuments.store().also { it.enrolAsFetched(HELD) }
 
     @Test
     fun `a system is added with the command that runs its agent, and never without one`() {

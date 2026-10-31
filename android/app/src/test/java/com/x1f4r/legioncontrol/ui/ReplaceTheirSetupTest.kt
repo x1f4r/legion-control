@@ -17,6 +17,8 @@ import com.x1f4r.legioncontrol.data.LaunchDocuments
 import com.x1f4r.legioncontrol.data.MemoryPreferences
 import com.x1f4r.legioncontrol.data.OperationStore
 import com.x1f4r.legioncontrol.data.SetupIdentityClash
+import com.x1f4r.legioncontrol.data.SetupOutcome
+import com.x1f4r.legioncontrol.data.enrolAsFetched
 import com.x1f4r.legioncontrol.data.withText
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -47,7 +49,7 @@ import java.nio.file.Files
 class ReplaceTheirSetupTest {
 
     private val store: ConfigStore = LaunchDocuments.store(MemoryPreferences()).also {
-        assertNull(it.applyEnrolment(LaunchDocuments.HELD, "Test phone"))
+        assertTrue(it.enrolAsFetched(LaunchDocuments.HELD) is SetupOutcome.Applied)
     }
     private val services = servicesOver(store)
     private val sync = SetupPeerSync(services) { 1_000_000L }

@@ -35,6 +35,9 @@ enum class DiagnosisStatus(val label: String) {
      */
     NOT_DIALLED("is not usable as written"),
 
+    /** A tailnet address, and no tunnel on this phone carries it. Tailscale is what this wants. */
+    NO_TUNNEL("has no tunnel from this phone"),
+
     /** Nothing at all: asleep, off, or a route that does not carry. */
     UNREACHABLE("did not answer"),
     ;

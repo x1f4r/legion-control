@@ -18,6 +18,7 @@ import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.LaunchDocuments
 import com.x1f4r.legioncontrol.data.MemoryPreferences
 import com.x1f4r.legioncontrol.data.SetupOutcome
+import com.x1f4r.legioncontrol.data.enrolAsFetched
 import com.x1f4r.legioncontrol.data.withList
 import com.x1f4r.legioncontrol.data.withText
 import kotlinx.coroutines.CompletableDeferred
@@ -43,7 +44,7 @@ class SetupPeerSyncTest {
 
     private var now = 1_000_000L
     private val store: ConfigStore = LaunchDocuments.store(MemoryPreferences()).also {
-        assertNull(it.applyEnrolment(LaunchDocuments.HELD, "Test phone"))
+        assertTrue(it.enrolAsFetched(LaunchDocuments.HELD) is SetupOutcome.Applied)
     }
     private val services = servicesOver(store)
     private val sync = SetupPeerSync(services) { now }
@@ -457,7 +458,7 @@ class SetupPeerSyncTest {
     @Test
     fun `a revision written with a fraction is pushed as the whole number the agent reads`() = runBlocking {
         val spelled = LaunchDocuments.store(MemoryPreferences()).also {
-            assertNull(it.applyEnrolment(LaunchDocuments.HELD.replace("\"revision\": 7,", "\"revision\": 7.0,"), "Test phone"))
+            assertTrue(it.enrolAsFetched(LaunchDocuments.HELD.replace("\"revision\": 7,", "\"revision\": 7.0,")) is SetupOutcome.Applied)
         }
         val spelledSync = SetupPeerSync(servicesOver(spelled)) { now }
         val machine = FakeMachine("pi")

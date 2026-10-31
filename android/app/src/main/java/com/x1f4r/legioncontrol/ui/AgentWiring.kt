@@ -37,6 +37,7 @@ import com.x1f4r.legioncontrol.data.SetupIdentityClash
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.net.LocalAddress
+import com.x1f4r.legioncontrol.net.NetworkPaths
 import com.x1f4r.legioncontrol.net.WakeSend
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
@@ -88,6 +89,14 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override fun networkAddresses(): Flow<List<LocalAddress>> = control.homeNetwork.observeAddresses()
 
+    override fun networkPaths(): Flow<NetworkPaths> = control.homeNetwork.observePaths()
+
+    override fun followPaths(paths: NetworkPaths) = control.follow(paths)
+
+    override fun retryAddresses() = control.retryAddresses()
+
+    override fun followPlacement(onSite: Set<String>) = control.place(onSite)
+
     override fun deviceName(): String = control.deviceName()
 
     override fun forgetRoute(machineId: String) = control.settings.forgetRoute(machineId)
@@ -101,8 +110,13 @@ private class WiredServices(private val control: LegionControl) : ControlService
     override fun applyEdit(document: ControllerDocument, deviceName: String?): String? =
         control.config.applyEdit(document, deviceName)
 
-    override fun applyEnrolment(text: String, deviceName: String?): String? =
-        control.config.applyEnrolment(text, deviceName)
+    override fun applyEnrolment(
+        text: String,
+        servedHash: String?,
+        expectedHead: String?,
+        servedBy: String,
+        deviceName: String?,
+    ): SetupOutcome = control.config.applyEnrolment(text, servedHash, expectedHead, servedBy, deviceName)
 
     override fun approveLaunch(entries: List<LaunchReviewEntry>): String? = control.config.approveLaunch(entries)
 

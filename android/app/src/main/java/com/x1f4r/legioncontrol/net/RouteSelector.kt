@@ -113,6 +113,19 @@ class RouteSelector(
     }
 
     /**
+     * Lets every address be dialled again on the next call, in the usual order, keeping the route
+     * that worked last time.
+     *
+     * For the moments a silence earned earlier stops meaning anything: the phone's way out changed,
+     * a tunnel came up or went, or a person asked to check again. Held back until its backoff ran
+     * out, a tailnet address stayed silent for up to four minutes after Tailscale was back on, which
+     * looked like a fix that had done nothing.
+     */
+    fun liftBackoff() {
+        backoff.clear()
+    }
+
+    /**
      * Drops an outgoing system's route and arranges the next authenticated call for the requested
      * system. The endpoint hint only affects order; whatever system answers is still accepted.
      */

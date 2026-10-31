@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.net
 
+import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.data.SiteConfig
 
 /**
@@ -153,6 +154,15 @@ fun onNetwork(
     val placing = firstInside(listOf(prefix), addresses) ?: return NetworkTest(false, "elsewhere", null)
     return NetworkTest(true, null, placing)
 }
+
+/** The ids of [machines] that are on this device's network, each by [onNetwork]. */
+fun machinesOnSite(
+    machines: List<Machine>,
+    sites: List<SiteConfig>,
+    addresses: List<LocalAddress>,
+    currentSite: String?,
+): Set<String> =
+    machines.filter { onNetwork(it.siteId, it.wake?.lanPrefix, sites, addresses, currentSite).on }.map { it.id }.toSet()
 
 /**
  * Works out the site from the addresses this device holds and what the user has declared.

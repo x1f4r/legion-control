@@ -78,6 +78,47 @@ sealed interface SetupOutcome {
 }
 
 /**
+ * What a copy of the setup a person fetched from a machine is, beside the document in force.
+ *
+ * Decided by ancestry, as contract section 9.5 decides about a machine's copy on every status, and
+ * never by the setup id alone. A fetched copy of this device's own setup used to be taken for an
+ * edit made here: it was stamped as the next revision of the copy this device held, so a phone that
+ * fetched to catch up wrote a revision that descended from neither history, and every machine then
+ * diverged from it.
+ */
+enum class FetchedCopy {
+    /** This device applies no setup, or none it can read: enrolment, which approves everything it showed. */
+    FIRST,
+
+    /** The document in force, byte for byte. */
+    SAME,
+
+    /** Another setup entirely, or a document that names none. Followed here only on Confirm. */
+    OTHER_SETUP,
+
+    /** Made from the document in force: a fast-forward, taken exactly as it was served. */
+    DESCENDANT,
+
+    /** One the document in force was made from. This device is ahead, and takes nothing. */
+    ANCESTOR,
+
+    /** A branch: neither was made from the other, and a person merges the two. */
+    DIVERGED,
+    ;
+
+    companion object {
+        fun of(head: ControllerDocument?, fetched: ControllerDocument): FetchedCopy = when {
+            head == null -> FIRST
+            fetched.hash == head.hash -> SAME
+            fetched.setupId == null || fetched.setupId != head.setupId -> OTHER_SETUP
+            head.hash in fetched.lineage -> DESCENDANT
+            fetched.hash in head.lineage -> ANCESTOR
+            else -> DIVERGED
+        }
+    }
+}
+
+/**
  * The setup this device holds, and everything about where it came from.
  *
  * Every device is a peer now: this one edits, publishes and adopts exactly like the Mac and the
@@ -199,20 +240,7 @@ class ConfigStore internal constructor(
      * A paste is an edit made on this device, so every command it changes is approved, at its new
      * value, in the same write as the document (contract section 9.9).
      */
-    fun applyPasted(text: String, deviceName: String?): String? = paste(text, deviceName, Approving.EDIT)
-
-    /**
-     * Puts a setup fetched from a machine into force, once every launch value in it was shown and
-     * the person confirmed it.
-     *
-     * Enrolment (contract section 9.9): on a device that applies no setup yet, confirming approves
-     * every one of them. On a device that already applies one it is taking a different document,
-     * which approves nothing, and anything this device has not approved waits for review.
-     */
-    fun applyEnrolment(text: String, deviceName: String?): String? =
-        paste(text, deviceName, if (_document.value == null) Approving.EVERYTHING else Approving.NOTHING)
-
-    private fun paste(text: String, deviceName: String?, approving: Approving): String? {
+    fun applyPasted(text: String, deviceName: String?): String? {
         val verdict = DocumentAcceptance.check(text, Intake.LOCAL)
         if (!verdict.valid) return verdict.errors.firstOrNull()?.message ?: "That configuration could not be read."
         val parsed = ControllerDocument.parse(text).getOrElse { return it.message }
@@ -226,7 +254,71 @@ class ConfigStore internal constructor(
 
             else -> parsed
         }
-        return store(document, approving = approving).failure
+        return store(document, approving = Approving.EDIT).failure
+    }
+
+    /**
+     * Puts a setup fetched from a machine into force, once every launch value in it was shown and
+     * the person confirmed it.
+     *
+     * [text] is what [servedBy] served, taken only if it hashes to [servedHash], the hash the machine
+     * reported: bytes that do not are a document no machine holds, and every machine would diverge
+     * from them (C1). It replaces the document in force only if the hash in storage is still
+     * [expectedHead], the [appliedHash] the summary was built against, null meaning none. That and
+     * not the document loaded is the head: a stored copy that cannot be read loads as no document at
+     * all, and a fetch is how such a phone is put right.
+     *
+     * What it does is decided by ancestry ([FetchedCopy]), never by the setup id alone: a copy that
+     * came off a machine is that machine's revision, not an edit made here. On a device that applies
+     * no setup yet it is enrolment (contract section 9.9), and confirming approves every launch value
+     * in it. A copy made from the document in force is stored exactly as served, as an automatic
+     * fetch stores it, and another setup is followed; both approve nothing, so what this device has
+     * not approved waits for review. The same copy, or one this device's was made from, changes
+     * nothing, and a branch is never written over the one here: a person merges the two.
+     */
+    fun applyEnrolment(
+        text: String,
+        servedHash: String?,
+        expectedHead: String?,
+        servedBy: String,
+        deviceName: String?,
+    ): SetupOutcome {
+        if (servedHash.isNullOrBlank()) {
+            return SetupOutcome.Invalid("$servedBy did not say which setup it holds, so nothing was applied.")
+        }
+        val verdict = DocumentAcceptance.check(text, Intake.LOCAL)
+        if (!verdict.valid) {
+            return SetupOutcome.Invalid(verdict.errors.firstOrNull()?.message ?: "That configuration could not be read.")
+        }
+        val parsed = ControllerDocument.parse(text).getOrElse {
+            return SetupOutcome.Invalid(it.message ?: "That setup could not be read.")
+        }
+        if (parsed.hash != servedHash) {
+            return SetupOutcome.Invalid(
+                "$servedBy served a setup whose contents do not match the hash it reported. Nothing was applied.",
+            )
+        }
+        if (appliedHash() != expectedHead) return SetupOutcome.HeadMoved
+        val applied = _document.value
+        // A document that names no setup gets one before it is applied, as a paste does.
+        val identified = if (verdict.assignsIdentity) parsed.withFreshIdentity(deviceName, now()) else parsed
+        val (document, approving) = when (FetchedCopy.of(applied, parsed)) {
+            FetchedCopy.FIRST -> identified to Approving.EVERYTHING
+            FetchedCopy.OTHER_SETUP -> identified to Approving.NOTHING
+            FetchedCopy.DESCENDANT -> parsed to Approving.NOTHING
+            FetchedCopy.SAME, FetchedCopy.ANCESTOR -> return SetupOutcome.Unchanged
+            FetchedCopy.DIVERGED -> return SetupOutcome.Invalid(
+                "The copy on $servedBy and the one here were edited separately, and neither was made from the " +
+                    "other, so it was not put over this one. They have to be merged.",
+            )
+        }
+        return when (val stored = store(document, readFrom = servedBy, approving = approving, head = Head.Is(expectedHead))) {
+            Stored.Written -> SetupOutcome.Applied("Took the setup from $servedBy.")
+            Stored.Unchanged -> SetupOutcome.Unchanged
+            Stored.HeadMoved -> SetupOutcome.HeadMoved
+            is Stored.Refused -> SetupOutcome.Invalid(stored.reason)
+            is Stored.NotSaved -> SetupOutcome.NotSaved(stored.reason)
+        }
     }
 
     /**
@@ -390,7 +482,7 @@ class ConfigStore internal constructor(
 
     /** What the document in force has to be at the moment of writing for a write to go ahead. */
     private sealed interface Head {
-        /** Whatever it is: an edit made here, a paste, enrolment. */
+        /** Whatever it is: an edit made here, or a paste. */
         data object Any : Head
 
         /** Exactly the document with this hash, or none at all when it is null. */

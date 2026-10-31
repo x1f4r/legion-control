@@ -1,5 +1,6 @@
 package com.x1f4r.legioncontrol.net
 
+import com.x1f4r.legioncontrol.agent.Machine
 import com.x1f4r.legioncontrol.data.SiteConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -36,6 +37,20 @@ class SiteDetectionTest {
     )
 
     private fun here(vararg addresses: String): List<LocalAddress> = addresses.map { LocalAddress(it, 24) }
+
+    /**
+     * What a silent LAN address is weighed by against a missing tunnel: the same test route order
+     * and direct wake use, so a machine at an ambiguous site is not counted as here either.
+     */
+    @Test
+    fun `the machines on this device's network are the ones whose site is effective`() {
+        fun machine(id: String, site: String?) = Machine(id = id, name = id, endpoints = emptyList(), systems = emptyList(), wake = null, siteId = site)
+        val machines = listOf(machine("tower", "office"), machine("pi", "attic-house"), machine("loose", null))
+
+        assertEquals(setOf("tower"), machinesOnSite(machines, listOf(attic, flat, distinct), here("10.0.0.7"), currentSite = null))
+        assertEquals(emptySet<String>(), machinesOnSite(machines, listOf(attic, flat, distinct), here("192.168.50.31"), currentSite = null))
+        assertEquals(setOf("pi"), machinesOnSite(machines, listOf(attic, flat, distinct), here("192.168.50.31"), currentSite = "attic-house"))
+    }
 
     @Test
     fun `one matching site is confirmed`() {

@@ -4,8 +4,11 @@ import com.x1f4r.legioncontrol.data.MachineHints
 import com.x1f4r.legioncontrol.net.CommandOutcome
 import com.x1f4r.legioncontrol.net.CommandTransport
 import com.x1f4r.legioncontrol.net.Endpoint
+import com.x1f4r.legioncontrol.net.LanPrefix
+import com.x1f4r.legioncontrol.net.RouteKind
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.StdinSource
+import com.x1f4r.legioncontrol.net.untunnelled
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
@@ -71,6 +74,18 @@ class AgentClient(
     private val transport: CommandTransport,
     private val routes: RouteSelector,
     private val settings: MachineHints,
+    /**
+     * The IPv4 prefixes this phone's tunnels carry now, or null before anything has been said about
+     * them. Read after each address that went unanswered, so a tailnet address no tunnel carries is
+     * reported as the phone being off the tailnet rather than as the machine being off.
+     */
+    private val tunnels: () -> List<LanPrefix>? = { null },
+    /**
+     * Whether this phone is on the machine's own network now, by site placement: the test route
+     * order and direct wake share. There a LAN address that did not answer says more than a tailnet
+     * address no tunnel carries, which is only the tunnel being off on purpose at home.
+     */
+    private val onSite: () -> Boolean = { false },
     /**
      * Milliseconds, for the one deadline each command has. Replaced in tests, and only there.
      *
@@ -642,6 +657,7 @@ class AgentClient(
                 is AgentFailure.AgentMissing -> DiagnosisStatus.NO_AGENT
                 is AgentFailure.BadOutput -> DiagnosisStatus.UNREADABLE
                 is AgentFailure.BadRequest -> DiagnosisStatus.NOT_DIALLED
+                is AgentFailure.NoTunnel -> DiagnosisStatus.NO_TUNNEL
                 else -> DiagnosisStatus.UNREACHABLE
             }
             EndpointDiagnosis(endpoint, status, failure.detail, took())
@@ -731,7 +747,7 @@ class AgentClient(
         }
         val deadline = clock() + timeoutMillis
         val walk = AttemptWalk(safety)
-        val failures = Failures()
+        val failures = Failures(atHome = onSite())
         val candidates = only?.let(::listOf) ?: routes.candidates()
         if (candidates.isEmpty()) {
             throw AgentFailure.Unreachable(machine.name, routes.probeSummary(), reason = FailureKind.NO_ROUTE)
@@ -774,9 +790,10 @@ class AgentClient(
                 attemptsMade += 1
                 val outcome = try {
                     transport.run(endpoint, line, remaining.coerceAtLeast(1L), stdin)
-                } catch (failure: AgentFailure) {
+                } catch (thrown: AgentFailure) {
+                    val failure = untunnelled(endpoint, thrown, tunnels())
                     noteFailure(endpoint, failure)
-                    failures.record(failure)
+                    failures.record(failure, onLan = endpoint.kind == RouteKind.LAN)
                     val reading = AttemptReading.failure(
                         failure.kind ?: FailureKind.LINK_LOST,
                         failure.dispatch,
@@ -911,6 +928,11 @@ class AgentClient(
 
     /** What an address did, for the next call's order and for the sentence when nothing answers. */
     private fun noteFailure(endpoint: Endpoint, failure: AgentFailure) {
+        // Held back like any address that did not answer, until a tunnel coming up lifts it.
+        if (failure is AgentFailure.NoTunnel) {
+            routes.penalise(endpoint, "is not carried by any tunnel on this phone")
+            return
+        }
         when (failure.kind) {
             // Only an address that did not get as far as a session is held back. One that answered
             // and turned something down is answering, and holding it back would hide that.
@@ -951,7 +973,11 @@ class AgentClient(
      * A key this phone could not read comes just before a machine that did not answer. Every address
      * that got as far as signing in failed on this side, so it is the better thing to say: reported
      * behind an address that was off, it turned a phone that could not read its own key into a
-     * machine that was asleep.
+     * machine that was asleep. A tailnet address no tunnel on this phone carries comes next, ahead of
+     * any other address that did not answer: with the tunnel down the LAN address is often silent
+     * too, from the wrong house, and what wants doing is turning the tunnel on. Not while the phone
+     * is on the machine's own network ([atHome]) and a LAN address there did not answer either: that
+     * is a machine asleep with the tunnel off on purpose, and Tailscale is the wrong place to look.
      *
      * An address skipped because it is outside the dial grammar comes last of all, after a machine
      * that did not answer. The document holding it is valid and Apply has already named the entry,
@@ -960,7 +986,7 @@ class AgentClient(
      * blocked rate. The route selector leaves such an address out whenever there is a good one, and
      * this keeps the same order should one ever be handed over anyway.
      */
-    private class Failures {
+    private class Failures(private val atHome: Boolean) {
         var hostKeyChanged: AgentFailure? = null
         var notAuthorised: AgentFailure? = null
         var badRequest: AgentFailure? = null
@@ -968,7 +994,9 @@ class AgentClient(
         var wrongShape: AgentFailure? = null
         var unreadable: AgentFailure? = null
         var keyUnavailable: AgentFailure? = null
+        var untunnelled: AgentFailure? = null
         var unreachable: AgentFailure? = null
+        var silentLan: AgentFailure? = null
         var ambiguous: AgentFailure? = null
         var undialable: AgentFailure? = null
 
@@ -977,7 +1005,8 @@ class AgentClient(
             undialable = undialable ?: failure
         }
 
-        fun record(failure: AgentFailure) {
+        /** [onLan] says the address was a LAN one, which only an address that did not answer cares about. */
+        fun record(failure: AgentFailure, onLan: Boolean = false) {
             when (failure) {
                 is AgentFailure.HostKeyChanged -> hostKeyChanged = hostKeyChanged ?: failure
                 is AgentFailure.NotAuthorised -> notAuthorised = notAuthorised ?: failure
@@ -991,18 +1020,20 @@ class AgentClient(
 
                 is AgentFailure.BadOutput -> unreadable = unreadable ?: failure
                 is AgentFailure.KeyUnavailable -> keyUnavailable = keyUnavailable ?: failure
+                is AgentFailure.NoTunnel -> untunnelled = untunnelled ?: failure
                 else ->
                     if (failure.dispatch.mayHaveRun) {
                         ambiguous = ambiguous ?: failure
                     } else {
                         unreachable = unreachable ?: failure
+                        if (onLan) silentLan = silentLan ?: failure
                     }
             }
         }
 
         fun worthReporting(): AgentFailure? =
             hostKeyChanged ?: notAuthorised ?: badRequest ?: scriptMissing ?: unreadable ?: ambiguous ?:
-                wrongShape ?: keyUnavailable ?: unreachable ?: undialable
+                wrongShape ?: keyUnavailable ?: silentLan?.takeIf { atHome } ?: untunnelled ?: unreachable ?: undialable
     }
 
     /**

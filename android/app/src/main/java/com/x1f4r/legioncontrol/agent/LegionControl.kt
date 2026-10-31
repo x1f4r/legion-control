@@ -12,10 +12,12 @@ import com.x1f4r.legioncontrol.data.SetupSource
 import com.x1f4r.legioncontrol.data.Settings
 import com.x1f4r.legioncontrol.net.Endpoint
 import com.x1f4r.legioncontrol.net.HomeNetwork
+import com.x1f4r.legioncontrol.net.NetworkPaths
 import com.x1f4r.legioncontrol.net.RouteKind
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.SshTransport
 import com.x1f4r.legioncontrol.net.WakeOnLan
+import com.x1f4r.legioncontrol.net.WayOut
 
 /** One machine, wired up: how to reach it, how to wake it, and how to talk to its agent. */
 class MachineControl(
@@ -86,6 +88,27 @@ class LegionControl(context: Context) {
      */
     private val built = mutableMapOf<String, MachineControl>()
 
+    /** The way out of this phone, and the addresses of every machine built so far to dial again when it changes. */
+    private val wayOut = WayOut { built.values.map { it.routes } }
+
+    /** Follows the way out of this phone. A change lets every address be dialled again at once. */
+    fun follow(paths: NetworkPaths) = wayOut.follow(paths)
+
+    /** Lets every address of every machine be dialled again on its next call, whatever it did before. */
+    fun retryAddresses() = wayOut.retry()
+
+    /** The machines this phone is on the network of, by id, as site placement last said. */
+    @Volatile
+    private var onSite: Set<String> = emptySet()
+
+    /**
+     * Follows which machines this phone is on the network of. On one of them a LAN address that did
+     * not answer is said ahead of a tailnet address no tunnel carries.
+     */
+    fun place(onSite: Set<String>) {
+        this.onSite = onSite
+    }
+
     /**
      * Reads the setup off a machine that is not in the configuration, because there is none yet.
      *
@@ -105,7 +128,7 @@ class LegionControl(context: Context) {
             label = source.host,
         )
         val transport = SshTransport(identity, hostKeys, source.host)
-        return fetchController(transport, endpoint)
+        return fetchController(transport, endpoint, wayOut.paths?.tunnels)
     }
 
     /**
@@ -148,7 +171,14 @@ class LegionControl(context: Context) {
         return MachineControl(
             machine = machine,
             routes = routes,
-            agent = AgentClient(machine, transport, routes, settings),
+            agent = AgentClient(
+                machine,
+                transport,
+                routes,
+                settings,
+                tunnels = { wayOut.paths?.tunnels },
+                onSite = { machine.id in onSite },
+            ),
             wake = machine.wake?.let(::WakeOnLan),
         )
     }

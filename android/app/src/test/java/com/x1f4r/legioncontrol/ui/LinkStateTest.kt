@@ -4,6 +4,7 @@ import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.DispatchStage
 import com.x1f4r.legioncontrol.agent.FailureKind
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.KeyStoreException
@@ -32,5 +33,18 @@ class LinkStateTest {
         val state = AgentFailure.Unreachable("Tower", "no answer", null, DispatchStage.NOT_STARTED, FailureKind.HOST_UNREACHABLE)
             .toLinkState()
         assertTrue("got $state", state is LinkState.Offline)
+        assertFalse((state as LinkState.Offline).noTunnel)
+    }
+
+    /**
+     * The machine page said "Asleep or unreachable" and the overview "Not reachable" while the
+     * footer said the phone was off the tailnet: the most prominent words still blamed the machine.
+     */
+    @Test
+    fun `a tailnet address no tunnel carries is offline, and says it is the phone's doing`() {
+        val state = AgentFailure.NoTunnel("No tunnel on this phone carries 100.64.0.9, which is a tailnet address.").toLinkState()
+        assertTrue("got $state", state is LinkState.Offline)
+        assertTrue((state as LinkState.Offline).noTunnel)
+        assertEquals("This phone is not connected to the tailnet. Is Tailscale on?", state.reason)
     }
 }
