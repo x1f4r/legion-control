@@ -1,13 +1,17 @@
+import com.android.build.api.variant.HostTestBuilder
+import javax.inject.Inject
+
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
 }
 
 android {
     namespace = "com.x1f4r.legioncontrol"
-    compileSdk = 36
+    // Compose and core-ktx are built against 37 and refuse an app compiled against less. targetSdk is
+    // the one that changes what the platform does, and it stays where it is.
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.x1f4r.legioncontrol"
@@ -53,16 +57,13 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
         // sshj and Bouncy Castle reach for pieces of the JDK that API 30 does not have all of.
         isCoreLibraryDesugaringEnabled = true
-    }
-
-    kotlin {
-        compilerOptions {
-            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
-        }
+        // AGP compiles the Kotlin too, and gives it this targetCompatibility as its JVM target.
     }
 
     buildFeatures {
         compose = true
+        // The app_name resValue above. AGP 9 turned resource values off unless a module asks.
+        resValues = true
         // AppUpdates compares the running versionName against the newest GitHub release.
         buildConfig = true
     }
@@ -93,15 +94,6 @@ android {
         }
     }
 
-    // The signed agent bundle, copied out of the repository's dist/ directory at build time.
-    //
-    // Copied rather than committed: it is a build output of scripts/package-agent.mjs, it is signed
-    // by the release key, and a client that carried its own copy in source control would be one more
-    // place for the two to drift apart. A build without it is normal and expected: every test and
-    // every debug build works, and the "install the control agent" action explains that this build
-    // carries nothing to install rather than offering something unverified.
-    sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/agentAssets"))
-
     lint {
         // The manifest names an activity the UI module supplies, so the class-existence check has
         // nothing to look at during a transport-only build.
@@ -116,29 +108,69 @@ android {
  * happens in the app, at run time, against the key pinned in Trust.kt, because a check performed by
  * the thing doing the copying proves nothing about the thing doing the installing.
  */
-val copyAgentBundle by tasks.registering(Sync::class) {
-    val dist = rootProject.layout.projectDirectory.dir("../dist")
-    // agent/package.json is the one place the agent's version is written, and it is what names the
-    // tarball scripts/package-agent.mjs puts in dist. A second copy here went stale with every
-    // agent release and left the APK without the bundle it was built to carry.
-    val version = providers.gradleProperty("legion.agentVersion")
-        .orElse(
-            providers.fileContents(rootProject.layout.projectDirectory.file("../agent/package.json")).asText.map { text ->
-                (groovy.json.JsonSlurper().parseText(text) as Map<*, *>)["version"] as? String
-                    ?: throw GradleException("agent/package.json does not say which version the agent is.")
-            },
-        )
-        .get()
-    from(dist) {
-        include("legionctl-agent-$version.tgz")
-        include("Legion-Control-agent-manifest.json")
-        include("Legion-Control-agent-manifest.json.sig")
+abstract class CopyAgentBundle : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val bundle: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val destination: DirectoryProperty
+
+    @get:Inject
+    abstract val files: FileSystemOperations
+
+    @TaskAction
+    fun copy() {
+        // A sync rather than a copy, so a bundle dist no longer supplies leaves the APK as well.
+        files.sync {
+            from(bundle)
+            into(destination.dir("agent"))
+        }
     }
-    into(layout.buildDirectory.dir("generated/agentAssets/agent"))
-    // Sync also removes a previously bundled artifact when dist no longer supplies it.
 }
 
-tasks.named("preBuild") { dependsOn(copyAgentBundle) }
+androidComponents {
+    // AGP 9 makes unit tests for the tested build type alone, which is debug. The release ones are
+    // kept: the release build has no src/debug and BuildConfig.DEBUG is false in it, and
+    // scripts/check.sh runs the same tests against both.
+    beforeVariants { variant ->
+        variant.hostTests[HostTestBuilder.UNIT_TEST_TYPE]?.enable = true
+    }
+
+    // The signed agent bundle, copied out of the repository's dist/ directory at build time.
+    //
+    // Copied rather than committed: it is a build output of scripts/package-agent.mjs, it is signed
+    // by the release key, and a client that carried its own copy in source control would be one more
+    // place for the two to drift apart. A build without it is normal and expected: every test and
+    // every debug build works, and the "install the control agent" action explains that this build
+    // carries nothing to install rather than offering something unverified.
+    onVariants { variant ->
+        val taskName = "copy${variant.name.replaceFirstChar { it.uppercase() }}AgentBundle"
+        val copy = tasks.register<CopyAgentBundle>(taskName) {
+            val dist = rootProject.layout.projectDirectory.dir("../dist")
+            // agent/package.json is the one place the agent's version is written, and it is what
+            // names the tarball scripts/package-agent.mjs puts in dist. A second copy here went
+            // stale with every agent release and left the APK without the bundle it was built to
+            // carry.
+            val packageJson = rootProject.layout.projectDirectory.file("../agent/package.json")
+            val version = providers.gradleProperty("legion.agentVersion")
+                .orElse(
+                    providers.fileContents(packageJson).asText.map { text ->
+                        (groovy.json.JsonSlurper().parseText(text) as Map<*, *>)["version"] as? String
+                            ?: throw GradleException("agent/package.json does not say which version the agent is.")
+                    },
+                )
+                .get()
+            bundle.from(dist.asFileTree.matching {
+                include("legionctl-agent-$version.tgz")
+                include("Legion-Control-agent-manifest.json")
+                include("Legion-Control-agent-manifest.json.sig")
+            })
+        }
+        // A generated directory carries its task along, so every build that reads assets runs it.
+        variant.sources.assets?.addGeneratedSourceDirectory(copy, CopyAgentBundle::destination)
+    }
+}
 
 dependencies {
     coreLibraryDesugaring(libs.desugar.jdk.libs)
@@ -169,6 +201,12 @@ dependencies {
     // Release signatures are checked with Bouncy Castle below, not with this.
     implementation(libs.eddsa)
     implementation(libs.bcprov)
+    constraints {
+        // Not used here, only brought along by sshj, and held to bcprov's release for the reason
+        // gradle/libs.versions.toml gives.
+        implementation(libs.bcpkix)
+        implementation(libs.bcutil)
+    }
     // sshj logs through slf4j. Without a binding, slf4j 2 falls back to a no-op and prints a warning
     // on first use; this sends the same lines to logcat instead, which is where they are useful.
     runtimeOnly(libs.slf4j.android)

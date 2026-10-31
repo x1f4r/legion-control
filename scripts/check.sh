@@ -40,7 +40,7 @@ if [[ "$component" == all || "$component" == android ]]; then
     export JAVA_HOME
   fi
   # And then the JDK is asked, because java_home answers a version it does not have with the newest
-  # JDK it does, and AGP refuses anything but 21 with an error that does not say so.
+  # JDK it does, and the build is pinned to 21.
   java="${JAVA_HOME:+$JAVA_HOME/bin/}java"
   java_version="$("$java" -XshowSettings:properties -version 2>&1 | sed -n 's/.*java\.specification\.version = //p' | head -1 || true)"
   if [[ "$java_version" != 21 ]]; then

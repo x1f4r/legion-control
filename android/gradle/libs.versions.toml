@@ -1,17 +1,19 @@
 [versions]
-# The toolchain is pinned on purpose and the pieces are not independent. AGP 8.13 calls into a Gradle
-# internal that Gradle 9.6 removed, so the wrapper stays on the 9.5 line; the Kotlin plugin has to be
-# a 2.3 release because that is the first line that supports Gradle 9. See android/README.md.
-agp = "8.13.0"
-kotlin = "2.3.21"
+# The toolchain is pinned on purpose and the pieces are not independent. AGP 9.5 refuses a Gradle older
+# than 9.6, so the wrapper moves with it. AGP 9 compiles Kotlin itself and brings a Kotlin Gradle
+# plugin of its own, older than this one; the root build puts this version on the classpath instead,
+# because the Compose and serialization compiler plugins have to match the compiler exactly. See
+# android/README.md.
+agp = "9.5.0"
+kotlin = "2.4.21"
 
-coreKtx = "1.17.0"
+coreKtx = "1.19.1"
 lifecycle = "2.9.4"
 activityCompose = "1.13.0"
-composeBom = "2026.06.01"
+composeBom = "2026.09.00"
 
 coroutines = "1.11.0"
-serialization = "1.11.0"
+serialization = "1.12.0"
 
 # sshj 0.39 is the last release that still depends on net.i2p.crypto:eddsa. That matters: the i2p
 # implementation of ed25519 is pure Java and needs no JCE provider, whereas 0.40 moved ed25519 onto
@@ -19,10 +21,11 @@ serialization = "1.11.0"
 sshj = "0.39.0"
 eddsa = "0.3.0"
 # Bouncy Castle checks release signatures (data/Trust.kt) with its own Ed25519 signer. sshj already
-# depends on it; it is named here because this app now calls it directly, and at the version sshj
-# resolves so that naming it changes nothing that ships.
-bouncycastle = "1.78.1"
-slf4jAndroid = "2.0.17-0"
+# depends on it, and on bcpkix and bcutil with it; it is named here because this app calls it
+# directly. The three are one release: they share packages, and a bcprov newer than the bcutil next to
+# it fails the first time one of its classes reaches for a field only its own release has.
+bouncycastle = "1.86"
+slf4jAndroid = "2.0.20-0"
 
 desugar = "2.1.5"
 junit = "4.13.2"
@@ -48,9 +51,13 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 sshj = { group = "com.hierynomus", name = "sshj", version.ref = "sshj" }
 eddsa = { group = "net.i2p.crypto", name = "eddsa", version.ref = "eddsa" }
 bcprov = { group = "org.bouncycastle", name = "bcprov-jdk18on", version.ref = "bouncycastle" }
+bcpkix = { group = "org.bouncycastle", name = "bcpkix-jdk18on", version.ref = "bouncycastle" }
+bcutil = { group = "org.bouncycastle", name = "bcutil-jdk18on", version.ref = "bouncycastle" }
 slf4j-android = { group = "uk.uuid.slf4j", name = "slf4j-android", version.ref = "slf4jAndroid" }
 
 desugar-jdk-libs = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugar" }
+
+kotlin-gradle-plugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }
 
 # The unit tests are plain JVM tests of the parsing, the validation and the packet building: no
 # Android, no Compose, nothing that needs a device.
@@ -58,6 +65,5 @@ junit = { group = "junit", name = "junit", version.ref = "junit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

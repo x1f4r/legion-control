@@ -1,6 +1,7 @@
 package com.x1f4r.legioncontrol.agent
 
 import com.x1f4r.legioncontrol.net.CommandOutcome
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -189,8 +190,13 @@ object AttemptClassifier {
      * The default configuration, which refuses unquoted keys, comments and trailing commas. The
      * decoders are lenient about all of those; this is not. What it lets through is checked by hand
      * in [jsonObjectSlice].
+     *
+     * Only the nesting limit is not the default. kotlinx has had one of its own since 1.12, and it is
+     * shallower than [MAX_NESTING]. The scan has already held the text to this app's limit, so the
+     * parse takes everything up to it rather than drawing a second line of its own.
      */
-    private val StrictJson = Json
+    @OptIn(ExperimentalSerializationApi::class)
+    private val StrictJson = Json { maxNestingDepth = MAX_NESTING }
 
     /** The only bare words JSON has. */
     private val JSON_WORDS = setOf("true", "false", "null")

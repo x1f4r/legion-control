@@ -23,7 +23,7 @@ android/app/build/outputs/apk/debug/app-debug.apk      # ./gradlew assembleDebug
 android/app/build/outputs/apk/release/app-release.apk  # ./android/build-apk.sh
 ```
 
-The release APK is about 28 MB across four dex files, which is more than a handful of screens
+The release APK is about 32 MB across five dex files, which is more than a handful of screens
 deserves and is not a symptom of anything being wrong. R8 is deliberately off, so Bouncy Castle
 and Compose both go in whole. `app/build.gradle.kts` explains that decision: sshj picks its
 ciphers and key exchanges out of name-keyed factory lists, which shrinking quietly empties.
@@ -47,46 +47,35 @@ JAVA_HOME=/path/to/jdk-21 ./gradlew --no-daemon assembleDebug
 
 This combination was arrived at the hard way. Do not "modernise" it without reading this.
 
-**Gradle 9.5, through the wrapper in this directory.** Never `gradle` off PATH. AGP 8.13 calls
-`org.gradle.api.problems.internal.InternalProblems`, which Gradle 9.6 removed. The build does
-not fail somewhere useful, it fails while applying the Android plugin, with a message telling
-you to use Gradle 9.5. Always `./gradlew`.
+**Gradle 9.6, through the wrapper in this directory.** Never `gradle` off PATH. Every AGP
+release names the oldest Gradle it runs on, and AGP 9.5 refuses anything before 9.6 while the
+Android plugin is being applied, before the build has done anything else. The older AGP failed
+the other way round: 8.13 called a Gradle internal that 9.6 removed. Always `./gradlew`, and move
+the wrapper and AGP together.
 
-**JDK 21.** AGP rejects newer JDKs outright. `build-apk.sh` exports `JAVA_HOME` itself and
-refuses to continue if the JDK there is not 21; point `LEGION_ANDROID_JAVA_HOME` at yours if
-it is not at the Temurin default location.
+**JDK 21.** It is the one JDK this build and CI are run on. `build-apk.sh` exports `JAVA_HOME`
+itself and refuses to continue if the JDK there is not 21; point `LEGION_ANDROID_JAVA_HOME` at
+yours if it is not at the Temurin default location.
 
-**AGP 8.13.0, compileSdk 36, targetSdk 36, minSdk 30, Kotlin 2.x with the Compose compiler
-plugin.**
+**AGP 9.5, compileSdk 37, targetSdk 36, minSdk 30, Kotlin 2.4 with the Compose compiler
+plugin.** AGP 9 compiles Kotlin itself, so there is no `org.jetbrains.kotlin.android` plugin to
+apply. It brings a Kotlin Gradle plugin of its own, older than the catalog's, and the root build
+puts the catalog's on the classpath instead, because the Compose and serialization compiler
+plugins have to be the same release as the compiler. compileSdk is 37 because Compose and
+core-ktx are built against it; targetSdk is the one that changes what the phone does, and it
+moves on its own.
 
 **`android/local.properties` needs `sdk.dir=<your Android SDK>`.** It is gitignored, because it
 is a path on one machine. `build-apk.sh` writes it on the first run if it is missing, from
 `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or the Android Studio default.
 
-One trap worth writing down: regenerating the wrapper with `gradle wrapper` inside this
-directory does not work. Configuring the project applies AGP, and AGP on a newer Gradle is the
-thing that explodes, so the wrapper task never gets to run. Generate it in a scratch directory
-containing nothing but a `settings.gradle.kts`, then copy `gradle/`, `gradlew` and
-`gradlew.bat` back into `android/`.
-
-### The wall of D8 stack traces is expected
-
-Every full build prints a few hundred lines of this, once per class, and the build still
-succeeds:
-
-```
-WARNING: D8: An error occurred when parsing kotlin metadata.
-WARNING: D8: Unexpected error during rewriting of Kotlin metadata for class '...':
-com.android.tools.r8.internal.xb4: Should never be called
-```
-
-Kotlin 2.3 writes a `kotlin.Metadata` version that the R8 bundled with AGP 8.13 does not know
-how to read, so D8 gives up rewriting it and copies it through unchanged. Nothing in this app
-reads that annotation: kotlinx.serialization goes through generated `$serializer` classes, and
-there is no Kotlin reflection anywhere. The APK is correct.
-
-It is noise rather than a problem, but it is enough noise to bury a real error, so when a build
-fails do not read the traces, read the last twenty lines.
+One trap worth writing down: once AGP has moved past the wrapper's Gradle, `./gradlew wrapper`
+cannot move the wrapper on any more, because configuring the project applies AGP and AGP is the
+thing that refuses. Set `distributionUrl` and `distributionSha256Sum` in
+`gradle/wrapper/gradle-wrapper.properties` by hand first, with the checksum gradle.org publishes
+next to the `-bin.zip`. Then run
+`./gradlew wrapper --gradle-version <version> --gradle-distribution-sha256-sum <checksum>` once on
+the new Gradle, so that it writes the jar and the scripts that go with it.
 
 ## Install it
 
@@ -354,7 +343,7 @@ android/
   build-apk.sh                one command to a signed release APK
   keystore.md                 the signing key: where it is, how it works, why to back it up
   README.md                   this file
-  gradlew                     Gradle 9.5, pinned, use this and never the one on PATH
+  gradlew                     Gradle 9.6, pinned, use this and never the one on PATH
   settings.gradle.kts
   gradle/libs.versions.toml   every pinned version, with the reason next to it
   app/
