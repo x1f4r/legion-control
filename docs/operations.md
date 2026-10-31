@@ -724,11 +724,13 @@ record the machine holds.
 | Private bindings | `bindings.json` beside the controller config |
 | Kept setup revisions, every device | `revisions/` beside it, filed by hash, last thirty |
 | Everything above, under test | one directory named by `LEGION_CONTROL_HOME`, including the generated key and `known_hosts` |
-| Last known settings per system, Mac | `UserDefaults` under `com.x1f4r.legion-control` |
+| Last known settings and working route per system, Mac | `UserDefaults` under `com.x1f4r.legion-control` |
 | The Android app's config, key and pins | app-private storage; the ssh key is wrapped by the Android keystore |
 
 The remembered settings only exist so the apps can show something for a system that is asleep,
-clearly labelled with when it was read. Nothing depends on them being right.
+clearly labelled with when it was read. Nothing depends on them being right. The remembered route
+is only the address the Mac dials first after a launch, and it is not used once the setup changes
+that machine's endpoints.
 
 ## Quick reference
 

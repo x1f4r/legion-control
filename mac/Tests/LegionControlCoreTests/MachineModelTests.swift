@@ -1604,6 +1604,80 @@ struct MachineModelTests {
         #expect(tower.autoUpdateValue(for: towerMachine.systems[0]) == true)
     }
 
+    @Test("the route that worked is dialled first at the next launch, and not once the machine's endpoints change")
+    func rememberedRouteOutlivesALaunch() async throws {
+        // Kept in memory alone, every launch dialled the dead addresses first again, a connect
+        // timeout each: eight to sixteen seconds a machine before the one that answers.
+        final class Dialled: @unchecked Sendable {
+            let lock = NSLock()
+            var destinations: [String] = []
+            func note(_ destination: String?) { lock.withLock { destinations.append(destination ?? "") } }
+            var first: String? { lock.withLock { destinations.first } }
+        }
+        var machine = Self.machine()
+        machine.endpoints = [Endpoint(id: "old", kind: "remote", host: "192.0.2.10", user: "me"),
+                             Endpoint(id: "new", kind: "remote", host: "192.0.2.20", user: "me")]
+        var saved: [String: RememberedSystem] = [:]
+        let remembered = RememberedSettings(systems: [:], save: { saved = $0 })
+        let logs = FakeSSH.logDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
+
+        let status = Self.onlineStatus
+        func launch(_ machine: Machine) async -> (MachineModel, Dialled) {
+            let dialled = Dialled()
+            var agent = RemoteAgent(machine: machine)
+            agent.logDirectory = logs
+            agent.runner = { _, arguments, _, _ in
+                let destination = FakeSSH.destination(arguments)
+                dialled.note(destination)
+                guard destination == "me@192.0.2.20" else {
+                    FakeSSH.writeLog("ssh: connect to host 192.0.2.10 port 22: Operation timed out\n", for: arguments)
+                    return FakeSSH.result(exit: 255)
+                }
+                return FakeSSH.result(out: status)
+            }
+            let model = MachineModel(machine: machine, agent: agent, remembered: remembered)
+            await model.refresh(userInitiated: false)
+            return (model, dialled)
+        }
+
+        let (first, dialledFirst) = await launch(machine)
+        #expect(first.isAwake)
+        #expect(dialledFirst.first == "me@192.0.2.10")
+        #expect(saved["pi/linux"]?.route == "new")
+
+        // The next launch knows nothing yet about which system is up, and starts where the last
+        // one finished.
+        let (second, dialledSecond) = await launch(machine)
+        #expect(second.isAwake)
+        #expect(dialledSecond.destinations == ["me@192.0.2.20"])
+
+        // A setup that reaches the machine some other way now walks its list as it stands.
+        machine.endpoints.append(Endpoint(id: "spare", kind: "remote", host: "192.0.2.30", user: "me"))
+        let (_, dialledThird) = await launch(machine)
+        #expect(dialledThird.first == "me@192.0.2.10")
+
+        // What an earlier build remembered, with no route at all, still reads.
+        let older = try JSONDecoder().decode([String: RememberedSystem].self, from: Data(#"{"pi/linux":{"autoUpdate":true}}"#.utf8))
+        #expect(older["pi/linux"]?.autoUpdate == true)
+        #expect(older["pi/linux"]?.route == nil)
+    }
+
+    @Test("a remembered route belongs to one system, and at launch to whichever answered last")
+    func rememberedRouteIsPerSystem() {
+        let now = Date()
+        let remembered = RememberedSettings(systems: [
+            "pi/linux": RememberedSystem(checkedAt: now.addingTimeInterval(-60), route: "lan", routes: "these"),
+            "pi/other": RememberedSystem(checkedAt: now, route: "tailnet", routes: "these"),
+            "pi-2/linux": RememberedSystem(checkedAt: now.addingTimeInterval(60), route: "elsewhere", routes: "these"),
+        ], save: { _ in })
+        // After a reboot the system it is heading for has a route of its own.
+        #expect(remembered.route(machine: "pi", system: "linux", routes: "these") == "lan")
+        #expect(remembered.route(machine: "pi", system: nil, routes: "these") == "tailnet")
+        #expect(remembered.route(machine: "pi", system: "linux", routes: "others") == nil)
+        #expect(remembered.route(machine: "pi", system: "windows", routes: "these") == nil)
+    }
+
     @Test("a refused automatic-update switch is not remembered as saved")
     func refusedAutoUpdateIsNotSaved() async throws {
         var saved: [String: RememberedSystem] = [:]

@@ -304,6 +304,29 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         agent.preferLAN = isOnMachineNetwork
     }
 
+    /// The route an earlier launch found working, for the system expected to answer: the one a
+    /// reboot is heading for, the one running, or at launch whichever answered last. Only asked
+    /// while this launch has no route of its own. Kept in memory alone, every launch dialled the
+    /// dead addresses first again, a connect timeout each: eight to sixteen seconds a machine.
+    private var rememberedRoute: MachineRoute? {
+        let routes = machine.routes(bindings: agent.bindings)
+        let system = (rebootInProgress?.target ?? commandableSystem)?.id
+        guard let id = remembered.route(machine: machine.id, system: system, routes: Self.routesFingerprint(routes))
+        else { return nil }
+        return routes.first { $0.id == id }
+    }
+
+    /// What a remembered route is held against: every route's id, kind, address and pinned system,
+    /// hashed. A setup that changes any of them reaches the machine some other way now, and the
+    /// route remembered from before is not put first.
+    static func routesFingerprint(_ routes: [MachineRoute]) -> String {
+        let lines = routes.map { route in
+            [route.id, route.kind ?? "", route.target.destination, String(route.target.port ?? 22), route.systemId ?? ""]
+                .joined(separator: " ")
+        }
+        return Canonical.sha256(Data(lines.joined(separator: "\n").utf8))
+    }
+
     /// Whether this device believes it is on this machine's own network. A hint that decides which
     /// addresses are worth dialling first, and nothing else: which machine actually answered is
     /// settled by the pinned host key, on every connection.
@@ -326,7 +349,8 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         let asked = Date()
 
         do {
-            let reply = try await agent.status(dialect: dialect, preferring: rebootInProgress?.target ?? commandableSystem, route: lastRoute)
+            let reply = try await agent.status(dialect: dialect, preferring: rebootInProgress?.target ?? commandableSystem,
+                                               route: lastRoute ?? rememberedRoute)
             guard reply.value.ok != false else {
                 handleStatusFailure(AgentFailure(
                     .agentFailed,
@@ -347,6 +371,10 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
             // as the entry had it then. Kept as it is, it would put an address back that the edit
             // took away, and the legacy agent install uploads to exactly that address.
             lastRoute = currentRoute(reply.route)
+            if let route = lastRoute, let system = commandableSystem {
+                remembered.record(machine: machine.id, system: system.id, route: route.id,
+                                  routes: Self.routesFingerprint(machine.routes(bindings: agent.bindings)))
+            }
             lastChecked = Date()
             if !userInitiated, core.lineIsRefreshFailure {
                 if let outcome = lastActionOutcome {
