@@ -1259,7 +1259,7 @@ export async function rollBackInterrupted(config, service, owed, { running }) {
     }
     if (drained.drained) appendLog(record.id, `recovery: ${drained.message}`);
     const fresh = await busyNow(config);
-    if (fresh.busy.busy) return waiting(fresh.busy, 'work started while it was being prepared: ');
+    if (fresh.busy.busy) return waiting(fresh.busy, busyReasonCode(fresh.busy) === REASON.busy ? 'work started while it was being prepared: ' : '');
   }
   note(`${found} after an interrupted update; rolling it back`, 'recover');
   const enter = (phase, progress = null) => appendLog(record.id, `recovery: ${phase}${progress?.note ? `, ${progress.note}` : ''}`);

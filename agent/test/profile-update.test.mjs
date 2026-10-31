@@ -105,12 +105,14 @@ test('a related process defers a command CLI update, with nothing run', async ()
 test('a forced command CLI update waits for a related process to exit, then goes ahead', async () => {
   await withCommandCli(async ({ dir, run }) => {
     // The session ends by itself a few seconds in, inside the stop step's budget.
-    writeFixture(dir, 'busy-until', Date.now() + 4000);
+    const sessionEnds = Date.now() + 4000;
+    writeFixture(dir, 'busy-until', sessionEnds);
     const { payload, exitCode } = run(['update', '--force']);
     assert.equal(exitCode, 0, JSON.stringify(payload));
     assert.equal(payload.action, 'updated');
     assert.equal(payload.to, '2.0.0');
     assert.equal(readFixture(dir, 'update-runs'), '1');
+    assert.ok(Number(readFixture(dir, 'update-at')) >= sessionEnds, 'the updater ran only once the session had ended');
     assert.equal(readFixture(dir, 'stop-runs'), '');
   });
 });

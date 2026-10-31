@@ -82,6 +82,19 @@ test('work that starts during the drain defers an npm update before the stop', a
   }, { initial: { 'drain-makes-busy': 'on' }, service: drain });
 });
 
+test('a probe that cannot be read after the drain defers an npm update as unknown, and claims no work started', async () => {
+  await withNpmService(async ({ dir, run, installed }) => {
+    const { payload, exitCode } = run(['update']);
+    assert.equal(exitCode, 0);
+    assert.equal(payload.action, 'deferred');
+    assert.equal(payload.reasonCode, 'busy-unknown');
+    assert.equal(payload.message, 'whether Demo is busy could not be established (busy state unknown) once the update was prepared; 2.0.0 is downloaded and will be installed at the next idle window');
+    assert.equal(readFixture(dir, 'stop-runs'), '');
+    assert.deepEqual(installs(dir), []);
+    assert.equal(installed(), '1.0.0');
+  }, { initial: { 'drain-makes-unknown': 'on' }, service: drain });
+});
+
 test('an npm service that will not stop is left running, with nothing installed or rolled back', async () => {
   await withNpmService(async ({ dir, run, installed }) => {
     const { payload, exitCode } = run(['update']);

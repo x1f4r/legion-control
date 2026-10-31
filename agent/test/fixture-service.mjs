@@ -45,6 +45,7 @@ switch (verb) {
     // agent that does the asking starts.
     await heldWhile('update-gate');
     bump('update-runs');
+    write('update-at', Date.now());
     if (read('update-noop') === 'on') break;
     if (read('update-fail') === 'on') process.exit(3);
     write('installed', read('latest', '1.0.0'));
@@ -84,6 +85,7 @@ switch (verb) {
   case 'drain':
     bump('drain-runs');
     if (read('drain-makes-busy') === 'on') write('busy', 'on');
+    if (read('drain-makes-unknown') === 'on') write('busy-unknown', 'on');
     process.exit(read('drain-fails') === 'on' ? 1 : 0);
   case 'action':
     bump('action-runs');
