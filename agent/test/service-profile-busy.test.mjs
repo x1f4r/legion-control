@@ -11,6 +11,9 @@ import { inspectProfileProcesses, processExitVerdict, profileInstall } from '../
 
 const posix = process.platform !== 'win32';
 const AGENT = 4100;
+// This probe's own process in a snapshot. Fixed, rather than this test's real
+// pid, which a runner can hand out as one of the other pids below.
+const PROBE = 4101;
 const IDLE = { busy: false, unknown: false, reason: 'No related application or CLI session is running.' };
 const BUSY = { busy: true, unknown: false, reason: 'A related application or CLI session is still running.' };
 const UNKNOWN = { busy: true, unknown: true, reason: 'Some process identities could not be inspected; waiting for a reliable idle result.' };
@@ -113,7 +116,7 @@ test('Linux is read from /proc as one snapshot, and what the agent itself starte
     40: { name: 'kworker/0:1-events', ppid: 2, flags: 0x04208060, argv: [] },
     // The agent that asked, its probes and their children.
     [AGENT]: { name: 'node-MainThread', argv: ['/usr/bin/node', '/home/me/.legion-control/agent/src/index.mjs', 'update', 'opencode'], exe: '/usr/bin/node' },
-    [process.pid]: { name: 'node-MainThread', ppid: AGENT, argv: ['/usr/bin/node', '/home/me/.legion-control/agent/src/service-profile-probe.mjs', 'busy', 'opencode'] },
+    [PROBE]: { name: 'node-MainThread', ppid: AGENT, argv: ['/usr/bin/node', '/home/me/.legion-control/agent/src/service-profile-probe.mjs', 'busy', 'opencode'] },
     4111: { name: 'node-MainThread', ppid: AGENT, argv: ['/usr/bin/node', '/home/me/.legion-control/probes/t3-busy.mjs', '/home/me/.t3'] },
     4112: { name: 'ps', ppid: 4111, argv: [] },
     4113: { name: 'pgrep', ppid: AGENT, argv: ['pgrep', '-f', 'cloudflared tunnel run'] },
@@ -138,7 +141,7 @@ test('Linux is read from /proc as one snapshot, and what the agent itself starte
     6407: { name: 'node-MainThread', ppid: 6300, argv: ['/usr/bin/node', '--inspect', '-e', 'setInterval(() => {}, 1000)'] },
   };
   const io = procFs(root, processes);
-  const asked = { platform: 'linux', io, home: path.join(root, 'home'), env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT };
+  const asked = { platform: 'linux', io, home: path.join(root, 'home'), env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT, ownPid: PROBE };
   assert.deepEqual(inspectProfileProcesses('opencode', asked), IDLE);
   // A version probe the agent itself runs is the agent's, not a session.
   assert.deepEqual(inspectProfileProcesses('opencode', { ...asked, env: {} }), BUSY);
@@ -167,12 +170,12 @@ test('Windows leaves out what the agent started only where each parent was creat
   const row = (pid, parent, name, command, created) => ({ ProcessId: pid, ParentProcessId: parent, SessionId: 1, Name: name, CommandLine: command, ExecutablePath: name === 'node.exe' ? node : opencode, CreatedAt: created });
   const rows = {
     agent: row(AGENT, 4000, 'node.exe', `"${node}" "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs" update opencode`, at('08:00:00')),
-    probe: row(process.pid, AGENT, 'node.exe', `"${node}" "C:\\Users\\me\\.legion-control\\agent\\src\\service-profile-probe.mjs" busy opencode`, at('11:00:00.1')),
+    probe: row(PROBE, AGENT, 'node.exe', `"${node}" "C:\\Users\\me\\.legion-control\\agent\\src\\service-profile-probe.mjs" busy opencode`, at('11:00:00.1')),
     sibling: row(4116, AGENT, 'node.exe', `"${node}" "C:\\Users\\me\\.legion-control\\agent\\src\\service-profile-probe.mjs" busy codex-cli`, at('11:00:00.2')),
     version: row(4115, AGENT, 'opencode.exe', `"${opencode}" --version`, at('11:00:00.3')),
   };
   const inspect = (entries) => inspectProfileProcesses('opencode', {
-    platform: 'win32', run: () => ({ status: 0, stdout: JSON.stringify(entries) }), io: sandbox('/nowhere'), home: 'C:\\Users\\me', env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT,
+    platform: 'win32', run: () => ({ status: 0, stdout: JSON.stringify(entries) }), io: sandbox('/nowhere'), home: 'C:\\Users\\me', env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT, ownPid: PROBE,
   });
   assert.deepEqual(inspect(Object.values(rows)), IDLE, 'a version probe the agent runs is the agent\'s, not a session');
   // A session whose parent has exited, and whose parent's id was given to the
@@ -203,7 +206,7 @@ test('a Mac re-reads the processes its two ps reads saw only once, and splits ar
   const processes = {
     1: { ppid: 0, stat: 'Ss', comm: '/sbin/launchd', args: '/sbin/launchd' },
     [AGENT]: { ppid: 4000, comm: 'node', args: 'node /Users/me/.legion-control/agent/src/index.mjs update opencode' },
-    [process.pid]: { ppid: AGENT, comm: '/opt/homebrew/bin/node', args: '/opt/homebrew/bin/node /Users/me/.legion-control/agent/src/service-profile-probe.mjs busy opencode' },
+    [PROBE]: { ppid: AGENT, comm: '/opt/homebrew/bin/node', args: '/opt/homebrew/bin/node /Users/me/.legion-control/agent/src/service-profile-probe.mjs busy opencode' },
     // A sibling probe that exited before the second read, and one that
     // started after the first.
     4120: { ppid: AGENT, comm: '/opt/homebrew/bin/node' },
@@ -225,7 +228,7 @@ test('a Mac re-reads the processes its two ps reads saw only once, and splits ar
     28713: { comm: '/opt/homebrew/Cellar/node/26.12.0/bin/node', args: '/opt/homebrew/Cellar/node/26.12.0/bin/node --experimental-addon-modules --v8-pool-size=4 --node-snapshot test/cli.test.mjs' },
   };
   const ps = macPs(processes);
-  const asked = { platform: 'darwin', run: ps.run, io: sandbox(root), home: path.join(root, 'home'), env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT };
+  const asked = { platform: 'darwin', run: ps.run, io: sandbox(root), home: path.join(root, 'home'), env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT, ownPid: PROBE };
   assert.deepEqual(inspectProfileProcesses('opencode', asked), IDLE);
   assert.deepEqual(ps.calls, ['comm', 'args', 'again', 'again'], 'only the processes seen once are read again');
   // The claude CLI is not the Claude app, and the Claude app is not the CLI.
