@@ -1751,9 +1751,9 @@
       "type": "object",
       "properties": {
         "id": {
-          "description": "The closed list of check ids, so a client can render each one. agent.floor, agent.signed, files.private and ssh.shell are reported by agent 3.1.0 on.",
+          "description": "The closed list of check ids, so a client can render each one. agent.floor, agent.signed, files.private, scheduler.timeLimit and ssh.shell are reported by agent 3.1.0 on.",
           "type": "string",
-          "pattern": "^(?:config\\.(?:parse|validate)|base\\.writable|node\\.(?:version|sqlite)|npm\\.(?:available|prefix)|service\\.[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:process|health|busy|relay|latest|endpoint)|scheduler\\.(?:present|command|lastRun)|privileges\\.(?:sudo|boot)|sleep\\.tool|locks|ops\\.dir|controller\\.copy|session\\.restricted|clock|agent\\.(?:floor|signed)|files\\.private|ssh\\.shell)$"
+          "pattern": "^(?:config\\.(?:parse|validate)|base\\.writable|node\\.(?:version|sqlite)|npm\\.(?:available|prefix)|service\\.[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:process|health|busy|relay|latest|endpoint)|scheduler\\.(?:present|command|lastRun|timeLimit)|privileges\\.(?:sudo|boot)|sleep\\.tool|locks|ops\\.dir|controller\\.copy|session\\.restricted|clock|agent\\.(?:floor|signed)|files\\.private|ssh\\.shell)$"
         },
         "level": {
           "enum": [
