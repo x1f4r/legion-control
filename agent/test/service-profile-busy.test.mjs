@@ -132,6 +132,10 @@ test('Linux is read from /proc as one snapshot, and what the agent itself starte
     6402: { name: 'node-MainThread', ppid: 6300, argv: ['node', 'server/main', '--stdio'], cwd: path.dirname(workdir) },
     6403: { name: 'node-MainThread', ppid: 6300, argv: ['/usr/bin/node', '--max-old-space-size=4096', '/opt/tools/tsserver.js'] },
     6404: { name: 'bash', ppid: 6300, argv: ['/bin/bash', '-c', 'node /home/me/My Scripts/run.js'] },
+    // Options that take a word of their own, or none, before the script.
+    6405: { name: 'node-MainThread', ppid: 6300, argv: ['/usr/bin/node', '--test', 'test/a.test.mjs', 'test/b.test.mjs'] },
+    6406: { name: 'node-MainThread', ppid: 6300, argv: ['/usr/bin/node', '--require', '/opt/tools/tsx/preflight.cjs', '--import', 'file:///opt/tools/tsx/loader.mjs', '/opt/tools/app/main.ts'] },
+    6407: { name: 'node-MainThread', ppid: 6300, argv: ['/usr/bin/node', '--inspect', '-e', 'setInterval(() => {}, 1000)'] },
   };
   const io = procFs(root, processes);
   const asked = { platform: 'linux', io, home: path.join(root, 'home'), env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT };
@@ -149,6 +153,10 @@ test('Linux is read from /proc as one snapshot, and what the agent itself starte
   assert.deepEqual(inspectProfileProcesses('opencode', asked), UNKNOWN);
   delete processes[7001];
   processes[7002] = { name: 'node', ppid: 1, states: ['R', 'R'], argv: [] };
+  assert.deepEqual(inspectProfileProcesses('opencode', asked), UNKNOWN);
+  delete processes[7002];
+  // A runtime with options and no script is a REPL, or something else unknown.
+  processes[7003] = { name: 'node', ppid: 1, argv: ['/usr/bin/node', '--inspect'] };
   assert.deepEqual(inspectProfileProcesses('opencode', asked), UNKNOWN);
 }));
 
@@ -212,6 +220,9 @@ test('a Mac re-reads the processes its two ps reads saw only once, and splits ar
     4200: { comm: 'node', args: `node ${extension} --stdio` },
     4201: { stat: 'Z', comm: '<defunct>', args: '<defunct>' },
     20235: { comm: 'claude', args: 'claude --output-format stream-json --verbose' },
+    // A test run and the runner's children, with options before their scripts.
+    28706: { comm: 'node', args: 'node --test test/actions.test.mjs test/boot.test.mjs' },
+    28713: { comm: '/opt/homebrew/Cellar/node/26.12.0/bin/node', args: '/opt/homebrew/Cellar/node/26.12.0/bin/node --experimental-addon-modules --v8-pool-size=4 --node-snapshot test/cli.test.mjs' },
   };
   const ps = macPs(processes);
   const asked = { platform: 'darwin', run: ps.run, io: sandbox(root), home: path.join(root, 'home'), env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT };
@@ -257,6 +268,9 @@ test('an npm service is guarded by the processes of its own install, not of anot
   assert.deepEqual(verdict([{ pid: 9, name: 'node', command: `node ${npmBin} app-server` }]), BUSY);
   assert.deepEqual(verdict([{ pid: 9, name: vendor, command: `${vendor} app-server` }]), BUSY);
   assert.deepEqual(verdict([{ pid: 9, name: npmBin, command: npmBin }]), BUSY);
+  assert.deepEqual(verdict([{ pid: 9, name: 'node', command: `node --inspect ${npmBin} app-server` }]), BUSY);
+  assert.deepEqual(verdict([{ pid: 9, name: 'node', command: `node --inspect ${npmBin} -p hello` }]), BUSY, 'a -p after the script is the script\'s own');
+  assert.deepEqual(verdict([{ pid: 9, name: 'node', command: `node --require ${vendor} ${standalone} app-server` }]), BUSY, 'any of the candidates may be the script');
   // A path that cannot be read leaves only the name to go by.
   assert.deepEqual(verdict([{ pid: 9, name: 'codex', command: 'codex app-server' }]), BUSY);
 

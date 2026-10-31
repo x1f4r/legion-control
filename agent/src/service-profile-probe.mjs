@@ -100,31 +100,50 @@ function locateScript(list, index, { paths, cwd, file }) {
     candidates.push(list.slice(index, end + 1).map((word) => word.value).join(' '));
   }
   const absolute = (candidate) => (paths.isAbsolute(candidate) ? candidate : typeof cwd === 'string' && paths.isAbsolute(cwd) ? paths.resolve(cwd, candidate) : null);
-  for (const candidate of candidates) {
+  for (const [count, candidate] of candidates.entries()) {
     const real = absolute(candidate) && file.real(absolute(candidate));
-    if (real && file.isFile(real)) return { value: candidate, path: real, resolved: true };
+    if (real && file.isFile(real)) return { value: candidate, path: real, resolved: true, words: count + 1 };
   }
   // node also runs a directory, by its package.json or index.js. A word that
   // is exact still says where the script was when it cannot be resolved; one
   // ps split might be only the start of it.
   const start = absolute(first.value);
   const real = start && file.real(start);
-  return { value: first.value, path: real || (first.exact && start ? paths.normalize(start) : null), resolved: Boolean(real) };
+  return { value: first.value, path: real || (first.exact && start ? paths.normalize(start) : null), resolved: Boolean(real), words: 1 };
 }
 
+const inlineCode = (list, index) => {
+  const { value } = list[index];
+  if (INLINE.has(value)) return { inline: list.slice(index + 1).map((word) => word.value).join(' ') };
+  if (/^--(?:eval|print)=/.test(value)) return { inline: value.slice(value.indexOf('=') + 1) };
+  return null;
+};
+
 /**
- * The script a runtime runs. An option in one word, --name=value, says nothing
- * about where the script is and is passed over. Any other option may take the
- * next word as its value, which could then not be told from the script.
+ * The scripts a runtime may run. An option in one word, --name=value, says
+ * nothing about where the script is and is passed over. Any other option may
+ * take the next word as its value, as --require and --import do, or take none,
+ * as --test and --inspect do, so after one every word that is no option is a
+ * candidate: `node --test a.test.mjs` is as plain as `node a.test.mjs`.
  */
 function scriptOf(list, context) {
   for (let index = 0; index < list.length; index += 1) {
     const { value } = list[index];
-    if (INLINE.has(value)) return { inline: list.slice(index + 1).map((word) => word.value).join(' ') };
-    if (/^--(?:eval|print)=/.test(value)) return { inline: value.slice(value.indexOf('=') + 1) };
+    const inline = inlineCode(list, index);
+    if (inline) return inline;
     if (/^--[^=\s]+=/.test(value)) continue;
-    if (value.startsWith('-')) return null;
-    return locateScript(list, index, context);
+    if (!value.startsWith('-')) return { scripts: [locateScript(list, index, context)] };
+    const scripts = [];
+    for (let next = index + 1; next < list.length; next += 1) {
+      // After a candidate, -p and -e may be the script's own: claude -p is.
+      const code = scripts.length === 0 && inlineCode(list, next);
+      if (code) return code;
+      if (list[next].value.startsWith('-')) continue;
+      const script = locateScript(list, next, context);
+      scripts.push(script);
+      next += script.words - 1;
+    }
+    return scripts.length > 0 ? { scripts } : null;
   }
   return null;
 }
@@ -155,13 +174,15 @@ function identify(row, { paths, file, cwdOf }) {
   const located = [];
   const runtime = (identity) => RUNTIME.test(String(identity ?? '').split(/[\\/]/).at(-1));
   if ([name, argv0].some(runtime)) {
-    const script = scriptOf(words(rest), { paths, file, cwd: cwdOf?.(row.pid) });
-    if (!script) uncertain = true;
-    else if (script.inline !== undefined) names.push(script.inline);
+    const found = scriptOf(words(rest), { paths, file, cwd: cwdOf?.(row.pid) });
+    if (!found) uncertain = true;
+    else if (found.inline !== undefined) names.push(found.inline);
     else {
-      names.push(script.value);
-      if (script.path) { names.push(script.path); located.push(script.path); }
-      if (!script.resolved && !SCRIPT_EXTENSION.test(script.value)) uncertain = true;
+      for (const script of found.scripts) names.push(script.value, ...(script.path ? [script.path] : []));
+      // Paths say where the program lives only when every candidate has one:
+      // the one without could be the script.
+      if (found.scripts.every((script) => script.path)) located.push(...found.scripts.map((script) => script.path));
+      if (!found.scripts.some((script) => script.resolved || SCRIPT_EXTENSION.test(script.value))) uncertain = true;
     }
   } else if (!runtime(row.executablePath)) {
     for (const candidate of [row.executablePath, argv0]) if (typeof candidate === 'string' && paths.isAbsolute(candidate)) located.push(candidate);
