@@ -210,6 +210,13 @@ struct OperationRecord: Codable, Sendable, Equatable, Identifiable {
 
     var duration: TimeInterval { (finishedAt ?? Date()).timeIntervalSince(startedAt) }
 
+    /// The longest any agent holds a queued request: `--expires` is seven days at the most.
+    static let longestQueue: TimeInterval = 7 * 24 * 60 * 60
+
+    /// When a queued request stops waiting: its own expiry, or for one that came back without one,
+    /// the longest any agent would have held it.
+    var queueDeadline: Date { expiresAt ?? startedAt.addingTimeInterval(Self.longestQueue) }
+
     /// A line for the exported log.
     func logLine() -> String {
         let stamp = ISO8601DateFormatter().string(from: startedAt)
@@ -434,6 +441,31 @@ final class OperationStore {
         }
     }
 
+    /// A queued request the far side took and now has no record of at all.
+    ///
+    /// Past its deadline it is not waiting any more, whatever else became of it, so it is filed as
+    /// expired, as of that deadline. Whether it ran in an idle moment before then is not known: the
+    /// record that would say so has been pruned, and the summary says that rather than claiming it
+    /// never ran. Before its deadline the agent has let go of a request it was still meant to be
+    /// holding, which is a lost record like any other.
+    func resolveQueuedAsGone(_ id: String, now: Date = Date()) {
+        guard let queued = record(id: id), queued.state == .queued else { return }
+        let deadline = queued.queueDeadline
+        guard deadline <= now else {
+            resolveAsLost(id, summary: "\(queued.machineName) no longer holds the queued request and has no record of it, so whether it ran is not known.")
+            return
+        }
+        update(id) { record in
+            Self.release(&record, reason: "the helper has no record of it")
+            record.state = .expired
+            record.needsReconciliation = false
+            let ended = record.expiresAt.map { "expired on \($0.formatted(date: .abbreviated, time: .shortened))" }
+                ?? "has waited longer than any agent holds one"
+            record.summary = "The queued request \(ended). \(record.machineName) no longer has a record of it, so whether it ran before then is not known."
+            if record.finishedAt == nil { record.finishedAt = deadline }
+        }
+    }
+
     /// The user has read the unknown outcome and does not want to be asked again. A wake hold on it
     /// goes with it: a person has decided they are done with that command.
     func dismissReconciliation(_ id: String) {
@@ -505,7 +537,7 @@ final class OperationStore {
         // Anything that was still running when the app went away has an unknown outcome, not a
         // successful one. Marked as such on the way back in so it can be chased.
         // A queued request lives on the machine, not here, so it is left exactly as it is: the next
-        // status either shows it still waiting or says what became of it.
+        // status either shows it still waiting, or its record read by id says what became of it.
         for index in records.indices where records[index].state == .running {
             records[index].state = .unknown
             records[index].summary = "\(records[index].title) was still running when Legion Control closed, so its outcome is not known."

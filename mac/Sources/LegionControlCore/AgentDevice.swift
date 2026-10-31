@@ -366,10 +366,23 @@ extension AgentDevice {
     /// This is the whole reason mutations carry an id. Before, an update that timed out left nothing
     /// behind but a red sentence, and the only way to find out whether it had actually installed was
     /// to read the version afterwards and guess.
+    ///
+    /// A request the agent queued is asked about too. It used to wait for a status that mentioned
+    /// it, and a status lists the queue and the last few finished records only, so one that had run
+    /// or expired and been pruned read "waiting for idle" for good.
     func reconcileIfNeeded() {
         guard let operations, dialect.supportsOperations else { return }
+        let queued = operations.queued.filter { $0.machineId == historyMachineId && $0.agentTracked && isAnsweredHere($0) }
+        // One the status lists as started or finished is settled from it, for nothing. One it lists
+        // as still waiting has nothing new to say.
+        for record in queued {
+            guard let known = status?.operation(id: record.id), !known.isQueued else { continue }
+            operations.reconcile(record.id, with: known)
+            onStateChange?()
+        }
         guard Date().timeIntervalSince(core.lastReconcileAttempt) > DeviceCore.reconcileEvery else { return }
-        let owed = operations.unresolved.filter { $0.machineId == historyMachineId && $0.agentTracked }
+        let owed = operations.unresolved.filter { $0.machineId == historyMachineId && $0.agentTracked && isAnsweredHere($0) }
+            + queued.filter { operations.record(id: $0.id)?.state == .queued && status?.operation(id: $0.id) == nil }
         guard let next = owed.first else { return }
         core.lastReconcileAttempt = Date()
 
@@ -389,13 +402,27 @@ extension AgentDevice {
                 if let operation = reply.operation {
                     operations.reconcile(next.id, with: operation)
                 } else if reply.isUnknownOperation {
-                    operations.resolveAsNeverStarted(next.id)
+                    // An agent that took a request into its queue did hear of it, so no record of
+                    // it now is no evidence that it never started.
+                    if operations.record(id: next.id)?.state == .queued {
+                        operations.resolveQueuedAsGone(next.id)
+                    } else {
+                        operations.resolveAsNeverStarted(next.id)
+                    }
                 }
                 self.onStateChange?()
             } catch {
                 // Still no answer. It stays owed, and the next poll asks again.
             }
         }
+    }
+
+    /// Whether the agent answering now is the one an operation was sent to. Only that one can say
+    /// what became of it: the other system of a machine that has since booted into it has never
+    /// heard of the id, and saying so is no evidence about it at all.
+    private func isAnsweredHere(_ record: OperationRecord) -> Bool {
+        guard let sent = record.systemId, let answering = recordedSystem.id else { return true }
+        return sent == answering
     }
 
     /// Ask now, because the user pressed the button that asks.

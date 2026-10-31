@@ -442,6 +442,106 @@ struct MachineModelTests {
         #expect(model.statusLine.contains("may or may not have happened"))
     }
 
+    // MARK: - Queued requests
+
+    /// A sleep this app saw queued on the Pi's Linux, until `expiry`.
+    static func queuedSleep(in store: OperationStore, expiry: Date?, system: String = "linux") -> OperationRecord {
+        let record = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: system,
+                                     kind: .sleep, subject: "Pi", summary: "Putting Pi to sleep.", agentTracked: true)
+        store.begin(record)
+        store.markQueued(record.id, expiresAt: expiry, summary: "The sleep is queued and runs the next time Pi is idle.")
+        return record
+    }
+
+    static func status(listing operation: String) -> String {
+        onlineStatus.replacingOccurrences(of: #""controller": null"#, with: #""operations": \#(operation), "controller": null"#)
+    }
+
+    static func waitWhile(_ condition: @MainActor () -> Bool, timeout: TimeInterval = 15) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while condition(), Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+    }
+
+    @Test("a queued request its machine has pruned is asked about by id once the machine answers, and expires")
+    func prunedQueuedRequestExpires() async throws {
+        // Two sleeps queued on 22 October read "waiting for idle" nine days later. Both agents had
+        // expired and pruned them, and nothing ever asked: the records were tracked and owed nothing.
+        let runner = FakeRunner()
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let expiry = Date().addingTimeInterval(-9 * 24 * 60 * 60)
+        let record = Self.queuedSleep(in: store, expiry: expiry)
+
+        // While the machine cannot be reached it is left exactly as it is.
+        await model.refresh(userInitiated: false)
+        #expect(!model.isAwake)
+        #expect(store.record(id: record.id)?.state == .queued)
+        #expect(!runner.sentCommands.contains { $0.contains(record.id) })
+
+        // Agent 3.0.x says it has no record with bad-argument and op null.
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"bad-argument","command":"op","op":null}"#, exit: 1)
+        model.allowRedial()
+        await model.refresh(userInitiated: false)
+        await Self.waitWhile { store.record(id: record.id)?.state == .queued }
+
+        #expect(runner.sentCommands.contains { $0.contains("op") && $0.contains(record.id) })
+        let settled = try #require(store.record(id: record.id))
+        #expect(settled.state == .expired)
+        #expect(!settled.needsReconciliation)
+        #expect(settled.finishedAt == expiry)
+        #expect(settled.summary.hasSuffix("Pi no longer has a record of it, so whether it ran before then is not known."))
+    }
+
+    @Test("a queued request the status lists is settled from it, and never asked of another system")
+    func queuedRequestFromTheStatus() async throws {
+        let runner = FakeRunner()
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let waiting = Self.queuedSleep(in: store, expiry: Date().addingTimeInterval(3600))
+        let ran = Self.queuedSleep(in: store, expiry: Date().addingTimeInterval(-60))
+        // Queued on the other system, which is not the one answering: Linux has never heard of it.
+        let elsewhere = Self.queuedSleep(in: store, expiry: Date().addingTimeInterval(-60), system: "other")
+
+        runner.answer("status", json: Self.status(listing: """
+        { "queued": [ { "id": "\(waiting.id)", "kind": "sleep", "state": "queued", "outcome": "pending" } ],
+          "recent": [ { "id": "\(ran.id)", "kind": "sleep", "state": "finished", "phase": "done",
+                        "action": "expired", "reasonCode": "expired", "outcome": "deferred" } ] }
+        """))
+        runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#, exit: 1)
+        await model.refresh(userInitiated: false)
+        // Long enough for a read by id to have gone out, had one been started.
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(store.record(id: waiting.id)?.state == .queued)
+        #expect(store.record(id: ran.id)?.state == .expired)
+        #expect(store.record(id: ran.id)?.summary == "The queued request for Pi expired before the machine was idle.")
+        #expect(store.record(id: elsewhere.id)?.state == .queued)
+        #expect(!runner.sentCommands.contains { $0.contains("op ") })
+    }
+
+    @Test("an unknown outcome is never settled by a system it was not sent to")
+    func unknownOutcomeWaitsForItsSystem() async throws {
+        // A boot from Linux whose answer was lost, read after the machine came up in the other
+        // system: that agent has never heard of the id, which is no sign the boot never started.
+        let runner = FakeRunner()
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "other",
+                                     kind: .boot, subject: "Linux", summary: "Switching to Linux.", agentTracked: true)
+        store.begin(record)
+        store.finish(record.id, state: .unknown, summary: "The switch to Linux may or may not have happened.")
+
+        runner.answer("status", json: Self.onlineStatus)
+        runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#, exit: 1)
+        await model.refresh(userInitiated: false)
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(!runner.sentCommands.contains { $0.contains("op ") })
+        #expect(store.record(id: record.id)?.state == .unknown)
+        #expect(store.record(id: record.id)?.needsReconciliation == true)
+    }
+
     // MARK: - Update semantics
 
     @Test("an update that did nothing says which of the reasons it was")
