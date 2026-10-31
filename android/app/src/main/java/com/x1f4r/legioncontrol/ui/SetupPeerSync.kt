@@ -509,11 +509,6 @@ internal class SetupPeerSync(
         return open?.hash != head
     }
 
-    /** Why a copy an agent before 3.1.0 rebuilt cannot be [used]: its bytes are not the ones it hashed. */
-    private fun unverifiable(name: String, used: String): String =
-        "$name's control agent has to be updated before its setup can be $used: what it sent does not match the " +
-            "hash it reported."
-
     /** What reading `config` gave. */
     private sealed interface Read {
         data class Bytes(
@@ -595,3 +590,11 @@ internal class SetupPeerSync(
         const val MAX_ROUNDS = 4
     }
 }
+
+/**
+ * Why a copy an agent before 3.1.0 rebuilt cannot be [used]: its bytes are not the ones it hashed.
+ * Said the same of an automatic fetch, a question and a Fetch somebody pressed.
+ */
+internal fun unverifiable(name: String, used: String): String =
+    "$name's control agent has to be updated before its setup can be $used: what it sent does not match the " +
+        "hash it reported."

@@ -313,10 +313,12 @@ interface ControlServices {
     fun applyEdit(document: ControllerDocument, deviceName: String?): String?
 
     /**
-     * Puts a fetched setup in force after a person was shown all of its launch values. Approves them
-     * on a device that applied no setup before, and nothing on one that did.
+     * Puts a fetched setup in force after a person was shown all of its launch values, if it hashes
+     * to [servedHash] and the document in force is still [expectedHead]. Approves them on a device
+     * that applied no setup before, and nothing on one that did. See
+     * [com.x1f4r.legioncontrol.data.ConfigStore.applyEnrolment].
      */
-    fun applyEnrolment(text: String, deviceName: String?): String?
+    fun applyEnrolment(text: String, servedHash: String?, expectedHead: String?, servedBy: String, deviceName: String?): SetupOutcome
 
     /** Records exactly the values [entries] showed as approved on this device. Returns null, or why not. */
     fun approveLaunch(entries: List<LaunchReviewEntry>): String?

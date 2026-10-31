@@ -2,6 +2,7 @@ package com.x1f4r.legioncontrol.agent
 
 import com.x1f4r.legioncontrol.contract.VectorJson
 import com.x1f4r.legioncontrol.contract.VectorJson.string
+import com.x1f4r.legioncontrol.data.CanonicalSetup
 import com.x1f4r.legioncontrol.data.ConfigStore
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.DEFAULT_GITHUB_REPO
@@ -23,6 +24,7 @@ import com.x1f4r.legioncontrol.data.MemoryPreferences
 import com.x1f4r.legioncontrol.data.adoptAsFetched
 import com.x1f4r.legioncontrol.data.SetupOutcome
 import com.x1f4r.legioncontrol.data.editedMachine
+import com.x1f4r.legioncontrol.data.enrolAsFetched
 import com.x1f4r.legioncontrol.data.withSystemValue
 import com.x1f4r.legioncontrol.net.CommandOutcome
 import com.x1f4r.legioncontrol.net.CommandTransport
@@ -99,7 +101,7 @@ class LaunchGateTest {
         assertTrue(adoptAsFetched(text) is SetupOutcome.Applied)
 
     private fun enrolled(prefs: MemoryPreferences = MemoryPreferences(), text: String = HELD): ConfigStore =
-        store(prefs).also { assertEquals(null, it.applyEnrolment(text, "Test phone")) }
+        store(prefs).also { assertTrue(it.enrolAsFetched(text) is SetupOutcome.Applied) }
 
     /** [root] with a machine called Nas added by a peer, whose one system runs [agent]. */
     private fun withNas(root: JsonObject, agent: List<String>): JsonObject {
@@ -317,7 +319,8 @@ class LaunchGateTest {
                     ("local" to buildJsonObject { put("agent", "/Users/me/.legion-control/agent/src/index.mjs") }),
             )
         }
-        val preview = EnrolmentPreview.of(everything, "desk-tower.local", approves = true).getOrThrow()
+        val preview = EnrolmentPreview.of(everything, "desk-tower.local", CanonicalSetup.hashOf(everything), head = null).getOrThrow()
+        assertTrue(preview.approves)
         assertEquals(listOf("Tower", "Beacon"), preview.machines.map { it.name })
         assertEquals(
             listOf(tuple(LINUX, "posix"), tuple(WINDOWS, "cmd"), tuple(PI, "dispatch")),
@@ -331,7 +334,8 @@ class LaunchGateTest {
         val prefs = MemoryPreferences()
         val store = store(prefs)
         assertEquals(null, store.document.value)
-        assertEquals(null, store.applyEnrolment(preview.text, "Test phone"))
+        val confirmed = store.applyEnrolment(preview.text, preview.servedHash, preview.head, preview.host, "Test phone")
+        assertTrue("$confirmed", confirmed is SetupOutcome.Applied)
         assertEquals(emptyList<String>(), store.paths())
         assertEquals("owner/fork", store.launch.value.config?.appUpdates?.githubRepo)
 

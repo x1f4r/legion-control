@@ -30,7 +30,9 @@ internal fun servicesOver(store: ConfigStore): ControlServices {
         override val identityClash: StateFlow<SetupIdentityClash?> get() = store.identityClash
         override fun deviceName(): String = "Test phone"
         override fun applyEdit(document: ControllerDocument, deviceName: String?): String? = store.applyEdit(document, deviceName)
-        override fun applyEnrolment(text: String, deviceName: String?): String? = store.applyEnrolment(text, deviceName)
+        override fun applyEnrolment(text: String, servedHash: String?, expectedHead: String?, servedBy: String, deviceName: String?): SetupOutcome =
+            store.applyEnrolment(text, servedHash, expectedHead, servedBy, deviceName)
+
         override fun appliedHash(): String? = store.appliedHash()
         override fun adoptFromMachine(text: String, expectedRemoteHash: String?, expectedLocalHash: String?, machineName: String): SetupOutcome =
             store.adoptFromMachine(text, expectedRemoteHash, expectedLocalHash, machineName)

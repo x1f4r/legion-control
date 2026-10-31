@@ -97,6 +97,13 @@ internal object LaunchDocuments {
 internal fun ConfigStore.adoptAsFetched(text: String, machineName: String = "Tower"): SetupOutcome =
     adoptFromMachine(text, CanonicalSetup.hashOf(text), appliedHash(), machineName)
 
+/**
+ * Takes [text] the way Confirm on a fetched setup does: the bytes as [servedBy] promised them, over
+ * the document in force when it was shown.
+ */
+internal fun ConfigStore.enrolAsFetched(text: String, servedBy: String = "Tower"): SetupOutcome =
+    applyEnrolment(text, CanonicalSetup.hashOf(text), appliedHash(), servedBy, "Test phone")
+
 /** [this] with [change] made to one machine. */
 internal fun JsonObject.editedMachine(id: String, change: (JsonObject) -> JsonObject): JsonObject =
     ControllerDocument.of(this).editMachine(id, change).root

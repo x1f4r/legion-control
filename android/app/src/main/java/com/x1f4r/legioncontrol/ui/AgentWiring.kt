@@ -101,8 +101,13 @@ private class WiredServices(private val control: LegionControl) : ControlService
     override fun applyEdit(document: ControllerDocument, deviceName: String?): String? =
         control.config.applyEdit(document, deviceName)
 
-    override fun applyEnrolment(text: String, deviceName: String?): String? =
-        control.config.applyEnrolment(text, deviceName)
+    override fun applyEnrolment(
+        text: String,
+        servedHash: String?,
+        expectedHead: String?,
+        servedBy: String,
+        deviceName: String?,
+    ): SetupOutcome = control.config.applyEnrolment(text, servedHash, expectedHead, servedBy, deviceName)
 
     override fun approveLaunch(entries: List<LaunchReviewEntry>): String? = control.config.approveLaunch(entries)
 

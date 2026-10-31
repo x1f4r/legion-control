@@ -118,7 +118,7 @@ class LaunchApprovalsTest {
     fun `an edit approves only the tuple it changed, in the same write as the document`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         // A peer changes the tower's Linux command, which waits.
         store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("sh", "-c", "id")) })
         assertEquals(listOf(TOWER_LINUX), store.launch.value.review.map { it.path })
@@ -140,7 +140,7 @@ class LaunchApprovalsTest {
     fun `a paste approves what it changed`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         val pasted = descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("/usr/local/bin/node", "/srv/lc/bin/launcher.mjs")) }
 
         assertNull(store.applyPasted(pasted, "Test phone"))
@@ -186,7 +186,7 @@ class LaunchApprovalsTest {
         for ((name, path) in paths) {
             val prefs = MemoryPreferences()
             val store = store(prefs)
-            store.applyEnrolment(HELD, "Test phone")
+            store.enrolAsFetched(HELD)
             val before = record(prefs)
             val offered = descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", changed) }
 
@@ -202,10 +202,10 @@ class LaunchApprovalsTest {
     fun `fetching on a device that already applies a setup approves nothing either`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         val before = record(prefs)
 
-        store.applyEnrolment(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("sh", "-c", "id")) }, "Test phone")
+        store.enrolAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("sh", "-c", "id")) })
 
         assertEquals(before, record(prefs))
         assertEquals(listOf(TOWER_LINUX), store.launch.value.review.map { it.path })
@@ -217,7 +217,7 @@ class LaunchApprovalsTest {
     fun `approving records exactly the value shown, and a newer one waits as a new entry`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         val first = listOf("/usr/bin/node", "/opt/lc/bin/launcher.mjs")
         store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", first) })
         val shown = store.launch.value.review.single()
@@ -240,7 +240,7 @@ class LaunchApprovalsTest {
     fun `an approval the disk refused approves nothing, and is said so`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("/usr/bin/node", "/opt/lc/bin/launcher.mjs")) })
         val before = record(prefs)
         val launch = store.launch.value
@@ -282,7 +282,7 @@ class LaunchApprovalsTest {
     fun `a value that cannot be shown faithfully is never approved`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         store.adoptAsFetched(
             descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("/usr/bin/node", "/home/me/\u202Esjm.rehcnual/nib/")) },
         )
@@ -298,7 +298,7 @@ class LaunchApprovalsTest {
     fun `keys the record does not know about are kept through every write`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         val extended = JsonObject(record(prefs) + ("note" to JsonPrimitive("kept")))
         prefs.edit().putString(LaunchApprovals.KEY, extended.toString()).apply()
         store.adoptAsFetched(descendant(store.text.value) { it.withSystemValue(tower, "linux", "agent", listOf("/usr/bin/node", "/opt/lc/bin/launcher.mjs")) })
@@ -314,7 +314,7 @@ class LaunchApprovalsTest {
     fun `a value accepted by reuse is recorded at its new place`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         // A new machine that runs exactly what the pi runs: accepted by value, then recorded there.
         val withNas = descendant(store.text.value) { root ->
             val pi = (root["machines"] as JsonArray)[1] as JsonObject
@@ -337,7 +337,7 @@ class LaunchApprovalsTest {
     fun `revert puts the approved tuple back as an edit, and the grammar with it`() {
         val prefs = MemoryPreferences()
         val store = store(prefs)
-        store.applyEnrolment(HELD, "Test phone")
+        store.enrolAsFetched(HELD)
         store.adoptAsFetched(
             descendant(store.text.value) { it.withSystemValue("pi", "linux", "restricted", false).withSystemValue("pi", "linux", "shell", "powershell") },
         )

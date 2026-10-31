@@ -103,7 +103,11 @@ peer: the phone edits and publishes it exactly as the Mac and the desktop do, an
 device whose copy wins by rank. On first launch the Machines page asks for a host, a port and a
 user; **Fetch** runs `config` there with the phone's key and shows every machine's command, key
 file and update source in what comes back. **Confirm** applies it and approves those commands on
-this phone; **Cancel** applies nothing.
+this phone; **Cancel** applies nothing. Only bytes that hash to what the machine reports are shown,
+so a machine whose agent predates 3.1.0 and cannot reproduce its copy's hash has to be updated
+first. On a phone that already has the setup, Fetch catches up rather than edits: a copy made from
+the phone's is taken as the machine stores it, the same copy or an older one changes nothing, and
+one edited separately goes to be merged.
 
 After that it keeps itself in step on every poll. Two things happen without asking, and both
 only along strict descent: the phone pushes to a machine whose copy its own was made from, and

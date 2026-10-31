@@ -788,7 +788,7 @@ class AppModel(
      * file and update source in it, and only [confirmEnrolment] puts it in force.
      */
     private fun applyFetched(fetched: ControllerFetch, source: SetupSource): String = when (fetched) {
-        is ControllerFetch.Document -> enrolment.offer(fetched.text, source.host)
+        is ControllerFetch.Document -> enrolment.offer(fetched, source.host)
 
         ControllerFetch.NothingStored ->
             "That machine has no setup stored yet. Paste one here, or fetch from a machine that has one."
