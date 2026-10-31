@@ -222,24 +222,34 @@ class SetupEnrolmentTest {
         assertEquals(writes, prefs.writes.size)
     }
 
+    /**
+     * Named after the machine in this setup that the address typed is one of, as a branch a status
+     * finds is: the merge page offers to take Tower's copy, not a bare address's.
+     */
     @Test
-    fun `a branch of this device's copy goes to be merged, and is not put over it`() {
+    fun `a branch of this device's copy goes to be merged under its machine's name, and is not put over it`() {
         val store = LaunchDocuments.store().also { it.enrolAsFetched(HELD) }
-        assertNull(store.applyEdit(store.document.value!!.editMachine("tower") { it.withText("name", "Edited here") }, "Test phone"))
+        assertNull(store.applyEdit(store.document.value!!.editMachine("pi") { it.withText("name", "Edited here") }, "Test phone"))
         val mine = store.text.value
         val theirs = pi(HELD, "Edited there")
         val enrolment = SetupEnrolment(servicesOver(store))
 
         assertEquals(
-            "$host has a copy of the setup that was edited separately. It is waiting to be merged.",
+            "Tower has a copy of the setup that was edited separately. It is waiting to be merged.",
             enrolment.offer(served(theirs), host),
         )
         assertNull(enrolment.preview)
         assertEquals(mine, store.text.value)
         val divergence = store.divergence.value!!
-        assertEquals(host, divergence.machineName)
+        assertEquals("tower", divergence.machineId)
+        assertEquals("Tower", divergence.machineName)
         assertEquals(theirs, divergence.theirText)
         assertEquals(hashOf(mine), divergence.mineProvenance?.hash)
+
+        // An address no machine in this setup has keeps its own name.
+        store.clearDivergence()
+        enrolment.offer(served(theirs), "192.0.2.99")
+        assertEquals("192.0.2.99", store.divergence.value!!.machineName)
     }
 
     /**

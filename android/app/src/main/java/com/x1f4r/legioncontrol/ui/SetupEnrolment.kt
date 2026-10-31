@@ -8,6 +8,7 @@ import com.x1f4r.legioncontrol.agent.ControllerFetch
 import com.x1f4r.legioncontrol.data.CanonicalSetup
 import com.x1f4r.legioncontrol.data.ControllerDocument
 import com.x1f4r.legioncontrol.data.FetchedCopy
+import com.x1f4r.legioncontrol.data.MachineConfig
 import com.x1f4r.legioncontrol.data.SetupOutcome
 
 /**
@@ -35,9 +36,9 @@ class SetupEnrolment(private val services: ControlServices) {
      *
      * Then by ancestry, as a fetch on a status decides it ([FetchedCopy]). The copy this device
      * applies already, or one it was made from, is said so and nothing waits. A branch of this
-     * device's copy goes to be merged, as one a machine carries does. Anything else waits for
-     * Confirm. A document that would be refused is said so now, rather than after somebody read
-     * through it.
+     * device's copy goes to be merged, as one a machine carries does, under the name of the machine
+     * in this setup that [host] is an address of. Anything else waits for Confirm. A document that
+     * would be refused is said so now, rather than after somebody read through it.
      *
      * Confirm is held to the hash in storage, the head every compare-and-swap is made against, and
      * not to the document loaded: a stored copy that cannot be read loads as none, and fetching is
@@ -62,13 +63,15 @@ class SetupEnrolment(private val services: ControlServices) {
                 return "This device's setup was made from the one $host holds, so there is nothing newer to take."
 
             FetchedCopy.DIVERGED -> {
+                val holder = holder(host)
+                val name = holder?.name?.takeIf { it.isNotBlank() } ?: holder?.id ?: host
                 services.recordDivergence(
-                    host,
-                    host,
-                    "This device and $host each have a copy of the setup that was edited separately, and neither was made from the other.",
+                    holder?.id ?: host,
+                    name,
+                    "This device and $name each have a copy of the setup that was edited separately, and neither was made from the other.",
                     fetched.text,
                 )
-                return "$host has a copy of the setup that was edited separately. It is waiting to be merged."
+                return "$name has a copy of the setup that was edited separately. It is waiting to be merged."
             }
 
             else -> Unit
@@ -76,6 +79,16 @@ class SetupEnrolment(private val services: ControlServices) {
         preview = found
         return "Check what the setup from $host runs before using it."
     }
+
+    /**
+     * The machine in the setup in force that [host] is an address of, or null. A divergence is
+     * named after it, as one a status raises is: the merge page offers to take that machine's copy,
+     * and an address typed by hand says less than its name.
+     */
+    private fun holder(host: String): MachineConfig? =
+        services.config.value?.machines?.firstOrNull { machine ->
+            machine.endpoints.any { it.host.equals(host.trim(), ignoreCase = true) }
+        }
 
     /**
      * Puts the previewed setup in force, if the setup here is still the one it was shown against.
