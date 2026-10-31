@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { discoverServiceProfiles } from '../src/service-profiles.mjs';
-import { inspectProfileProcesses, processExitVerdict, latestClaudeVersion, readProfileVersion, runNativeClaudeProbe } from '../src/service-profile-probe.mjs';
+import { inspectProfileProcesses, processExitVerdict, latestClaudeVersion, npmCommandRuns, readProfileVersion, runNativeClaudeProbe } from '../src/service-profile-probe.mjs';
 import { resolveClaudeUpdatePolicy, claudeTargetAllowed, readClaudeRemotePolicy } from '../src/service-profile-claude.mjs';
 import { normalizeConfig } from '../src/config-schema.mjs';
 import { readDesktopMetadata } from '../src/service-profile-desktop.mjs';
@@ -168,6 +169,8 @@ test('npm profile discovery preserves prefix and known channel without executing
     const profiles = discoverServiceProfiles({ platform: 'linux', home: root, env: { PATH: bin }, configuration: { services: [{ kind: 'npm', package: '@openai/codex', npmPrefix: prefix, channel: 'alpha' }] } });
     const codex = profiles.find((profile) => profile.id === 'codex-cli');
     assert.equal(codex.availability, 'available'); assert.equal(codex.service.npmPrefix, fs.realpathSync(prefix)); assert.equal(codex.service.channel, 'alpha'); assert.equal(codex.service.updates.automatic, false);
+    // Nothing else would notice an install that does not run: it has no process and no health check.
+    assert.deepEqual(codex.service.verify, [process.execPath, fileURLToPath(new URL('../src/service-profile-probe.mjs', import.meta.url)), 'npm-verify', 'codex-cli', fs.realpathSync(prefix)]);
     assert.deepEqual(profiles.find((profile) => profile.id === 'opencode').service.allowScripts, ['opencode-ai']);
     assert.equal(profiles.filter((profile) => ['codex-desktop', 'chatgpt-desktop'].includes(profile.id)).length, 1);
     assert.equal(profiles.find((profile) => profile.id === 'grok-cli').availability, 'unavailable');
@@ -181,3 +184,28 @@ test('npm profile discovery preserves prefix and known channel without executing
     assert.equal(native.availability, 'manual'); assert.equal(native.service, null, 'nearby stale npm metadata cannot prove executable ownership');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('the command an npm install of a profile left behind is run through its own bin entry', { skip: process.platform === 'win32' && 'a placeholder shell script' }, () => {
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'legion npm verify '));
+  try {
+    const root = path.join(prefix, 'lib', 'node_modules', 'opencode-ai');
+    const install = (bin, files) => {
+      fs.rmSync(root, { recursive: true, force: true }); fs.mkdirSync(path.join(root, 'bin'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'opencode-ai', version: '1.19.5', bin }));
+      for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(root, name), text, { mode: 0o755 });
+    };
+    // What npm leaves when it skipped the postinstall that replaces the placeholder.
+    install({ opencode: './bin/opencode.exe' }, { 'bin/opencode.exe': '#!/bin/sh\necho "Error: opencode-ai\'s postinstall script was not run." >&2\nexit 1\n' });
+    assert.deepEqual(npmCommandRuns('opencode', prefix), { ok: false, message: "opencode --version exited 1: Error: opencode-ai's postinstall script was not run." });
+    install({ opencode: './bin/opencode.exe' }, { 'bin/opencode.exe': '#!/bin/sh\necho 1.19.5\n' });
+    assert.deepEqual(npmCommandRuns('opencode', prefix), { ok: true, message: null });
+    // A Node script runs on the agent's own Node, whatever PATH holds.
+    install({ opencode: 'bin/opencode' }, { 'bin/opencode': '#!/usr/bin/env node\nconsole.log("1.19.5");\n' });
+    assert.equal(npmCommandRuns('opencode', prefix, { run: (file, args, options) => { assert.equal(file, process.execPath); assert.equal(options.timeout, 15000); return { status: 0 }; } }).ok, true);
+    install({ other: 'bin/other' }, {});
+    assert.match(npmCommandRuns('opencode', prefix).message, /^opencode-ai names no opencode command under /);
+    assert.equal(npmCommandRuns('grok-cli', prefix).ok, false);
+    assert.equal(npmCommandRuns('opencode', 'relative/prefix').ok, false);
+  } finally { fs.rmSync(prefix, { recursive: true, force: true }); }
+});
+

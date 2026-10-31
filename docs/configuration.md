@@ -123,6 +123,10 @@ how an update happens.
   "npmPrefix": null,
   // Packages allowed to run install scripts on npm 12 and newer.
   "allowScripts": ["node-pty"],
+  // Optional. A command that fails when what npm installed does not run, for a package whose
+  // postinstall puts the real binary in place. The CLI profiles set one that runs the package's
+  // command with --version.
+  "verify": ["/usr/local/bin/dashboard", "--version"],
   "process": { "type": "systemd-user", "unit": "dashboard.service" },
   "health": { "type": "http", "port": 8080, "path": "/healthz" },
   "busy": { "type": "http", "port": 8080, "path": "/status", "busyWhen": "jobs.running" }
@@ -132,9 +136,10 @@ how an update happens.
 The update cycle for this kind: resolve the tag, compare with the installed `package.json`
 version, check busy, pre-warm the npm cache, take the operation lock, **check busy again**, drain
 if a drain command is configured, stop the process and poll until it is really gone, install,
-verify the installed version, start, wait for health. Any failure reinstalls the previous version
-and reports a rollback. The second busy check is the one that matters: cache warming can take
-minutes, and the answer from before it is stale by the time anything is stopped.
+verify the installed version and run `verify` when there is one, start, wait for health. Any
+failure from the install on reinstalls the previous version and reports a rollback. The second
+busy check is the one that matters: cache warming can take minutes, and the answer from before it
+is stale by the time anything is stopped.
 
 #### `app`: a desktop app that updates itself
 

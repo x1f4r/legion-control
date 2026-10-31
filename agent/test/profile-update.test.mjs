@@ -8,9 +8,11 @@
 // asked to install anything.
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import {
-  cli, commandService, fakeNpm, fixtureConfig, fixtureData, npmCalls, npmPackageVersion, npmService, readFixture, withHome, writeConfig, writeFixture,
+  cli, commandService, fakeNpm, fixtureConfig, fixtureData, npmCalls, npmPackageVersion, npmService, readFixture, SRC, withHome, writeConfig, writeFixture,
 } from './helpers.mjs';
 
 const profileShape = { process: { type: 'none' }, health: { type: 'none' } };
@@ -112,3 +114,52 @@ test('a forced command CLI update waits for a related process to exit, then goes
     assert.equal(readFixture(dir, 'stop-runs'), '');
   });
 });
+
+/**
+ * What a version of opencode-ai holds once npm has unpacked it: a bin that
+ * prints its version, or, when the postinstall that puts the real binary in
+ * place never ran, the placeholder that only says so.
+ */
+function opencodeTree(dir, version, { postinstallRan }) {
+  const tree = path.join(dir, `npm-tree-${version}`);
+  fs.mkdirSync(path.join(tree, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(tree, 'package.json'), JSON.stringify({ name: 'opencode-ai', version, bin: { opencode: 'bin/opencode.js' } }));
+  fs.writeFileSync(path.join(tree, 'bin', 'opencode.js'), postinstallRan
+    ? `console.log(${JSON.stringify(version)});\n`
+    : 'console.error("Error: opencode-ai\'s postinstall script was not run."); process.exit(1);\n');
+}
+
+/** OpenCode as its profile describes it, verify included, at the fake npm's prefix. */
+async function withOpencode(body, { postinstallRan }) {
+  return withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const npm = fakeNpm(home, dir, { pkg: 'opencode-ai' });
+    opencodeTree(dir, '1.0.0', { postinstallRan: true });
+    opencodeTree(dir, '2.0.0', { postinstallRan });
+    const verify = [process.execPath, path.join(SRC, 'service-profile-probe.mjs'), 'npm-verify', 'opencode', npm.prefix];
+    writeConfig(home, fixtureConfig(dir, { services: [npmService(dir, npm, { ...profileShape, id: 'opencode', name: 'OpenCode', verify })] }));
+    return body({ dir, run: (argv) => cli(argv, { home, nodeArgs: npm.nodeArgs }), installed: () => npmPackageVersion(npm.prefix, npm.pkg) });
+  });
+}
+
+test('an npm CLI install whose command does not run is rolled back, not reported as updated', async () => {
+  await withOpencode(async ({ dir, run, installed }) => {
+    const { payload, exitCode } = run(['update']);
+    assert.equal(exitCode, 1, JSON.stringify(payload));
+    assert.equal(payload.action, 'rolled-back');
+    assert.match(payload.message, /2\.0\.0 was installed but does not run: .*opencode --version exited 1: Error: opencode-ai's postinstall script was not run\./);
+    assert.match(payload.message, /rolled back to 1\.0\.0$/);
+    assert.equal(installed(), '1.0.0');
+    assert.deepEqual(installs(dir).map((call) => call.split(' ').pop()), ['opencode-ai@2.0.0', 'opencode-ai@1.0.0']);
+  }, { postinstallRan: false });
+});
+
+test('an npm CLI install whose command runs is updated', async () => {
+  await withOpencode(async ({ run, installed }) => {
+    const { payload, exitCode } = run(['update']);
+    assert.equal(exitCode, 0, JSON.stringify(payload));
+    assert.equal(payload.action, 'updated');
+    assert.equal(installed(), '2.0.0');
+  }, { postinstallRan: true });
+});
+

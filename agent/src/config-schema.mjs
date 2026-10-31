@@ -599,7 +599,7 @@ const COMMON_SERVICE_KEYS = [
   'channel',
 ];
 const KIND_KEYS = {
-  npm: ['package', 'npmPrefix', 'allowScripts'],
+  npm: ['package', 'npmPrefix', 'allowScripts', 'verify'],
   app: ['path', 'bundleId', 'updaterCacheDir', 'stagedFilePattern', 'latest'],
   command: ['installedVersion', 'latestVersion', 'update', 'verify', 'rollback', 'requireVersionMatch'],
 };
@@ -645,6 +645,10 @@ function normalizeService(report, raw, index, { platform, base }) {
     const prefix = reqStr(report, `${where}.npmPrefix`, raw.npmPrefix);
     service.npmPrefix = prefix ? expandHome(prefix) : null;
     service.allowScripts = stringList(report, `${where}.allowScripts`, raw.allowScripts, []);
+    // A command that fails when what npm installed does not run. package.json
+    // only says npm wrote the package, and a placeholder left by a postinstall
+    // that never ran is written all the same.
+    service.verify = reqArgv(report, `${where}.verify`, raw.verify);
   } else if (kind === 'app') {
     const appPath = reqStr(report, `${where}.path`, raw.path);
     if (!appPath) report.error(`${where}.path`, 'an app service needs the bundle path', 'for example "/Applications/Thing.app"');

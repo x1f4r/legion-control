@@ -237,7 +237,7 @@ function npmInstallWorstMs() {
 export function updateWorstCaseMs(service) {
   if (service.kind === 'app') return stopWorstMs(service) + startWorstMs(service) + HEALTH_WAIT_MS + appProvider.VERSION_WAIT_MS;
   const install = service.kind === 'npm'
-    ? npmInstallWorstMs()
+    ? npmInstallWorstMs() + (service.verify ? mutationWorstCaseMs(VERIFY_COMMAND_MS) : 0)
     : mutationWorstCaseMs(commandProvider.UPDATE_COMMAND_MS) + mutationWorstCaseMs(VERIFY_COMMAND_MS);
   return drainWorstMs(service) + stopWorstMs(service) + install + startWorstMs(service) + HEALTH_WAIT_MS;
 }
@@ -368,6 +368,15 @@ async function performUpgrade(service, to, prefix, opId, lock, reached) {
   const onDisk = npmProvider.installedVersionAt(service, prefix);
   if (onDisk !== to) {
     throw new Error(`npm reported success but the installed version is ${onDisk ?? 'missing'}, not ${to}`);
+  }
+  // package.json proves npm wrote the package, and nothing about whether what
+  // it wrote runs. A package whose postinstall puts the real binary in place
+  // leaves a placeholder when npm skipped its scripts, and a health check of
+  // "none" passes on that. Where the service names a command that fails when
+  // the install does not run, as the profiles do, nothing starts until it passes.
+  if (service.verify) {
+    const verified = await runMutationArgv(service.verify, { timeoutMs: VERIFY_COMMAND_MS });
+    if (!verified.ok) throw new Error(`${to} was installed but does not run: ${describeFailure(verified)}`);
   }
 
   lock.phase('starting');

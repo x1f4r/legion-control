@@ -1,10 +1,12 @@
 // Conservative probes for explicitly enabled product profiles. Process rows
 // stay in this process; replies never include command lines or credentials.
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { resolveClaudeUpdatePolicy, claudeTargetAllowed, compareProfileVersions, nativeClaudeVersionAt } from './service-profile-claude.mjs';
 import { readDesktopMetadata } from './service-profile-desktop.mjs';
+import { CLI_PRODUCTS } from './service-profiles.mjs';
 
 const NAMES = {
   'claude-code': ['claude', 'claude-code'],
@@ -140,6 +142,47 @@ export function inspectProfileProcesses(profile, { platform = process.platform, 
   } catch { return processExitVerdict(profile, null); }
 }
 
+/** How long the command an npm install left behind gets to say its version. */
+export const NPM_VERIFY_MS = 15000;
+
+function firstLine(file) {
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(file, 'r');
+    const head = Buffer.alloc(256);
+    return head.subarray(0, fs.readSync(descriptor, head, 0, head.length, 0)).toString('latin1').split('\n')[0];
+  } catch { return ''; } finally { if (descriptor !== null) fs.closeSync(descriptor); }
+}
+
+/**
+ * Whether the command an npm install of a profile's CLI left behind runs.
+ *
+ * package.json only proves npm wrote the package. A package whose postinstall
+ * puts the real binary in place, as OpenCode's does, leaves a placeholder that
+ * cannot run when npm skipped its scripts, which npm 12 does unless they are
+ * allowlisted. The command is the one the package's own bin entry names, run
+ * the way npm's shims run it: a Node script through the running Node, anything
+ * else directly. Only the first line it printed comes back, and only on failure.
+ */
+export function npmCommandRuns(profile, prefix, { run = spawnSync, platform = process.platform } = {}) {
+  const product = CLI_PRODUCTS.find((entry) => entry.id === profile);
+  if (!product || typeof prefix !== 'string' || !path.isAbsolute(prefix)) return { ok: false, message: 'Unsupported profile probe.' };
+  const root = path.join(prefix, ...(platform === 'win32' ? [] : ['lib']), 'node_modules', ...product.package.split('/'));
+  let metadata = null;
+  try { metadata = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')); } catch { /* answered below */ }
+  const entry = typeof metadata?.bin === 'string' ? metadata.bin : metadata?.bin?.[product.executable];
+  if (typeof entry !== 'string' || path.isAbsolute(entry) || entry.split(/[\\/]/).includes('..')) {
+    return { ok: false, message: `${product.package} names no ${product.executable} command under ${root}.` };
+  }
+  const file = path.join(root, entry);
+  const script = /\.[cm]?js$/i.test(file) || /^#!.*\bnode\b/.test(firstLine(file));
+  const result = run(script ? process.execPath : file, script ? [file, '--version'] : ['--version'], { encoding: 'utf8', timeout: NPM_VERIFY_MS, maxBuffer: 64 * 1024, windowsHide: true });
+  if (result.status === 0 && !result.error) return { ok: true, message: null };
+  const said = String(result.stderr || result.stdout || '').trim().split('\n')[0].slice(0, 200);
+  const how = result.error?.code === 'ETIMEDOUT' ? `did not answer within ${NPM_VERIFY_MS / 1000} s` : result.error ? `could not be run (${result.error.code ?? result.error.message})` : `exited ${result.status ?? result.signal}`;
+  return { ok: false, message: `${product.executable} --version ${how}${said ? `: ${said}` : ''}` };
+}
+
 export function readProfileVersion(executable, { run = spawnSync, cwd } = {}) {
   if (typeof executable !== 'string' || !path.isAbsolute(executable)) return null;
   const result = run(executable, ['--version'], { encoding: 'utf8', timeout: 4000, maxBuffer: 64 * 1024, windowsHide: true, cwd });
@@ -215,6 +258,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const result = await runNativeClaudeProbe(verb, { executable, home, expectedPolicy });
     if (!result.ok) { process.stderr.write(`${result.message}\n`); process.exitCode = 1; }
     else if (result.version) process.stdout.write(`${result.version}\n`);
+  } else if (verb === 'npm-verify' && extra.length === 1) {
+    const result = npmCommandRuns(profile, extra[0]);
+    if (!result.ok) { process.stderr.write(`${result.message}\n`); process.exitCode = 1; }
   } else if (verb !== 'busy' || extra.length || !NAMES[profile]) {
     process.stderr.write('Unsupported profile probe.\n'); process.exitCode = 1;
   } else process.stdout.write(`${JSON.stringify(inspectProfileProcesses(profile))}\n`);

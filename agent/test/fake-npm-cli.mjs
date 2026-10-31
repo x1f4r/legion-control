@@ -63,8 +63,14 @@ if (verb === '--version') {
     process.stderr.write(`npm error could not install ${wanted.name}@${wanted.version}\n`);
     process.exit(1);
   }
-  fs.mkdirSync(root, { recursive: true });
-  fs.writeFileSync(path.join(root, 'package.json'), `${JSON.stringify({ name: wanted.name, version: wanted.version })}\n`);
+  // npm-tree-<version>, when a test made one, is what that version's tarball
+  // holds; otherwise it holds a package.json and nothing to run.
+  const tree = file(`npm-tree-${wanted.version}`);
+  if (fs.existsSync(tree)) fs.cpSync(tree, root, { recursive: true });
+  else {
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'package.json'), `${JSON.stringify({ name: wanted.name, version: wanted.version })}\n`);
+  }
 } else {
   process.exit(9);
 }
