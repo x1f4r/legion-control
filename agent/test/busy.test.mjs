@@ -191,7 +191,7 @@ test('a missing state database blocks unless the config says it is expected', as
 const hoursAgo = (hours) => new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
 
 /** statev2.sqlite with the tables the probe reads, in T3's own column layout. */
-function makeCurrentDb(home, { threads = [], turns = [], subagents = [], runs = [], requests = [] } = {}) {
+function makeCurrentDb(home, { threads = [], turns = [], subagents = [], runs = [], requests = [], items = [], providerThreads = [] } = {}) {
   const { DatabaseSync } = require('node:sqlite');
   const dir = path.join(home, 't3', 'userdata');
   fs.mkdirSync(dir, { recursive: true });
@@ -212,21 +212,40 @@ function makeCurrentDb(home, { threads = [], turns = [], subagents = [], runs = 
   db.exec(`CREATE TABLE orchestration_v2_projection_runtime_requests (runtime_request_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
     node_id TEXT NOT NULL, provider_turn_id TEXT, kind TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT,
     payload_json TEXT NOT NULL)`);
+  db.exec(`CREATE TABLE orchestration_v2_projection_turn_items (turn_item_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, run_id TEXT,
+    node_id TEXT, provider_thread_id TEXT, provider_turn_id TEXT, parent_item_id TEXT, ordinal INTEGER NOT NULL, type TEXT NOT NULL,
+    status TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL)`);
+  db.exec(`CREATE INDEX orchestration_v2_projection_turn_items_recovery_idx ON orchestration_v2_projection_turn_items(thread_id)
+    WHERE type IN ('command_execution', 'dynamic_tool', 'subagent') AND status IN ('pending', 'running', 'waiting')`);
+  db.exec(`CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT PRIMARY KEY, thread_id TEXT, owner_node_id TEXT,
+    provider TEXT NOT NULL, provider_session_id TEXT, status TEXT NOT NULL, first_run_ordinal INTEGER, last_run_ordinal INTEGER,
+    updated_at TEXT NOT NULL, payload_json TEXT NOT NULL, driver TEXT, provider_instance_id TEXT)`);
   for (const [index, row] of threads.entries()) {
     db.prepare(`INSERT INTO orchestration_v2_projection_threads VALUES (?, 'project', ?, 'claudeAgent', 'full-access', 'default', NULL, ?, ?, ?, ?, '{}', NULL)`)
       .run(row.thread, row.title ?? `Thread ${index}`, hoursAgo(48), hoursAgo(1), row.archivedAt ?? null, row.deletedAt ?? null);
   }
   for (const [index, row] of turns.entries()) {
-    db.prepare(`INSERT INTO orchestration_v2_projection_provider_turns VALUES (?, ?, 'provider-thread', 'node', NULL, ?, ?, ?, NULL, '{}')`)
-      .run(row.turn ?? `turn-${index}`, row.thread, index + 1, row.status, row.startedAt ?? null);
+    db.prepare(`INSERT INTO orchestration_v2_projection_provider_turns VALUES (?, ?, ?, 'node', ?, ?, ?, ?, NULL, '{}')`)
+      .run(row.turn ?? `turn-${index}`, row.thread, row.providerThread ?? 'provider-thread', row.attempt ?? null, index + 1, row.status, row.startedAt ?? null);
   }
   for (const [index, row] of subagents.entries()) {
-    db.prepare(`INSERT INTO orchestration_v2_projection_subagents VALUES (?, ?, NULL, 'node', 'claudeAgent', NULL, NULL, ?, ?, ?, NULL, ?, '{}', NULL, NULL, NULL)`)
-      .run(row.id ?? `agent-${index}`, row.thread, row.origin ?? 'provider_native', row.status, row.startedAt ?? null, row.updatedAt ?? row.startedAt ?? hoursAgo(0));
+    db.prepare(`INSERT INTO orchestration_v2_projection_subagents VALUES (?, ?, NULL, 'node', 'claudeAgent', NULL, NULL, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL)`)
+      .run(row.id ?? `agent-${index}`, row.thread, row.origin ?? 'provider_native', row.status, row.startedAt ?? null, row.updatedAt ?? row.startedAt ?? hoursAgo(0),
+        JSON.stringify(row.nativeId ? { nativeTaskRef: { nativeId: row.nativeId } } : {}));
   }
   for (const [index, row] of runs.entries()) {
-    db.prepare(`INSERT INTO orchestration_v2_projection_runs VALUES (?, ?, ?, 'claudeAgent', NULL, ?, ?, NULL, '{}', NULL)`)
-      .run(row.id ?? `run-${index}`, row.thread, index + 1, row.status, row.requestedAt);
+    db.prepare(`INSERT INTO orchestration_v2_projection_runs VALUES (?, ?, ?, 'claudeAgent', ?, ?, ?, NULL, ?, NULL)`)
+      .run(row.id ?? `run-${index}`, row.thread, index + 1, row.providerThread ?? null, row.status, row.requestedAt ?? hoursAgo(3),
+        JSON.stringify({ startedAt: row.startedAt ?? null, activeAttemptId: row.attempt ?? null, ...(row.queueHeld ? { queueHeld: true } : {}) }));
+  }
+  for (const [index, row] of items.entries()) {
+    const { id = `item-${index}`, thread, run = null, type, status, updatedAt = row.startedAt ?? hoursAgo(0), payload, ...fields } = row;
+    db.prepare(`INSERT INTO orchestration_v2_projection_turn_items VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)`)
+      .run(id, thread, run, index + 1, type, status, updatedAt, payload ?? JSON.stringify({ id, type, status, ...fields }));
+  }
+  for (const [index, row] of providerThreads.entries()) {
+    db.prepare(`INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, 'claudeAgent', NULL, 'idle', NULL, NULL, ?, ?, NULL, NULL)`)
+      .run(row.id ?? `provider-thread-${index}`, row.thread, row.ownerNode ?? null, row.updatedAt ?? hoursAgo(0), JSON.stringify({ pendingBackgroundTasks: row.tasks ?? [] }));
   }
   for (const [index, row] of requests.entries()) {
     db.prepare(`INSERT INTO orchestration_v2_projection_runtime_requests VALUES (?, ?, 'node', NULL, ?, ?, ?, NULL, '{}')`)
@@ -325,7 +344,7 @@ test('approvals and questions waiting in the current database block until they g
   });
 });
 
-test('a queued run waits as a pending turn and ages out on the staleness window', async () => {
+test('a queued run waits as a pending turn and ages out on the staleness window, and a queue T3 holds is idle', async () => {
   await withHome(async (home) => {
     const t3Home = makeCurrentDb(home, {
       runs: [
@@ -338,6 +357,92 @@ test('a queued run waits as a pending turn and ages out on the staleness window'
     assert.equal(answer.busy, true);
     assert.equal(answer.pendingTurns, 1);
     assert.equal(answer.staleTurns, 1);
+  });
+  await withHome(async (home) => {
+    // T3 holds a queue until the user releases it, shows that thread as idle,
+    // and holds it again after a restart, so a restart takes nothing from it.
+    const t3Home = makeCurrentDb(home, { runs: [{ thread: 't', status: 'queued', requestedAt: hoursAgo(1), queueHeld: true }] });
+    assert.equal(checkT3Sqlite({ home: t3Home }).reason, 'idle');
+  });
+});
+
+test('a shell, monitor or tool left running in the background blocks after its turn has ended', async () => {
+  await withHome(async (home) => {
+    const t3Home = makeCurrentDb(home, {
+      threads: [{ thread: 't', title: 'Background build' }],
+      turns: [{ thread: 't', status: 'completed', startedAt: hoursAgo(2), attempt: 'attempt' }],
+      // The turn is over and its run waits on what it started.
+      runs: [{ id: 'run', thread: 't', status: 'waiting', startedAt: hoursAgo(2), attempt: 'attempt', providerThread: 'provider-thread' }],
+      items: [
+        { thread: 't', run: 'run', type: 'command_execution', status: 'running', startedAt: hoursAgo(1), input: 'npm test' },
+        { thread: 't', run: 'run', type: 'command_execution', status: 'waiting', startedAt: hoursAgo(1), monitor: true },
+        { thread: 't', run: 'run', type: 'dynamic_tool', status: 'pending', startedAt: null, updatedAt: hoursAgo(1) },
+        // A payload T3 wrote wrong still counts as the work its row says it is.
+        { thread: 't', run: 'run', type: 'command_execution', status: 'running', updatedAt: hoursAgo(1), payload: '{not json' },
+        // None of these is background work a restart would cut.
+        { thread: 't', run: 'run', type: 'command_execution', status: 'completed', startedAt: hoursAgo(1) },
+        { thread: 't', run: 'run', type: 'todo_list', status: 'running', startedAt: hoursAgo(1) },
+        { thread: 't', run: 'run', type: 'subagent', status: 'running', startedAt: hoursAgo(1), origin: 'app_owned', childThreadId: 'child' },
+      ],
+    });
+    const answer = checkT3Sqlite({ home: t3Home }, { liveness: { serviceRunning: true, startedAt: hoursAgo(3) } });
+    assert.equal(answer.busy, true);
+    assert.equal(answer.runningTurns, 4, 'the waiting run is the work it holds, not one more');
+    assert.equal(answer.reason, '4 turns running');
+    assert.equal(answer.threads[0].title, 'Background build');
+
+    // T3 cancels all of it when it starts again.
+    const restarted = checkT3Sqlite({ home: t3Home }, { liveness: { serviceRunning: true, startedAt: hoursAgo(0.5) } });
+    assert.equal(restarted.busy, false);
+    assert.equal(restarted.abandonedTurns, 4);
+  });
+});
+
+test('work T3 records in several places counts once, and a run that holds nothing else counts by itself', async () => {
+  await withHome(async (home) => {
+    const t3Home = makeCurrentDb(home, {
+      // A running turn and the run it is the attempt of.
+      turns: [{ thread: 't', status: 'running', startedAt: hoursAgo(1), attempt: 'first-attempt', providerThread: 'first' }],
+      runs: [
+        { id: 'first-run', thread: 't', status: 'running', startedAt: hoursAgo(1), attempt: 'first-attempt', providerThread: 'first' },
+        // A run still draining its turn's output, with nothing else to show for it.
+        { id: 'second-run', thread: 't', status: 'waiting', startedAt: hoursAgo(1), attempt: 'second-attempt', providerThread: 'second' },
+      ],
+      // A subagent in its own table and as an item of its turn.
+      subagents: [{ id: 'agent', thread: 't', status: 'running', startedAt: hoursAgo(1), nativeId: 'native-agent' }],
+      items: [
+        { thread: 't', type: 'subagent', status: 'running', startedAt: hoursAgo(1), subagentId: 'agent', origin: 'provider_native' },
+        // A background shell as an item and in its provider thread's roster.
+        { thread: 't', type: 'command_execution', status: 'running', startedAt: hoursAgo(1), nativeItemRef: { nativeId: 'shell' } },
+      ],
+      providerThreads: [
+        { id: 'third', thread: 't', updatedAt: hoursAgo(1), tasks: [
+          { taskId: 'shell', kind: 'command' },
+          // Started by the subagent, which already counts.
+          { taskId: 'agent-shell', kind: 'command', parentTaskId: 'native-agent' },
+          { taskId: 'watcher', kind: 'monitor' },
+        ] },
+        // A subagent's own provider thread goes with the subagent.
+        { id: 'fourth', thread: 't', ownerNode: 'agent', updatedAt: hoursAgo(1), tasks: [{ taskId: 'inner', kind: 'command' }] },
+      ],
+    });
+    const answer = checkT3Sqlite({ home: t3Home }, { liveness: { serviceRunning: true, startedAt: hoursAgo(3) } });
+    assert.equal(answer.busy, true);
+    // The turn, the subagent, the shell, the monitor and the draining run.
+    assert.equal(answer.runningTurns, 5);
+    assert.deepEqual(answer.threads.map((thread) => thread.turnId).sort(), ['agent', 'item-1', 'second-run', 'turn-0', 'watcher']);
+  });
+});
+
+test('a run is dated by when it started, never by when it was queued', async () => {
+  await withHome(async (home) => {
+    // Queued before T3 restarted, released and started since.
+    const t3Home = makeCurrentDb(home, { runs: [{ thread: 't', status: 'running', requestedAt: hoursAgo(3), startedAt: hoursAgo(0.25) }] });
+    assert.equal(checkT3Sqlite({ home: t3Home }, { liveness: { serviceRunning: true, startedAt: hoursAgo(0.5) } }).busy, true);
+  });
+  await withHome(async (home) => {
+    const t3Home = makeCurrentDb(home, { runs: [{ thread: 't', status: 'waiting', requestedAt: hoursAgo(3), startedAt: null }] });
+    assert.equal(checkT3Sqlite({ home: t3Home }, { liveness: { serviceRunning: true, startedAt: hoursAgo(0.5) } }).busy, true, 'with no start time it keeps its protection');
   });
 });
 

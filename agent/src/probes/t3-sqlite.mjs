@@ -1,6 +1,6 @@
 // Busy detection for T3 Code: is it in the middle of something a restart would
-// destroy? Counts running and pending turns and pending approvals in T3 Code's
-// own state database.
+// destroy? Counts running and pending turns, the work they left running in the
+// background, and pending approvals in T3 Code's own state database.
 //
 // This feeds the gate in front of every disruptive action (update, restart,
 // boot, sleep), so it is deliberately conservative. THE RULE IS FAIL CLOSED: if
@@ -103,26 +103,43 @@ const LIVE_THREAD = (alias) =>
   `NOT EXISTS (SELECT 1 FROM orchestration_v2_projection_threads AS thread
                 WHERE thread.thread_id = ${alias}.thread_id AND thread.deleted_at IS NOT NULL)`;
 
+// A field of a row's payload_json. A payload that is not JSON has no fields,
+// which leaves the row counted rather than failing the whole read.
+const FIELD = (alias, key) =>
+  `CASE WHEN json_valid(${alias}.payload_json) THEN json_extract(${alias}.payload_json, '$.${key}') END`;
+
 /**
- * The schema T3 writes to statev2.sqlite. Four kinds of row hold work:
+ * The schema T3 writes to statev2.sqlite. What a restart of T3 cancels is
+ * what its own recovery cancels on startup, and these rows hold it:
  *
  *   provider turns    a turn the provider is running, or about to;
  *   native subagents  work a provider runs inside its own process, which a
  *                     restart ends with it, so a pending or waiting one is as
  *                     live as a running one. It keeps going after the turn
  *                     that started it has finished;
- *   queued runs       a message waiting for its turn, the old pending turn;
+ *   background items  a shell, monitor or tool a turn left running in the
+ *                     background, which T3 marks the turn's own item;
+ *   background roster the tasks a provider thread says it still has going;
+ *   runs              a run that is running, or waiting on background work
+ *                     after its turn has ended. One that is being prepared
+ *                     or started, or is queued for its turn, is the old
+ *                     pending turn. A queue T3 holds until the user releases
+ *                     it is idle, as T3 itself shows it, and a restart leaves
+ *                     it held;
  *   runtime requests  an approval or a question waiting for an answer.
  *
- * A subagent with no start time yet is dated by its last update, which is as
- * good for the restart rule: a row last touched before the server started
- * predates it.
+ * Work with no start time yet is dated by its last update, which is as good
+ * for the restart rule: a row last touched before the server started
+ * predates it, since T3's recovery rewrites every row it cancels. A run is
+ * dated by when it started, never by when it was asked for: a run queued
+ * before a restart can be running after it.
  */
 function readCurrent(db) {
   const turns = [
     ...db
       .prepare(
-        `SELECT turn.thread_id, turn.provider_turn_id AS turn_id, turn.status AS state, turn.started_at AS at,
+        `SELECT turn.thread_id, turn.provider_turn_id AS turn_id, turn.run_attempt_id AS attempt_id, turn.provider_thread_id,
+                turn.status AS state, turn.started_at AS at,
                 CASE turn.status WHEN 'running' THEN 'running' ELSE 'pending' END AS kind
            FROM orchestration_v2_projection_provider_turns AS turn
           WHERE turn.status IN ('running', 'pending') AND ${LIVE_THREAD('turn')}`,
@@ -130,18 +147,50 @@ function readCurrent(db) {
       .all(),
     ...db
       .prepare(
-        `SELECT agent.thread_id, agent.subagent_id AS turn_id, agent.status AS state,
+        `SELECT agent.thread_id, agent.subagent_id AS turn_id, ${FIELD('agent', 'nativeTaskRef.nativeId')} AS native_id,
+                agent.run_id, agent.provider_thread_id, agent.status AS state,
                 COALESCE(agent.started_at, agent.updated_at) AS at, 'running' AS kind
            FROM orchestration_v2_projection_subagents AS agent
           WHERE agent.origin = 'provider_native' AND agent.status IN ('pending', 'running', 'waiting')
             AND ${LIVE_THREAD('agent')}`,
       )
       .all(),
+    // A subagent T3 runs as a thread of its own is not cut by the restart:
+    // T3 continues that thread, and its turns count there.
     ...db
       .prepare(
-        `SELECT run.thread_id, run.run_id AS turn_id, run.status AS state, run.requested_at AS at, 'pending' AS kind
+        `SELECT item.thread_id, COALESCE(${FIELD('item', 'subagentId')}, item.turn_item_id) AS turn_id,
+                ${FIELD('item', 'nativeItemRef.nativeId')} AS native_id, item.run_id, item.provider_thread_id, item.status AS state,
+                COALESCE(${FIELD('item', 'startedAt')}, item.updated_at) AS at, 'running' AS kind
+           FROM orchestration_v2_projection_turn_items AS item
+          WHERE item.type IN ('command_execution', 'dynamic_tool', 'subagent') AND item.status IN ('pending', 'running', 'waiting')
+            AND NOT (item.type = 'subagent' AND ${FIELD('item', 'origin')} IS 'app_owned'
+                     AND (${FIELD('item', 'childThreadId')} IS NOT NULL OR ${FIELD('item', 'remoteChild')} IS NOT NULL))
+            AND ${LIVE_THREAD('item')}`,
+      )
+      .all(),
+    // A subagent's own provider thread is cleared with it, so only the
+    // threads no subagent owns are read.
+    ...db
+      .prepare(
+        `SELECT owner.thread_id, json_extract(task.value, '$.taskId') AS turn_id, json_extract(task.value, '$.taskId') AS native_id,
+                json_extract(task.value, '$.parentTaskId') AS parent_id, owner.provider_thread_id,
+                'background' AS state, owner.updated_at AS at, 'running' AS kind
+           FROM orchestration_v2_projection_provider_threads AS owner,
+                json_each(CASE WHEN json_valid(owner.payload_json) THEN owner.payload_json END, '$.pendingBackgroundTasks') AS task
+          WHERE owner.owner_node_id IS NULL AND ${LIVE_THREAD('owner')}`,
+      )
+      .all(),
+    ...db
+      .prepare(
+        `SELECT run.thread_id, run.run_id AS turn_id, run.run_id, ${FIELD('run', 'activeAttemptId')} AS attempt_id,
+                run.provider_thread_id, 'run' AS scope, run.status AS state,
+                CASE WHEN run.status IN ('running', 'waiting') THEN ${FIELD('run', 'startedAt')} ELSE run.requested_at END AS at,
+                CASE WHEN run.status IN ('running', 'waiting') THEN 'running' ELSE 'pending' END AS kind
            FROM orchestration_v2_projection_runs AS run
-          WHERE run.status IN ('preparing', 'queued', 'starting') AND ${LIVE_THREAD('run')}`,
+          WHERE (run.status IN ('preparing', 'starting', 'running', 'waiting')
+                 OR (run.status = 'queued' AND ${FIELD('run', 'queueHeld')} IS NOT 1))
+            AND ${LIVE_THREAD('run')}`,
       )
       .all(),
   ];
@@ -153,7 +202,34 @@ function readCurrent(db) {
         WHERE request.status = 'pending' AND ${LIVE_THREAD('request')}`,
     )
     .all();
-  return { turns, approvals, titles: fetchTitles(db, 'orchestration_v2_projection_threads', [...turns, ...approvals]) };
+  const work = distinctWork(turns);
+  return { turns: work, approvals, titles: fetchTitles(db, 'orchestration_v2_projection_threads', [...work, ...approvals]) };
+}
+
+/**
+ * One row for each piece of running work. T3 records some of it in more than
+ * one place: a native subagent in its own table and as an item of its turn, a
+ * background task as an item and in its thread's roster, where a task a
+ * subagent started names it as its parent. A run counts on its own only when
+ * nothing running in it, or on its provider thread, does already, as when it
+ * waits on output after its turn has ended. Pending rows are never the same
+ * work twice.
+ */
+const HOLDERS = ['run_id', 'attempt_id', 'provider_thread_id'];
+
+function distinctWork(rows) {
+  const seen = new Set();
+  const holding = new Set();
+  return rows.filter((row) => {
+    if (row.kind !== 'running') return true;
+    const ids = [row.turn_id, row.native_id].filter(Boolean).map((id) => `${row.thread_id}\0${id}`);
+    const holds = HOLDERS.filter((column) => row[column]).map((column) => `${column}\0${row[column]}`);
+    if (row.scope === 'run') return !holds.some((id) => holding.has(id));
+    if ([...ids, row.parent_id && `${row.thread_id}\0${row.parent_id}`].some((id) => id && seen.has(id))) return false;
+    for (const id of ids) seen.add(id);
+    for (const id of holds) holding.add(id);
+    return true;
+  });
 }
 
 const RETIRED = { stopped: 'the service is not running', restarted: 'the service restarted after this turn began' };
