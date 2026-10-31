@@ -34,6 +34,9 @@ function signedTree(dir, version, privateKey, { floor = null } = {}) {
   return dir;
 }
 
+// The fixtures are written from agent/package.json, so a reply held to one comes
+// from a live tree of that version.
+const PACKAGE_VERSION = JSON.parse(fs.readFileSync(path.join(AGENT, 'package.json'), 'utf8')).version;
 const versionOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
 const floorFile = (base) => path.join(base, 'agent-floor.json');
 const readFloor = (base) => JSON.parse(fs.readFileSync(floorFile(base), 'utf8'));
@@ -370,8 +373,8 @@ test('the refusals a client sees are the ones the fixtures show', async () => {
     assert.equal(flagged.reasonCode, 'restricted');
     assert.equal(flagged.argument, '--allow-downgrade');
     assert.equal(flagged.outcome, 'failed');
-    assert.equal(versionOf(path.join(base, 'agent')), '3.1.0');
-  });
+    assert.equal(versionOf(path.join(base, 'agent')), PACKAGE_VERSION);
+  }, { live: PACKAGE_VERSION });
 });
 
 // ---------------------------------------------------------------------------
