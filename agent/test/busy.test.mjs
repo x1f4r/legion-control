@@ -526,5 +526,27 @@ test('a current database T3 has changed beyond reading blocks rather than readin
     assert.equal(answer.busy, true);
     assert.equal(answer.unknown, true);
     assert.equal(answer.evidence, 'probe-error');
+    // A copy has the same schema, and of statev2.sqlite it would be gigabytes.
+    assert.match(answer.error, /no such table.*, and a copy would read the same$/);
+  });
+});
+
+test('a database SQLite cannot open where it lies is read from a copy', { skip: (process.platform === 'win32' || process.getuid?.() === 0) && 'needs a directory its owner cannot write' }, async () => {
+  await withHome(async (home) => {
+    const { DatabaseSync } = require('node:sqlite');
+    const t3Home = makeCurrentDb(home, { turns: [{ thread: 't', status: 'running', startedAt: hoursAgo(1) }] });
+    const userdata = path.join(t3Home, 'userdata');
+    const db = new DatabaseSync(path.join(userdata, 'statev2.sqlite'));
+    db.exec('PRAGMA journal_mode = WAL');
+    db.close();
+    // A reader of a WAL database needs its -shm file, and cannot make one here.
+    fs.chmodSync(userdata, 0o555);
+    try {
+      const answer = checkT3Sqlite({ home: t3Home });
+      assert.equal(answer.runningTurns, 1);
+      assert.equal(answer.unknown, false);
+    } finally {
+      fs.chmodSync(userdata, 0o755);
+    }
   });
 });

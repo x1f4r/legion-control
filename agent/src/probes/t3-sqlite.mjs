@@ -456,6 +456,19 @@ function readViaCopy(sqlite, file, read) {
 }
 
 /**
+ * Whether a copy could read what the database in place could not. What a copy
+ * helps with is a file SQLite cannot open, map or lock where it lies. SQL that
+ * no longer fits T3's schema fails the same in a copy, and so does a file that
+ * is no database; statev2.sqlite runs to gigabytes, and copying it on every
+ * check after a T3 schema change only to answer unknown would be the probe's
+ * whole cost.
+ */
+function copyCouldHelp(err) {
+  // SQLITE_ERROR, SQLITE_CORRUPT and SQLITE_NOTADB, with their extended codes.
+  return ![1, 11, 26].includes(Number(err?.errcode) & 0xff);
+}
+
+/**
  * When a database was last written. SQLite in WAL mode writes to the -wal file
  * and folds it into the main file only at a checkpoint, so the later of the two
  * is the answer. The -shm file is left out: every reader touches it, this probe
@@ -534,6 +547,14 @@ export function checkT3Sqlite(probe = {}, { liveness = null, serviceName = 'the 
       read = openAndRead(sqlite, database.file, { readOnly: true }, database.read);
     } catch (err) {
       firstError = err;
+    }
+    if (!read && !copyCouldHelp(firstError)) {
+      return answer('unknown', 'busy state unknown', {
+        evidence: 'probe-error',
+        path: database.file,
+        startedAt,
+        error: `direct read failed (${firstError.message}), and a copy would read the same`,
+      });
     }
     if (!read) {
       try {
