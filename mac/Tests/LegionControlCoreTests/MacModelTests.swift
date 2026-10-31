@@ -130,6 +130,22 @@ struct MacModelTests {
         #expect(runner.sent.count == before)
     }
 
+    @Test("this Mac's row says when its agent looks after nothing, rather than checking forever")
+    func rowOfAnAgentWithNoServices() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: """
+        { "ok": true, "contract": 3, "agentVersion": "3.1.0", "system": { "id": "mac", "name": "macOS" },
+          "agent": { "version": "3.1.0", "contract": 3 }, "services": [], "actions": [],
+          "updates": { "automatic": false, "pauseUntil": null, "maintenanceWindows": [] } }
+        """)
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        #expect(model.sidebarSummary == "checking")
+        await model.refresh()
+        #expect(model.isReachable)
+        #expect(model.sidebarSummary == "no services configured")
+    }
+
     // MARK: - Parity
 
     @Test("the local device offers restart and configured actions, like every other machine")

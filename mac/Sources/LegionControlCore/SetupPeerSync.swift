@@ -206,8 +206,8 @@ final class SetupPeerSync {
             case .hold(let code):
                 self.lastShare = nil
                 self.heldReasons[local.hash] = code == "restricted"
-                    ? "\(channel.setupHolder) takes this revision only from a device whose key is not restricted. A device with a full key shares it on its next read; nothing is sent from here again until the setup changes or you try again."
-                    : "\(channel.setupHolder) refused this revision: \(Self.ending(reply?.problems?.first?.message ?? Self.refusal(reply))) Nothing is sent from here again until the setup changes or you try again."
+                    ? "\(Self.opening(channel.setupHolder)) takes this revision only from a device whose key is not restricted. A device with a full key shares it on its next read; nothing is sent from here again until the setup changes or you try again."
+                    : "\(Self.opening(channel.setupHolder)) refused this revision: \(Self.ending(reply?.problems?.first?.message ?? Self.refusal(reply))) Nothing is sent from here again until the setup changes or you try again."
             }
             channel.setupDidChange()
         }
@@ -401,17 +401,23 @@ final class SetupPeerSync {
         case .diverged:
             let mine = local?.identity
             return .conflict("""
-                \(holder) and this device have both changed the setup since they last agreed. \
+                \(Self.opening(holder)) and this device have both changed the setup since they last agreed. \
                 This device has revision \(mine?.revisionNumber ?? 0) (\(mine?.authorDescription ?? "unknown")), \
                 \(holder) has revision \(remote?.revisionNumber ?? 0) (\(remote?.authorDescription ?? "unknown")). \
                 Neither was made from the other, so nothing has been sent either way.
                 """)
         case .differentSetup:
             return .conflict("""
-                \(holder) is carrying a different setup (\(remote?.name ?? remote?.id ?? "unnamed")), \
+                \(Self.opening(holder)) is carrying a different setup (\(remote?.name ?? remote?.id ?? "unnamed")), \
                 not an older copy of this one. Nothing has been sent: replacing it is a decision.
                 """)
         }
+    }
+
+    /// A holder's name where it opens a sentence. A machine's name already starts with a capital,
+    /// but this Mac's own agent is "the local agent".
+    static func opening(_ holder: String) -> String {
+        holder.prefix(1).uppercased() + holder.dropFirst()
     }
 
     /// The agent's own words, closed as a sentence.

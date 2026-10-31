@@ -522,5 +522,19 @@ struct SetupSyncTests {
         #expect(sentence.contains("MacBook"))
         #expect(sentence.contains("Pixel"))
         #expect(sentence.contains("nothing has been sent"))
+        // This Mac's own agent opens the sentence too, and is not "the local agent" there.
+        guard case .conflict(let local) = sync.sharing(holder: "the local agent", local: mine, status: channel.status) else {
+            Issue.record("expected a conflict")
+            return
+        }
+        #expect(local.hasPrefix("The local agent and this device"))
+        #expect(local.contains(", the local agent has revision 6"))
+    }
+
+    @Test("a holder's name opens a sentence with a capital, and is left alone otherwise")
+    func holderOpensASentence() {
+        #expect(SetupPeerSync.opening("the local agent") == "The local agent")
+        #expect(SetupPeerSync.opening("Pi") == "Pi")
+        #expect(SetupPeerSync.opening("") == "")
     }
 }

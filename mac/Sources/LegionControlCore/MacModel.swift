@@ -137,8 +137,11 @@ final class MacModel: AgentDevice {
     /// (SidebarRow.summary).
     var sidebarSummary: String {
         if failure != nil { return "not readable" }
-        guard !services.isEmpty else { return "checking" }
+        guard isReachable else { return "checking" }
         if !unresolvedOperations.isEmpty { return "outcome not known yet" }
+        // An agent that answered with nothing to look after has said all there is to say. Reading
+        // "checking" here kept VoiceOver waiting for an answer that had already come.
+        if services.isEmpty { return "no services configured" }
         if services.contains(where: { $0.hasStagedUpdate }) { return "update waiting" }
         if services.contains(where: { $0.upToDate == false }) { return "update available" }
         if let reason = busyReason { return reason }
