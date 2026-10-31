@@ -126,6 +126,10 @@ enum AgentReason: Sendable, Equatable {
         case .notInstalled:
             return "\(subject) is not installed there."
         case .notRunning:
+            // One code for a service that would not stop, would not start, or came up and does not
+            // answer, so only the agent's words say which. Said for itself, it put "Codex CLI is
+            // not running." on an update that failed because Codex CLI would not stop.
+            if let message, !message.isEmpty { return message }
             return "\(subject) is not running."
         case .appClosed:
             return "\(subject) is not open, so there was nothing to quit and restart."

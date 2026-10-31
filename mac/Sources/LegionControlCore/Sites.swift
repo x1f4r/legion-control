@@ -31,6 +31,10 @@ enum SiteAwareness {
         static let nowhere = Placement(matching: [], effective: nil, isAmbiguous: false, confirmed: nil, addresses: [])
 
         /// What the machine section says under the wake row.
+        ///
+        /// "Unconfirmed" is said only where nothing is effective (section 10.1). One matching site is
+        /// effective, and this device wakes and dials as though it were there, so calling it
+        /// unconfirmed read as holding back while the app did the opposite.
         func description(sites: [Site]) -> String {
             func name(_ id: String) -> String { sites.first { $0.id == id }?.name ?? id }
             if let confirmed, !confirmed.isEmpty, sites.contains(where: { $0.id == confirmed }) {
@@ -42,10 +46,11 @@ enum SiteAwareness {
             case 0:
                 return "Not on any configured network, so a magic packet from here would not reach anything."
             case 1:
-                return "Looks like \(name(matching[0])), from this device's addresses. Site unconfirmed: a private address range is a hint, not proof."
+                let site = name(matching[0])
+                return "On \(site), from this device's addresses. A private address range is a hint, not proof: another network on the same range would read as \(site) too."
             default:
                 let names = matching.map(name).joined(separator: " and ")
-                return "This device's addresses match \(names). Overlapping private ranges cannot be told apart, so wake goes through a helper unless you say which site this is."
+                return "This device's addresses match \(names). Overlapping private ranges cannot be told apart, so the site is unconfirmed and wake goes through a helper unless you say which site this is."
             }
         }
     }

@@ -146,6 +146,57 @@ struct MacModelTests {
         #expect(model.sidebarSummary == "no services configured")
     }
 
+    @Test("this Mac's row says when its agent is older than the one this app carries")
+    func rowOfAnOlderAgent() async throws {
+        let runner = FakeRunner()
+        let status = """
+        { "ok": true, "contract": 3, "agentVersion": "3.0.1", "system": { "id": "mac", "name": "macOS" },
+          "agent": { "version": "3.0.1", "contract": 3 },
+          "services": [ { "id": "t3", "name": "T3 Code", "installed": "2", "latest": "2", "upToDate": true,
+                          "busy": { "busy": false, "unknown": false, "monitored": true } } ],
+          "actions": [], "updates": { "automatic": false, "pauseUntil": null, "maintenanceWindows": [] } }
+        """
+        runner.answer("status", json: status)
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.bundledAgentVersion = "3.1.0"
+        await model.refresh()
+        #expect(model.sidebarSummary == "agent 3.1.0 available")
+        #expect(model.newerBundledAgentLine == "Agent 3.0.1 is older than the 3.1.0 this app carries.")
+        #expect(model.agentInstallRefusal == nil)
+        model.core.bundledAgentVersion = "3.0.1"
+        #expect(model.sidebarSummary == "up to date")
+
+        // The install beside the line says why it cannot be pressed, as it does for a machine.
+        runner.answer("status", json: status.replacingOccurrences(
+            of: #""agent": { "version": "3.0.1", "contract": 3 }"#,
+            with: #""agent": { "version": "3.0.1", "contract": 3, "restrictedSession": true }"#))
+        await model.refresh()
+        #expect(model.agentInstallRefusal == "The agent is installed from here only from an administrator session, and this one is restricted.")
+    }
+
+    @Test("a queued request that started stays in sight on this Mac's page, which draws nothing running")
+    func startedQueuedRequestStaysInSight() async throws {
+        // A machine's page lists what its status says is running, and leaves an owed record among
+        // them out of the outcomes nobody knows. This page lists nothing running, so it keeps it.
+        let runner = FakeRunner()
+        let (model, store, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = OperationRecord(id: AgentToken.newOperationId(), machineId: model.historyMachineId, machineName: "This Mac",
+                                     kind: .sleep, subject: "This Mac", summary: "Putting This Mac to sleep.", agentTracked: true)
+        store.begin(record)
+        store.markQueued(record.id, expiresAt: Date().addingTimeInterval(3600), summary: "The sleep is queued.")
+        runner.answer("status", json: Self.status.replacingOccurrences(
+            of: #""agent": { "version": "3.0.0", "contract": 3 },"#,
+            with: #""agent": { "version": "3.0.0", "contract": 3 }, "operations": { "running": [ { "id": "\#(record.id)", "kind": "sleep", "state": "running", "outcome": "pending" } ] },"#))
+        await model.refresh()
+
+        #expect(store.record(id: record.id)?.state == .running)
+        #expect(!model.isShownRunning(record))
+        #expect(model.unresolvedOperations.map(\.id) == [record.id])
+        #expect(model.unresolvedOperations.first?.summary == "Sleep: This Mac left the queue and started on This Mac.")
+    }
+
     // MARK: - Parity
 
     @Test("the local device offers restart and configured actions, like every other machine")

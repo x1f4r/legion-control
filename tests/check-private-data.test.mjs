@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { checkPrivateData } from '../scripts/check-private-data.mjs';
+import { checkCommitMessages, checkPrivateData } from '../scripts/check-private-data.mjs';
 
 const repository = path.resolve(import.meta.dirname, '..');
 const script = path.join(repository, 'scripts', 'check-private-data.mjs');
@@ -188,6 +188,38 @@ test('what git ignores and what is binary is not read, and a clean checkout pass
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /\nChecked 3 files: no private home directories, addresses or terms\.\n$/);
   assert.equal(fs.existsSync(path.join(tree, 'build', 'output.txt')), true);
+});
+
+test('the messages of the commits a push would publish are read as files are, the author left alone', (t) => {
+  // A body quoting a wake row with a real site's name went into a branch whose files all passed.
+  const { tree, home, check } = checkout(t, { 'README.md': 'clean\n' });
+  const git = (...args) => {
+    const done = spawnSync('git', ['-C', tree, '-c', 'user.name=Zebulon', '-c', 'user.email=zebulon@example.com', ...args], { encoding: 'utf8' });
+    assert.equal(done.status, 0, done.stderr);
+    return done.stdout.trim();
+  };
+  git('add', '.');
+  git('commit', '-q', '-m', 'Start');
+  git('commit', '-q', '--allow-empty', '-m', 'Say where the row is\n\nIt said "Looks like Albatross", and the key was at\n' + `${posixHome('home')}/.ssh.`);
+  const named = git('rev-parse', '--short', 'HEAD');
+  git('commit', '-q', '--allow-empty', '-m', 'Say it for Home');
+  assert.deepEqual(check({ LEGION_PRIVATE_TERMS: 'albatross, zebulon' }).findings, []);
+
+  const env = { LEGION_PRIVATE_TERMS: 'albatross, zebulon' };
+  const result = checkCommitMessages(tree, 'HEAD~2..HEAD', { env, home });
+  assert.equal(result.commits, 2);
+  assert.deepEqual(result.findings.map(({ file, line }) => `${file}:${line}`), [`commit ${named}:3`, `commit ${named}:4`]);
+  assert.equal(result.findings[0].message, 'holds entry 1 of LEGION_PRIVATE_TERMS.');
+  assert.deepEqual(checkCommitMessages(tree, 'HEAD~1..HEAD', { env, home }).findings, []);
+
+  const run = (...args) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', env: { ...process.env, ...env, HOME: home, USERPROFILE: home } });
+  const printed = run('--commits', 'HEAD~2..HEAD', tree);
+  assert.equal(printed.status, 1);
+  assert.match(printed.stderr, /\n2 private values in 1 of 2 commit messages\. The repository is public: write placeholders instead\.\n$/);
+  assert.doesNotMatch(printed.stdout + printed.stderr, /zebulon|albatross/i);
+  assert.equal(run('--commits', 'HEAD~1..HEAD', tree).stdout.split('\n')[1], 'Checked 1 commit messages: no private home directories, addresses or terms.');
+  assert.equal(run('--commits').status, 2);
+  assert.equal(run('--commits', 'no-such-branch..HEAD', tree).status, 2);
 });
 
 test('outside a git checkout the check says why in one line, as the syntax check does', (t) => {

@@ -82,8 +82,10 @@ struct AgentBootstrapTests {
         let node = try #require(["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"].first { FileManager.default.isExecutableFile(atPath: $0) })
         let layout = try AgentBootstrap.layout(argv: [node, old.appending(path: "index.mjs").path])
         let operation = AgentToken.newOperationId()
-        let reply = try await AgentBootstrap.installLocal(payload: archive, operation: operation, layout: layout)
+        let staging = dir.appending(path: "staging")
+        let reply = try await AgentBootstrap.installLocal(payload: archive, operation: operation, layout: layout, staging: staging)
         #expect(reply.action == "installed")
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
         let proof = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: base.appending(path: "proof.json"))) as? [String: Any])
         #expect(proof["base"] as? String == base.path)
         #expect(proof["args"] as? [String] == ["self-update", "--install", "--op", operation])
@@ -186,6 +188,24 @@ struct AgentBootstrapTests {
         #expect(AgentDowngrade.reason(installing: "3.1.0", over: try Self.status(#"{"ok":true,"agentVersion":"2.4.1"}"#)) == nil)
     }
 
+    @Test("a newer bundled agent is offered as one, and nothing else is")
+    func newerBundleIsOffered() throws {
+        // 3.0 speaks the contract this app needs, so only the version says it is a release behind.
+        let behind = try Self.status(#"{"ok":true,"contract":3,"agent":{"version":"3.0.1","contract":3}}"#)
+        #expect(AgentUpgrade.offered("3.1.0", over: behind) == "3.1.0")
+        #expect(AgentUpgrade.offered("3.0.1", over: behind) == nil)
+        #expect(AgentUpgrade.offered("3.0.0", over: behind) == nil)
+        // Nothing carried, nothing answered, and a version nobody can read are not behind.
+        #expect(AgentUpgrade.offered(nil, over: behind) == nil)
+        #expect(AgentUpgrade.offered("3.1.0", over: nil) == nil)
+        #expect(AgentUpgrade.offered("3.1.0", over: try Self.status(#"{"ok":false,"contract":3,"agent":{"version":"3.0.1","contract":3}}"#)) == nil)
+        #expect(AgentUpgrade.offered("3.1.0", over: try Self.status(#"{"ok":true,"agentVersion":"nightly"}"#)) == nil)
+        // A 2.x agent is behind, and a bundle below the floor is a way back however old the agent.
+        #expect(AgentUpgrade.offered("3.1.0", over: try Self.status(#"{"ok":true,"agentVersion":"2.4.1"}"#)) == "3.1.0")
+        let floored = try Self.status(#"{"ok":true,"contract":3,"agent":{"version":"3.0.1","contract":3,"floor":"3.2.0"}}"#)
+        #expect(AgentUpgrade.offered("3.1.0", over: floored) == nil)
+    }
+
     @Test("going back is offered only to an agent that reports a floor, and never over a restricted key")
     func goingBackNeedsAFloor() throws {
         let floored = try JSONDecoder().decode(AgentStatus.self, from: ContractCorpus.data("fixtures/status.full.json"))
@@ -237,7 +257,7 @@ struct AgentBootstrapTests {
         }
     }
 
-    @Test("bootstrap refuses archive symlinks before running any staged code")
+    @Test("bootstrap refuses archive symlinks before running any staged code, and keeps nothing it refused")
     func unsafeArchive() async throws {
         let (dir, source, _) = try await fixture()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -245,8 +265,12 @@ struct AgentBootstrapTests {
         let archive = dir.appending(path: "unsafe.tgz")
         let result = await Shell.run(executable: "/usr/bin/tar", arguments: ["-czf", archive.path, "-C", dir.appending(path: "source").path, "agent"], timeout: 10)
         #expect(result.succeeded)
+        let staging = dir.appending(path: "staging")
         await #expect(throws: AgentBootstrap.Failure.self) {
-            try await AgentBootstrap.stagedArchive(Data(contentsOf: archive), operation: AgentToken.newOperationId())
+            try await AgentBootstrap.stagedArchive(Data(contentsOf: archive), operation: AgentToken.newOperationId(), in: staging)
         }
+        // Every refused archive used to stay where it was staged, a hundred of them in the real
+        // application support folder from this test alone.
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }
 }

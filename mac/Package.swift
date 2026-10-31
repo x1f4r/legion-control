@@ -24,9 +24,15 @@ let package = Package(
                 .swiftLanguageMode(.v6)
             ]
         ),
+        // Points LEGION_CONTROL_HOME at a directory of the test run's own before the first test
+        // starts, so no test can write into the real app state, whatever it forgets to pass in.
+        .target(
+            name: "TestHome",
+            path: "Tests/TestHome"
+        ),
         .testTarget(
             name: "LegionControlCoreTests",
-            dependencies: ["LegionControlCore"],
+            dependencies: ["LegionControlCore", "TestHome"],
             path: "Tests/LegionControlCoreTests",
             swiftSettings: [
                 .swiftLanguageMode(.v6)

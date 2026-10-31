@@ -188,7 +188,48 @@ struct OperationTests {
         #expect(settled.summary.contains("never reached"))
     }
 
-    @Test("a queued request is not finished and is not chased")
+    @Test("no record of an id is read by what the agent said of it before")
+    func noRecordAfterItWasHeard() throws {
+        let (store, directory) = try Self.store()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Never a word from the agent about it: it never started.
+        let unheard = Self.record()
+        store.begin(unheard)
+        store.finish(unheard.id, state: .unknown, summary: "unknown")
+        store.resolveWithNoRecord(unheard.id)
+        #expect(store.record(id: unheard.id)?.state == .failed)
+
+        // Listed as running once, it ran, and the record that would say how it ended was pruned.
+        // It used to be filed as one that never reached the machine.
+        let heard = Self.record(kind: .sleep)
+        store.begin(heard)
+        store.markQueued(heard.id, expiresAt: Date().addingTimeInterval(3600), summary: "queued until idle")
+        var running = AgentOperation()
+        running.rawId = heard.id
+        running.state = "running"
+        store.reconcile(heard.id, with: running)
+        #expect(store.record(id: heard.id)?.summary == "Sleep: demo left the queue and started on Pi.")
+        #expect(store.record(id: heard.id)?.agentKnew == true)
+        store.resolveWithNoRecord(heard.id)
+        let lost = try #require(store.record(id: heard.id))
+        #expect(lost.state == .unknown)
+        #expect(!lost.needsReconciliation)
+        #expect(lost.summary == "Sleep: demo reached Pi, which no longer has a record of it, so how it ended is not known.")
+
+        // Still queued here, its deadline decides.
+        let queued = Self.record(kind: .sleep)
+        store.begin(queued)
+        store.markQueued(queued.id, expiresAt: Date().addingTimeInterval(-60), summary: "queued until idle")
+        store.resolveWithNoRecord(queued.id)
+        #expect(store.record(id: queued.id)?.state == .expired)
+
+        // A history written before the key existed still reads.
+        let older = try JSONDecoder().decode(OperationRecord.self, from: try JSONEncoder().encode(Self.record()))
+        #expect(older.agentKnew == nil)
+    }
+
+    @Test("a queued request is not finished and owes no unknown outcome")
     func queuedIsHeld() throws {
         let (store, directory) = try Self.store()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -207,6 +248,56 @@ struct OperationTests {
         // It lives on the machine, so reopening the app leaves it exactly as it was.
         let reopened = OperationStore(url: store.url)
         #expect(reopened.record(id: record.id)?.state == .queued)
+    }
+
+    @Test("a queued request the agent has no record of is expired once its time is up, and unknown before")
+    func queuedWithoutRecord() throws {
+        let (store, directory) = try Self.store()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Two sleeps queued nine days ago read "waiting for idle" ever after, though both agents
+        // had expired and pruned them long before.
+        let expiry = Date().addingTimeInterval(-9 * 24 * 60 * 60)
+        let lapsed = Self.record(kind: .sleep)
+        store.begin(lapsed)
+        store.markQueued(lapsed.id, expiresAt: expiry, summary: "queued until idle")
+        store.resolveQueuedAsGone(lapsed.id)
+        let expired = try #require(store.record(id: lapsed.id))
+        #expect(expired.state == .expired)
+        #expect(!expired.needsReconciliation)
+        // It stopped waiting when its time was up, not when this app noticed, and nothing says it
+        // never ran: the record that would have said is gone.
+        #expect(expired.finishedAt == expiry)
+        #expect(expired.summary.hasPrefix("The queued request expired on "))
+        #expect(expired.summary.hasSuffix("Pi no longer has a record of it, so whether it ran before then is not known."))
+        #expect(store.queued.isEmpty)
+
+        // One that came back without an expiry is held at most as long as any agent holds one.
+        let unnamed = Self.record(kind: .sleep)
+        store.begin(unnamed)
+        store.markQueued(unnamed.id, expiresAt: nil, summary: "queued until idle")
+        store.resolveQueuedAsGone(unnamed.id, now: unnamed.startedAt.addingTimeInterval(OperationRecord.longestQueue - 60))
+        #expect(store.record(id: unnamed.id)?.state == .unknown)
+        let old = Self.record(kind: .sleep)
+        store.begin(old)
+        store.markQueued(old.id, expiresAt: nil, summary: "queued until idle")
+        store.resolveQueuedAsGone(old.id, now: old.startedAt.addingTimeInterval(OperationRecord.longestQueue + 60))
+        #expect(store.record(id: old.id)?.state == .expired)
+        #expect(store.record(id: old.id)?.summary.contains("waited longer than any agent holds one") == true)
+
+        // Before its time the agent let go of a request it was still meant to hold: it may have run.
+        let early = Self.record(kind: .update)
+        store.begin(early)
+        store.markQueued(early.id, expiresAt: Date().addingTimeInterval(3600), summary: "queued until idle")
+        store.resolveQueuedAsGone(early.id)
+        let lost = try #require(store.record(id: early.id))
+        #expect(lost.state == .unknown)
+        #expect(!lost.needsReconciliation)
+        #expect(lost.summary == "Pi no longer holds the queued request and has no record of it, so whether it ran is not known.")
+
+        // Only a queued one: a record that has moved on is not touched.
+        store.resolveQueuedAsGone(lapsed.id)
+        #expect(store.record(id: lapsed.id) == expired)
     }
 
     @Test("the outcome decides the state, and the action only says which kind of it each one is")
