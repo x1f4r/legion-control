@@ -278,8 +278,8 @@ test('a task probe that fails is unknown in status, and the stop loop never take
     // rather than install over a service that may still be running.
     const update = invoke(home, ['update'], { env: powershell.env });
     assert.equal(update.action, 'failed');
-    assert.equal(update.reasonCode, 'not-running');
-    assert.match(update.message, /would not stop/);
+    assert.equal(update.reasonCode, 'busy');
+    assert.match(update.message, /would not stop: .*; nothing was installed$/);
     assert.match(powershell.scripts(), /Stop-ScheduledTask -TaskName 'Demo'/);
     assert.equal(readFixture(dir, 'update-runs'), '', 'nothing was installed');
     assert.equal(readFixture(dir, 'installed'), '1.0.0');

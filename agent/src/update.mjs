@@ -170,6 +170,19 @@ function heldAtSecondCheck(busy) {
 }
 
 /**
+ * A stop that did not complete, before anything was installed. Nothing is
+ * rolled back or started over it, and nothing about it failed while being
+ * applied. It was reported as not-running, which every client words as the
+ * opposite of what happened: the service kept running, as a busy one does.
+ */
+function wouldNotStop({ service, from, to, stopped }) {
+  const message = `${service.name} would not stop: ${stopped.message}; nothing was installed`;
+  log(message, 'update');
+  recordLastUpdate(service, 'failed', from, to, message);
+  return { ok: false, action: 'failed', reasonCode: REASON.busy, from, to, message };
+}
+
+/**
  * A service with nothing of its own to stop that was still busy when its stop
  * step gave up (service.mjs). Nothing was asked to stop and nothing was
  * installed, so it waits for an idle window like any other deferral, --force
@@ -582,12 +595,7 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
 
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
   if (!stopped.ok && stopped.busy) return stillBusyAtStop({ service, from, to, stopped, later: `${to} will be installed` });
-  if (!stopped.ok) {
-    const message = `${service.name} would not stop: ${stopped.message}`;
-    log(message, 'update');
-    recordLastUpdate(service, 'failed', from, to, message);
-    return { ok: false, action: 'failed', reasonCode: REASON.notRunning, from, to, message };
-  }
+  if (!stopped.ok) return wouldNotStop({ service, from, to, stopped });
 
   const reached = { installing: false };
   try {
@@ -1005,12 +1013,7 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
 
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
   if (!stopped.ok && stopped.busy) return stillBusyAtStop({ service, from, to, stopped, later: 'it will be applied' });
-  if (!stopped.ok) {
-    const message = `${service.name} would not stop: ${stopped.message}`;
-    log(message, 'update');
-    recordLastUpdate(service, 'failed', from, to, message);
-    return { ok: false, action: 'failed', reasonCode: REASON.notRunning, from, to, message };
-  }
+  if (!stopped.ok) return wouldNotStop({ service, from, to, stopped });
 
   lock.phase('installing');
   recordPhase(opId, 'installing');

@@ -87,8 +87,12 @@ test('an npm service that will not stop is left running, with nothing installed 
     const { payload, exitCode } = run(['update']);
     assert.equal(exitCode, 1);
     assert.equal(payload.action, 'failed');
-    assert.equal(payload.reasonCode, 'not-running');
-    assert.match(payload.message, /would not stop/);
+    // Not "not running", which is the opposite of what happened, nor a
+    // failure while it was applied: nothing was.
+    assert.equal(payload.reasonCode, 'busy');
+    assert.equal(payload.outcome, 'failed');
+    assert.match(payload.message, /would not stop: .*; nothing was installed$/);
+    assert.doesNotMatch(payload.message, /roll/);
     // One stop was asked for. A rollback used to ask for a second one, wait
     // out its own budget, and start the service over itself.
     assert.equal(readFixture(dir, 'stop-runs'), '1');
