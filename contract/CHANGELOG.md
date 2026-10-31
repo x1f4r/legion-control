@@ -4,6 +4,50 @@ The wire contract between the clients and the agent. Within a major contract
 number, keys are only ever added — never renamed, never retyped, never removed.
 A client decodes with every field optional.
 
+## 3 — agent 3.1.1, clients 1.4.1
+
+Contract stays 3. Agent 3.1.1 adds no reply key and no reason code. It changes
+which existing code some answers carry, and adds one optional key to the
+agent's own configuration. Clients decode every code as a string and render one
+they do not know from `message`, so none of them has to change to read these.
+
+### Changed
+
+- **`busy` over `busy-unknown`** (section 6). A gate held back by a service busy
+  on a reading reports `busy`, whatever another service's probe could not say.
+  `busy-unknown` is for a gate that nothing but unreadable probes held, and its
+  message names those services: "whether OpenCode is busy could not be
+  established (…)". Agents before 3.1.1 reported `busy-unknown` whenever any
+  probe was unknown, so a client that names the service it acted on in that
+  sentence names the wrong one; name the ones the message lists.
+- **A service with process `none`**, which every CLI a profile creates is, is
+  not stopped for an update. The update waits, within the stop's 20 s, for that
+  service's own busy probe to answer idle, and answers `deferred` with `busy`
+  or `busy-unknown` when it does not, `--force` included, with nothing
+  installed. Agents before 3.1.1 failed every such update 20 s in.
+- **A stop that did not complete** before anything was installed answers
+  `failed` with `busy`, not `not-running`, and its message says nothing was
+  installed (section 5.3). The outcome stays `failed`.
+- **Sleep failures** (section 5.3). `not-configured` only when nothing could
+  suspend the machine, with a message naming what is missing: the suspend
+  tools looked for, and that `sleep.command` is not set. A suspend command that
+  never returned answers `failed` with `timed-out`, whose outcome is `unknown`,
+  since the machine may have been going down. One that refused answers `failed`
+  with `internal`, in its own words.
+- **The update and action gates pass every service's process evidence** to the
+  busy probes, as status, boot, sleep and the queue already did, so a running
+  row that a stopped or restarted service left behind no longer blocks another
+  service's update or a gated action (section 6).
+
+### Added
+
+- `verify` on an `npm` service in the agent's `config.json`, as a `command`
+  service has: a command that fails when what npm installed does not run. It
+  runs once the installed version is read back and before anything starts, and
+  a failure rolls back. The profile drafts for npm CLIs carry one, which runs
+  the command the package's bin entry names with `--version`
+  (`service-config.profiles.json`).
+
 ## 3 — agent 3.1.0, clients 1.4.0
 
 Contract stays 3 and the setup document stays `"version": 1`. Every reply
