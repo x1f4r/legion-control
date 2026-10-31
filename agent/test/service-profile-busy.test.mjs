@@ -241,7 +241,26 @@ test('an npm service is guarded by the processes of its own install, not of anot
   assert.deepEqual(inspectProfileProcesses('codex-cli', { platform: 'darwin', run, io, home, env: {}, parentPid: AGENT }), BUSY);
 }));
 
-test('a bin link another package has taken over is no longer the package\'s own', { skip: !posix && 'POSIX paths and links' }, () => withRoot((root) => {
+test('an npm CLI that renames itself on Linux is still matched by the name it took', { skip: !posix && 'POSIX paths and links' }, () => withRoot((root) => {
+  const prefix = path.join(root, 'usr', 'local');
+  const packageRoot = path.join(prefix, 'lib', 'node_modules', '@anthropic-ai', 'claude-code');
+  write(path.join(packageRoot, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-code', bin: { claude: 'cli.js' } }));
+  write(path.join(packageRoot, 'cli.js'));
+  const bin = link('../lib/node_modules/@anthropic-ai/claude-code/cli.js', path.join(prefix, 'bin', 'claude'));
+  // cli.js sets process.title to claude: comm says so, argv is that name
+  // written over the old words, and exe is still the runtime.
+  const processes = { 6500: { name: 'claude', ppid: 6400, argv: ['claude', '', '', ''], exe: '/usr/bin/node' } };
+  const asked = { platform: 'linux', io: procFs(root, processes), home: path.join(root, 'home'), env: { LEGIONCTL_NPM_PREFIX: prefix, LEGIONCTL_NPM_PACKAGE: '@anthropic-ai/claude-code' }, parentPid: AGENT };
+  assert.deepEqual(inspectProfileProcesses('claude-code', asked), BUSY, 'the runtime\'s own path is not where the session runs from');
+  // Renamed to anything else, it is no session of this product.
+  processes[6500] = { ...processes[6500], name: 'next-server', argv: ['next-server (v15.0.0)', '', ''] };
+  assert.deepEqual(inspectProfileProcesses('claude-code', asked), IDLE);
+  // Debian's nodejs is the same runtime under another name.
+  processes[6500] = { name: 'nodejs', ppid: 6400, argv: ['nodejs', bin], exe: '/usr/bin/node' };
+  assert.deepEqual(inspectProfileProcesses('claude-code', asked), BUSY);
+}));
+
+test('a bin link another package has taken over is no longer the package\'s own',{ skip: !posix && 'POSIX paths and links' }, () => withRoot((root) => {
   const prefix = path.join(root, 'prefix');
   const other = write(path.join(prefix, 'lib', 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'), '', 0o755);
   const bin = link(other, path.join(prefix, 'bin', 'opencode'));

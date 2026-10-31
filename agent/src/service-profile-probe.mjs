@@ -68,7 +68,7 @@ function identifiedWindowsSystemProcess(row, rows, systemRoot) {
 }
 
 
-const RUNTIME = /^(?:node|bun|electron)(?:\.exe)?$/i;
+const RUNTIME = /^(?:node|nodejs|bun|electron)(?:\.exe)?$/i;
 const SCRIPT_EXTENSION = /\.(?:[cm]?js|[cm]?ts)$/i;
 const INLINE = new Set(['-e', '--eval', '-p', '--print']);
 // task_struct's PF_KTHREAD, in the flags field of /proc/<pid>/stat.
@@ -133,6 +133,11 @@ function scriptOf(list, context) {
  * What one row says its process is: the names it goes by, and the absolute
  * paths that say where its program lives. For node, bun and electron that
  * program is the script they run, never the runtime itself.
+ *
+ * A runtime can rename itself: Claude Code's cli.js sets process.title, and
+ * Linux then shows the new name as comm and writes it over argv. The script is
+ * gone from the row, and the runtime's own path still says nothing about which
+ * install it runs, so such a row has only its name to go by.
  */
 function identify(row, { paths, file, cwdOf }) {
   const name = String(row.name ?? '');
@@ -148,8 +153,8 @@ function identify(row, { paths, file, cwdOf }) {
   else ({ value: argv0 = '', rest = '' } = firstWord(command) ?? {});
   const names = [name, argv0];
   const located = [];
-  const runtime = [name, argv0].some((identity) => RUNTIME.test(identity.split(/[\\/]/).at(-1)));
-  if (runtime) {
+  const runtime = (identity) => RUNTIME.test(String(identity ?? '').split(/[\\/]/).at(-1));
+  if ([name, argv0].some(runtime)) {
     const script = scriptOf(words(rest), { paths, file, cwd: cwdOf?.(row.pid) });
     if (!script) uncertain = true;
     else if (script.inline !== undefined) names.push(script.inline);
@@ -158,7 +163,7 @@ function identify(row, { paths, file, cwdOf }) {
       if (script.path) { names.push(script.path); located.push(script.path); }
       if (!script.resolved && !SCRIPT_EXTENSION.test(script.value)) uncertain = true;
     }
-  } else {
+  } else if (!runtime(row.executablePath)) {
     for (const candidate of [row.executablePath, argv0]) if (typeof candidate === 'string' && paths.isAbsolute(candidate)) located.push(candidate);
   }
   return { names, located, uncertain };
