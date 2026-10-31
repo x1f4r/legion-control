@@ -17,6 +17,7 @@ struct MachineSection: View {
             }
             hostKeyBlock
             launchBlock
+            agentBlock
             if case .conflict = model.setupSharing { setupVerdict }
             unresolvedBlock
             operationsBlock
@@ -104,6 +105,26 @@ struct MachineSection: View {
                     .controlSize(.small)
             }
         }
+    }
+
+    /// An agent older than the one this app carries, with the install beside it.
+    @ViewBuilder
+    private var agentBlock: some View {
+        if let newer = model.newerBundledAgent, let line = model.newerBundledAgentLine {
+            VStack(alignment: .leading, spacing: 6) {
+                StatusText(symbol: "arrow.up.circle", text: line, tint: model.needsAgentUpgrade ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Install agent \(newer)") { model.installBundledAgent() }
+                    .controlSize(.small)
+                    .disabled(installDisabled)
+            }
+        }
+    }
+
+    /// Why the bundled agent's install cannot be pressed right now, the same wherever it is offered.
+    private var installDisabled: Bool {
+        model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true
+            || model.status?.isRestrictedSession == true || model.legacyInstallRefusal != nil
     }
 
     /// The line for one of `machine`'s waiting values, which says what runs meanwhile. `machine` is
@@ -711,8 +732,7 @@ struct MachineSection: View {
                 // offered only where the agent can be told it is meant.
                 if model.bundledAgentGoesBack == nil {
                     Button("Install agent \(AgentBundle.shared?.version ?? "")") { afterSheet { model.installBundledAgent() } }
-                        .disabled(model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true
-                                  || model.status?.isRestrictedSession == true || model.legacyInstallRefusal != nil)
+                        .disabled(installDisabled)
                 } else if model.canGoBackToBundledAgent {
                     Button("Go back to agent \(AgentBundle.shared?.version ?? "")…") { afterSheet { model.requestBundledAgentDowngrade() } }
                         .disabled(model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true)

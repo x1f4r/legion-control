@@ -264,7 +264,9 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         case .unknown: return "checking"
         case .offline(let failure): return failure.meansAsleepOrOff ? "asleep or unreachable" : failure.shortReason
         case .reachableWithoutAgent(let system): return "\(system.name), no agent"
-        case .online(let system): return needsAgentUpgrade ? "\(system.name), agent too old" : system.name
+        case .online(let system):
+            if needsAgentUpgrade { return "\(system.name), agent too old" }
+            return newerBundledAgent.map { "\(system.name), agent \($0) available" } ?? system.name
         }
     }
 

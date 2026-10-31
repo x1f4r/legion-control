@@ -146,6 +146,26 @@ struct MacModelTests {
         #expect(model.sidebarSummary == "no services configured")
     }
 
+    @Test("this Mac's row says when its agent is older than the one this app carries")
+    func rowOfAnOlderAgent() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: """
+        { "ok": true, "contract": 3, "agentVersion": "3.0.1", "system": { "id": "mac", "name": "macOS" },
+          "agent": { "version": "3.0.1", "contract": 3 },
+          "services": [ { "id": "t3", "name": "T3 Code", "installed": "2", "latest": "2", "upToDate": true,
+                          "busy": { "busy": false, "unknown": false, "monitored": true } } ],
+          "actions": [], "updates": { "automatic": false, "pauseUntil": null, "maintenanceWindows": [] } }
+        """)
+        let (model, _, directory) = try Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.bundledAgentVersion = "3.1.0"
+        await model.refresh()
+        #expect(model.sidebarSummary == "agent 3.1.0 available")
+        #expect(model.newerBundledAgentLine == "Agent 3.0.1 is older than the 3.1.0 this app carries.")
+        model.core.bundledAgentVersion = "3.0.1"
+        #expect(model.sidebarSummary == "up to date")
+    }
+
     // MARK: - Parity
 
     @Test("the local device offers restart and configured actions, like every other machine")

@@ -196,6 +196,47 @@ struct MachineModelTests {
         #expect(model.legacyInstallRefusal == nil)
     }
 
+    @Test("an agent older than the one this app carries says so where the machine's state is read")
+    func olderAgentIsSaid() async throws {
+        // A 3.0 agent speaks contract 3, so nothing said it was a release behind: the install was a
+        // button under Diagnostics, and the whole fleet stayed on 3.0 after 3.1 shipped.
+        let runner = FakeRunner()
+        runner.answer("status", json: Self.onlineStatus)
+        let (model, _, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.bundledAgentVersion = "3.1.0"
+        #expect(model.newerBundledAgent == nil)
+
+        await model.refresh(userInitiated: false)
+        #expect(!model.needsAgentUpgrade)
+        #expect(model.newerBundledAgent == "3.1.0")
+        #expect(model.newerBundledAgentLine == "Agent 3.0.0 is older than the 3.1.0 this app carries.")
+        #expect(model.sidebarSummary == "Linux, agent 3.1.0 available")
+
+        // The same agent, or a build that carries none, has nothing to offer.
+        model.core.bundledAgentVersion = "3.0.0"
+        #expect(model.newerBundledAgent == nil)
+        #expect(model.sidebarSummary == "Linux")
+        model.core.bundledAgentVersion = nil
+        #expect(model.newerBundledAgentLine == nil)
+    }
+
+    @Test("an agent too old for the contract says that first, with the install beside it")
+    func legacyAgentIsOfferedTheBundle() async throws {
+        let runner = FakeRunner()
+        runner.answer("status", json: """
+        { "ok": true, "agentVersion": "2.1.0", "os": "linux",
+          "t3": { "installed": "1", "nightly": "2", "upToDate": false } }
+        """)
+        let (model, _, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.bundledAgentVersion = "3.1.0"
+
+        await model.refresh(userInitiated: false)
+        #expect(model.sidebarSummary == "Linux, agent too old")
+        #expect(model.newerBundledAgentLine == "Agent 2.1.0 is too old for operations, policy and queue controls. This app carries 3.1.0.")
+    }
+
     /// A machine whose 2.x agent sits behind a cmd login, which the upgrade cannot be sent to.
     static func legacyCmdModel(_ runner: FakeRunner) -> (MachineModel, URL) {
         let windows = Machine(

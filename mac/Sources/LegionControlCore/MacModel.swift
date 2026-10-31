@@ -145,6 +145,7 @@ final class MacModel: AgentDevice {
         if services.contains(where: { $0.hasStagedUpdate }) { return "update waiting" }
         if services.contains(where: { $0.upToDate == false }) { return "update available" }
         if let reason = busyReason { return reason }
+        if let newer = newerBundledAgent { return "agent \(newer) available" }
         if services.allSatisfy({ $0.upToDate == true }) { return "up to date" }
         return "version not checked"
     }

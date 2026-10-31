@@ -25,6 +25,15 @@ struct MacSection: View {
                     Button("Details") { panel = "Diagnostics" }
                 }
             }
+            if let newer = mac.newerBundledAgent, let line = mac.newerBundledAgentLine {
+                VStack(alignment: .leading, spacing: 6) {
+                    StatusText(symbol: "arrow.up.circle", text: line, tint: mac.needsAgentUpgrade ? .orange : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Install agent \(newer)") { mac.installBundledAgent() }
+                        .controlSize(.small)
+                        .disabled(mac.isWorking || mac.status?.ok != true || mac.status?.isRestrictedSession == true)
+                }
+            }
             if case .conflict = mac.setupSharing { setupVerdict }
             unresolvedBlock
             queueBlock

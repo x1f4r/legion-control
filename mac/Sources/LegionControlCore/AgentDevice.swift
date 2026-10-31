@@ -94,6 +94,10 @@ final class DeviceCore {
     /// through. The tests hand in one that returns at once.
     @ObservationIgnored var pollPause: @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
 
+    /// The version of the agent this build carries, nil for a build made without one. The tests
+    /// hand in one, because no test runs out of an app bundle.
+    @ObservationIgnored var bundledAgentVersion: String? = AgentBundle.shared?.version
+
     /// How often an operation with an unknown outcome is chased.
     static let reconcileEvery: TimeInterval = 60
 
@@ -216,6 +220,19 @@ enum AgentDowngrade {
     }
 }
 
+/// Whether installing the bundled agent takes a device forward, which is worth saying where the
+/// device's state is read rather than only under Diagnostics.
+enum AgentUpgrade {
+    /// The bundled version, when the agent that sent `status` is known to be older than it and
+    /// installing it is no way back. Nil for the same version, a newer one, one either side does
+    /// not say, and a device that did not answer.
+    static func offered(_ bundled: String?, over status: AgentStatus?) -> String? {
+        guard let bundled, let status, status.ok != false, AgentVersion.isOlder(status.version, than: bundled),
+              AgentDowngrade.reason(installing: bundled, over: status) == nil else { return nil }
+        return bundled
+    }
+}
+
 // MARK: - What every device reads the same way
 
 extension AgentDevice {
@@ -243,6 +260,19 @@ extension AgentDevice {
     var needsAgentUpgrade: Bool {
         guard let status, status.ok != false else { return false }
         return !status.speaksRequiredContract
+    }
+
+    /// The agent this app carries, when the one running here is older. A 3.0 agent speaks the
+    /// contract this app needs, so nothing said it was a release behind: installing the newer one
+    /// was a button under Diagnostics, and a whole fleet stayed on 3.0 after 3.1 shipped.
+    var newerBundledAgent: String? { AgentUpgrade.offered(core.bundledAgentVersion, over: status) }
+
+    /// The line that says so beside the install.
+    var newerBundledAgentLine: String? {
+        guard let newer = newerBundledAgent, let running = status?.version else { return nil }
+        return needsAgentUpgrade
+            ? "Agent \(running) is too old for operations, policy and queue controls. This app carries \(newer)."
+            : "Agent \(running) is older than the \(newer) this app carries."
     }
 
     var services: [ServiceStatus] { status?.resolvedServices ?? [] }
