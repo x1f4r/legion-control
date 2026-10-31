@@ -921,7 +921,7 @@ class AgentClient(
 
     /** What an address did, for the next call's order and for the sentence when nothing answers. */
     private fun noteFailure(endpoint: Endpoint, failure: AgentFailure) {
-        // Held back like any address that did not answer.
+        // Held back like any address that did not answer, until a tunnel coming up lifts it.
         if (failure is AgentFailure.NoTunnel) {
             routes.penalise(endpoint, "is not carried by any tunnel on this phone")
             return

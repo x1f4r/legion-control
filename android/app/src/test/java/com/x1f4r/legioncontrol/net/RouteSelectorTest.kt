@@ -58,6 +58,35 @@ class RouteSelectorTest {
         assertEquals(listOf("dotted"), alone.candidates().map { it.id })
     }
 
+    /**
+     * After a network change, a tunnel coming up or a refresh somebody asked for, an address held
+     * back for going unanswered was still held back for up to four minutes.
+     */
+    @Test
+    fun `lifting the backoff dials every address again, from the route that worked last`() {
+        val tailnet = endpoint("tailnet", RouteKind.REMOTE)
+        val home = endpoint("home", RouteKind.LAN)
+        val machine = Machine(id = "tower", name = "Tower", endpoints = listOf(tailnet, home), systems = emptyList(), wake = null)
+        val routes = RouteSelector(machine, OneRoute()) { 1_000L }
+        routes.remember(home)
+        routes.penalise(home, "did not answer")
+        routes.penalise(tailnet, "did not answer")
+        assertEquals("only the one due soonest", 1, routes.candidates().size)
+
+        routes.liftBackoff()
+        assertEquals(listOf("home", "tailnet"), routes.candidates().map { it.id })
+    }
+
+    /** Hints that remember the one route that answered. */
+    private class OneRoute : MachineHints {
+        private val route = MutableStateFlow<String?>(null)
+        override fun lastGoodRoute(machineId: String): StateFlow<String?> = route
+        override fun rememberRoute(machineId: String, id: String) { route.value = id }
+        override fun forgetRoute(machineId: String) { route.value = null }
+        override fun lastKnownSystem(machineId: String): StateFlow<String?> = MutableStateFlow(null)
+        override fun rememberSystem(machineId: String, systemId: String) = Unit
+    }
+
     private object NoHints : MachineHints {
         override fun lastGoodRoute(machineId: String): StateFlow<String?> = MutableStateFlow(null)
         override fun rememberRoute(machineId: String, id: String) = Unit

@@ -429,7 +429,12 @@ class AppModel(
         requestedMachine = null
     }
 
+    /**
+     * Pull to refresh, or the refresh button. Asked for by a person, so every address is dialled
+     * again, the ones held back after going unanswered included.
+     */
     fun refreshAll() {
+        services.retryAddresses()
         machines.forEach { it.refreshNow() }
     }
 

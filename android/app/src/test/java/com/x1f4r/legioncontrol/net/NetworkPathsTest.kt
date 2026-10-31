@@ -107,7 +107,7 @@ class NetworkPathsTest {
         assertEquals(emptyList<LanPrefix>(), book.snapshot().tunnels)
     }
 
-    /** Each of these is a change in the way out, and the snapshot says so. */
+    /** Each of these is a change in the way out, which lets every address held back be dialled again. */
     @Test
     fun `the default network and every tunnel coming or going change the way out`() {
         val book = NetworkPathBook()

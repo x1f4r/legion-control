@@ -296,10 +296,13 @@ interface ControlServices {
     fun networkPaths(): Flow<NetworkPaths>
 
     /**
-     * Hands the transport the way out of this phone as it is now. Its tunnels decide whether a silent
-     * tailnet address is the phone's doing.
+     * Hands the transport the way out of this phone as it is now. A change lets every address be
+     * dialled again, and the tunnels decide whether a silent tailnet address is the phone's doing.
      */
     fun followPaths(paths: NetworkPaths)
+
+    /** A person asked to check again: every address held back is dialled on its machine's next call. */
+    fun retryAddresses()
 
     /** What to call this device in a revision it writes. */
     fun deviceName(): String

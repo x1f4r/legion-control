@@ -93,6 +93,8 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override fun followPaths(paths: NetworkPaths) = control.follow(paths)
 
+    override fun retryAddresses() = control.retryAddresses()
+
     override fun deviceName(): String = control.deviceName()
 
     override fun forgetRoute(machineId: String) = control.settings.forgetRoute(machineId)

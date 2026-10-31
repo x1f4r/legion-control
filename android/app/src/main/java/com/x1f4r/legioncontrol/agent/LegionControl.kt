@@ -95,9 +95,20 @@ class LegionControl(context: Context) {
     @Volatile
     private var paths: NetworkPaths? = null
 
-    /** Follows the way out of this phone. */
+    /**
+     * Follows the way out of this phone. A change lets every address be dialled again at once: one
+     * that was silent a moment ago may be on the far side of a tunnel that has just come up, or of
+     * a network the phone has just joined.
+     */
     fun follow(paths: NetworkPaths) {
+        if (paths == this.paths) return
         this.paths = paths
+        retryAddresses()
+    }
+
+    /** Lets every address of every machine be dialled again on its next call, whatever it did before. */
+    fun retryAddresses() {
+        built.values.forEach { it.routes.liftBackoff() }
     }
 
     /**
