@@ -23,6 +23,7 @@
 
 import { WEEKDAYS } from './config-schema.mjs';
 import { CLOCK_TIME_PATTERN, REASON } from './contract.mjs';
+import { busyReasonCode } from './probes/busy.mjs';
 
 function minutesOfDay(hhmm) {
   const [hours, minutes] = String(hhmm).split(':').map((part) => Number.parseInt(part, 10));
@@ -250,7 +251,7 @@ export function describeServiceUpdates(config, service, { now = new Date(), busy
   let deferredReason = eligibility.reasonCode;
   if (eligibleNow && busy && busy.busy === true) {
     eligibleNow = false;
-    deferredReason = busy.unknown ? REASON.busyUnknown : REASON.busy;
+    deferredReason = busyReasonCode(busy);
   }
 
   return {

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { aggregateBusy, checkAllBusy, checkServiceBusy, readCommandBusy } from '../src/probes/busy.mjs';
+import { aggregateBusy, busyReasonCode, checkAllBusy, checkServiceBusy, heldBecause, readCommandBusy } from '../src/probes/busy.mjs';
 import { checkT3Sqlite } from '../src/probes/t3-sqlite.mjs';
 import { cli, commandService, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
 
@@ -69,6 +69,43 @@ test('the aggregate blocks when any service does, and names which', () => {
   assert.equal(aggregate.monitoredServices, 2);
   assert.equal(aggregate.unmonitoredServices, 1);
   assert.match(aggregate.reason, /B: 1 turn running/);
+  // B is busy on a reading, so that is the reason, whatever C could not say.
+  assert.equal(busyReasonCode(aggregate), 'busy');
+  assert.match(heldBecause(aggregate), /^the machine is busy \(/);
+});
+
+test('a gate held only by probes that could not be read is busy-unknown, and names whose they were', () => {
+  const unread = (name) => ({ service: { id: name.toLowerCase(), name }, busy: { busy: true, unknown: true, monitored: true, reason: 'busy state unknown' } });
+  const idle = { service: { id: 'demo', name: 'Demo' }, busy: { busy: false, unknown: false, monitored: true, reason: 'idle' } };
+  const one = aggregateBusy([idle, unread('OpenCode')]);
+  assert.equal(busyReasonCode(one), 'busy-unknown');
+  assert.match(heldBecause(one), /^whether OpenCode is busy could not be established \(/);
+  const two = aggregateBusy([idle, unread('OpenCode'), unread('Antigravity')]);
+  assert.match(heldBecause(two), /^whether OpenCode and Antigravity are busy could not be established/);
+  // One service's own answer reads the same way it always did.
+  assert.equal(busyReasonCode(unread('OpenCode').busy), 'busy-unknown');
+  assert.equal(busyReasonCode(idle.busy), 'busy');
+});
+
+test('an update held back by another service\'s unreadable probe says whose it was', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    const unknown = [process.execPath, '-e', 'console.log(JSON.stringify({ unknown: true, reason: "Some process identities could not be inspected." }))'];
+    const opencode = commandService(fixtureData(path.join(home, 'other')), { id: 'opencode', name: 'OpenCode', busy: { type: 'command', command: unknown } });
+    writeConfig(home, fixtureConfig(dir, { services: [commandService(dir), opencode] }));
+    const update = cli(['update', '--service', 'demo'], { home }).payload;
+    assert.equal(update.action, 'deferred');
+    assert.equal(update.reasonCode, 'busy-unknown');
+    assert.match(update.message, /^whether OpenCode is busy could not be established \(Demo: idle; OpenCode: busy state unknown\)/);
+
+    // With a third service busy on a reading, that is what holds the update.
+    const t3 = commandService(fixtureData(path.join(home, 'third'), { busy: 'on' }), { id: 't3', name: 'T3 Code' });
+    writeConfig(home, fixtureConfig(dir, { services: [commandService(dir), opencode, t3] }));
+    const held = cli(['update', '--service', 'demo'], { home }).payload;
+    assert.equal(held.reasonCode, 'busy');
+    assert.match(held.message, /^the machine is busy \(.*T3 Code: /);
+    assert.equal(readFixture(dir, 'update-runs'), '');
+  });
 });
 
 test('several probes share one budget instead of adding up', async () => {

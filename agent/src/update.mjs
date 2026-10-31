@@ -44,7 +44,7 @@ import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { appendLog, listOperations, recordPhase, updateOperation, whenStarted } from './operations.mjs';
 import { describeFailure, mutationWorstCaseMs, runMutationArgv, unsettledWork } from './process-runner.mjs';
-import { aggregateBusy, BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { aggregateBusy, BUSY_BUDGET_MS, busyReasonCode, checkAllBusy, heldBecause } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
 import { PROCESS_COMMAND_MS } from './probes/process.mjs';
 import { hasUpdatePath, scheduledEligibility } from './policy.mjs';
@@ -156,6 +156,17 @@ function deferred({ service, from = null, to = null, busy, message }) {
     message,
     service: service?.id ?? null,
   };
+}
+
+/**
+ * Why the check immediately before the stop held. Work that started while the
+ * update was prepared is the usual answer, but a probe that could no longer
+ * be read is no evidence that anything started.
+ */
+function heldAtSecondCheck(busy) {
+  return busyReasonCode(busy) === REASON.busy
+    ? `work started while the update was being prepared (${busy.reason})`
+    : `${heldBecause(busy)} once the update was prepared`;
 }
 
 /**
@@ -311,7 +322,7 @@ export async function runRestart(config, service, options = {}) {
         return deferred({
           service,
           busy,
-          message: `the machine is busy (${busy.reason}); pass --force to restart anyway, or --when-idle to queue it`,
+          message: `${heldBecause(busy)}; pass --force to restart anyway, or --when-idle to queue it`,
         });
       }
       lock.phase('restarting');
@@ -452,7 +463,7 @@ async function alreadyOnTarget(config, service, from, to, { force, opId, budget 
       from,
       to,
       busy,
-      message: `already on ${to} but unhealthy; the machine is busy (${busy.reason}), so the restart was deferred`,
+      message: `already on ${to} but unhealthy; ${heldBecause(busy)}, so the restart was deferred`,
     });
   }
 
@@ -518,7 +529,7 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
   const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `the machine is busy (${busy.reason}); ${to} will be installed at the next idle window`;
+    const message = `${heldBecause(busy)}; ${to} will be installed at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy, message });
@@ -563,7 +574,7 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
   const fresh = await busyNow(config);
   if (fresh.busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `work started while the update was being prepared (${fresh.busy.reason}); ${to} is downloaded and will be installed at the next idle window`;
+    const message = `${heldAtSecondCheck(fresh.busy)}; ${to} is downloaded and will be installed at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy: fresh.busy, message });
@@ -700,7 +711,7 @@ async function runAppUpdate(config, service, { force, opId, lock, budget }) {
   const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: staged });
-    const message = `the machine is busy (${busy.reason}); ${staged} is downloaded and will be applied at the next idle window`;
+    const message = `${heldBecause(busy)}; ${staged} is downloaded and will be applied at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, staged, message);
     return deferred({ service, from, to: staged, busy, message });
@@ -962,7 +973,7 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
   const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `the machine is busy (${busy.reason}); ${to ?? 'the update'} will be applied at the next idle window`;
+    const message = `${heldBecause(busy)}; ${to ?? 'the update'} will be applied at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy, message });
@@ -986,7 +997,7 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
   const fresh = await busyNow(config);
   if (fresh.busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
-    const message = `work started while the update was being prepared (${fresh.busy.reason}); it will be applied at the next idle window`;
+    const message = `${heldAtSecondCheck(fresh.busy)}; it will be applied at the next idle window`;
     log(message, 'update');
     recordLastUpdate(service, 'deferred', from, to, message);
     return deferred({ service, from, to, busy: fresh.busy, message });

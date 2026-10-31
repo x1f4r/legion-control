@@ -227,12 +227,14 @@ export function aggregateBusy(entries) {
       monitoredServices: 0,
       unmonitoredServices: 0,
       blocking: [],
+      definite: false,
+      unknownServices: [],
       checkedAt: new Date().toISOString(),
     };
   }
 
   const blocking = entries.filter((entry) => entry.busy.busy === true);
-  const isUnknown = entries.some((entry) => entry.busy.unknown === true);
+  const unread = entries.filter((entry) => entry.busy.unknown === true);
   const reason =
     entries.length === 1
       ? entries[0].busy.reason ?? 'idle'
@@ -240,18 +242,44 @@ export function aggregateBusy(entries) {
 
   return {
     busy: blocking.length > 0,
-    unknown: isUnknown,
+    unknown: unread.length > 0,
     reason,
     monitoredServices: entries.filter((entry) => entry.busy.monitored === true).length,
     unmonitoredServices: entries.filter((entry) => entry.busy.monitored === false).length,
     blocking: blocking.map((entry) => entry.service.id),
+    // Neither of these is on the wire. Whether any service is busy on a
+    // reading rather than for want of one decides the reason code, and the
+    // names of those that could not be read say whose probe held a gate.
+    definite: blocking.some((entry) => entry.busy.unknown !== true),
+    unknownServices: unread.map((entry) => entry.service.name),
     checkedAt: new Date().toISOString(),
   };
 }
 
-/** The reasonCode a blocked action reports for an aggregate. */
+/**
+ * The reasonCode a blocked action reports, for an aggregate or for one
+ * service's answer.
+ *
+ * busy-unknown is for a gate that nothing but an unreadable probe held. A
+ * service busy on a reading is the reason whatever else could not be read,
+ * and calling that unknown sent a person after the service being updated,
+ * whose state was never in doubt, while another one was working.
+ */
 export function busyReasonCode(busy) {
-  return busy.unknown ? REASON.busyUnknown : REASON.busy;
+  return busy.unknown && busy.definite !== true ? REASON.busyUnknown : REASON.busy;
+}
+
+/**
+ * Why a gate held, as the clause a message opens with. With nothing busy on a
+ * reading it names the services whose state could not be read, because the
+ * one the action was for need not be among them.
+ */
+export function heldBecause(busy) {
+  if (busyReasonCode(busy) === REASON.busy) return `the machine is busy (${busy.reason})`;
+  const names = busy.unknownServices ?? [];
+  if (names.length === 0) return `whether the machine is busy could not be established (${busy.reason})`;
+  const who = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+  return `whether ${who} ${names.length === 1 ? 'is' : 'are'} busy could not be established (${busy.reason})`;
 }
 
 /**

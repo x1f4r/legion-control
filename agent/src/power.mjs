@@ -38,7 +38,7 @@ import { log } from './log.mjs';
 import { withOperation } from './operate.mjs';
 import { markPowerDispatch, recordPhase } from './operations.mjs';
 import { mutationWorstCaseMs } from './process-runner.mjs';
-import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy, heldBecause } from './probes/busy.mjs';
 import { machineLiveness } from './service.mjs';
 
 /**
@@ -123,7 +123,7 @@ export async function runBoot(config, target, options = {}) {
           target,
           armed: false,
           busy,
-          message: `the machine is busy (${busy.reason}); pass --force to reboot anyway, or --when-idle to queue it`,
+          message: `${heldBecause(busy)}; pass --force to reboot anyway, or --when-idle to queue it`,
         };
       }
 
@@ -207,7 +207,7 @@ export async function runSleep(config, options = {}) {
         action: 'deferred',
         reasonCode: busyReasonCode(busy),
         busy,
-        message: `the machine is busy (${busy.reason}); pass --force to sleep anyway, or --when-idle to queue it`,
+        message: `${heldBecause(busy)}; pass --force to sleep anyway, or --when-idle to queue it`,
       };
     }
 
