@@ -82,8 +82,10 @@ struct AgentBootstrapTests {
         let node = try #require(["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"].first { FileManager.default.isExecutableFile(atPath: $0) })
         let layout = try AgentBootstrap.layout(argv: [node, old.appending(path: "index.mjs").path])
         let operation = AgentToken.newOperationId()
-        let reply = try await AgentBootstrap.installLocal(payload: archive, operation: operation, layout: layout)
+        let staging = dir.appending(path: "staging")
+        let reply = try await AgentBootstrap.installLocal(payload: archive, operation: operation, layout: layout, staging: staging)
         #expect(reply.action == "installed")
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
         let proof = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: base.appending(path: "proof.json"))) as? [String: Any])
         #expect(proof["base"] as? String == base.path)
         #expect(proof["args"] as? [String] == ["self-update", "--install", "--op", operation])
@@ -237,7 +239,7 @@ struct AgentBootstrapTests {
         }
     }
 
-    @Test("bootstrap refuses archive symlinks before running any staged code")
+    @Test("bootstrap refuses archive symlinks before running any staged code, and keeps nothing it refused")
     func unsafeArchive() async throws {
         let (dir, source, _) = try await fixture()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -245,8 +247,12 @@ struct AgentBootstrapTests {
         let archive = dir.appending(path: "unsafe.tgz")
         let result = await Shell.run(executable: "/usr/bin/tar", arguments: ["-czf", archive.path, "-C", dir.appending(path: "source").path, "agent"], timeout: 10)
         #expect(result.succeeded)
+        let staging = dir.appending(path: "staging")
         await #expect(throws: AgentBootstrap.Failure.self) {
-            try await AgentBootstrap.stagedArchive(Data(contentsOf: archive), operation: AgentToken.newOperationId())
+            try await AgentBootstrap.stagedArchive(Data(contentsOf: archive), operation: AgentToken.newOperationId(), in: staging)
         }
+        // Every refused archive used to stay where it was staged, a hundred of them in the real
+        // application support folder from this test alone.
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }
 }

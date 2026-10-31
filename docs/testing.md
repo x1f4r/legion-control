@@ -16,7 +16,7 @@ From the repository root:
 node --test contract/test/*.test.mjs
 ```
 
-`./scripts/check.sh` runs all four components on a configured Mac. Set `LEGION_ANDROID_JAVA_HOME` to select JDK 21 and `LEGION_DOTNET` to select a .NET 10 executable. For isolated Mac tests, set `LEGION_CONTROL_HOME` to a temporary directory. Desktop tests create their own temporary state.
+`./scripts/check.sh` runs all four components on a configured Mac. Set `LEGION_ANDROID_JAVA_HOME` to select JDK 21 and `LEGION_DOTNET` to select a .NET 10 executable. The Mac tests give themselves a temporary `LEGION_CONTROL_HOME` before the first test starts (`mac/Tests/TestHome`), and a test fails if anything the app writes would resolve outside it. Desktop tests create their own temporary state.
 
 The agent check runs, in order: the agent's own check, the syntax of every JavaScript file in the checkout, the invisible-character check, the version check, the agent tests, the release and installer tests in `tests/`, contract validation, the generated-file check and the contract tests, and last the private-data check, so a private value it finds never hides what the tests would have said. The Mac check runs Swift tests and a release build. Android runs debug/release unit tests and debug lint. Desktop runs its tests and release build.
 

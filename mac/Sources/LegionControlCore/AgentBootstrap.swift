@@ -52,12 +52,26 @@ enum AgentBootstrap {
         return try? layout(argv: argv, explicitBase: field.stringValue.trimmingCharacters(in: .whitespaces))
     }
 
-    static func stagedArchive(_ payload: Data, operation: String) async throws -> URL {
+    /// Write the archive where it is inspected and uploaded from, and refuse it unless every entry
+    /// is a plain file or directory under `agent/`. A refused archive is removed again: nothing
+    /// else ever would, and a folder of them reads like a history of failed installations.
+    static func stagedArchive(_ payload: Data, operation: String,
+                              in directory: URL = AppPaths.file("bootstrap")) async throws -> URL {
         guard payload.count <= 32 * 1024 * 1024, AgentToken.isValidOperationId(operation) else {
             throw Failure(message: "The agent archive or operation id is invalid.")
         }
-        let file = AppPaths.file("bootstrap/\(operation).tgz")
+        let file = directory.appending(path: "\(operation).tgz")
         try AtomicFile.write(payload, to: file)
+        do {
+            try await inspect(file)
+        } catch {
+            try? FileManager.default.removeItem(at: file)
+            throw error
+        }
+        return file
+    }
+
+    private static func inspect(_ file: URL) async throws {
         let listing = await Shell.run(executable: "/usr/bin/tar", arguments: ["-tzf", file.path], timeout: 30)
         let verbose = await Shell.run(executable: "/usr/bin/tar", arguments: ["-tvzf", file.path], timeout: 30)
         guard listing.succeeded, verbose.succeeded else { throw Failure(message: "The signed archive could not be inspected.") }
@@ -84,7 +98,6 @@ enum AgentBootstrap {
               verbose.standardOutput.split(separator: "\n").allSatisfy({ $0.first == "-" || $0.first == "d" }) else {
             throw Failure(message: "The signed archive contains links, special files or an incomplete agent.")
         }
-        return file
     }
 
     static let prepareScript = """
@@ -194,8 +207,9 @@ enum AgentBootstrap {
         return try decode(install.result, verdict: install.verdict)
     }
 
-    static func installLocal(payload: Data, operation: String, layout: Layout) async throws -> AgentActionResult {
-        let archive = try await stagedArchive(payload, operation: operation)
+    static func installLocal(payload: Data, operation: String, layout: Layout,
+                             staging: URL = AppPaths.file("bootstrap")) async throws -> AgentActionResult {
+        let archive = try await stagedArchive(payload, operation: operation, in: staging)
         defer { try? FileManager.default.removeItem(at: archive) }
         let prepare = await Shell.run(executable: layout.prefix[0], arguments: Array(layout.prefix.dropFirst()) + ["-e", prepareScript, "--", layout.base], timeout: 30)
         guard prepare.succeeded else { throw Failure(message: "Bootstrap preflight failed: \(prepare.failureText)") }
