@@ -311,19 +311,23 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
     private var rememberedRoute: MachineRoute? {
         let routes = machine.routes(bindings: agent.bindings)
         let system = (rebootInProgress?.target ?? commandableSystem)?.id
-        guard let id = remembered.route(machine: machine.id, system: system, routes: Self.routesFingerprint(routes))
+        guard let id = remembered.route(machine: machine.id, system: system,
+                                        routes: Self.routesFingerprint(routes, onNetwork: agent.preferLAN))
         else { return nil }
         return routes.first { $0.id == id }
     }
 
     /// What a remembered route is held against: every route's id, kind, address and pinned system,
-    /// hashed. A setup that changes any of them reaches the machine some other way now, and the
-    /// route remembered from before is not put first.
-    static func routesFingerprint(_ routes: [MachineRoute]) -> String {
+    /// and whether this device took itself to be on the machine's network, hashed. A setup that
+    /// changes any of the routes reaches the machine some other way now. A device that has moved on
+    /// or off that network orders the routes the other way round, and a LAN address that answered
+    /// at home is a whole connect timeout from anywhere else, on a range that may be somebody
+    /// else's. Either way the route remembered from before is not put first.
+    static func routesFingerprint(_ routes: [MachineRoute], onNetwork: Bool) -> String {
         let lines = routes.map { route in
             [route.id, route.kind ?? "", route.target.destination, String(route.target.port ?? 22), route.systemId ?? ""]
                 .joined(separator: " ")
-        }
+        } + [onNetwork ? "on its network" : "elsewhere"]
         return Canonical.sha256(Data(lines.joined(separator: "\n").utf8))
     }
 
@@ -373,7 +377,7 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
             lastRoute = currentRoute(reply.route)
             if let route = lastRoute, let system = commandableSystem {
                 remembered.record(machine: machine.id, system: system.id, route: route.id,
-                                  routes: Self.routesFingerprint(machine.routes(bindings: agent.bindings)))
+                                  routes: Self.routesFingerprint(machine.routes(bindings: agent.bindings), onNetwork: agent.preferLAN))
             }
             lastChecked = Date()
             if !userInitiated, core.lineIsRefreshFailure {

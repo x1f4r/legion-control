@@ -730,7 +730,7 @@ record the machine holds.
 The remembered settings only exist so the apps can show something for a system that is asleep,
 clearly labelled with when it was read. Nothing depends on them being right. The remembered route
 is only the address the Mac dials first after a launch, and it is not used once the setup changes
-that machine's endpoints.
+that machine's endpoints or the Mac has moved on or off that machine's network.
 
 ## Quick reference
 

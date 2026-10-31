@@ -1604,16 +1604,18 @@ struct MachineModelTests {
         #expect(tower.autoUpdateValue(for: towerMachine.systems[0]) == true)
     }
 
+    /// Every address one launch dialled, in order.
+    final class Dialled: @unchecked Sendable {
+        let lock = NSLock()
+        var destinations: [String] = []
+        func note(_ destination: String?) { lock.withLock { destinations.append(destination ?? "") } }
+        var first: String? { lock.withLock { destinations.first } }
+    }
+
     @Test("the route that worked is dialled first at the next launch, and not once the machine's endpoints change")
     func rememberedRouteOutlivesALaunch() async throws {
         // Kept in memory alone, every launch dialled the dead addresses first again, a connect
         // timeout each: eight to sixteen seconds a machine before the one that answers.
-        final class Dialled: @unchecked Sendable {
-            let lock = NSLock()
-            var destinations: [String] = []
-            func note(_ destination: String?) { lock.withLock { destinations.append(destination ?? "") } }
-            var first: String? { lock.withLock { destinations.first } }
-        }
         var machine = Self.machine()
         machine.endpoints = [Endpoint(id: "old", kind: "remote", host: "192.0.2.10", user: "me"),
                              Endpoint(id: "new", kind: "remote", host: "192.0.2.20", user: "me")]
@@ -1661,6 +1663,50 @@ struct MachineModelTests {
         let older = try JSONDecoder().decode([String: RememberedSystem].self, from: Data(#"{"pi/linux":{"autoUpdate":true}}"#.utf8))
         #expect(older["pi/linux"]?.autoUpdate == true)
         #expect(older["pi/linux"]?.route == nil)
+    }
+
+    @Test("a LAN route remembered on the machine's network is not dialled first from anywhere else")
+    func rememberedRouteKeepsToItsNetwork() async throws {
+        // A laptop last opened at home and opened again somewhere else dialled the home address
+        // first: a whole connect timeout a machine, on a range that may be somebody else's.
+        var machine = Self.machine()
+        machine.endpoints = [Endpoint(id: "lan", kind: "lan", host: "192.168.1.10", user: "me"),
+                             Endpoint(id: "tailnet", kind: "remote", host: "192.0.2.20", user: "me")]
+        machine.wake = WakeConfig(mac: nil, lanPrefix: "192.168.1.")
+        let home = SiteAwareness.placement(sites: [], addresses: [LocalAddress("192.168.1.7/24")!], confirmed: nil)
+        let remembered = RememberedSettings.inMemory()
+        let logs = FakeSSH.logDirectory()
+        defer { try? FileManager.default.removeItem(at: logs) }
+
+        let status = Self.onlineStatus
+        func launch(at placement: SiteAwareness.Placement) async -> [String] {
+            let dialled = Dialled()
+            let atHome = placement == home
+            var agent = RemoteAgent(machine: machine)
+            agent.logDirectory = logs
+            agent.runner = { _, arguments, _, _ in
+                let destination = FakeSSH.destination(arguments)
+                dialled.note(destination)
+                // Away from home the LAN address reaches nothing.
+                guard atHome || destination != "me@192.168.1.10" else {
+                    FakeSSH.writeLog("ssh: connect to host 192.168.1.10 port 22: Operation timed out\n", for: arguments)
+                    return FakeSSH.result(exit: 255)
+                }
+                return FakeSSH.result(out: status)
+            }
+            let model = MachineModel(machine: machine, agent: agent, remembered: remembered)
+            model.placement = { placement }
+            await model.refresh(userInitiated: false)
+            #expect(model.isAwake)
+            return dialled.lock.withLock { dialled.destinations }
+        }
+
+        #expect(await launch(at: home) == ["me@192.168.1.10"])
+        #expect(await launch(at: .nowhere) == ["me@192.0.2.20"])
+        // And the tailnet route that answered away from home does not stand in front of the LAN
+        // once the laptop is back.
+        #expect(await launch(at: home) == ["me@192.168.1.10"])
+        #expect(await launch(at: home) == ["me@192.168.1.10"])
     }
 
     @Test("a remembered route belongs to one system, and at launch to whichever answered last")

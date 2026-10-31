@@ -8,9 +8,10 @@ struct RememberedSystem: Codable, Sendable, Equatable {
     var autoUpdate: Bool?
     var checkedAt: Date?
     /// The id of the route the last call to this system went over, and what the machine's routes
-    /// were then (MachineModel.routesFingerprint). A launch dials that route first rather than
-    /// walking the list from the top, where every dead address costs a whole connect timeout, and
-    /// never once the setup reaches the machine some other way.
+    /// were then and whether this device was on its network (MachineModel.routesFingerprint). A
+    /// launch dials that route first rather than walking the list from the top, where every dead
+    /// address costs a whole connect timeout, and never once the setup reaches the machine some
+    /// other way or the device has moved on or off the machine's network.
     var route: String?
     var routes: String?
 }
