@@ -229,6 +229,12 @@ methods and produce drafts with automatic updates disabled. Review the draft and
 only where the reported method fits your installation. The generic templates remain available
 when no profile applies.
 
+A profile's busy probe looks for the processes of the install its update would replace. For an npm
+service those are the ones whose program or script lies in the package under the service's prefix,
+so a second install of the same product elsewhere does not hold its updates back; for an
+application they are the ones inside its bundle. Only a process whose path cannot be read is
+matched by its name. The probes the agent runs beside it are left out.
+
 The command sequence is:
 
 1. `service-config get` returns `document`, an opaque `hash`, `templates`, and
@@ -284,9 +290,9 @@ every disruptive action and it fails closed: a probe that cannot be read counts 
 
 | type | fields | notes |
 | --- | --- | --- |
-| `command` | `command`, `staleHours` | exit code 0 means idle, anything else means busy. If stdout is a JSON object with `busy` and `reason`, those are used |
+| `command` | `command`, `staleHours` | exit code 0 means idle, anything else means busy. If stdout is a JSON object with `busy` and `reason`, those are used. The command runs with `LEGIONCTL_AGENT_PID` set to the agent that asked, and for an npm service `LEGIONCTL_NPM_PREFIX` and `LEGIONCTL_NPM_PACKAGE` |
 | `http` | `port`, `path`, `host`, `busyWhen` | GET the URL; busy when the JSON body's `busyWhen` path (dotted) is truthy |
-| `t3-sqlite` | `home`, `staleHours` (default 6), `allowMissing` | counts running and pending turns and pending approvals in T3 Code's state database |
+| `t3-sqlite` | `home`, `staleHours` (default 6), `allowMissing` | counts running and pending turns, the subagents, shells and monitors they left running, and waiting approvals in T3 Code's state database, `userdata/statev2.sqlite`. The older `userdata/state.sqlite` counts only when it is the only one, or was written after it |
 | `none` | | declared never busy |
 
 **There is no default.** A service with no `busy` block at all is *unmonitored*, which is not the

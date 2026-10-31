@@ -313,7 +313,8 @@
             "running",
             "pending",
             "pending-approval",
-            "stale"
+            "stale",
+            "abandoned"
           ]
         },
         "stale": {
@@ -1875,6 +1876,14 @@
         },
         "staleApprovals": {
           "$ref": "#/$defs/count"
+        },
+        "abandonedTurns": {
+          "description": "Running rows retired by evidence from outside the database: the service is not running, or started after the row began. They do not block.",
+          "$ref": "#/$defs/count"
+        },
+        "path": {
+          "description": "The state database a t3-sqlite probe read, or looked for and did not find.",
+          "$ref": "#/$defs/text"
         },
         "threads": {
           "type": "array",

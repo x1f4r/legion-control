@@ -59,6 +59,16 @@ they do not know from `message`, so none of them has to change to read these.
   the command the package's bin entry names with `--version`
   (`service-config.profiles.json`).
 
+### Fixed (schemas)
+
+- The busy schema names what the `t3-sqlite` probe has always sent:
+  `abandonedTurns`, the count of running rows retired by outside evidence;
+  `abandoned` as the `disposition` of such a row; and `path`, the database the
+  probe read or looked for (section 6). Every `t3-sqlite` answer carries
+  `abandonedTurns`, so none of them passed the schema before.
+
+---
+
 ## 3 — agent 3.1.0, clients 1.4.0
 
 Contract stays 3 and the setup document stays `"version": 1`. Every reply

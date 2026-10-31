@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { detectPlatform } from './paths.mjs';
 import { resolveClaudeUpdatePolicy, compareProfileVersions, nativeClaudeVersionAt } from './service-profile-claude.mjs';
-import { readDesktopMetadata } from './service-profile-desktop.mjs';
+import { DESKTOP_APPLICATIONS, desktopLocations, readDesktopMetadata } from './service-profile-desktop.mjs';
 
 /** The CLIs a profile can install with npm; service-profile-probe.mjs runs what each installs. */
 export const CLI_PRODUCTS = [
@@ -92,13 +92,8 @@ function directNpmRuntime(prefix, io, npm) {
   ].some((candidate) => fileExists(candidate, io));
 }
 
-function desktopProfile(id, name, names, { platform, home, env, io, readDesktop = readDesktopMetadata }) {
-  let candidates = [];
-  if (platform === 'mac') candidates = names.flatMap((app) => [path.join('/Applications', `${app}.app`), path.join(home, 'Applications', `${app}.app`)]);
-  if (platform === 'windows') {
-    const locations = [env.LOCALAPPDATA, env.ProgramFiles, env['ProgramFiles(x86)']].filter(Boolean);
-    candidates = names.flatMap((app) => locations.flatMap((location) => [path.join(location, app, `${app}.exe`), path.join(location, 'Programs', app, `${app}.exe`)]));
-  }
+function desktopProfile(id, name, { platform, home, env, io, readDesktop = readDesktopMetadata }) {
+  const candidates = desktopLocations(DESKTOP_APPLICATIONS[id], { platform, home, env });
   const found = candidates.find((candidate) => platform === 'mac' ? directoryExists(candidate, io) : fileExists(candidate, io));
   const metadata = found ? readDesktop(found, { platform: platform === 'mac' ? 'darwin' : 'win32', io }) : null;
   return {
@@ -155,11 +150,11 @@ export function discoverServiceProfiles({ platform = detectPlatform(), home = os
       } : null,
     };
   });
-  profiles.push(desktopProfile('claude-desktop', 'Claude desktop', ['Claude'], { platform, home, env, io, readDesktop }));
+  profiles.push(desktopProfile('claude-desktop', 'Claude desktop', { platform, home, env, io, readDesktop }));
   // Current Codex and ChatGPT desktop are one application. One catalog row
   // prevents two scheduled profiles from trying to update the same bundle.
-  profiles.push(desktopProfile('codex-desktop', 'Codex / ChatGPT desktop', ['ChatGPT', 'Codex'], { platform, home, env, io, readDesktop }));
-  profiles.push(desktopProfile('antigravity', 'Antigravity', ['Antigravity'], { platform, home, env, io, readDesktop }));
+  profiles.push(desktopProfile('codex-desktop', 'Codex / ChatGPT desktop', { platform, home, env, io, readDesktop }));
+  profiles.push(desktopProfile('antigravity', 'Antigravity', { platform, home, env, io, readDesktop }));
   profiles.push({ id: 'grok-cli', name: 'GrokCLI', platform, detected: false, availability: 'unavailable', message: 'Several unrelated tools use this name. Select the exact project and distribution before provisioning an updater.', updateMethod: null, service: null });
   return profiles;
 }
