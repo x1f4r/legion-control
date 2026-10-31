@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Check that the checkout names nobody's home directory, network or private name.
 //
-//   node scripts/check-private-data.mjs               this checkout
-//   node scripts/check-private-data.mjs <directory>   another one
+//   node scripts/check-private-data.mjs                           this checkout
+//   node scripts/check-private-data.mjs <directory>               another one
+//   node scripts/check-private-data.mjs --commits <range> [dir]   the messages of commits in a range
 //
 // The repository is public, and each of these has reached it before: a path with a real user name
 // in it, a home network's addresses, the names of the people and machines it was written on. Every
@@ -35,7 +36,13 @@
 //   through where it is part of one of them and refused everywhere else, `user: 'jdoe'` included.
 //   A place cannot hold a comma, which would end the entry.
 //
+// A commit message goes public with the branch and stays in its history, where no later commit can
+// take it back, and none of the files above holds it. `--commits origin/main..HEAD` reads the
+// messages of the commits a push would publish, line by line, for the same three things. Only the
+// message: the author is public by the nature of a commit.
+//
 // scripts/check.sh runs it, and CI runs it once more with the secret.
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -183,14 +190,40 @@ export function checkPrivateData(root = repository, options = {}) {
   return { files: files.length, terms: terms.length, sources, findings };
 }
 
+/**
+ * Every private value in the messages of the commits in `range`, as git log takes it, of the
+ * checkout under `root`, as `{ file, line, message }` with `commit <hash>` for the file and the
+ * subject as line 1, and how many commits and terms were looked at, from which sources.
+ */
+export function checkCommitMessages(root = repository, range, options = {}) {
+  const { terms, sources } = privateTerms(options);
+  const log = spawnSync('git', ['-C', root, 'log', '-z', '--format=%h%n%B', range, '--'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  if (log.error || log.status !== 0) {
+    throw new Error(`git could not read the commits ${range} of ${root}: ${(log.stderr || log.error?.message || `exit ${log.status}`).trim()}`);
+  }
+  const findings = [];
+  const commits = log.stdout.split('\0').filter(Boolean);
+  for (const commit of commits) {
+    const [hash, ...lines] = commit.split('\n');
+    lines.forEach((line, index) => {
+      for (const message of lineFindings(line, terms)) findings.push({ file: `commit ${hash}`, line: index + 1, message });
+    });
+  }
+  return { commits: commits.length, terms: terms.length, sources, findings };
+}
+
 // Compared through realpath, as contract/validate.mjs does. Node resolves the symlinks in
 // import.meta.url but not in argv[1], so through a symlinked checkout a plain comparison never
 // runs the check and the gate passes having looked at nothing.
 const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
 if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
+  const range = process.argv[2] === '--commits' ? process.argv[3] : null;
   let result;
   try {
-    result = checkPrivateData(path.resolve(process.argv[2] ?? repository));
+    if (process.argv[2] === '--commits' && !range) throw new Error('--commits needs a range of commits, such as origin/main..HEAD.');
+    result = range
+      ? checkCommitMessages(path.resolve(process.argv[4] ?? repository), range)
+      : checkPrivateData(path.resolve(process.argv[2] ?? repository));
   } catch (error) {
     console.error(error.message);
     process.exit(2);
@@ -198,11 +231,13 @@ if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.
   if (result.sources.length) console.log(`Looked for ${result.terms} private terms from ${result.sources.join(' and ')}.`);
   else console.log(`Looked for no private terms: ${TERMS_VARIABLE} is not set and there is no ${TERMS_FILE}. Home directories and addresses were still checked.`);
   for (const { file, line, message } of result.findings) console.error(line ? `${file}:${line}: ${message}` : `${file}: ${message}`);
+  const what = range ? 'commit messages' : 'files';
+  const count = range ? result.commits : result.files;
   if (result.findings.length) {
     const named = new Set(result.findings.map(finding => finding.file)).size;
-    console.error(`${result.findings.length} private values in ${named} of ${result.files} files. The repository is public: write placeholders instead.`);
+    console.error(`${result.findings.length} private values in ${named} of ${count} ${what}. The repository is public: write placeholders instead.`);
     process.exitCode = 1;
   } else {
-    console.log(`Checked ${result.files} files: no private home directories, addresses or terms.`);
+    console.log(`Checked ${count} ${what}: no private home directories, addresses or terms.`);
   }
 }

@@ -32,6 +32,8 @@ The repository is public, and `node scripts/check-private-data.mjs` keeps it fre
 
 The terms come from the `LEGION_PRIVATE_TERMS` environment variable, which CI fills from the repository secret of that name, and from `~/.legion-control/private/terms.txt`, outside the repository and never committed. Both have one format: one entry per line, or several separated by commas; a line starting with `#` is a comment; each term is at least three characters and matches case-insensitively in every line and file name. An entry may list the public places its term is allowed in after it, each after a `!`, such as `jdoe ! github.com/jdoe/ ! com.jdoe.`; each place must contain the term and cannot contain a comma. A finding prints the file, the line and the entry number, never the term. Without either source the check says it looked for no private terms and still checks homes and addresses.
 
+A commit message is published with its branch and stays in the history, and no file holds it. `node scripts/check-private-data.mjs --commits origin/main..HEAD` reads the messages of the commits a push would publish, line by line, for the same three things; the author is not read.
+
 Set the secret under **Settings → Secrets and variables → Actions**, or with `gh secret set LEGION_PRIVATE_TERMS < ~/.legion-control/private/terms.txt`. Until it exists, and on pull requests from forks, the CI job checks only homes and addresses.
 
 ### Linting the shell and PowerShell scripts
