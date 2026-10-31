@@ -71,7 +71,9 @@ switch (verb) {
   case 'busy':
     // The drain is what makes a "busy during preparation" test possible: it can
     // flip the machine busy at exactly the moment the update is about to stop it.
-    process.exit(read('busy') === 'on' ? 1 : 0);
+    // busy-until is a clock time in milliseconds, for a session that ends by
+    // itself a moment later.
+    process.exit(read('busy') === 'on' || Date.now() < Number(read('busy-until', '0')) ? 1 : 0);
   case 'drain':
     bump('drain-runs');
     if (read('drain-makes-busy') === 'on') write('busy', 'on');

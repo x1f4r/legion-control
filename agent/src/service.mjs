@@ -6,6 +6,7 @@
 
 import { detectPlatform } from './paths.mjs';
 import { describeFailure, runMutationArgv, sleep } from './process-runner.mjs';
+import { checkServiceBusy } from './probes/busy.mjs';
 import { checkHealth, describeHealth, healthPort } from './probes/health.mjs';
 import { isRunning, probeProcess, processEvidence, processStartedAt, startProcess, stopProcess, systemctlMutation } from './probes/process.mjs';
 import { NO_RELAY, probeRelay } from './probes/relay.mjs';
@@ -147,6 +148,33 @@ export async function drainService(service) {
 }
 
 /**
+ * Wait for a service that has no process of its own to have nothing running.
+ *
+ * A CLI only ever runs as the sessions somebody starts, so there is nothing to
+ * stop, and the process probe answers "running" for it for ever: with nothing
+ * to start or stop, nothing can be down either. Waiting on that probe failed
+ * every such update 20 s after a stop nobody had asked for. What its profile
+ * promises instead is that every related process has exited, which is the
+ * question its busy probe answers, so that is asked until it says idle or the
+ * budget runs out. One still busy then is not a stop that failed, because
+ * nothing was asked to stop: `busy` carries the answer, and the update waits.
+ */
+async function waitUntilIdle(service, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const own = (service.busy?.timeoutSeconds ?? 8) * 1000;
+  for (;;) {
+    const busy = await checkServiceBusy(service, { timeoutMs: Math.min(own, Math.max(0, deadline - Date.now())), liveness: livenessOf(service) });
+    if (!busy.busy) return { ok: true, message: null };
+    if (Date.now() + 1000 >= deadline) {
+      const waited = Math.round(timeoutMs / 1000);
+      const state = busy.unknown ? 'whether anything related was still running could not be established' : 'something related was still running';
+      return { ok: false, busy, message: `${service.name} has nothing of its own to stop, and ${waited} s later ${state}: ${busy.error ?? busy.reason}` };
+    }
+    await sleep(1000);
+  }
+}
+
+/**
  * Stop and wait for the process to actually disappear. An installer must not
  * replace a service's files while a process still has them open.
  */
@@ -157,6 +185,7 @@ export async function stopAndWait(service, timeoutMs = 20000) {
   if (service.process?.type === 'app') {
     return appProvider.quitAndWait(service, Math.max(timeoutMs, appProvider.QUIT_WAIT_MS));
   }
+  if ((service.process?.type ?? 'none') === 'none') return waitUntilIdle(service, timeoutMs);
 
   const stopped = await stopService(service);
   const deadline = Date.now() + timeoutMs;

@@ -44,7 +44,7 @@ import { REASON } from './contract.mjs';
 import { withOperation } from './operate.mjs';
 import { appendLog, listOperations, recordPhase, updateOperation, whenStarted } from './operations.mjs';
 import { describeFailure, mutationWorstCaseMs, runMutationArgv, unsettledWork } from './process-runner.mjs';
-import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
+import { aggregateBusy, BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
 import { describeHealth } from './probes/health.mjs';
 import { PROCESS_COMMAND_MS } from './probes/process.mjs';
 import { hasUpdatePath, scheduledEligibility } from './policy.mjs';
@@ -156,6 +156,21 @@ function deferred({ service, from = null, to = null, busy, message }) {
     message,
     service: service?.id ?? null,
   };
+}
+
+/**
+ * A service with nothing of its own to stop that was still busy when its stop
+ * step gave up (service.mjs). Nothing was asked to stop and nothing was
+ * installed, so it waits for an idle window like any other deferral, --force
+ * included: what keeps it is a session nobody here can end, and installing
+ * under that is what the stop step is there to prevent.
+ */
+function stillBusyAtStop({ service, from, to, stopped, later }) {
+  saveServiceState(service, { pendingRestart: true, pendingVersion: to });
+  const message = `${stopped.message}; nothing was installed, and ${later} at the next idle window`;
+  log(message, 'update');
+  recordLastUpdate(service, 'deferred', from, to, message);
+  return deferred({ service, from, to, busy: aggregateBusy([{ service, busy: stopped.busy }]), message });
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +401,7 @@ async function rollBack(service, previous, prefix, enter) {
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
   if (!stopped.ok) {
     await ensureServiceUp(service);
-    return { ok: false, message: `rollback skipped, ${service.name} would not stop: ${stopped.message}` };
+    return { ok: false, message: stopped.busy ? `rollback skipped: ${stopped.message}` : `rollback skipped, ${service.name} would not stop: ${stopped.message}` };
   }
 
   const reinstalled = await npmProvider.installVersion(service, previous, prefix);
@@ -555,6 +570,7 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
   }
 
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
+  if (!stopped.ok && stopped.busy) return stillBusyAtStop({ service, from, to, stopped, later: `${to} will be installed` });
   if (!stopped.ok) {
     const message = `${service.name} would not stop: ${stopped.message}`;
     log(message, 'update');
@@ -977,6 +993,7 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
   }
 
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
+  if (!stopped.ok && stopped.busy) return stillBusyAtStop({ service, from, to, stopped, later: 'it will be applied' });
   if (!stopped.ok) {
     const message = `${service.name} would not stop: ${stopped.message}`;
     log(message, 'update');
