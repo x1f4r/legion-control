@@ -215,8 +215,10 @@ export async function runSleep(config, options = {}) {
     markPowerDispatch(opId, 'suspending');
     const suspended = await suspendMachine(config);
     if (!suspended.ok) {
+      // timed-out reads as an unknown outcome (contract section 5.6): the
+      // suspend may be under way, and no client sends it again.
       log(`sleep failed: ${suspended.message}`, 'sleep');
-      return { ok: false, action: 'failed', reasonCode: REASON.notConfigured, message: suspended.message };
+      return { ok: false, action: 'failed', reasonCode: suspended.reasonCode, message: suspended.message };
     }
 
     lock.phase('suspending');

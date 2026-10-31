@@ -14,6 +14,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { REASON } from './contract.mjs';
 import { detectPlatform } from './paths.mjs';
 import { describeFailure, runArgv, runCommand, runMutation, runMutationArgv, sleep } from './process-runner.mjs';
 
@@ -442,10 +443,13 @@ export function selectSleepCommand(platform, sleepConfig = {}, probe = defaultTo
     return {
       ok: false,
       command: null,
-      message: `no suspend tool found; looked at ${candidates.join(', ') || 'nothing'}`,
+      message: candidates.length > 0
+        ? `no suspend tool is installed: none of ${candidates.join(', ')} was found, and sleep.command is not set`
+        : 'no suspend tool is configured: sleep.tools is empty, and sleep.command is not set',
+      fix: 'install Sysinternals PsShutdown (psshutdown64.exe) on PATH or at one of those paths, or set sleep.command in config.json',
     };
   }
-  return { ok: false, command: null, message: `no suspend command is configured for ${platform}` };
+  return { ok: false, command: null, message: `no suspend command is configured for ${platform}`, fix: 'set sleep.command in config.json' };
 }
 
 /**
@@ -467,12 +471,18 @@ export function selectSleepCommand(platform, sleepConfig = {}, probe = defaultTo
  * failure text. The command not returning usually means the machine went down
  * while we were waiting, so calling it a plain failure would be as wrong as
  * calling it a success. Say the result is unknown and let the caller look.
+ *
+ * So each failure carries the reasonCode it is reported with. Every one of
+ * them used to be not-configured, a timeout included, which made a suspend
+ * that may well have been under way read as a machine nobody had set up.
  */
-export async function suspendMachine(config) {
+export async function suspendMachine(config, { platform = detectPlatform(), probe = defaultToolProbe, timeoutMs = SUSPEND_COMMAND_MS } = {}) {
   const sleepConfig = config.sleep ?? {};
-  const chosen = selectSleepCommand(detectPlatform(), sleepConfig);
+  const chosen = selectSleepCommand(platform, sleepConfig, probe);
   if (!chosen.ok) {
-    return { ok: false, message: `${chosen.message}; the machine was left running` };
+    // The one failure that is a missing configuration: there is nothing here
+    // that could suspend this machine, and the message says what is missing.
+    return { ok: false, reasonCode: REASON.notConfigured, message: `${chosen.message}; ${chosen.fix}. The machine was left running` };
   }
 
   const warnings = [];
@@ -484,7 +494,7 @@ export async function suspendMachine(config) {
     await sleep(sleepConfig.settle * 1000);
   }
 
-  const result = runArgv(chosen.command, { timeoutMs: SUSPEND_COMMAND_MS });
+  const result = runArgv(chosen.command, { timeoutMs });
   const label = path.basename(chosen.command[0]);
   if (accepted(result)) {
     const wording = suspendAccepted(label);
@@ -497,7 +507,9 @@ export async function suspendMachine(config) {
     return { ok: true, message: wording };
   }
   if (result.timedOut) {
-    return { ok: false, message: `${result.command} never returned, so whether the machine is suspending is unknown` };
+    return { ok: false, reasonCode: REASON.timedOut, message: `${result.command} never returned, so whether the machine is suspending is unknown` };
   }
-  return { ok: false, message: describeFailure(result) };
+  // The suspend was asked for and refused, which a machine that went down
+  // would not be here to say: a plain failure, in the command's own words.
+  return { ok: false, reasonCode: REASON.internal, message: `${describeFailure(result)}; the machine was left running` };
 }
