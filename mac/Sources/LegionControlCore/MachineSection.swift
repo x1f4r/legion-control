@@ -107,7 +107,8 @@ struct MachineSection: View {
         }
     }
 
-    /// An agent older than the one this app carries, with the install beside it.
+    /// An agent older than the one this app carries, with the install beside it, and why it cannot
+    /// be pressed when that is anything more than something already running.
     @ViewBuilder
     private var agentBlock: some View {
         if let newer = model.newerBundledAgent, let line = model.newerBundledAgentLine {
@@ -117,14 +118,14 @@ struct MachineSection: View {
                 Button("Install agent \(newer)") { model.installBundledAgent() }
                     .controlSize(.small)
                     .disabled(installDisabled)
+                if let refusal = model.agentInstallRefusal { QuietNote(text: refusal) }
             }
         }
     }
 
-    /// Why the bundled agent's install cannot be pressed right now, the same wherever it is offered.
+    /// Whether the bundled agent's install cannot be pressed right now, the same wherever it is offered.
     private var installDisabled: Bool {
-        model.isWorking || model.status?.ok != true || model.commandableSystem?.isRestricted == true
-            || model.status?.isRestrictedSession == true || model.legacyInstallRefusal != nil
+        model.isWorking || model.status?.ok != true || model.agentInstallRefusal != nil
     }
 
     /// The line for one of `machine`'s waiting values, which says what runs meanwhile. `machine` is
@@ -746,7 +747,7 @@ struct MachineSection: View {
 
         if AgentBundle.shared == nil {
             QuietNote(text: AgentBundle.unavailableReason).padding(.top, 12)
-        } else if let refusal = model.legacyInstallRefusal {
+        } else if model.bundledAgentGoesBack == nil, let refusal = model.agentInstallRefusal {
             QuietNote(text: refusal).padding(.top, 12)
         } else if let goesBack = model.bundledAgentGoesBack, !model.canGoBackToBundledAgent {
             QuietNote(text: "\(goesBack), so it is not installed from here.").padding(.top, 12)

@@ -237,6 +237,36 @@ struct MachineModelTests {
         #expect(model.newerBundledAgentLine == "Agent 2.1.0 is too old for operations, policy and queue controls. This app carries 3.1.0.")
     }
 
+    @Test("the install beside an older agent says why it cannot be pressed, as Diagnostics does")
+    func olderAgentInstallSaysWhyNot() async throws {
+        // Greyed out with the reason drawn only under Diagnostics, it read as broken where the
+        // machine's state is read.
+        let runner = FakeRunner()
+        let (legacy, legacyDirectory) = Self.legacyCmdModel(runner)
+        defer { try? FileManager.default.removeItem(at: legacyDirectory) }
+        legacy.core.bundledAgentVersion = "3.1.0"
+        await legacy.refresh(userInitiated: false)
+        #expect(legacy.newerBundledAgent == "3.1.0")
+        #expect(legacy.agentInstallRefusal == legacy.legacyInstallRefusal)
+        #expect(legacy.agentInstallRefusal?.contains("cmd") == true)
+
+        let restricted = FakeRunner()
+        restricted.answer("status", json: Self.onlineStatus.replacingOccurrences(
+            of: #""agent": { "version": "3.0.0", "contract": 3 }"#,
+            with: #""agent": { "version": "3.0.0", "contract": 3, "restrictedSession": true }"#))
+        let (model, _, directory) = Self.model(restricted)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        model.core.bundledAgentVersion = "3.1.0"
+        await model.refresh(userInitiated: false)
+        #expect(model.newerBundledAgent == "3.1.0")
+        #expect(model.agentInstallRefusal == "The agent is installed from here only over an administrator connection, and this device reaches Pi with a restricted key.")
+
+        // An administrator connection has nothing to say.
+        restricted.answer("status", json: Self.onlineStatus)
+        await model.refresh(userInitiated: false)
+        #expect(model.agentInstallRefusal == nil)
+    }
+
     /// A machine whose 2.x agent sits behind a cmd login, which the upgrade cannot be sent to.
     static func legacyCmdModel(_ runner: FakeRunner) -> (MachineModel, URL) {
         let windows = Machine(

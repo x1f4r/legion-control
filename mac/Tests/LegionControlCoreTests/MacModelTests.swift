@@ -149,21 +149,30 @@ struct MacModelTests {
     @Test("this Mac's row says when its agent is older than the one this app carries")
     func rowOfAnOlderAgent() async throws {
         let runner = FakeRunner()
-        runner.answer("status", json: """
+        let status = """
         { "ok": true, "contract": 3, "agentVersion": "3.0.1", "system": { "id": "mac", "name": "macOS" },
           "agent": { "version": "3.0.1", "contract": 3 },
           "services": [ { "id": "t3", "name": "T3 Code", "installed": "2", "latest": "2", "upToDate": true,
                           "busy": { "busy": false, "unknown": false, "monitored": true } } ],
           "actions": [], "updates": { "automatic": false, "pauseUntil": null, "maintenanceWindows": [] } }
-        """)
+        """
+        runner.answer("status", json: status)
         let (model, _, directory) = try Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
         model.core.bundledAgentVersion = "3.1.0"
         await model.refresh()
         #expect(model.sidebarSummary == "agent 3.1.0 available")
         #expect(model.newerBundledAgentLine == "Agent 3.0.1 is older than the 3.1.0 this app carries.")
+        #expect(model.agentInstallRefusal == nil)
         model.core.bundledAgentVersion = "3.0.1"
         #expect(model.sidebarSummary == "up to date")
+
+        // The install beside the line says why it cannot be pressed, as it does for a machine.
+        runner.answer("status", json: status.replacingOccurrences(
+            of: #""agent": { "version": "3.0.1", "contract": 3 }"#,
+            with: #""agent": { "version": "3.0.1", "contract": 3, "restrictedSession": true }"#))
+        await model.refresh()
+        #expect(model.agentInstallRefusal == "The agent is installed from here only from an administrator session, and this one is restricted.")
     }
 
     // MARK: - Parity

@@ -128,6 +128,13 @@ final class MacModel: AgentDevice {
         return nil
     }
 
+    /// Why the bundled agent is not installed from here, in words, or nil when nothing stands in the
+    /// way but something already running.
+    var agentInstallRefusal: String? {
+        guard status?.isRestrictedSession == true else { return nil }
+        return "The agent is installed from here only from an administrator session, and this one is restricted."
+    }
+
     func actionUnavailableReason() -> String? {
         guard isReachable else { return "This Mac could not be read, so its actions cannot be run." }
         return nil

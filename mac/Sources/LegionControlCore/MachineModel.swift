@@ -1097,6 +1097,17 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
         return AgentBootstrap.remoteRefusal(system: system, restrictedSession: status.isRestrictedSession)
     }
 
+    /// Why the bundled agent is not installed from here, in words, or nil when nothing stands in the
+    /// way but something already running. Said beside the install wherever it is offered: a button
+    /// greyed out for a reason given only under Diagnostics read as broken everywhere else.
+    var agentInstallRefusal: String? {
+        if let refusal = legacyInstallRefusal { return refusal }
+        if commandableSystem?.isRestricted == true || status?.isRestrictedSession == true {
+            return "The agent is installed from here only over an administrator connection, and this device reaches \(name) with a restricted key."
+        }
+        return nil
+    }
+
     /// A 2.x agent cannot take the payload on stdin, so the bootstrap is uploaded over the route
     /// the last call went over and run there.
     func installOverLegacyAgent(_ payload: Data, operation: String, version: String) async -> ActionResolution {

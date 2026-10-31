@@ -31,7 +31,8 @@ struct MacSection: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Button("Install agent \(newer)") { mac.installBundledAgent() }
                         .controlSize(.small)
-                        .disabled(mac.isWorking || mac.status?.ok != true || mac.status?.isRestrictedSession == true)
+                        .disabled(mac.isWorking || mac.status?.ok != true || mac.agentInstallRefusal != nil)
+                    if let refusal = mac.agentInstallRefusal { QuietNote(text: refusal) }
                 }
             }
             if case .conflict = mac.setupSharing { setupVerdict }
