@@ -212,6 +212,9 @@ final class MachineModel: AgentDevice, @MainActor Identifiable {
 
     var recordedSystem: (id: String?, name: String?) { (commandableSystem?.id, currentSystem?.name) }
 
+    /// The machine section's operations block lists them.
+    var drawsRunningOperations: Bool { true }
+
     var recordedRoute: String? { lastRoute?.label }
 
     func send<Value: Decodable & Sendable>(_ request: AgentRequest, decoding: Value.Type) async throws -> Value {

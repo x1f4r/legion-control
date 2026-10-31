@@ -660,8 +660,18 @@ final class AppModel {
 
     /// Operations this app started and never learned the outcome of. The one thing that asks for
     /// attention on its own, because an update that may or may not have installed is a question the
-    /// user has to be able to see and settle.
-    var unresolvedOperations: [OperationRecord] { operations.unresolved }
+    /// user has to be able to see and settle. Less the ones a device's page draws as running, as
+    /// each device leaves them out of its own (AgentDevice.unresolvedOperations).
+    var unresolvedOperations: [OperationRecord] {
+        operations.unresolved.filter { device(filing: $0.machineId)?.isShownRunning($0) != true }
+    }
+
+    /// The device whose operations are filed under `machineId`, while it is in the setup.
+    func device(filing machineId: String) -> (any AgentDevice)? {
+        if let machine = machine(id: machineId) { return machine }
+        if let mac, mac.historyMachineId == machineId { return mac }
+        return nil
+    }
 
     /// Anything the agents could not read, machine by machine.
     var agentNotes: [(machine: String, notes: [String])] {
@@ -687,7 +697,7 @@ final class AppModel {
 
     /// The symbol the menu bar draws.
     var menuBarSymbol: String {
-        if !operations.unresolved.isEmpty { return "questionmark.circle" }
+        if !unresolvedOperations.isEmpty { return "questionmark.circle" }
         if appUpdates.availableVersion != nil { return "arrow.down.circle" }
         guard let first = machines.first else { return mac == nil ? "circle.dotted" : "laptopcomputer" }
         if machines.count == 1 { return first.symbolName }

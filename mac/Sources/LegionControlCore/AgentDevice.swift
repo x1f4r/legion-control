@@ -31,6 +31,9 @@ protocol AgentDevice: SetupChannel {
     /// Whether a fresh status read follows every action, rather than only the ones whose resolution
     /// asks for one.
     var readsAfterEveryAction: Bool { get }
+    /// Whether this device's page draws the operations its status lists as running, so that an owed
+    /// one among them is shown there rather than as an outcome nobody knows.
+    var drawsRunningOperations: Bool { get }
 
     /// Put one request in front of this device's agent and decode what comes back.
     ///
@@ -252,6 +255,8 @@ extension AgentDevice {
 
     var readsAfterEveryAction: Bool { false }
 
+    var drawsRunningOperations: Bool { false }
+
     /// Which contract the far side speaks, and therefore what may be sent to it.
     var dialect: AgentDialect { AgentDialect(status) }
 
@@ -305,9 +310,26 @@ extension AgentDevice {
         return busy.summary
     }
 
-    /// Operations this app started here and lost the answer to.
+    /// Operations this app started here and lost the answer to. One the page draws as running is
+    /// left out while it does: the agent is saying where it has got to. It is still owed, and asked
+    /// about by id once the status stops listing it.
     var unresolvedOperations: [OperationRecord] {
-        (operations?.unresolved ?? []).filter { $0.machineId == historyMachineId }
+        (operations?.unresolved ?? []).filter { $0.machineId == historyMachineId && !isShownRunning($0) }
+    }
+
+    /// Whether this device's page draws the record among the operations running, from the status
+    /// just read.
+    func isShownRunning(_ record: OperationRecord) -> Bool {
+        drawsRunningOperations && runningOperations.contains { $0.id == record.id }
+    }
+
+    /// Why an owed record is not asked about now, or nil when it is. Only the system it was sent to
+    /// can say what became of it, and the button that asks did nothing at all while another system
+    /// of the machine was answering.
+    func checkUnavailableReason(for record: OperationRecord) -> String? {
+        guard !isAnsweredHere(record) else { return nil }
+        let system = record.systemName ?? record.systemId ?? "the system it was sent to"
+        return "Sent to \(system), which is the only one that can say what became of it. It is asked once \(system) answers."
     }
 
     /// The record for the operation the app is watching, so the section can draw its phase.
@@ -402,28 +424,28 @@ extension AgentDevice {
     /// or expired and been pruned read "waiting for idle" for good.
     func reconcileIfNeeded() {
         guard let operations, dialect.supportsOperations else { return }
-        let queued = operations.queued.filter { $0.machineId == historyMachineId && $0.agentTracked && isAnsweredHere($0) }
-        // One the status lists as started or finished is settled from it, for nothing. One it lists
-        // as still waiting has nothing new to say.
-        for record in queued {
-            guard let known = status?.operation(id: record.id), !known.isQueued else { continue }
+        let asked = { (record: OperationRecord) in
+            record.machineId == self.historyMachineId && record.agentTracked && self.isAnsweredHere(record)
+        }
+        // What the status the poll just read lists is settled from it, which costs nothing at all:
+        // a queued request that has started or finished, an owed one that has moved on. One still
+        // where the record has it has nothing new to say. All of them on every poll: taken one a
+        // minute, an owed record the status listed as running stood first in line for as long as
+        // it ran, and the ones behind it were never asked.
+        for record in operations.queued.filter(asked) + operations.unresolved.filter(asked) {
+            guard let known = status?.operation(id: record.id), Self.settles(record, from: known),
+                  !(record.state == .queued && known.isQueued), !(record.state == .running && known.state == "running")
+            else { continue }
             operations.reconcile(record.id, with: known)
             onStateChange?()
         }
         guard Date().timeIntervalSince(core.lastReconcileAttempt) > DeviceCore.reconcileEvery else { return }
-        let owed = operations.unresolved.filter { $0.machineId == historyMachineId && $0.agentTracked && isAnsweredHere($0) }
-            + queued.filter { operations.record(id: $0.id)?.state == .queued && status?.operation(id: $0.id) == nil }
-        guard let next = owed.first else { return }
-        core.lastReconcileAttempt = Date()
-
-        // The status the poll just read may already carry it, which costs nothing at all. Not for a
-        // finished cycle: a summary names none of its services, and a cycle is decided on them too.
-        if let known = status?.operation(id: next.id),
-           next.kind != .updateAll || !known.isFinished || known.children != nil {
-            operations.reconcile(next.id, with: known)
-            onStateChange?()
-            return
+        // The rest are asked for by id, one a minute.
+        let unlisted = (operations.unresolved.filter(asked) + operations.queued.filter(asked)).filter { record in
+            status?.operation(id: record.id).map { !Self.settles(record, from: $0) } ?? true
         }
+        guard let next = unlisted.first else { return }
+        core.lastReconcileAttempt = Date()
 
         Task { @MainActor in
             do {
@@ -432,13 +454,9 @@ extension AgentDevice {
                 if let operation = reply.operation {
                     operations.reconcile(next.id, with: operation)
                 } else if reply.isUnknownOperation {
-                    // An agent that took a request into its queue did hear of it, so no record of
-                    // it now is no evidence that it never started.
-                    if operations.record(id: next.id)?.state == .queued {
-                        operations.resolveQueuedAsGone(next.id)
-                    } else {
-                        operations.resolveAsNeverStarted(next.id)
-                    }
+                    // An agent that took a request into its queue, or listed it since, did hear of
+                    // it, so no record of it now is no evidence that it never started.
+                    operations.resolveWithNoRecord(next.id)
                 }
                 self.onStateChange?()
             } catch {
@@ -447,10 +465,16 @@ extension AgentDevice {
         }
     }
 
+    /// Whether what a status lists about an operation is enough to settle the record. Not for a
+    /// finished cycle: a summary names none of its services, and a cycle is decided on them too.
+    private static func settles(_ record: OperationRecord, from known: AgentOperation) -> Bool {
+        record.kind != .updateAll || !known.isFinished || known.children != nil
+    }
+
     /// Whether the agent answering now is the one an operation was sent to. Only that one can say
     /// what became of it: the other system of a machine that has since booted into it has never
     /// heard of the id, and saying so is no evidence about it at all.
-    private func isAnsweredHere(_ record: OperationRecord) -> Bool {
+    func isAnsweredHere(_ record: OperationRecord) -> Bool {
         guard let sent = record.systemId, let answering = recordedSystem.id else { return true }
         return sent == answering
     }
@@ -924,6 +948,16 @@ extension AgentDevice {
         ))
     }
 
+    /// An agent installation whose outcome is still owed, which holds back another: on the system
+    /// answering now, whether or not the status lists it running. One sent to the machine's other
+    /// system can only be read there, and holding this one back for it said to check a result that
+    /// no check could read.
+    var owedAgentInstall: OperationRecord? {
+        operations?.unresolved.first {
+            $0.machineId == historyMachineId && $0.kind == .appUpdate && $0.subject == "control agent" && isAnsweredHere($0)
+        }
+    }
+
     /// Install the agent this build was made with, after verifying its signature here.
     ///
     /// Never as an upgrade when it is older than the agent running, or below the version floor: an
@@ -933,7 +967,7 @@ extension AgentDevice {
         guard let bundle = AgentBundle.shared, let status, status.ok == true, isCommandable else { return }
         let goesBack = AgentDowngrade.reason(installing: bundle.version, over: status) != nil
         guard goesBack == allowDowngrade, !allowDowngrade || AgentDowngrade.isOffered(by: status) else { return }
-        if let previous = unresolvedOperations.first(where: { $0.kind == .appUpdate && $0.subject == "control agent" }) {
+        if let previous = owedAgentInstall {
             setStatus("Agent installation \(previous.id) still has an unknown outcome. Check its result before starting another installation.", isError: true)
             reconcileNow()
             return

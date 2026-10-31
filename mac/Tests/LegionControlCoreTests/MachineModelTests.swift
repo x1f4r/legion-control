@@ -591,7 +591,54 @@ struct MachineModelTests {
         #expect(!runner.sentCommands.contains { $0.contains("op ") })
     }
 
-    @Test("an unknown outcome is never settled by a system it was not sent to")
+    @Test("a queued request the status shows running reads as running, and is asked about once it is not listed")
+    func queuedRequestThatStarts() async throws {
+        // Reconciled to running, it was owed an answer like a lost one: the section drew it under
+        // "Outcome not known" beside its running row, still saying it waited for idle, and the
+        // sidebar read "outcome not known yet".
+        let runner = FakeRunner()
+        let (model, store, directory) = Self.model(runner)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sleep = Self.queuedSleep(in: store, expiry: Date().addingTimeInterval(3600))
+        // Lost after it and owed as well. A running record the status listed stood first in line
+        // and was read from the status again on every poll, and this one was never asked.
+        let lost = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "linux",
+                                   kind: .update, subject: "Demo", summary: "Updating Demo.", agentTracked: true)
+        store.begin(lost)
+        store.finish(lost.id, state: .unknown, summary: "The update of Demo may or may not have happened.")
+
+        runner.answer("status", json: Self.status(listing: """
+        { "running": [ { "id": "\(sleep.id)", "kind": "sleep", "state": "running", "phase": "suspending", "outcome": "pending" } ] }
+        """))
+        runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#, exit: 1)
+        await model.refresh(userInitiated: false)
+        await Self.waitWhile { store.record(id: lost.id)?.needsReconciliation == true }
+
+        let running = try #require(store.record(id: sleep.id))
+        #expect(running.state == .running)
+        #expect(running.summary == "Sleep: Pi left the queue and started on Pi.")
+        #expect(running.needsReconciliation)
+        #expect(model.isShownRunning(running))
+        #expect(model.unresolvedOperations.isEmpty)
+        #expect(model.sidebarSummary == "Linux")
+        #expect(runner.sentCommands.contains { $0.contains("op") && $0.contains(lost.id) })
+        #expect(!runner.sentCommands.contains { $0.contains(sleep.id) })
+
+        // No longer listed, it is owed again and asked about by id. The agent ran it, so a record
+        // it has pruned since is no sign that it never started.
+        runner.answer("status", json: Self.onlineStatus)
+        await model.refresh(userInitiated: false)
+        #expect(model.unresolvedOperations.map(\.id) == [sleep.id])
+        model.reconcileNow()
+        await Self.waitWhile { store.record(id: sleep.id)?.needsReconciliation == true }
+        #expect(runner.sentCommands.contains { $0.contains("op") && $0.contains(sleep.id) })
+        let pruned = try #require(store.record(id: sleep.id))
+        #expect(pruned.state == .unknown)
+        #expect(!pruned.needsReconciliation)
+        #expect(pruned.summary == "Sleep: Pi reached Pi, which no longer has a record of it, so how it ended is not known.")
+    }
+
+    @Test("an unknown outcome is never settled by a system it was not sent to, and the section says so")
     func unknownOutcomeWaitsForItsSystem() async throws {
         // A boot from Linux whose answer was lost, read after the machine came up in the other
         // system: that agent has never heard of the id, which is no sign the boot never started.
@@ -599,9 +646,16 @@ struct MachineModelTests {
         let (model, store, directory) = Self.model(runner)
         defer { try? FileManager.default.removeItem(at: directory) }
         let record = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "other",
-                                     kind: .boot, subject: "Linux", summary: "Switching to Linux.", agentTracked: true)
+                                     systemName: "Other", kind: .boot, subject: "Linux", summary: "Switching to Linux.",
+                                     agentTracked: true)
         store.begin(record)
         store.finish(record.id, state: .unknown, summary: "The switch to Linux may or may not have happened.")
+        // An agent installation sent there too, whose outcome is just as unknown.
+        let install = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "other",
+                                      systemName: "Other", kind: .appUpdate, subject: "control agent",
+                                      summary: "Installing agent 3.1.0 on Pi.", agentTracked: true)
+        store.begin(install)
+        store.finish(install.id, state: .unknown, summary: "The agent installation may or may not have happened.")
 
         runner.answer("status", json: Self.onlineStatus)
         runner.answer("op", json: #"{"ok":false,"contract":3,"reasonCode":"not-configured","op":null}"#, exit: 1)
@@ -611,6 +665,21 @@ struct MachineModelTests {
         #expect(!runner.sentCommands.contains { $0.contains("op ") })
         #expect(store.record(id: record.id)?.state == .unknown)
         #expect(store.record(id: record.id)?.needsReconciliation == true)
+        // "Check now" asked nothing and said nothing. What it would ask is said instead.
+        #expect(model.checkUnavailableReason(for: record)
+                == "Sent to Other, which is the only one that can say what became of it. It is asked once Other answers.")
+        // And an installation only Other can account for holds back none on Linux, which said to
+        // check a result that no check could read.
+        #expect(model.owedAgentInstall == nil)
+
+        // Sent to the system answering, it is asked, and holds the next installation back.
+        let here = OperationRecord(id: AgentToken.newOperationId(), machineId: "pi", machineName: "Pi", systemId: "linux",
+                                   systemName: "Linux", kind: .appUpdate, subject: "control agent",
+                                   summary: "Installing agent 3.1.0 on Pi.", agentTracked: true)
+        store.begin(here)
+        store.finish(here.id, state: .unknown, summary: "The agent installation may or may not have happened.")
+        #expect(model.checkUnavailableReason(for: here) == nil)
+        #expect(model.owedAgentInstall?.id == here.id)
     }
 
     // MARK: - Update semantics

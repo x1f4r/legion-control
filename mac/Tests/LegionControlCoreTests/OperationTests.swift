@@ -188,6 +188,47 @@ struct OperationTests {
         #expect(settled.summary.contains("never reached"))
     }
 
+    @Test("no record of an id is read by what the agent said of it before")
+    func noRecordAfterItWasHeard() throws {
+        let (store, directory) = try Self.store()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Never a word from the agent about it: it never started.
+        let unheard = Self.record()
+        store.begin(unheard)
+        store.finish(unheard.id, state: .unknown, summary: "unknown")
+        store.resolveWithNoRecord(unheard.id)
+        #expect(store.record(id: unheard.id)?.state == .failed)
+
+        // Listed as running once, it ran, and the record that would say how it ended was pruned.
+        // It used to be filed as one that never reached the machine.
+        let heard = Self.record(kind: .sleep)
+        store.begin(heard)
+        store.markQueued(heard.id, expiresAt: Date().addingTimeInterval(3600), summary: "queued until idle")
+        var running = AgentOperation()
+        running.rawId = heard.id
+        running.state = "running"
+        store.reconcile(heard.id, with: running)
+        #expect(store.record(id: heard.id)?.summary == "Sleep: demo left the queue and started on Pi.")
+        #expect(store.record(id: heard.id)?.agentKnew == true)
+        store.resolveWithNoRecord(heard.id)
+        let lost = try #require(store.record(id: heard.id))
+        #expect(lost.state == .unknown)
+        #expect(!lost.needsReconciliation)
+        #expect(lost.summary == "Sleep: demo reached Pi, which no longer has a record of it, so how it ended is not known.")
+
+        // Still queued here, its deadline decides.
+        let queued = Self.record(kind: .sleep)
+        store.begin(queued)
+        store.markQueued(queued.id, expiresAt: Date().addingTimeInterval(-60), summary: "queued until idle")
+        store.resolveWithNoRecord(queued.id)
+        #expect(store.record(id: queued.id)?.state == .expired)
+
+        // A history written before the key existed still reads.
+        let older = try JSONDecoder().decode(OperationRecord.self, from: try JSONEncoder().encode(Self.record()))
+        #expect(older.agentKnew == nil)
+    }
+
     @Test("a queued request is not finished and owes no unknown outcome")
     func queuedIsHeld() throws {
         let (store, directory) = try Self.store()

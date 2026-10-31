@@ -159,6 +159,10 @@ struct OperationRecord: Codable, Sendable, Equatable, Identifiable {
     var agentProgress: String?
     /// When a queued request stops waiting.
     var expiresAt: Date?
+    /// Set once the agent has said anything about the id: a reply that queued it, a status that
+    /// listed it, a read by id. Its having no record later is then a record it pruned, not one it
+    /// never had. Old records lack the key.
+    var agentKnew: Bool?
     /// Set on a helper's wake action that is not a declared `wol`: the machine it was run to wake.
     /// While it is set the record is a wake hold (section 10.2), and no other helper runs a command
     /// for that machine; it is cleared when the hold is released. Old builds ignore the key.
@@ -203,6 +207,7 @@ struct OperationRecord: Codable, Sendable, Equatable, Identifiable {
         self.agentPhase = nil
         self.agentProgress = nil
         self.expiresAt = nil
+        self.agentKnew = nil
         self.wakeTarget = wakeTarget
     }
 
@@ -345,6 +350,8 @@ final class OperationStore {
     /// again is no evidence about that service.
     func reconcile(_ id: String, with operation: AgentOperation) {
         update(id) { record in
+            let wasQueued = record.state == .queued
+            record.agentKnew = true
             if operation.isFinished { Self.release(&record, reason: "the helper's record of it finished") }
             let cycle = record.kind == .updateAll && operation.isFinished
                 ? CycleReport(operation, machine: record.machineName) : nil
@@ -372,6 +379,10 @@ final class OperationStore {
                 record.summary = reason.sentence(subject: record.subject, message: nil)
             } else if operation.isFinished {
                 record.summary = "\(record.title): \(record.state.title), according to \(record.machineName)."
+            } else if wasQueued, record.state == .running {
+                // Left as it was, the summary went on saying the request was waiting for idle, beside
+                // a row that said it was running.
+                record.summary = "\(record.title) left the queue and started on \(record.machineName)."
             }
             if let output = operation.result?.output, !output.isEmpty { record.output = output }
             record.agentPhase = operation.phase ?? record.agentPhase
@@ -399,6 +410,7 @@ final class OperationStore {
             record.summary = summary
             record.expiresAt = expiresAt
             record.needsReconciliation = false
+            record.agentKnew = true
         }
     }
 
@@ -438,6 +450,21 @@ final class OperationStore {
             record.summary = summary
             record.detail = detail ?? record.detail
             if record.finishedAt == nil { record.finishedAt = Date() }
+        }
+    }
+
+    /// The far side has no record of an id this app asked it about. What that says depends on what
+    /// this app saw of it before: a request still queued here has run out its time or been let go,
+    /// one the agent has spoken about before has had its record pruned, and only one it never said
+    /// a word about never started.
+    func resolveWithNoRecord(_ id: String, now: Date = Date()) {
+        guard let unheard = record(id: id) else { return }
+        if unheard.state == .queued {
+            resolveQueuedAsGone(id, now: now)
+        } else if unheard.agentKnew == true {
+            resolveAsLost(id, summary: "\(unheard.title) reached \(unheard.machineName), which no longer has a record of it, so how it ended is not known.")
+        } else {
+            resolveAsNeverStarted(id)
         }
     }
 

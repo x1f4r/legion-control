@@ -437,10 +437,20 @@ struct MachineSection: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
+                            if let reason = model.checkUnavailableReason(for: record) {
+                                Text(reason)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                         Spacer(minLength: 8)
-                        Button("Check now") { model.reconcileNow() }
-                            .controlSize(.small)
+                        // Nothing to press where pressing could not ask anything: the line under
+                        // the summary says who can, and when.
+                        if model.checkUnavailableReason(for: record) == nil {
+                            Button("Check now") { model.reconcileNow() }
+                                .controlSize(.small)
+                        }
                         Button("Dismiss") { model.dismissUnknownOutcome(record.id) }
                             .controlSize(.small)
                     }
