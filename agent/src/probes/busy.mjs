@@ -173,12 +173,21 @@ async function checkHttpBusy(probe, timeoutMs, startedAt) {
 }
 
 /**
- * What a busy command is told about the request, in its environment: the
+ * What a busy command is told about the request, in its environment. The
  * agent's own pid, so a probe that reads the process table can leave out the
- * probes the agent runs beside it.
+ * probes the agent runs beside it; and for an npm service, the prefix and
+ * package an update replaces, so it can tell that install's processes from
+ * another one of the same product.
  */
 export function busyCommandEnvironment(service, environment = process.env) {
-  return { ...environment, LEGIONCTL_AGENT_PID: String(process.pid) };
+  const env = { ...environment, LEGIONCTL_AGENT_PID: String(process.pid) };
+  delete env.LEGIONCTL_NPM_PREFIX;
+  delete env.LEGIONCTL_NPM_PACKAGE;
+  if (service.kind === 'npm' && typeof service.npmPrefix === 'string' && service.npmPrefix && typeof service.package === 'string' && service.package) {
+    env.LEGIONCTL_NPM_PREFIX = service.npmPrefix;
+    env.LEGIONCTL_NPM_PACKAGE = service.package;
+  }
+  return env;
 }
 
 /**

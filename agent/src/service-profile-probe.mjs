@@ -1,12 +1,17 @@
 // Conservative probes for explicitly enabled product profiles. Process rows
 // stay in this process; replies never include command lines or credentials.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { resolveClaudeUpdatePolicy, claudeTargetAllowed, compareProfileVersions, nativeClaudeVersionAt } from './service-profile-claude.mjs';
-import { readDesktopMetadata } from './service-profile-desktop.mjs';
+import { DESKTOP_APPLICATIONS, desktopLocations, readDesktopMetadata } from './service-profile-desktop.mjs';
 
+// Each name belongs to one profile. Outside Windows a name is matched with its
+// case, so the claude CLI is not the Claude app and the codex CLI is not the
+// Codex app. Windows matches file names without case, and claude.exe is both
+// there; the applications are told apart by where they are installed.
 const NAMES = {
   'claude-code': ['claude', 'claude-code'],
   'claude-desktop': ['Claude', 'claude-desktop'],
@@ -178,18 +183,34 @@ function realFiles(io) {
 /**
  * The verdict for one profile over one process snapshot.
  *
+ * `install.owned` is where the install an update replaces lives: the npm
+ * package root and the bin links it owns, or the application bundle. When it
+ * is known, a process whose program has a path counts only when that path is
+ * inside it, whatever the process is called; a name decides only for a
+ * process whose path cannot be read. `install.foreign` is where other
+ * profiles' applications live, and a name never claims a process from there.
+ *
  * `agentPid` is the agent that asked. Outside Windows its whole tree is left
  * out: the agent runs up to four probes at once, and each of them used to see
  * the others, and their children, start and exit around it. Windows keeps a
  * parent's id after the parent exits and gives it to the next process, so a
  * parent id there cannot prove descent.
  */
-export function processExitVerdict(profile, rows, ownPid = process.pid, { platform = process.platform, systemRoot = process.env.SystemRoot, agentPid = null, cwdOf = null, io = fs } = {}) {
+export function processExitVerdict(profile, rows, ownPid = process.pid, { platform = process.platform, systemRoot = process.env.SystemRoot, agentPid = null, install = null, cwdOf = null, io = fs } = {}) {
   const names = NAMES[profile];
   if (!names || !Array.isArray(rows)) return { busy: true, unknown: true, reason: 'Process inspection is unavailable for this profile.' };
   const paths = platform === 'win32' ? path.win32 : path.posix;
-  const patterns = names.map((name) => new RegExp(`(?:^|[\\s/\\\\"'])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.exe|\\.app)?(?:$|[\\s/\\\\"'])`, 'i'));
+  const fold = (value) => (platform === 'linux' ? value : value.toLowerCase());
+  const patterns = names.map((name) => new RegExp(`(?:^|[\\s/\\\\"'])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.exe|\\.app)?(?:$|[\\s/\\\\"'])`, platform === 'win32' ? 'i' : ''));
   const file = realFiles(io);
+  const inside = (candidate, roots) => roots.some((root) => {
+    const base = fold(paths.normalize(root)).replace(/[\\/]+$/, '');
+    const target = fold(paths.normalize(candidate));
+    return target === base || target.startsWith(`${base}${paths.sep}`);
+  });
+  const owned = install?.owned?.length ? install.owned : null;
+  const links = new Set((install?.links ?? []).map((link) => fold(paths.normalize(link))));
+  const foreign = install?.foreign ?? [];
   const excluded = platform !== 'win32' && Number.isInteger(agentPid) ? agentTree(rows, agentPid) : new Set();
   let uncertain = false;
   for (const row of rows) {
@@ -199,12 +220,65 @@ export function processExitVerdict(profile, rows, ownPid = process.pid, { platfo
     // A zombie has exited: it runs nothing and holds no file open.
     if (platform !== 'win32' && typeof row.state === 'string' && row.state.startsWith('Z')) continue;
     const identity = identify(row, { paths, file, cwdOf });
-    if (patterns.some((pattern) => identity.names.some((value) => pattern.test(value)))) return { busy: true, unknown: false, reason: 'A related application or CLI session is still running.' };
+    const where = identity.located.flatMap((candidate) => [candidate, file.real(candidate)]).filter(Boolean);
+    let related;
+    if (owned && where.length > 0) related = where.some((candidate) => inside(candidate, owned) || links.has(fold(paths.normalize(candidate))));
+    else if (where.some((candidate) => inside(candidate, foreign))) related = false;
+    else related = patterns.some((pattern) => identity.names.some((value) => pattern.test(value)));
+    if (related) return { busy: true, unknown: false, reason: 'A related application or CLI session is still running.' };
     if (identity.uncertain) uncertain = true;
   }
   return uncertain
     ? { busy: true, unknown: true, reason: 'Some process identities could not be inspected; waiting for a reliable idle result.' }
     : { busy: false, unknown: false, reason: 'No related application or CLI session is running.' };
+}
+
+function readJson(file, io) {
+  try {
+    if (io.statSync(file).size > 1024 * 1024) return null;
+    return JSON.parse(io.readFileSync(file, 'utf8'));
+  } catch { return null; }
+}
+
+/**
+ * Where the install a profile's update replaces lives, and where the other
+ * profiles' applications live. An npm service's prefix and package come from
+ * the agent that runs this probe: npm replaces <prefix>/lib/node_modules/<package>
+ * (<prefix>\node_modules\<package> on Windows) and the bin links into it, and
+ * nothing else. An application is the bundle its installer put in place.
+ */
+export function profileInstall(profile, { platform = process.platform, env = process.env, home = os.homedir(), io = fs } = {}) {
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const file = realFiles(io);
+  const owned = [];
+  const links = [];
+  const prefix = env.LEGIONCTL_NPM_PREFIX;
+  const packageName = env.LEGIONCTL_NPM_PACKAGE;
+  if (typeof prefix === 'string' && paths.isAbsolute(prefix) && typeof packageName === 'string' && /^(?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+$/i.test(packageName)) {
+    const root = platform === 'win32' ? paths.join(prefix, 'node_modules', packageName) : paths.join(prefix, 'lib', 'node_modules', packageName);
+    const realRoot = file.real(root);
+    owned.push(root, ...(realRoot && realRoot !== root ? [realRoot] : []));
+    const bin = readJson(paths.join(root, 'package.json'), io)?.bin;
+    const commands = typeof bin === 'string' ? [packageName.split('/').at(-1)] : bin && typeof bin === 'object' ? Object.keys(bin) : [];
+    for (const command of commands.filter((entry) => /^[A-Za-z0-9._-]+$/.test(entry))) {
+      // A Windows shim is a script of its own that starts node on the package;
+      // a POSIX link is the package's own only while it still points into it.
+      if (platform === 'win32') links.push(...['', '.cmd', '.ps1'].map((suffix) => paths.join(prefix, `${command}${suffix}`)).filter((shim) => file.isFile(shim)));
+      else {
+        const link = paths.join(prefix, 'bin', command);
+        const target = file.real(link);
+        if (target && [root, realRoot].some((base) => base && (target === base || target.startsWith(`${base}/`)))) links.push(link);
+      }
+    }
+  }
+  const system = platform === 'darwin' ? 'mac' : platform === 'win32' ? 'windows' : platform;
+  const bundles = (id) => desktopLocations(DESKTOP_APPLICATIONS[id], { platform: system, home, env })
+    .filter((location) => (system === 'mac' ? file.real(location) && !file.isFile(location) : file.isFile(location)))
+    .map((location) => (system === 'mac' ? location : paths.dirname(location)));
+  const own = DESKTOP_APPLICATIONS[profile] ? bundles(profile) : [];
+  owned.push(...own);
+  const foreign = Object.keys(DESKTOP_APPLICATIONS).flatMap(bundles).filter((bundle) => !own.includes(bundle));
+  return { owned, links, foreign: [...new Set(foreign)] };
 }
 
 /** The agent that asked, when it started this probe and says so. */
@@ -304,7 +378,7 @@ function linuxRows(io) {
   return io.readdirSync('/proc').filter((entry) => /^\d+$/.test(entry)).map((entry) => linuxProcess(Number(entry), io)).filter(Boolean);
 }
 
-export function inspectProfileProcesses(profile, { platform = process.platform, run = spawnSync, io = fs, env = process.env, parentPid = process.ppid } = {}) {
+export function inspectProfileProcesses(profile, { platform = process.platform, run = spawnSync, io = fs, env = process.env, home = os.homedir(), parentPid = process.ppid } = {}) {
   if (!NAMES[profile]) return processExitVerdict(profile, null);
   try {
     let rows;
@@ -327,7 +401,7 @@ export function inspectProfileProcesses(profile, { platform = process.platform, 
       cwdOf = (pid) => { try { return String(io.readlinkSync(`/proc/${pid}/cwd`)); } catch { return null; } };
     } else return processExitVerdict(profile, null);
     if (!rows) return processExitVerdict(profile, null);
-    return processExitVerdict(profile, rows, process.pid, { platform, agentPid: requestingAgent(env, parentPid), cwdOf, io });
+    return processExitVerdict(profile, rows, process.pid, { platform, agentPid: requestingAgent(env, parentPid), install: profileInstall(profile, { platform, env, home, io }), cwdOf, io });
   } catch { return processExitVerdict(profile, null); }
 }
 

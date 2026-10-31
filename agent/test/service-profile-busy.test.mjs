@@ -1,5 +1,5 @@
-// The profile busy probe: one consistent process snapshot, with the agent's
-// own probes left out of it.
+// The profile busy probe: one consistent process snapshot, the agent's own
+// probes left out of it, and an npm service guarded by the install npm replaces.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { checkServiceBusy } from '../src/probes/busy.mjs';
-import { inspectProfileProcesses } from '../src/service-profile-probe.mjs';
+import { inspectProfileProcesses, processExitVerdict, profileInstall } from '../src/service-profile-probe.mjs';
 
 const posix = process.platform !== 'win32';
 const AGENT = 4100;
@@ -192,6 +192,11 @@ test('a Mac re-reads the processes its two ps reads saw only once, and splits ar
   const asked = { platform: 'darwin', run: ps.run, io: sandbox(root), home: path.join(root, 'home'), env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT };
   assert.deepEqual(inspectProfileProcesses('opencode', asked), IDLE);
   assert.deepEqual(ps.calls, ['comm', 'args', 'again', 'again'], 'only the processes seen once are read again');
+  // The claude CLI is not the Claude app, and the Claude app is not the CLI.
+  assert.deepEqual(inspectProfileProcesses('claude-code', asked), BUSY);
+  delete processes[20235];
+  assert.deepEqual(inspectProfileProcesses('claude-code', asked), IDLE);
+  assert.deepEqual(inspectProfileProcesses('claude-desktop', asked), BUSY);
   // A process still seen only once after it is read again stays uncertain.
   processes[5203] = { args: '/opt/homebrew/bin/node /Users/me/tool.js', again: { args: '/opt/homebrew/bin/node /Users/me/tool.js' } };
   assert.deepEqual(inspectProfileProcesses('opencode', asked), UNKNOWN);
@@ -203,8 +208,121 @@ test('a failed Mac re-read fails closed', () => {
   assert.equal(inspectProfileProcesses('opencode', { platform: 'darwin', run: failing, io: sandbox('/nowhere'), env: {} }).unknown, true);
 });
 
-test('a busy command is told which agent asked', async () => {
-  const echo = [process.execPath, '-e', 'process.stdout.write(JSON.stringify({ busy: false, reason: String(process.env.LEGIONCTL_AGENT_PID) }))'];
-  const answer = await checkServiceBusy({ id: 'opencode', name: 'OpenCode', kind: 'npm', busy: { type: 'command', command: echo } });
-  assert.equal(answer.reason, String(process.pid));
+test('an npm service is guarded by the processes of its own install, not of another one of the same product', { skip: !posix && 'POSIX paths and links' }, () => withRoot((root) => {
+  const home = path.join(root, 'home');
+  const prefix = path.join(root, 'opt', 'homebrew');
+  const packageRoot = path.join(prefix, 'lib', 'node_modules', '@openai', 'codex');
+  write(path.join(packageRoot, 'package.json'), JSON.stringify({ name: '@openai/codex', version: '0.159.1', bin: { codex: 'bin/codex.js' } }));
+  write(path.join(packageRoot, 'bin', 'codex.js'));
+  const vendor = write(path.join(packageRoot, 'node_modules', '@openai', 'codex-darwin-arm64', 'vendor', 'aarch64-apple-darwin', 'codex', 'codex'), '', 0o755);
+  const npmBin = link('../lib/node_modules/@openai/codex/bin/codex.js', path.join(prefix, 'bin', 'codex'));
+  const standalone = write(path.join(home, '.codex', 'packages', 'standalone', 'releases', '0.166.0-aarch64-apple-darwin', 'bin', 'codex'), '', 0o755);
+  const shadow = link(standalone, path.join(home, '.local', 'bin', 'codex'));
+  const env = { LEGIONCTL_AGENT_PID: String(AGENT), LEGIONCTL_NPM_PREFIX: prefix, LEGIONCTL_NPM_PACKAGE: '@openai/codex' };
+  const io = sandbox(root);
+  const install = profileInstall('codex-cli', { platform: 'darwin', env, home, io });
+  assert.deepEqual(install.owned, [packageRoot]);
+  assert.deepEqual(install.links, [npmBin]);
+  const verdict = (rows, options = {}) => processExitVerdict('codex-cli', rows, 1, { platform: 'darwin', install, io, ...options });
+
+  // A launchd job keeps the standalone install's app server running for good.
+  const appServer = { pid: 2305, parentPid: 2224, name: shadow, command: `${shadow} app-server --listen unix:///tmp/codex.sock` };
+  assert.deepEqual(verdict([appServer]), IDLE, 'npm never touches the standalone install');
+  assert.deepEqual(verdict([appServer], { install: null }), BUSY, 'by name alone it is the same product');
+  assert.deepEqual(verdict([{ pid: 9, name: 'node', command: `node ${npmBin} app-server` }]), BUSY);
+  assert.deepEqual(verdict([{ pid: 9, name: vendor, command: `${vendor} app-server` }]), BUSY);
+  assert.deepEqual(verdict([{ pid: 9, name: npmBin, command: npmBin }]), BUSY);
+  // A path that cannot be read leaves only the name to go by.
+  assert.deepEqual(verdict([{ pid: 9, name: 'codex', command: 'codex app-server' }]), BUSY);
+
+  // The probe takes the prefix and package from the agent that ran it.
+  const { run } = macPs({ 2305: { comm: shadow, args: appServer.command } });
+  assert.deepEqual(inspectProfileProcesses('codex-cli', { platform: 'darwin', run, io, home, env, parentPid: AGENT }), IDLE);
+  assert.deepEqual(inspectProfileProcesses('codex-cli', { platform: 'darwin', run, io, home, env: {}, parentPid: AGENT }), BUSY);
+}));
+
+test('a bin link another package has taken over is no longer the package\'s own', { skip: !posix && 'POSIX paths and links' }, () => withRoot((root) => {
+  const prefix = path.join(root, 'prefix');
+  const other = write(path.join(prefix, 'lib', 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'), '', 0o755);
+  const bin = link(other, path.join(prefix, 'bin', 'opencode'));
+  const env = { LEGIONCTL_NPM_PREFIX: prefix, LEGIONCTL_NPM_PACKAGE: 'opencode-ai' };
+  const install = profileInstall('opencode', { platform: 'linux', env, home: root, io: sandbox(root) });
+  assert.deepEqual(install.links, []);
+  const row = { pid: 9, name: 'opencode', argv: [bin], command: bin, executablePath: other };
+  assert.deepEqual(processExitVerdict('opencode', [row], 1, { platform: 'linux', install, io: sandbox(root) }), IDLE);
+}));
+
+test('a Windows npm service is matched under <prefix>\\node_modules\\<package>, without case', () => {
+  const prefix = 'C:\\Users\\me\\AppData\\Roaming\\npm';
+  const install = profileInstall('codex-cli', { platform: 'win32', env: { LEGIONCTL_NPM_PREFIX: prefix, LEGIONCTL_NPM_PACKAGE: '@openai/codex' }, home: 'C:\\Users\\me', io: sandbox('C:\\nowhere') });
+  assert.deepEqual(install.owned, ['C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex']);
+  const verdict = (rows) => processExitVerdict('codex-cli', rows, 99999, { platform: 'win32', systemRoot: 'C:\\Windows', install, io: sandbox('C:\\nowhere') });
+  const node = 'C:\\Program Files\\nodejs\\node.exe';
+  assert.deepEqual(verdict([{ pid: 10, parentPid: 9, name: 'node.exe', command: `"${node}" "${prefix}\\\\node_modules\\@openai\\codex\\bin\\codex.js" app-server`, executablePath: node }]), BUSY);
+  assert.deepEqual(verdict([{ pid: 10, parentPid: 9, name: 'codex.exe', command: '"C:\\Users\\me\\APPDATA\\ROAMING\\NPM\\node_modules\\@OpenAI\\Codex\\vendor\\codex.exe" app-server', executablePath: 'C:\\Users\\me\\APPDATA\\ROAMING\\NPM\\node_modules\\@OpenAI\\Codex\\vendor\\codex.exe' }]), BUSY);
+  const elsewhere = 'C:\\Tools\\codex\\bin\\codex.js';
+  assert.deepEqual(verdict([{ pid: 10, parentPid: 9, name: 'node.exe', command: `"${node}" "${elsewhere}" app-server`, executablePath: node }]), IDLE, 'a quoted script path decides even when it cannot be resolved');
+  const standalone = 'C:\\Users\\me\\.codex\\packages\\standalone\\current\\codex.exe';
+  assert.deepEqual(verdict([{ pid: 10, parentPid: 9, name: 'codex.exe', command: `"${standalone}" app-server`, executablePath: standalone }]), IDLE);
+  assert.deepEqual(verdict([{ pid: 10, parentPid: 9, name: 'codex.exe', command: null, executablePath: null }]), BUSY, 'a protected process is matched by its name');
+});
+
+test('Windows desktop applications are told from the CLIs of the same name by where they are installed', () => {
+  const files = new Set(['C:\\Users\\me\\AppData\\Local\\Claude\\Claude.exe']);
+  const io = { realpathSync: () => { throw new Error('missing'); }, statSync: (file) => { if (!files.has(file)) throw new Error('missing'); return { isFile: () => true }; } };
+  const env = { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' };
+  const desktop = profileInstall('claude-desktop', { platform: 'win32', env, home: 'C:\\Users\\me', io });
+  const cli = profileInstall('claude-code', { platform: 'win32', env, home: 'C:\\Users\\me', io });
+  assert.deepEqual(desktop.owned, ['C:\\Users\\me\\AppData\\Local\\Claude']);
+  assert.deepEqual(cli, { owned: [], links: [], foreign: ['C:\\Users\\me\\AppData\\Local\\Claude'] });
+  const app = { pid: 10, parentPid: 9, name: 'claude.exe', command: '"C:\\Users\\me\\AppData\\Local\\Claude\\app-1.0.0\\claude.exe"', executablePath: 'C:\\Users\\me\\AppData\\Local\\Claude\\app-1.0.0\\claude.exe' };
+  const session = { pid: 11, parentPid: 9, name: 'claude.exe', command: '"C:\\Users\\me\\.local\\bin\\claude.exe" --print', executablePath: 'C:\\Users\\me\\.local\\bin\\claude.exe' };
+  const verdict = (profile, install, rows) => processExitVerdict(profile, rows, 99999, { platform: 'win32', systemRoot: 'C:\\Windows', install, io });
+  assert.deepEqual(verdict('claude-code', cli, [app]), IDLE);
+  assert.deepEqual(verdict('claude-code', cli, [session]), BUSY);
+  assert.deepEqual(verdict('claude-desktop', desktop, [app]), BUSY);
+  assert.deepEqual(verdict('claude-desktop', desktop, [session]), IDLE);
+});
+
+test('a Mac desktop profile is matched by its bundle, and the CLIs and apps of one vendor no longer overlap', { skip: !posix && 'POSIX paths' }, () => withRoot((root) => {
+  const home = path.join(root, 'home');
+  const bundle = path.join(home, 'Applications', 'Claude.app');
+  const main = write(path.join(bundle, 'Contents', 'MacOS', 'Claude'), '', 0o755);
+  const copy = write(path.join(root, 'Downloads', 'Claude.app', 'Contents', 'MacOS', 'Claude'), '', 0o755);
+  const io = sandbox(root);
+  const install = profileInstall('claude-desktop', { platform: 'darwin', env: {}, home, io });
+  assert.deepEqual(install.owned, [bundle]);
+  const verdict = (profile, rows, options = {}) => processExitVerdict(profile, rows, 1, { platform: 'darwin', io, ...options });
+  assert.deepEqual(verdict('claude-desktop', [{ pid: 9, name: main, command: main }], { install }), BUSY);
+  assert.deepEqual(verdict('claude-desktop', [{ pid: 9, name: copy, command: copy }], { install }), IDLE, 'an update replaces the installed bundle, not a copy elsewhere');
+  assert.deepEqual(verdict('claude-code', [{ pid: 9, name: main, command: main }], { install: profileInstall('claude-code', { platform: 'darwin', env: {}, home, io }) }), IDLE);
+
+  // Without a bundle to go by, names decide, each for its own profile only.
+  const session = { pid: 9, name: 'claude', command: 'claude --output-format stream-json' };
+  const app = { pid: 9, name: '/Applications/Claude.app/Contents/MacOS/Claude', command: '/Applications/Claude.app/Contents/MacOS/Claude' };
+  const codex = { pid: 9, name: '/Users/me/.local/bin/codex', command: '/Users/me/.local/bin/codex app-server' };
+  const chatgpt = { pid: 9, name: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', command: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT' };
+  assert.deepEqual(verdict('claude-code', [session]), BUSY);
+  assert.deepEqual(verdict('claude-code', [app]), IDLE);
+  assert.deepEqual(verdict('claude-desktop', [app]), BUSY);
+  assert.deepEqual(verdict('claude-desktop', [session]), IDLE);
+  assert.deepEqual(verdict('codex-cli', [codex]), BUSY);
+  assert.deepEqual(verdict('codex-desktop', [codex]), IDLE);
+  assert.deepEqual(verdict('codex-desktop', [chatgpt]), BUSY);
+  assert.deepEqual(verdict('codex-cli', [chatgpt]), IDLE);
+}));
+
+test('a busy command is told which agent asked and, for an npm service, which install it guards', async () => {
+  const echo = [process.execPath, '-e', "const e = process.env; process.stdout.write(JSON.stringify({ busy: false, reason: [e.LEGIONCTL_AGENT_PID, e.LEGIONCTL_NPM_PREFIX ?? '-', e.LEGIONCTL_NPM_PACKAGE ?? '-'].join(' ') }))"];
+  const previous = process.env.LEGIONCTL_NPM_PREFIX;
+  process.env.LEGIONCTL_NPM_PREFIX = '/inherited';
+  try {
+    const npm = await checkServiceBusy({ id: 'codex-cli', name: 'Codex CLI', kind: 'npm', package: '@openai/codex', npmPrefix: '/opt/homebrew', busy: { type: 'command', command: echo } });
+    assert.equal(npm.reason, `${process.pid} /opt/homebrew @openai/codex`);
+    const command = await checkServiceBusy({ id: 'claude-code', name: 'Claude Code', kind: 'command', busy: { type: 'command', command: echo } });
+    assert.equal(command.reason, `${process.pid} - -`, 'an inherited value is never passed on as the install');
+  } finally {
+    if (previous === undefined) delete process.env.LEGIONCTL_NPM_PREFIX;
+    else process.env.LEGIONCTL_NPM_PREFIX = previous;
+  }
 });
