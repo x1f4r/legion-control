@@ -32,7 +32,9 @@ documents the 3.0 schema allowed are refused (see Changed).
   back to a tree at or above the floor, and an unrestricted one needs the flag
   to go below the live version or the floor (section 13).
 - `status.agent.signed`: whether the running tree carries its signed manifest.
-- Doctor checks `agent.floor`, `agent.signed`, `files.private` and `ssh.shell`.
+- Doctor checks `agent.floor`, `agent.signed`, `files.private`, `scheduler.timeLimit` and
+  `ssh.shell`. Agent 3.1.0 sent `scheduler.timeLimit` before the schema named it, wherever it
+  could read the scheduler's time limit.
 - `problems: [{path, message}]` on a `config-invalid` refusal of `config set`.
 - `config set` refusal codes `lock-held` and `internal`, which the agent
   already sent and the schema did not allow.

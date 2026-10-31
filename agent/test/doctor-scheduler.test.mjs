@@ -7,6 +7,9 @@ import { linuxSchedulerCommand, runDoctor, schedulerTimeLimitCheck, schedulerTim
 import { loadConfig } from '../src/config-store.mjs';
 import { withHome, writeConfig } from './helpers.mjs';
 
+// Every check id has to be one the contract names, or a reply that carries it fails the schema.
+const contractCheckId = new RegExp(JSON.parse(fs.readFileSync(new URL('../../contract/schemas/common.schema.json', import.meta.url), 'utf8')).$defs.doctorCheck.properties.id.pattern, 'u');
+
 const base = '/home/me/.legion-control';
 const node = '/home/me/.local/opt/node-v24.20.0-linux-arm64/bin/node';
 const home = '/home/me';
@@ -103,6 +106,7 @@ test('doctor reads how long each scheduler lets a cycle run', () => {
     ['<ExecutionTimeLimit>fifteen</ExecutionTimeLimit>', null],
   ]) assert.equal(schedulerTimeLimitMs(task(limit), { kind: 'task' }), expected, limit || 'no limit named');
 
+  assert.match(schedulerTimeLimitCheck(minutes(30), 'fix it').id, contractCheckId);
   assert.equal(schedulerTimeLimitCheck(minutes(30), 'fix it').level, 'ok');
   assert.equal(schedulerTimeLimitCheck(Infinity, 'fix it').summary, 'the scheduler lets a cycle run as long as it needs');
   const short = schedulerTimeLimitCheck(minutes(15), 're-run the installer');
@@ -134,6 +138,7 @@ test('Linux doctor reports the installed launcher correctly through the schedule
     const short = (await runDoctor(loaded)).checks.find((check) => check.id === 'scheduler.timeLimit');
     assert.equal(short.level, 'warn');
     assert.match(short.fix, /install-linux\.sh/);
+    assert.match(short.id, contractCheckId);
     command = `"${home}/bin/legionctl" cycle`;
     command = '"/other/installation/bin/legionctl" cycle';
     const refused = await runDoctor(loaded);
