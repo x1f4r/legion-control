@@ -3,6 +3,10 @@ package com.x1f4r.legioncontrol.net
 import com.x1f4r.legioncontrol.agent.AgentFailure
 import com.x1f4r.legioncontrol.agent.DispatchStage
 import com.x1f4r.legioncontrol.agent.FailureKind
+import com.x1f4r.legioncontrol.agent.Machine
+import com.x1f4r.legioncontrol.data.MachineHints
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -130,5 +134,45 @@ class NetworkPathsTest {
         // A network that went away after another took over leaves the new default where it is.
         book.defaultLost(wifi)
         assertEquals(away, book.snapshot())
+    }
+
+    /**
+     * A dead address was held back for up to four minutes after the network changed, a tunnel came
+     * up, or a person pulled to refresh, which looked like a fix that had done nothing.
+     */
+    @Test
+    fun `a change in the way out, or a refresh, dials every held-back address again`() {
+        val tailnet = endpoint("100.64.0.9")
+        val machine = Machine(id = "tower", name = "Tower", endpoints = listOf(tailnet), systems = emptyList(), wake = null)
+        val routes = RouteSelector(machine, NoHints) { 1_000L }
+        val wayOut = WayOut { listOf(routes) }
+        fun heldBack() = routes.heldBackFor(tailnet) != null
+
+        val home = NetworkPaths(wifi, emptyList())
+        wayOut.follow(home)
+        assertEquals(home, wayOut.paths)
+        routes.penalise(tailnet, "did not answer")
+        wayOut.follow(home)
+        assertTrue("the same way out lifts nothing", heldBack())
+
+        wayOut.follow(NetworkPaths(wifi, listOf(TAILNET)))
+        assertFalse("a tunnel came up", heldBack())
+        assertEquals(listOf(TAILNET), wayOut.paths?.tunnels)
+
+        routes.penalise(tailnet, "did not answer")
+        wayOut.follow(NetworkPaths(cellular, listOf(TAILNET)))
+        assertFalse("the default network changed", heldBack())
+
+        routes.penalise(tailnet, "did not answer")
+        wayOut.retry()
+        assertFalse("a person asked to check again", heldBack())
+    }
+
+    private object NoHints : MachineHints {
+        override fun lastGoodRoute(machineId: String): StateFlow<String?> = MutableStateFlow(null)
+        override fun rememberRoute(machineId: String, id: String) = Unit
+        override fun forgetRoute(machineId: String) = Unit
+        override fun lastKnownSystem(machineId: String): StateFlow<String?> = MutableStateFlow(null)
+        override fun rememberSystem(machineId: String, systemId: String) = Unit
     }
 }

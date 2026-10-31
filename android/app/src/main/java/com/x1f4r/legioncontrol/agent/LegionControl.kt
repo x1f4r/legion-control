@@ -17,7 +17,7 @@ import com.x1f4r.legioncontrol.net.RouteKind
 import com.x1f4r.legioncontrol.net.RouteSelector
 import com.x1f4r.legioncontrol.net.SshTransport
 import com.x1f4r.legioncontrol.net.WakeOnLan
-import com.x1f4r.legioncontrol.net.untunnelled
+import com.x1f4r.legioncontrol.net.WayOut
 
 /** One machine, wired up: how to reach it, how to wake it, and how to talk to its agent. */
 class MachineControl(
@@ -88,28 +88,14 @@ class LegionControl(context: Context) {
      */
     private val built = mutableMapOf<String, MachineControl>()
 
-    /**
-     * The way out of this phone as last seen, or null before anything has been said about it. Until
-     * then no address that went unanswered is put down to a missing tunnel.
-     */
-    @Volatile
-    private var paths: NetworkPaths? = null
+    /** The way out of this phone, and the addresses of every machine built so far to dial again when it changes. */
+    private val wayOut = WayOut { built.values.map { it.routes } }
 
-    /**
-     * Follows the way out of this phone. A change lets every address be dialled again at once: one
-     * that was silent a moment ago may be on the far side of a tunnel that has just come up, or of
-     * a network the phone has just joined.
-     */
-    fun follow(paths: NetworkPaths) {
-        if (paths == this.paths) return
-        this.paths = paths
-        retryAddresses()
-    }
+    /** Follows the way out of this phone. A change lets every address be dialled again at once. */
+    fun follow(paths: NetworkPaths) = wayOut.follow(paths)
 
     /** Lets every address of every machine be dialled again on its next call, whatever it did before. */
-    fun retryAddresses() {
-        built.values.forEach { it.routes.liftBackoff() }
-    }
+    fun retryAddresses() = wayOut.retry()
 
     /** The machines this phone is on the network of, by id, as site placement last said. */
     @Volatile
@@ -142,11 +128,7 @@ class LegionControl(context: Context) {
             label = source.host,
         )
         val transport = SshTransport(identity, hostKeys, source.host)
-        return try {
-            fetchController(transport, endpoint)
-        } catch (failure: AgentFailure) {
-            throw untunnelled(endpoint, failure, paths?.tunnels)
-        }
+        return fetchController(transport, endpoint, wayOut.paths?.tunnels)
     }
 
     /**
@@ -194,7 +176,7 @@ class LegionControl(context: Context) {
                 transport,
                 routes,
                 settings,
-                tunnels = { paths?.tunnels },
+                tunnels = { wayOut.paths?.tunnels },
                 onSite = { machine.id in onSite },
             ),
             wake = machine.wake?.let(::WakeOnLan),

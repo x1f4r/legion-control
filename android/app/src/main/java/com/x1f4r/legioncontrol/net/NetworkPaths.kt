@@ -65,6 +65,33 @@ class NetworkPathBook {
         NetworkPaths(defaultNetwork, tunnels.values.filter { !it.blocked }.flatMap { it.prefixes }.distinct())
 }
 
+/**
+ * The way out of this phone as last seen, and what a change in it does: every address held back for
+ * going unanswered is dialled again on its machine's next call. One that was silent a moment ago may
+ * be on the far side of a tunnel that has just come up, or of a network the phone has just joined.
+ *
+ * Pure Kotlin, so what lifts a backoff is tested without a device. [selectors] is read at each change
+ * rather than kept, because the machines are rebuilt as the setup changes.
+ */
+class WayOut(private val selectors: () -> Collection<RouteSelector>) {
+    /** As last seen, or null before anything has been said about it. Until then no silence is put down to a missing tunnel. */
+    @Volatile
+    var paths: NetworkPaths? = null
+        private set
+
+    /** Takes the way out as it is now. A change, the first word about it included, dials every address again. */
+    fun follow(now: NetworkPaths) {
+        if (now == paths) return
+        paths = now
+        retry()
+    }
+
+    /** Lets every address of every machine be dialled again on its next call, whatever it did before. */
+    fun retry() {
+        selectors().forEach { it.liftBackoff() }
+    }
+}
+
 /** 100.64.0.0/10, the range every tailnet address is in. */
 val TAILNET: LanPrefix = LanPrefix(LanPrefix.parseIPv4("100.64.0.0")!!, 10, LanPrefix.Form.CIDR)
 
