@@ -466,6 +466,26 @@ async function rollBack(service, previous, prefix, enter) {
  * the held lock, so it restarts directly rather than re-entering runRestart.
  */
 async function alreadyOnTarget(config, service, from, to, { force, opId, budget }) {
+  // An npm service with a verify command is asked first whether what is on
+  // disk runs. Its health cannot say: a CLI has none, and the process probe
+  // answers running for it whatever is installed. So an install that failed
+  // its verify and was not rolled back, because a session held the rollback
+  // off or there was no version to go back to, read as current and healthy on
+  // every run after the one that found it broken.
+  if (service.kind === 'npm' && service.verify) {
+    const late = budget?.refuses(mutationWorstCaseMs(VERIFY_COMMAND_MS), `checking that ${service.name} ${to} runs`);
+    if (late) {
+      return { ok: true, action: 'deferred', reasonCode: REASON.timedOut, from, to, message: `already on ${to}; ${late}`, service: service.id };
+    }
+    const verified = await runMutationArgv(service.verify, { timeoutMs: VERIFY_COMMAND_MS });
+    if (!verified.ok) {
+      const message = `already on ${to}, but it does not run: ${describeFailure(verified)}`;
+      log(message, 'update');
+      recordLastUpdate(service, 'failed', from, to, message);
+      return { ok: false, action: 'failed', reasonCode: REASON.applyFailed, from, to, message };
+    }
+  }
+
   const health = await serviceHealth(service);
   if (health.ok) {
     if (serviceState(service).pendingRestart) {

@@ -51,7 +51,11 @@ they do not know from `message`, so none of them has to change to read these.
 - `verify` on an `npm` service in the agent's `config.json`, as a `command`
   service has: a command that fails when what npm installed does not run. It
   runs once the installed version is read back and before anything starts, and
-  a failure rolls back. The profile drafts for npm CLIs carry one, which runs
+  a failure rolls back. It runs again whenever an update finds the service
+  already on the target, and one that fails there answers `failed` with
+  `apply-failed` ("already on 2.0.0, but it does not run: …") rather than
+  `noop` with `already-on-target`, so an install whose rollback did not take
+  never reads as current. The profile drafts for npm CLIs carry one, which runs
   the command the package's bin entry names with `--version`
   (`service-config.profiles.json`).
 

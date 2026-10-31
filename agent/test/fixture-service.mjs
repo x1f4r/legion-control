@@ -51,6 +51,7 @@ switch (verb) {
     write('installed', read('latest', '1.0.0'));
     break;
   case 'verify':
+    bump('verify-runs');
     process.exit(read('verify-fails') === 'on' ? 1 : 0);
   case 'rollback':
     bump('rollback-runs');

@@ -139,7 +139,8 @@ if a drain command is configured, stop the process and poll until it is really g
 verify the installed version and run `verify` when there is one, start, wait for health. Any
 failure from the install on reinstalls the previous version and reports a rollback. The second
 busy check is the one that matters: cache warming can take minutes, and the answer from before it
-is stale by the time anything is stopped.
+is stale by the time anything is stopped. An update that finds the service already on the target
+runs `verify` too, and reports a failed update rather than a current one when it fails.
 
 #### `app`: a desktop app that updates itself
 
