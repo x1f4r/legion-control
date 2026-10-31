@@ -393,7 +393,9 @@ sealed interface OperationEvent {
      *
      * For a change the agent was never heard from about, that settles it: the agent writes the record
      * before it acts, so the request never arrived. For one the agent had already answered about, the
-     * record has been pruned since, and what became of it is not known.
+     * record has been pruned since, and what became of it is not known. One it queued and whose
+     * expiry has passed is not waiting any more whatever else became of it, and is said to have
+     * expired, without claiming it never ran in an idle moment before then.
      */
     data class NotRecorded(override val at: Long) : OperationEvent
 
@@ -474,6 +476,15 @@ fun OperationRecord.reduce(event: OperationEvent): OperationRecord {
                 // It never arrived, so asking for it again cannot do it twice.
                 retryable = true,
             ).logged(event.at, "$machineName has no record of this operation.", isError = true)
+        } else if (state == TrackedState.QUEUED && queueDeadline <= event.at) {
+            copy(
+                state = TrackedState.FINISHED,
+                outcome = Outcome.UNKNOWN,
+                summary = "${kind.label} on $subjectName expired while it was queued. $machineName no longer " +
+                    "has a record of it, so whether it ran before then is not known.",
+                updatedAt = event.at,
+                retryable = false,
+            ).logged(event.at, "$machineName has no record of this operation any more, and its expiry has passed.", isError = true)
         } else {
             copy(
                 state = TrackedState.FINISHED,
@@ -560,6 +571,16 @@ private val OperationRecord.answered: Boolean
         progressStep != null ||
         progressOf != null ||
         action != null
+
+/** The longest any agent holds a queued request: `--expires` is seven days at the most. */
+private const val LONGEST_QUEUE_MS = 7L * 24 * 60 * 60 * 1000
+
+/**
+ * When a queued request stops waiting: its own expiry, or for one that came back without one, the
+ * longest any agent would have held it.
+ */
+private val OperationRecord.queueDeadline: Long
+    get() = expiresAt ?: (startedAt + LONGEST_QUEUE_MS)
 
 private fun OperationRecord.unknownSentence(): String =
     if (trackable) {

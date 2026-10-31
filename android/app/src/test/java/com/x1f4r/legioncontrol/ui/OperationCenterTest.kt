@@ -170,7 +170,8 @@ class OperationCenterTest {
     /**
      * A change queued for an idle moment, long past its expiry, that the machine has since let go
      * of. It is not left waiting for idle for good: the first read after the app comes back settles
-     * it, as one whose end is not known, because it may have run before the record went.
+     * it as expired, and as one whose end is not known, because it may have run before the record
+     * went.
      */
     @Test
     fun `a queued change the machine no longer has is settled on return, not left queued`() {
@@ -184,6 +185,10 @@ class OperationCenterTest {
         assertEquals(TrackedState.FINISHED, stored.state)
         assertEquals(Outcome.UNKNOWN, stored.outcome)
         assertFalse(stored.isCancellable)
+        assertEquals(
+            "Boot on Windows expired while it was queued. Tower no longer has a record of it, so whether it ran before then is not known.",
+            stored.summary,
+        )
     }
 
     @Test
