@@ -177,7 +177,10 @@ async function waitUntilIdle(service, timeoutMs) {
   for (;;) {
     const busy = await checkServiceBusy(service, { timeoutMs: Math.min(own, Math.max(0, deadline - Date.now())), liveness: livenessOf(service) });
     if (!busy.busy) return { ok: true, message: null };
-    if (Date.now() + 1000 >= deadline) {
+    // Another reading goes only where it has a second of its own to answer in.
+    // One asked with the last few milliseconds of the budget times out, and a
+    // plain "still running" would end as "could not be established".
+    if (Date.now() + 2000 >= deadline) {
       const waited = Math.round(timeoutMs / 1000);
       const state = busy.unknown ? 'whether anything related was still running could not be established' : 'something related was still running';
       return { ok: false, busy, message: `${service.name} has nothing of its own to stop, and ${waited} s later ${state}: ${busy.error ?? busy.reason}` };
