@@ -173,6 +173,15 @@ async function checkHttpBusy(probe, timeoutMs, startedAt) {
 }
 
 /**
+ * What a busy command is told about the request, in its environment: the
+ * agent's own pid, so a probe that reads the process table can leave out the
+ * probes the agent runs beside it.
+ */
+export function busyCommandEnvironment(service, environment = process.env) {
+  return { ...environment, LEGIONCTL_AGENT_PID: String(process.pid) };
+}
+
+/**
  * The busy state of one service. Never throws.
  *
  * `liveness` carries what the caller already knows about the service's process:
@@ -194,7 +203,7 @@ export async function checkServiceBusy(service, { timeoutMs = null, liveness = n
         if (budget <= 0) {
           return unreadable('timed-out', `there was no time left in the budget to ask ${service.name}`, startedAt);
         }
-        return readCommandBusy(await runArgvAsync(probe.command, { timeoutMs: budget }), startedAt);
+        return readCommandBusy(await runArgvAsync(probe.command, { timeoutMs: budget, env: busyCommandEnvironment(service) }), startedAt);
       }
       case 'http':
         if (budget <= 0) {

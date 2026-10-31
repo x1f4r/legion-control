@@ -120,12 +120,15 @@ test('profile process protection covers running sessions and fails closed withou
   }
   assert.equal(processExitVerdict('codex-cli', [{ pid: 2, name: 'node.exe', command: null }], 100).unknown, true);
   assert.equal(processExitVerdict('claude-code', [{ pid: 2, name: '/bin/bash', command: '/bin/bash' }], 100).busy, false);
-  assert.equal(inspectProfileProcesses('codex-cli', { platform: 'linux', run: () => ({ status: 1, stdout: 'private-value' }) }).unknown, true);
+  const unreadable = { readdirSync: () => { throw new Error('private-value'); } };
+  assert.equal(inspectProfileProcesses('codex-cli', { platform: 'linux', io: unreadable, env: {} }).unknown, true);
   for (const binary of ['/tmp/custom runtime/node', '/tmp/custom runtime tools/node']) {
-    assert.equal(inspectProfileProcesses('claude-code', { platform: 'darwin', run: (_file, args) => { assert.equal(args[0], '-ww'); return { status: 0, stdout: args.includes('comm=') ? `123 ${binary}\n` : `123 ${binary} /prefix/node_modules/@anthropic-ai/claude-code/cli.js\n` }; } }).busy, true);
+    const found = inspectProfileProcesses('claude-code', { platform: 'darwin', env: {}, run: (_file, args) => { assert.equal(args[0], '-ww'); return { status: 0, stdout: args.includes('comm=') ? `123 1 S ${binary}\n` : `123 ${binary} /prefix/node_modules/@anthropic-ai/claude-code/cli.js\n` }; } });
+    assert.equal(found.busy, true);
+    assert.equal(found.unknown, false);
     assert.equal(processExitVerdict('claude-code', [{ pid: 123, name: binary, command: `${binary} /opt/legion/agent/src/index.mjs update --service claude-code` }]).busy, false);
   }
-  assert.doesNotMatch(JSON.stringify(inspectProfileProcesses('codex-cli', { platform: 'linux', run: () => ({ status: 1, stdout: 'private-value' }) })), /private-value/);
+  assert.doesNotMatch(JSON.stringify(inspectProfileProcesses('codex-cli', { platform: 'darwin', env: {}, run: () => ({ status: 1, stdout: 'private-value' }) })), /private-value/);
 });
 
 test('desktop monitoring reads metadata through fixed OS tools and never starts the application', () => {
