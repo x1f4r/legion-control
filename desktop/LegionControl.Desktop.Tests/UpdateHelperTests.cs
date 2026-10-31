@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using LegionControl.Desktop.Config;
 using LegionControl.Desktop.Updates;
 using Xunit;
@@ -655,7 +656,8 @@ public class UpdateHelperTests
 /// them.
 public sealed class InstanceLockFactAttribute : FactAttribute
 {
-    public InstanceLockFactAttribute()
+    public InstanceLockFactAttribute([CallerFilePath] string? sourceFilePath = null, [CallerLineNumber] int sourceLineNumber = -1)
+        : base(sourceFilePath, sourceLineNumber)
     {
         if (!OperatingSystem.IsWindows() && !new[] { "/usr/bin/flock", "/bin/flock" }.Any(File.Exists))
             Skip = "flock(1) is not installed here";
