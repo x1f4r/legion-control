@@ -3715,6 +3715,7 @@ add('service-config.profiles.json', {
         channel: 'latest', allowScripts: [], process: { type: 'none' }, health: { type: 'none' },
         busy: { type: 'command', command: ['/opt/homebrew/bin/node', '/example/base/agent/src/service-profile-probe.mjs', 'busy', 'codex-cli'], timeoutSeconds: 6 },
         updates: { automatic: false },
+        verify: ['/opt/homebrew/bin/node', '/example/base/agent/src/service-profile-probe.mjs', 'npm-verify', 'codex-cli', '/opt/homebrew'],
       } },
     { id: 'codex-desktop', name: 'Codex / ChatGPT desktop', platform: 'mac', detected: true, availability: 'manual',
       message: 'The application is installed. Its built-in updater has no verified unattended command for this install; update through the application.',

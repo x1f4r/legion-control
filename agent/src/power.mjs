@@ -38,8 +38,8 @@ import { log } from './log.mjs';
 import { withOperation } from './operate.mjs';
 import { markPowerDispatch, recordPhase } from './operations.mjs';
 import { mutationWorstCaseMs } from './process-runner.mjs';
-import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
-import { livenessOf } from './service.mjs';
+import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy, heldBecause } from './probes/busy.mjs';
+import { machineLiveness } from './service.mjs';
 
 /**
  * The longest a queued boot or sleep can take once a cycle takes it up
@@ -58,9 +58,7 @@ export function powerWorstCaseMs(config, kind) {
 }
 
 async function machineBusy(config) {
-  const liveness = {};
-  for (const service of config.services) liveness[service.id] = livenessOf(service);
-  const { busy } = await checkAllBusy(config, { liveness });
+  const { busy } = await checkAllBusy(config, { liveness: machineLiveness(config) });
   return busy;
 }
 
@@ -125,7 +123,7 @@ export async function runBoot(config, target, options = {}) {
           target,
           armed: false,
           busy,
-          message: `the machine is busy (${busy.reason}); pass --force to reboot anyway, or --when-idle to queue it`,
+          message: `${heldBecause(busy)}; pass --force to reboot anyway, or --when-idle to queue it`,
         };
       }
 
@@ -209,7 +207,7 @@ export async function runSleep(config, options = {}) {
         action: 'deferred',
         reasonCode: busyReasonCode(busy),
         busy,
-        message: `the machine is busy (${busy.reason}); pass --force to sleep anyway, or --when-idle to queue it`,
+        message: `${heldBecause(busy)}; pass --force to sleep anyway, or --when-idle to queue it`,
       };
     }
 
@@ -217,8 +215,10 @@ export async function runSleep(config, options = {}) {
     markPowerDispatch(opId, 'suspending');
     const suspended = await suspendMachine(config);
     if (!suspended.ok) {
+      // timed-out reads as an unknown outcome (contract section 5.6): the
+      // suspend may be under way, and no client sends it again.
       log(`sleep failed: ${suspended.message}`, 'sleep');
-      return { ok: false, action: 'failed', reasonCode: REASON.notConfigured, message: suspended.message };
+      return { ok: false, action: 'failed', reasonCode: suspended.reasonCode, message: suspended.message };
     }
 
     lock.phase('suspending');

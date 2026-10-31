@@ -36,7 +36,7 @@ export const LEGACY_DEFAULTS = {
   // Packages in the T3 dependency tree that are allowed to run install scripts.
   // npm 12 blocks them by default and node-pty has to compile pty.node from
   // source on Linux, so without this the server cannot start after an update.
-  // Only consulted on npm 12 and newer; see allowScriptsArgs in providers/npm.mjs.
+  // Only consulted on npm 11.16 and newer; see allowScriptsArgs in providers/npm.mjs.
   allowScripts: ['node-pty', 'msgpackr-extract'],
   t3AppPath: '/Applications/T3 Code (Nightly).app',
   t3AppBundleId: 'com.t3tools.t3code',
@@ -599,7 +599,7 @@ const COMMON_SERVICE_KEYS = [
   'channel',
 ];
 const KIND_KEYS = {
-  npm: ['package', 'npmPrefix', 'allowScripts'],
+  npm: ['package', 'npmPrefix', 'allowScripts', 'verify'],
   app: ['path', 'bundleId', 'updaterCacheDir', 'stagedFilePattern', 'latest'],
   command: ['installedVersion', 'latestVersion', 'update', 'verify', 'rollback', 'requireVersionMatch'],
 };
@@ -645,6 +645,10 @@ function normalizeService(report, raw, index, { platform, base }) {
     const prefix = reqStr(report, `${where}.npmPrefix`, raw.npmPrefix);
     service.npmPrefix = prefix ? expandHome(prefix) : null;
     service.allowScripts = stringList(report, `${where}.allowScripts`, raw.allowScripts, []);
+    // A command that fails when what npm installed does not run. package.json
+    // only says npm wrote the package, and a placeholder left by a postinstall
+    // that never ran is written all the same.
+    service.verify = reqArgv(report, `${where}.verify`, raw.verify);
   } else if (kind === 'app') {
     const appPath = reqStr(report, `${where}.path`, raw.path);
     if (!appPath) report.error(`${where}.path`, 'an app service needs the bundle path', 'for example "/Applications/Thing.app"');

@@ -121,8 +121,12 @@ how an update happens.
   // The global prefix the package lives under. Default: the platform's usual one, probed if
   // that is empty.
   "npmPrefix": null,
-  // Packages allowed to run install scripts on npm 12 and newer.
+  // Packages allowed to run install scripts, passed to npm 11.16 and newer, which know the setting.
   "allowScripts": ["node-pty"],
+  // Optional. A command that fails when what npm installed does not run, for a package whose
+  // postinstall puts the real binary in place. The CLI profiles set one that runs the package's
+  // command with --version.
+  "verify": ["/usr/local/bin/dashboard", "--version"],
   "process": { "type": "systemd-user", "unit": "dashboard.service" },
   "health": { "type": "http", "port": 8080, "path": "/healthz" },
   "busy": { "type": "http", "port": 8080, "path": "/status", "busyWhen": "jobs.running" }
@@ -132,9 +136,11 @@ how an update happens.
 The update cycle for this kind: resolve the tag, compare with the installed `package.json`
 version, check busy, pre-warm the npm cache, take the operation lock, **check busy again**, drain
 if a drain command is configured, stop the process and poll until it is really gone, install,
-verify the installed version, start, wait for health. Any failure reinstalls the previous version
-and reports a rollback. The second busy check is the one that matters: cache warming can take
-minutes, and the answer from before it is stale by the time anything is stopped.
+verify the installed version and run `verify` when there is one, start, wait for health. Any
+failure from the install on reinstalls the previous version and reports a rollback. The second
+busy check is the one that matters: cache warming can take minutes, and the answer from before it
+is stale by the time anything is stopped. An update that finds the service already on the target
+runs `verify` too, and reports a failed update rather than a current one when it fails.
 
 #### `app`: a desktop app that updates itself
 
@@ -253,7 +259,7 @@ separate operation against `controller.json`.
 | `scheduled-task` | `task`, `match` | Windows. `Start-/Stop-ScheduledTask`; running is decided by a process whose command line contains `match` (default: the npm package root) |
 | `app` | | macOS, implied for kind `app` |
 | `command` | `start`, `stop`, `running` | argv arrays, at least one required. `running` is judged by exit code 0 |
-| `none` | | nothing to start or stop, so nothing that can be down: reported as running, and not restartable |
+| `none` | | nothing to start or stop, so nothing that can be down: reported as running, and not restartable. An update stops nothing: it waits up to 20 s for the service's own busy probe to answer idle, and defers when it does not |
 
 **`drain`** is a service-level command run after the operation lock is taken and before the service
 is stopped, for a service that can be told to finish what it is doing and stop accepting new work.

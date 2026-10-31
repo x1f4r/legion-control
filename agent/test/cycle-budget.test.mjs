@@ -14,7 +14,7 @@ import { CYCLE_BUDGET_MS, cycleBudget, runCycle, SCHEDULER_LIMIT_MS } from '../s
 import { serviceState } from '../src/state.mjs';
 import { recoveryWorstCaseMs, restartWorstCaseMs, runUpdate, updateWorstCaseMs } from '../src/update.mjs';
 import {
-  commandService, deadPid, fakeNpm, fixtureConfig, fixtureData, npmCalls, npmPackageVersion, npmService, readFixture, REPO, SRC, withHome,
+  commandService, deadPid, fakeNpm, FIXTURE, fixtureConfig, fixtureData, npmCalls, npmPackageVersion, npmService, readFixture, REPO, SRC, withHome,
   writeConfig, writeFixture,
 } from './helpers.mjs';
 
@@ -124,6 +124,28 @@ test('a service already current reads as current in a cycle that has run out of 
     ]);
     assert.equal(readFixture(behind, 'stop-runs'), '');
     assert.equal(readFixture(behind, 'installed'), '1.0.0');
+  });
+});
+
+test('an npm service already current is checked to run only by a cycle with the time, and is current once it has', async () => {
+  await withHome(async (home) => {
+    const dir = fixtureData(home);
+    const npm = fakeNpm(home, dir);
+    const verify = [process.execPath, FIXTURE, 'verify', dir];
+    writeConfig(home, fixtureConfig(dir, { services: [npmService(dir, npm, { verify })] }));
+
+    // Running what is installed can take as long as any verify, and nothing
+    // else can say whether it runs, so a cycle without that time says so
+    // rather than calling it current.
+    const spent = cycleWithFakeNpm(home, npm, { budgetMs: 1 });
+    assert.deepEqual(spent.children.map((child) => [child.service, child.action, child.reasonCode]), [['demo', 'deferred', 'timed-out']]);
+    assert.match(spent.children[0].message, /^already on 1\.0\.0; checking that Demo 1\.0\.0 runs can take up to/);
+    assert.equal(readFixture(dir, 'verify-runs'), '');
+
+    const full = cycleWithFakeNpm(home, npm, {});
+    assert.deepEqual(full.children.map((child) => [child.service, child.action, child.reasonCode]), [['demo', 'noop', 'already-on-target']]);
+    assert.equal(readFixture(dir, 'verify-runs'), '1');
+    assert.deepEqual(npmCalls(dir).filter((call) => call.startsWith('install ')), []);
   });
 });
 

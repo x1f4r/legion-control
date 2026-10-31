@@ -448,7 +448,7 @@ export async function stopProcess(service) {
   // Asking is all we ever do to an app. There is no forced stop here.
   if (type === 'app') return appProvider.askAppToQuit(service);
   if (type === 'command') {
-    if (!service.process.stop) return { ok: false, message: `${service.name} has no stop command configured` };
+    if (!service.process.stop) return { ok: false, notConfigured: true, message: `${service.name} has no stop command configured` };
     const result = await runMutationArgv(service.process.stop, { timeoutMs: PROCESS_COMMAND_MS });
     return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
   }
