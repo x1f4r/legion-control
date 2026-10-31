@@ -216,6 +216,7 @@ private fun AgentDetailsDialog(model: MachineModel, app: AppModel, onDismiss: ()
         text = {
             Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
                 DetailRow("Version") { VersionText(model.abilities.agentVersion, "not known") }
+                AgentDeploymentPath.behind(app.agentBundleVersion, model.abilities.agentVersion)?.let { QuietText(it) }
                 val contract = model.abilities.contract?.takeIf { it > 0 }
                 if (contract != null) QuietText("Protocol contract $contract.")
                 if (!model.speaksV3 && contract != null) {

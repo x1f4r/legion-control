@@ -251,6 +251,18 @@ sealed interface AgentDeploymentPath {
             return null
         }
 
+        /**
+         * That the machine runs an older control agent than [bundled], the one this build carries,
+         * as a line for beside the install action, or null. A version that does not read as three
+         * numbers says nothing either way, as it does for a downgrade.
+         */
+        fun behind(bundled: String?, running: String?): String? {
+            val carried = parseVersion(bundled) ?: return null
+            val installed = parseVersion(running) ?: return null
+            if (compareVersions(installed, carried) >= 0) return null
+            return "Older than control agent $bundled, which this build carries."
+        }
+
         /** `X.Y.Z` as three numbers, compared numerically as the agent compares them, or null. */
         private fun parseVersion(text: String?): List<Long>? {
             val match = text?.let { VERSION.find(it) } ?: return null
