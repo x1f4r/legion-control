@@ -7,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { aggregateBusy, checkAllBusy, checkServiceBusy, readCommandBusy } from '../src/probes/busy.mjs';
 import { checkT3Sqlite } from '../src/probes/t3-sqlite.mjs';
+import { loadSchemas, resolveRef, validate } from '../../contract/validate.mjs';
 import { FIXTURE, fixtureData, withHome, writeFixture } from './helpers.mjs';
 
 const call = (dir, verb) => [process.execPath, FIXTURE, verb, dir];
@@ -548,5 +549,31 @@ test('a database SQLite cannot open where it lies is read from a copy', { skip: 
     } finally {
       fs.chmodSync(userdata, 0o755);
     }
+  });
+});
+
+test('every answer of the state database probe is one the contract allows', async () => {
+  loadSchemas();
+  const busy = resolveRef('common.schema.json#/$defs/busy', 'common.schema.json');
+  const allowed = (answer) => assert.deepEqual(validate(busy.schema, answer, { file: busy.file }).errors, [], answer.reason);
+  await withHome(async (home) => {
+    const t3Home = makeDb(home, [{ thread: 't', turn: 'u', state: 'running', at: hoursAgo(1) }, { thread: 't', turn: 'v', state: 'pending', at: hoursAgo(7) }]);
+    allowed(checkT3Sqlite({ home: t3Home }));
+    // An abandoned row, the counts that say so, and the path a missing database was looked for at.
+    allowed(checkT3Sqlite({ home: t3Home }, { liveness: { serviceRunning: false } }));
+    allowed(checkT3Sqlite({ home: path.join(home, 'nowhere') }));
+    allowed(checkT3Sqlite({ home: path.join(home, 'nowhere'), allowMissing: true }));
+  });
+  await withHome(async (home) => {
+    const t3Home = makeCurrentDb(home, {
+      threads: [{ thread: 't', title: 'Work' }],
+      turns: [{ thread: 't', status: 'running', startedAt: hoursAgo(1) }],
+      runs: [{ thread: 't', status: 'queued', requestedAt: hoursAgo(1) }],
+      items: [{ thread: 't', type: 'command_execution', status: 'running', startedAt: hoursAgo(1) }],
+      providerThreads: [{ thread: 't', tasks: [{ taskId: 'watcher', kind: 'monitor' }] }],
+      requests: [{ thread: 't', status: 'pending', createdAt: hoursAgo(1) }],
+    });
+    allowed(checkT3Sqlite({ home: t3Home }));
+    allowed(checkT3Sqlite({ home: t3Home }, { liveness: { serviceRunning: true, startedAt: new Date().toISOString() } }));
   });
 });

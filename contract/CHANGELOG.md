@@ -4,6 +4,18 @@ The wire contract between the clients and the agent. Within a major contract
 number, keys are only ever added — never renamed, never retyped, never removed.
 A client decodes with every field optional.
 
+## 3 — agent 3.1.1, clients 1.4.1
+
+### Fixed (schemas)
+
+- The busy schema names what the `t3-sqlite` probe has always sent:
+  `abandonedTurns`, the count of running rows retired by outside evidence;
+  `abandoned` as the `disposition` of such a row; and `path`, the database the
+  probe read or looked for (section 6). Every `t3-sqlite` answer carries
+  `abandonedTurns`, so none of them passed the schema before.
+
+---
+
 ## 3 — agent 3.1.0, clients 1.4.0
 
 Contract stays 3 and the setup document stays `"version": 1`. Every reply
