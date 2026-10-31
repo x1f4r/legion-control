@@ -39,7 +39,7 @@ import { withOperation } from './operate.mjs';
 import { markPowerDispatch, recordPhase } from './operations.mjs';
 import { mutationWorstCaseMs } from './process-runner.mjs';
 import { BUSY_BUDGET_MS, busyReasonCode, checkAllBusy } from './probes/busy.mjs';
-import { livenessOf } from './service.mjs';
+import { machineLiveness } from './service.mjs';
 
 /**
  * The longest a queued boot or sleep can take once a cycle takes it up
@@ -58,9 +58,7 @@ export function powerWorstCaseMs(config, kind) {
 }
 
 async function machineBusy(config) {
-  const liveness = {};
-  for (const service of config.services) liveness[service.id] = livenessOf(service);
-  const { busy } = await checkAllBusy(config, { liveness });
+  const { busy } = await checkAllBusy(config, { liveness: machineLiveness(config) });
   return busy;
 }
 

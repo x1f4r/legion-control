@@ -59,7 +59,7 @@ import {
   canRestart,
   drainService,
   isRunning,
-  livenessOf,
+  machineLiveness,
   recoveryEvidence,
   restartService,
   serviceHealth,
@@ -136,12 +136,12 @@ async function recoverService(service, opId) {
  * The busy state, with what the process probe already knows folded in.
  *
  * The liveness hint is what lets a state database's "running" row be retired
- * when the thing that would be running it is gone or has restarted since.
+ * when the thing that would be running it is gone or has restarted since. The
+ * gate asks every service, so every service's hint goes with it, as it does
+ * for status, boot, sleep and the queue.
  */
-async function busyNow(config, service) {
-  const liveness = {};
-  if (service) liveness[service.id] = livenessOf(service);
-  const { busy, entries } = await checkAllBusy(config, { liveness });
+async function busyNow(config) {
+  const { busy, entries } = await checkAllBusy(config, { liveness: machineLiveness(config) });
   return { busy, entries };
 }
 
@@ -305,7 +305,7 @@ export async function runRestart(config, service, options = {}) {
       ensureServiceStateWritable(service);
       lock.phase('checking-busy');
       recordPhase(opId, 'checking-busy');
-      const { busy } = await busyNow(config, service);
+      const { busy } = await busyNow(config);
       if (busy.busy && !options.force) {
         log(`restart of ${service.id} deferred: ${busy.reason}`, 'restart');
         return deferred({
@@ -445,7 +445,7 @@ async function alreadyOnTarget(config, service, from, to, { force, opId, budget 
     };
   }
 
-  const { busy } = await busyNow(config, service);
+  const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     return deferred({
       service,
@@ -515,7 +515,7 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
-  const { busy } = await busyNow(config, service);
+  const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
     const message = `the machine is busy (${busy.reason}); ${to} will be installed at the next idle window`;
@@ -560,7 +560,7 @@ async function runNpmUpdate(config, service, { force, opId, lock, budget }) {
   // warm above can legitimately take minutes; anything that started during it,
   // or that the drain left running, would otherwise be destroyed by a decision
   // made before it existed.
-  const fresh = await busyNow(config, service);
+  const fresh = await busyNow(config);
   if (fresh.busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
     const message = `work started while the update was being prepared (${fresh.busy.reason}); ${to} is downloaded and will be installed at the next idle window`;
@@ -697,7 +697,7 @@ async function runAppUpdate(config, service, { force, opId, lock, budget }) {
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
-  const { busy } = await busyNow(config, service);
+  const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: staged });
     const message = `the machine is busy (${busy.reason}); ${staged} is downloaded and will be applied at the next idle window`;
@@ -959,7 +959,7 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
 
   lock.phase('checking-busy');
   recordPhase(opId, 'checking-busy');
-  const { busy } = await busyNow(config, service);
+  const { busy } = await busyNow(config);
   if (busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
     const message = `the machine is busy (${busy.reason}); ${to ?? 'the update'} will be applied at the next idle window`;
@@ -983,7 +983,7 @@ async function runCommandUpdate(config, service, { force, opId, lock, budget }) 
   }
 
   // One last look, immediately before the stop.
-  const fresh = await busyNow(config, service);
+  const fresh = await busyNow(config);
   if (fresh.busy.busy && !force) {
     saveServiceState(service, { pendingRestart: true, pendingVersion: to });
     const message = `work started while the update was being prepared (${fresh.busy.reason}); it will be applied at the next idle window`;
@@ -1220,14 +1220,14 @@ export async function rollBackInterrupted(config, service, owed, { running }) {
     message: `${found}, and the rollback to ${from} waits for an idle machine (${why}${busy.reason})`,
   });
   if (running && (service.kind === 'npm' || service.rollback)) {
-    const { busy } = await busyNow(config, service);
+    const { busy } = await busyNow(config);
     if (busy.busy) return waiting(busy);
     const drained = await drainService(service);
     if (!drained.ok) {
       return { settled: false, action: 'drain-refused', reasonCode: REASON.busy, message: `${found}, and ${service.name} was not rolled back to ${from}: ${drained.message}` };
     }
     if (drained.drained) appendLog(record.id, `recovery: ${drained.message}`);
-    const fresh = await busyNow(config, service);
+    const fresh = await busyNow(config);
     if (fresh.busy.busy) return waiting(fresh.busy, 'work started while it was being prepared: ');
   }
   note(`${found} after an interrupted update; rolling it back`, 'recover');

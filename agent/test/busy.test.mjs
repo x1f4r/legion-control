@@ -7,7 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { aggregateBusy, checkAllBusy, checkServiceBusy, readCommandBusy } from '../src/probes/busy.mjs';
 import { checkT3Sqlite } from '../src/probes/t3-sqlite.mjs';
-import { FIXTURE, fixtureData, withHome, writeFixture } from './helpers.mjs';
+import { cli, commandService, FIXTURE, fixtureConfig, fixtureData, readFixture, withHome, writeConfig, writeFixture } from './helpers.mjs';
 
 const call = (dir, verb) => [process.execPath, FIXTURE, verb, dir];
 
@@ -180,5 +180,30 @@ test('a missing state database blocks unless the config says it is expected', as
 
     const allowed = checkT3Sqlite({ home: nowhere, allowMissing: true });
     assert.equal(allowed.busy, false);
+  });
+});
+
+test('rows a stopped service left running block neither another service\'s update nor an action', async () => {
+  await withHome(async (home) => {
+    // T3 Code is stopped, and its database still calls a turn from an hour ago
+    // running. Only its own liveness can retire that row, and the update gate
+    // and the action gate used to pass the target's alone, or nothing.
+    const t3Dir = fixtureData(path.join(home, 't3-fixture'), { running: 'off' });
+    const t3 = commandService(t3Dir, {
+      id: 't3', name: 'T3 Code',
+      busy: { type: 't3-sqlite', home: makeDb(home, [{ thread: 't', turn: 'u', state: 'running', at: new Date(Date.now() - 60 * 60 * 1000).toISOString() }]) },
+    });
+    const dir = fixtureData(home, { latest: '2.0.0' });
+    writeConfig(home, fixtureConfig(dir, {
+      services: [t3, commandService(dir)],
+      actions: [{ id: 'count', name: 'Count', command: [process.execPath, FIXTURE, 'action', dir], busyGated: true }],
+    }));
+
+    const update = cli(['update', '--service', 'demo'], { home }).payload;
+    assert.equal(update.action, 'updated', update.message);
+    assert.equal(readFixture(dir, 'installed'), '2.0.0');
+    const run = cli(['run', 'count'], { home }).payload;
+    assert.equal(run.action, 'ran', run.message);
+    assert.equal(readFixture(dir, 'action-runs'), '1');
   });
 });

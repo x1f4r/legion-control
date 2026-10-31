@@ -61,6 +61,17 @@ export function livenessOf(service) {
 }
 
 /**
+ * The same evidence for every service on the machine, for a gate that asks
+ * all of them. A state database's leftover row belongs to its own service,
+ * and only that service's liveness can retire it, so a gate that passed only
+ * the service it was about to act on kept every other service's dead rows
+ * blocking it.
+ */
+export function machineLiveness(config) {
+  return Object.fromEntries(config.services.map((service) => [service.id, livenessOf(service)]));
+}
+
+/**
  * The health check, with "none" resolved against the process probe. The process
  * is only probed when the answer actually depends on it: on Windows that probe
  * is a PowerShell start, and paying for one before every http health check would
