@@ -126,7 +126,8 @@ broadcast are warnings that say why something is not driven, never a reason to r
 The machines' endpoints are dialled directly by the app's own ssh client, in the order listed:
 a tunnel address first works from anywhere, a LAN address as the fallback works from home. A
 tailnet address (100.64.0.0/10 or a `*.ts.net` name) that goes unanswered while no VPN on the
-phone routes it is reported as the phone being off the tailnet, not as the machine being off.
+phone routes it is reported as the phone being off the tailnet, not as the machine being off,
+unless the phone is on that machine's own network and its LAN address went unanswered too.
 
 **The public key has to be authorised on every system.** The app generates its own ed25519
 keypair on the phone on first run and keeps the private half in app-private storage, wrapped by

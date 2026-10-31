@@ -111,6 +111,18 @@ class LegionControl(context: Context) {
         built.values.forEach { it.routes.liftBackoff() }
     }
 
+    /** The machines this phone is on the network of, by id, as site placement last said. */
+    @Volatile
+    private var onSite: Set<String> = emptySet()
+
+    /**
+     * Follows which machines this phone is on the network of. On one of them a LAN address that did
+     * not answer is said ahead of a tailnet address no tunnel carries.
+     */
+    fun place(onSite: Set<String>) {
+        this.onSite = onSite
+    }
+
     /**
      * Reads the setup off a machine that is not in the configuration, because there is none yet.
      *
@@ -177,7 +189,14 @@ class LegionControl(context: Context) {
         return MachineControl(
             machine = machine,
             routes = routes,
-            agent = AgentClient(machine, transport, routes, settings, tunnels = { paths?.tunnels }),
+            agent = AgentClient(
+                machine,
+                transport,
+                routes,
+                settings,
+                tunnels = { paths?.tunnels },
+                onSite = { machine.id in onSite },
+            ),
             wake = machine.wake?.let(::WakeOnLan),
         )
     }

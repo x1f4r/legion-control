@@ -304,6 +304,13 @@ interface ControlServices {
     /** A person asked to check again: every address held back is dialled on its machine's next call. */
     fun retryAddresses()
 
+    /**
+     * Hands the transport the machines this phone is on the network of now, by id: the test route
+     * order and direct wake share. On one of them a silent LAN address is what is said, and not a
+     * tunnel that is off.
+     */
+    fun followPlacement(onSite: Set<String>)
+
     /** What to call this device in a revision it writes. */
     fun deviceName(): String
 

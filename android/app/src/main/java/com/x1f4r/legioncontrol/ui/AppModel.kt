@@ -36,6 +36,7 @@ import com.x1f4r.legioncontrol.data.advisories
 import com.x1f4r.legioncontrol.data.SiteConfig
 import com.x1f4r.legioncontrol.net.LocalAddress
 import com.x1f4r.legioncontrol.net.SiteMatch
+import com.x1f4r.legioncontrol.net.machinesOnSite
 import com.x1f4r.legioncontrol.net.matchSite
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -439,7 +440,9 @@ class AppModel(
     }
 
     private fun recomputeSite() {
-        siteMatch = matchSite(sites, addresses, bindings.bindings.value.currentSite)
+        val currentSite = bindings.bindings.value.currentSite
+        siteMatch = matchSite(sites, addresses, currentSite)
+        services.followPlacement(machinesOnSite(clients.map { it.machine }, sites, addresses, currentSite))
     }
 
     // MARK: - The setup

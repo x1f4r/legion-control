@@ -106,9 +106,10 @@ class AgentClientTest {
         transport: CommandTransport,
         hints: Hints = Hints(),
         tunnels: () -> List<LanPrefix>? = { null },
+        onSite: () -> Boolean = { false },
     ): Pair<AgentClient, RouteSelector> {
         val routes = RouteSelector(machine, hints) { now }
-        return AgentClient(machine, transport, routes, hints, tunnels) { now } to routes
+        return AgentClient(machine, transport, routes, hints, tunnels, onSite) { now } to routes
     }
 
     private val accepted = CommandOutcome(0, """{"ok":true,"contract":3,"action":"restarted"}""", "")
@@ -418,7 +419,8 @@ class AgentClientTest {
         val transport = FakeTransport {
             throw AgentFailure.Unreachable("Tower", "no answer", null, DispatchStage.NOT_STARTED, FailureKind.HOST_UNREACHABLE)
         }
-        fun agent(tunnels: List<LanPrefix>?) = client(machine, transport, Hints().apply { rememberRoute("tower", "lan") }) { tunnels }.first
+        fun agent(tunnels: List<LanPrefix>?) =
+            client(machine, transport, Hints().apply { rememberRoute("tower", "lan") }, tunnels = { tunnels }).first
 
         val failure = failsWith<AgentFailure.NoTunnel> { agent(tunnels = emptyList()).status() }
         assertEquals(listOf("lan", "tailnet"), transport.sent.map { it.endpoint })
@@ -429,6 +431,29 @@ class AgentClientTest {
         // tunnels yet nothing is put down to one.
         failsWith<AgentFailure.Unreachable> { agent(tunnels = listOf(TAILNET)).status() }
         failsWith<AgentFailure.Unreachable> { agent(tunnels = null).status() }
+    }
+
+    /**
+     * At home on the machine's own network, with Tailscale off on purpose, a machine that is asleep
+     * leaves its LAN address silent too. That is the thing to say: sent to look at Tailscale, a
+     * person would turn it on and find the machine just as silent.
+     */
+    @Test
+    fun `on the machine's own network a silent LAN address is said ahead of a missing tunnel`() = runBlocking<Unit> {
+        val tailnet = endpoint("tailnet", host = "100.64.0.9")
+        val lan = endpoint("lan").copy(kind = RouteKind.LAN)
+        val transport = FakeTransport {
+            throw AgentFailure.Unreachable("Tower", "no answer", null, DispatchStage.NOT_STARTED, FailureKind.HOST_UNREACHABLE)
+        }
+        fun agent(endpoints: List<Endpoint>) =
+            client(machine(endpoints = endpoints, systems = listOf(linux)), transport, tunnels = { emptyList() }, onSite = { true }).first
+
+        val failure = failsWith<AgentFailure.Unreachable> { agent(listOf(tailnet, lan)).status() }
+        assertEquals("Tower did not answer.", failure.summary)
+        assertEquals(listOf("tailnet", "lan"), transport.sent.map { it.endpoint })
+
+        // A machine this phone reaches only over the tailnet is still the tunnel's to explain.
+        failsWith<AgentFailure.NoTunnel> { agent(listOf(tailnet)).status() }
     }
 
     @Test

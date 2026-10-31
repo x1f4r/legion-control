@@ -95,6 +95,8 @@ private class WiredServices(private val control: LegionControl) : ControlService
 
     override fun retryAddresses() = control.retryAddresses()
 
+    override fun followPlacement(onSite: Set<String>) = control.place(onSite)
+
     override fun deviceName(): String = control.deviceName()
 
     override fun forgetRoute(machineId: String) = control.settings.forgetRoute(machineId)
