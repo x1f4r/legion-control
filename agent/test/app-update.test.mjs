@@ -5,13 +5,14 @@
 // endings was held to anything. The quit itself is AppleScript sent to a real
 // app and is never sent from a test; what comes before it is the part that
 // keeps a background timer from quitting the app somebody is working in, for
-// a build that is not there, cannot be compared, or will never apply.
+// a build that is not there, cannot be compared, or will never apply. Where a
+// test goes as far as the quit, a stand-in osascript answers it (helpers.mjs).
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { cli, fixtureConfig, fixtureData, withHome, writeConfig } from './helpers.mjs';
+import { cli, fixtureConfig, fixtureData, standInApp, withHome, writeConfig } from './helpers.mjs';
 
 // The bundle's version is read with PlistBuddy, which only a Mac has.
 const mac = process.platform === 'darwin';
@@ -122,5 +123,27 @@ test('a build that failed to apply three times is not tried again unless forced'
     // Forced, it goes past the count, as far as the app being closed.
     const forced = cli(['update', '--force'], { home }).payload;
     assert.equal(forced.reasonCode, 'app-closed');
+  });
+});
+
+test('an app that will not quit has had nothing applied, and is not an update that failed while applied', { skip: !mac && 'PlistBuddy reads the bundle version' }, async () => {
+  await withHome(async (home) => {
+    bundleAt(home, '1.0.0');
+    staged(home, '2.0.0');
+    writeConfig(home, fixtureConfig(fixtureData(home), { services: [appService(home, { busy: { type: 'none' } })] }));
+    const app = standInApp(home, { code: 1 });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const { payload, exitCode } = cli(['update'], { home, env: app.env });
+      assert.equal(exitCode, 1, JSON.stringify(payload));
+      assert.equal(payload.action, 'failed');
+      assert.equal(payload.reasonCode, 'internal');
+      assert.equal(payload.outcome, 'failed');
+      assert.match(payload.message, /^the quit request failed \(.*User canceled.*\) and Demo is still running; it was left alone rather than forced; nothing was applied, and 2\.0\.0 applies by itself the next time Demo quits$/);
+      assert.deepEqual([payload.from, payload.to], ['1.0.0', '2.0.0']);
+      assert.match(app.calls(), /quit app id "com\.example\.demo"/);
+    } finally {
+      app.stop();
+    }
   });
 });

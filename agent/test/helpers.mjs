@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 export const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
 export const ENTRY = path.join(SRC, 'index.mjs');
@@ -190,4 +190,31 @@ export function deadPid() {
   // the air might belong to a live process and make the test lie.
   const result = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
   return result.pid;
+}
+
+/**
+ * A process that stands for the app: /bin/sleep, run through a link inside
+ * the bundle, which ps reports by that path. A stand-in osascript first on
+ * PATH answers every quit request with `code` and quits nothing, so no real
+ * app is ever asked anything.
+ */
+export function standInApp(home, { code }) {
+  const macos = path.join(home, 'Demo.app', 'Contents', 'MacOS');
+  fs.mkdirSync(macos, { recursive: true });
+  fs.symlinkSync('/bin/sleep', path.join(macos, 'Demo'));
+  const app = spawn(path.join(macos, 'Demo'), ['120'], { stdio: 'ignore' });
+  const bin = path.join(home, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'osascript'), [
+    '#!/bin/sh',
+    `echo "$*" >> '${path.join(home, 'osascript-calls')}'`,
+    code === 0 ? '' : "echo 'execution error: Demo got an error: User canceled. (-128)' >&2",
+    `exit ${code}`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return {
+    env: { PATH: `${bin}${path.delimiter}${process.env.PATH}` },
+    calls: () => readFixture(home, 'osascript-calls'),
+    stop: () => app.kill(),
+  };
 }

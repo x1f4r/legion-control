@@ -25,9 +25,16 @@ they do not know from `message`, so none of them has to change to read these.
   service's own busy probe to answer idle, and answers `deferred` with `busy`
   or `busy-unknown` when it does not, `--force` included, with nothing
   installed. Agents before 3.1.1 failed every such update 20 s in.
-- **A stop that did not complete** before anything was installed answers
-  `failed` with `busy`, not `not-running`, and its message says nothing was
-  installed (section 5.3). The outcome stays `failed`.
+- **A stop that did not complete** (section 5.3), in an `update` before
+  anything was installed or applied, or in a `restart`, answers `failed` with
+  the code of what may follow it. `not-configured` when nothing could ask the
+  service to stop, such as a `command` process with no `stop`. `internal` when
+  the stop request failed and the service kept running. `timed-out`, whose
+  outcome is `unknown`, when the stop was asked for and not seen through, since
+  the service may still be going down. An app that would not quit for an
+  update is one of these, with "nothing was applied" in its message. Agent
+  3.1.0 answered `not-running` for every one of them but the app's, which it
+  answered with `apply-failed`.
 - **Sleep failures** (section 5.3). `not-configured` only when nothing could
   suspend the machine, with a message naming what is missing: the suspend
   tools looked for, and that `sleep.command` is not set. A suspend command that

@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import https from 'node:https';
 import path from 'node:path';
 import { compilePattern, LEGACY_DEFAULTS } from '../config-schema.mjs';
+import { REASON } from '../contract.mjs';
 import { describeFailure, runCommand, runMutation, sleep } from '../process-runner.mjs';
 import { cachedLookup, channelCacheKey } from './npm.mjs';
 
@@ -270,7 +271,7 @@ export function isAppRunning(service) {
  * launchd's child, never the agent's, so it is still only ever asked.
  */
 export async function askAppToQuit(service) {
-  if (!service.bundleId) return { ok: false, message: 'no bundle id is configured for this service' };
+  if (!service.bundleId) return { ok: false, notConfigured: true, message: 'no bundle id is configured for this service' };
   const result = await runMutation('osascript', ['-e', `quit app id "${service.bundleId}"`], { timeoutMs: APP_COMMAND_MS });
   return { ok: result.ok, message: result.ok ? null : describeFailure(result) };
 }
@@ -278,11 +279,19 @@ export async function askAppToQuit(service) {
 /**
  * Ask, then wait for every process in the bundle to be gone. On timeout we
  * report failure and leave the app exactly as it is. We do NOT escalate.
+ *
+ * A quit that did not happen carries the code of what may follow, the same
+ * three a stop has (service.mjs). One that could not be asked for and one the
+ * app refused leave it running. One asked for and not seen through may still
+ * come, once somebody answers the app's own dialog, so its outcome is unknown.
  */
 export async function quitAndWait(service, timeoutMs = QUIT_WAIT_MS) {
   if (!isAppRunning(service)) return { ok: true, notRunning: true, message: 'the app was not running' };
 
   const asked = await askAppToQuit(service);
+  if (asked.notConfigured) {
+    return { ok: false, reasonCode: REASON.notConfigured, message: `${service.name} could not be asked to quit: ${asked.message}; it was left running` };
+  }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!isAppRunning(service)) return { ok: true, message: null };
@@ -293,6 +302,7 @@ export async function quitAndWait(service, timeoutMs = QUIT_WAIT_MS) {
     if (!asked.ok && Date.now() > deadline - timeoutMs + QUIT_POLL_MS * 2) {
       return {
         ok: false,
+        reasonCode: REASON.internal,
         message: `the quit request failed (${asked.message}) and ${service.name} is still running; it was left alone rather than forced`,
       };
     }
@@ -302,6 +312,7 @@ export async function quitAndWait(service, timeoutMs = QUIT_WAIT_MS) {
   const waited = Math.round(timeoutMs / 1000);
   return {
     ok: false,
+    reasonCode: asked.ok ? REASON.timedOut : REASON.internal,
     message: asked.ok
       ? `${service.name} did not quit within ${waited} s; it was left running on purpose, since forcing it would lose open work and could leave a staged update half applied`
       : `the quit request failed (${asked.message}) and ${service.name} is still running after ${waited} s; it was left alone rather than forced`,
@@ -324,6 +335,9 @@ export async function launchAndSettle(service) {
 /**
  * Quit, confirm it is really gone, start it again. Health is the caller's
  * business, because both callers want to phrase the failure differently.
+ * A quit that did not happen comes back with its reasonCode, and nothing
+ * else does: that is how a caller tells an app that was never closed from
+ * one that was closed and would not open again.
  *
  * launchIfStopped defaults to false on purpose. A background job that finds the
  * app already closed must not open it: the user closed it deliberately, and

@@ -170,16 +170,17 @@ function heldAtSecondCheck(busy) {
 }
 
 /**
- * A stop that did not complete, before anything was installed. Nothing is
- * rolled back or started over it, and nothing about it failed while being
- * applied. It was reported as not-running, which every client words as the
- * opposite of what happened: the service kept running, as a busy one does.
+ * A stop that did not complete, before anything was installed or applied.
+ * Nothing is rolled back or started over it, and nothing about it failed while
+ * being applied. Its code is the stop's own (service.mjs), which says whether
+ * the service is still up as it was or may yet be going down. It was reported
+ * as not-running, which every client words as the opposite of what happened.
  */
-function wouldNotStop({ service, from, to, stopped }) {
-  const message = `${service.name} would not stop: ${stopped.message}; nothing was installed`;
+function wouldNotStop({ service, from, to, stopped, nothing = 'nothing was installed' }) {
+  const message = `${stopped.message}; ${nothing}`;
   log(message, 'update');
   recordLastUpdate(service, 'failed', from, to, message);
-  return { ok: false, action: 'failed', reasonCode: REASON.busy, from, to, message };
+  return { ok: false, action: 'failed', reasonCode: stopped.reasonCode ?? REASON.internal, from, to, message };
 }
 
 /**
@@ -292,7 +293,9 @@ async function performRestart(service, { opId }) {
   if (!restarted.ok) {
     await ensureServiceUp(service);
     log(`restart failed: ${restarted.message}`, 'restart');
-    return { ok: false, action: 'failed', reasonCode: REASON.notRunning, message: restarted.message };
+    // A stop that did not complete carries its own code (service.mjs), and
+    // anything else that fails here is a start that did not.
+    return { ok: false, action: 'failed', reasonCode: restarted.reasonCode ?? REASON.notRunning, message: restarted.message };
   }
 
   recordPhase(opId, 'health');
@@ -434,7 +437,7 @@ async function rollBack(service, previous, prefix, enter) {
   const stopped = await stopAndWait(service, STOP_WAIT_MS);
   if (!stopped.ok) {
     await ensureServiceUp(service);
-    return { ok: false, message: stopped.busy ? `rollback skipped: ${stopped.message}` : `rollback skipped, ${service.name} would not stop: ${stopped.message}` };
+    return { ok: false, message: `rollback skipped: ${stopped.message}` };
   }
 
   const reinstalled = await npmProvider.installVersion(service, previous, prefix);
@@ -745,6 +748,11 @@ async function runAppUpdate(config, service, { force, opId, lock, budget }) {
     const message = `${service.name} closed while the update was starting; ${staged} applies on that quit by itself`;
     log(message, 'update');
     return { ok: true, action: 'deferred', reasonCode: REASON.appClosed, from, to: staged, message };
+  }
+  // A quit that did not happen applied nothing, so it is not apply-failed. The
+  // staged build is still the updater's, and goes in on the next quit.
+  if (!restarted.ok && restarted.reasonCode) {
+    return wouldNotStop({ service, from, to: staged, stopped: restarted, nothing: `nothing was applied, and ${staged} applies by itself the next time ${service.name} quits` });
   }
   if (!restarted.ok) {
     log(`update to ${staged} failed: ${restarted.message}`, 'update');

@@ -4,6 +4,7 @@
 // Everything here takes a normalized service object. Nothing in this file knows
 // which product it is looking after.
 
+import { REASON } from './contract.mjs';
 import { detectPlatform } from './paths.mjs';
 import { describeFailure, runMutationArgv, sleep } from './process-runner.mjs';
 import { checkServiceBusy } from './probes/busy.mjs';
@@ -188,6 +189,14 @@ async function waitUntilIdle(service, timeoutMs) {
 /**
  * Stop and wait for the process to actually disappear. An installer must not
  * replace a service's files while a process still has them open.
+ *
+ * A stop that did not complete carries the reasonCode of what may follow it.
+ * One nothing could ask for is `not-configured`, and one refused while the
+ * service plainly kept running is `internal`: either way it is still up, as it
+ * was. One asked for and not seen through, still running at the deadline or
+ * never readable, may yet be under way, so it is `timed-out`, whose outcome is
+ * unknown. None of them is `busy`: every client words that as nothing having
+ * been touched, and a stop request is something.
  */
 export async function stopAndWait(service, timeoutMs = 20000) {
   // An app has its own budget and its own wording: quitting an app someone is
@@ -200,16 +209,28 @@ export async function stopAndWait(service, timeoutMs = 20000) {
 
   const stopped = await stopService(service);
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isRunning(service)) return { ok: true, message: null };
+  let evidence = processEvidence(service);
+  while (evidence.state !== 'stopped') {
+    // Nothing was asked to stop, so nothing is going to.
+    if (stopped.notConfigured && evidence.state === 'running') break;
+    if (Date.now() + 1000 >= deadline) break;
     await sleep(1000);
+    evidence = processEvidence(service);
   }
-  return {
-    ok: false,
-    message: stopped.ok
-      ? `${service.name} was still running ${Math.round(timeoutMs / 1000)} s after the stop request`
-      : `stop failed: ${stopped.message}`,
-  };
+  if (evidence.state === 'stopped') return { ok: true, message: null };
+
+  const waited = Math.round(timeoutMs / 1000);
+  if (stopped.notConfigured) {
+    return { ok: false, reasonCode: REASON.notConfigured, message: `${stopped.message}, so it could not be stopped` };
+  }
+  if (!stopped.ok && evidence.state === 'running') {
+    return { ok: false, reasonCode: REASON.internal, message: `the stop request failed (${stopped.message}), and ${service.name} was still running ${waited} s later` };
+  }
+  if (evidence.state === 'running') {
+    return { ok: false, reasonCode: REASON.timedOut, message: `${service.name} was still running ${waited} s after the stop request` };
+  }
+  const asked = stopped.ok ? 'was asked to stop' : `was asked to stop, though the request failed (${stopped.message})`;
+  return { ok: false, reasonCode: REASON.timedOut, message: `${service.name} ${asked}, and ${waited} s later whether it had could not be established: ${evidence.error}` };
 }
 
 /** Start and give the service a moment to bind before anyone health-checks it. */

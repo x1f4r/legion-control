@@ -88,11 +88,11 @@ test('an npm service that will not stop is left running, with nothing installed 
     assert.equal(exitCode, 1);
     assert.equal(payload.action, 'failed');
     // Not "not running", which is the opposite of what happened, nor a
-    // failure while it was applied: nothing was.
-    assert.equal(payload.reasonCode, 'busy');
+    // failure while it was applied: nothing was. Nor busy, which says nothing
+    // was touched: a stop was asked for, and refused.
+    assert.equal(payload.reasonCode, 'internal');
     assert.equal(payload.outcome, 'failed');
-    assert.match(payload.message, /would not stop: .*; nothing was installed$/);
-    assert.doesNotMatch(payload.message, /roll/);
+    assert.equal(payload.message, 'the stop request failed (node failed (exit 1)), and Demo was still running 20 s later; nothing was installed');
     // One stop was asked for. A rollback used to ask for a second one, wait
     // out its own budget, and start the service over itself.
     assert.equal(readFixture(dir, 'stop-runs'), '1');
@@ -101,6 +101,19 @@ test('an npm service that will not stop is left running, with nothing installed 
     assert.equal(readFixture(dir, 'running'), 'on');
     assert.equal(installed(), '1.0.0');
   }, { initial: { 'stop-refuses': 'on' } });
+});
+
+test('an npm service with no way to stop it is not configured for an update, and nothing is installed', async () => {
+  await withNpmService(async ({ dir, run, installed }) => {
+    const { payload, exitCode } = run(['update']);
+    assert.equal(exitCode, 1);
+    assert.equal(payload.action, 'failed');
+    assert.equal(payload.reasonCode, 'not-configured');
+    assert.equal(payload.outcome, 'failed');
+    assert.equal(payload.message, 'Demo has no stop command configured, so it could not be stopped; nothing was installed');
+    assert.deepEqual(installs(dir), []);
+    assert.equal(installed(), '1.0.0');
+  }, { service: (dir) => ({ process: { type: 'command', running: [process.execPath, FIXTURE, 'running', dir], start: [process.execPath, FIXTURE, 'start', dir] } }) });
 });
 
 test('an npm install that fails is rolled back to the version that was running, and started on it', async () => {

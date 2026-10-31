@@ -64,6 +64,8 @@ switch (verb) {
   case 'stop':
     bump('stop-runs');
     if (read('stop-refuses') === 'on') process.exit(1);
+    // Asked, and answered, by a service that takes its time going down.
+    if (read('stop-ignored') === 'on') break;
     write('running', 'off');
     break;
   case 'health':
@@ -72,7 +74,12 @@ switch (verb) {
     // The drain is what makes a "busy during preparation" test possible: it can
     // flip the machine busy at exactly the moment the update is about to stop it.
     // busy-until is a clock time in milliseconds, for a session that ends by
-    // itself a moment later.
+    // itself a moment later. busy-unknown is a probe that ran and could not
+    // tell, the way one that cannot read its session list answers.
+    if (read('busy-unknown') === 'on') {
+      process.stdout.write(JSON.stringify({ unknown: true, reason: 'the session list could not be read' }));
+      process.exit(0);
+    }
     process.exit(read('busy') === 'on' || Date.now() < Number(read('busy-until', '0')) ? 1 : 0);
   case 'drain':
     bump('drain-runs');
