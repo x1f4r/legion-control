@@ -38,10 +38,11 @@
     <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
     <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.4" />
-    <!-- This compatible release posts D-Bus callbacks instead of synchronously sending them to
-         a dispatcher that may already be stopping during Linux session cleanup. -->
+    <!-- The tray check asks the session bus itself (see TrayHost). Avalonia's Linux backend needs
+         0.94.1 or later, and every release since 0.23 posts D-Bus callbacks instead of
+         synchronously sending them to a dispatcher that may already be stopping during Linux
+         session cleanup. -->
     <PackageReference Include="Tmds.DBus.Protocol" Version="0.95.2" />
-    <PackageReference Include="Avalonia.Diagnostics" Version="11.3.22" Condition="'$(Configuration)' == 'Debug'" />
     <!-- The managed Ed25519 verifier cross-publishes without a per-platform native library. -->
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
   </ItemGroup>

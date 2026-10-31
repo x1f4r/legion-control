@@ -168,7 +168,7 @@ public partial class App : Application
             using var bitmap = new RenderTargetBitmap(size, new Vector(96, 96));
             bitmap.Render(_window);
             Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
-            bitmap.Save(path);
+            bitmap.Save(path, PngBitmapEncoderOptions.Default);
             Console.WriteLine($"Wrote {path}");
         }
         catch (Exception error)

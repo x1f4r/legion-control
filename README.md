@@ -195,7 +195,7 @@ the fallback. `android/README.md` covers building and installing it.
 
 ### Linux and Windows desktop (`desktop/`)
 
-Avalonia 11 on .NET 10, one project, a native window and a tray icon. Linux x64, Linux ARM64 and
+Avalonia 12 on .NET 10, one project, a native window and a tray icon. Linux x64, Linux ARM64 and
 Windows x64 are cross-published as self-contained directories, so no .NET installation is needed
 on the target and no Windows toolchain is needed to build the Windows binary. Keep all extracted
 files together.

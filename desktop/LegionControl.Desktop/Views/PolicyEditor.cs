@@ -33,10 +33,10 @@ public sealed class PolicyEditor : Window
         }
         var automatic = Choice("Automatic updates", service is null ? new[] { "Unchanged", "On", "Off" } : new[] { "Unchanged", "On", "Off", "Inherit" });
         var pause = Choice("Pause", service is null ? new[] { "Unchanged", "Until", "Resume" } : new[] { "Unchanged", "Until", "Inherit / resume" });
-        var until = new TextBox { Watermark = "Future ISO time, e.g. 2026-09-07T18:00:00+02:00" }; body.Children.Add(until);
+        var until = new TextBox { PlaceholderText = "Future ISO time, e.g. 2026-09-07T18:00:00+02:00" }; body.Children.Add(until);
         AutomationProperties.SetName(until, "Pause until");
         var windows = Choice("Maintenance windows", service is null ? new[] { "Unchanged", "Custom", "Clear" } : new[] { "Unchanged", "Custom", "Clear", "Inherit" });
-        var schedule = new TextBox { Watermark = "mon,tue:02:00-06:00;fri:23:00-05:00" }; body.Children.Add(schedule);
+        var schedule = new TextBox { PlaceholderText = "mon,tue:02:00-06:00;fri:23:00-05:00" }; body.Children.Add(schedule);
         AutomationProperties.SetName(schedule, "Custom maintenance windows");
         var problem = new TextBlock { Foreground = Ui.Bad, TextWrapping = Avalonia.Media.TextWrapping.Wrap }; body.Children.Add(problem);
         var save = Ui.Action("Apply and read back", () => Ui.Run(this, "Changing the update policy", async () =>

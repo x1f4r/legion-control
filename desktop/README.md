@@ -4,7 +4,7 @@ The same app as the Mac one and the phone one, for the two desktops. It reads th
 document, talks to the same agent over the same ssh, and follows the same rules about what it will
 and will not claim.
 
-Built with Avalonia 11 on .NET 10, published self-contained for Linux x64, Linux ARM64 and Windows x64
+Built with Avalonia 12 on .NET 10, published self-contained for Linux x64, Linux ARM64 and Windows x64
 so no .NET installation is required. Keep every file from the archive in the installation directory.
 OpenSSH is required for remote connections; the window also needs the platform graphics libraries.
 The window and the headless mode are the same objects: `--smoke` and `--command` drive
