@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.1.0",
+  "agentVersion": "3.1.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -40,7 +40,7 @@
         "line": "queued until idle, expires in 4h"
       }
     ],
-    "agentVersion": "3.1.0",
+    "agentVersion": "3.1.1",
     "systemId": "linux",
     "outcome": "pending"
   }

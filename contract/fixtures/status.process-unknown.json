@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.1.0",
+  "agentVersion": "3.1.1",
   "system": {
     "id": "windows",
     "name": "Windows 11"
@@ -14,7 +14,7 @@
     "partial": false
   },
   "agent": {
-    "version": "3.1.0",
+    "version": "3.1.1",
     "contract": 3,
     "base": "C:\\Users\\me\\.legion-control",
     "node": "24.9.0",

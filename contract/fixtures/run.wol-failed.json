@@ -1,7 +1,7 @@
 {
   "ok": false,
   "contract": 3,
-  "agentVersion": "3.1.0",
+  "agentVersion": "3.1.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -50,7 +50,7 @@
         "line": "wol wake-legion: EACCES on 192.168.50.255:9"
       }
     ],
-    "agentVersion": "3.1.0",
+    "agentVersion": "3.1.1",
     "systemId": "linux",
     "outcome": "failed"
   }

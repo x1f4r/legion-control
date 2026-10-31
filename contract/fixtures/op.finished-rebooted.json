@@ -1,7 +1,7 @@
 {
   "ok": true,
   "contract": 3,
-  "agentVersion": "3.1.0",
+  "agentVersion": "3.1.1",
   "system": {
     "id": "linux",
     "name": "Raspberry Pi OS"
@@ -53,7 +53,7 @@
         "line": "recovery: uptime 42s and the running system is windows, so the transition happened"
       }
     ],
-    "agentVersion": "3.1.0",
+    "agentVersion": "3.1.1",
     "systemId": "linux",
     "outcome": "succeeded"
   }
