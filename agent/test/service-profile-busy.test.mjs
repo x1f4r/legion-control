@@ -152,6 +152,31 @@ test('Linux is read from /proc as one snapshot, and what the agent itself starte
   assert.deepEqual(inspectProfileProcesses('opencode', asked), UNKNOWN);
 }));
 
+test('Windows leaves out what the agent started only where each parent was created before its child', () => {
+  const node = 'C:\\Program Files\\nodejs\\node.exe';
+  const opencode = 'C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\opencode-ai\\bin\\opencode.exe';
+  const at = (time) => `2026-10-31T${time}.0000000Z`;
+  const row = (pid, parent, name, command, created) => ({ ProcessId: pid, ParentProcessId: parent, SessionId: 1, Name: name, CommandLine: command, ExecutablePath: name === 'node.exe' ? node : opencode, CreatedAt: created });
+  const rows = {
+    agent: row(AGENT, 4000, 'node.exe', `"${node}" "C:\\Users\\me\\.legion-control\\agent\\src\\index.mjs" update opencode`, at('08:00:00')),
+    probe: row(process.pid, AGENT, 'node.exe', `"${node}" "C:\\Users\\me\\.legion-control\\agent\\src\\service-profile-probe.mjs" busy opencode`, at('11:00:00.1')),
+    sibling: row(4116, AGENT, 'node.exe', `"${node}" "C:\\Users\\me\\.legion-control\\agent\\src\\service-profile-probe.mjs" busy codex-cli`, at('11:00:00.2')),
+    version: row(4115, AGENT, 'opencode.exe', `"${opencode}" --version`, at('11:00:00.3')),
+  };
+  const inspect = (entries) => inspectProfileProcesses('opencode', {
+    platform: 'win32', run: () => ({ status: 0, stdout: JSON.stringify(entries) }), io: sandbox('/nowhere'), home: 'C:\\Users\\me', env: { LEGIONCTL_AGENT_PID: String(AGENT) }, parentPid: AGENT,
+  });
+  assert.deepEqual(inspect(Object.values(rows)), IDLE, 'a version probe the agent runs is the agent\'s, not a session');
+  // A session whose parent has exited, and whose parent's id was given to the
+  // agent or one of its probes after the session had started.
+  assert.deepEqual(inspect([...Object.values(rows), row(7000, AGENT, 'opencode.exe', `"${opencode}" serve`, at('07:00:00'))]), BUSY);
+  assert.deepEqual(inspect([...Object.values(rows), row(7001, 4116, 'opencode.exe', `"${opencode}" serve`, at('09:00:00'))]), BUSY);
+  // Without creation times nothing is proven, and neither is a probe the
+  // named agent cannot have started.
+  assert.deepEqual(inspect([rows.agent, rows.probe, { ...rows.version, CreatedAt: null }]), BUSY);
+  assert.deepEqual(inspect([rows.agent, { ...rows.probe, CreatedAt: at('07:00:00') }, rows.version]), BUSY);
+});
+
 test('an unreadable /proc fails closed without disclosing anything', () => {
   const io = { readdirSync: () => { throw Object.assign(new Error('private-value'), { code: 'EACCES' }); } };
   const result = inspectProfileProcesses('codex-cli', { platform: 'linux', io, env: {} });

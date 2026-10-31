@@ -169,13 +169,19 @@ function identify(row, { paths, file, cwdOf }) {
   return { names, located, uncertain };
 }
 
-/** The agent's process and everything it started: its other probes are no product session. */
-function agentTree(rows, agentPid) {
+/**
+ * The agent's process and everything it started: its other probes are no
+ * product session. `descends` says whether a row really is the child its
+ * parent id names. The tree counts only when this probe is in it, which is
+ * what shows the agent named is the one that started it.
+ */
+function agentTree(rows, agentPid, ownPid, descends) {
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
   const children = new Map();
-  for (const row of rows) if (Number.isInteger(row.parentPid) && row.parentPid !== row.pid) children.set(row.parentPid, [...(children.get(row.parentPid) ?? []), row.pid]);
+  for (const row of rows) if (Number.isInteger(row.parentPid) && row.parentPid !== row.pid) children.set(row.parentPid, [...(children.get(row.parentPid) ?? []), row]);
   const tree = new Set([agentPid]);
-  for (const pid of tree) for (const child of children.get(pid) ?? []) tree.add(child);
-  return tree;
+  for (const pid of tree) for (const child of children.get(pid) ?? []) if (descends(byPid.get(pid), child)) tree.add(child.pid);
+  return tree.has(ownPid) ? tree : new Set();
 }
 
 function realFiles(io) {
@@ -195,11 +201,11 @@ function realFiles(io) {
  * process whose path cannot be read. `install.foreign` is where other
  * profiles' applications live, and a name never claims a process from there.
  *
- * `agentPid` is the agent that asked. Outside Windows its whole tree is left
- * out: the agent runs up to four probes at once, and each of them used to see
- * the others, and their children, start and exit around it. Windows keeps a
+ * `agentPid` is the agent that asked, and its whole tree is left out: the
+ * agent runs up to four probes at once, and each of them used to see the
+ * others, and their children, start and exit around it. Windows keeps a
  * parent's id after the parent exits and gives it to the next process, so a
- * parent id there cannot prove descent.
+ * parent id there proves descent only from a parent created before the child.
  */
 export function processExitVerdict(profile, rows, ownPid = process.pid, { platform = process.platform, systemRoot = process.env.SystemRoot, agentPid = null, install = null, cwdOf = null, io = fs } = {}) {
   const names = NAMES[profile];
@@ -216,7 +222,10 @@ export function processExitVerdict(profile, rows, ownPid = process.pid, { platfo
   const owned = install?.owned?.length ? install.owned : null;
   const links = new Set((install?.links ?? []).map((link) => fold(paths.normalize(link))));
   const foreign = install?.foreign ?? [];
-  const excluded = platform !== 'win32' && Number.isInteger(agentPid) ? agentTree(rows, agentPid) : new Set();
+  const descends = platform === 'win32'
+    ? (parent, child) => typeof parent?.createdAt === 'string' && typeof child.createdAt === 'string' && parent.createdAt < child.createdAt
+    : () => true;
+  const excluded = Number.isInteger(agentPid) ? agentTree(rows, agentPid, ownPid, descends) : new Set();
   let uncertain = false;
   for (const row of rows) {
     if (platform === 'win32' && identifiedWindowsSystemProcess(row, rows, systemRoot)) continue;
@@ -391,15 +400,17 @@ export function inspectProfileProcesses(profile, { platform = process.platform, 
     if (platform === 'win32') {
       const ownerCandidates = [...WINDOWS_SYSTEM_NAMES, ...WINDOWS_KERNEL_NAMES, ...WINDOWS_ISOLATED_SERVICE_IDENTITIES.keys(), 'vmmem', 'vmmemwsl'];
       const script = `$ErrorActionPreference='Stop'; $names=@(${ownerCandidates.map((name) => `'${name}'`).join(',')}); ` +
-        `@(Get-CimInstance Win32_Process | ForEach-Object { $sid=$null; ` +
+        `@(Get-CimInstance Win32_Process | ForEach-Object { $sid=$null; $created=$null; ` +
+        `if ($_.CreationDate) { $created=$_.CreationDate.ToUniversalTime().ToString('o') }; ` +
         `if ([string]::IsNullOrEmpty($_.CommandLine) -and $names -contains $_.Name) { ` +
         `try { $owner=Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid; if ($owner.ReturnValue -eq 0) { $sid=$owner.Sid } } catch {} }; ` +
-        `[PSCustomObject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;SessionId=$_.SessionId;Name=$_.Name;CommandLine=$_.CommandLine;ExecutablePath=$_.ExecutablePath;OwnerSid=$sid} }) | ConvertTo-Json -Compress`;
+        `[PSCustomObject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;SessionId=$_.SessionId;Name=$_.Name;CommandLine=$_.CommandLine;ExecutablePath=$_.ExecutablePath;OwnerSid=$sid;CreatedAt=$created} }) | ConvertTo-Json -Compress`;
       const result = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 4000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
       if (result.status !== 0 || result.error) return processExitVerdict(profile, null);
       const entries = JSON.parse(result.stdout);
       if (!Array.isArray(entries)) return processExitVerdict(profile, null);
-      rows = entries.map((row) => ({ pid: row.ProcessId, parentPid: row.ParentProcessId, sessionId: row.SessionId, name: row.Name, command: row.CommandLine, executablePath: row.ExecutablePath, ownerSid: row.OwnerSid }));
+      // CreatedAt is the round-trip format, UTC to the tick, so creation times compare as text.
+      rows = entries.map((row) => ({ pid: row.ProcessId, parentPid: row.ParentProcessId, sessionId: row.SessionId, name: row.Name, command: row.CommandLine, executablePath: row.ExecutablePath, ownerSid: row.OwnerSid, createdAt: row.CreatedAt }));
     } else if (platform === 'darwin') rows = darwinRows(run);
     else if (platform === 'linux') {
       rows = linuxRows(io);
