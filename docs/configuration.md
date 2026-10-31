@@ -253,7 +253,7 @@ separate operation against `controller.json`.
 | `scheduled-task` | `task`, `match` | Windows. `Start-/Stop-ScheduledTask`; running is decided by a process whose command line contains `match` (default: the npm package root) |
 | `app` | | macOS, implied for kind `app` |
 | `command` | `start`, `stop`, `running` | argv arrays, at least one required. `running` is judged by exit code 0 |
-| `none` | | nothing to start or stop, so nothing that can be down: reported as running, and not restartable |
+| `none` | | nothing to start or stop, so nothing that can be down: reported as running, and not restartable. An update stops nothing: it waits up to 20 s for the service's own busy probe to answer idle, and defers when it does not |
 
 **`drain`** is a service-level command run after the operation lock is taken and before the service
 is stopped, for a service that can be told to finish what it is doing and stop accepting new work.
