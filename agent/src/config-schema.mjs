@@ -36,7 +36,7 @@ export const LEGACY_DEFAULTS = {
   // Packages in the T3 dependency tree that are allowed to run install scripts.
   // npm 12 blocks them by default and node-pty has to compile pty.node from
   // source on Linux, so without this the server cannot start after an update.
-  // Only consulted on npm 12 and newer; see allowScriptsArgs in providers/npm.mjs.
+  // Only consulted on npm 11.16 and newer; see allowScriptsArgs in providers/npm.mjs.
   allowScripts: ['node-pty', 'msgpackr-extract'],
   t3AppPath: '/Applications/T3 Code (Nightly).app',
   t3AppBundleId: 'com.t3tools.t3code',

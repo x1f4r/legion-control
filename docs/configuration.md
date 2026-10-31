@@ -121,7 +121,7 @@ how an update happens.
   // The global prefix the package lives under. Default: the platform's usual one, probed if
   // that is empty.
   "npmPrefix": null,
-  // Packages allowed to run install scripts on npm 12 and newer.
+  // Packages allowed to run install scripts, passed to npm 11.16 and newer, which know the setting.
   "allowScripts": ["node-pty"],
   // Optional. A command that fails when what npm installed does not run, for a package whose
   // postinstall puts the real binary in place. The CLI profiles set one that runs the package's

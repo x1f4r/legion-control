@@ -150,3 +150,18 @@ test('an npm update that cannot record its install starts the service again, and
     assert.equal(readFixture(dir, 'running'), 'on');
   });
 });
+
+test('the install script allowlist goes to every npm that knows it, 11.16 included, and to none before', async () => {
+  // npm 11.16.0 brought allow-scripts in, and under strict-allow-scripts an npm
+  // 11 install fails on any script the list does not cover, so waiting for npm
+  // 12 left a service's own allowlist out on the machines where it counted.
+  for (const [npmVersion, passed] of [['11.15.0', false], ['11.16.0', true], ['11.20.0', true], ['12.0.2', true]]) {
+    await withNpmService(async ({ dir, run }) => {
+      const { payload } = run(['update']);
+      assert.equal(payload.action, 'updated', `${npmVersion}: ${payload.message}`);
+      const [install] = installs(dir);
+      assert.equal(install.includes('--allow-scripts=demo-pkg,node-pty'), passed, `${npmVersion}: ${install}`);
+    }, { initial: { 'npm-version': npmVersion }, service: () => ({ allowScripts: ['demo-pkg', 'node-pty'] }) });
+  }
+});
+

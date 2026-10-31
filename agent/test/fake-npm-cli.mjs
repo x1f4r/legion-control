@@ -43,7 +43,7 @@ async function heldWhile(name) {
 
 const [verb] = args;
 if (verb === '--version') {
-  process.stdout.write('10.9.0\n');
+  process.stdout.write(`${read('npm-version', '10.9.0')}\n`);
 } else if (verb === 'view') {
   if (read('latest-fails') === 'on') process.exit(1);
   process.stdout.write(`${JSON.stringify(read('latest', '1.0.0'))}\n`);
