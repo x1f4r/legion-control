@@ -4,7 +4,7 @@
 # plugin of its own, older than this one; the root build puts this version on the classpath instead,
 # because the Compose and serialization compiler plugins have to match the compiler exactly. See
 # android/README.md.
-agp = "9.5.0"
+agp = "9.5.1"
 kotlin = "2.4.21"
 
 coreKtx = "1.19.1"
