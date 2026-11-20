@@ -4,7 +4,7 @@
 # plugin of its own, older than this one; the root build puts this version on the classpath instead,
 # because the Compose and serialization compiler plugins have to match the compiler exactly. See
 # android/README.md.
-agp = "9.5.0"
+agp = "9.5.1"
 kotlin = "2.4.21"
 
 coreKtx = "1.19.1"
@@ -13,7 +13,7 @@ activityCompose = "1.13.0"
 composeBom = "2026.09.00"
 
 coroutines = "1.11.0"
-serialization = "1.12.0"
+serialization = "1.13.0"
 
 # sshj 0.39 is the last release that still depends on net.i2p.crypto:eddsa. That matters: the i2p
 # implementation of ed25519 is pure Java and needs no JCE provider, whereas 0.40 moved ed25519 onto
@@ -24,7 +24,7 @@ eddsa = "0.3.0"
 # depends on it, and on bcpkix and bcutil with it; it is named here because this app calls it
 # directly. The three are one release: they share packages, and a bcprov newer than the bcutil next to
 # it fails the first time one of its classes reaches for a field only its own release has.
-bouncycastle = "1.86"
+bouncycastle = "1.87"
 slf4jAndroid = "2.0.20-0"
 
 desugar = "2.1.5"
