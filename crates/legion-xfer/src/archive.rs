@@ -156,6 +156,10 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
     let mut written_exact: BTreeSet<String> = BTreeSet::new();
     let mut written_ancestors: BTreeSet<String> = BTreeSet::new();
     let mut deferred_dirs: Vec<DeferredDir> = Vec::new();
+    // Batch parent directory syncs per unique touched directory rather than calling fsync after
+    // every small file, keeping durability before unpack returns while avoiding O(files) redundant
+    // directory syncs.
+    let mut dirs_to_sync: BTreeSet<PathBuf> = BTreeSet::new();
 
     for item in entries {
         let mut entry = item?;
@@ -193,7 +197,8 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
             continue;
         }
 
-        let (parent, final_seg) = ensure_safe_parent_dirs(root, &canonical_root, &segments, &rel)?;
+        let (parent, final_seg) =
+            ensure_safe_parent_dirs(root, &canonical_root, &segments, &rel, &mut dirs_to_sync)?;
         let dest = parent.join(final_seg);
 
         let mtime = entry
@@ -222,6 +227,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                     }
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {
                         fs::create_dir(&dest).map_err(|e| classify_io(&dest, e))?;
+                        dirs_to_sync.insert(parent.clone());
                     }
                     Err(err) => return Err(classify_io(&dest, err)),
                 }
@@ -258,6 +264,9 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                     });
                 }
                 tmp_file.flush().map_err(|e| classify_io(guard.path(), e))?;
+                tmp_file
+                    .sync_all()
+                    .map_err(|e| classify_io(guard.path(), e))?;
                 drop(tmp_file);
 
                 if let Some(mode) = safe_mode {
@@ -270,6 +279,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
 
                 platform::replace_file(guard.path(), &dest)?;
                 guard.disarm();
+                dirs_to_sync.insert(parent);
 
                 record_written(&mut written_exact, &mut written_ancestors, &rel);
                 report.files.push(rel);
@@ -314,6 +324,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                 }
 
                 if platform::create_symlink_atomic(Path::new(target_str), &dest)? {
+                    dirs_to_sync.insert(parent);
                     record_written(&mut written_exact, &mut written_ancestors, &rel);
                     report.symlinks.push(rel);
                 } else {
@@ -336,6 +347,11 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                 });
             }
         }
+    }
+
+    // Sync each unique modified parent directory once before applying restrictive directory modes.
+    for dir in dirs_to_sync {
+        platform::sync_dir(&dir)?;
     }
 
     // Apply directory mtimes and modes deepest-first so writing children never clobbers parent
@@ -506,6 +522,7 @@ fn ensure_safe_parent_dirs<'a>(
     canonical_root: &Path,
     segments: &'a [String],
     rel: &str,
+    dirs_to_sync: &mut BTreeSet<PathBuf>,
 ) -> Result<(PathBuf, &'a str)> {
     let Some((final_seg, parents)) = segments.split_last() else {
         return Err(Error::UnsafeArchiveEntry {
@@ -516,6 +533,7 @@ fn ensure_safe_parent_dirs<'a>(
 
     let mut cur = root.to_path_buf();
     for seg in parents {
+        let parent_before = cur.clone();
         cur.push(seg);
         match fs::symlink_metadata(&cur) {
             Ok(meta) if meta.file_type().is_dir() => {}
@@ -546,6 +564,7 @@ fn ensure_safe_parent_dirs<'a>(
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(&cur).map_err(|e| classify_io(&cur, e))?;
+                dirs_to_sync.insert(parent_before);
             }
             Err(err) => return Err(classify_io(&cur, err)),
         }
@@ -1055,5 +1074,43 @@ mod tests {
         let err = unpack(dst.path(), Cursor::new(tar_bytes)).unwrap_err();
         assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
         assert!(!dst.path().join("alias.txt").exists());
+    }
+
+    #[test]
+    fn unpack_syncs_modified_parent_directories_including_readonly_dirs() {
+        let dst = tempfile::tempdir().unwrap();
+        let before = platform::dir_sync_calls();
+
+        let mut tar_bytes = Vec::new();
+        for (path, entry_type, data, mode) in [
+            ("ro", EntryType::Directory, b"".as_slice(), 0o555),
+            ("ro/a.txt", EntryType::Regular, b"one".as_slice(), 0o644),
+            ("ro/b.txt", EntryType::Regular, b"two".as_slice(), 0o644),
+        ] {
+            let mut h = Header::new_gnu();
+            h.set_entry_type(entry_type);
+            h.set_size(data.len() as u64);
+            h.set_mode(mode);
+            h.set_mtime(1_700_000_000);
+            let raw = h.as_mut_bytes();
+            raw[..path.len()].copy_from_slice(path.as_bytes());
+            h.set_cksum();
+            tar_bytes.extend_from_slice(h.as_bytes());
+            tar_bytes.extend_from_slice(data);
+            let rem = data.len() % 512;
+            if rem != 0 {
+                tar_bytes.resize(tar_bytes.len() + (512 - rem), 0);
+            }
+        }
+        tar_bytes.resize(tar_bytes.len() + 1024, 0);
+
+        unpack(dst.path(), Cursor::new(tar_bytes)).unwrap();
+        assert!(platform::dir_sync_calls() > before);
+        assert_eq!(fs::read(dst.path().join("ro/a.txt")).unwrap(), b"one");
+        assert_eq!(fs::read(dst.path().join("ro/b.txt")).unwrap(), b"two");
+
+        // Restore write permission so tempdir cleanup succeeds on Unix.
+        #[cfg(unix)]
+        platform::set_mode(&dst.path().join("ro"), 0o755).unwrap();
     }
 }

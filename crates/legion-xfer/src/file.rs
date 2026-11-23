@@ -163,6 +163,7 @@ pub fn put<R: Read>(
     }
 
     file.flush().map_err(|e| classify_io(&partial, e))?;
+    file.sync_all().map_err(|e| classify_io(&partial, e))?;
     drop(file);
 
     let actual_hash = hash_file(&partial)?;
@@ -180,6 +181,11 @@ pub fn put<R: Read>(
     }
 
     platform::replace_file(&partial, path)?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    platform::sync_dir(parent)?;
 
     Ok(PutReport {
         size,
@@ -478,5 +484,23 @@ mod tests {
 
         let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn put_syncs_parent_directory_after_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("durable.bin");
+        let before = platform::dir_sync_calls();
+        let data = b"durable bytes";
+        put(
+            &dst,
+            data.len() as u64,
+            hash_bytes(data),
+            0,
+            Cursor::new(data),
+            None,
+        )
+        .unwrap();
+        assert!(platform::dir_sync_calls() > before);
     }
 }

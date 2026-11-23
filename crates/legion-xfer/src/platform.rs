@@ -8,6 +8,15 @@ use crate::error::{Result, classify_io};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+static DIR_SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the number of [`sync_dir`] calls made in this test process.
+#[cfg(test)]
+pub(crate) fn dir_sync_calls() -> u64 {
+    DIR_SYNC_CALLS.load(Ordering::Relaxed)
+}
+
 /// Returns a crate-unique monotonic counter value for temporary sibling filenames.
 pub(crate) fn next_temp_id() -> u64 {
     TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -19,6 +28,23 @@ pub(crate) fn next_temp_id() -> u64 {
 /// target briefly) can replace this body in one place.
 pub(crate) fn replace_file(from: &Path, to: &Path) -> Result<()> {
     fs::rename(from, to).map_err(|e| classify_io(to, e))
+}
+
+/// Flushes directory metadata to durable storage on Unix after a rename or entry creation.
+#[cfg(unix)]
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    DIR_SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+    let handle = fs::File::open(dir).map_err(|e| classify_io(dir, e))?;
+    handle.sync_all().map_err(|e| classify_io(dir, e))
+}
+
+/// No-op on non-Unix platforms where directories cannot be synced via `File::open`.
+#[cfg(not(unix))]
+pub(crate) fn sync_dir(_dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    DIR_SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Returns Unix permission bits (`0o7777` mask) on Unix and `None` on non-Unix platforms.
