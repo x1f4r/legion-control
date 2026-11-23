@@ -13,6 +13,7 @@
 pub mod error;
 pub mod hash;
 pub mod manifest;
+pub mod plan;
 mod platform;
 
 pub use error::{Error, Result};
@@ -20,3 +21,4 @@ pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
     CaseCollision, Entry, EntryKind, Manifest, ManifestOptions, SkippedEntry, Timestamp,
 };
+pub use plan::{Plan, PlanOptions, PlanTotals};
