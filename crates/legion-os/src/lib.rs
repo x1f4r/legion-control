@@ -8,6 +8,7 @@
 
 pub mod atomic;
 mod error;
+pub mod lock;
 pub mod shell;
 
 pub use error::{OsError, Result};
