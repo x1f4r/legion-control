@@ -27,4 +27,4 @@ pub use manifest::{
     CaseCollision, Entry, EntryKind, Manifest, ManifestOptions, SkippedEntry, Timestamp,
 };
 pub use path::{resolve_relative_path, validate_relative_path};
-pub use plan::{Plan, PlanOptions, PlanTotals};
+pub use plan::{Plan, PlanConflict, PlanOptions, PlanTotals};

@@ -5,13 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{CaseCollision, Entry, EntryKind, Manifest, detect_case_collisions};
+use crate::path::validate_relative_path;
 
 /// Options controlling how [`plan`] compares source and destination entries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanOptions {
     /// Compare regular files by BLAKE3 hash instead of size and whole-second mtime.
     pub checksum: bool,
-    /// Plan removal of destination entries absent from the source manifest.
+    /// Plan removal of destination entries absent from the source manifest and allow replacing a
+    /// destination directory with a source file or symlink.
     pub delete: bool,
 }
 
@@ -32,25 +34,38 @@ pub struct PlanTotals {
     pub entries_to_delete: u64,
 }
 
+/// An entry that cannot be scheduled automatically without explicit confirmation or deletion.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlanConflict {
+    /// Relative path where the conflict occurred.
+    pub path: String,
+    /// Human-readable reason the entry was neither sent nor deleted.
+    pub reason: String,
+}
+
 /// Actionable transfer plan produced by [`plan`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     /// Relative paths to pack and send from the source, ordered parents-first.
     pub send: Vec<String>,
-    /// Relative paths to remove from the destination, ordered deepest-first so children precede
-    /// their parent directories.
+    /// Relative paths to remove from the destination before unpacking, ordered deepest-first so
+    /// children precede their parent directories.
     pub delete: Vec<String>,
     /// Aggregate counts for progress reporting and dry-run summaries.
     pub totals: PlanTotals,
+    /// Entries blocked by type conflicts (such as a destination directory where the source has a
+    /// file or symlink while `delete` is false) or unsafe relative paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<PlanConflict>,
     /// Paths across source and destination that differ only in letter case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub case_collisions: Vec<CaseCollision>,
 }
 
 impl Plan {
-    /// Returns `true` when neither uploads nor deletions are needed.
+    /// Returns `true` when there is nothing to send, nothing to delete, and no conflicts.
     pub fn is_empty(&self) -> bool {
-        self.send.is_empty() && self.delete.is_empty()
+        self.send.is_empty() && self.delete.is_empty() && self.conflicts.is_empty()
     }
 }
 
@@ -58,28 +73,67 @@ impl Plan {
 ///
 /// Paths are matched case-sensitively so entries differing only in case are never silently merged;
 /// any such collisions within or across manifests are reported in [`Plan::case_collisions`].
+///
+/// When an entry's kind differs between source and destination:
+/// - A destination file or symlink is scheduled for deletion before sending, regardless of
+///   [`PlanOptions::delete`].
+/// - A destination directory where the source has a file or symlink is deleted (children first)
+///   only when [`PlanOptions::delete`] is `true`; otherwise it is neither sent nor deleted and is
+///   reported in [`Plan::conflicts`].
 pub fn plan(source: &Manifest, dest: &Manifest, options: &PlanOptions) -> Plan {
-    let dest_by_path: BTreeMap<&str, &Entry> = dest
-        .entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect();
+    let mut conflicts = Vec::new();
+    let mut dest_by_path: BTreeMap<&str, &Entry> = BTreeMap::new();
+    for entry in &dest.entries {
+        if let Err(err) = validate_relative_path(&entry.path) {
+            conflicts.push(PlanConflict {
+                path: entry.path.clone(),
+                reason: err.to_string(),
+            });
+            continue;
+        }
+        dest_by_path.insert(entry.path.as_str(), entry);
+    }
 
     let mut source_paths: BTreeSet<&str> = BTreeSet::new();
     let mut send = Vec::new();
+    let mut delete_set: BTreeSet<String> = BTreeSet::new();
     let mut totals = PlanTotals::default();
 
     for src in &source.entries {
-        source_paths.insert(src.path.as_str());
-        let unchanged = dest_by_path
-            .get(src.path.as_str())
-            .is_some_and(|dst| is_unchanged(src, dst, options.checksum));
-
-        if unchanged {
-            if src.kind == EntryKind::File {
-                totals.files_unchanged += 1;
-            }
+        if let Err(err) = validate_relative_path(&src.path) {
+            conflicts.push(PlanConflict {
+                path: src.path.clone(),
+                reason: err.to_string(),
+            });
             continue;
+        }
+        source_paths.insert(src.path.as_str());
+
+        if let Some(dst) = dest_by_path.get(src.path.as_str()) {
+            if dst.kind != src.kind {
+                if dst.kind == EntryKind::Dir {
+                    if !options.delete {
+                        conflicts.push(PlanConflict {
+                            path: src.path.clone(),
+                            reason: format!(
+                                "destination is a directory while source is a {}; enable delete to replace it",
+                                kind_label(src.kind)
+                            ),
+                        });
+                        continue;
+                    }
+                    delete_set.insert(dst.path.clone());
+                } else {
+                    // Replacing a single destination file or symlink with a different kind is
+                    // safe without `delete`, and must happen before unpack writes the new entry.
+                    delete_set.insert(dst.path.clone());
+                }
+            } else if is_unchanged(src, dst, options.checksum) {
+                if src.kind == EntryKind::File {
+                    totals.files_unchanged += 1;
+                }
+                continue;
+            }
         }
 
         send.push(src.path.clone());
@@ -99,22 +153,26 @@ pub fn plan(source: &Manifest, dest: &Manifest, options: &PlanOptions) -> Plan {
 
     send.sort();
 
-    let mut delete = Vec::new();
     if options.delete {
-        for dst in &dest.entries {
+        for dst in dest_by_path.values() {
             if !source_paths.contains(dst.path.as_str()) {
-                delete.push(dst.path.clone());
+                delete_set.insert(dst.path.clone());
             }
         }
-        // Delete deepest entries first so files inside removed directories are unlinked before
-        // their parent directories.
-        delete.sort_by(|a, b| {
-            let depth_a = a.matches('/').count();
-            let depth_b = b.matches('/').count();
-            depth_b.cmp(&depth_a).then_with(|| a.cmp(b))
-        });
-        totals.entries_to_delete = delete.len() as u64;
     }
+
+    // Delete deepest entries first so files inside removed directories are unlinked before their
+    // parent directories.
+    let mut delete: Vec<String> = delete_set.into_iter().collect();
+    delete.sort_by(|a, b| {
+        let depth_a = a.matches('/').count();
+        let depth_b = b.matches('/').count();
+        depth_b.cmp(&depth_a).then_with(|| a.cmp(b))
+    });
+    totals.entries_to_delete = delete.len() as u64;
+
+    conflicts.sort();
+    conflicts.dedup();
 
     let case_collisions = detect_case_collisions(
         source
@@ -128,7 +186,16 @@ pub fn plan(source: &Manifest, dest: &Manifest, options: &PlanOptions) -> Plan {
         send,
         delete,
         totals,
+        conflicts,
         case_collisions,
+    }
+}
+
+fn kind_label(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::File => "file",
+        EntryKind::Dir => "directory",
+        EntryKind::Symlink => "symlink",
     }
 }
 
@@ -212,6 +279,7 @@ mod tests {
         let p = plan(&src, &dst, &PlanOptions::default());
         assert_eq!(p.send, vec!["a.txt", "link", "sub", "sub/b.txt"]);
         assert!(p.delete.is_empty());
+        assert!(p.conflicts.is_empty());
         assert_eq!(p.totals.files_to_send, 2);
         assert_eq!(p.totals.bytes_to_send, 350);
         assert_eq!(p.totals.files_unchanged, 0);
@@ -275,25 +343,151 @@ mod tests {
     }
 
     #[test]
-    fn kind_change_or_symlink_target_change_triggers_send() {
+    fn kind_changes_cover_all_combinations_with_and_without_delete() {
+        // 1. Dest file or symlink replaced by a different kind -> always deleted before send,
+        //    whether `delete` is false or true.
+        for delete_flag in [false, true] {
+            let opts = PlanOptions {
+                checksum: false,
+                delete: delete_flag,
+            };
+
+            // file -> symlink
+            let p = plan(
+                &manifest(vec![symlink("x", "target")]),
+                &manifest(vec![file("x", 10, 100, 0, None)]),
+                &opts,
+            );
+            assert_eq!(p.delete, vec!["x"]);
+            assert_eq!(p.send, vec!["x"]);
+            assert!(p.conflicts.is_empty());
+            assert_eq!(p.totals.entries_to_delete, 1);
+            assert_eq!(p.totals.symlinks_to_send, 1);
+
+            // symlink -> file
+            let p = plan(
+                &manifest(vec![file("x", 10, 100, 0, None)]),
+                &manifest(vec![symlink("x", "target")]),
+                &opts,
+            );
+            assert_eq!(p.delete, vec!["x"]);
+            assert_eq!(p.send, vec!["x"]);
+            assert!(p.conflicts.is_empty());
+            assert_eq!(p.totals.entries_to_delete, 1);
+            assert_eq!(p.totals.files_to_send, 1);
+
+            // file -> dir (with child inside dir)
+            let p = plan(
+                &manifest(vec![dir("x", 100), file("x/a.txt", 3, 100, 0, None)]),
+                &manifest(vec![file("x", 10, 100, 0, None)]),
+                &opts,
+            );
+            assert_eq!(p.delete, vec!["x"]);
+            assert_eq!(p.send, vec!["x", "x/a.txt"]);
+            assert!(p.conflicts.is_empty());
+            assert_eq!(p.totals.entries_to_delete, 1);
+            assert_eq!(p.totals.dirs_to_send, 1);
+            assert_eq!(p.totals.files_to_send, 1);
+
+            // symlink -> dir
+            let p = plan(
+                &manifest(vec![dir("x", 100)]),
+                &manifest(vec![symlink("x", "target")]),
+                &opts,
+            );
+            assert_eq!(p.delete, vec!["x"]);
+            assert_eq!(p.send, vec!["x"]);
+            assert!(p.conflicts.is_empty());
+            assert_eq!(p.totals.entries_to_delete, 1);
+            assert_eq!(p.totals.dirs_to_send, 1);
+        }
+
+        // 2. Dest directory replaced by source file or symlink -> conflict when `delete` is false,
+        //    deleted children-first then sent when `delete` is true.
+        let dst_tree = manifest(vec![
+            dir("x", 100),
+            dir("x/sub", 100),
+            file("x/sub/leaf.txt", 4, 100, 0, None),
+            file("x/top.txt", 2, 100, 0, None),
+        ]);
+
+        for (src_entry, expect_files, expect_symlinks) in [
+            (file("x", 10, 100, 0, None), 1u64, 0u64),
+            (symlink("x", "other"), 0u64, 1u64),
+        ] {
+            let src = manifest(vec![src_entry]);
+
+            let without_delete = plan(
+                &src,
+                &dst_tree,
+                &PlanOptions {
+                    checksum: false,
+                    delete: false,
+                },
+            );
+            assert!(without_delete.send.is_empty());
+            assert!(without_delete.delete.is_empty());
+            assert_eq!(without_delete.conflicts.len(), 1);
+            assert_eq!(without_delete.conflicts[0].path, "x");
+            assert_eq!(without_delete.totals.files_to_send, 0);
+            assert_eq!(without_delete.totals.symlinks_to_send, 0);
+            assert!(!without_delete.is_empty());
+
+            let with_delete = plan(
+                &src,
+                &dst_tree,
+                &PlanOptions {
+                    checksum: false,
+                    delete: true,
+                },
+            );
+            assert!(with_delete.conflicts.is_empty());
+            assert_eq!(with_delete.send, vec!["x"]);
+            assert_eq!(
+                with_delete.delete,
+                vec!["x/sub/leaf.txt", "x/sub", "x/top.txt", "x"]
+            );
+            assert_eq!(with_delete.totals.entries_to_delete, 4);
+            assert_eq!(with_delete.totals.files_to_send, expect_files);
+            assert_eq!(with_delete.totals.symlinks_to_send, expect_symlinks);
+        }
+    }
+
+    #[test]
+    fn symlink_target_change_triggers_send_without_extra_delete() {
         let src = manifest(vec![
-            file("was_dir", 10, 100, 0, None),
-            dir("was_file", 100),
             symlink("link_same", "a"),
             symlink("link_changed", "b"),
         ]);
         let dst = manifest(vec![
-            dir("was_dir", 100),
-            file("was_file", 10, 100, 0, None),
             symlink("link_same", "a"),
             symlink("link_changed", "a"),
         ]);
 
         let p = plan(&src, &dst, &PlanOptions::default());
-        assert_eq!(p.send, vec!["link_changed", "was_dir", "was_file"]);
-        assert_eq!(p.totals.files_to_send, 1);
-        assert_eq!(p.totals.dirs_to_send, 1);
+        assert_eq!(p.send, vec!["link_changed"]);
+        assert!(p.delete.is_empty());
+        assert!(p.conflicts.is_empty());
         assert_eq!(p.totals.symlinks_to_send, 1);
+    }
+
+    #[test]
+    fn unsafe_paths_in_manifests_become_conflicts_not_deletes_or_sends() {
+        let src = manifest(vec![file("../escape.txt", 4, 10, 0, None)]);
+        let dst = manifest(vec![file("sub/C:evil.txt", 4, 10, 0, None)]);
+
+        let p = plan(
+            &src,
+            &dst,
+            &PlanOptions {
+                checksum: false,
+                delete: true,
+            },
+        );
+        assert!(p.send.is_empty());
+        assert!(p.delete.is_empty());
+        assert_eq!(p.conflicts.len(), 2);
+        assert!(!p.is_empty());
     }
 
     #[test]
