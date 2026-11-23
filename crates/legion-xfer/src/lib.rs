@@ -12,6 +12,7 @@
 
 pub mod archive;
 pub mod error;
+pub mod file;
 pub mod hash;
 pub mod manifest;
 pub mod plan;
@@ -19,6 +20,7 @@ mod platform;
 
 pub use archive::{PackReport, UnpackReport, pack, unpack};
 pub use error::{Error, Result};
+pub use file::{PART_SUFFIX, PutReport, get, part_path, put, resume_offset};
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
     CaseCollision, Entry, EntryKind, Manifest, ManifestOptions, SkippedEntry, Timestamp,
