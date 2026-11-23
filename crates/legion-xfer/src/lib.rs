@@ -10,12 +10,14 @@
 //! Each operation works over plain blocking [`std::io::Read`] and [`std::io::Write`] streams so
 //! local copies and copies relayed through remote pipes share the same code paths.
 
+pub mod archive;
 pub mod error;
 pub mod hash;
 pub mod manifest;
 pub mod plan;
 mod platform;
 
+pub use archive::{PackReport, UnpackReport, pack, unpack};
 pub use error::{Error, Result};
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{

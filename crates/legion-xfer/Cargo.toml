@@ -9,6 +9,7 @@ description = "File transfer engine for trees, hashes, archives, and resumable b
 blake3 = "1.8.7"
 globset = "0.4.22"
 serde = { version = "1.0.229", features = ["derive"] }
+tar = "0.4.46"
 thiserror = "2.0.21"
 
 [dev-dependencies]
