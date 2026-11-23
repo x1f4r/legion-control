@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod atomic;
 mod error;
 pub mod shell;
 
