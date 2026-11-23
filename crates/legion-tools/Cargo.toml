@@ -7,13 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Tools that exist only so the command line and the rpc session can be tested end to end: one that
+# echoes its arguments, one that sleeps until cancelled, two that check a path. The CLI's tests turn
+# it on through a dev-dependency, so a release build never carries them.
+testing = []
+
 [dependencies]
 legion-core.workspace = true
 legion-proto.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

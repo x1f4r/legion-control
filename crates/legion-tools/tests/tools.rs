@@ -48,7 +48,12 @@ fn every_built_in_tool_has_a_closed_object_schema_and_a_description() {
             "{expected} is missing from {names:?}"
         );
     }
-    for spec in registry.specs() {
+    // The test family, which a workspace test run builds in, echoes whatever it is given on purpose.
+    let released = registry
+        .specs()
+        .into_iter()
+        .filter(|spec| !spec.name.starts_with("test."));
+    for spec in released {
         assert_eq!(spec.input_schema["type"], json!("object"), "{}", spec.name);
         assert_eq!(
             spec.input_schema["additionalProperties"],

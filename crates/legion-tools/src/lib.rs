@@ -7,6 +7,8 @@
 
 pub mod audit;
 pub mod meta;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 use legion_core::Registry;
 
@@ -14,6 +16,8 @@ use legion_core::Registry;
 pub fn register_all(registry: &mut Registry) {
     meta::register(registry);
     audit::register(registry);
+    #[cfg(feature = "testing")]
+    testing::register(registry);
 }
 
 /// A registry holding every built-in tool.
