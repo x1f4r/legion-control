@@ -10,13 +10,20 @@ publish.workspace = true
 [dependencies]
 dunce.workspace = true
 gethostname.workspace = true
+jiff.workspace = true
 legion-proto.workspace = true
+schemars.workspace = true
 serde.workspace = true
+serde_ignored.workspace = true
 serde_json.workspace = true
+serde_path_to_error.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+tokio-util.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

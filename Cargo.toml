@@ -14,11 +14,17 @@ publish = false
 legion-proto = { path = "crates/legion-proto" }
 dunce = "1.0.5"
 gethostname = "1.1.0"
+jiff = { version = "1.0.2", default-features = false, features = ["std"] }
+schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_ignored = "0.1.14"
 # preserve_order keeps a result's fields in the order its type declares them, which is the order a
 # person reads them in.
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+serde_path_to_error = "0.1.20"
 tempfile = "3.27.0"
+tokio = "1.54.1"
+tokio-util = "0.7.20"
 toml = "1.2.2"
 
 [workspace.lints.rust]
