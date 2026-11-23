@@ -10,6 +10,7 @@ pub mod atomic;
 mod error;
 pub mod lock;
 pub mod procid;
+pub mod run;
 pub mod shell;
 
 pub use error::{OsError, Result};
