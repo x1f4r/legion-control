@@ -324,47 +324,10 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                 }
             }
             EntryType::Link => {
-                let raw_target =
-                    entry
-                        .link_name_bytes()
-                        .ok_or_else(|| Error::UnsafeArchiveEntry {
-                            entry: rel.clone(),
-                            reason: "hard link entry missing target".to_string(),
-                        })?;
-                let Some((_, target_segments)) = parse_relative_path_bytes(raw_target.as_ref())?
-                else {
-                    return Err(Error::UnsafeArchiveEntry {
-                        entry: rel,
-                        reason: "hard link target cannot be archive root".to_string(),
-                    });
-                };
-
-                let mut target_path = root.to_path_buf();
-                for seg in &target_segments {
-                    target_path.push(seg);
-                }
-                let canonical_target =
-                    fs::canonicalize(&target_path).map_err(|_| Error::UnsafeArchiveEntry {
-                        entry: rel.clone(),
-                        reason: "hard link target does not exist inside destination root"
-                            .to_string(),
-                    })?;
-                if !canonical_target.starts_with(&canonical_root) {
-                    return Err(Error::UnsafeArchiveEntry {
-                        entry: rel,
-                        reason: "hard link target escapes destination root".to_string(),
-                    });
-                }
-
-                let tmp_path = unique_temp_path(&parent);
-                fs::hard_link(&canonical_target, &tmp_path)
-                    .map_err(|e| classify_io(&tmp_path, e))?;
-                if let Err(err) = platform::replace_file(&tmp_path, &dest) {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(err);
-                }
-                record_written(&mut written_exact, &mut written_ancestors, &rel);
-                report.files.push(rel);
+                return Err(Error::UnsafeArchiveEntry {
+                    entry: rel,
+                    reason: "hard link entries are not allowed".to_string(),
+                });
             }
             other => {
                 return Err(Error::UnsafeArchiveEntry {
@@ -1081,5 +1044,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn refuses_hard_link_even_to_existing_file_inside_root() {
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(dst.path().join("existing.txt"), b"sensitive").unwrap();
+
+        let tar_bytes = build_raw_tar(&[("alias.txt", EntryType::Link, b"", Some("existing.txt"))]);
+        let err = unpack(dst.path(), Cursor::new(tar_bytes)).unwrap_err();
+        assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
+        assert!(!dst.path().join("alias.txt").exists());
     }
 }
