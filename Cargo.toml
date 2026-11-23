@@ -11,10 +11,14 @@ publish = false
 
 # Every version is named once, here; a crate takes what it needs with `workspace = true`.
 [workspace.dependencies]
+legion-proto = { path = "crates/legion-proto" }
+gethostname = "1.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 # preserve_order keeps a result's fields in the order its type declares them, which is the order a
 # person reads them in.
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tempfile = "3.27.0"
+toml = "1.2.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
