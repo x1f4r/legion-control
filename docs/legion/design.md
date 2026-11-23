@@ -44,15 +44,20 @@ neither touches the other's files.
     Cargo.toml                 workspace, shared dependency versions and lints
     crates/
       legion-proto/            wire types only: requests, replies, errors, tool specs (serde)
+      legion-os/               the one place platforms differ: shells, process trees, detaching,
+                               process identity, atomic files, locks
+      legion-xfer/             the transfer engine: hashes, tree listings, plans, tar streams,
+                               resumable single files; knows nothing about machines
       legion-core/             node: registry, context, policy, audit, config, paths
       legion-tools/            the built-in tool families, one module per family
       legion-net/              reaching other nodes: connectors, sessions, router, transfer
       legion-doors/            MCP (stdio and HTTP) and the JSON HTTP API
       legion-cli/              the `legion` binary: argument parsing and wiring
 
-Dependencies point one way: `proto ← core ← tools ← net ← doors ← cli`. `legion-tools` never
-knows a call came from another machine; `legion-net` wraps a local registry and adds the tools
-that only make sense across machines.
+Dependencies point one way: `proto, os, xfer ← core ← tools ← net ← doors ← cli`. `legion-os`
+and `legion-xfer` know nothing about tools or policy, and `legion-tools` never knows a call came
+from another machine; `legion-net` wraps a local registry and adds the tools that only make sense
+across machines.
 
 Never name a source directory `bin`: the repository ignores `**/bin/`.
 
@@ -221,7 +226,9 @@ the name of a built-in tool, and defining one needs the `admin` effect.
     command = ["docker", "exec", "-i", "box", "legion", "rpc"]
 
 `ssh` is anything the system ssh client accepts, so aliases, jump hosts, agents and Tailscale all
-keep working and Legion stores no key. For a machine with several systems the one that answered
+keep working and Legion stores no key. A command run over ssh gets a bare `PATH` that rarely
+holds a user's own programs, so the node asks for `legion` and, failing that, the place the
+installer puts it; a system's `program` setting names it outright when it lives elsewhere. For a machine with several systems the one that answered
 last is tried first; only the running system answers, and its `hello` says which it is.
 
 The node keeps one session per machine open while it lives and multiplexes calls over it by id,
