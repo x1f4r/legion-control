@@ -12,6 +12,7 @@ publish = false
 # Every version is named once, here; a crate takes what it needs with `workspace = true`.
 [workspace.dependencies]
 legion-proto = { path = "crates/legion-proto" }
+legion-core = { path = "crates/legion-core" }
 dunce = "1.0.5"
 gethostname = "1.1.0"
 jiff = { version = "1.0.2", default-features = false, features = ["std"] }

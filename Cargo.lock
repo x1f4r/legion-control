@@ -178,6 +178,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "legion-tools"
+version = "0.1.0"
+dependencies = [
+ "legion-core",
+ "legion-proto",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
