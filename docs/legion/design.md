@@ -286,11 +286,18 @@ replaced by their size.
   schema. Output is a readable rendering on a terminal and the raw JSON object otherwise.
 - **MCP.** `legion mcp` serves the registry over stdio. Tool names swap the dot for an underscore
   (`fs_read`), every tool gains the optional `on` argument, and effects become the standard
-  annotations. `--compact` serves three tools instead (`legion_tools`, `legion_describe`,
-  `legion_call`) for agents that should not carry forty schemas in their context.
+  annotations (`readOnlyHint` for `read`, `destructiveHint` for `destroy` and `power`). A failed
+  call is a result with `isError` and the same error object as text, so the agent can read the
+  code and the hint. `--compact` serves three tools instead (`legion_tools`, `legion_describe`,
+  `legion_call`) for agents that should not carry forty schemas in their context. Two revisions
+  of the protocol are in use, one with an `initialize` handshake and one without; the official
+  SDK (`rmcp`) speaks both, so the door is built on it rather than written by hand.
 - **HTTP.** `legion serve` listens on `127.0.0.1` only: `GET /v1/tools`, `POST /v1/call`, and MCP
-  at `/mcp`. Every request needs a bearer token. Publishing it beyond the machine is Tailscale
-  Serve's job, never a wider bind address.
+  at `/mcp`. Every request needs a bearer token from `tokens.toml`, where only the token's hash
+  is stored, and a request with an `Origin` header that is not this server is refused. Publishing
+  it beyond the machine is Tailscale Serve's job, never a wider bind address.
+- **Agents.** `legion agents add <claude|codex|antigravity|opencode>` registers the stdio door
+  with that tool through the tool's own `mcp add` command, pinned to the principal you name.
 - **RPC.** `legion rpc`, the pipe other nodes use.
 
 ## Files on disk
