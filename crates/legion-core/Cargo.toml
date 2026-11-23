@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+dunce.workspace = true
 gethostname.workspace = true
 legion-proto.workspace = true
 serde.workspace = true
