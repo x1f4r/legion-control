@@ -95,13 +95,16 @@ where
         header.set_mtime(mtime_secs);
 
         if ft.is_file() {
-            let mut file = File::open(&full_path).map_err(|e| classify_io(&full_path, e))?;
-            let len = meta.len();
+            let file = File::open(&full_path).map_err(|e| classify_io(&full_path, e))?;
+            let file_meta = file.metadata().map_err(|e| classify_io(&full_path, e))?;
+            let len = file_meta.len();
+            let file_mtime = Timestamp::from_metadata(&file_meta);
+            header.set_mtime(u64::try_from(file_mtime.secs).unwrap_or(0));
             header.set_entry_type(EntryType::Regular);
             header.set_size(len);
-            header.set_mode(platform::entry_mode(&meta).unwrap_or(0o644));
+            header.set_mode(platform::entry_mode(&file_meta).unwrap_or(0o644));
             header.set_cksum();
-            builder.append_data(&mut header, &rel, &mut file)?;
+            append_exact_reader(&mut builder, &mut header, &rel, &full_path, file, len)?;
             report.files += 1;
             report.bytes += len;
         } else if ft.is_dir() {
@@ -407,6 +410,76 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
     report.skipped.sort();
 
     Ok(report)
+}
+
+struct ExactRead<R> {
+    inner: io::Take<R>,
+    expected: u64,
+    read: u64,
+    shrank: bool,
+}
+
+impl<R: Read> Read for ExactRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            if self.read < self.expected {
+                self.shrank = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "file shrank while packing: expected {} bytes, read {}",
+                        self.expected, self.read
+                    ),
+                ));
+            }
+            return Ok(0);
+        }
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+
+/// Appends exactly `expected` bytes from `reader` into `builder`.
+///
+/// Caps reads at `expected` bytes so a growing file cannot desynchronize the tar stream, and
+/// returns [`Error::Conflict`] if `reader` hits EOF before `expected` bytes are produced.
+fn append_exact_reader<R: Read, W: Write>(
+    builder: &mut Builder<W>,
+    header: &mut Header,
+    rel: &str,
+    full_path: &Path,
+    reader: R,
+    expected: u64,
+) -> Result<()> {
+    let mut exact = ExactRead {
+        inner: reader.take(expected),
+        expected,
+        read: 0,
+        shrank: false,
+    };
+    match builder.append_data(header, rel, &mut exact) {
+        Ok(()) => {
+            if exact.read < expected {
+                return Err(Error::Conflict {
+                    path: full_path.to_path_buf(),
+                    reason: format!(
+                        "file shrank while packing: expected {expected} bytes, read {}",
+                        exact.read
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(_) if exact.shrank => Err(Error::Conflict {
+            path: full_path.to_path_buf(),
+            reason: format!(
+                "file shrank while packing: expected {expected} bytes, read {}",
+                exact.read
+            ),
+        }),
+        Err(err) => Err(Error::from(err)),
+    }
 }
 
 struct DeferredDir {
@@ -936,5 +1009,77 @@ mod tests {
         let inner_meta = fs::symlink_metadata(dst.path().join("inner")).unwrap();
         assert_eq!(Timestamp::from_metadata(&inner_meta).secs, 1_600_000_000);
         assert_eq!(inner_meta.permissions().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn append_exact_reader_caps_growing_file_and_fails_on_shrinking_file() {
+        // Growing file: 200 bytes available when header declares 100. Tar stream must stay
+        // synchronized so a following entry unpacks cleanly.
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_bytes);
+
+            let mut h1 = Header::new_gnu();
+            h1.set_entry_type(EntryType::Regular);
+            h1.set_size(100);
+            h1.set_mode(0o644);
+            h1.set_mtime(1_700_000_000);
+            h1.set_cksum();
+            let growing_data = vec![b'A'; 200];
+            append_exact_reader(
+                &mut builder,
+                &mut h1,
+                "grew.bin",
+                Path::new("grew.bin"),
+                Cursor::new(growing_data),
+                100,
+            )
+            .unwrap();
+
+            let mut h2 = Header::new_gnu();
+            h2.set_entry_type(EntryType::Regular);
+            h2.set_size(5);
+            h2.set_mode(0o644);
+            h2.set_mtime(1_700_000_000);
+            h2.set_cksum();
+            append_exact_reader(
+                &mut builder,
+                &mut h2,
+                "after.txt",
+                Path::new("after.txt"),
+                Cursor::new(b"hello".as_slice()),
+                5,
+            )
+            .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let dst = tempfile::tempdir().unwrap();
+        unpack(dst.path(), Cursor::new(&tar_bytes)).unwrap();
+        assert_eq!(
+            fs::read(dst.path().join("grew.bin")).unwrap(),
+            vec![b'A'; 100]
+        );
+        assert_eq!(fs::read(dst.path().join("after.txt")).unwrap(), b"hello");
+
+        // Shrinking file: only 50 bytes arrive when header declares 100 -> Conflict error.
+        let mut bad_buf = Vec::new();
+        let mut builder = Builder::new(&mut bad_buf);
+        let mut h = Header::new_gnu();
+        h.set_entry_type(EntryType::Regular);
+        h.set_size(100);
+        h.set_mode(0o644);
+        h.set_mtime(1_700_000_000);
+        h.set_cksum();
+        let err = append_exact_reader(
+            &mut builder,
+            &mut h,
+            "shrank.bin",
+            Path::new("shrank.bin"),
+            Cursor::new(vec![b'B'; 50]),
+            100,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
     }
 }
