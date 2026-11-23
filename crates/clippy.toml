@@ -1,0 +1,5 @@
+# A test that cannot set up what it tests has nothing better to do than stop, so the lints that keep
+# panics out of the node let tests have theirs.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

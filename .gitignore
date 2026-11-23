@@ -26,3 +26,6 @@ dist/
 **/obj/
 desktop/artifacts/
 *.key
+
+# What cargo builds for the Rust workspace at the root of the repository.
+/target/

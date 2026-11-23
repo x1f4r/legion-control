@@ -1,0 +1,34 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+publish = false
+
+# Every version is named once, here; a crate takes what it needs with `workspace = true`.
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+# preserve_order keeps a result's fields in the order its type declares them, which is the order a
+# person reads them in.
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# A panic in a long-lived node takes every session with it, so the ways to write one by accident
+# are flagged; the few deliberate ones say why where they stand.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+# Every fallible function returns the one ErrorBody every door hands to callers, about 150 bytes.
+# Failing is the rare path and the type crosses crate and process boundaries as a plain value, so
+# boxing it everywhere would cost readability for no measurable gain.
+result_large_err = "allow"
