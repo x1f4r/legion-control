@@ -46,6 +46,27 @@ jobs:
       # notes, and uninstalls them again.
       - run: bash scripts/check.sh agent
 
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The runners come with rustup, so the toolchain is installed through it rather than through an
+      # action that would be one more thing to pin. Stable is what the workspace is written for.
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      # Formatting, clippy with warnings as errors, and the tests, as scripts/check.sh runs them. The
+      # tests run the built binary under a LEGION_HOME of their own, so Windows is the one place its
+      # paths, its locks and its line endings are exercised.
+      - run: bash scripts/check.sh rust
+
   private-data:
     name: Private data
     runs-on: ubuntu-latest
