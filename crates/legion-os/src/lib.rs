@@ -1,0 +1,12 @@
+//! Platform-specific process, file, and locking primitives for Legion.
+//!
+//! Higher-level crates call into this crate so OS differences between Linux, macOS, and Windows
+//! remain isolated behind a uniform API with no scattered `cfg` branches above this layer.
+
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+
+mod error;
+pub mod shell;
+
+pub use error::{OsError, Result};
