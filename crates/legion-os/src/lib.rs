@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod atomic;
+pub mod detach;
 mod error;
 pub mod lock;
 pub mod procid;
