@@ -25,6 +25,11 @@ pub enum Command {
         /// Print JSON even on a terminal.
         json: bool,
     },
+    /// `legion rpc`: serve JSON-RPC on stdin and stdout.
+    Rpc {
+        /// The principal every call in the session acts as.
+        pinned: Option<String>,
+    },
     /// `legion --version`.
     Version,
 }
@@ -71,6 +76,7 @@ Usage:
   legion <tool> [key=value ...] [--args JSON | --args -] [--as PRINCIPAL] [--on MACHINE] [--json]
   legion tools [--json]
   legion help [<tool>] [--json]
+  legion rpc [--as PRINCIPAL]
   legion --version
 
 A value that parses as JSON is JSON (n=3, ok=true, tags=[\"a\"]); anything else is a string.
@@ -113,6 +119,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
             Ok(Command::Help {
                 tool,
                 json: flags.json,
+            })
+        }
+        "rpc" => {
+            let mut flags = Flags::read(rest, &["--as"])?;
+            flags.no_pairs("rpc")?;
+            Ok(Command::Rpc {
+                pinned: flags.as_principal,
             })
         }
         tool if tool.starts_with('-') => Err(UsageError(format!(
@@ -363,6 +376,7 @@ mod tests {
             &["meta.version", "--on", ""],
             &["meta.version", "--json=yes"],
             &["tools", "a=1"],
+            &["rpc", "--json"],
             &["help", "a.b", "c.d"],
             &["--version", "x"],
         ] {
@@ -388,6 +402,13 @@ mod tests {
                 json: true
             })
         );
+        assert_eq!(
+            run(&["rpc", "--as", "phone"]),
+            Ok(Command::Rpc {
+                pinned: Some("phone".into())
+            })
+        );
+        assert_eq!(run(&["rpc"]), Ok(Command::Rpc { pinned: None }));
         assert_eq!(run(&["--version"]), Ok(Command::Version));
         assert_eq!(
             run(&["-h"]),

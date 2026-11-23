@@ -1,5 +1,5 @@
 //! Where a call runs. The fleet milestone replaces [`Local`] with a router that reaches other
-//! machines; the command line only ever sees the [`Router`] trait.
+//! machines; the command line and the rpc session only ever see the [`Router`] trait.
 
 use legion_core::proto::{ErrorBody, ErrorCode, Target};
 use legion_core::{BoxFuture, Call, Node};

@@ -1,6 +1,6 @@
 [package]
 name = "legion-cli"
-description = "The legion binary: the command line, and the wiring between it and a node."
+description = "The legion binary: the command line, the rpc session, and the wiring between them and a node."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

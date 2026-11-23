@@ -7,9 +7,11 @@
 mod args;
 mod render;
 mod route;
+mod rpc;
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use legion_core::proto::{ErrorBody, EventKind, ToolsResult};
 use legion_core::{Call, Door, EventSink, Node, Paths, VERSION};
@@ -56,7 +58,7 @@ async fn run(command: Command) -> ExitCode {
     let json = match &command {
         Command::Call(call) => call.json,
         Command::Tools { json } | Command::Help { json, .. } => *json,
-        Command::Version => false,
+        Command::Rpc { .. } | Command::Version => false,
     };
     let node = match Paths::from_env() {
         Ok(paths) => Node::new(paths, legion_tools::registry()),
@@ -87,6 +89,24 @@ async fn run(command: Command) -> ExitCode {
             }
             Err(error) => failed(&error, json),
         },
+        Command::Rpc { pinned } => {
+            let router: Arc<dyn Router> = Arc::new(Local);
+            match rpc::serve(
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+                node,
+                router,
+                pinned,
+            )
+            .await
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    err(&format!("legion rpc: the session ended: {error}\n"));
+                    ExitCode::from(FAILED)
+                }
+            }
+        }
         Command::Help { tool: None, .. } | Command::Version => {
             out(&format!("{USAGE}\n"));
             ExitCode::SUCCESS
