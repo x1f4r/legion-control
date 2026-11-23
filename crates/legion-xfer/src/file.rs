@@ -176,7 +176,7 @@ pub fn put<R: Read>(
     }
 
     if let Some(m) = mode {
-        platform::set_mode(&partial, m & 0o7777)?;
+        platform::set_mode(&partial, m & 0o777)?;
     }
 
     platform::replace_file(&partial, path)?;
@@ -456,5 +456,27 @@ mod tests {
         let ads = dir.path().join("file.txt:stream");
         let err = put(&ads, 0, hash_bytes(b""), 0, Cursor::new(b""), None).unwrap_err();
         assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_strips_special_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("tool.bin");
+        let payload = b"binary";
+        put(
+            &dst,
+            payload.len() as u64,
+            hash_bytes(payload),
+            0,
+            Cursor::new(payload),
+            Some(0o6755),
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
     }
 }
