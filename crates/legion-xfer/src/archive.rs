@@ -149,7 +149,9 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
 
     let mut report = UnpackReport::default();
     let mut seen_lower: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut deferred_dirs: Vec<(PathBuf, Option<SystemTime>, Option<u32>)> = Vec::new();
+    let mut written_exact: BTreeSet<String> = BTreeSet::new();
+    let mut written_ancestors: BTreeSet<String> = BTreeSet::new();
+    let mut deferred_dirs: Vec<DeferredDir> = Vec::new();
 
     for item in entries {
         let mut entry = item?;
@@ -219,7 +221,12 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                     }
                     Err(err) => return Err(classify_io(&dest, err)),
                 }
-                deferred_dirs.push((dest, mtime, safe_mode));
+                deferred_dirs.push(DeferredDir {
+                    segments,
+                    mtime,
+                    mode: safe_mode,
+                });
+                record_written(&mut written_exact, &mut written_ancestors, &rel);
                 report.dirs.push(rel);
             }
             EntryType::Regular | EntryType::Continuous => {
@@ -260,10 +267,19 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                 platform::replace_file(guard.path(), &dest)?;
                 guard.disarm();
 
+                record_written(&mut written_exact, &mut written_ancestors, &rel);
                 report.files.push(rel);
                 report.bytes += written;
             }
             EntryType::Symlink => {
+                if written_exact.contains(&rel) || written_ancestors.contains(&rel) {
+                    return Err(Error::UnsafeArchiveEntry {
+                        entry: rel,
+                        reason: "symlink entry overwrites or shadows an already-written entry"
+                            .to_string(),
+                    });
+                }
+
                 let raw_target =
                     entry
                         .link_name_bytes()
@@ -294,6 +310,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                 }
 
                 if platform::create_symlink_atomic(Path::new(target_str), &dest)? {
+                    record_written(&mut written_exact, &mut written_ancestors, &rel);
                     report.symlinks.push(rel);
                 } else {
                     report.skipped.push(SkippedEntry {
@@ -341,6 +358,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                     let _ = fs::remove_file(&tmp_path);
                     return Err(err);
                 }
+                record_written(&mut written_exact, &mut written_ancestors, &rel);
                 report.files.push(rel);
             }
             other => {
@@ -353,14 +371,20 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
     }
 
     // Apply directory mtimes and modes deepest-first so writing children never clobbers parent
-    // timestamps and read-only parent directories do not block child extraction.
-    deferred_dirs.sort_by_key(|a| std::cmp::Reverse(a.0.components().count()));
-    for (dir_path, mtime, mode) in deferred_dirs {
-        if let Some(mtime) = mtime {
+    // timestamps and read-only parent directories do not block child extraction. Re-verify every
+    // path component as a real directory inside `canonical_root` before touching metadata so a
+    // symlink cannot redirect chmod or set_times outside the root.
+    deferred_dirs.sort_by_key(|a| std::cmp::Reverse(a.segments.len()));
+    for deferred in deferred_dirs {
+        let Some(dir_path) = verify_real_dir_inside_root(root, &canonical_root, &deferred.segments)
+        else {
+            continue;
+        };
+        if let Some(mtime) = deferred.mtime {
             fs::set_times(&dir_path, FileTimes::new().set_modified(mtime))
                 .map_err(|e| classify_io(&dir_path, e))?;
         }
-        if let Some(m) = mode {
+        if let Some(m) = deferred.mode {
             platform::set_mode(&dir_path, m)?;
         }
     }
@@ -381,6 +405,46 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
     report.skipped.sort();
 
     Ok(report)
+}
+
+struct DeferredDir {
+    segments: Vec<String>,
+    mtime: Option<SystemTime>,
+    mode: Option<u32>,
+}
+
+fn record_written(exact: &mut BTreeSet<String>, ancestors: &mut BTreeSet<String>, rel: &str) {
+    exact.insert(rel.to_string());
+    let mut current = rel;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        ancestors.insert(parent.to_string());
+        current = parent;
+    }
+}
+
+/// Re-verifies that every segment of `segments` beneath `root` resolves through real directories
+/// (never symlinks) and that the canonical path stays inside `canonical_root`.
+fn verify_real_dir_inside_root(
+    root: &Path,
+    canonical_root: &Path,
+    segments: &[String],
+) -> Option<PathBuf> {
+    let mut cur = root.to_path_buf();
+    for seg in segments {
+        cur.push(seg);
+        let meta = fs::symlink_metadata(&cur).ok()?;
+        if !meta.file_type().is_dir() {
+            return None;
+        }
+    }
+    let canonical = fs::canonicalize(&cur).ok()?;
+    if !canonical.starts_with(canonical_root) {
+        return None;
+    }
+    Some(cur)
 }
 
 fn record_seen_with_ancestors(seen_lower: &mut BTreeMap<String, BTreeSet<String>>, path: &str) {
@@ -807,5 +871,117 @@ mod tests {
         );
         // First file's content must never be silently lost even on case-insensitive filesystems.
         assert_eq!(fs::read(dst.path().join("Readme.md")).unwrap(), b"first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlink_retargeting_deferred_directory_outside_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_secret = outside.path().join("secret");
+        fs::create_dir(&outside_secret).unwrap();
+        fs::set_permissions(&outside_secret, fs::Permissions::from_mode(0o700)).unwrap();
+        let original_time = UNIX_EPOCH + Duration::from_secs(1_650_000_000);
+        fs::set_times(
+            &outside_secret,
+            FileTimes::new().set_modified(original_time),
+        )
+        .unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        let outside_str = outside.path().to_str().unwrap();
+
+        let mut tar_bytes = Vec::new();
+        for (path, entry_type, mode, link_target) in [
+            ("inner", EntryType::Directory, 0o755, None),
+            ("s", EntryType::Symlink, 0o777, Some("inner")),
+            ("s/secret", EntryType::Directory, 0o777, None),
+            ("s", EntryType::Symlink, 0o777, Some(outside_str)),
+        ] {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_size(0);
+            header.set_mode(mode);
+            header.set_mtime(1_700_000_999);
+            let raw = header.as_mut_bytes();
+            raw[..path.len()].copy_from_slice(path.as_bytes());
+            if let Some(target) = link_target {
+                raw[157..157 + target.len()].copy_from_slice(target.as_bytes());
+            }
+            header.set_cksum();
+            tar_bytes.extend_from_slice(header.as_bytes());
+        }
+        tar_bytes.resize(tar_bytes.len() + 1024, 0);
+
+        let err = unpack(dst.path(), Cursor::new(tar_bytes)).unwrap_err();
+        assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
+
+        let meta = fs::symlink_metadata(&outside_secret).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        assert_eq!(Timestamp::from_metadata(&meta).secs, 1_650_000_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlink_overwriting_written_entry_or_ancestor() {
+        let outside = tempfile::tempdir().unwrap();
+        let outside_str = outside.path().to_str().unwrap();
+
+        // Symlink replacing an already-written file.
+        let dst1 = tempfile::tempdir().unwrap();
+        let tar1 = build_raw_tar(&[
+            ("file.txt", EntryType::Regular, b"hello", None),
+            ("file.txt", EntryType::Symlink, b"", Some(outside_str)),
+        ]);
+        let err1 = unpack(dst1.path(), Cursor::new(tar1)).unwrap_err();
+        assert!(matches!(err1, Error::UnsafeArchiveEntry { .. }), "{err1:?}");
+
+        // Symlink replacing an ancestor of an already-written file.
+        let dst2 = tempfile::tempdir().unwrap();
+        let tar2 = build_raw_tar(&[
+            ("sub/file.txt", EntryType::Regular, b"hello", None),
+            ("sub", EntryType::Symlink, b"", Some(outside_str)),
+        ]);
+        let err2 = unpack(dst2.path(), Cursor::new(tar2)).unwrap_err();
+        assert!(matches!(err2, Error::UnsafeArchiveEntry { .. }), "{err2:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_dir_update_skips_paths_traversing_symlinked_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dst = tempfile::tempdir().unwrap();
+        let mut tar_bytes = Vec::new();
+        for (path, entry_type, mode, link_target) in [
+            ("inner", EntryType::Directory, 0o755, None),
+            ("s", EntryType::Symlink, 0o777, Some("inner")),
+            ("s/secret", EntryType::Directory, 0o777, None),
+        ] {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_size(0);
+            header.set_mode(mode);
+            header.set_mtime(1_600_000_000);
+            let raw = header.as_mut_bytes();
+            raw[..path.len()].copy_from_slice(path.as_bytes());
+            if let Some(target) = link_target {
+                raw[157..157 + target.len()].copy_from_slice(target.as_bytes());
+            }
+            header.set_cksum();
+            tar_bytes.extend_from_slice(header.as_bytes());
+        }
+        tar_bytes.resize(tar_bytes.len() + 1024, 0);
+
+        unpack(dst.path(), Cursor::new(tar_bytes)).unwrap();
+
+        // `inner/secret` was reached via symlink `s`, so deferred chmod/set_times must skip it.
+        let meta = fs::symlink_metadata(dst.path().join("inner/secret")).unwrap();
+        assert_ne!(Timestamp::from_metadata(&meta).secs, 1_600_000_000);
+        // `inner` itself is a real directory and receives its deferred mtime.
+        let inner_meta = fs::symlink_metadata(dst.path().join("inner")).unwrap();
+        assert_eq!(Timestamp::from_metadata(&inner_meta).secs, 1_600_000_000);
+        assert_eq!(inner_meta.permissions().mode() & 0o777, 0o755);
     }
 }
