@@ -52,7 +52,11 @@ pub(super) async fn spawn_detached(
             (CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).0,
         );
 
-    match cmd.spawn() {
+    let spawn_result = cmd.spawn();
+    // Release the command (and its appended log handles) before falling back to WMI.
+    drop(cmd);
+
+    match spawn_result {
         Ok(child) => {
             let pid = child.id();
             let identity = lookup_or_fallback_identity(pid)?;

@@ -269,14 +269,14 @@ pub(crate) fn build_wmi_launcher_script(
 
     lines.push(match stdout_path {
         Some(path) => format!(
-            "$outStream = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite, 1, [System.IO.FileOptions]::WriteThrough)",
+            "$outStream = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete), 1, [System.IO.FileOptions]::WriteThrough)",
             powershell_single_quote(path)
         ),
         None => "$outStream = [System.IO.Stream]::Null".to_owned(),
     });
     lines.push(match stderr_path {
         Some(path) => format!(
-            "$errStream = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite, 1, [System.IO.FileOptions]::WriteThrough)",
+            "$errStream = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete), 1, [System.IO.FileOptions]::WriteThrough)",
             powershell_single_quote(path)
         ),
         None => "$errStream = [System.IO.Stream]::Null".to_owned(),
