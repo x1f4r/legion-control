@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, classify_io};
 use crate::hash::{Hash, hash_file};
+use crate::path::validate_target_filename;
 use crate::platform;
 
 /// Suffix appended to a target filename while a single-file [`put`] is in progress.
@@ -29,10 +30,7 @@ pub struct PutReport {
 
 /// Computes the sibling partial file path (`<name>.legion-part`) for `target`.
 pub fn part_path(target: &Path) -> Result<PathBuf> {
-    let file_name = target.file_name().ok_or_else(|| Error::Conflict {
-        path: target.to_path_buf(),
-        reason: "target path has no file name".to_string(),
-    })?;
+    let file_name = validate_target_filename(target)?;
     let mut name = file_name.to_os_string();
     name.push(PART_SUFFIX);
     Ok(match target.parent() {
@@ -450,5 +448,13 @@ mod tests {
         put(&framed, 5, hello_hash, 0, &mut cursor, None).unwrap();
         assert_eq!(fs::read(&framed).unwrap(), b"hello");
         assert_eq!(cursor.position(), 5);
+    }
+
+    #[test]
+    fn put_rejects_colon_in_target_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let ads = dir.path().join("file.txt:stream");
+        let err = put(&ads, 0, hash_bytes(b""), 0, Cursor::new(b""), None).unwrap_err();
+        assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
     }
 }

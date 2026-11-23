@@ -15,6 +15,7 @@ pub mod error;
 pub mod file;
 pub mod hash;
 pub mod manifest;
+pub mod path;
 pub mod plan;
 mod platform;
 
@@ -25,4 +26,5 @@ pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
     CaseCollision, Entry, EntryKind, Manifest, ManifestOptions, SkippedEntry, Timestamp,
 };
+pub use path::{resolve_relative_path, validate_relative_path};
 pub use plan::{Plan, PlanOptions, PlanTotals};

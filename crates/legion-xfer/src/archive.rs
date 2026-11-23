@@ -11,6 +11,7 @@ use tar::{Archive, Builder, EntryType, Header};
 
 use crate::error::{Error, Result, classify_io};
 use crate::manifest::{CaseCollision, SkippedEntry, Timestamp};
+use crate::path::parse_relative_path_bytes;
 use crate::platform;
 
 /// Summary returned by [`pack`].
@@ -70,7 +71,7 @@ where
 
     for raw_name in names {
         let name = raw_name.as_ref();
-        let Some((rel, segments)) = parse_safe_rel_path(name.as_bytes())? else {
+        let Some((rel, segments)) = parse_relative_path_bytes(name.as_bytes())? else {
             return Err(Error::UnsafeArchiveEntry {
                 entry: name.to_string(),
                 reason: "empty or current-directory path cannot be packed".to_string(),
@@ -162,7 +163,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
         }
 
         let raw_path = entry.path_bytes();
-        let parsed = parse_safe_rel_path(raw_path.as_ref())?;
+        let parsed = parse_relative_path_bytes(raw_path.as_ref())?;
         let Some((rel, segments)) = parsed else {
             if entry_type == EntryType::Directory {
                 continue;
@@ -327,7 +328,8 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                             entry: rel.clone(),
                             reason: "hard link entry missing target".to_string(),
                         })?;
-                let Some((_, target_segments)) = parse_safe_rel_path(raw_target.as_ref())? else {
+                let Some((_, target_segments)) = parse_relative_path_bytes(raw_target.as_ref())?
+                else {
                     return Err(Error::UnsafeArchiveEntry {
                         entry: rel,
                         reason: "hard link target cannot be archive root".to_string(),
@@ -459,68 +461,6 @@ fn record_seen_with_ancestors(seen_lower: &mut BTreeMap<String, BTreeSet<String>
             _ => break,
         }
     }
-}
-
-/// Validates and normalizes a raw tar path into forward-slash canonical form and path segments.
-///
-/// Returns `Ok(None)` only for `.` / `./`. Refuses absolute paths, `..`, backslashes, NUL bytes,
-/// invalid UTF-8, and Windows drive prefixes on every platform.
-fn parse_safe_rel_path(raw: &[u8]) -> Result<Option<(String, Vec<String>)>> {
-    let display = String::from_utf8_lossy(raw).into_owned();
-    if raw.contains(&0) {
-        return Err(Error::UnsafeArchiveEntry {
-            entry: display,
-            reason: "path contains NUL byte".to_string(),
-        });
-    }
-    let s = std::str::from_utf8(raw).map_err(|_| Error::UnsafeArchiveEntry {
-        entry: display.clone(),
-        reason: "path is not valid UTF-8".to_string(),
-    })?;
-    if s.starts_with('/') {
-        return Err(Error::UnsafeArchiveEntry {
-            entry: display,
-            reason: "absolute path is not allowed".to_string(),
-        });
-    }
-    if s.contains('\\') {
-        return Err(Error::UnsafeArchiveEntry {
-            entry: display,
-            reason: "backslash separator is not allowed in archive paths".to_string(),
-        });
-    }
-
-    let mut segments = Vec::new();
-    for seg in s.split('/') {
-        if seg.is_empty() || seg == "." {
-            continue;
-        }
-        if seg == ".." {
-            return Err(Error::UnsafeArchiveEntry {
-                entry: display,
-                reason: "parent directory component '..' is not allowed".to_string(),
-            });
-        }
-        if segments.is_empty() && has_windows_drive_prefix(seg) {
-            return Err(Error::UnsafeArchiveEntry {
-                entry: display,
-                reason: "drive-prefixed path is not allowed".to_string(),
-            });
-        }
-        segments.push(seg.to_string());
-    }
-
-    if segments.is_empty() {
-        return Ok(None);
-    }
-
-    let normalized = segments.join("/");
-    Ok(Some((normalized, segments)))
-}
-
-fn has_windows_drive_prefix(segment: &str) -> bool {
-    let bytes = segment.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Ensures every ancestor component exists inside `canonical_root` without following any symlink
@@ -799,11 +739,24 @@ mod tests {
     }
 
     #[test]
-    fn refuses_windows_drive_prefix_in_archive() {
+    fn refuses_colon_and_drive_prefixes_in_any_segment() {
         let dst = tempfile::tempdir().unwrap();
-        let tar_bytes = build_raw_tar(&[("C:evil.txt", EntryType::Regular, b"nope", None)]);
-        let err = unpack(dst.path(), Cursor::new(tar_bytes)).unwrap_err();
-        assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
+        let src = tempfile::tempdir().unwrap();
+        for bad in ["C:evil.txt", "sub/C:evil.txt", "a/b:stream"] {
+            let tar_bytes = build_raw_tar(&[(bad, EntryType::Regular, b"nope", None)]);
+            let err = unpack(dst.path(), Cursor::new(tar_bytes)).unwrap_err();
+            assert!(
+                matches!(err, Error::UnsafeArchiveEntry { .. }),
+                "expected unpack rejection for {bad:?}, got {err:?}"
+            );
+
+            let mut out = Vec::new();
+            let pack_err = pack(src.path(), &[bad], &mut out).unwrap_err();
+            assert!(
+                matches!(pack_err, Error::UnsafeArchiveEntry { .. }),
+                "expected pack rejection for {bad:?}, got {pack_err:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
