@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="legion_bg_dark">#FF0D0E10</color>
+    <color name="legion_bg_light">#FFF3F2EE</color>
+    <color name="ic_launcher_background">#FF0D0E10</color>
+</resources>

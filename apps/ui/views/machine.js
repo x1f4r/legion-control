@@ -4,6 +4,7 @@ import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { CopyButton, Meter, Notice } from './common.js';
 import {
   diskUsagePct,
+  formatBusyReasonLines,
   formatBytePair,
   formatBytes,
   formatDuration,
@@ -107,13 +108,16 @@ function OverviewTab({ machine, allowedSet, onWake }) {
     .filter(Boolean)
     .join(' · ');
 
+  const busyReasonLines = formatBusyReasonLines(machine.busyReasons);
   const busySummary = machine.busy
-    ? machine.runningJobs > 0
-      ? `yes: ${machine.runningJobs} ${machine.runningJobs === 1 ? 'job' : 'jobs'}`
-      : machine.busyReasons?.length
-        ? `yes: ${machine.busyReasons.join(', ')}`
+    ? busyReasonLines.length > 0
+      ? null
+      : machine.runningJobs > 0
+        ? `yes: ${machine.runningJobs} ${machine.runningJobs === 1 ? 'job' : 'jobs'}`
         : 'yes'
-    : 'no';
+    : machine.busyState === 'unmonitored'
+      ? 'unmonitored (no busy checks configured)'
+      : 'no';
 
   const systemLine = [
     sys?.os?.family ? osLabel(sys.os.family) : null,
@@ -189,7 +193,13 @@ function OverviewTab({ machine, allowedSet, onWake }) {
               `
             : null}
           <dt>busy</dt>
-          <dd>${busySummary}</dd>
+          ${busyReasonLines.length > 0
+            ? html`
+                <dd class="allows-lines">
+                  ${busyReasonLines.map((line, i) => html`<span key=${i}>${line}</span>`)}
+                </dd>
+              `
+            : html`<dd>${busySummary}</dd>`}
         </dl>
       </div>
     </div>
@@ -1312,25 +1322,37 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
         : null}
 
       ${status
-        ? html`
-            <div class="list">
-              <dl class="kv">
-                <dt>state</dt>
-                <dd>
-                  ${status.busy?.state || 'unknown'}
-                  ${status.busy?.reasons?.length ? ` (${status.busy.reasons.join(', ')})` : ''}
-                </dd>
-                ${status.system
-                  ? html`
-                      <dt>system</dt>
-                      <dd>${status.system}</dd>
-                    `
-                  : null}
-                <dt>sudo</dt>
-                <dd>${status.sudo ? 'yes' : 'no'}</dd>
-              </dl>
-            </div>
-          `
+        ? (() => {
+            const powerReasons = formatBusyReasonLines(status.busy?.reasons);
+            const stateLabel =
+              status.busy?.state === 'unmonitored'
+                ? 'unmonitored (no busy checks configured)'
+                : status.busy?.state || 'unknown';
+            return html`
+              <div class="list">
+                <dl class="kv">
+                  <dt>state</dt>
+                  <dd>${stateLabel}</dd>
+                  ${powerReasons.length > 0
+                    ? html`
+                        <dt>reasons</dt>
+                        <dd class="allows-lines">
+                          ${powerReasons.map((line, i) => html`<span key=${i}>${line}</span>`)}
+                        </dd>
+                      `
+                    : null}
+                  ${status.system
+                    ? html`
+                        <dt>system</dt>
+                        <dd>${status.system}</dd>
+                      `
+                    : null}
+                  <dt>sudo</dt>
+                  <dd>${status.sudo ? 'yes' : 'no'}</dd>
+                </dl>
+              </div>
+            `;
+          })()
         : !error
           ? html`<div class="empty">Loading power state…</div>`
           : null}

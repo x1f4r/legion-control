@@ -185,3 +185,67 @@ test('callWithTimeout aborts a slow call independently without hanging', async (
     (err) => err.code === 'unreachable' && err.machine === 'slow',
   );
 });
+
+test('refreshFleetProgressive preserves busyState (busy object reasons and unmonitored)', async () => {
+  const probeReason = { source: 'probe', name: 'agents', detail: 'busy: 42 worker' };
+  const link = {
+    async call(tool, args = {}, opts = {}) {
+      if (tool === 'fleet.list') {
+        return {
+          node: 'tower',
+          machines: [
+            { name: 'tower', this_node: true, systems: [], wake_via: [] },
+            { name: 'pi', this_node: false, systems: [], wake_via: [] },
+          ],
+        };
+      }
+      if (tool === 'meta.version') {
+        return { version: '0.1.0', os: 'linux', arch: 'x86_64' };
+      }
+      if (tool === 'fleet.ping') {
+        return {
+          results: [
+            { machine: 'pi', reachable: true, os: 'linux', arch: 'aarch64', version: '0.1.0', latency_ms: 4 },
+          ],
+        };
+      }
+      if (tool === 'sys.info') {
+        return {
+          os: { family: 'linux', arch: 'x86_64' },
+          uptime_s: 60,
+          cpu: { usage_pct: 5 },
+          memory: { total: 1000, used: 100 },
+          disks: [],
+          gpus: [],
+        };
+      }
+      if (tool === 'job.list') {
+        return { jobs: [] };
+      }
+      if (tool === 'power.status') {
+        if (opts.on === 'pi') {
+          return { system: 'linux', busy: { state: 'busy', reasons: [probeReason] } };
+        }
+        return { system: 'linux', busy: { state: 'unmonitored', reasons: [] } };
+      }
+      throw new Error(`unexpected tool ${tool}`);
+    },
+  };
+
+  const finalSnap = await refreshFleetProgressive({
+    link,
+    localNode: 'tower',
+    onUpdate() {},
+    now: () => 1700000200000,
+  });
+
+  const tower = finalSnap.machines.find((m) => m.name === 'tower');
+  const pi = finalSnap.machines.find((m) => m.name === 'pi');
+  assert.equal(tower.busy, false);
+  assert.equal(tower.busyState, 'unmonitored');
+  assert.deepEqual(tower.busyReasons, []);
+
+  assert.equal(pi.busy, true);
+  assert.equal(pi.busyState, 'busy');
+  assert.deepEqual(pi.busyReasons, [probeReason]);
+});
