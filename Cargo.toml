@@ -28,6 +28,12 @@ tempfile = "3.27.0"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.2"
+legion-os = { path = "crates/legion-os" }
+base64 = "0.23.1"
+blake3 = "1.8.7"
+globset = "0.4.22"
+ignore = "0.4.35"
+regex = "1.13.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

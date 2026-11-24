@@ -6,6 +6,7 @@
 //! says, so they work the same on the command line, over MCP and when forwarded from another node.
 
 pub mod audit;
+pub mod fs;
 pub mod meta;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -16,6 +17,7 @@ use legion_core::Registry;
 pub fn register_all(registry: &mut Registry) {
     meta::register(registry);
     audit::register(registry);
+    fs::register(registry);
     #[cfg(feature = "testing")]
     testing::register(registry);
 }
