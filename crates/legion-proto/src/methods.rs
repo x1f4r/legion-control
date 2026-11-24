@@ -65,10 +65,17 @@ pub struct CallParams {
     /// The machine or machines to run on; absent is the node that was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<Target>,
+    /// How many nodes have already forwarded this call; absent is 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hops: u32,
 }
 
 fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// `cancel` params.
@@ -117,6 +124,9 @@ pub struct EventParams {
     pub kind: EventKind,
     /// Its content.
     pub data: Value,
+    /// The machine that produced the event, set on forwarded calls and fan-outs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// Where a call runs: one machine, several, or every machine in the fleet.

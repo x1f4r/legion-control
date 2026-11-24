@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 legion-core.workspace = true
 legion-doors.workspace = true
+legion-net.workspace = true
 legion-proto.workspace = true
 legion-tools.workspace = true
 serde.workspace = true
@@ -24,6 +25,12 @@ tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi
 legion-tools = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["time"] }
+
+# Re-executes its own binary as cross-platform connector wrappers (setting LEGION_HOME per remote
+# node, emitting banners, simulating disconnects) without relying on sh, env, or sleep.
+[[test]]
+name = "fleet"
+harness = false
 
 [lints]
 workspace = true

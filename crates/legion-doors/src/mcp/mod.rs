@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use legion_core::policy::Policy;
 use legion_core::proto::{ErrorBody, ErrorCode, Target};
-use legion_core::{Call, Door, EventSink, Grant, Node, Router, VERSION};
+use legion_core::{Call, Door, EventSink, Grant, Node, RouteOutcome, Router, VERSION};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     JsonObject, ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
@@ -94,6 +94,7 @@ impl McpDoor {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let calls = self.calls.clone();
+        let router = Arc::clone(&self.router);
         let served = match rmcp::serve_server(self, (input, output)).await {
             Ok(running) => running
                 .waiting()
@@ -106,6 +107,7 @@ impl McpDoor {
         };
         calls.close();
         calls.wait().await;
+        router.shutdown().await;
         served
     }
 
@@ -172,7 +174,7 @@ impl McpDoor {
         args: Value,
         on: Option<Target>,
         context: &RequestContext<RoleServer>,
-    ) -> Result<Value, ErrorBody> {
+    ) -> RouteOutcome {
         let session_level = *self
             .log_level
             .lock()
@@ -194,6 +196,7 @@ impl McpDoor {
             // Cancelled when the client cancels the request, and when the session ends.
             cancel: context.ct.clone(),
             events,
+            hops: 0,
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);
@@ -205,10 +208,10 @@ impl McpDoor {
             _ => running.await,
         };
         joined.unwrap_or_else(|error| {
-            Err(ErrorBody::new(
+            RouteOutcome::One(Err(ErrorBody::new(
                 ErrorCode::Internal,
                 format!("The call to {tool} stopped before it replied: {error}."),
-            ))
+            )))
         })
     }
 
@@ -218,12 +221,13 @@ impl McpDoor {
         name: &str,
         mut args: JsonObject,
         context: &RequestContext<RoleServer>,
-    ) -> Result<Value, ErrorBody> {
-        let on = self.on(args.remove(ON))?;
+    ) -> RouteOutcome {
+        let on = match self.on(args.remove(ON)) {
+            Ok(on) => on,
+            Err(error) => return RouteOutcome::One(Err(error)),
+        };
         let tool = self.catalog.resolve(name);
-        self.run(tool, Value::Object(args), on, context)
-            .await
-            .map_err(|error| self.for_client(error, tool))
+        self.rewrite_outcome(self.run(tool, Value::Object(args), on, context).await, tool)
     }
 
     /// A call to one of the three tools compact mode serves.
@@ -232,38 +236,42 @@ impl McpDoor {
         name: &str,
         args: JsonObject,
         context: &RequestContext<RoleServer>,
-    ) -> Result<Value, ErrorBody> {
+    ) -> RouteOutcome {
         match name {
-            compact::TOOLS => {
-                let args: compact::ToolsArgs = compact::parse(name, args)?;
-                self.list_compact(args.family.as_deref())
-            }
-            compact::DESCRIBE => {
-                let args: compact::DescribeArgs = compact::parse(name, args)?;
-                let grant = self.grant()?;
-                match self.visible(&grant, &args.tool) {
-                    Some(entry) => to_object(&entry.spec),
-                    None => Err(self
-                        .door_error(
-                            ErrorCode::UnknownTool,
-                            format!(
-                                "There is no tool called {} on {}.",
-                                args.tool,
-                                self.node.name()
-                            ),
-                        )
-                        .with_hint(LIST_COMPACT)),
+            compact::TOOLS => RouteOutcome::One(
+                compact::parse::<compact::ToolsArgs>(name, args)
+                    .and_then(|args| self.list_compact(args.family.as_deref())),
+            ),
+            compact::DESCRIBE => RouteOutcome::One(
+                compact::parse::<compact::DescribeArgs>(name, args).and_then(|args| {
+                    let grant = self.grant()?;
+                    match self.visible(&grant, &args.tool) {
+                        Some(entry) => to_object(&entry.spec),
+                        None => Err(self
+                            .door_error(
+                                ErrorCode::UnknownTool,
+                                format!(
+                                    "There is no tool called {} on {}.",
+                                    args.tool,
+                                    self.node.name()
+                                ),
+                            )
+                            .with_hint(LIST_COMPACT)),
+                    }
+                }),
+            ),
+            compact::CALL => match compact::parse::<compact::CallArgs>(name, args) {
+                Ok(args) => {
+                    let tool = self.catalog.resolve(&args.tool);
+                    let tool_args = Value::Object(args.args.unwrap_or_default());
+                    let on = match self.on(args.on) {
+                        Ok(on) => on,
+                        Err(error) => return RouteOutcome::One(Err(error)),
+                    };
+                    self.rewrite_outcome(self.run(tool, tool_args, on, context).await, tool)
                 }
-            }
-            compact::CALL => {
-                let args: compact::CallArgs = compact::parse(name, args)?;
-                let tool = self.catalog.resolve(&args.tool);
-                let tool_args = Value::Object(args.args.unwrap_or_default());
-                let on = self.on(args.on)?;
-                self.run(tool, tool_args, on, context)
-                    .await
-                    .map_err(|error| self.for_client(error, tool))
-            }
+                Err(error) => RouteOutcome::One(Err(error)),
+            },
             other => {
                 let hint = match self
                     .grant()
@@ -273,12 +281,12 @@ impl McpDoor {
                     Some(tool) => format!("Run it with legion_call, giving tool \"{tool}\"."),
                     None => "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned(),
                 };
-                Err(self
+                RouteOutcome::One(Err(self
                     .door_error(
                         ErrorCode::UnknownTool,
                         format!("There is no tool called {other} in this session."),
                     )
-                    .with_hint(hint))
+                    .with_hint(hint)))
             }
         }
     }
@@ -376,6 +384,26 @@ impl McpDoor {
         }
     }
 
+    /// Applies [`Self::for_client`] to every error inside a routed outcome.
+    fn rewrite_outcome(&self, outcome: RouteOutcome, tool: &str) -> RouteOutcome {
+        match outcome {
+            RouteOutcome::One(result) => {
+                RouteOutcome::One(result.map_err(|error| self.for_client(error, tool)))
+            }
+            RouteOutcome::Many(results) => RouteOutcome::Many(
+                results
+                    .into_iter()
+                    .map(|(machine, result)| {
+                        (
+                            machine,
+                            result.map_err(|error| self.for_client(error, tool)),
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
     /// The machines an `on` argument names.
     fn on(&self, on: Option<Value>) -> Result<Option<Target>, ErrorBody> {
         catalog::target(on.unwrap_or(Value::Null)).map_err(|error| {
@@ -394,16 +422,18 @@ impl McpDoor {
 /// A tool's outcome as an MCP result: the JSON object as one line of text, which every client
 /// shows the model. It is not sent as structured content as well: no tool declares an output
 /// schema to check that against, and a client that passes on both would cost the model every
-/// byte twice. A failure is the error object, marked as an error.
-fn tool_result(outcome: Result<Value, ErrorBody>) -> CallToolResult {
-    match outcome {
-        Ok(value) => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
-        Err(error) => {
-            let text = serde_json::to_string(&error).unwrap_or_else(|_| {
-                json!({"code": "internal", "message": error.message}).to_string()
-            });
-            CallToolResult::error(vec![ContentBlock::text(text)])
-        }
+/// byte twice. A failure (or a fan-out where every machine failed) is marked as an error.
+fn tool_result(outcome: RouteOutcome) -> CallToolResult {
+    let failed = outcome.all_failed();
+    let text = match outcome.into_wire() {
+        Ok(value) => value.to_string(),
+        Err(error) => serde_json::to_string(&error)
+            .unwrap_or_else(|_| json!({"code": "internal", "message": error.message}).to_string()),
+    };
+    if failed {
+        CallToolResult::error(vec![ContentBlock::text(text)])
+    } else {
+        CallToolResult::success(vec![ContentBlock::text(text)])
     }
 }
 

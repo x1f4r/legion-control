@@ -230,7 +230,14 @@ impl AuditLog {
         // The end of the earliest line found so far, whose start is in a block not read yet; `None`
         // while that line has grown past LONGEST_ENTRY and is being passed over.
         let mut carried: Option<Vec<u8>> = Some(Vec::new());
-        let mut end = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "audit log path is a directory",
+            ));
+        }
+        let mut end = metadata.len();
         'blocks: while end > 0 {
             if cancel.is_cancelled() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));

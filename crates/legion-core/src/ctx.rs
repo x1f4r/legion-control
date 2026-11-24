@@ -47,37 +47,86 @@ impl fmt::Display for Door {
     }
 }
 
+/// One event emitted by a running call: its kind, its content, and the machine that produced it
+/// when the call was forwarded or fanned out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Event {
+    /// What kind of event it is.
+    pub kind: EventKind,
+    /// Its content.
+    pub data: Value,
+    /// The machine that produced the event, when set by routing.
+    pub machine: Option<String>,
+}
+
 /// Where a running call's `event` notifications go: to the rpc client as notifications carrying
 /// the call's id, to stderr on a command line, nowhere when nobody listens.
 #[derive(Clone, Default)]
-pub struct EventSink(Option<Arc<dyn Fn(EventKind, Value) + Send + Sync>>);
+pub struct EventSink {
+    deliver: Option<Arc<dyn Fn(Event) + Send + Sync>>,
+    machine: Option<Arc<str>>,
+}
 
 impl EventSink {
-    /// A sink that hands each event to `deliver`.
+    /// A sink that hands each event's kind and content to `deliver`.
     pub fn new(deliver: impl Fn(EventKind, Value) + Send + Sync + 'static) -> EventSink {
-        EventSink(Some(Arc::new(deliver)))
+        EventSink {
+            deliver: Some(Arc::new(move |event| deliver(event.kind, event.data))),
+            machine: None,
+        }
+    }
+
+    /// A sink that receives the full [`Event`], including the machine that produced it.
+    pub fn with_events(deliver: impl Fn(Event) + Send + Sync + 'static) -> EventSink {
+        EventSink {
+            deliver: Some(Arc::new(deliver)),
+            machine: None,
+        }
     }
 
     /// A sink that drops every event.
     pub fn discard() -> EventSink {
-        EventSink(None)
+        EventSink::default()
     }
 
-    /// Delivers one event.
+    /// Returns a sink that tags emitted events with `machine` unless an event already carries a
+    /// machine from a deeper hop.
+    #[must_use]
+    pub fn for_machine(&self, machine: impl Into<Arc<str>>) -> EventSink {
+        EventSink {
+            deliver: self.deliver.clone(),
+            machine: Some(machine.into()),
+        }
+    }
+
+    /// Delivers one event from this node.
     pub fn emit(&self, kind: EventKind, data: Value) {
-        if let Some(deliver) = &self.0 {
-            deliver(kind, data);
+        self.emit_event(Event {
+            kind,
+            data,
+            machine: None,
+        });
+    }
+
+    /// Delivers one [`Event`], preserving its `machine` when already set and otherwise using the
+    /// machine bound to this sink.
+    pub fn emit_event(&self, mut event: Event) {
+        if let Some(deliver) = &self.deliver {
+            if event.machine.is_none() {
+                event.machine = self.machine.as_deref().map(str::to_owned);
+            }
+            deliver(event);
         }
     }
 }
 
 impl fmt::Debug for EventSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0.is_some() {
-            "EventSink"
-        } else {
-            "EventSink(discard)"
-        })
+        match (&self.deliver, &self.machine) {
+            (Some(_), Some(machine)) => write!(f, "EventSink({machine})"),
+            (Some(_), None) => f.write_str("EventSink"),
+            (None, _) => f.write_str("EventSink(discard)"),
+        }
     }
 }
 

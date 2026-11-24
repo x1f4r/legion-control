@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 legion-proto = { path = "crates/legion-proto" }
 legion-core = { path = "crates/legion-core" }
+legion-net = { path = "crates/legion-net" }
 legion-tools = { path = "crates/legion-tools" }
 dunce = "1.0.5"
 gethostname = "1.1.0"
@@ -29,6 +30,7 @@ tempfile = "3.27.0"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.2"
+toml_edit = "0.25.20"
 legion-os = { path = "crates/legion-os" }
 # Only what sys.info and sys.procs read: CPUs, memory and processes, disks, and user names.
 sysinfo = { version = "0.40.4", default-features = false, features = ["system", "disk", "user"] }
