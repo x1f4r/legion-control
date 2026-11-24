@@ -304,6 +304,9 @@ impl NodeFile {
     }
 }
 
+/// The longest a node's name may be: what a DNS label may be, so a name can also be a host's.
+const LONGEST_NAME: usize = 63;
+
 /// A node's name: lower-case letters, digits, `-` and `_`, starting with a letter or digit. Not
 /// `all`, which an `on` uses to mean every machine.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize)]
@@ -317,7 +320,7 @@ impl NodeName {
     }
 
     /// The name the host name gives: lower-cased, without its domain, anything else a name cannot
-    /// hold turned into `-`.
+    /// hold turned into `-`, and cut to the length a name may have.
     pub fn from_host() -> NodeName {
         NodeName::from_host_name(&gethostname::gethostname().to_string_lossy())
     }
@@ -335,7 +338,13 @@ impl NodeName {
                 }
             })
             .collect();
-        let trimmed = cleaned.trim_matches(|c| c == '-' || c == '_');
+        let separator = |c| c == '-' || c == '_';
+        let trimmed = cleaned.trim_matches(separator);
+        // Every character is ASCII by now, so any byte is a place to cut.
+        let trimmed = trimmed
+            .get(..LONGEST_NAME)
+            .unwrap_or(trimmed)
+            .trim_end_matches(separator);
         match trimmed {
             "" | "all" => NodeName("localhost".to_owned()),
             name => NodeName(name.to_owned()),
@@ -362,7 +371,7 @@ impl TryFrom<String> for NodeName {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
         if name == "all" {
             Err("`all` means every machine and cannot be a node's name".to_owned())
-        } else if !starts_well || !rest_fits || name.len() > 63 {
+        } else if !starts_well || !rest_fits || name.len() > LONGEST_NAME {
             Err(format!(
                 "{name:?} is not a node name: use lower-case letters, digits, - and _, starting with a letter or digit"
             ))
@@ -546,6 +555,16 @@ mod tests {
         );
         assert_eq!(NodeName::from_host_name("").as_str(), "localhost");
         assert_eq!(NodeName::from_host_name("ALL").as_str(), "localhost");
+    }
+
+    #[test]
+    fn a_long_host_name_makes_a_name_the_file_would_accept() {
+        let long = NodeName::from_host_name(&"x".repeat(80));
+        assert_eq!(long.as_str(), "x".repeat(63));
+        assert!(NodeName::try_from(long.as_str().to_owned()).is_ok());
+        // Cut where it ends in a separator, the separator goes too.
+        let cut = format!("{}-{}", "a".repeat(62), "b".repeat(17));
+        assert_eq!(NodeName::from_host_name(&cut).as_str(), "a".repeat(62));
     }
 
     #[test]
