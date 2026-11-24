@@ -84,7 +84,10 @@ export function readToolSpecs(binary) {
     if (!parsed || !Array.isArray(parsed.tools)) {
       throw new Error(`${binary} tools --json did not return a {"tools": [...]} object.`);
     }
-    return parsed.tools;
+    // `cargo test` unifies legion-cli's dev-dependency on legion-tools' `testing` feature, which
+    // adds internal `test.*` fixtures to target/debug/legion; exclude them so debug and release
+    // binaries generate the same reference.
+    return parsed.tools.filter(spec => !String(spec.name ?? '').startsWith('test.'));
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
