@@ -212,9 +212,9 @@ export function checkCommitMessages(root = repository, range, options = {}) {
   return { commits: commits.length, terms: terms.length, sources, findings };
 }
 
-// Compared through realpath, as contract/validate.mjs does. Node resolves the symlinks in
-// import.meta.url but not in argv[1], so through a symlinked checkout a plain comparison never
-// runs the check and the gate passes having looked at nothing.
+// Compared through realpath: Node resolves the symlinks in import.meta.url but not in argv[1],
+// so through a symlinked checkout a plain comparison never runs the check and the gate passes
+// having looked at nothing.
 const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
 if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
   const range = process.argv[2] === '--commits' ? process.argv[3] : null;

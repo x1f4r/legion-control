@@ -4,10 +4,8 @@
 //   node scripts/check-syntax.mjs               this checkout
 //   node scripts/check-syntax.mjs <directory>   another one
 //
-// npm --prefix agent run check parses agent/src, the modules the agent ships, and nothing else.
-// The rest runs too: the release and check scripts, the installers' helpers, the contract's
-// generators, references and validator, and every test. A script that does not parse fails only
-// once something runs it, and for a release script that is in the middle of a release.
+// Parses every JavaScript file tracked in the checkout (scripts, UI modules, and tests) so a
+// syntax error fails immediately instead of only when a script is executed.
 //
 // scripts/check.sh runs it.
 import { execFile } from 'node:child_process';
@@ -44,9 +42,9 @@ export async function checkSyntax(root = repository) {
   return { files: files.length, problems };
 }
 
-// Compared through realpath, as contract/validate.mjs does. Node resolves the symlinks in
-// import.meta.url but not in argv[1], so through a symlinked checkout a plain comparison never
-// runs the check and the gate passes having looked at nothing.
+// Compared through realpath: Node resolves the symlinks in import.meta.url but not in argv[1],
+// so through a symlinked checkout a plain comparison never runs the check and the gate passes
+// having looked at nothing.
 const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
 if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
   // Outside a git checkout, a source archive for one, there is no list of files to read. That is
