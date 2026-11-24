@@ -15,8 +15,8 @@ use legion_core::policy::Policy;
 use legion_core::{
     BoxFuture, Call, CancellationToken, Ctx, EventSink, Node, Paths, RouteOutcome, Router, VERSION,
 };
-use legion_proto::{CallParams, ErrorBody, ErrorCode, Target};
-use serde_json::Value;
+use legion_proto::{CallParams, Effect, ErrorBody, ErrorCode, Target};
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -144,9 +144,10 @@ impl Fleet {
             .map(|live| live.session)
     }
 
-    /// Runs a tool call on a remote `machine` from inside a tool, forwarding `ctx.principal()`,
-    /// `ctx.hops() + 1`, cancellation, and events (tagged with `machine`), retrying once only if
-    /// the session died before any byte was written.
+    /// Runs a tool call on a remote `machine` from inside a tool, authorising `ctx.principal()`
+    /// against this node's live policy, writing one audit line on this node, and forwarding
+    /// `ctx.principal()`, `ctx.hops() + 1`, cancellation, and events (tagged with `machine`),
+    /// retrying once only if the session died before any byte was written.
     pub async fn call_remote(
         &self,
         ctx: &Ctx,
@@ -155,6 +156,39 @@ impl Fleet {
         args: Value,
         events: EventSink,
     ) -> Result<Value, ErrorBody> {
+        let started = Instant::now();
+        let node = ctx.node();
+        let here = ctx.node_name();
+        let principal = ctx.principal().to_owned();
+        let result = self
+            .call_remote_checked(ctx, node, here, &principal, machine, tool, &args, events)
+            .await;
+        node.record_audit(
+            machine.to_owned(),
+            Some(principal),
+            ctx.door(),
+            tool.to_owned(),
+            &args,
+            started,
+            &result,
+        )
+        .await;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_remote_checked(
+        &self,
+        ctx: &Ctx,
+        node: &Node,
+        here: &str,
+        principal: &str,
+        machine: &str,
+        tool: &str,
+        args: &Value,
+        events: EventSink,
+    ) -> Result<Value, ErrorBody> {
+        let auth = authorize_principal_for_tool(node, here, principal, tool)?;
         let next_hops = ctx.hops().saturating_add(1);
         if next_hops > MAX_HOPS {
             return Err(ErrorBody::new(
@@ -168,7 +202,6 @@ impl Fleet {
             )
             .with_machine(machine));
         }
-        let here = ctx.node_name();
         let fleet_file = ctx
             .config()
             .get::<FleetFile>()
@@ -181,10 +214,29 @@ impl Fleet {
             )
             .with_machine(here));
         }
+        if let ForwardAuth::NeedsRemoteEffect { policy, .. } = auth {
+            if relayed {
+                policy
+                    .authorize_name(principal, tool, None, node.paths())
+                    .map_err(|err| err.with_machine(here))?;
+            } else {
+                let effect = self
+                    .query_remote_effect(
+                        direct_machine,
+                        direct_entry,
+                        tool,
+                        ctx.cancel_token().clone(),
+                    )
+                    .await?;
+                policy
+                    .authorize_name(principal, tool, effect, node.paths())
+                    .map_err(|err| err.with_machine(here))?;
+            }
+        }
         let params = CallParams {
             tool: tool.to_owned(),
-            args,
-            as_principal: Some(ctx.principal().to_owned()),
+            args: args.clone(),
+            as_principal: Some(principal.to_owned()),
             on: relayed.then(|| Target::One(machine.to_owned())),
             hops: next_hops,
         };
@@ -203,6 +255,9 @@ impl Fleet {
     /// Opens a fresh dedicated pipe to `machine` running a fixed remote [`Subcommand`] (such as
     /// [`Subcommand::Stream`] for `legion stream` bulk file transfer) from inside a tool.
     ///
+    /// Authorises `ctx.principal()` against this node's live policy before spawning any pipe and
+    /// writes one audit line on this node for the attempt.
+    ///
     /// When the machine has multiple systems or an SSH transport with no cached OS shape, the pool
     /// first verifies the active system and OS through [`Fleet::session`] so the pipe targets the
     /// running system directly.
@@ -212,14 +267,90 @@ impl Fleet {
         machine: &str,
         subcommand: Subcommand,
     ) -> Result<Pipe, ErrorBody> {
-        self.open_pipe_for(
-            ctx.config(),
-            ctx.node_name(),
+        let (audit_tool, required_tool, required_effect, sub_name) = match subcommand {
+            Subcommand::Stream => ("stream.open", "fs.transfer", Some(Effect::Write), "stream"),
+            Subcommand::Rpc => ("rpc.open", "fleet.rpc", None, "rpc"),
+        };
+        let args = json!({ "subcommand": sub_name });
+        self.open_pipe_checked(
+            ctx,
             machine,
             subcommand,
-            ctx.cancel_token().clone(),
+            audit_tool,
+            &[(required_tool, required_effect)],
+            &args,
         )
         .await
+    }
+
+    /// Opens a dedicated `legion stream` pipe for `fs.transfer`, checking this node's live policy
+    /// for both `fs.transfer` and the stream operation's underlying file tool (`fs.read`,
+    /// `fs.write`, or `fs.remove`), and writing one audit line on this node.
+    pub(crate) async fn open_stream_pipe(
+        &self,
+        ctx: &Ctx,
+        machine: &str,
+        op: &str,
+        underlying_tool: &str,
+        underlying_effect: Effect,
+        recorded_args: &Value,
+    ) -> Result<Pipe, ErrorBody> {
+        let audit_tool = format!("stream.{op}");
+        self.open_pipe_checked(
+            ctx,
+            machine,
+            Subcommand::Stream,
+            &audit_tool,
+            &[
+                ("fs.transfer", Some(Effect::Write)),
+                (underlying_tool, Some(underlying_effect)),
+            ],
+            recorded_args,
+        )
+        .await
+    }
+
+    async fn open_pipe_checked(
+        &self,
+        ctx: &Ctx,
+        machine: &str,
+        subcommand: Subcommand,
+        audit_tool: &str,
+        required: &[(&str, Option<Effect>)],
+        recorded_args: &Value,
+    ) -> Result<Pipe, ErrorBody> {
+        let started = Instant::now();
+        let node = ctx.node();
+        let here = ctx.node_name();
+        let principal = ctx.principal().to_owned();
+        let result = match authorize_pipe_open(node, here, &principal, required) {
+            Ok(()) => {
+                self.open_pipe_for(
+                    ctx.config(),
+                    here,
+                    machine,
+                    subcommand,
+                    ctx.cancel_token().clone(),
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
+        let audit_outcome = match &result {
+            Ok(_) => Ok(Value::Null),
+            Err(err) => Err(err.clone()),
+        };
+        node.record_audit(
+            machine.to_owned(),
+            Some(principal),
+            ctx.door(),
+            audit_tool.to_owned(),
+            recorded_args,
+            started,
+            &audit_outcome,
+        )
+        .await;
+        result
     }
 
     /// Opens a fresh dedicated pipe to `machine` running `subcommand`, using a [`ConfigStore`]
@@ -241,7 +372,9 @@ impl Fleet {
             )
             .with_machine(machine));
         }
-        let fleet_file = config.get::<FleetFile>()?;
+        let fleet_file = config
+            .get::<FleetFile>()
+            .map_err(|err| ensure_machine(err, here))?;
         let entry = lookup_machine(&fleet_file, machine, here)?;
         if let Some(relay) = &entry.via {
             return Err(ErrorBody::new(
@@ -249,7 +382,7 @@ impl Fleet {
                 format!("Machine {machine} is reached via relay {relay}, so a direct pipe cannot be opened to it."),
             )
             .with_hint(format!(
-                "Configure a direct ssh or command transport for {machine}, or open a pipe to {relay}."
+                "Run transfers involving {machine} on {relay} instead (for example `legion fs.transfer --on {relay} from=... to=...`), or configure a direct ssh or command transport for {machine} in fleet.toml."
             ))
             .with_machine(here));
         }
@@ -1187,23 +1320,72 @@ fn authorize_for_forward(
             return Err((Some(caller), err.with_machine(&here)));
         }
     };
-    if let Some(tool) = node.registry().get(&call.tool) {
+    authorize_principal_with_policy(node, &here, &policy, &principal, &call.tool)
+        .map_err(|err| (Some(principal), err))
+}
+
+fn authorize_principal_for_tool(
+    node: &Node,
+    here: &str,
+    principal: &str,
+    tool: &str,
+) -> Result<ForwardAuth, ErrorBody> {
+    let policy = node
+        .config()
+        .get::<Policy>()
+        .map_err(|err| ensure_machine(err, here))?;
+    authorize_principal_with_policy(node, here, &policy, principal, tool)
+}
+
+fn authorize_principal_with_policy(
+    node: &Node,
+    here: &str,
+    policy: &Arc<Policy>,
+    principal: &str,
+    tool_name: &str,
+) -> Result<ForwardAuth, ErrorBody> {
+    if let Some(tool) = node.registry().get(tool_name) {
         policy
-            .authorize(&principal, tool.spec(), node.paths())
-            .map_err(|err| (Some(principal.clone()), err.with_machine(&here)))?;
-        return Ok(ForwardAuth::Authorized { principal });
+            .authorize(principal, tool.spec(), node.paths())
+            .map_err(|err| err.with_machine(here))?;
+        return Ok(ForwardAuth::Authorized {
+            principal: principal.to_owned(),
+        });
     }
     // Tool exists only on the target (or does not exist).
-    match policy.authorize_name(&principal, &call.tool, None, node.paths()) {
-        Ok(_) => Ok(ForwardAuth::Authorized { principal }),
+    match policy.authorize_name(principal, tool_name, None, node.paths()) {
+        Ok(_) => Ok(ForwardAuth::Authorized {
+            principal: principal.to_owned(),
+        }),
         Err(denied) => {
-            if policy.could_allow_with_remote_effect(&principal, &call.tool) {
-                Ok(ForwardAuth::NeedsRemoteEffect { principal, policy })
+            if policy.could_allow_with_remote_effect(principal, tool_name) {
+                Ok(ForwardAuth::NeedsRemoteEffect {
+                    principal: principal.to_owned(),
+                    policy: Arc::clone(policy),
+                })
             } else {
-                Err((Some(principal), denied.with_machine(&here)))
+                Err(denied.with_machine(here))
             }
         }
     }
+}
+
+fn authorize_pipe_open(
+    node: &Node,
+    here: &str,
+    principal: &str,
+    required: &[(&str, Option<Effect>)],
+) -> Result<(), ErrorBody> {
+    let policy = node
+        .config()
+        .get::<Policy>()
+        .map_err(|err| ensure_machine(err, here))?;
+    for &(tool, effect) in required {
+        policy
+            .authorize_name(principal, tool, effect, node.paths())
+            .map_err(|err| err.with_machine(here))?;
+    }
+    Ok(())
 }
 
 impl Drop for PoolInner {
@@ -1530,5 +1712,205 @@ mod tests {
 
         fleet.close().await;
         server_task.await.unwrap();
+    }
+
+    struct PipeOpenTool {
+        spec: ToolSpec,
+        fleet: Fleet,
+        machine: String,
+    }
+
+    impl Tool for PipeOpenTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            ctx: &'a Ctx,
+            _args: Value,
+        ) -> BoxFuture<'a, Result<Value, ToolError>> {
+            Box::pin(async move {
+                let pipe = self
+                    .fleet
+                    .open_pipe(ctx, &self.machine, Subcommand::Stream)
+                    .await?;
+                pipe.close(Duration::from_millis(50)).await;
+                Ok(json!({"opened": true}))
+            })
+        }
+    }
+
+    struct WriteRelayTool {
+        spec: ToolSpec,
+        fleet: Fleet,
+    }
+
+    impl Tool for WriteRelayTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            ctx: &'a Ctx,
+            _args: Value,
+        ) -> BoxFuture<'a, Result<Value, ToolError>> {
+            Box::pin(async move {
+                self.fleet
+                    .call_remote(
+                        ctx,
+                        "pi",
+                        "fs.write",
+                        json!({"path": "~/x", "content": "hi"}),
+                        EventSink::discard(),
+                    )
+                    .await
+            })
+        }
+    }
+
+    struct DummyTool {
+        spec: ToolSpec,
+    }
+
+    impl Tool for DummyTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            _ctx: &'a Ctx,
+            _args: Value,
+        ) -> BoxFuture<'a, Result<Value, ToolError>> {
+            Box::pin(async move { Ok(json!({})) })
+        }
+    }
+
+    fn read_audit_lines(paths: &Paths) -> Vec<Value> {
+        let Ok(text) = std::fs::read_to_string(paths.audit_log()) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn call_remote_and_open_pipe_authorise_and_audit_on_forwarding_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"laptop\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\nssh = \"pi.example\"\n\n[machines.leaf]\nvia = \"pi\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "[principals.reader]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+        )
+        .unwrap();
+
+        let fleet = Fleet::new(&paths);
+        let mut registry = Registry::new();
+        registry.add(DummyTool {
+            spec: ToolSpec {
+                name: "fs.write".to_owned(),
+                description: "Dummy write tool.".to_owned(),
+                effect: Effect::Write,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+        });
+        registry.add(WriteRelayTool {
+            spec: ToolSpec {
+                name: "test.write_relay".to_owned(),
+                description: "Calls remote fs.write via Fleet::call_remote.".to_owned(),
+                effect: Effect::Read,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+            fleet: fleet.clone(),
+        });
+        registry.add(PipeOpenTool {
+            spec: ToolSpec {
+                name: "test.open_pi".to_owned(),
+                description: "Opens a stream pipe to pi.".to_owned(),
+                effect: Effect::Read,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+            fleet: fleet.clone(),
+            machine: "pi".to_owned(),
+        });
+        registry.add(PipeOpenTool {
+            spec: ToolSpec {
+                name: "test.open_leaf".to_owned(),
+                description: "Opens a stream pipe to relayed leaf.".to_owned(),
+                effect: Effect::Read,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+            fleet: fleet.clone(),
+            machine: "leaf".to_owned(),
+        });
+        let node = Node::new(paths.clone(), registry);
+
+        // 1. observer may invoke test.write_relay (Read), but Fleet::call_remote refuses
+        //    fs.write on the forwarding node and audits it as denied without touching pi.
+        let mut call = Call::new(Door::Cli, "test.write_relay", json!({}));
+        call.as_principal = Some("reader".to_owned());
+        let err = node.call(call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert_eq!(err.machine.as_deref(), Some("laptop"));
+        let audit = read_audit_lines(&paths);
+        assert!(
+            audit.iter().any(|e| {
+                e["target"] == "pi"
+                    && e["tool"] == "fs.write"
+                    && e["principal"] == "reader"
+                    && e["outcome"] == "denied"
+            }),
+            "{audit:?}"
+        );
+
+        // 2. observer cannot open a stream pipe because it lacks fs.transfer; denied and audited
+        //    on laptop without attempting SSH.
+        let mut call = Call::new(Door::Cli, "test.open_pi", json!({}));
+        call.as_principal = Some("reader".to_owned());
+        let err = node.call(call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert_eq!(err.machine.as_deref(), Some("laptop"));
+        let audit = read_audit_lines(&paths);
+        assert!(
+            audit.iter().any(|e| {
+                e["target"] == "pi"
+                    && e["tool"] == "stream.open"
+                    && e["principal"] == "reader"
+                    && e["outcome"] == "denied"
+            }),
+            "{audit:?}"
+        );
+
+        // 3. owner opening a pipe to a via-relayed machine gets Unsupported with a hint telling
+        //    them to run transfers on the relay.
+        let call = Call::new(Door::Cli, "test.open_leaf", json!({}));
+        let err = node.call(call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert_eq!(err.machine.as_deref(), Some("laptop"));
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(hint.contains("pi") && hint.contains("--on pi"), "{err:?}");
+        let audit = read_audit_lines(&paths);
+        assert!(
+            audit.iter().any(|e| {
+                e["target"] == "leaf"
+                    && e["tool"] == "stream.open"
+                    && e["principal"] == "owner"
+                    && e["outcome"] == "unsupported"
+            }),
+            "{audit:?}"
+        );
+
+        fleet.close().await;
     }
 }

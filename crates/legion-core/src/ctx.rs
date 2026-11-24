@@ -147,6 +147,12 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// The node running this call, for tools that authorise or audit forwarded operations against
+    /// this node's live policy and audit log.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// The name of the node the tool runs on.
     pub fn node_name(&self) -> &str {
         &self.name

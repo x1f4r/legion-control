@@ -8,7 +8,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
@@ -53,6 +53,10 @@ fn main() -> ExitCode {
         (
             "sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly",
             sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly,
+        ),
+        (
+            "sigterm_on_legion_cp_cancels_transfer_and_leaves_no_stream_process",
+            sigterm_on_legion_cp_cancels_transfer_and_leaves_no_stream_process,
         ),
         (
             "multiplexes_concurrent_calls_and_reuses_one_session",
@@ -284,6 +288,55 @@ fn run_helper(args: &[String]) -> ExitCode {
                 std::thread::sleep(Duration::from_millis(50));
             }
             ExitCode::SUCCESS
+        }
+        // stream-slow <legion_bin> <legion_home> <user_home> <pid_log> <subcommand>
+        // Spawns `legion <subcommand>` (`rpc` or `stream`), records the child PID for data streams,
+        // and throttles `put` input so a signal test can interrupt `legion cp` mid-transfer.
+        "stream-slow" => {
+            let legion = &rest[0];
+            let legion_home = &rest[1];
+            let user_home = &rest[2];
+            let pid_log = Path::new(&rest[3]);
+            let subcommand = rest.last().map(String::as_str).unwrap_or("rpc");
+            let mut cmd = Command::new(legion);
+            cmd.arg(subcommand)
+                .env("LEGION_HOME", legion_home)
+                .env("HOME", user_home)
+                .env("USERPROFILE", user_home)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_STATE_HOME");
+            if subcommand != "stream" {
+                let status = cmd.status().unwrap();
+                return exit_from_status(status);
+            }
+            let mut input = BufReader::new(std::io::stdin().lock());
+            let mut header = Vec::new();
+            let _ = input.read_until(b'\n', &mut header);
+            let is_put = header.starts_with(b"{\"op\":\"put\"");
+            let is_get = header.starts_with(b"{\"op\":\"get\"");
+            let mut child = cmd.stdin(Stdio::piped()).spawn().unwrap();
+            if is_put || is_get {
+                append_line(pid_log, &child.id().to_string());
+            }
+            let mut child_in = child.stdin.take().unwrap();
+            if child_in.write_all(&header).is_ok() {
+                let _ = child_in.flush();
+                if is_put {
+                    let mut buf = [0u8; 16 * 1024];
+                    while let Ok(read) = input.read(&mut buf) {
+                        if read == 0 || child_in.write_all(&buf[..read]).is_err() {
+                            break;
+                        }
+                        let _ = child_in.flush();
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                } else {
+                    let _ = std::io::copy(&mut input, &mut child_in);
+                }
+            }
+            drop(child_in);
+            let status = child.wait().unwrap();
+            exit_from_status(status)
         }
         // fail <log_file> <stderr_message>
         "fail" => {
@@ -1914,6 +1967,126 @@ fn sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly() {
 
 #[cfg(not(unix))]
 fn sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly() {}
+
+#[cfg(unix)]
+fn sigterm_on_legion_cp_cancels_transfer_and_leaves_no_stream_process() {
+    let laptop = Home::new();
+    let pi = Home::new();
+    let tower = Home::new();
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    tower.write_config("node.toml", "name = \"tower\"\n");
+
+    fs::create_dir_all(pi.state()).unwrap();
+    fs::create_dir_all(tower.state()).unwrap();
+    let pi_pids = pi.state().join("stream-pids.log");
+    let tower_pids = tower.state().join("stream-pids.log");
+
+    let stream_argv = |target: &Home, pid_log: &Path| {
+        helper_argv(
+            "stream-slow",
+            &[
+                LEGION_BIN.to_owned(),
+                legion_home_of(target).to_string_lossy().into_owned(),
+                target.home().to_string_lossy().into_owned(),
+                pid_log.to_string_lossy().into_owned(),
+                "rpc".to_owned(),
+            ],
+        )
+    };
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.tower]\ncommand = {}\n",
+            toml_argv(&stream_argv(&pi, &pi_pids)),
+            toml_argv(&stream_argv(&tower, &tower_pids)),
+        ),
+    );
+
+    // 24 MiB file so the throttled remote-to-remote transfer stays in flight while SIGTERM lands.
+    let payload: Vec<u8> = (0..(24 * 1024 * 1024))
+        .map(|i| ((i * 31 + 7) & 0xff) as u8)
+        .collect();
+    fs::write(pi.home().join("huge.bin"), &payload).unwrap();
+
+    let mut cp = laptop
+        .command(&["cp", "pi:~/huge.bin", "tower:~/huge.bin", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let read_pids = |path: &Path| -> Vec<u32> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    };
+
+    // Wait until both remote `legion stream` data processes (get on pi, put on tower) are live.
+    let deadline = Instant::now() + PATIENCE;
+    let (src_pids, dst_pids) = loop {
+        let s = read_pids(&pi_pids);
+        let d = read_pids(&tower_pids);
+        if !s.is_empty() && !d.is_empty() {
+            break (s, d);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "legion cp never started both remote stream pipes (pi={s:?}, tower={d:?})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    send_signal(cp.id(), "TERM");
+    let started = Instant::now();
+    let status = wait_for_exit(&mut cp, PATIENCE);
+    assert!(
+        !status.success(),
+        "interrupted legion cp should exit non-zero"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "legion cp took too long to exit after SIGTERM: {:?}",
+        started.elapsed()
+    );
+
+    let mut stdout = String::new();
+    if let Some(mut out) = cp.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    let body: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
+    assert_eq!(body["code"], json!("cancelled"), "stdout={stdout}");
+
+    // Neither remote `legion stream` process may remain alive after both pipes close.
+    let reap_deadline = Instant::now() + Duration::from_secs(5);
+    for pid in src_pids.into_iter().chain(dst_pids) {
+        while pid_alive(pid) {
+            assert!(
+                Instant::now() < reap_deadline,
+                "remote legion stream process {pid} survived SIGTERM on legion cp"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    assert!(
+        !tower.home().join("huge.bin").exists(),
+        "half-written file must never take its final name"
+    );
+    let laptop_audit = laptop.audit();
+    assert!(
+        laptop_audit
+            .iter()
+            .any(|e| e["tool"] == json!("fs.transfer") && e["outcome"] == json!("cancelled")),
+        "{laptop_audit:?}"
+    );
+}
+
+#[cfg(not(unix))]
+fn sigterm_on_legion_cp_cancels_transfer_and_leaves_no_stream_process() {}
 
 fn pipe_handle_drop_is_non_blocking_and_kills_lingering_child() {
     let dir = tempfile::tempdir().unwrap();
