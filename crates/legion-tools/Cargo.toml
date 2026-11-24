@@ -46,6 +46,10 @@ name = "job"
 harness = false
 
 [[test]]
+name = "proj"
+harness = false
+
+[[test]]
 name = "sys"
 harness = false
 
