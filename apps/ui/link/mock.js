@@ -651,14 +651,19 @@ export function createMockLink(mode = '') {
             },
           ],
         };
-      case 'fleet.ping':
-        return {
-          results: [
-            { machine: 'pi', reachable: true, node: 'pi', system: 'linux', version: '0.1.0', os: 'linux', arch: 'aarch64', latency_ms: 4 },
-            { machine: 'studio', reachable: true, node: 'studio', system: 'macos', version: '0.1.0', os: 'macos', arch: 'aarch64', latency_ms: 11 },
-            { machine: 'laptop', reachable: false, error: machines.laptop.error },
-          ],
-        };
+      case 'fleet.ping': {
+        const all = [
+          { machine: 'tower', reachable: true, node: 'tower', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 0 },
+          { machine: 'pi', reachable: true, node: 'pi', system: 'linux', version: '0.1.0', os: 'linux', arch: 'aarch64', latency_ms: 4 },
+          { machine: 'studio', reachable: true, node: 'studio', system: 'macos', version: '0.1.0', os: 'macos', arch: 'aarch64', latency_ms: 11 },
+          { machine: 'laptop', reachable: false, error: machines.laptop.error },
+        ];
+        if (Array.isArray(args?.machines) && args.machines.length > 0) {
+          const wanted = new Set(args.machines);
+          return { results: all.filter((entry) => wanted.has(entry.machine)) };
+        }
+        return { results: all.filter((entry) => entry.machine !== 'tower') };
+      }
       case 'sys.info':
         return m.sys;
       case 'exec.run': {
