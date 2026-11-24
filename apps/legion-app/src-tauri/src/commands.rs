@@ -12,7 +12,8 @@ use tauri::State;
 use tauri::ipc::Channel;
 
 use crate::backend::{
-    AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, UnpairResult,
+    AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, RepairResult,
+    UnpairResult,
 };
 
 /// Log line emitted when the web interface finishes its first paint.
@@ -130,6 +131,13 @@ pub async fn select_node(
     node: String,
 ) -> Result<AppState, AppError> {
     backend.0.select_node(node).await
+}
+
+/// Moves a damaged or unsupported state file aside (`legion-app.json.damaged-<timestamp>`) and
+/// resets the backend to a clean state.
+#[tauri::command]
+pub async fn repair_store(backend: State<'_, SharedBackend>) -> Result<RepairResult, AppError> {
+    backend.0.repair_store().await
 }
 
 /// Returns a sensible default name for this device (model on mobile, host name on desktop).

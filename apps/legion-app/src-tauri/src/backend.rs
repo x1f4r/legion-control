@@ -149,6 +149,28 @@ impl std::error::Error for AppError {}
 pub enum Needs {
     /// At least one node must be paired before commands can run.
     Pairing,
+    /// The persisted state file could not be loaded and must be moved aside explicitly.
+    Repair,
+}
+
+/// Plain-language details about a damaged or unsupported persisted state file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairInfo {
+    /// Plain explanation of why the state file could not be loaded.
+    pub message: String,
+    /// Full path of the unreadable or unsupported state file.
+    pub path: String,
+}
+
+/// Result of moving a damaged state file aside and starting fresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairResult {
+    /// Full path where the damaged state file was moved (`legion-app.json.damaged-<timestamp>`).
+    pub archived_to: String,
+    /// Plain reminder naming where the file went and that paired machines still list this device.
+    pub message: String,
+    /// Fresh application state after starting clean.
+    pub state: AppState,
 }
 
 /// Summary of one node link known to the app.
@@ -173,6 +195,9 @@ pub struct AppState {
     pub nodes: Vec<NodeLink>,
     /// What setup step is still required, or `null` when ready.
     pub needs: Option<Needs>,
+    /// Populated when `needs == Some(Needs::Repair)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<RepairInfo>,
 }
 
 /// Identifier of an in-flight call for cancellation.
@@ -249,6 +274,9 @@ pub trait Backend: Send + Sync {
 
     /// Selects which configured node calls go through by default and returns the updated state.
     fn select_node(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>>;
+
+    /// Moves a damaged or unsupported state file aside and starts fresh.
+    fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>>;
 }
 
 /// Fallback backend returning honest unpaired responses.
@@ -262,6 +290,7 @@ impl Backend for Unpaired {
                 ready: false,
                 nodes: Vec::new(),
                 needs: Some(Needs::Pairing),
+                repair: None,
             })
         })
     }
@@ -306,6 +335,15 @@ impl Backend for Unpaired {
     fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async { Err(AppError::not_paired()) })
     }
+
+    fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+        Box::pin(async {
+            Err(AppError::new(
+                ErrorCode::InvalidArgs,
+                "App state does not need repair.",
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +387,7 @@ mod tests {
             ready: false,
             nodes: Vec::new(),
             needs: Some(Needs::Pairing),
+            repair: None,
         };
         let json = serde_json::to_value(&unpaired)?;
         assert_eq!(json["ready"], false);
@@ -364,6 +403,7 @@ mod tests {
                 via: "ssh".to_owned(),
             }],
             needs: None,
+            repair: None,
         };
         let ready_json = serde_json::to_value(&ready)?;
         assert_eq!(ready_json["ready"], true);

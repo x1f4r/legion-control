@@ -254,6 +254,20 @@ export function createAppLink() {
     }
   }
 
+  async function repairStore() {
+    try {
+      const result = await invoke('repair_store');
+      const nextState = await state();
+      return {
+        archived_to: result?.archived_to || '',
+        message: result?.message || '',
+        state: nextState,
+      };
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
   async function scanInvite() {
     try {
       const reply = await invoke('scan_invite');
@@ -281,6 +295,7 @@ export function createAppLink() {
     pair,
     unpair,
     selectNode,
+    repairStore,
     scanInvite,
   };
 }

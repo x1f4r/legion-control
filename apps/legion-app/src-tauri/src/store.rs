@@ -7,6 +7,7 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use legion_link::LinkConfig;
 use serde::{Deserialize, Serialize};
@@ -199,13 +200,67 @@ impl AppStore {
             }
         };
 
-        serde_json::from_slice(&bytes).map_err(|err| {
+        let data: AppStoreData = serde_json::from_slice(&bytes).map_err(|err| {
             AppError::new(
                 ErrorCode::Internal,
                 format!("Stored app state is not valid JSON: {err}"),
             )
-            .with_hint("Remove the damaged state file or reset app storage and pair again.")
-        })
+            .with_hint("Move the damaged state file aside to start fresh, or restore a backup.")
+        })?;
+
+        if data.version > STORE_VERSION {
+            return Err(AppError::new(
+                ErrorCode::Unsupported,
+                format!(
+                    "Saved app state uses schema version {}, which is newer than this build supports (version {STORE_VERSION}).",
+                    data.version
+                ),
+            )
+            .with_hint(
+                "Update Legion to open this file, or move the file aside to start fresh.",
+            ));
+        }
+
+        Ok(data)
+    }
+
+    /// Moves a damaged or unsupported state file aside to `legion-app.json.damaged-<timestamp>`
+    /// without ever deleting it, returning the archived file path.
+    pub fn archive_damaged(&self) -> Result<PathBuf, AppError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            AppError::new(
+                ErrorCode::Internal,
+                "App state path has no parent directory.",
+            )
+        })?;
+
+        let stamp = format_utc_timestamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+
+        let mut dest = parent.join(format!("{STORE_FILENAME}.damaged-{stamp}"));
+        let mut suffix: u32 = 1;
+        while dest.exists() {
+            dest = parent.join(format!("{STORE_FILENAME}.damaged-{stamp}-{suffix}"));
+            suffix = suffix.saturating_add(1);
+        }
+
+        fs::rename(&self.path, &dest).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not move damaged state file aside: {err}"),
+            )
+        })?;
+
+        #[cfg(unix)]
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+
+        Ok(dest)
     }
 
     /// Atomically writes `data` to the backing JSON file with owner-only permissions on Unix.
@@ -272,6 +327,28 @@ impl AppStore {
 
         Ok(())
     }
+}
+
+/// Formats a Unix timestamp in seconds as `YYYYMMDD-HHMMSSZ` in UTC without external crates.
+fn format_utc_timestamp(unix_secs: u64) -> String {
+    let secs_of_day = unix_secs % 86_400;
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+
+    // Howard Hinnant's civil-from-days algorithm (proleptic Gregorian calendar).
+    let z = (unix_secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}Z")
 }
 
 #[cfg(test)]
@@ -349,6 +426,40 @@ mod tests {
         let err = store.load().err().ok_or("expected parse error")?;
         assert_eq!(err.code, ErrorCode::Internal);
         assert!(err.hint.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn newer_schema_version_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        fs::write(
+            store.path(),
+            serde_json::json!({ "version": STORE_VERSION + 1, "link": {} }).to_string(),
+        )?;
+        let err = store.load().err().ok_or("expected newer-version error")?;
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.message.contains("newer"));
+        Ok(())
+    }
+
+    #[test]
+    fn archive_damaged_moves_file_aside_without_deleting_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let original = b"{\"version\":1,\"truncated\":";
+        fs::write(store.path(), original)?;
+
+        let archived = store.archive_damaged()?;
+        assert!(!store.path().exists());
+        assert!(archived.exists());
+        let name = archived
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("missing filename")?;
+        assert!(name.starts_with("legion-app.json.damaged-"));
+        assert_eq!(fs::read(&archived)?, original);
         Ok(())
     }
 }

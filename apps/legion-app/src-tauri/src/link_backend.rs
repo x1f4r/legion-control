@@ -17,7 +17,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult, ErrorCode, Needs,
-    NodeLink, UnpairResult,
+    NodeLink, RepairInfo, RepairResult, UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -37,6 +37,7 @@ pub struct LinkBackend {
 
 struct BackendState {
     data: AppStoreData,
+    store_error: Option<AppError>,
     local_program: Option<String>,
     active_node: Option<String>,
     link: Link,
@@ -45,17 +46,41 @@ struct BackendState {
 impl LinkBackend {
     /// Loads persisted state from `store`, discovers any local desktop `legion` binary, and
     /// prepares the live [`Link`] handle.
+    ///
+    /// A damaged, unreadable, or newer-version state file is kept as a fatal `store_error` so
+    /// [`Backend::state`] reports `needs: "repair"` and every save is refused until the user
+    /// explicitly archives the damaged file via [`Backend::repair_store`].
     pub fn from_store(store: AppStore) -> Self {
-        let data = store.load().unwrap_or_default();
         let local_program = discover_local_legion();
-        let link_cfg = build_runtime_config(&data.link, local_program.as_deref());
-        let active_node = resolve_active_node(&data, local_program.as_deref());
+        Self::init(store, local_program)
+    }
+
+    /// Creates a backend with an explicit local binary override (used in unit tests).
+    #[cfg(test)]
+    pub fn with_local_program(store: AppStore, local_program: Option<String>) -> Self {
+        Self::init(store, local_program)
+    }
+
+    fn init(store: AppStore, local_program: Option<String>) -> Self {
+        let (data, store_error) = match store.load() {
+            Ok(data) => (data, None),
+            Err(err) => (AppStoreData::default(), Some(err)),
+        };
+        let (link_cfg, active_node) = if store_error.is_some() {
+            (LinkConfig::default(), None)
+        } else {
+            (
+                build_runtime_config(&data.link, local_program.as_deref()),
+                resolve_active_node(&data, local_program.as_deref()),
+            )
+        };
         let link = Link::new(link_cfg);
 
         Self {
             store,
             state: Mutex::new(BackendState {
                 data,
+                store_error,
                 local_program,
                 active_node,
                 link,
@@ -65,25 +90,15 @@ impl LinkBackend {
         }
     }
 
-    /// Creates a backend with an explicit local binary override (used in unit tests).
-    #[cfg(test)]
-    pub fn with_local_program(store: AppStore, local_program: Option<String>) -> Self {
-        let data = store.load().unwrap_or_default();
-        let link_cfg = build_runtime_config(&data.link, local_program.as_deref());
-        let active_node = resolve_active_node(&data, local_program.as_deref());
-        let link = Link::new(link_cfg);
-
-        Self {
-            store,
-            state: Mutex::new(BackendState {
-                data,
-                local_program,
-                active_node,
-                link,
-            }),
-            mutate_lock: AsyncMutex::new(()),
-            next_call_seq: AtomicU64::new(1),
+    fn require_healthy_store(&self) -> Result<(), AppError> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(err) = &guard.store_error {
+            return Err(err.clone());
         }
+        Ok(())
     }
 
     fn snapshot_state(&self) -> AppState {
@@ -91,18 +106,21 @@ impl LinkBackend {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        build_app_state(&guard)
+        build_app_state(&guard, self.store.path())
     }
 
-    fn candidate_nodes(&self) -> (Link, Vec<String>) {
+    fn candidate_nodes(&self) -> Result<(Link, Vec<String>), AppError> {
         let guard = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(err) = &guard.store_error {
+            return Err(err.clone());
+        }
         let link = guard.link.clone();
-        let app_state = build_app_state(&guard);
+        let app_state = build_app_state(&guard, self.store.path());
         let names = app_state.nodes.into_iter().map(|n| n.node).collect();
-        (link, names)
+        Ok((link, names))
     }
 
     fn mark_active(&self, node: &str) {
@@ -110,6 +128,9 @@ impl LinkBackend {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.store_error.is_some() {
+            return;
+        }
         if guard.active_node.as_deref() == Some(node) {
             return;
         }
@@ -138,7 +159,7 @@ impl Backend for LinkBackend {
 
     fn tools(&self, on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
         Box::pin(async move {
-            let (link, candidates) = self.candidate_nodes();
+            let (link, candidates) = self.candidate_nodes()?;
             if candidates.is_empty() {
                 return Err(AppError::not_paired());
             }
@@ -178,7 +199,7 @@ impl Backend for LinkBackend {
         on_event: Option<Channel<Value>>,
     ) -> BoxFuture<'_, Result<Value, AppError>> {
         Box::pin(async move {
-            let (link, candidates) = self.candidate_nodes();
+            let (link, candidates) = self.candidate_nodes()?;
             if candidates.is_empty() {
                 return Err(AppError::not_paired());
             }
@@ -241,6 +262,7 @@ impl Backend for LinkBackend {
 
     fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
+            self.require_healthy_store()?;
             let trimmed_invite = invite.trim();
             if trimmed_invite.is_empty() {
                 return Err(
@@ -338,7 +360,7 @@ impl Backend for LinkBackend {
                 guard.data = updated_data;
                 guard.active_node = Some(node_name);
                 guard.link = next_link;
-                build_app_state(&guard)
+                build_app_state(&guard, self.store.path())
             };
 
             if !had_key {
@@ -351,6 +373,7 @@ impl Backend for LinkBackend {
 
     fn unpair(&self, node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
         Box::pin(async move {
+            self.require_healthy_store()?;
             let trimmed = node.trim();
             if trimmed.is_empty() {
                 return Err(AppError::new(
@@ -431,6 +454,7 @@ impl Backend for LinkBackend {
 
     fn select_node(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
+            self.require_healthy_store()?;
             let trimmed = node.trim();
             if trimmed.is_empty() {
                 return Err(AppError::new(
@@ -445,6 +469,9 @@ impl Backend for LinkBackend {
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(err) = &guard.store_error {
+                    return Err(err.clone());
+                }
                 let exists_ssh = guard.data.link.node(trimmed).is_some();
                 let exists_local = is_local_node_available(guard.local_program.as_deref(), trimmed);
                 if !exists_ssh && !exists_local {
@@ -461,7 +488,7 @@ impl Backend for LinkBackend {
                     guard.data.current_node = None;
                     Some(guard.data.clone())
                 };
-                (build_app_state(&guard), save)
+                (build_app_state(&guard, self.store.path()), save)
             };
 
             if let Some(data) = data_to_save {
@@ -469,6 +496,54 @@ impl Backend for LinkBackend {
             }
 
             Ok(updated_state)
+        })
+    }
+
+    fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+        Box::pin(async move {
+            let _mutation = self.mutate_lock.lock().await;
+            {
+                let guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if guard.store_error.is_none() {
+                    return Err(AppError::new(
+                        ErrorCode::InvalidArgs,
+                        "App state is healthy and does not need repair.",
+                    ));
+                }
+            }
+
+            let archived = self.store.archive_damaged()?;
+            let archived_to = archived.display().to_string();
+
+            let (old_link, next_state) = {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let fresh = AppStoreData::default();
+                let runtime_cfg = build_runtime_config(&fresh.link, guard.local_program.as_deref());
+                let active = resolve_active_node(&fresh, guard.local_program.as_deref());
+                let old = std::mem::replace(&mut guard.link, Link::new(runtime_cfg));
+                guard.data = fresh;
+                guard.store_error = None;
+                guard.active_node = active;
+                (old, build_app_state(&guard, self.store.path()))
+            };
+
+            old_link.close().await;
+
+            let message = format!(
+                "Moved the unreadable state file to {archived_to}. Paired machines still list this device until you remove it there with `legion device.remove`."
+            );
+
+            Ok(RepairResult {
+                archived_to,
+                message,
+                state: next_state,
+            })
         })
     }
 }
@@ -516,7 +591,19 @@ fn resolve_active_node(data: &AppStoreData, local_program: Option<&str>) -> Opti
     data.link.nodes.first().map(|n| n.node.clone())
 }
 
-fn build_app_state(state: &BackendState) -> AppState {
+fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppState {
+    if let Some(err) = &state.store_error {
+        return AppState {
+            ready: false,
+            nodes: Vec::new(),
+            needs: Some(Needs::Repair),
+            repair: Some(RepairInfo {
+                message: err.message.clone(),
+                path: store_path.display().to_string(),
+            }),
+        };
+    }
+
     let mut nodes: Vec<NodeLink> = Vec::new();
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -564,6 +651,7 @@ fn build_app_state(state: &BackendState) -> AppState {
         ready,
         nodes,
         needs,
+        repair: None,
     }
 }
 
@@ -737,6 +825,81 @@ mod tests {
         let persisted = store.load()?;
         assert_eq!(persisted.link.nodes.len(), 1);
         assert_eq!(persisted.link.nodes[0].node, "pi");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn damaged_state_file_reports_repair_refuses_saves_and_archives_explicitly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        // Truncate the state file by 3 bytes to simulate a damaged file.
+        let mut raw = std::fs::read(store.path())?;
+        raw.truncate(raw.len().saturating_sub(3));
+        std::fs::write(store.path(), &raw)?;
+
+        let backend = LinkBackend::with_local_program(store.clone(), None);
+        let st = backend.state().await?;
+        assert!(!st.ready);
+        assert_eq!(st.needs, Some(Needs::Repair));
+        let repair_info = st.repair.ok_or("expected repair info")?;
+        assert!(!repair_info.message.is_empty());
+        assert_eq!(repair_info.path, store.path().display().to_string());
+
+        // Every mutating and read operation refuses and leaves the damaged file untouched.
+        assert!(backend.tools(None).await.is_err());
+        assert!(
+            backend
+                .pair("legion-invite-1:abc".to_owned(), "phone".to_owned())
+                .await
+                .is_err()
+        );
+        assert!(backend.unpair("tower".to_owned()).await.is_err());
+        assert!(backend.select_node("tower".to_owned()).await.is_err());
+        assert_eq!(std::fs::read(store.path())?, raw);
+
+        // Explicit repair moves the damaged file aside with original bytes intact and starts fresh.
+        let repaired = backend.repair_store().await?;
+        assert!(!store.path().exists());
+        let archived_path = std::path::PathBuf::from(&repaired.archived_to);
+        assert!(archived_path.exists());
+        assert_eq!(std::fs::read(&archived_path)?, raw);
+        assert!(repaired.message.contains("legion device.remove"));
+        assert_eq!(repaired.state.needs, Some(Needs::Pairing));
+
+        let after = backend.state().await?;
+        assert_eq!(after.needs, Some(Needs::Pairing));
+        assert!(after.repair.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn newer_schema_version_reports_repair_and_refuses_overwrite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let future_json = serde_json::json!({
+            "version": crate::store::STORE_VERSION + 5,
+            "link": { "nodes": [] },
+        })
+        .to_string();
+        std::fs::write(store.path(), &future_json)?;
+
+        let backend = LinkBackend::with_local_program(store.clone(), None);
+        let st = backend.state().await?;
+        assert!(!st.ready);
+        assert_eq!(st.needs, Some(Needs::Repair));
+        assert!(
+            st.repair
+                .as_ref()
+                .is_some_and(|r| r.message.contains("newer"))
+        );
+        assert!(backend.select_node("tower".to_owned()).await.is_err());
+        assert_eq!(std::fs::read_to_string(store.path())?, future_json);
         Ok(())
     }
 }

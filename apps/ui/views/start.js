@@ -11,6 +11,7 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
   const [pasteOpen, setPasteOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(linkState?.error || null);
+  const [archivedInfo, setArchivedInfo] = useState(null);
   const inviteInputRef = useRef(null);
 
   useEffect(() => {
@@ -21,7 +22,8 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
   }, [pasteOpen]);
 
   const nodeName = linkState?.health?.node || 'this machine';
-  const needsPairing = linkState?.needs === 'pairing' || link.kind === 'app';
+  const needsRepair = linkState?.needs === 'repair';
+  const needsPairing = !needsRepair && (linkState?.needs === 'pairing' || link.kind === 'app');
 
   useEffect(() => {
     if (!needsPairing || typeof link.deviceName !== 'function') return;
@@ -88,6 +90,100 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
     }
   }
 
+  async function onRepairStore() {
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await link.repairStore();
+      setArchivedInfo({
+        archivedTo: res?.archived_to || '',
+        message: res?.message || '',
+        nextState: res?.state || null,
+      });
+      if (res?.state && !res.state.ready) {
+        onConnected(res.state);
+      }
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (needsRepair) {
+    const repair = linkState?.repair || {};
+    return html`
+      <div class="app standalone">
+        <header class="bar">
+          <h1 class="wordmark"><b>▍</b>Legion</h1>
+        </header>
+        <main class="main">
+          <div class="start-column">
+            <h2 class="start-heading">Saved device state could not be read.</h2>
+            <p class="lede">
+              Legion stopped before writing anything so your existing device key and pairings are
+              not overwritten.
+            </p>
+            <div class="notice bad">
+              <strong>${repair.message || 'The saved state file is damaged or from a newer version.'}</strong>
+              ${repair.path ? html`<span>File: <code>${repair.path}</code></span>` : null}
+            </div>
+            ${error ? html`<${Notice} error=${error} />` : null}
+            <div class="actions">
+              <button type="button" class="btn primary" disabled=${busy} onClick=${onRepairStore}>
+                ${busy ? 'Moving file aside…' : 'Move file aside and start fresh'}
+              </button>
+            </div>
+            <div class="notice spaced-lg">
+              <strong>What happens next</strong>
+              <span>
+                The unreadable file is moved to a timestamped backup in the same folder and never
+                deleted. Any machines already paired with this device will still list it until you
+                remove it there with <code>legion device.remove</code>.
+              </span>
+            </div>
+          </div>
+        </main>
+      </div>
+    `;
+  }
+
+  if (archivedInfo && archivedInfo.nextState?.ready) {
+    return html`
+      <div class="app standalone">
+        <header class="bar">
+          <h1 class="wordmark"><b>▍</b>Legion</h1>
+        </header>
+        <main class="main">
+          <div class="start-column">
+            <h2 class="start-heading">Damaged state file moved aside.</h2>
+            <div class="notice">
+              <strong>Saved backup</strong>
+              <span>Moved to <code>${archivedInfo.archivedTo}</code>.</span>
+            </div>
+            <p class="lede spaced">
+              Any machines already paired with this device still list it until you remove it there
+              with <code>legion device.remove</code>.
+            </p>
+            <div class="actions">
+              <button
+                type="button"
+                class="btn primary"
+                onClick=${() => {
+                  const next = archivedInfo.nextState;
+                  setArchivedInfo(null);
+                  onConnected(next);
+                }}
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        </main>
+      </div>
+    `;
+  }
+
   if (needsPairing) {
     return html`
       <div class="app">
@@ -102,6 +198,17 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
           <h1 class="wordmark"><b>▍</b>Legion</h1>
         </header>
         <main class="main">
+          ${archivedInfo?.archivedTo
+            ? html`
+                <div class="notice">
+                  <strong>Damaged state file moved aside</strong>
+                  <span>
+                    Saved at <code>${archivedInfo.archivedTo}</code>. Previously paired machines
+                    still list this device until removed there with <code>legion device.remove</code>.
+                  </span>
+                </div>
+              `
+            : null}
           <h2 class="start-heading">Pair this device with one of your machines.</h2>
           <p class="lede">One is enough: through it you reach the others. On that machine, run</p>
           <div class="code">
