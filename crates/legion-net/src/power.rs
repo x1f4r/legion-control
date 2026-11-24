@@ -30,6 +30,8 @@ const PING_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a waking or restarting machine is looked at.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long the look taken at the deadline gets, however little of the wait was left.
+const LAST_LOOK: Duration = Duration::from_secs(5);
 /// The longest `power.wake` waits for the machine to answer.
 const LONGEST_WAKE_WAIT_S: u32 = 300;
 /// How long `power.switch` waits when not told, and the longest it will.
@@ -331,10 +333,16 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
             )
             .await?;
             let left = deadline.saturating_duration_since(Instant::now());
+            // However short the wait, the machine is asked once more when it is up.
+            let timeout = if left.is_zero() {
+                LAST_LOOK
+            } else {
+                left.min(PING_TIMEOUT)
+            };
+            awake = answers(hands, ctx, &machine, timeout).await;
             if left.is_zero() {
                 break;
             }
-            awake = answers(hands, ctx, &machine, left.min(PING_TIMEOUT)).await;
         }
     }
     Ok(WakeResult {
@@ -535,13 +543,12 @@ async fn power_switch(
     if let Some(into) = &args.into {
         restart["into"] = json!(into);
     }
-    let started = Instant::now();
-    let result = |system: Option<String>, restarted| SwitchResult {
+    let result = |system: Option<String>, restarted, waited_s| SwitchResult {
         machine: machine.clone(),
         from_system: before.system.clone(),
         system,
         restarted,
-        waited_s: seconds(started.elapsed()),
+        waited_s,
         would_run: None,
         dry_run: false,
     };
@@ -560,7 +567,7 @@ async fn power_switch(
             return Ok(SwitchResult {
                 would_run: Some(reply),
                 dry_run: true,
-                ..result(None, false)
+                ..result(None, false, 0.0)
             });
         }
         Ok(_) => {}
@@ -569,10 +576,13 @@ async fn power_switch(
         Err(error) => return Err(error),
     }
     if wait_s == 0 {
-        return Ok(result(None, false));
+        return Ok(result(None, false, 0.0));
     }
+    // The wait starts once the machine has taken the restart, not while it was being armed.
+    let started = Instant::now();
     let deadline = started + Duration::from_secs(u64::from(wait_s));
-    let mut last = String::from("it was not looked at");
+    // Every pass looks, so this always says what the last look saw.
+    let mut last: String;
     loop {
         pause(
             ctx,
@@ -580,12 +590,16 @@ async fn power_switch(
         )
         .await?;
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match look(hands, ctx, &machine, relayed, left.min(LOOK_TIMEOUT)).await {
+        // However short the wait, the machine is looked at once more when it is up.
+        let at_deadline = left.is_zero();
+        let timeout = if at_deadline {
+            LAST_LOOK
+        } else {
+            left.min(LOOK_TIMEOUT)
+        };
+        match look(hands, ctx, &machine, relayed, timeout).await {
             Ok(seen) if seen.boot_id.is_some() && seen.boot_id.as_deref() != Some(&boot_before) => {
-                let came_back = result(seen.system.clone(), true);
+                let came_back = result(seen.system.clone(), true, seconds(started.elapsed()));
                 return match &args.into {
                     Some(into) if seen.system.as_deref() != Some(into.as_str()) => {
                         Err(wrong_system(&came_back, into))
@@ -607,6 +621,9 @@ async fn power_switch(
                 hands.fleet.evict(&machine).await;
                 last = format!("it did not answer ({})", error.message);
             }
+        }
+        if at_deadline {
+            break;
         }
     }
     let hint = if last.starts_with("it still answered") {
@@ -660,8 +677,30 @@ async fn look(
     if relayed {
         return look_through_relay(hands, ctx, machine, timeout).await;
     }
+    let started = Instant::now();
     let cancel = ctx.cancel_token().child_token();
     let config: &ConfigStore = ctx.config();
+    // ping gives each of the machine's systems a share of the timeout, so a system that does not
+    // answer cannot use it all up before the one that does is tried; the session it opens is
+    // pooled for the hello below.
+    let ping = hands
+        .fleet
+        .ping(config, ctx.node_name(), machine, timeout, cancel.clone())
+        .await;
+    if !ping.reachable {
+        return Err(ping.error.unwrap_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!(
+                    "{machine} did not answer within {} seconds",
+                    timeout.as_secs()
+                ),
+            )
+        }));
+    }
+    let timeout = timeout
+        .saturating_sub(started.elapsed())
+        .max(Duration::from_secs(1));
     let work = async {
         let session = hands
             .fleet

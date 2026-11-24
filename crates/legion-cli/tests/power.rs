@@ -55,6 +55,10 @@ fn main() -> ExitCode {
             "switch_reaches_a_machine_through_a_relay",
             switch_reaches_a_machine_through_a_relay,
         ),
+        (
+            "switch_looks_at_every_system_however_short_the_wait",
+            switch_looks_at_every_system_however_short_the_wait,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -91,13 +95,17 @@ fn main() -> ExitCode {
 fn run_helper(args: &[String]) -> ExitCode {
     match args.split_first() {
         // system <legion_home> <user_home> <power_dir> <machine_dir> <system>
-        Some((mode, rest)) if mode == "system" && rest.len() == 5 => run_system(
-            Path::new(&rest[0]),
-            Path::new(&rest[1]),
-            Path::new(&rest[2]),
-            Path::new(&rest[3]),
-            &rest[4],
-        ),
+        // system <legion_home> <user_home> <power_dir> <machine_dir> <system> [hang]
+        Some((mode, rest)) if mode == "system" && (rest.len() == 5 || rest.len() == 6) => {
+            run_system(
+                Path::new(&rest[0]),
+                Path::new(&rest[1]),
+                Path::new(&rest[2]),
+                Path::new(&rest[3]),
+                &rest[4],
+                rest.get(5).map(String::as_str) == Some("hang"),
+            )
+        }
         // sleep <seconds>
         Some((mode, rest)) if mode == "sleep" && rest.len() == 1 => {
             std::thread::sleep(Duration::from_secs(rest[0].parse().unwrap()));
@@ -118,10 +126,22 @@ fn run_system(
     power_dir: &Path,
     machine_dir: &Path,
     system: &str,
+    hang: bool,
 ) -> ExitCode {
     let started_as = read_state(machine_dir);
     if started_as.up != system {
-        eprintln!("ssh: connect to host {system} port 22: No route to host");
+        if hang {
+            // A system half way down: the connection opens and nothing ever answers, until the
+            // caller gives up and closes it.
+            let (done, gone) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+                let _ = done.send(());
+            });
+            let _ = gone.recv_timeout(PATIENCE);
+        } else {
+            eprintln!("ssh: connect to host {system} port 22: No route to host");
+        }
         return ExitCode::from(255);
     }
     let mut child = Command::new(LEGION_BIN)
@@ -213,7 +233,16 @@ impl System {
 
     /// The connector command that reaches this system of `machine` as `name`.
     fn command(&self, machine: &Machine, name: &str) -> String {
-        let argv = [
+        self.connector(machine, name, false)
+    }
+
+    /// The same, for a system that hangs rather than refuses while it is down.
+    fn hanging_command(&self, machine: &Machine, name: &str) -> String {
+        self.connector(machine, name, true)
+    }
+
+    fn connector(&self, machine: &Machine, name: &str, hang: bool) -> String {
+        let mut argv = vec![
             std::env::current_exe()
                 .unwrap()
                 .to_string_lossy()
@@ -226,6 +255,9 @@ impl System {
             machine.path().to_string_lossy().into_owned(),
             name.to_owned(),
         ];
+        if hang {
+            argv.push("hang".to_owned());
+        }
         let quoted: Vec<String> = argv
             .iter()
             .map(|part| serde_json::to_string(part).unwrap())
@@ -786,4 +818,50 @@ fn switch_reaches_a_machine_through_a_relay() {
         refused.stdout
     );
     assert_eq!(windows.power_actions().len(), 0);
+}
+
+fn switch_looks_at_every_system_however_short_the_wait() {
+    let laptop_machine = Machine::new("laptop", "boot-l");
+    let laptop = System::new("name = \"laptop\"\n");
+    let tower = Machine::new("linux", "boot-1");
+    let linux = System::new(TOWER_LINUX);
+    let windows = System::new(TOWER_WINDOWS);
+    let fleet = |linux_command: String| {
+        format!(
+            "[machines.tower]\n\n[[machines.tower.systems]]\nname = \"linux\"\ncommand = {linux_command}\n\n[[machines.tower.systems]]\nname = \"windows\"\ncommand = {}\n",
+            windows.command(&tower, "windows"),
+        )
+    };
+    let switch = |wait: &str| {
+        let switching = laptop.spawn(
+            &laptop_machine,
+            &["power.switch", "machine=tower", "into=windows", wait],
+        );
+        let handed = linux.power_actions().len() + 1;
+        wait_until("tower's linux hands over the restart", || {
+            linux.power_actions().len() == handed
+        });
+        switching
+    };
+
+    // A wait shorter than the time between looks still gets one look, at its end.
+    laptop
+        .home
+        .write_config("fleet.toml", &fleet(linux.command(&tower, "linux")));
+    let switching = switch("wait_s=1");
+    tower.set("windows", 2, "boot-2");
+    let (code, switched) = finish(switching);
+    assert_eq!(code, 0, "{switched}");
+    assert_eq!(switched["restarted"], json!(true), "{switched}");
+
+    // linux, tried first, hangs on its way down; windows still gets its share of each look.
+    tower.set("linux", 3, "boot-3");
+    laptop
+        .home
+        .write_config("fleet.toml", &fleet(linux.hanging_command(&tower, "linux")));
+    let switching = switch("wait_s=5");
+    tower.set("windows", 4, "boot-4");
+    let (code, switched) = finish(switching);
+    assert_eq!(code, 0, "{switched}");
+    assert_eq!(switched["system"], json!("windows"), "{switched}");
 }
