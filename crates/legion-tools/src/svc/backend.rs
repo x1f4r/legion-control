@@ -32,6 +32,41 @@ pub(crate) const QUERY_CAPTURE_LIMIT: usize = 2 * 1024 * 1024;
 /// Per-stream capture cap for `logs` commands (8 MiB, enough for up to 2000 bounded JSON entries).
 pub(crate) const LOGS_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 
+/// Maximum number of near-match service names included in a `NotFound` hint.
+pub(crate) const MAX_SUGGESTIONS: usize = 5;
+
+/// Deduplicates suggested service names in order and caps the list at [`MAX_SUGGESTIONS`].
+pub(crate) fn dedup_suggestions(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        if item.is_empty() || out.iter().any(|existing| existing == &item) {
+            continue;
+        }
+        out.push(item);
+        if out.len() >= MAX_SUGGESTIONS {
+            break;
+        }
+    }
+    out
+}
+
+/// Formats a `NotFound` hint naming up to [`MAX_SUGGESTIONS`] near-match service names, or falls
+/// back to suggesting `svc.list` when none match.
+pub(crate) fn not_found_hint(suggestions: &[String]) -> String {
+    if suggestions.is_empty() {
+        return "Run `svc.list` to see the services on this machine.".to_owned();
+    }
+    let quoted: Vec<String> = suggestions
+        .iter()
+        .take(MAX_SUGGESTIONS)
+        .map(|s| format!("`{s}`"))
+        .collect();
+    format!(
+        "Did you mean {}? Pass the exact service name as shown by `svc.list`.",
+        quoted.join(", ")
+    )
+}
+
 /// A system command ready to run with exact argv (never a shell string) and explicit environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CmdSpec {
@@ -172,6 +207,17 @@ pub(crate) trait Backend: Send + Sync {
         lines: usize,
         since: Option<Timestamp>,
     ) -> BoxFuture<'a, Result<BackendLogs, ErrorBody>>;
+
+    /// Suggests up to [`MAX_SUGGESTIONS`] existing service names in `scope` that closely match
+    /// `name` after an exact lookup returned `NotFound`. Never acts on them.
+    fn suggest_names<'a>(
+        &'a self,
+        _ctx: &'a Ctx,
+        _name: &'a str,
+        _scope: Scope,
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async { Vec::new() })
+    }
 }
 
 static SYSTEMD: Systemd = Systemd;

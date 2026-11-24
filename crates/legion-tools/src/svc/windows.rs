@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::backend::{
     ACTION_TIMEOUT, Backend, BackendLogs, BackendStatus, CmdSpec, LOGS_CAPTURE_LIMIT,
-    QUERY_CAPTURE_LIMIT, QUERY_TIMEOUT, run_cmd,
+    QUERY_CAPTURE_LIMIT, QUERY_TIMEOUT, dedup_suggestions, not_found_hint, run_cmd,
 };
 use super::{Action, BackendKind, Scope, ServiceState, ServiceSummary};
 
@@ -162,14 +162,22 @@ Get-Service | ForEach-Object { \
 /// Builds the PowerShell command for `svc.status` using `Get-Service` and `Get-CimInstance Win32_Service`.
 ///
 /// Filters to an exact (case-insensitive) service name match so wildcard expansion never picks an
-/// arbitrary service, and uses the resolved `$s.Name` for the WMI lookup.
+/// arbitrary service, and uses the resolved `$s.Name` for the WMI lookup. When no service name
+/// matches, checks whether the input equals any service's `DisplayName` and returns up to five
+/// matching service names as hints without acting on them.
 pub(crate) fn status_cmd(name: &str) -> CmdSpec {
     const SCRIPT: &str = "\
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); \
 $ErrorActionPreference = 'Stop'; \
 $n = $env:LEGION_SVC_NAME; \
-$matches = @(Get-Service -Name $n -ErrorAction Stop | Where-Object { $_.Name -ieq $n }); \
-if ($matches.Count -eq 0) { throw \"Cannot find any service with service name '$n'.\" }; \
+$err = $null; \
+$matches = @(Get-Service -Name $n -ErrorAction SilentlyContinue -ErrorVariable err | Where-Object { $_.Name -ieq $n }); \
+if ($matches.Count -eq 0) { \
+  if ($err -and $err[0].CategoryInfo.Category -ne 'ObjectNotFound') { throw $err[0] }; \
+  $sugg = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -ieq $n } | Select-Object -ExpandProperty Name -First 5); \
+  [PSCustomObject]@{ NotFound = $true; Suggestions = $sugg } | ConvertTo-Json -Compress; \
+  exit 0 \
+}; \
 if ($matches.Count -gt 1) { throw \"Multiple services matched '$n'.\" }; \
 $s = $matches[0]; \
 $resolved = $s.Name; \
@@ -354,6 +362,21 @@ pub(crate) fn parse_list_json(text: &str) -> Result<Vec<ServiceSummary>, ErrorBo
         .collect())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PsNotFoundRow {
+    not_found: bool,
+    #[serde(default)]
+    suggestions: Option<OneOrMany<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PsStatusPayload {
+    NotFound(PsNotFoundRow),
+    Found(Box<PsServiceRow>),
+}
+
 /// Parses PowerShell `ConvertTo-Json` output for `svc.status`.
 pub(crate) fn parse_status_json(
     text: &str,
@@ -365,14 +388,36 @@ pub(crate) fn parse_status_json(
             ErrorCode::NotFound,
             format!("Windows service {requested_name:?} was not found."),
         )
-        .with_hint("Run `svc.list` to see the services on this machine."));
+        .with_hint(not_found_hint(&[])));
     }
-    let row: PsServiceRow = serde_json::from_str(trimmed).map_err(|error| {
+    let payload: PsStatusPayload = serde_json::from_str(trimmed).map_err(|error| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!("Could not parse Windows service status JSON: {error}."),
         )
     })?;
+    let row = match payload {
+        PsStatusPayload::NotFound(missing) if missing.not_found => {
+            let suggestions = dedup_suggestions(
+                missing
+                    .suggestions
+                    .map(OneOrMany::into_vec)
+                    .unwrap_or_default(),
+            );
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("Windows service {requested_name:?} was not found."),
+            )
+            .with_hint(not_found_hint(&suggestions)));
+        }
+        PsStatusPayload::NotFound(_) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                "Could not parse Windows service status JSON: missing service details.",
+            ));
+        }
+        PsStatusPayload::Found(row) => *row,
+    };
 
     let status_text = status_value_to_str(row.status.as_ref());
     let start_mode = row
@@ -797,5 +842,31 @@ mod tests {
             "inspect service",
         );
         assert_eq!(missing.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn parse_status_json_includes_display_name_suggestions_in_not_found_hint() {
+        let single = r#"{"NotFound":true,"Suggestions":"Spooler"}"#;
+        let err = parse_status_json(single, "Print Spooler").unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(
+            err.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("Did you mean `Spooler`?"),
+            "{err}"
+        );
+
+        let many = r#"{"NotFound":true,"Suggestions":["Svc1","Svc2","Svc3","Svc4","Svc5","Svc6"]}"#;
+        let err = parse_status_json(many, "Shared Display").unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(hint.contains("`Svc1`") && hint.contains("`Svc5`"), "{hint}");
+        assert!(!hint.contains("`Svc6`"), "{hint}");
+
+        let none = r#"{"NotFound":true,"Suggestions":[]}"#;
+        let err = parse_status_json(none, "Unknown").unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(err.hint.as_deref().unwrap_or("").contains("svc.list"));
     }
 }
