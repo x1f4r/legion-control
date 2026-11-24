@@ -262,9 +262,8 @@ non-owner revocations independently of unrelated entries), and reconciles only r
 to `nobody` when a role is undefined on the receiving node or two live devices collide on one
 `device:*` principal. If two live entries in `devices.toml` ever share a public key (or collide
 with a foreign line in `authorized_keys`), no `authorized_keys` line is written for any colliding
-entry and both `device.list` and `meta.doctor` warn loudly. Tombstones stay permanently through
-syncs; an owner can drop tombstones older than 400 days with `device.list prune_tombstones=true`
-only after every peer in `fleet.toml` has acknowledged them.
+entry and both `device.list` and `meta.doctor` warn loudly. Tombstones in `devices.toml` are
+permanent so removed devices cannot be resurrected and quarantine cannot be lifted by pruning.
 
 Each device records `paired_by = { principal, device }` captured from the invite creator. When a
 device is tombstoned, any live descendant with `paired_by.device == <tombstoned id>` and

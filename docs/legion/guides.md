@@ -764,12 +764,13 @@ read-only).
 
 - **List devices and invites**: `legion device.list` reconciles `authorized_keys` with
   `devices.toml`, sweeps expired invites recorded by this home, and shows each device's `id`,
-  `name`, `principal`, effective `role`, `fingerprint`, `added`, `paired_on`, `not_synced_to`, and
-  any collision or quarantine `status`. For owner callers, it also shows Legion lines pointing at
-  another or deleted Legion home (`foreign: true`, `missing_home: true`, `home`), and
-  `device.list prune_tombstones=true` drops tombstones older than 400 days once every peer in
-  `fleet.toml` has acknowledged them. `meta.doctor` warns about orphaned keys, unmarked `device:*`
-  principals, key collisions, quarantined devices, and unsynced or drifted fleet peers.
+  `name`, `principal`, effective `role`, `fingerprint`, `added`, `paired_on`, and any collision,
+  unmarked-principal, or quarantine `status`. For owner callers, it also shows Legion lines pointing
+  at another or deleted Legion home (`foreign: true`, `missing_home: true`, `home`). `meta.doctor`
+  warns about orphaned keys, unmarked `device:*` principals, key collisions, quarantined devices,
+  and drifted fleet peers. Tombstones in `devices.toml` are permanent so removed devices cannot
+  return; a fleet can hold several thousand removed devices before the 1 MiB configuration limit
+  matters.
 - **Change role, rename, or confirm**: `legion device.set` changes a paired device's role (owner
   role only, only for a registry-owned `device:*` principal marked with `device = "<pairing id>"`,
   requiring `allow_owner=true` to raise to `owner`, and refusing expiring credentials), renames it,
@@ -804,7 +805,6 @@ read-only).
 
 ```sh
 legion device.list
-legion device.list prune_tombstones=true
 legion device.set name=pixel role=editor
 legion device.set name=pixel rename=pixel-10
 legion device.set id=<pairing-id> confirm=true

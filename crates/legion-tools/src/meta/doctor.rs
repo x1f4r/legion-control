@@ -118,12 +118,6 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         checks.push(check);
     }
 
-    let unsynced =
-        crate::device::registry::unsynced_fleet_peers_summary(ctx.paths(), ctx.node_name());
-    if let Some(check) = check_unsynced_fleet_devices(&unsynced) {
-        checks.push(check);
-    }
-
     if !quick
         && let Some(ping_tool) = ctx.node().registry().get("fleet.ping")
         && ctx.grant().allows(ping_tool.spec())
@@ -267,27 +261,6 @@ pub fn check_policy_unmarked_device_principals(policy: &Policy) -> Option<Check>
         ),
         hint: Some(
             "Rename human-authored principals so they do not start with `device:`, or add `device = \"<pairing_id>\"` if a principal belongs exclusively to one paired device."
-                .to_owned(),
-        ),
-    })
-}
-
-/// Builds a `meta.doctor` warning when local `devices.toml` has entries or tombstones that have
-/// not yet been acknowledged by every machine in `fleet.toml`.
-pub fn check_unsynced_fleet_devices(unsynced_peers: &[String]) -> Option<Check> {
-    if unsynced_peers.is_empty() {
-        return None;
-    }
-    Some(Check {
-        name: "unsynced fleet devices".to_owned(),
-        ok: true,
-        warning: true,
-        detail: format!(
-            "These machine(s) have not received this node's latest paired devices yet: {}.",
-            unsynced_peers.join(", ")
-        ),
-        hint: Some(
-            "Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` to push local devices to them."
                 .to_owned(),
         ),
     })
@@ -1403,20 +1376,6 @@ deny = [\"effect:power\", \"effect:admin\"]
         assert!(
             check_fleet_device_drift(&denied_only).is_none(),
             "Denied config.read must not be reported as drift"
-        );
-
-        // Unsynced local fleet devices check names missing peers and the exact push command.
-        assert!(check_unsynced_fleet_devices(&[]).is_none());
-        let unsynced = check_unsynced_fleet_devices(&["pi".to_owned(), "nas".to_owned()]).unwrap();
-        assert!(unsynced.ok && unsynced.warning);
-        assert!(unsynced.detail.contains("pi") && unsynced.detail.contains("nas"));
-        assert!(
-            unsynced
-                .hint
-                .as_deref()
-                .is_some_and(|h| h.contains("legion fleet.sync direction=push")),
-            "{:?}",
-            unsynced.hint
         );
     }
 }

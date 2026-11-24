@@ -31,7 +31,7 @@ use legion_os::lock::{FileLock, LockMode};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::{
     DEVICES_VERSION, DevicesFile, MergeApplyError, MergeChange, apply_devices_merge_blocking,
-    merge_devices, record_peer_device_ack,
+    merge_devices,
 };
 use legion_tools::device::sessions::{
     DEFAULT_TERMINATE_GRACE, terminate_device_sessions_for_target,
@@ -277,7 +277,7 @@ impl SharedDocument {
             );
             return Err(if *self == Self::Devices {
                 err.with_hint(
-                    "Sync devices.toml to every machine in fleet.toml (`legion fleet.sync direction=push documents='[\"devices.toml\"]'`), then run `legion device.list prune_tombstones=true` as owner to drop tombstones older than 400 days that every peer has acknowledged.",
+                    "Tombstones in devices.toml are permanent so removed devices cannot return; inspect devices.toml for unexpectedly large or corrupted entries.",
                 )
             } else {
                 err
@@ -635,7 +635,6 @@ struct WriteOutcome {
     hash_before: Option<String>,
     hash_after: String,
     backup: Option<String>,
-    canonical_content: Option<String>,
     warnings: Vec<String>,
 }
 
@@ -772,7 +771,6 @@ fn write_local_document_blocking(
         hash_before,
         hash_after,
         backup,
-        canonical_content: None,
         warnings: Vec::new(),
     })
 }
@@ -819,7 +817,7 @@ async fn apply_local_write(
                 ),
             )
             .with_hint(
-                "Sync devices.toml to every machine in fleet.toml (`legion fleet.sync direction=push documents='[\"devices.toml\"]'`), then run `legion device.list prune_tombstones=true` as owner to drop tombstones older than 400 days that every peer has acknowledged.",
+                "Tombstones in devices.toml are permanent so removed devices cannot return; inspect devices.toml for unexpectedly large or corrupted entries.",
             ));
         }
         if let Some(ref expected) = expect_hash {
@@ -1071,7 +1069,6 @@ async fn apply_local_write(
             hash_before,
             hash_after,
             backup: merge_outcome.backup,
-            canonical_content: Some(merge_outcome.canonical_toml),
             warnings: merge_outcome.warnings,
         });
     }
@@ -2147,20 +2144,12 @@ async fn sync_devices_document(
                 remote_after_push != remote_devices || (!remote.exists && !outgoing_is_empty);
 
             if !local_needs_tombstones && !remote_needs_push {
-                if !dry_run {
-                    let paths = ctx.paths().clone();
-                    let peer_name = machine.to_owned();
-                    let confirmed = outgoing.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        record_peer_device_ack(&paths, &peer_name, &confirmed)
-                    })
-                    .await;
-                    if local.hash == remote.hash
-                        && let Some(ref lh) = local.hash
-                        && last_synced_hash.as_deref() != Some(lh.as_str())
-                    {
-                        let _ = record_sidecar_async(&state_dir, &doc, machine, lh).await;
-                    }
+                if !dry_run
+                    && local.hash == remote.hash
+                    && let Some(ref lh) = local.hash
+                    && last_synced_hash.as_deref() != Some(lh.as_str())
+                {
+                    let _ = record_sidecar_async(&state_dir, &doc, machine, lh).await;
                 }
                 let extra_remote = remote_devices != local_after_tombstones;
                 let detail = extra_remote.then(|| {
@@ -2196,7 +2185,7 @@ async fn sync_devices_document(
                 };
             }
 
-            let mut current_local = local_devices.clone();
+            let current_local = local_devices.clone();
             let mut current_local_hash = local.hash.clone().unwrap_or_else(|| {
                 hash_bytes(local_devices.to_toml_string().as_bytes()).to_string()
             });
@@ -2210,7 +2199,6 @@ async fn sync_devices_document(
                     .iter()
                     .any(|(id, dev)| current_local.devices.get(id) != Some(dev));
             let mut tombstones_to_import = remote_tombstones_only;
-            let mut pushed_to_ack = DevicesFile::default();
 
             // 1. Push our outgoing entries to the peer FIRST so revocation tombstones leave this
             //    node even if a local step or an unrelated entry fails.
@@ -2243,7 +2231,6 @@ async fn sync_devices_document(
                         };
                         final_remote_hash = Some(written.hash.clone());
                         warnings.extend(written.warnings);
-                        pushed_to_ack = outgoing.clone();
                         // If the remote hash differs from ours, read back ONLY tombstones from
                         // the peer (never live device entries!).
                         if written.hash != current_local_hash
@@ -2298,13 +2285,6 @@ async fn sync_devices_document(
                                 && let Ok(written) =
                                     serde_json::from_value::<ConfigWriteResult>(val)
                             {
-                                let paths = ctx.paths().clone();
-                                let peer_name = machine.to_owned();
-                                let confirmed = tombs_only.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    record_peer_device_ack(&paths, &peer_name, &confirmed)
-                                })
-                                .await;
                                 warnings.extend(written.warnings);
                                 warnings.push(format!(
                                     "Tombstones were pushed to {machine}, but live device entries could not be pushed: {}",
@@ -2342,12 +2322,6 @@ async fn sync_devices_document(
                         local_backup = written.backup;
                         current_local_hash = written.hash_after;
                         warnings.extend(written.warnings);
-                        if let Some(canonical) = written.canonical_content
-                            && let Ok(parsed) =
-                                parse::<DevicesFile>(&local_path, canonical.as_bytes())
-                        {
-                            current_local = parsed;
-                        }
                     }
                     Err(error) => {
                         return DocSyncOutcome {
@@ -2362,22 +2336,6 @@ async fn sync_devices_document(
                         };
                     }
                 }
-            }
-
-            // Record that `machine` has now acknowledged every entry we pushed (and for owners,
-            // every tombstone we confirmed it already holds).
-            let paths = ctx.paths().clone();
-            let peer_name = machine.to_owned();
-            let confirmed = if caller_is_owner {
-                current_local.clone()
-            } else {
-                merge_devices(&pushed_to_ack, &tombstones_to_import)
-            };
-            if !confirmed.is_empty() {
-                let _ = tokio::task::spawn_blocking(move || {
-                    record_peer_device_ack(&paths, &peer_name, &confirmed)
-                })
-                .await;
             }
 
             let converged = final_remote_hash.as_deref() == Some(current_local_hash.as_str());
@@ -2411,20 +2369,12 @@ async fn sync_devices_document(
             let local_up_to_date =
                 local_devices == merged && (merged_is_empty || local_file_exists);
             if local_up_to_date {
-                if !dry_run {
-                    let paths = ctx.paths().clone();
-                    let peer_name = machine.to_owned();
-                    let confirmed = remote_devices.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        record_peer_device_ack(&paths, &peer_name, &confirmed)
-                    })
-                    .await;
-                    if local.hash == remote.hash
-                        && let Some(ref lh) = local.hash
-                        && last_synced_hash.as_deref() != Some(lh.as_str())
-                    {
-                        let _ = record_sidecar_async(&state_dir, &doc, machine, lh).await;
-                    }
+                if !dry_run
+                    && local.hash == remote.hash
+                    && let Some(ref lh) = local.hash
+                    && last_synced_hash.as_deref() != Some(lh.as_str())
+                {
+                    let _ = record_sidecar_async(&state_dir, &doc, machine, lh).await;
                 }
                 return DocSyncOutcome {
                     status: SyncStatus::Same,
@@ -2471,13 +2421,6 @@ async fn sync_devices_document(
             match apply_local_write(ctx, SharedDocument::Devices, remote_content, None, false).await
             {
                 Ok(written) => {
-                    let paths = ctx.paths().clone();
-                    let peer_name = machine.to_owned();
-                    let confirmed = remote_devices.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        record_peer_device_ack(&paths, &peer_name, &confirmed)
-                    })
-                    .await;
                     let converged = remote.hash.as_deref() == Some(written.hash_after.as_str());
                     if converged
                         && let Err(error) =
@@ -3787,7 +3730,8 @@ role = \"phone_admin\"
         assert_eq!(read["exists"], json!(false), "{read}");
         assert!(read["content"].is_null(), "{read}");
 
-        // Exceeding MAX_DOCUMENT_BYTES on devices.toml gives a clear error with prune hint.
+        // Exceeding MAX_DOCUMENT_BYTES on devices.toml gives a clear error explaining that
+        // tombstones are permanent.
         let huge = "a".repeat(MAX_DOCUMENT_BYTES + 16);
         let err = node
             .call(Call::new(
@@ -3799,10 +3743,12 @@ role = \"phone_admin\"
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgs);
         assert!(
-            err.hint
-                .as_deref()
-                .is_some_and(|h| h.contains("prune_tombstones") && h.contains("400")),
-            "expected prune hint on size limit error: {err:?}"
+            err.message.contains("configuration limit")
+                && err
+                    .hint
+                    .as_deref()
+                    .is_some_and(|h| h.contains("permanent") && !h.contains("prune_tombstones")),
+            "expected clear permanent-tombstone size limit error: {err:?}"
         );
     }
 }

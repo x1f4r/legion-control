@@ -74,7 +74,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.list",
         Effect::Admin,
-        "List paired devices (from devices.toml, adopting state-matched --pairing lines on first run and listing any unmatched local-only lines) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. Reports which machines in fleet.toml have not yet received each device (with the exact `fleet.sync` command to push them). Pass `prune_tombstones=true` (owner role only) to drop tombstones older than 400 days that every fleet machine has acknowledged. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).",
+        "List paired devices (from devices.toml, adopting state-matched --pairing lines on first run and listing any unmatched local-only lines) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).",
         list,
     );
     registry.add_fn(
@@ -1040,12 +1040,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
 /// Arguments of `device.list`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ListArgs {
-    /// Drop tombstones in `devices.toml` older than 400 days that every machine in `fleet.toml`
-    /// has acknowledged (owner role only). Off unless given as true.
-    #[serde(default)]
-    prune_tombstones: bool,
-}
+struct ListArgs {}
 
 /// What `device.list` returns.
 #[derive(Debug, Serialize)]
@@ -1054,10 +1049,6 @@ struct ListResult {
     invites: Vec<ListedInvite>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sync_hint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pruned_tombstones: Option<registry::PruneTombstonesResult>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1080,8 +1071,6 @@ struct ListedDevice {
     paired_on: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    not_synced_to: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     home: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
@@ -1111,43 +1100,16 @@ struct ListedInvite {
     missing_home: bool,
 }
 
-async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
+async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
     let caller = Caller::of(ctx)?;
     let caller_is_owner = caller.is_owner();
-    if args.prune_tombstones && !caller_is_owner {
-        return Err(ErrorBody::new(
-            ErrorCode::Denied,
-            "Only a caller with the owner role may prune acknowledged device tombstones.",
-        )
-        .with_hint(
-            "Run `legion device.list prune_tombstones=true` as the owner of this machine.",
-        ));
-    }
     let node_file = ctx.config().get::<NodeFile>()?;
     let policy = ctx.config().get::<Policy>()?;
     let node_name = ctx.node_name().to_owned();
     let paths = ctx.paths().clone();
     let paths_for_sessions = paths.clone();
-    let prune_tombstones = args.prune_tombstones;
 
-    let pruned_tombstones = if prune_tombstones {
-        let paths_for_prune = paths.clone();
-        let node_for_prune = node_name.clone();
-        Some(
-            blocking(move || {
-                registry::prune_acknowledged_tombstones_blocking(
-                    &paths_for_prune,
-                    &node_for_prune,
-                    Timestamp::now(),
-                )
-            })
-            .await?,
-        )
-    } else {
-        None
-    };
-
-    let (raw_devices, raw_invites, removed_stale, warnings, unsynced_fleet) = blocking(move || {
+    let (raw_devices, raw_invites, removed_stale, warnings) = blocking(move || {
         let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
         let caller_account = caller_account_for_target(&target)?;
@@ -1217,10 +1179,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
         }
         sessions::sweep_stale_sessions(&paths);
 
-        let fleet_peers = registry::fleet_peer_names(&paths, &node_name);
-        let acks = registry::load_device_acks(&paths);
-        let mut unsynced_fleet = std::collections::BTreeSet::new();
-
         let mut own_devices: Vec<ListedDevice> = devices_file
             .devices
             .iter()
@@ -1246,15 +1204,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                 } else {
                     (false, None)
                 };
-                let not_synced_to = registry::unsynced_peers_for_device(
-                    id,
-                    &entry.updated_at,
-                    &fleet_peers,
-                    &acks,
-                );
-                for peer in &not_synced_to {
-                    unsynced_fleet.insert(peer.clone());
-                }
                 ListedDevice {
                     id: Some(id.clone()),
                     name: entry.name.clone(),
@@ -1264,7 +1213,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                     added: Some(entry.paired_at.clone()),
                     paired_on: Some(entry.paired_on.clone()),
                     status,
-                    not_synced_to,
                     home: None,
                     foreign: false,
                     quarantined,
@@ -1273,17 +1221,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                 }
             })
             .collect();
-        for id in devices_file.removed.keys() {
-            for peer in &fleet_peers {
-                if !acks
-                    .peers
-                    .get(peer.as_str())
-                    .is_some_and(|rec| rec.removed.contains(id))
-                {
-                    unsynced_fleet.insert(peer.clone());
-                }
-            }
-        }
         own_devices.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
 
         let mut devices = own_devices;
@@ -1327,7 +1264,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                                 "local-only: present in authorized_keys but not in devices.toml and never synced to peers; pair again with `legion pair` or remove with `legion device.remove`"
                                     .to_owned(),
                             ),
-                            not_synced_to: Vec::new(),
                             home: None,
                             foreign: false,
                             quarantined: false,
@@ -1351,7 +1287,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                         added: None,
                         paired_on: None,
                         status: None,
-                        not_synced_to: Vec::new(),
                         home: home.as_ref().map(PinnedHome::display_label),
                         foreign: true,
                         quarantined: false,
@@ -1421,7 +1356,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             invites,
             report.removed_targets,
             report.warnings,
-            unsynced_fleet.into_iter().collect::<Vec<String>>(),
         ))
     })
     .await?;
@@ -1456,21 +1390,10 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             .collect()
     };
 
-    let sync_hint = if !unsynced_fleet.is_empty() && (caller_is_owner || !devices.is_empty()) {
-        Some(format!(
-            "Machine(s) not yet up to date with local devices: {}. Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` to push local devices to them.",
-            unsynced_fleet.join(", ")
-        ))
-    } else {
-        None
-    };
-
     Ok(ListResult {
         devices,
         invites,
         warnings,
-        sync_hint,
-        pruned_tombstones,
     })
 }
 
