@@ -48,7 +48,61 @@ const fn libc_esrch() -> i32 {
     Errno::ESRCH as i32
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod macos_proc {
+    use std::mem::{size_of, zeroed};
+
+    use crate::procid::ProcessId;
+    use crate::{OsError, Result};
+
+    // Darwin `<sys/proc.h>` `SZOMB` state indicating an exited, unreaped zombie process.
+    const SZOMB: u32 = 5;
+
+    pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
+        let Ok(raw_pid) = i32::try_from(pid) else {
+            return Err(OsError::InvalidArgument {
+                detail: format!("pid {pid} exceeds Unix pid_t range"),
+            });
+        };
+
+        // SAFETY: `libc::proc_bsdinfo` is a plain C struct safe to zero-initialize; `proc_pidinfo`
+        // writes at most `size_of::<libc::proc_bsdinfo>()` bytes into `info` and returns the byte
+        // count written (0 or negative when the PID does not exist or cannot be queried).
+        let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+        let expected = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                raw_pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                expected,
+            )
+        };
+        if written != expected {
+            return Ok(None);
+        }
+        if !include_zombie && info.pbi_status == SZOMB {
+            return Ok(None);
+        }
+        let start_us = info
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec);
+        if start_us == 0 {
+            return Ok(None);
+        }
+        Ok(Some(ProcessId::new(pid, start_us)))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
+    macos_proc::of_pid(pid, include_zombie)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
     let mut system = System::new().map_err(|err| OsError::Platform {
         detail: format!("failed to initialize system process view: {err}"),

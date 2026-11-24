@@ -11,6 +11,8 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{OsError, Result};
 
 /// Tolerance applied by [`same_boot`] when comparing time-derived boot IDs (such as Windows
@@ -34,16 +36,21 @@ static CACHED_BOOT_ID: OnceLock<String> = OnceLock::new();
 /// Unambiguous identity of a process within a single system boot.
 ///
 /// Comparing two [`ProcessId`] values checks both `pid` and `start_time` so a recycled PID
-/// never masquerades as an earlier process.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+/// never masquerades as an earlier process. The serialized representation (`{ pid, start_time }`)
+/// is stable across releases for persistence in job records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ProcessId {
     /// Operating system process identifier.
     pub pid: u32,
-    /// Kernel start timestamp for the process.
+    /// Full-precision kernel start timestamp for the process.
     ///
-    /// On Linux this is the monotonic tick count since boot from `/proc/<pid>/stat` field 22,
-    /// which is unaffected by wall-clock jumps. On macOS and Windows it is the process creation
-    /// timestamp in seconds since the Unix epoch.
+    /// Units per platform (never compared across machines or operating systems):
+    /// - **Linux:** clock ticks (jiffies) since boot from `/proc/<pid>/stat` field 22, immune to
+    ///   wall-clock adjustments.
+    /// - **macOS:** microseconds since the Unix epoch from `proc_bsdinfo`
+    ///   (`pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`).
+    /// - **Windows:** 100-nanosecond `FILETIME` ticks since 1601-01-01 UTC from
+    ///   `GetProcessTimes` (`CreationTime`).
     pub start_time: u64,
 }
 
@@ -172,9 +179,11 @@ fn parse_prefixed_u64(value: &str, prefix: &str) -> Option<u64> {
 ///
 /// On Unix, signals both the target's process group (when the target leads its own group distinct
 /// from ours) and every discovered descendant with `SIGTERM`, waits up to `grace`, and escalates
-/// any survivors to `SIGKILL`. On Windows, runs `taskkill /T /F` against the root and any
-/// orphaned descendants discovered in the process table. Returns only after every tracked process
-/// has exited or the post-kill settle period elapses, reporting any survivors.
+/// any survivors to `SIGKILL`. On Windows, opens each target and descendant handle with
+/// `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verifies its exact 100-ns `FILETIME`
+/// creation time while the held handle pins the PID, and calls `TerminateProcess` through that
+/// handle. Returns only once every tracked process has exited or the post-kill settle period
+/// elapses, reporting any survivors.
 pub async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
     if identity.pid == 0 {
         return Err(OsError::InvalidArgument {
@@ -323,6 +332,15 @@ mod tests {
         assert!(!original.matches(&recycled));
         assert_ne!(original, recycled);
         assert!(!original.matches(&different_pid));
+    }
+
+    #[test]
+    fn process_id_serializes_with_stable_schema() {
+        let id = ProcessId::new(1234, 133_700_000_000_000_001);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, r#"{"pid":1234,"start_time":133700000000000001}"#);
+        let decoded: ProcessId = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, id);
     }
 
     #[test]

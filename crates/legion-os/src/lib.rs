@@ -13,5 +13,7 @@ pub mod lock;
 pub mod procid;
 pub mod run;
 pub mod shell;
+#[cfg(windows)]
+mod win_proc;
 
 pub use error::{OsError, Result};
