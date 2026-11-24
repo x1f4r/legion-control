@@ -508,6 +508,179 @@ fn configure_common_cmd(
     cmd.stdin(Stdio::null())
         .stdout(stdout_stdio)
         .stderr(stderr_stdio);
+    // Ensure no caller file descriptors above stdio (fd >= 3, such as extra pipes or redirected
+    // descriptors) survive into the detached process across either `systemd-run --scope` or
+    // direct `setsid` launches.
+    close_fds::install_cloexec_above_stdio(cmd);
+}
+
+#[allow(unsafe_code)]
+mod close_fds {
+    use std::os::unix::process::CommandExt;
+
+    pub(super) fn install_cloexec_above_stdio(cmd: &mut std::process::Command) {
+        // SAFETY: The closure runs in the forked child immediately before `exec`. Every call it
+        // makes (`syscall(SYS_close_range)`, `open`, `syscall(SYS_getdents64)`, `fcntl`, `close`,
+        // `getrlimit`) is async-signal-safe and performs zero heap allocations. Setting
+        // `FD_CLOEXEC` (rather than closing immediately) preserves Rust's internal `O_CLOEXEC`
+        // exec-error pipe while guaranteeing the kernel closes every fd >= 3 at `exec`.
+        unsafe {
+            cmd.pre_exec(|| {
+                mark_fds_cloexec_from_3();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn mark_fds_cloexec_from_3() {
+        // Fast path (Linux >= 5.11): mark all open fds >= 3 close-on-exec in one kernel call.
+        // SAFETY: `SYS_close_range` with `CLOSE_RANGE_CLOEXEC` is an async-signal-safe syscall
+        // with no heap allocation.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if rc == 0 {
+            return;
+        }
+
+        // Fallback when `close_range` is unavailable (older kernel or seccomp): walk
+        // `/proc/self/fd` with raw `open` + `SYS_getdents64` into a fixed stack buffer.
+        if unsafe { mark_proc_self_fd_cloexec() } {
+            return;
+        }
+
+        // Last resort when `/proc` is not mounted.
+        unsafe { mark_rlimit_cloexec() };
+    }
+
+    #[cfg(target_os = "freebsd")]
+    unsafe fn mark_fds_cloexec_from_3() {
+        // SAFETY: `close_range` is an async-signal-safe syscall with no heap allocation.
+        if unsafe {
+            libc::close_range(
+                3,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+            )
+        } == 0
+        {
+            return;
+        }
+        unsafe { mark_rlimit_cloexec() };
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    unsafe fn mark_fds_cloexec_from_3() {
+        // On macOS and other POSIX targets without `close_range`, avoid `opendir("/dev/fd")`
+        // because `opendir` calls `malloc` (not async-signal-safe in `pre_exec`); sweep
+        // `fcntl(fd, F_SETFD, FD_CLOEXEC)` across `3..RLIMIT_NOFILE` instead.
+        unsafe { mark_rlimit_cloexec() };
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn mark_proc_self_fd_cloexec() -> bool {
+        // SAFETY: Static NUL-terminated path; raw `open` is async-signal-safe and allocates nothing.
+        let dir_fd = unsafe {
+            libc::open(
+                c"/proc/self/fd".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if dir_fd < 0 {
+            return false;
+        }
+
+        let mut buf = [0u8; 4096];
+        loop {
+            // SAFETY: `dir_fd` is a valid directory descriptor and `buf` is a stack-allocated
+            // writable byte array; `SYS_getdents64` is async-signal-safe.
+            let n =
+                unsafe { libc::syscall(libc::SYS_getdents64, dir_fd, buf.as_mut_ptr(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let len = n as usize;
+            let mut offset = 0usize;
+            while offset + 19 < len {
+                // Stable Linux kernel `struct linux_dirent64` layout:
+                // d_ino (8) + d_off (8) + d_reclen (2) + d_type (1) + d_name (NUL-terminated).
+                let reclen = u16::from_ne_bytes([buf[offset + 16], buf[offset + 17]]) as usize;
+                if reclen == 0 || offset + reclen > len {
+                    break;
+                }
+                let name = &buf[offset + 19..offset + reclen];
+                if let Some(fd) = parse_fd_name(name)
+                    && fd >= 3
+                    && fd != dir_fd
+                {
+                    // SAFETY: `fcntl(F_SETFD, FD_CLOEXEC)` is async-signal-safe; EBADF is ignored.
+                    let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                }
+                offset += reclen;
+            }
+        }
+
+        // SAFETY: `dir_fd` was opened above and is closed once.
+        let _ = unsafe { libc::close(dir_fd) };
+        true
+    }
+
+    unsafe fn mark_rlimit_cloexec() {
+        const MAX_SWEEP: u64 = 65_536;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` is async-signal-safe and writes into stack-allocated `limit`.
+        let upper = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            #[allow(clippy::unnecessary_cast)]
+            let cur = limit.rlim_cur as u64;
+            if cur == 0 || cur > MAX_SWEEP {
+                MAX_SWEEP
+            } else {
+                cur
+            }
+        } else {
+            1024
+        };
+
+        let mut fd: libc::c_int = 3;
+        while (fd as u64) < upper {
+            // SAFETY: `fcntl(F_SETFD, FD_CLOEXEC)` is async-signal-safe; invalid fds return EBADF.
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            fd += 1;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn parse_fd_name(bytes: &[u8]) -> Option<libc::c_int> {
+        let mut acc: i64 = 0;
+        let mut saw_digit = false;
+        for &b in bytes {
+            if b == 0 {
+                break;
+            }
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            saw_digit = true;
+            acc = acc.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            if acc > i64::from(libc::c_int::MAX) {
+                return None;
+            }
+        }
+        if saw_digit {
+            Some(acc as libc::c_int)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -625,6 +798,18 @@ fn ensure_target_exists(program: &OsStr, options: &DetachOptions) -> Result<()> 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_fd_name_accepts_non_negative_integers_only() {
+        assert_eq!(close_fds::parse_fd_name(b"0\0"), Some(0));
+        assert_eq!(close_fds::parse_fd_name(b"3\0junk"), Some(3));
+        assert_eq!(close_fds::parse_fd_name(b"1024\0"), Some(1024));
+        assert_eq!(close_fds::parse_fd_name(b".\0"), None);
+        assert_eq!(close_fds::parse_fd_name(b"..\0"), None);
+        assert_eq!(close_fds::parse_fd_name(b"\0"), None);
+        assert_eq!(close_fds::parse_fd_name(b"3a\0"), None);
+        assert_eq!(close_fds::parse_fd_name(b"99999999999999999999\0"), None);
+    }
 
     #[tokio::test]
     async fn confirm_scope_entry_reports_stderr_on_early_exit() {

@@ -86,6 +86,10 @@ fn main() -> ExitCode {
             || Box::pin(test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop()),
         ),
         (
+            "detach_does_not_inherit_extra_open_file_descriptors",
+            || Box::pin(test_detach_does_not_inherit_extra_open_file_descriptors()),
+        ),
+        (
             "procid_kill_tree_leaves_process_untouched_on_mismatched_start_time",
             || Box::pin(test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time()),
         ),
@@ -184,6 +188,8 @@ fn run_helper(mode: &str) -> ExitCode {
         "lock_holder" => helper_lock_holder(&args),
         "count_sigterm" => helper_count_sigterm(),
         "orphan_root_exit" => helper_orphan_root_exit(&args),
+        "detach_fd_parent" => helper_detach_fd_parent(&args),
+        "report_open_fds" => helper_report_open_fds(&args),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -505,6 +511,81 @@ fn helper_orphan_root_exit(args: &[String]) -> ExitCode {
         std::thread::sleep(Duration::from_millis(15));
     }
 
+    ExitCode::SUCCESS
+}
+
+fn helper_detach_fd_parent(args: &[String]) -> ExitCode {
+    let handle_file = PathBuf::from(&args[0]);
+    let report_file = args[1].clone();
+    let canary_file = PathBuf::from(&args[2]);
+    let disable_systemd = args.get(3).is_some_and(|s| s == "--no-systemd");
+
+    // Verify fd 3 really is open and points to `canary_file` in the parent calling spawn_detached.
+    #[cfg(target_os = "linux")]
+    {
+        let fd3_target = fs::read_link("/proc/self/fd/3")
+            .expect("expected inheritable fd 3 to be open in parent");
+        assert_eq!(
+            fs::canonicalize(&fd3_target).unwrap(),
+            fs::canonicalize(&canary_file).unwrap(),
+            "fd 3 in parent did not point to canary file"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = canary_file;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("helper tokio runtime");
+
+    let mut opts = DetachOptions::new(CommandSpec::argv(current_exe(), [report_file]))
+        .name("fd-leak-check")
+        .env(HELPER_ENV, "report_open_fds");
+    if disable_systemd {
+        // Point XDG_RUNTIME_DIR at a nonexistent path so `systemd-run --user` is unreachable and
+        // `spawn_detached` exercises the direct `setsid` branch too.
+        opts = opts
+            .env("XDG_RUNTIME_DIR", "/nonexistent-legion-fd-test-dir")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent-legion-bus",
+            );
+    }
+
+    let handle = rt
+        .block_on(spawn_detached(opts))
+        .expect("spawn_detached failed inside detach_fd_parent");
+
+    let serialized = serde_json::to_string(&handle).expect("failed to serialize DetachHandle");
+    write_atomic(&handle_file, serialized.as_bytes(), WriteOptions::default())
+        .expect("failed to write DetachHandle");
+    ExitCode::SUCCESS
+}
+
+fn helper_report_open_fds(args: &[String]) -> ExitCode {
+    let report_file = Path::new(&args[0]);
+    let mut lines: Vec<String> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(entries) = fs::read_dir("/proc/self/fd") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let target = fs::read_link(entry.path())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_owned());
+                lines.push(format!("{name}->{target}"));
+            }
+        }
+    }
+    lines.sort();
+    write_atomic(
+        report_file,
+        (lines.join("\n") + "\n").as_bytes(),
+        WriteOptions::default(),
+    )
+    .expect("failed to write open fd report");
+    std::thread::sleep(Duration::from_secs(30));
     ExitCode::SUCCESS
 }
 
@@ -1008,6 +1089,64 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
         .unwrap();
     assert!(r1.all_gone);
     assert!(!procid::is_alive(&h1.process));
+}
+
+async fn test_detach_does_not_inherit_extra_open_file_descriptors() {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let canary = dir.path().join("leaked-canary-fd3.txt");
+        let canary_str = canary.to_string_lossy().into_owned();
+        let exe_str = current_exe().to_string_lossy().into_owned();
+
+        // Exercise both the default Linux branch (`systemd-run --user --scope` when available)
+        // and the direct `setsid` fallback branch (`--no-systemd`).
+        for (label, extra_flag) in [("systemd", ""), ("setsid", "--no-systemd")] {
+            let handle_file = dir.path().join(format!("fd-handle-{label}.json"));
+            let report_file = dir.path().join(format!("fd-report-{label}.txt"));
+            let handle_str = handle_file.to_string_lossy().into_owned();
+            let report_str = report_file.to_string_lossy().into_owned();
+
+            // `exec 3>"$1"` opens `canary` on fd 3 WITHOUT O_CLOEXEC, matching `cmd ... 3>/file`.
+            let mut cmd = Command::new("sh");
+            cmd.args([
+                "-c",
+                "exec 3>\"$1\"; shift; exec \"$@\"",
+                "_",
+                &canary_str,
+                &exe_str,
+                &handle_str,
+                &report_str,
+                &canary_str,
+            ]);
+            if !extra_flag.is_empty() {
+                cmd.arg(extra_flag);
+            }
+            let status = cmd
+                .env(HELPER_ENV, "detach_fd_parent")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .status()
+                .unwrap();
+            assert!(status.success(), "detach_fd_parent ({label}) failed");
+
+            let handle_json = wait_for_file(&handle_file, Duration::from_secs(5)).await;
+            let handle: DetachHandle = serde_json::from_str(&handle_json).unwrap();
+            let fd_report = wait_for_file(&report_file, Duration::from_secs(5)).await;
+
+            assert!(
+                !fd_report.contains("leaked-canary-fd3.txt"),
+                "detached child ({label}) inherited caller's fd 3 canary file:\n{fd_report}"
+            );
+
+            let stop = stop_detached(&handle, Duration::from_millis(300))
+                .await
+                .unwrap();
+            assert!(stop.all_gone);
+            assert!(!procid::is_alive(&handle.process));
+        }
+    }
 }
 
 async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time() {
