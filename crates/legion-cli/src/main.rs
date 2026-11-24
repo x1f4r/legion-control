@@ -388,7 +388,9 @@ async fn gate(
         if let Err(error) = auth_check {
             err(&format!("legion gate: {}\n", error.message));
             router.shutdown().await;
-            if let Some(guard) = session.take() {
+            if error.code == ErrorCode::Denied
+                && let Some(guard) = session.take()
+            {
                 guard.reject_and_terminate_parent().await;
             }
             return ExitCode::from(FAILED);
