@@ -367,7 +367,9 @@ pub(crate) fn windows_cmdline_escape(arg: &str) -> String {
 ///
 /// With plain `-Command`, Windows PowerShell decodes stdin and encodes stdout in the active OEM
 /// code page and collapses failing native exit codes to `1`. Running this wrapper fixes all three
-/// for Windows PowerShell 5.1 and PowerShell 7.
+/// for Windows PowerShell 5.1 and PowerShell 7. The console encodings can only be set where the
+/// process has a console; where it has none, setting them throws ("The handle is invalid"), and
+/// the command runs anyway with the defaults rather than failing over it.
 #[allow(dead_code)]
 pub(crate) fn build_powershell_shell_wrapper(command: &str) -> String {
     build_powershell_shell_wrapper_with_cleanup(command, None)
@@ -386,9 +388,10 @@ pub(crate) fn build_powershell_shell_wrapper_with_cleanup(
         ));
     }
     lines.extend([
-        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)".to_owned(),
-        "[Console]::InputEncoding = [Console]::OutputEncoding".to_owned(),
-        "$OutputEncoding = [Console]::OutputEncoding".to_owned(),
+        "$__legion_utf8 = New-Object System.Text.UTF8Encoding($false)".to_owned(),
+        "try { [Console]::OutputEncoding = $__legion_utf8 } catch { }".to_owned(),
+        "try { [Console]::InputEncoding = $__legion_utf8 } catch { }".to_owned(),
+        "$OutputEncoding = $__legion_utf8".to_owned(),
         "$global:LASTEXITCODE = $null".to_owned(),
         "$__legion_err_count = $Error.Count".to_owned(),
         command.to_owned(),
@@ -660,13 +663,10 @@ mod tests {
     fn powershell_shell_wrapper_sets_utf8_preserves_exit_code_and_round_trips_base64() {
         let cmd = "git status --short; echo 'caf\u{00e9}'";
         let wrapper = build_powershell_shell_wrapper(cmd);
-        assert!(
-            wrapper.contains(
-                "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)"
-            )
-        );
-        assert!(wrapper.contains("[Console]::InputEncoding = [Console]::OutputEncoding"));
-        assert!(wrapper.contains("$OutputEncoding = [Console]::OutputEncoding"));
+        assert!(wrapper.contains("$__legion_utf8 = New-Object System.Text.UTF8Encoding($false)"));
+        assert!(wrapper.contains("try { [Console]::OutputEncoding = $__legion_utf8 } catch { }"));
+        assert!(wrapper.contains("try { [Console]::InputEncoding = $__legion_utf8 } catch { }"));
+        assert!(wrapper.contains("$OutputEncoding = $__legion_utf8"));
         assert!(wrapper.contains("$global:LASTEXITCODE = $null"));
         assert!(wrapper.contains("$__legion_err_count = $Error.Count"));
         assert!(wrapper.contains(cmd));
@@ -681,6 +681,80 @@ mod tests {
         let encoded = encode_utf16le_base64(&wrapper);
         let decoded = decode_utf16le_base64(&encoded);
         assert_eq!(decoded, wrapper);
+    }
+
+    /// The wrapper under Windows PowerShell 5.1, which every Windows has, and PowerShell 7 where
+    /// it is installed; with stdin and without; with a console that has no window, as `run` and
+    /// `detach` start it, and with no console at all, where the encodings cannot be set.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_wrapper_runs_under_both_editions_with_and_without_stdin_or_a_console() {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        use windows::Win32::System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let text = "caf\u{e9} \u{2713} \u{65e5}\u{672c} \u{1f600}\nsecond line\n";
+        let mut programs = vec![OsString::from("powershell.exe")];
+        let extensions = parse_pathext(std::env::var_os("PATHEXT").as_deref());
+        if let Some(pwsh) =
+            find_executable_in_paths("pwsh", std::env::var_os("PATH").as_deref(), &extensions)
+        {
+            programs.push(pwsh.into_os_string());
+        }
+        for program in programs {
+            for (flags, console) in [(CREATE_NO_WINDOW.0, true), (DETACHED_PROCESS.0, false)] {
+                for with_stdin in [true, false] {
+                    let command = if with_stdin {
+                        "[Console]::Out.Write([Console]::In.ReadToEnd())"
+                    } else {
+                        "[Console]::Out.Write('no stdin'); [Console]::In.ReadToEnd() | Out-Null"
+                    };
+                    let resolved =
+                        resolve_powershell_command(program.clone(), command, dir.path()).unwrap();
+                    let mut child = Command::new(&resolved.program);
+                    child
+                        .args(&resolved.args)
+                        .creation_flags(flags)
+                        .stdin(if with_stdin {
+                            Stdio::piped()
+                        } else {
+                            Stdio::null()
+                        })
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    for name in &resolved.env_remove {
+                        child.env_remove(name);
+                    }
+                    let mut child = child.spawn().unwrap();
+                    if with_stdin {
+                        child
+                            .stdin
+                            .take()
+                            .unwrap()
+                            .write_all(text.as_bytes())
+                            .unwrap();
+                    }
+                    let out = child.wait_with_output().unwrap();
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let case = format!("{program:?} console={console} stdin={with_stdin}");
+                    assert!(out.status.success(), "{case}: {stdout} {stderr}");
+                    let lower = stderr.to_lowercase();
+                    assert!(
+                        !lower.contains("handle is invalid") && !lower.contains("encoding"),
+                        "{case}: {stderr}"
+                    );
+                    if !with_stdin {
+                        assert_eq!(stdout, "no stdin", "{case}");
+                    } else if console {
+                        assert_eq!(stdout, text, "{case}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
