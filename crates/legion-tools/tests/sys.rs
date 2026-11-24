@@ -151,11 +151,11 @@ async fn start_time_of(fixture: &Fixture, pid: u32) -> String {
 
 async fn kill_stops_a_child_and_only_that_child() {
     let fixture = Fixture::new();
-    let mut child = spawn_helper("sleep", &["60"]);
-    let pid = child.id();
-    wait_for(Duration::from_secs(10), || alive(pid).then_some(()))
-        .await
-        .unwrap();
+    let pids = fixture.dir.path().join("pids");
+    let mut child = spawn_helper("family", &[&pids.to_string_lossy()]);
+    let family = read_pids(&pids).await;
+    let (pid, grandchild) = (family[0], family[1]);
+    assert_eq!(pid, child.id());
     let start_time = start_time_of(&fixture, pid).await;
     let killed = fixture
         .call("sys.kill", json!({"pid": pid, "start_time": start_time}))
@@ -167,12 +167,21 @@ async fn kill_stops_a_child_and_only_that_child() {
     );
     let status = child.wait().unwrap();
     assert!(!status.success());
+    // Without `tree`, what the process started is left running.
+    assert!(alive(grandchild), "the grandchild was stopped too");
 
     let error = fixture
         .call("sys.kill", json!({"pid": pid}))
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::NotFound, "{}", error.message);
+
+    let killed = fixture
+        .call("sys.kill", json!({"pid": grandchild, "force": true}))
+        .await
+        .unwrap();
+    assert_eq!(killed["stopped"], json!(true), "{killed}");
+    assert!(gone(grandchild).await);
 }
 
 async fn kill_tree_stops_the_descendants_too() {

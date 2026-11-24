@@ -7,14 +7,13 @@
 
 mod disks;
 mod gpu;
-mod stop;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Ctx, NoArgs, Registry, ToolError};
-use legion_os::procid;
+use legion_os::procid::{self, ProcessId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -431,14 +430,7 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
         })
         .transpose()?;
 
-    let (identity, started) = blocking(move || {
-        let started = start_time_of(pid)?;
-        let identity =
-            procid::of_pid(pid).map_err(|error| failed(&format!("read process {pid}"), &error))?;
-        Ok(identity.zip(started))
-    })
-    .await?
-    .ok_or_else(|| {
+    let (identity, started) = blocking(move || identify(pid)).await?.ok_or_else(|| {
         ErrorBody::new(
             ErrorCode::NotFound,
             format!("There is no process {pid} on this machine."),
@@ -465,6 +457,8 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     } else {
         KILL_GRACE
     };
+    // The identity read above goes all the way down: legion-os checks it again at the moment it
+    // signals, so a process that exits meanwhile and whose id is reused is never hit.
     let survivors = if args.tree {
         let report = procid::kill_tree(&identity, grace)
             .await
@@ -475,7 +469,10 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
             .map(|survivor| survivor.pid)
             .collect()
     } else {
-        stop::one(identity, grace).await?
+        let gone = procid::kill_process(&identity, args.force, grace)
+            .await
+            .map_err(|error| failed(&format!("stop process {pid}"), &error))?;
+        if gone { Vec::new() } else { vec![pid] }
     };
     Ok(Killed {
         pid,
@@ -484,9 +481,18 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     })
 }
 
-/// When a live process started, in seconds since the epoch, or `None` when there is no such
-/// process. The same clock `sys.procs` reports, so a time read back from it compares equal.
-fn start_time_of(pid: u32) -> Result<Option<u64>, ErrorBody> {
+/// The identity of a live process and when it started, in seconds since the epoch, or `None`
+/// when there is no such process.
+///
+/// The seconds are what `sys.procs` reports and a caller passes back; the identity is what
+/// legion-os stops by. Both are read for the same process: the identity is read before and after
+/// the start time, and a process that changed in between counts as gone.
+fn identify(pid: u32) -> Result<Option<(ProcessId, u64)>, ErrorBody> {
+    let read =
+        || procid::of_pid(pid).map_err(|error| failed(&format!("read process {pid}"), &error));
+    let Some(identity) = read()? else {
+        return Ok(None);
+    };
     let mut system = System::new().map_err(|error| failed("look the process up", &error))?;
     let target = Pid::from_u32(pid);
     system.refresh_processes_specifics(
@@ -494,7 +500,11 @@ fn start_time_of(pid: u32) -> Result<Option<u64>, ErrorBody> {
         true,
         ProcessRefreshKind::nothing(),
     );
-    Ok(system.process(target).map(sysinfo::Process::start_time))
+    let started = system.process(target).map(sysinfo::Process::start_time);
+    match (started, read()?) {
+        (Some(started), Some(again)) if again.matches(&identity) => Ok(Some((identity, started))),
+        _ => Ok(None),
+    }
 }
 
 /// Seconds since the epoch as RFC 3339 UTC.
