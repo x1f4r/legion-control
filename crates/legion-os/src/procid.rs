@@ -274,6 +274,30 @@ fn read_boot_id_impl() -> Result<String> {
     })
 }
 
+/// Return `true` while `identity` itself or any surviving process belonging to its tree/session
+/// (using the same verified ownership rule as [`kill_tree`]) is still running.
+///
+/// Runs all OS queries off the async executor via `spawn_blocking` and performs no writes or
+/// signaling.
+pub(crate) async fn tree_is_active(identity: &ProcessId) -> Result<bool> {
+    if identity.pid == 0 {
+        return Ok(false);
+    }
+    tree_is_active_impl(identity).await
+}
+
+#[cfg(any(unix, windows))]
+async fn tree_is_active_impl(identity: &ProcessId) -> Result<bool> {
+    platform::tree_is_active(identity).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn tree_is_active_impl(_identity: &ProcessId) -> Result<bool> {
+    Err(OsError::Unsupported {
+        detail: "process tree liveness check is not supported on this platform".into(),
+    })
+}
+
 #[cfg(any(unix, windows))]
 fn is_protected_impl(identity: &ProcessId) -> Option<&'static str> {
     platform::is_protected(identity)

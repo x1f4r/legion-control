@@ -304,6 +304,95 @@ async fn confirm_scope_entry(
     }
 }
 
+pub(super) async fn detached_active(handle: &DetachHandle) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    if let Some(ref unit) = handle.systemd_unit {
+        return systemd_scope_active(unit, &handle.process).await;
+    }
+
+    procid::tree_is_active(&handle.process).await
+}
+
+#[cfg(target_os = "linux")]
+async fn systemd_scope_active(unit: &str, root_process: &ProcessId) -> Result<bool> {
+    let unit_owned = unit.to_owned();
+    let root = *root_process;
+
+    // Fast path off the async worker thread: check root liveness and read the standard cgroup v2
+    // user scope directory directly (zero subprocesses for the common case).
+    let direct = tokio::task::spawn_blocking(move || -> Option<bool> {
+        if procid::is_alive(&root) {
+            return Some(true);
+        }
+
+        // Guard against any path traversal in a deserialized handle's `systemd_unit`.
+        if unit_owned.is_empty()
+            || unit_owned.contains('/')
+            || unit_owned.contains('\\')
+            || unit_owned == "."
+            || unit_owned == ".."
+        {
+            return Some(false);
+        }
+
+        let uid = nix::unistd::Uid::current().as_raw();
+        let app_slice = Path::new("/sys/fs/cgroup")
+            .join("user.slice")
+            .join(format!("user-{uid}.slice"))
+            .join(format!("user@{uid}.service"))
+            .join("app.slice");
+
+        if !app_slice.is_dir() {
+            // Non-standard slice or cgroup v1 layout; fall back to `systemctl --user show`.
+            return None;
+        }
+
+        let scope_dir = app_slice.join(&unit_owned);
+        if !scope_dir.is_dir() {
+            // Standard cgroup v2 user app.slice exists and the transient scope directory is gone
+            // (and the root process is already dead).
+            return Some(false);
+        }
+
+        // Check `cgroup.procs` for any live (non-zombie) process directly inside the scope.
+        if let Ok(procs) = std::fs::read_to_string(scope_dir.join("cgroup.procs")) {
+            let own_pid = std::process::id();
+            for line in procs.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>()
+                    && pid != own_pid
+                    && matches!(procid::of_pid(pid), Ok(Some(_)))
+                {
+                    return Some(true);
+                }
+            }
+        }
+
+        // Check `cgroup.events` (`populated 0/1`) so nested sub-cgroups are accounted for too.
+        if let Ok(events) = std::fs::read_to_string(scope_dir.join("cgroup.events"))
+            && let Some(populated) = super::parse_cgroup_events_populated(&events)
+        {
+            return Some(populated);
+        }
+
+        None
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("detached_active worker task failed: {err}"),
+    })?;
+
+    if let Some(active) = direct {
+        return Ok(active);
+    }
+
+    // Fallback for cgroup v1 or custom slice layouts: query systemd directly.
+    let state = query_scope_state(unit).await;
+    if !state.live_pids().is_empty() || state.is_active() {
+        return Ok(true);
+    }
+    procid::tree_is_active(root_process).await
+}
+
 pub(super) async fn stop_detached(
     handle: &DetachHandle,
     grace: Duration,

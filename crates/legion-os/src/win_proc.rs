@@ -166,6 +166,40 @@ fn query_parent_pid_raw(handle: HANDLE) -> Result<u32> {
     })
 }
 
+/// Open `pid` with `PROCESS_QUERY_LIMITED_INFORMATION` only (strictly read-only) and read both
+/// its creation time and its `parent_pid` directly from the held handle.
+pub(crate) fn open_pinned_query_only(pid: u32, include_exited: bool) -> OpenPinnedOutcome {
+    // SAFETY: `OpenProcess` takes plain integer arguments and any returned handle is immediately
+    // wrapped in `OwnedHandle`.
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => OwnedHandle(h),
+        Err(err) if err.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+            return OpenPinnedOutcome::Gone;
+        }
+        Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+            return OpenPinnedOutcome::AccessDenied;
+        }
+        Err(_) => return OpenPinnedOutcome::Failed,
+    };
+
+    let Ok((creation, exit_ft)) = query_times_raw(handle.0, &format!("pid {pid}")) else {
+        return OpenPinnedOutcome::Failed;
+    };
+    if !include_exited && !is_still_running(handle.0, exit_ft) {
+        return OpenPinnedOutcome::Gone;
+    }
+    let Ok(parent_pid) = query_parent_pid_raw(handle.0) else {
+        return OpenPinnedOutcome::Failed;
+    };
+
+    OpenPinnedOutcome::Pinned(PinnedProcess {
+        handle,
+        id: ProcessId::new(pid, creation),
+        parent_pid,
+        can_terminate: false,
+    })
+}
+
 /// Open `pid` (requesting `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, falling back to
 /// `PROCESS_QUERY_LIMITED_INFORMATION` if termination is denied) and read both its creation time
 /// and its `parent_pid` directly from the held handle.

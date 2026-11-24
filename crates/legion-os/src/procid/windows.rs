@@ -78,6 +78,67 @@ pub(super) fn boot_id() -> Result<String> {
     Ok(format!("boot-win-{unbiased}"))
 }
 
+pub(super) async fn tree_is_active(identity: &ProcessId) -> Result<bool> {
+    let identity = *identity;
+    let own_pid = std::process::id();
+
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut direct_child_max_start: Option<u64> = None;
+
+        // Fast path: check root directly using read-only query rights.
+        match win_proc::open_pinned_query_only(identity.pid, false) {
+            OpenPinnedOutcome::Pinned(root_proc) => {
+                if identity.matches(&root_proc.id) {
+                    return Ok(true);
+                }
+                if root_proc.id.start_time > identity.start_time {
+                    direct_child_max_start = Some(root_proc.id.start_time);
+                } else {
+                    return Ok(false);
+                }
+            }
+            OpenPinnedOutcome::Gone => {}
+            OpenPinnedOutcome::AccessDenied | OpenPinnedOutcome::Failed => {
+                match super::of_pid(identity.pid) {
+                    Ok(Some(observed)) if identity.matches(&observed) => return Ok(true),
+                    Ok(Some(observed)) if observed.start_time > identity.start_time => {
+                        direct_child_max_start = Some(observed.start_time);
+                    }
+                    Ok(Some(_)) => return Ok(false),
+                    Ok(None) | Err(_) => {}
+                }
+            }
+        }
+
+        // Root has exited; run the same verified snapshot walk as `kill_tree` (strictly
+        // read-only, opening handles with `PROCESS_QUERY_LIMITED_INFORMATION` only) and return
+        // `true` on the first verified live descendant.
+        let entries = win_proc::snapshot_processes()?;
+        for entry in entries {
+            if entry.pid == 0
+                || entry.pid == own_pid
+                || entry.pid == entry.parent_pid
+                || entry.parent_pid != identity.pid
+            {
+                continue;
+            }
+            if let OpenPinnedOutcome::Pinned(child) =
+                win_proc::open_pinned_query_only(entry.pid, false)
+                && child.parent_pid == identity.pid
+                && child.id.start_time >= identity.start_time
+                && direct_child_max_start.is_none_or(|limit| child.id.start_time < limit)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("tree_is_active worker task failed: {err}"),
+    })?
+}
+
 pub(super) async fn kill_process(
     identity: &ProcessId,
     _force: bool,

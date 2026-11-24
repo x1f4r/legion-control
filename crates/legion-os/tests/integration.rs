@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, write_atomic, write_atomic_from_reader};
-use legion_os::detach::{DetachHandle, DetachOptions, spawn_detached, stop_detached};
+use legion_os::detach::{
+    DetachHandle, DetachOptions, detached_active, spawn_detached, stop_detached,
+};
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid::{self, ProcessId};
 use legion_os::run::{OutputStream, RunOptions, run};
@@ -88,6 +90,10 @@ fn main() -> ExitCode {
         (
             "detach_does_not_inherit_extra_open_file_descriptors",
             || Box::pin(test_detach_does_not_inherit_extra_open_file_descriptors()),
+        ),
+        (
+            "detach_active_tracks_root_and_surviving_descendants",
+            || Box::pin(test_detach_active_tracks_root_and_surviving_descendants()),
         ),
         (
             "procid_kill_tree_leaves_process_untouched_on_mismatched_start_time",
@@ -1146,6 +1152,78 @@ async fn test_detach_does_not_inherit_extra_open_file_descriptors() {
             assert!(stop.all_gone);
             assert!(!procid::is_alive(&handle.process));
         }
+    }
+}
+
+async fn test_detach_active_tracks_root_and_surviving_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Test both the default detach mode (systemd scope on Linux, direct/WMI on Windows) and
+    // the non-scope `setsid` path on Linux.
+    #[cfg(target_os = "linux")]
+    let modes: &[(&str, bool)] = &[("default", false), ("setsid", true)];
+    #[cfg(not(target_os = "linux"))]
+    let modes: &[(&str, bool)] = &[("default", false)];
+
+    for &(label, disable_systemd) in modes {
+        let root_id_file = dir.path().join(format!("active-root-{label}.pid"));
+        let child_id_file = dir.path().join(format!("active-child-{label}.pid"));
+        let root_str = root_id_file.to_string_lossy().into_owned();
+        let child_str = child_id_file.to_string_lossy().into_owned();
+
+        let (spec, env_vars) = helper_spec("orphan_root_exit", &[&root_str, &child_str]);
+        let mut opts = DetachOptions::new(spec)
+            .name(format!("active-{label}"))
+            .envs(env_vars);
+        if disable_systemd {
+            opts = opts
+                .env("XDG_RUNTIME_DIR", "/nonexistent-legion-active-test-dir")
+                .env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "unix:path=/nonexistent-legion-bus",
+                );
+        }
+
+        let handle = spawn_detached(opts).await.unwrap();
+        if disable_systemd {
+            assert!(handle.systemd_unit.is_none());
+        }
+
+        let child_id = parse_procid(&wait_for_file(&child_id_file, Duration::from_secs(5)).await);
+
+        // Wait for the root process to finish exiting while its child keeps running.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while procid::is_alive(&handle.process) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !procid::is_alive(&handle.process),
+            "root {} ({label}) should have exited",
+            handle.process
+        );
+        assert!(
+            procid::is_alive(&child_id),
+            "surviving child {child_id} ({label}) should still be alive"
+        );
+
+        // `detached_active` must still report true because a descendant under the handle is alive.
+        assert!(
+            detached_active(&handle).await.unwrap(),
+            "detached_active ({label}) returned false while descendant {child_id} was still running"
+        );
+
+        let report = stop_detached(&handle, Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert!(
+            report.all_gone,
+            "stop_detached ({label}) left survivors: {report:?}"
+        );
+        assert!(!procid::is_alive(&child_id));
+        assert!(
+            !detached_active(&handle).await.unwrap(),
+            "detached_active ({label}) still returned true after tree stopped"
+        );
     }
 }
 

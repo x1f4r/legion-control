@@ -194,6 +194,25 @@ pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
     spawn_detached_impl(&resolved, &options).await
 }
 
+/// Return `true` while any process started under `handle` is still running—not just the root.
+///
+/// Strictly read-only and non-blocking on async worker threads (designed to be cheap when listing
+/// many jobs):
+/// - **Linux with a systemd user scope (`handle.systemd_unit`):** checks the root process first,
+///   then reads the scope's cgroup (`cgroup.procs` / `cgroup.events`) directly under `/sys/fs/cgroup`
+///   when available, falling back to `systemctl --user show` on non-standard cgroup layouts.
+/// - **Other Unix (or `setsid` fallback):** returns `true` if `handle.process` is alive or if any
+///   live process still has `handle.process.pid` as its session ID or process group ID and started
+///   at or after `handle.process.start_time` (the same rule [`procid::kill_tree`] uses).
+/// - **Windows:** returns `true` if `handle.process` is alive or if a verified read-only process
+///   tree walk finds any live descendant whose handle confirms `parent_pid` and creation time.
+pub async fn detached_active(handle: &DetachHandle) -> Result<bool> {
+    if handle.systemd_unit.is_some() {
+        return detached_active_impl(handle).await;
+    }
+    procid::tree_is_active(&handle.process).await
+}
+
 /// Stop a detached process and its entire tree using the boundary recorded in `handle`.
 ///
 /// When `handle.systemd_unit` names a Linux transient systemd user scope, termination goes through
@@ -241,6 +260,21 @@ pub(crate) fn sanitize_scope_prefix(raw: &str) -> String {
         out.pop();
     }
     out
+}
+
+/// Parse the `populated` flag (`0` or `1`) from a Linux cgroup v2 `cgroup.events` file.
+#[allow(dead_code)]
+pub(crate) fn parse_cgroup_events_populated(contents: &str) -> Option<bool> {
+    for line in contents.lines() {
+        if let Some(rest) = line.trim().strip_prefix("populated ") {
+            match rest.trim() {
+                "1" => return Some(true),
+                "0" => return Some(false),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Return `true` when any cgroup path in `/proc/<pid>/cgroup` ends with `/<full_unit>`
@@ -379,6 +413,16 @@ async fn spawn_detached_impl(
     Err(OsError::Unsupported {
         detail: "detached process launching is not supported on this platform".into(),
     })
+}
+
+#[cfg(unix)]
+async fn detached_active_impl(handle: &DetachHandle) -> Result<bool> {
+    platform::detached_active(handle).await
+}
+
+#[cfg(not(unix))]
+async fn detached_active_impl(handle: &DetachHandle) -> Result<bool> {
+    procid::tree_is_active(&handle.process).await
 }
 
 #[cfg(unix)]
@@ -1128,6 +1172,33 @@ mod tests {
             "0::/user.slice/user-1000.slice/session-2.scope\n",
             unit
         ));
+
+        assert_eq!(
+            parse_cgroup_events_populated("populated 1\nfrozen 0\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_cgroup_events_populated("populated 0\nfrozen 0\n"),
+            Some(false)
+        );
+        assert_eq!(parse_cgroup_events_populated("frozen 0\n"), None);
+    }
+
+    #[tokio::test]
+    async fn detached_active_reports_false_for_absent_handle() {
+        let absent = DetachHandle {
+            process: ProcessId::new(i32::MAX as u32, 1),
+            systemd_unit: None,
+            warnings: Vec::new(),
+        };
+        assert!(!detached_active(&absent).await.unwrap());
+
+        let absent_scope = DetachHandle {
+            process: ProcessId::new(i32::MAX as u32, 1),
+            systemd_unit: Some("legion-job-definitely-absent-0.scope".into()),
+            warnings: Vec::new(),
+        };
+        assert!(!detached_active(&absent_scope).await.unwrap());
     }
 
     #[test]

@@ -312,6 +312,126 @@ pub(super) fn boot_id() -> Result<String> {
     Ok(format!("boot-sec-{secs}"))
 }
 
+pub(super) async fn tree_is_active(identity: &ProcessId) -> Result<bool> {
+    let raw_pid = match i32::try_from(identity.pid) {
+        Ok(p) => p,
+        Err(_) => return Ok(false),
+    };
+    let root_nix_pid = Pid::from_raw(raw_pid);
+    let identity = *identity;
+    let own_pid = std::process::id();
+
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        // Fast path: check root identity directly first (single /proc/<pid>/stat or proc_pidinfo).
+        match super::of_pid(identity.pid)? {
+            Some(observed) if identity.matches(&observed) => return Ok(true),
+            // PID has been recycled; per POSIX no live process can still hold it as pgid or sid.
+            Some(_) => return Ok(false),
+            None => {}
+        }
+
+        let own_pgid = getpgrp();
+        let own_sid = getsid(None).ok();
+        let check_group = root_nix_pid != own_pgid;
+        let check_session = Some(root_nix_pid) != own_sid;
+        if !check_group && !check_session {
+            return Ok(false);
+        }
+
+        Ok(has_live_group_or_session_member(
+            &identity,
+            root_nix_pid,
+            check_group,
+            check_session,
+            own_pid,
+        ))
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("tree_is_active worker task failed: {err}"),
+    })?
+}
+
+#[cfg(target_os = "linux")]
+fn has_live_group_or_session_member(
+    root: &ProcessId,
+    root_nix_pid: Pid,
+    check_group: bool,
+    check_session: bool,
+    own_pid: u32,
+) -> bool {
+    // Walk `/proc` numeric PIDs and call lightweight `getpgid`/`getsid` syscalls before opening
+    // `/proc/<pid>/stat`, avoiding full process-table parsing when scanning many jobs.
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 || pid == own_pid || pid == root.pid {
+            continue;
+        }
+        let Ok(raw) = i32::try_from(pid) else {
+            continue;
+        };
+        let nix_p = Pid::from_raw(raw);
+        let in_group = check_group && getpgid(Some(nix_p)).ok() == Some(root_nix_pid);
+        let in_session = check_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
+        if (in_group || in_session)
+            && let Ok(Some(id)) = super::of_pid(pid)
+            && id.start_time >= root.start_time
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_live_group_or_session_member(
+    root: &ProcessId,
+    root_nix_pid: Pid,
+    check_group: bool,
+    check_session: bool,
+    own_pid: u32,
+) -> bool {
+    let Ok(mut system) = System::new() else {
+        return false;
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    for (sys_pid, proc_info) in system.processes() {
+        if matches!(
+            proc_info.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        ) {
+            continue;
+        }
+        let pid = sys_pid.as_u32();
+        if pid == 0 || pid == own_pid || pid == root.pid {
+            continue;
+        }
+        let Ok(raw) = i32::try_from(pid) else {
+            continue;
+        };
+        let nix_p = Pid::from_raw(raw);
+        let in_group = check_group && getpgid(Some(nix_p)).ok() == Some(root_nix_pid);
+        let in_session = check_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
+        if (in_group || in_session)
+            && let Ok(Some(id)) = super::of_pid(pid)
+            && id.start_time >= root.start_time
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub(super) async fn kill_process(
     identity: &ProcessId,
     force: bool,
