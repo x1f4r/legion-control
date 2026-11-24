@@ -61,8 +61,32 @@ DOCKER_ENV=()
 
 if [[ "$TARGET" == "pkgbuild" ]]; then
   [[ "$DISTRO_KIND" == "arch" ]] || die "'pkgbuild' mode is only supported with archlinux images."
+  # Verify every source path required by `cargo build` and `package()` before launching the
+  # container: `apps/ui` is embedded at compile time by `crates/legion-doors/build.rs` and
+  # `contract/release-public-key.pem` is compiled into release verification.
+  for rel in Cargo.toml Cargo.lock rust-toolchain.toml LICENSE crates contract packaging apps/ui; do
+    [[ -e "${REPO_ROOT}/${rel}" ]] || die "Required source path is missing from checkout: ${rel}"
+  done
+  for rel in apps/ui/index.html contract/release-public-key.pem; do
+    [[ -f "${REPO_ROOT}/${rel}" ]] || die "Required compile-time asset is missing from checkout: ${rel}"
+  done
+
+  HOST_BUILD_REV="${LEGION_BUILD_REV:-}"
+  if [[ -z "$HOST_BUILD_REV" ]] && command -v git >/dev/null 2>&1 \
+    && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null || true)" ]]; then
+      SHORT_REV="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || true)"
+      if [[ -n "$SHORT_REV" ]]; then
+        HOST_BUILD_REV="${SHORT_REV}, modified"
+      fi
+    else
+      HOST_BUILD_REV="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+    fi
+  fi
+  [[ -n "$HOST_BUILD_REV" ]] || die "Could not determine build revision (set LEGION_BUILD_REV or run inside a git checkout)."
+
   DOCKER_MOUNTS+=(-v "${REPO_ROOT}:/src:ro")
-  DOCKER_ENV+=(-e "LEGION_TEST_MODE=pkgbuild")
+  DOCKER_ENV+=(-e "LEGION_TEST_MODE=pkgbuild" -e "LEGION_BUILD_REV=${HOST_BUILD_REV}" -e "LEGION_EXPECT_BUILD_REV=1")
   if [[ -n "${LEGION_CARGO_CACHE_DIR:-}" ]]; then
     mkdir -p "$LEGION_CARGO_CACHE_DIR"
     CACHE_ABS="$(cd -- "$LEGION_CARGO_CACHE_DIR" && pwd -P)"
@@ -82,6 +106,9 @@ else
   PKG_BASE="$(basename -- "$TARGET")"
   DOCKER_MOUNTS+=(-v "${PKG_DIR}/${PKG_BASE}:/pkg/${PKG_BASE}:ro")
   DOCKER_ENV+=(-e "LEGION_TEST_MODE=package" -e "LEGION_PKG_FILE=/pkg/${PKG_BASE}")
+  if [[ -n "${LEGION_EXPECT_BUILD_REV:-}" ]]; then
+    DOCKER_ENV+=(-e "LEGION_EXPECT_BUILD_REV=${LEGION_EXPECT_BUILD_REV}")
+  fi
 fi
 
 DOCKER_ENV+=(-e "LEGION_DISTRO_KIND=${DISTRO_KIND}" -e "LEGION_IMAGE=${IMAGE}")
@@ -160,6 +187,9 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
 
     useradd -m -s /bin/bash builder
     mkdir -p /work/repo /work/out
+    for rel in Cargo.toml Cargo.lock rust-toolchain.toml LICENSE crates contract packaging apps/ui; do
+      [[ -e "/src/${rel}" ]] || fail "required source path missing in /src: ${rel}"
+    done
     tar -C /src -cf - \
       Cargo.toml Cargo.lock rust-toolchain.toml LICENSE crates contract packaging apps/ui \
       | tar -C /work/repo -xf -
@@ -184,7 +214,11 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
       cd /work/repo
       rustup toolchain install
       bash packaging/arch/build-local.sh source /work/out
-    '
+    ' 2>&1 | tee /work/makepkg-source.log
+
+    if grep -Fq 'Package contains reference to $srcdir' /work/makepkg-source.log; then
+      fail "makepkg warned that the source package contains a reference to \$srcdir"
+    fi
 
     BUILT_PKG="$(find /work/out -maxdepth 1 -type f -name 'legion-[0-9]*.pkg.tar*' ! -name '*-debug-*' | head -n 1)"
     [[ -n "$BUILT_PKG" ]] || fail "makepkg did not produce a legion package"
@@ -198,6 +232,10 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
 
     if [[ "${LEGION_TEST_BIN_PKG:-0}" == "1" ]]; then
       step "Building legion-bin via makepkg and checking with namcap"
+      STATIC_VER="$(/static-bin/legion --version)"
+      printf '  static binary version: %s\n' "$STATIC_VER"
+      [[ "$STATIC_VER" =~ ^legion[[:space:]][0-9][^[:space:]]*[[:space:]]\([0-9a-f]{7,} ]] \
+        || fail "static binary for legion-bin missing build revision: $STATIC_VER"
       mkdir -p /work/out-bin
       chown builder:builder /work/out-bin
       su -s /bin/bash builder -c '
@@ -217,6 +255,14 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
     step "Installing built package with pacman -U"
     pacman -U --noconfirm "$BUILT_PKG" >/dev/null
     REINSTALL_PKG="$BUILT_PKG"
+
+    step "Verifying built Arch binary contains no build directory or cargo home paths"
+    BUILDER_HOME="$(getent passwd builder | cut -d: -f6)"
+    for forbidden in /work/ /cargo-cache "$BUILDER_HOME"; do
+      if [[ -n "$forbidden" ]] && strings /usr/bin/legion | grep -Fq "$forbidden"; then
+        fail "/usr/bin/legion contains build host path: $forbidden"
+      fi
+    done
   else
     step "Installing package with pacman -U"
     pacman -U --noconfirm "$LEGION_PKG_FILE" >/dev/null
@@ -247,6 +293,10 @@ step "Running legion --version, init, meta.version, meta.doctor as me"
 VER_LINE="$(run_as_me 'legion --version')"
 printf '  version: %s\n' "$VER_LINE"
 [[ "$VER_LINE" =~ ^legion[[:space:]][0-9] ]] || fail "unexpected --version output: $VER_LINE"
+if [[ "${LEGION_EXPECT_BUILD_REV:-1}" != "0" ]]; then
+  [[ "$VER_LINE" =~ ^legion[[:space:]][0-9][^[:space:]]*[[:space:]]\([0-9a-f]{7,} ]] \
+    || fail "--version did not include a build revision: $VER_LINE"
+fi
 
 INIT_JSON="$(run_as_me 'legion init --name tower --json')"
 printf '%s' "$INIT_JSON" | jq -e '.node == "tower"' >/dev/null || fail "init failed: $INIT_JSON"
@@ -255,6 +305,11 @@ META_VER_JSON="$(run_as_me 'legion meta.version --json')"
 printf '%s' "$META_VER_JSON" | jq -e --arg mgr "$EXPECTED_MANAGER" \
   '.name == "legion" and .node == "tower" and .install == $mgr' >/dev/null \
   || fail "meta.version did not report install=$EXPECTED_MANAGER: $META_VER_JSON"
+if [[ "${LEGION_EXPECT_BUILD_REV:-1}" != "0" ]]; then
+  printf '%s' "$META_VER_JSON" | jq -e \
+    '(.build | type == "string") and (.build | test("^[0-9a-f]{7,}"))' >/dev/null \
+    || fail "meta.version did not report a build revision: $META_VER_JSON"
+fi
 
 DOCTOR_JSON="$(run_as_me 'legion meta.doctor --json')"
 printf '%s' "$DOCTOR_JSON" | jq -e --arg mgr "$EXPECTED_MANAGER" \
