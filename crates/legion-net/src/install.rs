@@ -21,6 +21,7 @@ use legion_os::OsError;
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_tools::floor::{SemVer, check_version_transition, commit_floor, machine_floor_path};
 use legion_tools::trust::RELEASE_PUBLIC_KEY;
 use legion_tools::update::{
     ReleaseFetcher, SystemFetcher, artifact_url, dist_cache_binary, normalize_version, random_hex,
@@ -134,6 +135,9 @@ pub struct InstallArgs {
     /// Probe the remote machine and report what would be copied where without modifying it.
     #[serde(default)]
     pub dry_run: bool,
+    /// Permit installing a version older than the machine's current version or recorded version floor.
+    #[serde(default)]
+    pub allow_downgrade: bool,
 }
 
 /// Result of `fleet.install`.
@@ -822,6 +826,11 @@ async fn run_fleet_install_with_key(
         RemoteOs::Windows => r"%LOCALAPPDATA%\legion\legion.exe".to_owned(),
     };
 
+    let floor_path = machine_floor_path(paths, &args.machine);
+    let previous_semver = previous_version
+        .as_deref()
+        .and_then(|v| SemVer::parse(v).ok());
+
     if args.dry_run {
         let (planned_version, source_desc) = match &args.from {
             Some(from_raw) => {
@@ -833,6 +842,14 @@ async fn run_fleet_install_with_key(
                     Some(raw) => normalize_version(raw)?,
                     None => backend.latest_version(cancel).await?,
                 };
+                let target_semver = SemVer::parse(&version)?;
+                check_version_transition(
+                    &target_semver,
+                    previous_semver.as_ref(),
+                    &floor_path,
+                    args.allow_downgrade,
+                )
+                .map_err(|err| err.with_machine(args.machine.clone()))?;
                 let cached = dist_cache_binary(paths, &version, platform.target);
                 let source = if cached.is_file() {
                     cached.display().to_string()
@@ -862,6 +879,14 @@ async fn run_fleet_install_with_key(
                 Some(raw) => normalize_version(raw)?,
                 None => backend.latest_version(cancel.clone()).await?,
             };
+            let target_semver = SemVer::parse(&version)?;
+            check_version_transition(
+                &target_semver,
+                previous_semver.as_ref(),
+                &floor_path,
+                args.allow_downgrade,
+            )
+            .map_err(|err| err.with_machine(args.machine.clone()))?;
             let fetcher = BackendFetcher(backend);
             resolve_release_binary_with_key(
                 paths,
@@ -965,6 +990,10 @@ async fn run_fleet_install_with_key(
             )
             .with_machine(args.machine.clone())
         })?;
+
+    if let Ok(installed_semver) = SemVer::parse(&installed_version) {
+        commit_floor(&floor_path, &installed_semver, args.allow_downgrade)?;
+    }
 
     Ok(InstallResult {
         machine: args.machine,
@@ -1573,6 +1602,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1627,6 +1657,7 @@ via = "tower"
                 version: Some("legion-v0.3.0".to_owned()),
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1648,6 +1679,7 @@ via = "tower"
                 version: Some("0.3.0".to_owned()),
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1679,6 +1711,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1707,6 +1740,7 @@ via = "tower"
                 version: None,
                 from: Some(local_bin.display().to_string()),
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1743,6 +1777,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1761,6 +1796,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1787,6 +1823,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: true,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1832,6 +1869,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1846,5 +1884,86 @@ via = "tower"
                 .iter()
                 .any(|(_, cmd)| cmd.contains("rm -f \"$HOME/.local/bin/.legion-install-"))
         );
+    }
+
+    #[tokio::test]
+    async fn fleet_install_refuses_downgrade_below_live_or_floor_unless_allowed() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x34; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+
+        // Install 0.3.0 first, raising the floor for `tower` to 0.3.0.
+        let up = FakeInstallBackend::linux_x86_64("0.3.0", Some("0.1.0"), "0.3.0").with_release(
+            "0.3.0",
+            "x86_64-unknown-linux-musl",
+            b"legion-0.3.0",
+            Some(&signing),
+        );
+        run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &up,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.3.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // Attempting to install 0.2.0 fails even if remote reports no live version (floor blocks it).
+        let down = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0").with_release(
+            "0.2.0",
+            "x86_64-unknown-linux-musl",
+            b"legion-0.2.0",
+            Some(&signing),
+        );
+        let err = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &down,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(down.scp_log.lock().unwrap().is_empty());
+
+        // With allow_downgrade = true it succeeds and lowers the machine floor to 0.2.0.
+        let ok = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &down,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: true,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.installed_version, "0.2.0");
     }
 }

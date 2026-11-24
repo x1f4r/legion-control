@@ -9,6 +9,7 @@ pub mod agent;
 pub mod audit;
 pub mod exec;
 pub mod ext;
+pub mod floor;
 pub mod fs;
 pub mod job;
 pub mod meta;

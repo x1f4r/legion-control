@@ -25,6 +25,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::floor::{SemVer, check_version_transition, commit_floor, node_floor_path};
 use crate::trust::{RELEASE_PUBLIC_KEY, SIGNATURE_FILENAME, verify_signature_with_key};
 
 /// The single repository URL constant from which release metadata and binaries are fetched.
@@ -67,13 +68,16 @@ pub fn register(registry: &mut Registry) {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateArgs {
-    /// Release version to install (for example `0.2.0` or `legion-v0.2.0`). Defaults to the latest
-    /// published `legion-v*` release.
+    /// Release version to install (for example `0.2.0` or `legion-v0.2.0`). Defaults to the
+    /// highest published stable `legion-v*` semantic version.
     #[serde(default)]
     pub version: Option<String>,
     /// Resolve the target release and report what would be replaced without downloading or writing.
     #[serde(default)]
     pub dry_run: bool,
+    /// Permit replacing with a version older than the running binary or the recorded version floor.
+    #[serde(default)]
+    pub allow_downgrade: bool,
 }
 
 /// Result of `meta.update`.
@@ -205,7 +209,9 @@ pub fn normalize_version(raw: &str) -> Result<String, ErrorBody> {
     Ok(stripped.to_owned())
 }
 
-/// Selects the newest non-draft, non-prerelease `legion-v*` version from GitHub's `/releases` JSON.
+/// Selects the highest published stable `legion-v*` semantic version from GitHub's `/releases`
+/// JSON, ignoring drafts, GitHub prereleases, and SemVer pre-release tags regardless of creation
+/// order.
 pub fn parse_latest_release_version(releases_json: &str) -> Result<String, ErrorBody> {
     #[derive(Deserialize)]
     struct ReleaseEntry {
@@ -224,16 +230,30 @@ pub fn parse_latest_release_version(releases_json: &str) -> Result<String, Error
         .with_hint("Check network connectivity to api.github.com or pass an explicit `version`.")
     })?;
 
+    let mut highest: Option<SemVer> = None;
     for entry in entries {
-        if !entry.draft && !entry.prerelease && entry.tag_name.starts_with(RELEASE_TAG_PREFIX) {
-            return normalize_version(&entry.tag_name);
+        if entry.draft || entry.prerelease || !entry.tag_name.starts_with(RELEASE_TAG_PREFIX) {
+            continue;
         }
+        let Ok(ver) = SemVer::parse(&entry.tag_name) else {
+            continue;
+        };
+        if ver.is_prerelease() {
+            continue;
+        }
+        if highest.as_ref().is_none_or(|best| ver > *best) {
+            highest = Some(ver);
+        }
+    }
+
+    if let Some(best) = highest {
+        return Ok(best.to_string());
     }
 
     Err(ErrorBody::new(
         ErrorCode::NotFound,
         format!(
-            "No published {RELEASE_TAG_PREFIX}* release was found at {RELEASE_REPO_URL}/releases."
+            "No published stable {RELEASE_TAG_PREFIX}* release was found at {RELEASE_REPO_URL}/releases."
         ),
     )
     .with_hint("Specify an explicit `version` or install from a local binary with `from`."))
@@ -824,6 +844,34 @@ async fn run_meta_update_with_key(
         Some(raw) => normalize_version(&raw)?,
         None => fetcher.latest_version(cancel.clone()).await?,
     };
+    let desired_semver = SemVer::parse(&desired_version)?;
+    let current_semver = SemVer::parse(current_version).ok();
+    let floor_path = node_floor_path(paths);
+
+    // When asking for "latest" and already at or above it, check only if a downgrade would happen:
+    // if the node is newer than the highest published release, refuse a silent downgrade unless
+    // allow_downgrade is explicitly set.
+    if !explicit_version
+        && current_semver
+            .as_ref()
+            .is_some_and(|cur| *cur == desired_semver)
+    {
+        return Ok(UpdateResult {
+            previous_version: current_version.to_owned(),
+            installed_version: desired_version,
+            target: target.to_owned(),
+            path: current_exe.display().to_string(),
+            dry_run: args.dry_run,
+            updated: false,
+        });
+    }
+
+    check_version_transition(
+        &desired_semver,
+        current_semver.as_ref(),
+        &floor_path,
+        args.allow_downgrade,
+    )?;
 
     if args.dry_run {
         return Ok(UpdateResult {
@@ -832,17 +880,6 @@ async fn run_meta_update_with_key(
             target: target.to_owned(),
             path: current_exe.display().to_string(),
             dry_run: true,
-            updated: false,
-        });
-    }
-
-    if !explicit_version && desired_version == current_version {
-        return Ok(UpdateResult {
-            previous_version: current_version.to_owned(),
-            installed_version: desired_version,
-            target: target.to_owned(),
-            path: current_exe.display().to_string(),
-            dry_run: false,
             updated: false,
         });
     }
@@ -867,6 +904,8 @@ async fn run_meta_update_with_key(
             format!("Replacing the legion binary stopped unexpectedly: {err}."),
         )
     })??;
+
+    commit_floor(&floor_path, &desired_semver, args.allow_downgrade)?;
 
     Ok(UpdateResult {
         previous_version: current_version.to_owned(),
@@ -1168,15 +1207,18 @@ mod tests {
     }
 
     #[test]
-    fn latest_release_parser_skips_drafts_prereleases_and_non_legion_tags() {
+    fn latest_release_parser_picks_highest_stable_semver_not_first_created() {
+        // Simulates a maintenance patch `0.1.9` created AFTER `0.10.0` (so GitHub lists `0.1.9`
+        // first), plus an unflagged SemVer prerelease `0.11.0-rc.1`: highest stable must be 0.10.0.
         let json = r#"[
             {"tag_name": "v2.0.0", "draft": false, "prerelease": false},
-            {"tag_name": "legion-v0.4.0", "draft": true, "prerelease": false},
-            {"tag_name": "legion-v0.3.0-rc1", "draft": false, "prerelease": true},
-            {"tag_name": "legion-v0.2.1", "draft": false, "prerelease": false},
-            {"tag_name": "legion-v0.1.0", "draft": false, "prerelease": false}
+            {"tag_name": "legion-v0.1.9", "draft": false, "prerelease": false},
+            {"tag_name": "legion-v0.11.0-rc.1", "draft": false, "prerelease": false},
+            {"tag_name": "legion-v0.12.0", "draft": true, "prerelease": false},
+            {"tag_name": "legion-v0.10.0", "draft": false, "prerelease": false},
+            {"tag_name": "legion-v0.9.5", "draft": false, "prerelease": false}
         ]"#;
-        assert_eq!(parse_latest_release_version(json).unwrap(), "0.2.1");
+        assert_eq!(parse_latest_release_version(json).unwrap(), "0.10.0");
 
         let empty = r#"[{"tag_name": "v1.0.0", "draft": false, "prerelease": false}]"#;
         assert_eq!(
@@ -1254,6 +1296,7 @@ mod tests {
             UpdateArgs {
                 version: None,
                 dry_run: true,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1279,6 +1322,7 @@ mod tests {
             UpdateArgs {
                 version: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1304,6 +1348,7 @@ mod tests {
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1371,6 +1416,7 @@ mod tests {
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1416,6 +1462,7 @@ mod tests {
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1443,6 +1490,7 @@ mod tests {
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1451,5 +1499,77 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Denied);
         assert_eq!(bad_fetcher.download_count(), 2);
         assert_eq!(fs::read(&exe).unwrap(), b"original-good-binary");
+    }
+
+    #[tokio::test]
+    async fn meta_update_refuses_downgrade_unless_allow_downgrade_is_set() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("home"));
+        let exe = dir.path().join("legion");
+        fs::write(&exe, b"legion-0.3.0-binary").unwrap();
+
+        let signing = SigningKey::from_bytes(&[0x77; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let target = "x86_64-unknown-linux-musl";
+        let old_bytes = b"legion-0.2.0-binary".to_vec();
+        let asset = artifact_filename("0.2.0", target);
+        let sums = format!("{}  {asset}\n", sha256_bytes(&old_bytes));
+        let sig = crate::trust::encode_signature_bytes(&signing.sign(sums.as_bytes()).to_bytes());
+        let mut files = HashMap::new();
+        files.insert(checksums_url("0.2.0"), sums.into_bytes());
+        files.insert(checksums_sig_url("0.2.0"), sig.into_bytes());
+        files.insert(artifact_url("0.2.0", target), old_bytes.clone());
+        let fetcher = FakeFetcher::new("0.2.0", files);
+
+        // Node running 0.3.0 refuses silent downgrade to 0.2.0 (whether explicit or via "latest").
+        let err = run_meta_update_with_key(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.3.0",
+            &exe,
+            false,
+            &pubkey,
+            UpdateArgs {
+                version: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert_eq!(fetcher.download_count(), 0);
+        assert_eq!(fs::read(&exe).unwrap(), b"legion-0.3.0-binary");
+
+        // Explicit allow_downgrade permits downgrading and records the new floor.
+        let ok = run_meta_update_with_key(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.3.0",
+            &exe,
+            false,
+            &pubkey,
+            UpdateArgs {
+                version: Some("0.2.0".to_owned()),
+                dry_run: false,
+                allow_downgrade: true,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok.updated);
+        assert_eq!(fs::read(&exe).unwrap(), old_bytes);
+        assert_eq!(
+            crate::floor::read_floor(&node_floor_path(&paths)),
+            crate::floor::FloorState::Recorded(SemVer::parse("0.2.0").unwrap())
+        );
     }
 }
