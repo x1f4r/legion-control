@@ -233,13 +233,16 @@ node name, candidate host names / Tailscale addresses, SSH port, OS account name
 host keys (with auto-discovered host-key scans cached briefly per node, and without exposing how
 host keys were resolved). Device management follows the same caller-scoping and `allow_owner` rules
 as `token.*`: creating a `device:<name>` principal or changing a device's role with `device.set`
-requires the `owner` role and `allow_owner=true` to grant `owner`. Expiring credentials (such as
-expiring HTTP bearer tokens) cannot mint or modify permanent device access: locally,
-`device.invite`, `device.set`, and any `devices.toml` merge that adds or changes a live entry are
-refused (pure tombstones are still allowed locally so an expiring credential can revoke a device);
-across remote hops (`on`), forwarding `device.invite`, `token.add`, `device.set`, `config.write`
-for `devices.toml` or `policy.toml`, and `fleet.sync` `push`/`pull` is refused by the forwarding
-node because credential expiry is not carried over RPC.
+requires the `owner` role and `allow_owner=true` to grant `owner`. A paired device may create
+pairing invites only on the node it is connected to directly: forwarding `device.invite` (`on=`)
+from a paired device is refused with a hint to connect to that machine directly so `paired_by.device`
+is always recorded from the session context. Expiring credentials (such as expiring HTTP bearer
+tokens) cannot mint or modify permanent device access: locally, `device.invite`, `device.set`, and
+any `devices.toml` merge that adds or changes a live entry are refused (pure tombstones are still
+allowed locally so an expiring credential can revoke a device); across remote hops (`on`),
+forwarding `device.invite`, `token.add`, `device.set`, `config.write` for `devices.toml` or
+`policy.toml`, and `fleet.sync` `push`/`pull` is refused by the forwarding node because credential
+expiry is not carried over RPC.
 
 **Trust rule for syncing paired devices:** a node trusts a paired device only if (a) it paired the
 device itself, (b) a caller with accepted credentials pushed it via `config.write` under this
@@ -252,25 +255,37 @@ inject keys back onto the pushing machine. `fleet.sync direction=status` compare
 
 The registry owns only `device:*` principals it created for one pairing id — marked with
 `device = "<pairing id>"` in `policy.toml` — and refuses creating tokens, agents, or `--as`
-pairings on a registry-owned principal. Merging `devices.toml` via `fleet.sync` or `config.write`
-refuses incoming timestamps more than 10 minutes in the future, refuses introducing duplicate live
-public keys, always merges with the local file (tombstones always win and can never be dropped by
-syncing), restricts non-owner admins to devices pinned to their own principal (and pushes
-non-owner revocations independently of unrelated entries), and reconciles only registry-owned
-`device:*` principals in `policy.toml` to the exact recorded role — leaving shared and unmarked
-`device:*` principals untouched (with a warning in the result and `meta.doctor`) and failing closed
-to `nobody` when a role is undefined on the receiving node or two live devices collide on one
-`device:*` principal. If two live entries in `devices.toml` ever share a public key (or collide
-with a foreign line in `authorized_keys`), no `authorized_keys` line is written for any colliding
-entry and both `device.list` and `meta.doctor` warn loudly. Tombstones in `devices.toml` are
-permanent so removed devices cannot be resurrected and quarantine cannot be lifted by pruning.
+pairings on a registry-owned principal. Each registry-owned `device:*` principal belongs to
+**exactly one** pairing id across the lifetime of the fleet: every merge (including owner writes)
+refuses assigning a marked, live, or previously tombstoned `device:*` principal to a different
+pairing id, and reconciliation never re-creates a `device:*` principal for a different id than the
+one that owned it. Merging `devices.toml` via `fleet.sync` or `config.write` refuses incoming
+timestamps more than 10 minutes in the future, refuses introducing duplicate live public keys,
+always merges with the local file (tombstones always win and can never be dropped by syncing),
+refuses setting `confirmed_by`/`confirmed_at` or dropping `paired_by` on an existing entry even for
+owner callers (confirmation is only allowed through `device.set confirm=true`), restricts non-owner
+admins to devices pinned to their own principal (recording `paired_by` from the call's context —
+including the caller's pairing id when the caller is a paired device — and refusing entries that
+claim otherwise, while treating `paired_at`, `paired_on`, `paired_by`, and `public_key` as
+immutable once written), pushes non-owner revocations independently of unrelated entries, and
+reconciles only registry-owned `device:*` principals in `policy.toml` to the exact recorded role —
+leaving shared and unmarked `device:*` principals untouched (with a warning in the result and
+`meta.doctor`) and failing closed to `nobody` when a role is undefined on the receiving node or two
+live devices collide on one `device:*` principal. If two live entries in `devices.toml` ever share
+a public key (or collide with a foreign line in `authorized_keys`), no `authorized_keys` line is
+written for any colliding entry and both `device.list` and `meta.doctor` warn loudly. Tombstones in
+`devices.toml` are permanent so removed devices cannot be resurrected and quarantine cannot be
+lifted by pruning.
 
-Each device records `paired_by = { principal, device }` captured from the invite creator. When a
-device is tombstoned, any live descendant with `paired_by.device == <tombstoned id>` and
-`paired_at >= tomb.removed_at` — and transitively its unconfirmed descendants — is automatically
-quarantined (omitted from `authorized_keys`, restricted to `nobody`, refused by `legion gate`, and
-flagged loudly in `device.list` and `meta.doctor`) until an owner explicitly confirms it with
-`legion device.set id=<pairing_id> confirm=true` (recording `confirmed_by`).
+Each device records `paired_by = { principal, device }` captured from the invite creator (or filled
+from the call's context when added via `config.write`). When a device is tombstoned, any live
+descendant with `paired_by.device == <tombstoned id>` and
+`paired_at >= tomb.removed_at - 10 minutes` (matching the 10-minute clock-skew bound) — and
+transitively its unconfirmed descendants — is automatically quarantined (omitted from
+`authorized_keys`, restricted to `nobody`, refused by `legion gate`, and flagged loudly in
+`device.list` and `meta.doctor`) until an owner explicitly confirms it locally on that node with
+`legion device.set id=<pairing_id> confirm=true` (which is refused unless the device is quarantined
+right now and records `confirmed_by` and `confirmed_at > tomb.removed_at`).
 
 Removing a device with `legion device.remove` writes the tombstone to `devices.toml` first before
 cleaning up its unused `device:*` principal and `authorized_keys` line, immediately terminates any

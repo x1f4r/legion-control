@@ -30,8 +30,8 @@ use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::{
-    DEVICES_VERSION, DevicesFile, MergeApplyError, MergeChange, apply_devices_merge_blocking,
-    merge_devices,
+    DEVICES_VERSION, DevicesFile, MergeApplyError, MergeChange, PairedBy,
+    apply_devices_merge_blocking, merge_devices,
 };
 use legion_tools::device::sessions::{
     DEFAULT_TERMINATE_GRACE, terminate_device_sessions_for_target,
@@ -838,6 +838,7 @@ async fn apply_local_write(
         let caller_is_owner = ctx.grant().role() == OWNER;
         let caller_principal = ctx.principal().to_owned();
         let caller_role = ctx.grant().role().to_owned();
+        let caller_pairing_id = ctx.pairing_id().map(str::to_owned);
         let credential_expires = ctx.credential_expires();
 
         let merge_result = tokio::task::spawn_blocking(move || {
@@ -881,6 +882,183 @@ async fn apply_local_write(
                 }
                 Ok(())
             };
+            let caller_principal_prep = caller_principal.clone();
+            let caller_role_prep = caller_role.clone();
+            let prepare_incoming = |local: &DevicesFile,
+                                    live_policy: &Policy,
+                                    incoming_mut: &mut DevicesFile|
+             -> Result<(), ErrorBody> {
+                let caller_device_id: Option<String> = caller_pairing_id.clone().or_else(|| {
+                    live_policy
+                        .device_owner(&caller_principal_prep)
+                        .map(str::to_owned)
+                });
+                for (id, inc) in &mut incoming_mut.devices {
+                    if local.removed.contains_key(id) {
+                        continue;
+                    }
+                    if let Some(prev) = local.devices.get(id) {
+                        // Confirmation is ONLY allowed through `device.set confirm=true`, never
+                        // through `config.write` (even for owner callers).
+                        if (inc.confirmed_by.is_some() || inc.confirmed_at.is_some())
+                            && (inc.confirmed_by != prev.confirmed_by
+                                || inc.confirmed_at != prev.confirmed_at)
+                        {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                "Setting confirmed_by or confirmed_at through `config.write devices.toml` is not allowed.",
+                            )
+                            .with_hint("Confirm a quarantined device with `legion device.set id=<pairing_id> confirm=true`."));
+                        }
+                        // Dropping creator metadata on an existing entry is refused even for owner
+                        // callers so quarantine provenance cannot be stripped through `config.write`.
+                        let drops_paired_by = prev.paired_by.is_some() && inc.paired_by.is_none();
+                        let drops_creator_device = prev
+                            .paired_by
+                            .as_ref()
+                            .and_then(|p| p.device.as_ref())
+                            .is_some()
+                            && inc
+                                .paired_by
+                                .as_ref()
+                                .and_then(|p| p.device.as_ref())
+                                .is_none();
+                        if drops_paired_by || drops_creator_device {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                "Removing paired_by provenance from an existing paired device via `config.write` is not allowed.",
+                            )
+                            .with_hint("Keep the existing paired_by metadata intact, or confirm a quarantined device with `device.set confirm=true`."));
+                        }
+
+                        if !caller_is_owner {
+                            if inc != prev && prev.principal != caller_principal_prep {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "As {caller_principal_prep}, you may not modify a paired device owned by {}.",
+                                        prev.principal
+                                    ),
+                                )
+                                .with_hint("Modify other principals' devices as the owner of this machine."));
+                            }
+                            if inc.paired_at != prev.paired_at {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "paired_at for device {id} is immutable once written for non-owner callers."
+                                    ),
+                                ));
+                            }
+                            if inc.paired_on != prev.paired_on {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "paired_on for device {id} is immutable once written for non-owner callers."
+                                    ),
+                                ));
+                            }
+                            if inc.paired_by != prev.paired_by {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "paired_by for device {id} is immutable once written for non-owner callers."
+                                    ),
+                                ));
+                            }
+                            if inc.public_key != prev.public_key {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "public_key for device {id} is immutable once written for non-owner callers."
+                                    ),
+                                ));
+                            }
+                            if inc.confirmed_by != prev.confirmed_by
+                                || inc.confirmed_at != prev.confirmed_at
+                            {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    "Only a caller with the owner role may confirm a quarantined paired device.",
+                                )
+                                .with_hint("Run `device.set confirm=true` as the owner of this machine."));
+                            }
+                            if inc.principal != prev.principal {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "As {caller_principal_prep}, you may not change a paired device's principal from {} to {}.",
+                                        prev.principal, inc.principal
+                                    ),
+                                ));
+                            }
+                            if inc.role != prev.role
+                                && inc.role.as_deref() != Some(caller_role_prep.as_str())
+                            {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "As {caller_principal_prep} ({caller_role_prep}), you may not assign role {:?} to a paired device.",
+                                        inc.role
+                                    ),
+                                )
+                                .with_hint("Only a caller with the owner role may assign or change device roles."));
+                            }
+                        }
+                    } else {
+                        // Brand-new live entry: confirmation is never allowed via `config.write`.
+                        if inc.confirmed_by.is_some() || inc.confirmed_at.is_some() {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                "Setting confirmed_by or confirmed_at through `config.write devices.toml` is not allowed.",
+                            )
+                            .with_hint("Confirm a quarantined device with `legion device.set id=<pairing_id> confirm=true`."));
+                        }
+                        if !caller_is_owner {
+                            // For a non-owner adding a live entry, `paired_by` must match the
+                            // caller's principal (and its pairing id when the caller is itself a
+                            // paired device); fill omitted fields from call context and reject any
+                            // entry claiming otherwise.
+                            match &mut inc.paired_by {
+                                None => {
+                                    inc.paired_by = Some(PairedBy {
+                                        principal: caller_principal_prep.clone(),
+                                        device: caller_device_id.clone(),
+                                    });
+                                }
+                                Some(pb) => {
+                                    if pb.principal != caller_principal_prep {
+                                        return Err(ErrorBody::new(
+                                            ErrorCode::Denied,
+                                            format!(
+                                                "As {caller_principal_prep}, you may not record paired_by.principal as {}.",
+                                                pb.principal
+                                            ),
+                                        ));
+                                    }
+                                    if let Some(ref expected_dev) = caller_device_id {
+                                        match pb.device.as_deref() {
+                                            None => {
+                                                pb.device = Some(expected_dev.clone());
+                                            }
+                                            Some(given) if given == expected_dev => {}
+                                            Some(other) => {
+                                                return Err(ErrorBody::new(
+                                                    ErrorCode::Denied,
+                                                    format!(
+                                                        "As paired device {expected_dev}, you may not record paired_by.device as {other}."
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            };
             let authorize_change = |change: MergeChange<'_>| -> Result<(), ErrorBody> {
                 if let Some(limit) = credential_expires
                     && matches!(change, MergeChange::Live { .. })
@@ -912,7 +1090,9 @@ async fn apply_local_write(
                                 )
                                 .with_hint("Modify other principals' devices as the owner of this machine."));
                             }
-                            if entry.confirmed_by != prev.confirmed_by {
+                            if entry.confirmed_by != prev.confirmed_by
+                                || entry.confirmed_at != prev.confirmed_at
+                            {
                                 return Err(ErrorBody::new(
                                     ErrorCode::Denied,
                                     "Only a caller with the owner role may confirm a quarantined paired device.",
@@ -926,7 +1106,7 @@ async fn apply_local_write(
                                 ));
                             }
                         } else {
-                            if entry.confirmed_by.is_some() {
+                            if entry.confirmed_by.is_some() || entry.confirmed_at.is_some() {
                                 return Err(ErrorBody::new(
                                     ErrorCode::Denied,
                                     "Only a caller with the owner role may mark a paired device as confirmed.",
@@ -996,6 +1176,7 @@ async fn apply_local_write(
                 &node_file,
                 &incoming,
                 check_precondition,
+                prepare_incoming,
                 authorize_change,
             )
         })
@@ -2033,7 +2214,6 @@ async fn sync_devices_document(
     };
 
     let merged = merge_devices(&local_devices, &remote_devices);
-    let merged_is_empty = merged.devices.is_empty() && merged.removed.is_empty();
 
     if direction == SyncDirection::Status {
         let (status, detail) = classify_devices_status(
@@ -2069,8 +2249,25 @@ async fn sync_devices_document(
             let caller_principal = ctx.principal();
             let caller_role = ctx.grant().role();
 
+            // Confirmations (`confirmed_by`/`confirmed_at`) are node-local and only accepted via
+            // `device.set confirm=true`, so align outgoing confirmation fields with what the peer
+            // already holds (never smuggling a confirmation over `config.write` or failing sync of
+            // unrelated entries).
             let outgoing = if caller_is_owner {
-                local_devices.clone()
+                let mut aligned = local_devices.clone();
+                for (id, entry) in &mut aligned.devices {
+                    match remote_devices.devices.get(id) {
+                        Some(prev_remote) => {
+                            entry.confirmed_by = prev_remote.confirmed_by.clone();
+                            entry.confirmed_at = prev_remote.confirmed_at.clone();
+                        }
+                        None => {
+                            entry.confirmed_by = None;
+                            entry.confirmed_at = None;
+                        }
+                    }
+                }
+                aligned
             } else {
                 let mut scoped = DevicesFile::default();
                 for (id, entry) in &local_devices.devices {
@@ -2078,20 +2275,38 @@ async fn sync_devices_document(
                         continue;
                     }
                     let prev_remote = remote_devices.devices.get(id);
+                    if prev_remote == Some(entry) {
+                        continue;
+                    }
+                    let mut candidate = entry.clone();
+                    match prev_remote {
+                        Some(p) => {
+                            candidate.confirmed_by = p.confirmed_by.clone();
+                            candidate.confirmed_at = p.confirmed_at.clone();
+                        }
+                        None => {
+                            candidate.confirmed_by = None;
+                            candidate.confirmed_at = None;
+                        }
+                    }
+                    if prev_remote == Some(&candidate) {
+                        continue;
+                    }
                     let prev_ok = prev_remote.is_none_or(|p| {
                         p.principal == caller_principal
-                            && p.confirmed_by == entry.confirmed_by
-                            && p.paired_by == entry.paired_by
+                            && p.paired_at == candidate.paired_at
+                            && p.paired_on == candidate.paired_on
+                            && p.paired_by == candidate.paired_by
+                            && p.public_key == candidate.public_key
                     });
                     let new_ok = prev_remote.is_some()
-                        || (entry.confirmed_by.is_none()
-                            && entry
-                                .paired_by
-                                .as_ref()
-                                .is_none_or(|pb| pb.principal == caller_principal));
-                    let role_ok = entry.role.as_deref().is_none_or(|r| r == caller_role);
-                    if entry.principal == caller_principal && prev_ok && new_ok && role_ok {
-                        scoped.devices.insert(id.clone(), entry.clone());
+                        || candidate
+                            .paired_by
+                            .as_ref()
+                            .is_none_or(|pb| pb.principal == caller_principal);
+                    let role_ok = candidate.role.as_deref().is_none_or(|r| r == caller_role);
+                    if candidate.principal == caller_principal && prev_ok && new_ok && role_ok {
+                        scoped.devices.insert(id.clone(), candidate);
                     }
                 }
                 for (id, tomb) in &local_devices.removed {
@@ -2365,9 +2580,26 @@ async fn sync_devices_document(
         }
         SyncDirection::Pull => {
             // Explicit pull: merges the peer's live devices and tombstones into local `devices.toml`
-            // without writing back to the peer.
+            // without writing back to the peer. Confirmations are node-local (`device.set`), so
+            // align incoming `confirmed_by`/`confirmed_at` with what this node already holds.
+            let mut sanitized_remote = remote_devices.clone();
+            for (id, entry) in &mut sanitized_remote.devices {
+                match local_devices.devices.get(id) {
+                    Some(prev_local) => {
+                        entry.confirmed_by = prev_local.confirmed_by.clone();
+                        entry.confirmed_at = prev_local.confirmed_at.clone();
+                    }
+                    None => {
+                        entry.confirmed_by = None;
+                        entry.confirmed_at = None;
+                    }
+                }
+            }
+            let sanitized_merged = merge_devices(&local_devices, &sanitized_remote);
+            let sanitized_empty =
+                sanitized_merged.devices.is_empty() && sanitized_merged.removed.is_empty();
             let local_up_to_date =
-                local_devices == merged && (merged_is_empty || local_file_exists);
+                local_devices == sanitized_merged && (sanitized_empty || local_file_exists);
             if local_up_to_date {
                 if !dry_run
                     && local.hash == remote.hash
@@ -2388,7 +2620,7 @@ async fn sync_devices_document(
                 };
             }
 
-            let Some(remote_content) = remote.content else {
+            if remote.content.is_none() {
                 return DocSyncOutcome {
                     status: SyncStatus::OnlyHere,
                     local_hash: local.hash,
@@ -2401,7 +2633,7 @@ async fn sync_devices_document(
                     warnings: Vec::new(),
                     error: None,
                 };
-            };
+            }
 
             if dry_run {
                 return DocSyncOutcome {
@@ -2418,7 +2650,14 @@ async fn sync_devices_document(
                 };
             }
 
-            match apply_local_write(ctx, SharedDocument::Devices, remote_content, None, false).await
+            match apply_local_write(
+                ctx,
+                SharedDocument::Devices,
+                sanitized_remote.to_toml_string(),
+                None,
+                false,
+            )
+            .await
             {
                 Ok(written) => {
                     let converged = remote.hash.as_deref() == Some(written.hash_after.as_str());
@@ -3029,6 +3268,7 @@ mod tests {
             paired_on: "node-a".to_owned(),
             paired_by: None,
             confirmed_by: None,
+            confirmed_at: None,
             updated_at: "2026-11-24T10:00:00Z".to_owned(),
             updated_on: "node-a".to_owned(),
         };
@@ -3041,6 +3281,7 @@ mod tests {
             paired_on: "node-b".to_owned(),
             paired_by: None,
             confirmed_by: None,
+            confirmed_at: None,
             updated_at: "2026-11-24T10:01:00Z".to_owned(),
             updated_on: "node-b".to_owned(),
         };
@@ -3128,6 +3369,7 @@ role = \"phone_admin\"
                 paired_on: "box-a".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3159,6 +3401,7 @@ role = \"phone_admin\"
                 paired_on: "box-a".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T11:00:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3174,6 +3417,7 @@ role = \"phone_admin\"
                 paired_on: "box-b".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:10:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3227,6 +3471,7 @@ role = \"phone_admin\"
                 paired_on: "box-b".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:20:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3321,6 +3566,7 @@ device = \"11111111111111111111111111111111\"
                 paired_on: "box-a".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3342,6 +3588,7 @@ device = \"11111111111111111111111111111111\"
                 paired_on: "box-a".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:05:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3452,6 +3699,7 @@ role = \"phone_admin\"
                 paired_on: "box-a".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3472,6 +3720,7 @@ role = \"phone_admin\"
                 paired_on: "box-a".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:05:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3529,6 +3778,7 @@ role = \"phone_admin\"
                 paired_on: "box-b".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:07:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3595,6 +3845,7 @@ role = \"phone_admin\"
                 paired_on: "box-a".to_owned(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3749,6 +4000,417 @@ role = \"phone_admin\"
                     .as_deref()
                     .is_some_and(|h| h.contains("permanent") && !h.contains("prune_tombstones")),
             "expected clear permanent-tombstone size limit error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn m1_quarantine_and_removal_cannot_be_bypassed_via_config_write() {
+        use jiff::SignedDuration;
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{
+            DeviceTombstone, FleetDevice, PairedBy, lock_config, reconcile_device_principals_locked,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+
+        let id_d = "d1".repeat(16);
+        let id_e = "e1".repeat(16);
+        let id_s = "a1".repeat(16);
+        let id_child = "c1".repeat(16);
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.\"device:d\"]
+role = \"ops\"
+device = \"{id_d}\"
+
+[principals.shared_ops]
+role = \"ops\"
+"
+            ),
+        )
+        .unwrap();
+
+        let now = Timestamp::now();
+        let t0 = (now - SignedDuration::from_mins(30)).to_string();
+        let t1 = (now - SignedDuration::from_mins(20)).to_string();
+        let t2 = (now - SignedDuration::from_mins(10)).to_string();
+        let t_older = (now - SignedDuration::from_mins(25)).to_string();
+        let t_backdated = (now - SignedDuration::from_hours(2)).to_string();
+
+        let mut initial = DevicesFile::default();
+        initial.devices.insert(
+            id_d.clone(),
+            FleetDevice {
+                name: "d".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0xd1; 32]),
+                principal: "device:d".to_owned(),
+                role: Some("ops".to_owned()),
+                paired_at: t0.clone(),
+                paired_on: "box-a".to_owned(),
+                paired_by: Some(PairedBy {
+                    principal: "owner".to_owned(),
+                    device: None,
+                }),
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: t0.clone(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        initial.devices.insert(
+            id_s.clone(),
+            FleetDevice {
+                name: "shared-parent".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0xa1; 32]),
+                principal: "shared_ops".to_owned(),
+                role: None,
+                paired_at: t0.clone(),
+                paired_on: "box-a".to_owned(),
+                paired_by: Some(PairedBy {
+                    principal: "owner".to_owned(),
+                    device: None,
+                }),
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: t0.clone(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        // 1. Reproduced attack: device `d` (admin-capable role `ops` on marked `device:d`) writes
+        //    a new live entry `e` with another key, `principal = "device:d"`, `paired_by` omitted.
+        //    Must be refused because `device:d` is marked for `id_d`!
+        let mut hijack = DevicesFile::default();
+        hijack.devices.insert(
+            id_e.clone(),
+            FleetDevice {
+                name: "e".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0xe1; 32]),
+                principal: "device:d".to_owned(),
+                role: Some("ops".to_owned()),
+                paired_at: t1.clone(),
+                paired_on: "box-a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: t1.clone(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        let mut hijack_call = Call::new(
+            Door::Ssh,
+            "config.write",
+            json!({"document": "devices.toml", "content": hijack.to_toml_string()}),
+        );
+        hijack_call.pinned = Some("device:d".to_owned());
+        hijack_call.device = Some("d".to_owned());
+        hijack_call.pairing_id = Some(id_d.clone());
+        let err = node.call(hijack_call).await.unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::Denied,
+            "hijack by d must fail: {err:?}"
+        );
+
+        // 1b. Even an owner caller cannot assign another pairing id to marked principal `device:d`.
+        let owner_hijack_err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": hijack.to_toml_string()}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            owner_hijack_err.code,
+            ErrorCode::Denied,
+            "owner merge claiming marked device:d for id_e must fail: {owner_hijack_err:?}"
+        );
+
+        // 2. Non-owner paired device `s` on shared principal `shared_ops` adding a new live entry:
+        //    - claiming another `paired_by.principal` -> refused;
+        //    - claiming another `paired_by.device` -> refused;
+        //    - omitting `paired_by` -> node fills `{ principal: "shared_ops", device: Some(id_s) }`!
+        let make_child = |paired_by: Option<PairedBy>| {
+            let mut f = DevicesFile::default();
+            f.devices.insert(
+                id_child.clone(),
+                FleetDevice {
+                    name: "child".to_owned(),
+                    public_key: ed25519_public_key_from_seed(&[0xc1; 32]),
+                    principal: "shared_ops".to_owned(),
+                    role: None,
+                    paired_at: t1.clone(),
+                    paired_on: "box-a".to_owned(),
+                    paired_by,
+                    confirmed_by: None,
+                    confirmed_at: None,
+                    updated_at: t1.clone(),
+                    updated_on: "box-a".to_owned(),
+                },
+            );
+            f
+        };
+        let mut wrong_principal = Call::new(
+            Door::Ssh,
+            "config.write",
+            json!({
+                "document": "devices.toml",
+                "content": make_child(Some(PairedBy {
+                    principal: "owner".to_owned(),
+                    device: None,
+                })).to_toml_string()
+            }),
+        );
+        wrong_principal.pinned = Some("shared_ops".to_owned());
+        wrong_principal.device = Some("shared-parent".to_owned());
+        wrong_principal.pairing_id = Some(id_s.clone());
+        assert_eq!(
+            node.call(wrong_principal).await.unwrap_err().code,
+            ErrorCode::Denied
+        );
+
+        let mut wrong_device = Call::new(
+            Door::Ssh,
+            "config.write",
+            json!({
+                "document": "devices.toml",
+                "content": make_child(Some(PairedBy {
+                    principal: "shared_ops".to_owned(),
+                    device: Some(id_d.clone()),
+                })).to_toml_string()
+            }),
+        );
+        wrong_device.pinned = Some("shared_ops".to_owned());
+        wrong_device.device = Some("shared-parent".to_owned());
+        wrong_device.pairing_id = Some(id_s.clone());
+        assert_eq!(
+            node.call(wrong_device).await.unwrap_err().code,
+            ErrorCode::Denied
+        );
+
+        let mut omitted_paired_by = Call::new(
+            Door::Ssh,
+            "config.write",
+            json!({"document": "devices.toml", "content": make_child(None).to_toml_string()}),
+        );
+        omitted_paired_by.pinned = Some("shared_ops".to_owned());
+        omitted_paired_by.device = Some("shared-parent".to_owned());
+        omitted_paired_by.pairing_id = Some(id_s.clone());
+        node.call(omitted_paired_by).await.unwrap();
+
+        let saved: DevicesFile = parse(
+            &paths.config_file("devices.toml"),
+            &std::fs::read(paths.config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved.devices[&id_child].paired_by,
+            Some(PairedBy {
+                principal: "shared_ops".to_owned(),
+                device: Some(id_s.clone()),
+            }),
+            "node must fill paired_by from call context when omitted"
+        );
+
+        // 3. Reproduced attack #2: child tries to rewrite its own immutable fields (`paired_at`,
+        //    `paired_on`, `paired_by`, `public_key`), both with newer `updated_at` AND with an
+        //    older `updated_at` that would lose a CRDT tie. Every attempt must be refused!
+        let base_child = saved.devices[&id_child].clone();
+        for (label, mutate) in [
+            (
+                "paired_at newer",
+                Box::new(|d: &mut FleetDevice| {
+                    d.paired_at = t_backdated.clone();
+                    d.updated_at = t2.clone();
+                }) as Box<dyn Fn(&mut FleetDevice)>,
+            ),
+            (
+                "paired_at older tie-loser (must still be refused, not silently ignored)",
+                Box::new(|d: &mut FleetDevice| {
+                    d.paired_at = t_backdated.clone();
+                    d.updated_at = t_older.clone();
+                }),
+            ),
+            (
+                "paired_on",
+                Box::new(|d: &mut FleetDevice| {
+                    d.paired_on = "other-node".to_owned();
+                    d.updated_at = t2.clone();
+                }),
+            ),
+            (
+                "paired_by",
+                Box::new(|d: &mut FleetDevice| {
+                    d.paired_by = None;
+                    d.updated_at = t2.clone();
+                }),
+            ),
+            (
+                "public_key",
+                Box::new(|d: &mut FleetDevice| {
+                    d.public_key = ed25519_public_key_from_seed(&[0xfe; 32]);
+                    d.updated_at = t2.clone();
+                }),
+            ),
+        ] {
+            let mut attempt = DevicesFile::default();
+            let mut mutated = base_child.clone();
+            mutate(&mut mutated);
+            attempt.devices.insert(id_child.clone(), mutated);
+            let mut call = Call::new(
+                Door::Ssh,
+                "config.write",
+                json!({"document": "devices.toml", "content": attempt.to_toml_string()}),
+            );
+            call.pinned = Some("shared_ops".to_owned());
+            call.device = Some("child".to_owned());
+            call.pairing_id = Some(id_child.clone());
+            let err = node.call(call).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{label}: {err:?}");
+        }
+
+        // 4. Owner `config.write` cannot drop `paired_by` or set `confirmed_by`/`confirmed_at`
+        //    on an existing entry (confirmation only through `device.set`).
+        let mut owner_drop_pb = DevicesFile::default();
+        let mut dropped = base_child.clone();
+        dropped.paired_by = None;
+        dropped.updated_at = t2.clone();
+        owner_drop_pb.devices.insert(id_child.clone(), dropped);
+        let drop_err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": owner_drop_pb.to_toml_string()}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            drop_err.code,
+            ErrorCode::Denied,
+            "owner drop paired_by: {drop_err:?}"
+        );
+
+        let confirm_toml = format!(
+            "\
+version = 1
+
+[devices.{id_child}]
+name = \"child\"
+public_key = \"{}\"
+principal = \"shared_ops\"
+paired_at = \"{t1}\"
+paired_on = \"box-a\"
+paired_by = {{ principal = \"shared_ops\", device = \"{id_s}\" }}
+confirmed_by = \"owner\"
+confirmed_at = \"{t2}\"
+updated_at = \"{t2}\"
+updated_on = \"box-a\"
+",
+            base_child.public_key
+        );
+        let confirm_err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": confirm_toml}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            confirm_err.code,
+            ErrorCode::Denied,
+            "owner config.write setting confirmed_by/confirmed_at must fail: {confirm_err:?}"
+        );
+
+        // 5. After `d` is tombstoned, reconcile removes `device:d` and NEVER re-creates `device:d`
+        //    for a different pairing id `e` (nor does owner `config.write` allow adding `e` on `device:d`).
+        let mut tomb_d = DevicesFile::default();
+        tomb_d.removed.insert(
+            id_d.clone(),
+            DeviceTombstone {
+                name: "d".to_owned(),
+                principal: "device:d".to_owned(),
+                paired_at: Some(t0.clone()),
+                paired_on: Some("box-a".to_owned()),
+                removed_at: t2.clone(),
+                removed_on: "box-a".to_owned(),
+            },
+        );
+        node.call(Call::new(
+            Door::Cli,
+            "config.write",
+            json!({"document": "devices.toml", "content": tomb_d.to_toml_string()}),
+        ))
+        .await
+        .unwrap();
+
+        let reuse_err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": hijack.to_toml_string()}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            reuse_err.code,
+            ErrorCode::Denied,
+            "reusing tombstoned device:d for id_e must fail: {reuse_err:?}"
+        );
+
+        // Even if a pre-existing file had `e` claiming `device:d` alongside `removed.d`,
+        // reconcile_device_principals_locked must never re-create `device:d` for `e`.
+        let mut corrupted: DevicesFile = parse(
+            &paths.config_file("devices.toml"),
+            &std::fs::read(paths.config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        corrupted
+            .devices
+            .insert(id_e.clone(), hijack.devices[&id_e].clone());
+        {
+            let _cfg = lock_config(&paths).unwrap();
+            let warnings = reconcile_device_principals_locked(&paths, &corrupted).unwrap();
+            assert!(
+                warnings.iter().any(|w| w.contains("device:d")),
+                "expected warning refusing to re-create device:d: {warnings:?}"
+            );
+        }
+        let pol_after: Policy = parse(
+            &paths.config_file("policy.toml"),
+            &std::fs::read(paths.config_file("policy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pol_after.device_owner("device:d"),
+            None,
+            "reconcile must never re-create device:d for id_e"
         );
     }
 }

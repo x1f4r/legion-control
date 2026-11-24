@@ -567,22 +567,25 @@ fn process_enrol_blocking(
             );
         }
         if invite.create_principal
-            && devices.devices.values().any(|dev| {
+            && (devices.devices.values().any(|dev| {
                 dev.principal == principal
                     || invite
                         .device_name
                         .as_deref()
                         .is_some_and(|slug| dev.name == slug)
-            })
+            }) || devices
+                .removed
+                .values()
+                .any(|tomb| tomb.principal == principal))
         {
             return fail_with_sweep(
                 Some(principal.clone()),
                 ErrorBody::new(
                     ErrorCode::Conflict,
-                    format!("A paired device for {principal} already exists in devices.toml."),
+                    format!("A paired device for {principal} already exists or was previously removed in devices.toml."),
                 )
                 .with_hint(
-                    "Create a new invite with a different device name, or remove the existing device first.",
+                    "Create a new invite so a fresh `device:*` principal is allocated.",
                 ),
                 auth_keys,
                 state,
@@ -657,6 +660,7 @@ fn process_enrol_blocking(
                 paired_on: valid_node_name.clone(),
                 paired_by,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: precise_now,
                 updated_on: valid_node_name.clone(),
             },

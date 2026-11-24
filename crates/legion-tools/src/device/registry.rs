@@ -115,9 +115,14 @@ pub struct FleetDevice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paired_by: Option<PairedBy>,
     /// Owner principal that explicitly confirmed this device after a quarantine, clearing
-    /// quarantine for it and its unconfirmed descendants.
+    /// quarantine for it and its unconfirmed descendants when `confirmed_at` is later than the
+    /// removing tombstone's `removed_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_by: Option<String>,
+    /// RFC 3339 UTC timestamp when `confirmed_by` confirmed this device via `device.set`.
+    /// Must be present whenever `confirmed_by` is set and absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<String>,
     /// RFC 3339 UTC timestamp of the most recent update (initially `paired_at`).
     pub updated_at: String,
     /// Node name that wrote the most recent update (initially `paired_on`).
@@ -239,6 +244,16 @@ impl Document for DevicesFile {
                 Principal::parse(confirmed_by)
                     .map_err(|e| format!("devices.{id}.confirmed_by: {}", e.message))?;
             }
+            if let Some(confirmed_at) = &entry.confirmed_at {
+                confirmed_at
+                    .parse::<Timestamp>()
+                    .map_err(|e| format!("devices.{id}.confirmed_at is not RFC 3339 UTC: {e}"))?;
+            }
+            if entry.confirmed_by.is_some() != entry.confirmed_at.is_some() {
+                return Err(format!(
+                    "devices.{id}: confirmed_by and confirmed_at must either both be set or both be omitted"
+                ));
+            }
             entry
                 .updated_at
                 .parse::<Timestamp>()
@@ -306,6 +321,9 @@ impl DevicesFile {
                 }
                 if let Some(confirmed_by) = &dev.confirmed_by {
                     t["confirmed_by"] = value(confirmed_by.as_str());
+                }
+                if let Some(confirmed_at) = &dev.confirmed_at {
+                    t["confirmed_at"] = value(confirmed_at.as_str());
                 }
                 t["updated_at"] = value(dev.updated_at.as_str());
                 t["updated_on"] = value(dev.updated_on.as_str());
@@ -433,6 +451,9 @@ pub fn validate_incoming_timestamps(
     for (id, entry) in &devices.devices {
         check("devices", id, "paired_at", &entry.paired_at)?;
         check("devices", id, "updated_at", &entry.updated_at)?;
+        if let Some(confirmed_at) = &entry.confirmed_at {
+            check("devices", id, "confirmed_at", confirmed_at)?;
+        }
     }
     for (id, tomb) in &devices.removed {
         if let Some(paired_at) = &tomb.paired_at {
@@ -480,41 +501,56 @@ fn device_sort_key(d: &FleetDevice) -> impl Ord + '_ {
             .and_then(|p| p.device.as_deref())
             .unwrap_or(""),
         d.confirmed_by.as_deref().unwrap_or(""),
+        d.confirmed_at.as_deref().unwrap_or(""),
     )
 }
 
-/// Returns the live pairing ids in `devices` that are quarantined because they (or an unconfirmed
-/// ancestor in their `paired_by.device` chain) were paired at or after their creator device was
-/// tombstoned, mapped to a human-readable reason.
+fn confirmed_after(entry: &FleetDevice, removed_ts: Timestamp) -> bool {
+    entry.confirmed_by.is_some()
+        && entry
+            .confirmed_at
+            .as_deref()
+            .and_then(|raw| raw.parse::<Timestamp>().ok())
+            .is_some_and(|confirmed_ts| confirmed_ts > removed_ts)
+}
+
+/// Returns the live pairing ids in `devices` that are quarantined, mapped to
+/// `(causing_removed_at, human_reason)`.
 ///
-/// A device with `confirmed_by.is_some()` has been explicitly confirmed by the owner and is never
-/// quarantined (nor does it propagate quarantine to its own descendants).
-pub fn quarantined_devices(devices: &DevicesFile) -> BTreeMap<String, String> {
-    let mut quarantined: BTreeMap<String, String> = BTreeMap::new();
+/// A child counts as created after its creator's removal when `paired_at >= removed_at - 10
+/// minutes` (matching [`MAX_FUTURE_SKEW`]). A confirmation (`confirmed_by` + `confirmed_at`)
+/// clears quarantine for a device and its unconfirmed descendants ONLY when `confirmed_at` is
+/// strictly later than the removing tombstone's `removed_at`.
+pub fn quarantined_devices_with_timestamps(
+    devices: &DevicesFile,
+) -> BTreeMap<String, (Timestamp, String)> {
+    let mut quarantined: BTreeMap<String, (Timestamp, String)> = BTreeMap::new();
 
     for (id, entry) in &devices.devices {
-        if entry.confirmed_by.is_some() {
-            continue;
-        }
         let Some(creator_id) = entry.paired_by.as_ref().and_then(|p| p.device.as_deref()) else {
             continue;
         };
         let Some(tomb) = devices.removed.get(creator_id) else {
             continue;
         };
-        let paired_at_or_after_removal = match (
+        let (Ok(paired_ts), Ok(removed_ts)) = (
             entry.paired_at.parse::<Timestamp>(),
             tomb.removed_at.parse::<Timestamp>(),
-        ) {
-            (Ok(paired_ts), Ok(removed_ts)) => paired_ts >= removed_ts,
-            _ => false,
+        ) else {
+            continue;
         };
-        if paired_at_or_after_removal {
+        let cutoff = removed_ts
+            .checked_sub(MAX_FUTURE_SKEW)
+            .unwrap_or(Timestamp::MIN);
+        if paired_ts >= cutoff && !confirmed_after(entry, removed_ts) {
             quarantined.insert(
                 id.clone(),
-                format!(
-                    "created by removed device {} ({creator_id}) at {} (creator was removed at {})",
-                    tomb.name, entry.paired_at, tomb.removed_at
+                (
+                    removed_ts,
+                    format!(
+                        "created by removed device {} ({creator_id}) at {} (creator was removed at {})",
+                        tomb.name, entry.paired_at, tomb.removed_at
+                    ),
                 ),
             );
         }
@@ -523,14 +559,16 @@ pub fn quarantined_devices(devices: &DevicesFile) -> BTreeMap<String, String> {
     loop {
         let mut added = Vec::new();
         for (id, entry) in &devices.devices {
-            if entry.confirmed_by.is_some() || quarantined.contains_key(id) {
+            if quarantined.contains_key(id) {
                 continue;
             }
             let Some(creator_id) = entry.paired_by.as_ref().and_then(|p| p.device.as_deref())
             else {
                 continue;
             };
-            if quarantined.contains_key(creator_id) {
+            if let Some((parent_removed_ts, _)) = quarantined.get(creator_id)
+                && !confirmed_after(entry, *parent_removed_ts)
+            {
                 let creator_name = devices
                     .devices
                     .get(creator_id)
@@ -538,19 +576,32 @@ pub fn quarantined_devices(devices: &DevicesFile) -> BTreeMap<String, String> {
                     .unwrap_or(creator_id);
                 added.push((
                     id.clone(),
-                    format!("created by quarantined device {creator_name} ({creator_id})"),
+                    (
+                        *parent_removed_ts,
+                        format!("created by quarantined device {creator_name} ({creator_id})"),
+                    ),
                 ));
             }
         }
         if added.is_empty() {
             break;
         }
-        for (id, reason) in added {
-            quarantined.insert(id, reason);
+        for (id, entry) in added {
+            quarantined.insert(id, entry);
         }
     }
 
     quarantined
+}
+
+/// Returns the live pairing ids in `devices` that are quarantined because they (or an unconfirmed
+/// ancestor in their `paired_by.device` chain) were paired at or after their creator device's
+/// removal (within the [`MAX_FUTURE_SKEW`] window), mapped to a human-readable reason.
+pub fn quarantined_devices(devices: &DevicesFile) -> BTreeMap<String, String> {
+    quarantined_devices_with_timestamps(devices)
+        .into_iter()
+        .map(|(id, (_, reason))| (id, reason))
+        .collect()
 }
 
 /// Read-only list of `(name, pairing_id, reason)` for quarantined live devices in `devices.toml`,
@@ -1004,8 +1055,8 @@ fn write_policy_with_backup(
 ///    principals and human-authored (unmarked) `device:*` principals are never created, elevated,
 ///    modified, or removed; unmarked `device:*` principals emit a warning.
 /// 2. Tombstoned registry-owned `device:*` principals (matching `device = "<tombstone_id>"` and
-///    not referenced by any token) are removed first so a new device later paired under the same
-///    name can cleanly take ownership.
+///    not referenced by any token) are removed first, and a `device:*` principal that belonged to
+///    a tombstoned pairing id is never re-created for a different pairing id.
 /// 3. Every single live `device:*` entry that carries a recorded `role` sets its owned
 ///    `[principals."device:..."]` entry to that exact role with `device = "<pairing_id>"`.
 /// 4. If a recorded role is not defined in this node's `policy.toml` (and is not `owner` or
@@ -1112,6 +1163,22 @@ pub fn reconcile_device_principals_locked(
             warnings.push(format!(
                 "Principal {principal} in policy.toml is owned by pairing {other}, not {pairing_id}; leaving it untouched."
             ));
+            continue;
+        }
+
+        if let Some((tomb_id, _)) = devices
+            .removed
+            .iter()
+            .find(|(tid, t)| tid.as_str() != pairing_id && t.principal == *principal)
+        {
+            warnings.push(format!(
+                "Principal {principal} previously belonged to removed pairing {tomb_id} and will not be re-created for pairing {pairing_id}."
+            ));
+            if let Some(existing) = existing_entry
+                && existing.device.as_deref() == Some(pairing_id)
+            {
+                upsert_device_principal_locked(paths, principal, NOBODY, pairing_id)?;
+            }
             continue;
         }
 
@@ -1282,6 +1349,7 @@ pub fn adopt_legacy_devices_from_auth_keys(
                 paired_on: valid_node.clone(),
                 paired_by: None,
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: paired_at,
                 updated_on: valid_node.clone(),
             });
@@ -2034,15 +2102,18 @@ pub fn read_devices_for_sync_blocking(
 
 /// Applies an incoming `DevicesFile` (e.g. from `fleet.sync` or `config.write`) by merging it with
 /// this node's current `devices.toml` (after adopting any legacy lines when `devices.toml` is
-/// absent), verifying preconditions and caller authorization, saving the merged `devices.toml`
-/// FIRST, then updating registry-owned `device:*` principals in `policy.toml` and reconciling
-/// `authorized_keys`.
+/// absent), verifying preconditions, preparing/validating incoming entries against the live
+/// `policy.toml` and `devices.toml`, enforcing registry-owned principal uniqueness for every
+/// caller, checking caller authorization, saving the merged `devices.toml` FIRST, then updating
+/// registry-owned `device:*` principals in `policy.toml` and reconciling `authorized_keys`.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_devices_merge_blocking(
     paths: &Paths,
     node_name: &str,
     node_file: &NodeFile,
     incoming: &DevicesFile,
     check_precondition: impl FnOnce(Option<&[u8]>) -> Result<(), ErrorBody>,
+    prepare_incoming: impl FnOnce(&DevicesFile, &Policy, &mut DevicesFile) -> Result<(), ErrorBody>,
     authorize_change: impl Fn(MergeChange<'_>) -> Result<(), ErrorBody>,
 ) -> Result<MergeApplyOutcome, MergeApplyError> {
     let _cfg_guard = lock_config(paths).map_err(MergeApplyError::BeforeSave)?;
@@ -2062,6 +2133,18 @@ pub fn apply_devices_merge_blocking(
     validate_incoming_timestamps(incoming, Timestamp::now())
         .map_err(MergeApplyError::BeforeSave)?;
 
+    let policy_path = paths.config_file(Policy::FILE);
+    let live_policy = match std::fs::read(&policy_path) {
+        Ok(bytes) => parse::<Policy>(&policy_path, &bytes).map_err(MergeApplyError::BeforeSave)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
+        Err(error) => {
+            return Err(MergeApplyError::BeforeSave(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", policy_path.display()),
+            )));
+        }
+    };
+
     let had_existing_file = bytes_before.is_some();
     let local = match bytes_before.as_deref() {
         Some(bytes) => {
@@ -2079,11 +2162,6 @@ pub fn apply_devices_merge_blocking(
                 super::authkeys::AuthKeysFile::parse(b"")
             };
             let state = load_state(paths).unwrap_or_default();
-            let policy_path = paths.config_file(Policy::FILE);
-            let policy = std::fs::read(&policy_path)
-                .ok()
-                .and_then(|b| parse::<Policy>(&policy_path, &b).ok())
-                .unwrap_or_default();
             adopt_legacy_devices_from_auth_keys(
                 paths,
                 node_name,
@@ -2091,12 +2169,84 @@ pub fn apply_devices_merge_blocking(
                 &target,
                 caller_account.as_deref(),
                 &state,
-                &policy,
+                &live_policy,
             )
         }
     };
 
-    let merged = merge_devices(&local, incoming);
+    let mut prepared_incoming = incoming.clone();
+    prepare_incoming(&local, &live_policy, &mut prepared_incoming)
+        .map_err(MergeApplyError::BeforeSave)?;
+
+    let merged = merge_devices(&local, &prepared_incoming);
+
+    // Every registry-owned (marked) principal belongs to exactly one pairing id: refuse, for
+    // EVERY caller and at EVERY merge, any incoming or newly added/changed live entry whose
+    // principal is marked for a different id in policy.toml, claimed by another live pairing in
+    // devices.toml, or owned by a tombstoned pairing of a different id.
+    let check_principal_ownership = |id: &str, entry: &FleetDevice| -> Result<(), ErrorBody> {
+        if let Some(owner_id) = live_policy.device_owner(&entry.principal)
+            && owner_id != id
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "Principal {} in policy.toml is owned by pairing {owner_id} and cannot be assigned to pairing {id}.",
+                    entry.principal
+                ),
+            )
+            .with_hint(
+                "Each registry-owned `device:*` principal belongs to exactly one pairing id.",
+            ));
+        }
+        if entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+            if let Some((other_id, _)) = merged.devices.iter().find(|(other_id, other)| {
+                other_id.as_str() != id && other.principal == entry.principal
+            }) {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Principal {} is already claimed by live pairing {other_id} and cannot also be assigned to pairing {id}.",
+                        entry.principal
+                    ),
+                )
+                .with_hint(
+                    "Each `device:*` principal belongs to exactly one pairing id.",
+                ));
+            }
+            if let Some((tomb_id, _)) = merged
+                .removed
+                .iter()
+                .find(|(tomb_id, tomb)| tomb_id.as_str() != id && tomb.principal == entry.principal)
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Principal {} previously belonged to removed pairing {tomb_id} and cannot be assigned to pairing {id}.",
+                        entry.principal
+                    ),
+                )
+                .with_hint(
+                    "Each `device:*` principal belongs to exactly one pairing id and cannot be reused after removal.",
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    for (id, inc) in &prepared_incoming.devices {
+        if merged.removed.contains_key(id) {
+            continue;
+        }
+        if local.devices.get(id) != Some(inc) {
+            check_principal_ownership(id, inc).map_err(MergeApplyError::BeforeSave)?;
+        }
+    }
+    for (id, entry) in &merged.devices {
+        if local.devices.get(id) != Some(entry) {
+            check_principal_ownership(id, entry).map_err(MergeApplyError::BeforeSave)?;
+        }
+    }
 
     // Refuse any merge that adds or changes a live entry whose public key collides with another
     // live entry in the merged view.
@@ -2404,6 +2554,7 @@ mod tests {
             paired_on: "tower".to_owned(),
             paired_by: None,
             confirmed_by: None,
+            confirmed_at: None,
             updated_at: updated_at.to_owned(),
             updated_on: node.to_owned(),
         }
@@ -2474,6 +2625,9 @@ mod tests {
                         }),
                     };
                     let confirmed_by = (*rng.pick(&confirmed_opts)).map(str::to_owned);
+                    let confirmed_at = confirmed_by
+                        .as_ref()
+                        .map(|_| (*rng.pick(&times)).to_owned());
                     file.devices.insert(
                         id.clone(),
                         FleetDevice {
@@ -2485,6 +2639,7 @@ mod tests {
                             paired_on: paired_on.to_owned(),
                             paired_by,
                             confirmed_by,
+                            confirmed_at,
                             updated_at: updated_at.to_owned(),
                             updated_on: updated_on.to_owned(),
                         },
@@ -2535,6 +2690,7 @@ mod tests {
                 device: None,
             }),
             confirmed_by: None,
+            confirmed_at: None,
             updated_at: "2026-11-24T10:00:00Z".to_owned(),
             updated_on: "pi".to_owned(),
         };
@@ -2558,7 +2714,14 @@ mod tests {
                 device: Some(sample_id(1)),
             });
         });
-        push_variant(|d| d.confirmed_by = Some("owner".to_owned()));
+        push_variant(|d| {
+            d.confirmed_by = Some("owner".to_owned());
+            d.confirmed_at = Some("2026-11-24T10:00:00Z".to_owned());
+        });
+        push_variant(|d| {
+            d.confirmed_by = Some("owner".to_owned());
+            d.confirmed_at = Some("2026-11-24T10:00:01Z".to_owned());
+        });
 
         let mut base_file = DevicesFile::default();
         base_file.devices.insert(id.clone(), base.clone());
@@ -3001,6 +3164,7 @@ role = "editor"
                 &node_file,
                 &incoming,
                 |_| Ok(()),
+                |_, _, _| Ok(()),
                 |_| Ok(()),
             ) {
                 Err(MergeApplyError::BeforeSave(err)) => err,

@@ -68,7 +68,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.invite",
         Effect::Admin,
-        "Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves `device:<name>` and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true.",
+        "Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves a unique `device:<name>` principal and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true. A paired device may create invites only on the node it is connected to directly (not forwarded via `on=`).",
         invite,
     );
     registry.add_fn(
@@ -80,7 +80,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.set",
         Effect::Admin,
-        "Change a paired device's role (only for a dedicated `device:*` principal marked with `device = \"<pairing_id>\"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a quarantined descendant (`confirm=true`, owner role only) in devices.toml, reconciling authorized_keys and pushing the change to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for the owner role) and every `device.set` call is refused through an expiring credential.",
+        "Change a paired device's role (only for a dedicated `device:*` principal marked with `device = \"<pairing_id>\"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a currently quarantined descendant (`confirm=true`, owner role only; confirmation records `confirmed_at` locally on this node and is refused if the device is not quarantined) in devices.toml, reconciling authorized_keys and pushing role or name changes to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for the owner role) and every `device.set` call is refused through an expiring credential.",
         set_device,
     );
     registry.add_fn(
@@ -289,6 +289,29 @@ pub struct InviteResult {
 }
 
 async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> {
+    // A paired device may create invites only on the node it is connected to directly, so
+    // `paired_by.device` is always known from the session context.
+    if ctx.hops() > 0 {
+        let policy = ctx.config().get::<Policy>()?;
+        let is_paired_device = ctx.pairing_id().is_some()
+            || ctx.device().is_some()
+            || policy.device_owner(ctx.principal()).is_some()
+            || ctx.principal().starts_with(DEVICE_PRINCIPAL_PREFIX);
+        if is_paired_device {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "A paired device may create pairing invites only on the machine it is connected to directly, not forwarded to {}.",
+                    ctx.node_name()
+                ),
+            )
+            .with_hint(format!(
+                "Connect directly to {} over SSH and run `device.invite` there.",
+                ctx.node_name()
+            )));
+        }
+    }
+
     // An expiring credential (such as an expiring HTTP token) must not mint a permanent SSH key.
     if let Some(limit) = ctx.credential_expires() {
         return Err(ErrorBody::new(
@@ -449,27 +472,13 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         ForcedCommandShell::host()?,
     )?;
 
-    let payload = InvitePayload {
-        v: keys::INVITE_VERSION,
-        id: id.clone(),
-        node: ctx.node_name().to_owned(),
-        hosts: hosts.clone(),
-        port,
-        user: user.clone(),
-        host_keys: host_keys.clone(),
-        key: ephemeral.seed_b64,
-        principal: principal.clone(),
-        expires: expires.clone(),
-    };
-    let invite_text = payload.encode()?;
-
     let creator_policy = ctx.config().get::<Policy>()?;
     let created_by_device = ctx.pairing_id().map(str::to_owned).or_else(|| {
         creator_policy
             .device_owner(ctx.principal())
             .map(str::to_owned)
     });
-    let record = InviteRecord {
+    let base_record = InviteRecord {
         id: id.clone(),
         principal: principal.clone(),
         role: invite_role,
@@ -486,7 +495,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     let id_for_write = id.clone();
     let principal_for_write = principal.clone();
     let node_name_for_write = ctx.node_name().to_owned();
-    blocking(move || {
+    let final_principal = blocking(move || {
         let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
         let caller_account = caller_account_for_target(&target)?;
@@ -499,11 +508,12 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
 
-        let precheck = |auth_keys: &self::authkeys::AuthKeysFile,
-                        state: &store::DevicesState|
-         -> Result<(), ErrorBody> {
+        let resolve_record = |auth_keys: &self::authkeys::AuthKeysFile,
+                              state: &store::DevicesState|
+         -> Result<InviteRecord, ErrorBody> {
+            let mut record = base_record.clone();
             if !create_device_principal {
-                return Ok(());
+                return Ok(record);
             }
             let policy_path = paths.config_file(Policy::FILE);
             let live_policy = match std::fs::read(&policy_path) {
@@ -573,29 +583,83 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
                     "Choose a different device name, or remove the existing device first with `legion device.remove`.",
                 ));
             }
-            Ok(())
+            // A registry-owned `device:*` principal belongs to at most one pairing id across the
+            // lifetime of the fleet. If a removed tombstone already used `device:<slug>`, allocate
+            // the first unused numbered principal (`device:<slug>-2`, ...) so the replacement device
+            // keeps its name without reusing a tombstoned principal.
+            if let Some(slug) = invite_device_name.as_deref()
+                && devices_file
+                    .removed
+                    .values()
+                    .any(|tomb| tomb.principal == principal_for_write)
+            {
+                let mut suffix: u32 = 2;
+                let chosen = loop {
+                    let candidate = format!("{DEVICE_PRINCIPAL_PREFIX}{slug}-{suffix}");
+                    let taken = live_policy
+                        .principals
+                        .keys()
+                        .any(|known| known.as_str() == candidate)
+                        || state.invites.values().any(|inv| inv.principal == candidate)
+                        || devices_file
+                            .devices
+                            .values()
+                            .any(|dev| dev.principal == candidate)
+                        || devices_file
+                            .removed
+                            .values()
+                            .any(|tomb| tomb.principal == candidate);
+                    if !taken && Principal::parse(&candidate).is_ok() {
+                        break candidate;
+                    }
+                    suffix = suffix.checked_add(1).ok_or_else(|| {
+                        ErrorBody::new(
+                            ErrorCode::Conflict,
+                            format!(
+                                "No unused `device:*` principal is available for device name {slug}."
+                            ),
+                        )
+                    })?;
+                };
+                record.principal = chosen;
+            }
+            Ok(record)
         };
 
-        commit_invite_and_state_checked(
+        let saved_record = commit_invite_and_state_checked(
             &paths,
             &target,
             &write_path,
             &id_for_write,
             &invite_line,
-            record,
             now,
-            precheck,
+            resolve_record,
             save_state,
-        )
+        )?;
+        Ok(saved_record.principal)
     })
     .await?;
+
+    let payload = InvitePayload {
+        v: keys::INVITE_VERSION,
+        id: id.clone(),
+        node: ctx.node_name().to_owned(),
+        hosts: hosts.clone(),
+        port,
+        user: user.clone(),
+        host_keys: host_keys.clone(),
+        key: ephemeral.seed_b64,
+        principal: final_principal.clone(),
+        expires: expires.clone(),
+    };
+    let invite_text = payload.encode()?;
 
     let fleet_peers = registry::fleet_peer_names(ctx.paths(), ctx.node_name());
     Ok(InviteResult {
         invite: invite_text,
         id,
         node: ctx.node_name().to_owned(),
-        principal,
+        principal: final_principal,
         role,
         expires,
         hosts,
@@ -754,6 +818,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         .map(|n| n.as_str().to_owned())
         .unwrap_or_else(|_| "node".to_owned());
     let paths = ctx.paths().clone();
+    let should_push_fleet = args.role.is_some() || new_name.is_some();
     let new_role = args.role;
     let confirm = args.confirm;
     let caller_principal = ctx.principal().to_owned();
@@ -895,6 +960,27 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             .cloned()
             .ok_or_else(|| ErrorBody::new(ErrorCode::Internal, "Matched device disappeared."))?;
 
+        let quarantine_removed_ts = if confirm {
+            let quarantined_map = registry::quarantined_devices_with_timestamps(&devices_file);
+            match quarantined_map.get(&pairing_id) {
+                Some((removed_ts, _)) => Some(*removed_ts),
+                None => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::InvalidArgs,
+                        format!(
+                            "Device {} ({pairing_id}) is not quarantined, so confirm=true cannot be applied.",
+                            current_entry.name
+                        ),
+                    )
+                    .with_hint(
+                        "Only a device that is currently quarantined may be confirmed with `device.set confirm=true`.",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         if let Some(ref renamed) = new_name
             && renamed != &current_entry.name
             && devices_file
@@ -953,9 +1039,16 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         };
 
         let mut updated_entry = current_entry.clone();
-        if confirm {
+        let now = Timestamp::now();
+        let confirm_ts = if let Some(removed_ts) = quarantine_removed_ts {
+            let removed_str = registry::format_precise_rfc3339(removed_ts);
+            let ts = registry::next_updated_timestamp_at(Some(&removed_str), now)?;
             updated_entry.confirmed_by = Some(caller_principal);
-        }
+            updated_entry.confirmed_at = Some(ts.clone());
+            Some(ts)
+        } else {
+            None
+        };
         let previous_name = if let Some(ref renamed) = new_name
             && renamed != &current_entry.name
         {
@@ -973,7 +1066,14 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             None
         };
 
-        updated_entry.updated_at = next_updated_timestamp(Some(&current_entry.updated_at))?;
+        let mut next_updated = registry::next_updated_timestamp_at(Some(&current_entry.updated_at), now)?;
+        if let Some(ref c_str) = confirm_ts
+            && let (Ok(c_ts), Ok(u_ts)) = (c_str.parse::<Timestamp>(), next_updated.parse::<Timestamp>())
+            && u_ts < c_ts
+        {
+            next_updated = c_str.clone();
+        }
+        updated_entry.updated_at = next_updated;
         updated_entry.updated_on = valid_node_name;
         devices_file
             .devices
@@ -1033,7 +1133,9 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
     })
     .await?;
 
-    result.fleet = push_devices_to_fleet(ctx.node(), Some(ctx), None).await;
+    if should_push_fleet {
+        result.fleet = push_devices_to_fleet(ctx.node(), Some(ctx), None).await;
+    }
     Ok(result)
 }
 
@@ -2370,11 +2472,11 @@ fn commit_invite_and_state(
         write_path,
         invite_id,
         invite_line,
-        record,
         now,
-        |_, _| Ok(()),
+        |_, _| Ok(record.clone()),
         save_fn,
-    )
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2384,27 +2486,29 @@ fn commit_invite_and_state_checked(
     write_path: &std::path::Path,
     invite_id: &str,
     invite_line: &str,
-    record: InviteRecord,
     now: Timestamp,
-    precheck: impl Fn(&self::authkeys::AuthKeysFile, &store::DevicesState) -> Result<(), ErrorBody>,
+    build_record: impl Fn(
+        &self::authkeys::AuthKeysFile,
+        &store::DevicesState,
+    ) -> Result<InviteRecord, ErrorBody>,
     save_fn: impl FnOnce(&legion_core::Paths, &store::DevicesState) -> Result<(), ErrorBody>,
-) -> Result<(), ErrorBody> {
-    let mut state = edit_auth_keys_with_retry(target, write_path, |mut auth_keys| {
+) -> Result<InviteRecord, ErrorBody> {
+    let (mut state, record) = edit_auth_keys_with_retry(target, write_path, |mut auth_keys| {
         let mut state = load_state(paths)?;
         sweep(&mut auth_keys, &mut state, now);
-        precheck(&auth_keys, &state)?;
+        let record = build_record(&auth_keys, &state)?;
         auth_keys.append_line(invite_line);
-        Ok((Some(auth_keys), state))
+        Ok((Some(auth_keys), (state, record)))
     })?;
 
-    state.invites.insert(invite_id.to_owned(), record);
+    state.invites.insert(invite_id.to_owned(), record.clone());
     if let Err(state_err) = save_fn(paths, &state) {
         // Roll back through the guarded concurrent-edit path by removing only this invite's line,
         // so any out-of-band edit that landed after the append is preserved intact.
         let _ = rollback_invite_line(target, write_path, invite_id);
         return Err(state_err);
     }
-    Ok(())
+    Ok(record)
 }
 
 fn rollback_invite_line(
@@ -4014,6 +4118,7 @@ allow = ["effect:read", "effect:write"]
                     paired_on: "tower".to_owned(),
                     paired_by: None,
                     confirmed_by: None,
+                    confirmed_at: None,
                     updated_at: "2026-11-24T10:00:00Z".to_owned(),
                     updated_on: "tower".to_owned(),
                 },
@@ -4439,6 +4544,7 @@ allow = ["effect:read", "effect:write"]
                     device: Some(id_b.clone()),
                 }),
                 confirmed_by: None,
+                confirmed_at: None,
                 updated_at: b_paired_at.clone(),
                 updated_on: "tower".to_owned(),
             },
@@ -4565,5 +4671,150 @@ allow = ["effect:read", "effect:write"]
             None,
         )
         .expect("descendant C of confirmed B must pass gate verification");
+    }
+
+    #[tokio::test]
+    async fn m1_quarantine_skew_confirm_guards_and_forwarded_invite_refusal() {
+        let h = Harness::new();
+        let now = Timestamp::now();
+        let id_parent = "71".repeat(16);
+        let id_within_skew = "72".repeat(16);
+        let id_before_skew = "73".repeat(16);
+        let id_preconfirmed = "74".repeat(16);
+
+        let removed_at = now - SignedDuration::from_mins(20);
+        let within_skew = removed_at - SignedDuration::from_mins(5);
+        let before_skew = removed_at - SignedDuration::from_mins(15);
+        let preconfirm_at = removed_at - SignedDuration::from_mins(1);
+
+        let key_within = keys::ed25519_public_key_from_seed(&[0x72; 32]);
+        let key_before = keys::ed25519_public_key_from_seed(&[0x73; 32]);
+        let key_pre = keys::ed25519_public_key_from_seed(&[0x74; 32]);
+
+        let devices_toml = format!(
+            "\
+version = 1
+
+[devices.{id_within_skew}]
+name = \"within-skew\"
+public_key = \"{key_within}\"
+principal = \"device:within-skew\"
+role = \"observer\"
+paired_at = \"{within_skew}\"
+paired_on = \"tower\"
+paired_by = {{ principal = \"device:parent\", device = \"{id_parent}\" }}
+updated_at = \"{within_skew}\"
+updated_on = \"tower\"
+
+[devices.{id_before_skew}]
+name = \"before-skew\"
+public_key = \"{key_before}\"
+principal = \"device:before-skew\"
+role = \"observer\"
+paired_at = \"{before_skew}\"
+paired_on = \"tower\"
+paired_by = {{ principal = \"device:parent\", device = \"{id_parent}\" }}
+updated_at = \"{before_skew}\"
+updated_on = \"tower\"
+
+[devices.{id_preconfirmed}]
+name = \"preconfirmed\"
+public_key = \"{key_pre}\"
+principal = \"device:preconfirmed\"
+role = \"observer\"
+paired_at = \"{within_skew}\"
+paired_on = \"tower\"
+paired_by = {{ principal = \"device:parent\", device = \"{id_parent}\" }}
+confirmed_by = \"owner\"
+confirmed_at = \"{preconfirm_at}\"
+updated_at = \"{preconfirm_at}\"
+updated_on = \"tower\"
+
+[removed.{id_parent}]
+name = \"parent\"
+principal = \"device:parent\"
+paired_at = \"{before_skew}\"
+paired_on = \"tower\"
+removed_at = \"{removed_at}\"
+removed_on = \"tower\"
+"
+        );
+        std::fs::write(h.node.paths().config_file("devices.toml"), devices_toml).unwrap();
+
+        let listed = h.call("device.list", json!({})).await.unwrap();
+        let find_dev = |name: &str| {
+            listed["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == json!(name))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {name} in {listed}"))
+        };
+
+        // 1. Child paired 5 min before parent's removed_at (within 10 min skew) IS quarantined.
+        assert_eq!(find_dev("within-skew")["quarantined"], json!(true));
+        // 2. Child paired 15 min before parent's removed_at (outside 10 min skew) is NOT quarantined.
+        assert_ne!(find_dev("before-skew")["quarantined"], json!(true));
+        // 3. Synthetic confirmation with confirmed_at <= removed_at does NOT clear quarantine.
+        assert_eq!(find_dev("preconfirmed")["quarantined"], json!(true));
+
+        // 4. `device.set confirm=true` on a non-quarantined device is refused.
+        let not_q_err = h
+            .call("device.set", json!({"id": id_before_skew, "confirm": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(not_q_err.code, ErrorCode::InvalidArgs, "{not_q_err:?}");
+
+        // 5. `device.set confirm=true` on a quarantined device records `confirmed_at > removed_at`
+        //    and lifts quarantine.
+        let confirmed = h
+            .call("device.set", json!({"id": id_within_skew, "confirm": true}))
+            .await
+            .unwrap();
+        assert_eq!(confirmed["confirmed"], json!(true));
+        let saved_toml =
+            std::fs::read_to_string(h.node.paths().config_file("devices.toml")).unwrap();
+        assert!(
+            saved_toml.contains("confirmed_at ="),
+            "confirm=true must record confirmed_at in devices.toml:\n{saved_toml}"
+        );
+        let listed_after = h.call("device.list", json!({})).await.unwrap();
+        let within_after = listed_after["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == json!("within-skew"))
+            .unwrap();
+        assert_ne!(within_after["quarantined"], json!(true));
+
+        // 6. Forwarded `device.invite` (`hops > 0`) from an owner-role paired device is refused
+        //    with a hint to connect directly.
+        {
+            let _cfg = registry::lock_config(h.node.paths()).unwrap();
+            registry::upsert_device_principal_locked(
+                h.node.paths(),
+                "device:before-skew",
+                "owner",
+                &id_before_skew,
+            )
+            .unwrap();
+        }
+        let mut fwd_inv = Call::new(
+            Door::Rpc,
+            "device.invite",
+            json!({"name": "via-hop", "role": "observer"}),
+        );
+        fwd_inv.pinned = Some("device:before-skew".to_owned());
+        fwd_inv.hops = 1;
+        let fwd_err = h.node.call(fwd_inv).await.unwrap_err();
+        assert_eq!(fwd_err.code, ErrorCode::Denied, "{fwd_err:?}");
+        assert!(
+            fwd_err
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.to_lowercase().contains("connect")),
+            "expected direct-connection hint: {fwd_err:?}"
+        );
     }
 }
