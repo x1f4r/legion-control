@@ -359,6 +359,7 @@ async fn gate(
         match legion_tools::device::sessions::DeviceSessionGuard::register(
             node.paths(),
             device_name,
+            pairing.as_deref(),
             &pinned,
         ) {
             Ok(guard) => Some(guard),
@@ -388,14 +389,16 @@ async fn gate(
             });
         match auth_check {
             Ok(removed_stale) => {
-                for stale_name in removed_stale {
-                    if stale_name != device_name {
-                        let _ = legion_tools::device::sessions::terminate_device_sessions(
-                            node.paths(),
-                            &stale_name,
-                            legion_tools::device::sessions::DEFAULT_TERMINATE_GRACE,
-                        )
-                        .await;
+                for stale_target in removed_stale {
+                    let is_self = stale_target.pairing_id.as_deref() == Some(pairing_id);
+                    if !is_self {
+                        let _ =
+                            legion_tools::device::sessions::terminate_device_sessions_for_target(
+                                node.paths(),
+                                &stale_target,
+                                legion_tools::device::sessions::DEFAULT_TERMINATE_GRACE,
+                            )
+                            .await;
                     }
                 }
             }

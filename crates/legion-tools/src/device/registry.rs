@@ -31,7 +31,7 @@ use super::authkeys::{
     verify_exe_not_group_or_world_writable, verify_owner_matches_euid,
 };
 use super::keys::{fingerprint_key_b64, validate_ed25519_public_key, validate_pairing_id};
-use super::sessions::validate_device_label;
+use super::sessions::{SessionTarget, validate_device_label};
 use super::store::{DevicesState, load_state, lock_auth_keys};
 
 /// Current schema version of `devices.toml`.
@@ -1130,8 +1130,9 @@ pub const FOREIGN_KEY_COLLISION_STATUS: &str =
 pub struct AuthKeysReconcileReport {
     /// Whether `authorized_keys` was modified in memory and needs to be saved.
     pub changed: bool,
-    /// Device names whose `authorized_keys` lines were removed during reconciliation.
-    pub removed_device_names: Vec<String>,
+    /// Devices (disambiguated by pairing id) whose `authorized_keys` lines were removed during
+    /// reconciliation.
+    pub removed_targets: Vec<SessionTarget>,
     /// Live pairing ids skipped because two or more live devices share the same public key, mapped
     /// to the other colliding pairing ids.
     pub duplicate_key_ids: BTreeMap<String, Vec<String>>,
@@ -1329,7 +1330,7 @@ pub fn reconcile_authorized_keys_in_memory(
     }
 
     let mut kept_ids: HashSet<String> = HashSet::new();
-    let mut removed_device_names: BTreeSet<String> = BTreeSet::new();
+    let mut removed_targets: BTreeSet<SessionTarget> = BTreeSet::new();
 
     let mut changed = auth_keys.retain(|line| {
         let LineKind::Device {
@@ -1368,7 +1369,7 @@ pub fn reconcile_authorized_keys_in_memory(
             }
         }
 
-        removed_device_names.insert(name.clone());
+        removed_targets.insert(SessionTarget::new(name.clone(), Some(pairing_id.clone())));
         false
     });
 
@@ -1389,7 +1390,7 @@ pub fn reconcile_authorized_keys_in_memory(
 
     Ok(AuthKeysReconcileReport {
         changed,
-        removed_device_names: removed_device_names.into_iter().collect(),
+        removed_targets: removed_targets.into_iter().collect(),
         duplicate_key_ids,
         foreign_key_ids,
         warnings,
@@ -1406,9 +1407,9 @@ pub struct ReconcileOutcome {
     pub devices_adopted: usize,
     /// Whether `authorized_keys` was rewritten.
     pub auth_keys_changed: bool,
-    /// Device names whose `authorized_keys` lines were removed during reconciliation (callers
-    /// should terminate active sessions for these names).
-    pub removed_device_names: Vec<String>,
+    /// Devices (disambiguated by pairing id) whose `authorized_keys` lines were removed during
+    /// reconciliation (callers should terminate active sessions for these targets).
+    pub removed_targets: Vec<SessionTarget>,
     /// Warnings generated during `authorized_keys` reconciliation (duplicate keys or foreign-line
     /// collisions).
     pub warnings: Vec<String>,
@@ -1495,7 +1496,7 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
         devices,
         devices_adopted,
         auth_keys_changed: report.changed,
-        removed_device_names: report.removed_device_names,
+        removed_targets: report.removed_targets,
         warnings: report.warnings,
     })
 }
@@ -1516,7 +1517,7 @@ pub fn verify_gate_device(
     pairing_id: &str,
     principal: &str,
     account: Option<&str>,
-) -> Result<Vec<String>, ErrorBody> {
+) -> Result<Vec<SessionTarget>, ErrorBody> {
     let target = resolve_target(paths, node_file)?;
     let write_path = resolve_safe_write_path(&target, paths.home())?;
     if target.windows_admin_acl {
@@ -1592,7 +1593,7 @@ pub fn verify_gate_device(
     )?;
     if probe_report.changed {
         let outcome = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false)?;
-        return Ok(outcome.removed_device_names);
+        return Ok(outcome.removed_targets);
     }
 
     Ok(Vec::new())
@@ -1633,12 +1634,27 @@ pub struct MergeApplyOutcome {
     pub bytes_before: Option<Vec<u8>>,
     /// Backup path created when `devices.toml` previously existed.
     pub backup: Option<String>,
-    /// Device names whose `authorized_keys` lines were removed or that just became tombstoned
-    /// (callers should terminate live sessions for these names).
-    pub removed_device_names: Vec<String>,
-    /// Warnings generated during `device:*` principal reconciliation (for example unknown roles
-    /// set to `nobody`).
+    /// Devices (disambiguated by pairing id) whose `authorized_keys` lines were removed or that
+    /// just became tombstoned (callers should terminate live sessions for these targets).
+    pub removed_targets: Vec<SessionTarget>,
+    /// Warnings generated during `device:*` principal or `authorized_keys` reconciliation.
     pub warnings: Vec<String>,
+}
+
+/// Error returned by [`apply_devices_merge_blocking`], distinguishing failures before `devices.toml`
+/// was saved from failures after `devices.toml` was durably updated (in which case callers MUST
+/// still terminate active sessions for every newly tombstoned device).
+#[derive(Clone, Debug)]
+pub enum MergeApplyError {
+    /// Nothing was written to `devices.toml`.
+    BeforeSave(ErrorBody),
+    /// `devices.toml` was saved with the tombstones, but a subsequent reconciliation step failed.
+    AfterSave {
+        /// Underlying failure from `policy.toml` or `authorized_keys` reconciliation.
+        error: ErrorBody,
+        /// Every previously live device that was just tombstoned in `devices.toml`.
+        tombstoned: Vec<SessionTarget>,
+    },
 }
 
 /// Read-only view of `devices.toml` for `config.read` and `fleet.sync`.
@@ -1716,9 +1732,10 @@ pub fn read_devices_for_sync_blocking(
 }
 
 /// Applies an incoming `DevicesFile` (e.g. from `fleet.sync` or `config.write`) by merging it with
-/// this node's current `devices.toml` (after adopting any legacy lines), verifying preconditions
-/// and caller authorization, updating `device:*` principals in `policy.toml` without escalation,
-/// saving the merged `devices.toml`, and reconciling `authorized_keys`.
+/// this node's current `devices.toml` (after adopting any legacy lines when `devices.toml` is
+/// absent), verifying preconditions and caller authorization, saving the merged `devices.toml`
+/// FIRST, then updating registry-owned `device:*` principals in `policy.toml` and reconciling
+/// `authorized_keys`.
 pub fn apply_devices_merge_blocking(
     paths: &Paths,
     node_name: &str,
@@ -1726,39 +1743,37 @@ pub fn apply_devices_merge_blocking(
     incoming: &DevicesFile,
     check_precondition: impl FnOnce(Option<&[u8]>) -> Result<(), ErrorBody>,
     authorize_change: impl Fn(MergeChange<'_>) -> Result<(), ErrorBody>,
-) -> Result<MergeApplyOutcome, ErrorBody> {
-    let _cfg_guard = lock_config(paths)?;
-
-    let target = resolve_target(paths, node_file)?;
-    let caller_account = caller_account_for_target(&target)?;
-    let write_path = resolve_safe_write_path(&target, paths.home())?;
-    verify_owner_matches_euid(
-        &write_path,
-        paths.home(),
-        target.is_default_home_ssh,
-        legion_os::user::effective_uid(),
-    )?;
-    let _auth_guard = lock_auth_keys(&target, &write_path)?;
+) -> Result<MergeApplyOutcome, MergeApplyError> {
+    let _cfg_guard = lock_config(paths).map_err(MergeApplyError::BeforeSave)?;
 
     let devices_path = paths.config_file(DevicesFile::FILE);
     let bytes_before = match std::fs::read(&devices_path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
-            return Err(ErrorBody::new(
+            return Err(MergeApplyError::BeforeSave(ErrorBody::new(
                 ErrorCode::Failed,
                 format!("{} cannot be read: {error}.", devices_path.display()),
-            ));
+            )));
         }
     };
-    check_precondition(bytes_before.as_deref())?;
-    validate_incoming_timestamps(incoming, Timestamp::now())?;
+    check_precondition(bytes_before.as_deref()).map_err(MergeApplyError::BeforeSave)?;
+    validate_incoming_timestamps(incoming, Timestamp::now()).map_err(MergeApplyError::BeforeSave)?;
 
     let had_existing_file = bytes_before.is_some();
     let local = match bytes_before.as_deref() {
-        Some(bytes) => parse::<DevicesFile>(&devices_path, bytes)?,
+        Some(bytes) => parse::<DevicesFile>(&devices_path, bytes).map_err(MergeApplyError::BeforeSave)?,
         None => {
-            let auth_keys = read_auth_keys(&write_path)?;
+            let target = resolve_target(paths, node_file).map_err(MergeApplyError::BeforeSave)?;
+            let caller_account =
+                caller_account_for_target(&target).map_err(MergeApplyError::BeforeSave)?;
+            let write_path =
+                resolve_safe_write_path(&target, paths.home()).map_err(MergeApplyError::BeforeSave)?;
+            let auth_keys = if write_path.is_file() {
+                read_auth_keys(&write_path).map_err(MergeApplyError::BeforeSave)?
+            } else {
+                super::authkeys::AuthKeysFile::parse(b"")
+            };
             let state = load_state(paths).unwrap_or_default();
             let policy_path = paths.config_file(Policy::FILE);
             let policy = std::fs::read(&policy_path)
@@ -1781,7 +1796,8 @@ pub fn apply_devices_merge_blocking(
 
     // Refuse any merge that adds or changes a live entry whose public key collides with another
     // live entry in the merged view.
-    let duplicate_keys = duplicate_live_public_keys(&merged)?;
+    let duplicate_keys =
+        duplicate_live_public_keys(&merged).map_err(MergeApplyError::BeforeSave)?;
     for ids in duplicate_keys.values() {
         if let Some(changed_id) = ids
             .iter()
@@ -1803,15 +1819,17 @@ pub fn apply_devices_merge_blocking(
                         .unwrap_or_else(|| id.clone())
                 })
                 .collect();
-            return Err(ErrorBody::new(
-                ErrorCode::Conflict,
-                format!(
-                    "Paired device {name} ({changed_id}) uses a public key already assigned to another live paired device: {}.",
-                    others.join(", ")
+            return Err(MergeApplyError::BeforeSave(
+                ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "Paired device {name} ({changed_id}) uses a public key already assigned to another live paired device: {}.",
+                        others.join(", ")
+                    ),
+                )
+                .with_hint(
+                    "Remove the conflicting device or pair with a dedicated Ed25519 key pair.",
                 ),
-            )
-            .with_hint(
-                "Remove the conflicting device or pair with a dedicated Ed25519 key pair.",
             ));
         }
     }
@@ -1820,7 +1838,8 @@ pub fn apply_devices_merge_blocking(
     for (id, entry) in &merged.devices {
         let previous = local.devices.get(id);
         if previous != Some(entry) {
-            authorize_change(MergeChange::Live { entry, previous })?;
+            authorize_change(MergeChange::Live { entry, previous })
+                .map_err(MergeApplyError::BeforeSave)?;
         }
     }
     for (id, tombstone) in &merged.removed {
@@ -1830,12 +1849,22 @@ pub fn apply_devices_merge_blocking(
             authorize_change(MergeChange::Removed {
                 tombstone,
                 previous_live,
-            })?;
+            })
+            .map_err(MergeApplyError::BeforeSave)?;
         }
     }
 
-    let mut warnings = reconcile_device_principals_locked(paths, &merged)?;
-    let canonical = save_devices_locked(paths, &merged)?;
+    // Record every previously live device that this merge tombstones so live sessions are ALWAYS
+    // terminated once `devices.toml` has been saved, even if a later step fails.
+    let newly_tombstoned: Vec<SessionTarget> = local
+        .devices
+        .iter()
+        .filter(|(id, _)| merged.removed.contains_key(*id))
+        .map(|(id, prev)| SessionTarget::new(prev.name.clone(), Some(id.clone())))
+        .collect();
+
+    // Write `devices.toml` FIRST (tombstone first, then policy and authorized_keys).
+    let canonical = save_devices_locked(paths, &merged).map_err(MergeApplyError::BeforeSave)?;
     let backup = had_existing_file.then(|| {
         paths
             .state_dir()
@@ -1846,8 +1875,27 @@ pub fn apply_devices_merge_blocking(
             .to_string()
     });
 
-    let exe = legion_core::current_exe()?;
-    let shell = ForcedCommandShell::host()?;
+    let after_save = |error: ErrorBody| MergeApplyError::AfterSave {
+        error,
+        tombstoned: newly_tombstoned.clone(),
+    };
+
+    let mut warnings = reconcile_device_principals_locked(paths, &merged).map_err(after_save)?;
+
+    let target = resolve_target(paths, node_file).map_err(after_save)?;
+    let caller_account = caller_account_for_target(&target).map_err(after_save)?;
+    let write_path = resolve_safe_write_path(&target, paths.home()).map_err(after_save)?;
+    verify_owner_matches_euid(
+        &write_path,
+        paths.home(),
+        target.is_default_home_ssh,
+        legion_os::user::effective_uid(),
+    )
+    .map_err(after_save)?;
+    let _auth_guard = lock_auth_keys(&target, &write_path).map_err(after_save)?;
+
+    let exe = legion_core::current_exe().map_err(after_save)?;
+    let shell = ForcedCommandShell::host().map_err(after_save)?;
     let auth_report = edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
         let report = reconcile_authorized_keys_in_memory(
             &mut auth_keys,
@@ -1859,16 +1907,14 @@ pub fn apply_devices_merge_blocking(
             shell,
         )?;
         Ok((report.changed.then_some(auth_keys), report))
-    })?;
+    })
+    .map_err(after_save)?;
     warnings.extend(auth_report.warnings);
-    let mut removed_device_names = auth_report.removed_device_names;
 
-    // Also include names of any previously live devices that just became tombstoned so live
-    // sessions are terminated even if their authorized_keys line was already gone.
-    for (id, prev) in &local.devices {
-        if merged.removed.contains_key(id) && !removed_device_names.contains(&prev.name) {
-            removed_device_names.push(prev.name.clone());
-        }
+    let mut removed_set: BTreeSet<SessionTarget> =
+        auth_report.removed_targets.into_iter().collect();
+    for target_dev in newly_tombstoned {
+        removed_set.insert(target_dev);
     }
 
     Ok(MergeApplyOutcome {
@@ -1876,7 +1922,7 @@ pub fn apply_devices_merge_blocking(
         canonical_toml: canonical,
         bytes_before,
         backup,
-        removed_device_names,
+        removed_targets: removed_set.into_iter().collect(),
         warnings,
     })
 }
@@ -2366,7 +2412,10 @@ role = "editor"
         let after =
             reconcile_devices_and_auth_keys_blocking(&paths, "tower", &node_file, false).unwrap();
         assert!(after.auth_keys_changed);
-        assert_eq!(after.removed_device_names, vec!["legacy-phone".to_owned()]);
+        assert_eq!(
+            after.removed_targets,
+            vec![SessionTarget::new("legacy-phone", Some(legacy_id.clone()))]
+        );
         let auth_after = std::fs::read_to_string(&auth_path).unwrap();
         assert!(auth_after.contains(&foreign_line));
         assert!(!auth_after.contains("legion-device:legacy-phone"));
@@ -2429,15 +2478,17 @@ role = "editor"
                 f
             }),
         ] {
-            let err = apply_devices_merge_blocking(
+            let err = match apply_devices_merge_blocking(
                 &paths,
                 "tower",
                 &node_file,
                 &incoming,
                 |_| Ok(()),
                 |_| Ok(()),
-            )
-            .expect_err(label);
+            ) {
+                Err(MergeApplyError::BeforeSave(err)) => err,
+                other => panic!("{label}: expected BeforeSave error, got {other:?}"),
+            };
             assert_eq!(err.code, ErrorCode::InvalidArgs, "{label}: {err:?}");
         }
 

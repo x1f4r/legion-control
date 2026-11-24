@@ -1188,14 +1188,14 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                 LineKind::Foreign => {}
             }
         }
-        Ok((devices, invites, report.removed_device_names, report.warnings))
+        Ok((devices, invites, report.removed_targets, report.warnings))
     })
     .await?;
 
-    for stale_name in removed_stale {
-        let _ = sessions::terminate_device_sessions(
+    for stale_target in removed_stale {
+        let _ = sessions::terminate_device_sessions_for_target(
             &paths_for_sessions,
-            &stale_name,
+            &stale_target,
             sessions::DEFAULT_TERMINATE_GRACE,
         )
         .await;
@@ -1318,22 +1318,220 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     let paths = ctx.paths().clone();
     let paths_for_sessions = paths.clone();
 
-    let (mut removed, terminate_device, extra_stale) = blocking(move || {
-        let _cfg_guard = lock_config(&paths)?;
-        let target = resolve_target(&paths, &node_file)?;
-        let caller_account = caller_account_for_target(&target)?;
-        let write_path = resolve_safe_write_path(&target, paths.home())?;
+    enum RemoveBlockingError {
+        BeforeSave(ErrorBody),
+        AfterSave {
+            error: ErrorBody,
+            tombstoned: Vec<sessions::SessionTarget>,
+        },
+    }
+
+    let blocking_result = tokio::task::spawn_blocking(move || -> Result<
+        (Removed, Option<sessions::SessionTarget>, Vec<sessions::SessionTarget>),
+        RemoveBlockingError,
+    > {
+        let _cfg_guard = lock_config(&paths).map_err(RemoveBlockingError::BeforeSave)?;
+        let existing_devices = load_devices_raw(&paths).map_err(RemoveBlockingError::BeforeSave)?;
+
+        // For local paired-device removals, write the tombstone to `devices.toml` FIRST before
+        // touching `policy.toml` or `authorized_keys`. If anything fails after `devices.toml` is
+        // saved, return `AfterSave` so the caller still ends every live session for that device.
+        if !remove_foreign {
+            let mut devices_file = match &existing_devices {
+                Some(file) => file.clone(),
+                None => {
+                    let target = resolve_target(&paths, &node_file)
+                        .map_err(RemoveBlockingError::BeforeSave)?;
+                    let caller_account = caller_account_for_target(&target)
+                        .map_err(RemoveBlockingError::BeforeSave)?;
+                    let write_path = resolve_safe_write_path(&target, paths.home())
+                        .map_err(RemoveBlockingError::BeforeSave)?;
+                    let auth_keys = if write_path.is_file() {
+                        authkeys::read_auth_keys(&write_path)
+                            .map_err(RemoveBlockingError::BeforeSave)?
+                    } else {
+                        authkeys::AuthKeysFile::parse(b"")
+                    };
+                    let state = load_state(&paths).unwrap_or_default();
+                    adopt_legacy_devices_from_auth_keys(
+                        &paths,
+                        &valid_node_name,
+                        &auth_keys,
+                        &target,
+                        caller_account.as_deref(),
+                        &state,
+                        &policy,
+                    )
+                }
+            };
+
+            let matched_id = match &target_item {
+                RemoveTarget::Id(id) => devices_file
+                    .devices
+                    .get(id)
+                    .filter(|entry| caller.may_manage(&entry.principal))
+                    .map(|_| id.clone()),
+                RemoveTarget::DeviceName(name) => {
+                    let matched: Vec<String> = devices_file
+                        .devices
+                        .iter()
+                        .filter(|(_, entry)| {
+                            entry.name == *name && caller.may_manage(&entry.principal)
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    if matched.len() > 1 {
+                        return Err(RemoveBlockingError::BeforeSave(
+                            ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "Multiple paired devices are named {name} (pairing ids: {}).",
+                                    matched.join(", ")
+                                ),
+                            )
+                            .with_hint(
+                                "Pass `id=<pairing_id>` from `device.list` to choose which one to remove.",
+                            ),
+                        ));
+                    }
+                    matched.into_iter().next()
+                }
+            };
+
+            if let Some(pairing_id) = matched_id {
+                let entry = devices_file.devices.remove(&pairing_id).ok_or_else(|| {
+                    RemoveBlockingError::BeforeSave(ErrorBody::new(
+                        ErrorCode::Internal,
+                        "Matched device disappeared.",
+                    ))
+                })?;
+                let removed_at = next_updated_timestamp(Some(&entry.updated_at))
+                    .map_err(RemoveBlockingError::BeforeSave)?;
+                devices_file.removed.insert(
+                    pairing_id.clone(),
+                    DeviceTombstone {
+                        name: entry.name.clone(),
+                        principal: entry.principal.clone(),
+                        paired_at: Some(entry.paired_at),
+                        paired_on: Some(entry.paired_on),
+                        removed_at,
+                        removed_on: valid_node_name.clone(),
+                    },
+                );
+
+                // 1. Write the tombstone to `devices.toml` FIRST.
+                save_devices_locked(&paths, &devices_file)
+                    .map_err(RemoveBlockingError::BeforeSave)?;
+
+                let primary_target =
+                    sessions::SessionTarget::new(entry.name.clone(), Some(pairing_id.clone()));
+                let tombstoned = vec![primary_target.clone()];
+                let after_save = |error: ErrorBody| RemoveBlockingError::AfterSave {
+                    error,
+                    tombstoned: tombstoned.clone(),
+                };
+
+                // 2. Reconcile `policy.toml` (clean up registry-owned `device:*` principal).
+                let _ = reconcile_device_principals_locked(&paths, &devices_file)
+                    .map_err(after_save)?;
+
+                // 3. Reconcile `authorized_keys` and sweep expired invites.
+                let target = resolve_target(&paths, &node_file).map_err(after_save)?;
+                let caller_account =
+                    caller_account_for_target(&target).map_err(after_save)?;
+                let write_path =
+                    resolve_safe_write_path(&target, paths.home()).map_err(after_save)?;
+                verify_owner_matches_euid(
+                    &write_path,
+                    paths.home(),
+                    target.is_default_home_ssh,
+                    legion_os::user::effective_uid(),
+                )
+                .map_err(after_save)?;
+                let _guard = lock_auth_keys(&target, &write_path).map_err(after_save)?;
+
+                let exe = legion_core::current_exe().map_err(after_save)?;
+                let shell = ForcedCommandShell::host().map_err(after_save)?;
+                let (lines_before, state_to_save, extra_stale) =
+                    edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+                        let mut state = load_state(&paths)?;
+                        let now = Timestamp::now();
+                        let (swept_auth, _) = sweep(&mut auth_keys, &mut state, now);
+                        let lines_before = auth_keys
+                            .lines
+                            .iter()
+                            .filter(|line| {
+                                matches!(
+                                    &line.kind,
+                                    LineKind::Device { pairing_id: pid, home, account, .. }
+                                        if pid == &pairing_id
+                                            && line_matches_home(home.as_ref(), &paths)
+                                            && line_matches_account(
+                                                account.as_deref(),
+                                                caller_account.as_deref(),
+                                                target.windows_admin_acl,
+                                                cfg!(windows),
+                                            )
+                                )
+                            })
+                            .count();
+                        let report = reconcile_authorized_keys_in_memory(
+                            &mut auth_keys,
+                            &devices_file,
+                            &paths,
+                            &target,
+                            caller_account.as_deref(),
+                            &exe,
+                            shell,
+                        )?;
+                        let still_uses_name = devices_file
+                            .devices
+                            .values()
+                            .any(|other| other.name == entry.name);
+                        if !still_uses_name {
+                            state.devices.remove(&entry.name);
+                        }
+                        let write_auth = (swept_auth || report.changed).then_some(auth_keys);
+                        Ok((write_auth, (lines_before, state, report.removed_targets)))
+                    })
+                    .map_err(after_save)?;
+                save_state(&paths, &state_to_save).map_err(after_save)?;
+
+                return Ok((
+                    Removed {
+                        kind: "device",
+                        name: Some(entry.name),
+                        id: Some(pairing_id),
+                        principal: entry.principal,
+                        removed: true,
+                        lines_removed: lines_before,
+                        sessions_ended: 0,
+                        sessions_not_ended: false,
+                        jobs_left_running: Vec::new(),
+                        fleet: BTreeMap::new(),
+                        still_trusted_by: Vec::new(),
+                        hint: None,
+                    },
+                    Some(primary_target),
+                    extra_stale,
+                ));
+            }
+        }
+
+        // Remaining paths: pending invites, foreign lines (`foreign=true`), or not-found errors.
+        let target = resolve_target(&paths, &node_file).map_err(RemoveBlockingError::BeforeSave)?;
+        let caller_account =
+            caller_account_for_target(&target).map_err(RemoveBlockingError::BeforeSave)?;
+        let write_path = resolve_safe_write_path(&target, paths.home())
+            .map_err(RemoveBlockingError::BeforeSave)?;
         verify_owner_matches_euid(
             &write_path,
             paths.home(),
             target.is_default_home_ssh,
             legion_os::user::effective_uid(),
-        )?;
-        let _guard = lock_auth_keys(&target, &write_path)?;
-
-        let existing_devices = load_devices_raw(&paths)?;
-        let exe = legion_core::current_exe()?;
-        let shell = ForcedCommandShell::host()?;
+        )
+        .map_err(RemoveBlockingError::BeforeSave)?;
+        let _guard = lock_auth_keys(&target, &write_path).map_err(RemoveBlockingError::BeforeSave)?;
 
         let (outcome, state_to_save, devices_to_save, extra_stale) =
             edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
@@ -1341,7 +1539,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 let now = Timestamp::now();
                 let (swept_auth, swept_state) = sweep(&mut auth_keys, &mut state, now);
 
-                let (mut devices_file, adopted_new) = match &existing_devices {
+                let (devices_file, adopted_new) = match &existing_devices {
                     Some(file) => (file.clone(), false),
                     None => {
                         let adopted = adopt_legacy_devices_from_auth_keys(
@@ -1358,89 +1556,6 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     }
                 };
 
-                // Local paired-device removal by pairing id (when `id` matches a live device).
-                let local_device_match_by_id = if !remove_foreign
-                    && let RemoveTarget::Id(id) = &target_item
-                    && let Some(entry) = devices_file.devices.get(id)
-                    && caller.may_manage(&entry.principal)
-                {
-                    Some(id.clone())
-                } else {
-                    None
-                };
-
-                if let Some(pairing_id) = local_device_match_by_id {
-                    let entry = devices_file.devices.remove(&pairing_id).ok_or_else(|| {
-                        ErrorBody::new(ErrorCode::Internal, "Matched device disappeared.")
-                    })?;
-                    let removed_at = next_updated_timestamp(Some(&entry.updated_at))?;
-                    devices_file.removed.insert(
-                        pairing_id.clone(),
-                        DeviceTombstone {
-                            name: entry.name.clone(),
-                            principal: entry.principal.clone(),
-                            paired_at: Some(entry.paired_at),
-                            paired_on: Some(entry.paired_on),
-                            removed_at,
-                            removed_on: valid_node_name.clone(),
-                        },
-                    );
-                    let lines_before = auth_keys
-                        .lines
-                        .iter()
-                        .filter(|line| {
-                            matches!(
-                                &line.kind,
-                                LineKind::Device { pairing_id: pid, home, account, .. }
-                                    if pid == &pairing_id
-                                        && line_matches_home(home.as_ref(), &paths)
-                                        && line_matches_account(
-                                            account.as_deref(),
-                                            caller_account.as_deref(),
-                                            target.windows_admin_acl,
-                                            cfg!(windows),
-                                        )
-                            )
-                        })
-                        .count();
-                    let report = reconcile_authorized_keys_in_memory(
-                        &mut auth_keys,
-                        &devices_file,
-                        &paths,
-                        &target,
-                        caller_account.as_deref(),
-                        &exe,
-                        shell,
-                    )?;
-                    state.devices.remove(&entry.name);
-                    let write_auth = (swept_auth || report.changed).then_some(auth_keys);
-                    return Ok((
-                        write_auth,
-                        (
-                            Ok((
-                                Removed {
-                                    kind: "device",
-                                    name: Some(entry.name.clone()),
-                                    id: Some(pairing_id),
-                                    principal: entry.principal,
-                                    removed: true,
-                                    lines_removed: lines_before,
-                                    sessions_ended: 0,
-                                    sessions_not_ended: false,
-                                    jobs_left_running: Vec::new(),
-                                    fleet: BTreeMap::new(),
-                                    still_trusted_by: Vec::new(),
-                                    hint: None,
-                                },
-                                Some(entry.name),
-                            )),
-                            Some(state),
-                            Some(devices_file),
-                            report.removed_device_names,
-                        ),
-                    ));
-                }
-
                 match &target_item {
                     RemoveTarget::DeviceName(name) if !remove_foreign => {
                         let visible_entries: Vec<(&String, &registry::FleetDevice)> = devices_file
@@ -1448,109 +1563,6 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                             .iter()
                             .filter(|(_, entry)| caller.may_manage(&entry.principal))
                             .collect();
-                        let matched: Vec<String> = visible_entries
-                            .iter()
-                            .filter(|(_, entry)| entry.name == *name)
-                            .map(|(id, _)| (*id).clone())
-                            .collect();
-
-                        if matched.len() > 1 {
-                            let err = ErrorBody::new(
-                                ErrorCode::Conflict,
-                                format!(
-                                    "Multiple paired devices are named {name} (pairing ids: {}).",
-                                    matched.join(", ")
-                                ),
-                            )
-                            .with_hint(
-                                "Pass `id=<pairing_id>` from `device.list` to choose which one to remove.",
-                            );
-                            return Ok((
-                                swept_auth.then_some(auth_keys),
-                                (
-                                    Err(err),
-                                    swept_state.then_some(state),
-                                    adopted_new.then_some(devices_file),
-                                    Vec::new(),
-                                ),
-                            ));
-                        }
-
-                        if let Some(pairing_id) = matched.into_iter().next() {
-                            let entry =
-                                devices_file.devices.remove(&pairing_id).ok_or_else(|| {
-                                    ErrorBody::new(
-                                        ErrorCode::Internal,
-                                        "Matched device disappeared.",
-                                    )
-                                })?;
-                            let removed_at = next_updated_timestamp(Some(&entry.updated_at))?;
-                            devices_file.removed.insert(
-                                pairing_id.clone(),
-                                DeviceTombstone {
-                                    name: entry.name.clone(),
-                                    principal: entry.principal.clone(),
-                                    paired_at: Some(entry.paired_at),
-                                    paired_on: Some(entry.paired_on),
-                                    removed_at,
-                                    removed_on: valid_node_name.clone(),
-                                },
-                            );
-                            let lines_before = auth_keys
-                                .lines
-                                .iter()
-                                .filter(|line| {
-                                    matches!(
-                                        &line.kind,
-                                        LineKind::Device { pairing_id: pid, home, account, .. }
-                                            if pid == &pairing_id
-                                                && line_matches_home(home.as_ref(), &paths)
-                                                && line_matches_account(
-                                                    account.as_deref(),
-                                                    caller_account.as_deref(),
-                                                    target.windows_admin_acl,
-                                                    cfg!(windows),
-                                                )
-                                    )
-                                })
-                                .count();
-                            let report = reconcile_authorized_keys_in_memory(
-                                &mut auth_keys,
-                                &devices_file,
-                                &paths,
-                                &target,
-                                caller_account.as_deref(),
-                                &exe,
-                                shell,
-                            )?;
-                            state.devices.remove(&entry.name);
-                            let write_auth = (swept_auth || report.changed).then_some(auth_keys);
-                            return Ok((
-                                write_auth,
-                                (
-                                    Ok((
-                                        Removed {
-                                            kind: "device",
-                                            name: Some(entry.name.clone()),
-                                            id: Some(pairing_id),
-                                            principal: entry.principal,
-                                            removed: true,
-                                            lines_removed: lines_before,
-                                            sessions_ended: 0,
-                                            sessions_not_ended: false,
-                                            jobs_left_running: Vec::new(),
-                                            fleet: BTreeMap::new(),
-                                            still_trusted_by: Vec::new(),
-                                            hint: None,
-                                        },
-                                        Some(entry.name),
-                                    )),
-                                    Some(state),
-                                    Some(devices_file),
-                                    report.removed_device_names,
-                                ),
-                            ));
-                        }
 
                         // Not found locally: check whether a foreign home owns a device with this name.
                         let foreign_match_home = if caller.is_owner() {
@@ -1870,15 +1882,17 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                         ))
                     }
                 }
-            })?;
+            })
+            .map_err(RemoveBlockingError::BeforeSave)?;
         match outcome {
             Ok((result, terminate)) => {
                 if let Some(devices) = devices_to_save {
-                    save_devices_locked(&paths, &devices)?;
-                    let _ = reconcile_device_principals_locked(&paths, &devices)?;
+                    save_devices_locked(&paths, &devices).map_err(RemoveBlockingError::BeforeSave)?;
+                    let _ = reconcile_device_principals_locked(&paths, &devices)
+                        .map_err(RemoveBlockingError::BeforeSave)?;
                 }
                 if let Some(state) = state_to_save {
-                    save_state(&paths, &state)?;
+                    save_state(&paths, &state).map_err(RemoveBlockingError::BeforeSave)?;
                 }
                 Ok((result, terminate, extra_stale))
             }
@@ -1889,22 +1903,44 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 if let Some(state) = state_to_save {
                     let _ = save_state(&paths, &state);
                 }
-                Err(err)
+                Err(RemoveBlockingError::BeforeSave(err))
             }
         }
     })
-    .await?;
+    .await
+    .map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("device.remove stopped unexpectedly: {error}."),
+        )
+    })?;
 
-    if let Some(device_name) = terminate_device {
-        removed.sessions_ended = sessions::terminate_device_sessions(
+    let (mut removed, terminate_target, extra_stale) = match blocking_result {
+        Ok(ok) => ok,
+        Err(RemoveBlockingError::BeforeSave(err)) => return Err(err),
+        Err(RemoveBlockingError::AfterSave { error, tombstoned }) => {
+            for target in &tombstoned {
+                let _ = sessions::terminate_device_sessions_for_target(
+                    &paths_for_sessions,
+                    target,
+                    sessions::DEFAULT_TERMINATE_GRACE,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
+
+    if let Some(target) = terminate_target {
+        removed.sessions_ended = sessions::terminate_device_sessions_for_target(
             &paths_for_sessions,
-            &device_name,
+            &target,
             sessions::DEFAULT_TERMINATE_GRACE,
         )
         .await;
         for stale in extra_stale {
-            if stale != device_name {
-                let _ = sessions::terminate_device_sessions(
+            if stale != target {
+                let _ = sessions::terminate_device_sessions_for_target(
                     &paths_for_sessions,
                     &stale,
                     sessions::DEFAULT_TERMINATE_GRACE,
@@ -1914,7 +1950,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         }
         let paths_for_jobs = paths_for_sessions.clone();
         let principal_for_jobs = removed.principal.clone();
-        let device_for_jobs = device_name.clone();
+        let device_for_jobs = target.device.clone();
         removed.jobs_left_running = blocking(move || {
             Ok(crate::job::running_job_ids_for_device(
                 &paths_for_jobs,
@@ -1932,8 +1968,12 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
             .map(|(machine, _)| machine.clone())
             .collect();
         if !still_trusted.is_empty() {
+            let label = match target.pairing_id.as_deref() {
+                Some(id) => format!("{} ({id})", target.device),
+                None => target.device.clone(),
+            };
             removed.hint = Some(format!(
-                "These machines could not be reached and still trust {device_name} until their next sync: {}. Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` when they are back online.",
+                "These machines could not be reached and still trust {label} until their next sync: {}. Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` when they are back online.",
                 still_trusted.join(", ")
             ));
         }
@@ -3636,6 +3676,70 @@ allow = ["effect:read", "effect:write"]
                     .is_some_and(|d| d.contains("foreign-dev")
                         && d.contains("already on another line of authorized_keys"))),
             "expected foreign-key warning in meta.doctor: {doctor}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_writes_tombstone_first_and_runs_session_termination_after_save_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let inv = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "pixel", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv_id = inv["id"].as_str().unwrap();
+        let key = generate_ephemeral_ed25519().unwrap();
+        let req = format!(
+            "{{\"enrol\":1,\"id\":\"{inv_id}\",\"public_key\":\"{}\",\"name\":\"pixel\"}}\n",
+            key.public_key
+        );
+        assert!(run_enrol(&h.node, inv_id, req.as_bytes()).await.is_ok());
+
+        // 1. Unwritable config/ directory: `device.remove` must fail BEFORE touching authorized_keys.
+        let cfg_dir = h.node.paths().config_dir().to_path_buf();
+        std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let unwritable_err = h.call("device.remove", json!({"name": "pixel"})).await;
+        std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            unwritable_err.is_err(),
+            "device.remove must fail when config dir is unwritable"
+        );
+        let auth_after_unwritable = std::fs::read_to_string(&h.auth_keys).unwrap();
+        assert!(
+            auth_after_unwritable.contains("legion-device:pixel"),
+            "authorized_keys must remain untouched when saving devices.toml fails:\n{auth_after_unwritable}"
+        );
+
+        // 2. Failure AFTER saving devices.toml (authorized_keys replaced with a directory):
+        //    devices.toml MUST contain the tombstone AND session termination MUST still run.
+        let sess_dir = h.node.paths().state_dir().join("device-sessions");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let marker_session = sess_dir.join("pixel-999999-1.json");
+        std::fs::write(&marker_session, b"{\"stale\":true}\n").unwrap();
+
+        std::fs::remove_file(&h.auth_keys).unwrap();
+        std::fs::create_dir(&h.auth_keys).unwrap();
+        let after_save_err = h.call("device.remove", json!({"name": "pixel"})).await;
+        let _ = std::fs::remove_dir(&h.auth_keys);
+        assert!(
+            after_save_err.is_err(),
+            "device.remove must report error when authorized_keys cannot be updated"
+        );
+        let saved: DevicesFile = legion_core::config::parse(
+            &h.node.paths().config_file("devices.toml"),
+            &std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.devices.is_empty(), "device should be removed from live map");
+        assert_eq!(saved.removed.len(), 1, "tombstone must be saved durably");
+        assert!(
+            !marker_session.exists(),
+            "session termination/sweep must run whenever devices.toml was saved, even if authorized_keys update fails"
         );
     }
 }

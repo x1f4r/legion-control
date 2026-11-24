@@ -46,12 +46,45 @@ pub enum SessionRecordKind {
     SshConnection,
 }
 
+/// Identifies a paired device whose live sessions should be terminated.
+///
+/// When `pairing_id` is `Some`, session records that also carry a `pairing_id` are matched by
+/// exact `pairing_id` so two devices sharing the same name after a merge never terminate each
+/// other's sessions. Records written by older gates without `pairing_id` fall back to `device`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SessionTarget {
+    /// Device name (`--device`).
+    pub device: String,
+    /// Pairing identifier (`--pairing`), when known.
+    pub pairing_id: Option<String>,
+}
+
+impl SessionTarget {
+    /// Creates a [`SessionTarget`] from a device name and optional pairing id.
+    pub fn new(device: impl Into<String>, pairing_id: Option<String>) -> Self {
+        Self {
+            device: device.into(),
+            pairing_id,
+        }
+    }
+
+    fn matches(&self, record: &DeviceSessionRecord) -> bool {
+        match (self.pairing_id.as_deref(), record.pairing_id.as_deref()) {
+            (Some(want), Some(got)) => want == got,
+            _ => record.device == self.device,
+        }
+    }
+}
+
 /// Persistent record for one live `legion gate --device <name>` session or its parent `sshd`
 /// connection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSessionRecord {
     /// Device name (`legion-device:<name>`).
     pub device: String,
+    /// Pairing identifier (`--pairing <id>`), when present; disambiguates devices sharing a name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_id: Option<String>,
     /// Principal pinned by `legion gate --as`.
     pub principal: String,
     /// OS process ID of the recorded process (`legion gate` or parent `sshd`).
@@ -109,13 +142,17 @@ pub struct DeviceSessionGuard {
 
 impl DeviceSessionGuard {
     /// Registers the current process (and any verified same-account parent `sshd` session process)
-    /// under `state/device-sessions/` for `device` and `principal`.
+    /// under `state/device-sessions/` for `device`, optional `pairing_id`, and `principal`.
     pub fn register(
         paths: &Paths,
         device: &str,
+        pairing_id: Option<&str>,
         principal: &str,
     ) -> Result<DeviceSessionGuard, ErrorBody> {
         validate_device_label(device)?;
+        if let Some(pid) = pairing_id {
+            validate_device_label(pid)?;
+        }
         let dir = sessions_dir(paths);
         ensure_private_dir(&dir)?;
 
@@ -139,6 +176,7 @@ impl DeviceSessionGuard {
 
         let record = DeviceSessionRecord {
             device: device.to_owned(),
+            pairing_id: pairing_id.map(str::to_owned),
             principal: principal.to_owned(),
             pid: identity.pid,
             start_time: identity.start_time,
@@ -147,7 +185,7 @@ impl DeviceSessionGuard {
             kind: SessionRecordKind::Gate,
             parent_sshd,
         };
-        let path = session_file_path(&dir, device, identity);
+        let path = session_file_path(&dir, device, pairing_id, identity);
         write_session_record(&path, &record)?;
 
         // Also persist a deduplicated record for the parent `sshd` connection process so
@@ -156,6 +194,7 @@ impl DeviceSessionGuard {
         let conn_path = if let Some(sshd_id) = parent_sshd {
             let conn = DeviceSessionRecord {
                 device: device.to_owned(),
+                pairing_id: pairing_id.map(str::to_owned),
                 principal: principal.to_owned(),
                 pid: sshd_id.pid,
                 start_time: sshd_id.start_time,
@@ -164,7 +203,7 @@ impl DeviceSessionGuard {
                 kind: SessionRecordKind::SshConnection,
                 parent_sshd: None,
             };
-            let conn_file = connection_file_path(&dir, device, sshd_id);
+            let conn_file = connection_file_path(&dir, device, pairing_id, sshd_id);
             write_session_record(&conn_file, &conn)?;
             Some(conn_file)
         } else {
@@ -288,21 +327,33 @@ enum TerminationResult {
 /// sessions/connections terminated (counting an active gate together with its parent `sshd` as one
 /// session, and an idle `ControlMaster` connection with no active gate as one session).
 pub async fn terminate_device_sessions(paths: &Paths, device: &str, grace: Duration) -> usize {
+    let target = SessionTarget::new(device, None);
+    terminate_device_sessions_for_target(paths, &target, grace).await
+}
+
+/// Sweeps stale session records and terminates every live recorded session and verified
+/// same-account parent `sshd` connection matching `target` (disambiguated by `pairing_id` when
+/// both target and record carry one).
+pub async fn terminate_device_sessions_for_target(
+    paths: &Paths,
+    target: &SessionTarget,
+    grace: Duration,
+) -> usize {
     let expected_exe = std::env::current_exe().ok();
-    terminate_device_sessions_with_exe(paths, device, grace, expected_exe.as_deref()).await
+    terminate_device_sessions_with_exe(paths, target, grace, expected_exe.as_deref()).await
 }
 
 async fn terminate_device_sessions_with_exe(
     paths: &Paths,
-    device: &str,
+    target: &SessionTarget,
     grace: Duration,
     expected_exe: Option<&Path>,
 ) -> usize {
     let dir = sessions_dir(paths);
-    let device_owned = device.to_owned();
+    let target_owned = target.clone();
     let exe_for_collect = expected_exe.map(Path::to_path_buf);
     let collected = tokio::task::spawn_blocking(move || {
-        collect_live_and_sweep(&dir, &device_owned, exe_for_collect.as_deref())
+        collect_live_and_sweep(&dir, &target_owned, exe_for_collect.as_deref())
     })
     .await
     .unwrap_or(CollectedTargets {
@@ -399,7 +450,7 @@ async fn terminate_device_sessions_with_exe(
 
 fn collect_live_and_sweep(
     dir: &Path,
-    device: &str,
+    target: &SessionTarget,
     expected_exe: Option<&Path>,
 ) -> CollectedTargets {
     let current_boot = procid::boot_id().ok();
@@ -421,7 +472,7 @@ fn collect_live_and_sweep(
         }
         match is_live_session_file(&path, current_boot.as_deref(), expected_exe) {
             Some(record) => {
-                if record.device != device {
+                if !target.matches(&record) {
                     continue;
                 }
                 match record.kind {
@@ -495,18 +546,40 @@ fn sessions_dir(paths: &Paths) -> PathBuf {
     paths.state_dir().join(SESSIONS_DIR_NAME)
 }
 
-fn session_file_path(dir: &Path, device: &str, identity: ProcessId) -> PathBuf {
-    dir.join(format!(
-        "{device}-{}-{}.json",
-        identity.pid, identity.start_time
-    ))
+fn session_file_path(
+    dir: &Path,
+    device: &str,
+    pairing_id: Option<&str>,
+    identity: ProcessId,
+) -> PathBuf {
+    match pairing_id {
+        Some(pid) => dir.join(format!(
+            "{device}-{pid}-{}-{}.json",
+            identity.pid, identity.start_time
+        )),
+        None => dir.join(format!(
+            "{device}-{}-{}.json",
+            identity.pid, identity.start_time
+        )),
+    }
 }
 
-fn connection_file_path(dir: &Path, device: &str, sshd_id: ProcessId) -> PathBuf {
-    dir.join(format!(
-        "conn-{device}-{}-{}.json",
-        sshd_id.pid, sshd_id.start_time
-    ))
+fn connection_file_path(
+    dir: &Path,
+    device: &str,
+    pairing_id: Option<&str>,
+    sshd_id: ProcessId,
+) -> PathBuf {
+    match pairing_id {
+        Some(pid) => dir.join(format!(
+            "conn-{device}-{pid}-{}-{}.json",
+            sshd_id.pid, sshd_id.start_time
+        )),
+        None => dir.join(format!(
+            "conn-{device}-{}-{}.json",
+            sshd_id.pid, sshd_id.start_time
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +660,7 @@ mod tests {
             &format!("pixel-{}-{}.json", victim_id.pid, victim_id.start_time),
             &DeviceSessionRecord {
                 device: "pixel".to_owned(),
+                pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: victim_id.pid,
                 start_time: victim_id.start_time,
@@ -606,6 +680,7 @@ mod tests {
             ),
             &DeviceSessionRecord {
                 device: "pixel".to_owned(),
+                pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: bystander_id.pid,
                 start_time: bystander_id.start_time,
@@ -622,6 +697,7 @@ mod tests {
             "pixel-recycled.json",
             &DeviceSessionRecord {
                 device: "pixel".to_owned(),
+                pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: bystander_id.pid,
                 start_time: bystander_id.start_time.wrapping_add(999),
@@ -638,6 +714,7 @@ mod tests {
             "pixel-oldboot.json",
             &DeviceSessionRecord {
                 device: "pixel".to_owned(),
+                pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: bystander_id.pid,
                 start_time: bystander_id.start_time,
@@ -656,6 +733,7 @@ mod tests {
             ),
             &DeviceSessionRecord {
                 device: "tablet".to_owned(),
+                pairing_id: None,
                 principal: "tablet".to_owned(),
                 pid: bystander_id.pid,
                 start_time: bystander_id.start_time,
@@ -672,7 +750,7 @@ mod tests {
         let sleeper_exe = sleeper_executable();
         let ended = terminate_device_sessions_with_exe(
             &paths,
-            "pixel",
+            &SessionTarget::new("pixel", None),
             Duration::from_secs(2),
             Some(&sleeper_exe),
         )
@@ -703,6 +781,7 @@ mod tests {
             ),
             &DeviceSessionRecord {
                 device: "forged".to_owned(),
+                pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: bystander_id.pid,
                 start_time: bystander_id.start_time,
@@ -725,6 +804,81 @@ mod tests {
         let _ = bystander.wait();
     }
 
+    #[tokio::test]
+    async fn duplicate_device_names_are_disambiguated_by_pairing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("legion"));
+        let sess_dir = sessions_dir(&paths);
+        let boot = procid::boot_id().unwrap();
+
+        let id1 = "11".repeat(16);
+        let id2 = "22".repeat(16);
+
+        let mut victim = spawn_sleeper();
+        let victim_id = procid::of_pid(victim.id()).unwrap().unwrap();
+        let mut survivor = spawn_sleeper();
+        let survivor_id = procid::of_pid(survivor.id()).unwrap().unwrap();
+
+        let victim_file = write_record(
+            &sess_dir,
+            &format!(
+                "pixel-{id1}-{}-{}.json",
+                victim_id.pid, victim_id.start_time
+            ),
+            &DeviceSessionRecord {
+                device: "pixel".to_owned(),
+                pairing_id: Some(id1.clone()),
+                principal: "device:pixel".to_owned(),
+                pid: victim_id.pid,
+                start_time: victim_id.start_time,
+                boot_id: boot.clone(),
+                started: "2026-11-24T12:00:00Z".to_owned(),
+                kind: SessionRecordKind::Gate,
+                parent_sshd: None,
+            },
+        );
+        let survivor_file = write_record(
+            &sess_dir,
+            &format!(
+                "pixel-{id2}-{}-{}.json",
+                survivor_id.pid, survivor_id.start_time
+            ),
+            &DeviceSessionRecord {
+                device: "pixel".to_owned(),
+                pairing_id: Some(id2.clone()),
+                principal: "device:pixel-2".to_owned(),
+                pid: survivor_id.pid,
+                start_time: survivor_id.start_time,
+                boot_id: boot,
+                started: "2026-11-24T12:00:00Z".to_owned(),
+                kind: SessionRecordKind::Gate,
+                parent_sshd: None,
+            },
+        );
+
+        let sleeper_exe = sleeper_executable();
+        let ended = terminate_device_sessions_with_exe(
+            &paths,
+            &SessionTarget::new("pixel", Some(id1)),
+            Duration::from_secs(2),
+            Some(&sleeper_exe),
+        )
+        .await;
+        assert_eq!(ended, 1);
+
+        let status = victim.wait().unwrap();
+        assert!(!status.success() || !procid::is_alive(&victim_id));
+        assert!(!victim_file.exists());
+        assert!(
+            procid::is_alive(&survivor_id),
+            "second device sharing the same name with another pairing_id must stay alive"
+        );
+        assert!(survivor_file.exists());
+
+        let _ = survivor.kill();
+        let _ = survivor.wait();
+    }
+
     #[cfg(unix)]
     #[test]
     fn guard_creates_owner_only_dir_and_file_and_cleans_up_on_drop() {
@@ -735,7 +889,13 @@ mod tests {
         let sess_dir = sessions_dir(&paths);
 
         let recorded_path = {
-            let guard = DeviceSessionGuard::register(&paths, "pixel", "phone").unwrap();
+            let guard = DeviceSessionGuard::register(
+                &paths,
+                "pixel",
+                Some(&"aa".repeat(16)),
+                "phone",
+            )
+            .unwrap();
             let dir_mode = std::fs::metadata(&sess_dir).unwrap().permissions().mode() & 0o777;
             let file_mode = std::fs::metadata(guard.path())
                 .unwrap()

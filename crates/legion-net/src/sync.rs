@@ -30,10 +30,12 @@ use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::{
-    DevicesFile, MergeChange, apply_devices_merge_blocking, merge_devices,
+    DevicesFile, MergeApplyError, MergeChange, apply_devices_merge_blocking, merge_devices,
     read_devices_for_sync_blocking,
 };
-use legion_tools::device::sessions::{DEFAULT_TERMINATE_GRACE, terminate_device_sessions};
+use legion_tools::device::sessions::{
+    DEFAULT_TERMINATE_GRACE, terminate_device_sessions_for_target,
+};
 use legion_tools::ext::def::parse_toml as parse_extension_toml;
 use legion_tools::proj::ProjectsFile;
 use legion_xfer::hash::{Hash, hash_bytes};
@@ -862,7 +864,7 @@ async fn apply_local_write(
         let caller_role = ctx.grant().role().to_owned();
         let credential_expires = ctx.credential_expires();
 
-        let merge_outcome = tokio::task::spawn_blocking(move || {
+        let merge_result = tokio::task::spawn_blocking(move || {
             let check_precondition = |bytes_before: Option<&[u8]>| -> Result<(), ErrorBody> {
                 let hash_before = bytes_before.map(|b| hash_bytes(b).to_string());
                 match (expect_hash.as_deref(), expect_absent) {
@@ -996,13 +998,31 @@ async fn apply_local_write(
                 ErrorCode::Internal,
                 format!("Updating devices.toml stopped unexpectedly: {error}."),
             )
-        })??;
+        })?;
+
+        let merge_outcome = match merge_result {
+            Ok(outcome) => outcome,
+            Err(MergeApplyError::BeforeSave(err)) => return Err(err),
+            Err(MergeApplyError::AfterSave { error, tombstoned }) => {
+                // Always end live sessions for every newly tombstoned device whenever devices.toml
+                // was saved, even if policy or authorized_keys reconciliation failed afterwards.
+                for target in &tombstoned {
+                    let _ = terminate_device_sessions_for_target(
+                        &paths_for_sessions,
+                        target,
+                        DEFAULT_TERMINATE_GRACE,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
 
         // End live sessions and open SSH connections for any devices removed by the merge.
-        for device_name in &merge_outcome.removed_device_names {
-            let _ = terminate_device_sessions(
+        for target in &merge_outcome.removed_targets {
+            let _ = terminate_device_sessions_for_target(
                 &paths_for_sessions,
-                device_name,
+                target,
                 DEFAULT_TERMINATE_GRACE,
             )
             .await;
@@ -3225,6 +3245,118 @@ role = \"phone_admin\"
             err3.code,
             ErrorCode::Conflict,
             "duplicate live public key in merge must fail with Conflict: {err3:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn devices_merge_writes_tombstone_first_and_ends_sessions_on_failure_after_save() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{DeviceTombstone, FleetDevice};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        let id = "55".repeat(16);
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.\"device:pixel\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        let mut initial = DevicesFile::default();
+        initial.devices.insert(
+            id.clone(),
+            FleetDevice {
+                name: "pixel".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[55u8; 32]),
+                principal: "device:pixel".to_owned(),
+                role: Some("observer".to_owned()),
+                paired_at: "2026-11-24T10:00:00Z".to_owned(),
+                paired_on: "box-a".to_owned(),
+                updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
+
+        let mut revoke = DevicesFile::default();
+        revoke.removed.insert(
+            id.clone(),
+            DeviceTombstone {
+                name: "pixel".to_owned(),
+                principal: "device:pixel".to_owned(),
+                paired_at: Some("2026-11-24T10:00:00Z".to_owned()),
+                paired_on: Some("box-a".to_owned()),
+                removed_at: "2026-11-24T10:05:00Z".to_owned(),
+                removed_on: "box-b".to_owned(),
+            },
+        );
+
+        // 1. Unwritable config/ dir fails BEFORE touching policy.toml or authorized_keys.
+        let cfg_dir = paths.config_dir().to_path_buf();
+        let policy_before = std::fs::read_to_string(paths.config_file("policy.toml")).unwrap();
+        std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err_unwritable = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": revoke.to_toml_string()}),
+            ))
+            .await;
+        std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(err_unwritable.is_err());
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file("policy.toml")).unwrap(),
+            policy_before
+        );
+
+        // 2. Failure AFTER saving devices.toml (authorized_keys is a directory):
+        //    devices.toml has the tombstone AND session termination/sweep STILL runs.
+        let sess_dir = paths.state_dir().join("device-sessions");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let marker_session = sess_dir.join("pixel-999999-1.json");
+        std::fs::write(&marker_session, b"{\"stale\":true}\n").unwrap();
+        std::fs::create_dir(&auth_keys).unwrap();
+
+        let err_after = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": revoke.to_toml_string()}),
+            ))
+            .await;
+        let _ = std::fs::remove_dir(&auth_keys);
+        assert!(err_after.is_err());
+        let saved: DevicesFile = parse(
+            &paths.config_file("devices.toml"),
+            &std::fs::read(paths.config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.devices.is_empty());
+        assert!(saved.removed.contains_key(&id));
+        assert!(
+            !marker_session.exists(),
+            "session termination/sweep must run after devices.toml save even when authorized_keys fails"
         );
     }
 }
