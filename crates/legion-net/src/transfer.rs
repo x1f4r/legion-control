@@ -842,6 +842,9 @@ enum Listed {
     Entry(Entry),
 }
 
+// A transfer holds two of these for its whole life, so the size of the larger variant, which
+// differs by platform, costs nothing worth an allocation.
+#[allow(clippy::large_enum_variant)]
 enum Process {
     /// `legion stream` on another machine, through its connector.
     Remote(PipeHandle),
