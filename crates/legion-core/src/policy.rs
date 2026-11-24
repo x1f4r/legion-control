@@ -29,8 +29,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use same_file::Handle;
@@ -53,6 +55,12 @@ pub const NOBODY: &str = "nobody";
 /// inside it (a broad root such as `~/**` does not count). This is a guard rail for file tools; it
 /// does not bind a role that allows `effect:exec`.
 ///
+/// Deliberately NOT covered: `.npmrc` and shell history files (`.bash_history`, `.zsh_history`,
+/// fish/PowerShell history), because they cause too many false positives in normal development.
+/// Owners who want to protect those or any other custom path can add top-level
+/// `secrets = ["~/extra/path"]` in `policy.toml`, which is enforced identically to the built-in
+/// list.
+///
 /// | Path (relative to `~`) | What lives there |
 /// | --- | --- |
 /// | `.ssh` | SSH private keys and client configuration |
@@ -65,6 +73,12 @@ pub const NOBODY: &str = "nobody";
 /// | `.git-credentials` | Git credential-store tokens |
 /// | `.config/gh` | GitHub CLI authentication tokens |
 /// | `.config/gcloud` | Google Cloud SDK credentials |
+/// | `.config/rclone` | rclone remote storage credentials |
+/// | `.config/op` | 1Password CLI session and configuration |
+/// | `.vault-token` | HashiCorp Vault authentication token |
+/// | `.terraform.d/credentials.tfrc.json` | Terraform CLI registry tokens |
+/// | `.cargo/credentials.toml` | Cargo registry tokens |
+/// | `.pypirc` | PyPI upload tokens and credentials |
 /// | `.password-store` | `pass` encrypted password store |
 /// | `.local/share/keyrings` | Linux desktop keyrings |
 /// | `Library/Keychains` | macOS Keychain databases |
@@ -77,14 +91,24 @@ pub const NOBODY: &str = "nobody";
 /// | `.local/share/opencode/auth.json` | OpenCode authentication tokens |
 /// | `.config/github-copilot` | GitHub Copilot CLI tokens |
 /// | `.mozilla` | Firefox browser profiles (Linux) |
+/// | `.thunderbird` | Thunderbird mail profiles and credentials |
 /// | `.config/google-chrome` | Google Chrome profiles (Linux) |
 /// | `.config/chromium` | Chromium profiles (Linux) |
 /// | `.config/BraveSoftware/Brave-Browser` | Brave browser profiles (Linux) |
+/// | `.config/microsoft-edge` | Microsoft Edge profiles (Linux) |
 /// | `Library/Application Support/Google/Chrome` | Google Chrome profiles (macOS) |
 /// | `Library/Application Support/Firefox` | Firefox profiles (macOS) |
+/// | `Library/Application Support/BraveSoftware/Brave-Browser` | Brave browser profiles (macOS) |
+/// | `Library/Application Support/Microsoft Edge` | Microsoft Edge profiles (macOS) |
+/// | `Library/Cookies` | Safari and WebKit cookies (macOS) |
+/// | `Library/Containers/com.apple.Safari/Data/Library/Cookies` | Safari sandboxed cookies (macOS) |
 /// | `AppData/Local/Google/Chrome/User Data` | Google Chrome profiles (Windows) |
 /// | `AppData/Local/Microsoft/Edge/User Data` | Microsoft Edge profiles (Windows) |
+/// | `AppData/Local/BraveSoftware/Brave-Browser/User Data` | Brave browser profiles (Windows) |
 /// | `AppData/Roaming/Mozilla/Firefox` | Firefox profiles (Windows) |
+/// | `AppData/Roaming/Microsoft/Credentials` | Windows Credential Manager roaming store |
+/// | `AppData/Roaming/Microsoft/Protect` | Windows DPAPI master keys |
+/// | `AppData/Local/Microsoft/Credentials` | Windows Credential Manager local store |
 pub const SECRET_LOCATIONS: &[&str] = &[
     ".ssh",
     ".gnupg",
@@ -96,6 +120,12 @@ pub const SECRET_LOCATIONS: &[&str] = &[
     ".git-credentials",
     ".config/gh",
     ".config/gcloud",
+    ".config/rclone",
+    ".config/op",
+    ".vault-token",
+    ".terraform.d/credentials.tfrc.json",
+    ".cargo/credentials.toml",
+    ".pypirc",
     ".password-store",
     ".local/share/keyrings",
     "Library/Keychains",
@@ -108,14 +138,24 @@ pub const SECRET_LOCATIONS: &[&str] = &[
     ".local/share/opencode/auth.json",
     ".config/github-copilot",
     ".mozilla",
+    ".thunderbird",
     ".config/google-chrome",
     ".config/chromium",
     ".config/BraveSoftware/Brave-Browser",
+    ".config/microsoft-edge",
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Firefox",
+    "Library/Application Support/BraveSoftware/Brave-Browser",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Cookies",
+    "Library/Containers/com.apple.Safari/Data/Library/Cookies",
     "AppData/Local/Google/Chrome/User Data",
     "AppData/Local/Microsoft/Edge/User Data",
+    "AppData/Local/BraveSoftware/Brave-Browser/User Data",
     "AppData/Roaming/Mozilla/Firefox",
+    "AppData/Roaming/Microsoft/Credentials",
+    "AppData/Roaming/Microsoft/Protect",
+    "AppData/Local/Microsoft/Credentials",
 ];
 
 /// `policy.toml`.
@@ -125,6 +165,10 @@ pub struct Policy {
     /// The principal of a caller who names none; `owner` when absent.
     #[serde(default)]
     pub default: Option<Principal>,
+    /// Extra secret locations (absolute or starting with `~`) treated identically to
+    /// [`SECRET_LOCATIONS`] for every role without `effect:admin`.
+    #[serde(default)]
+    pub secrets: Vec<PathRoot>,
     /// The principals this node knows, each with its role.
     #[serde(default)]
     pub principals: BTreeMap<Principal, PrincipalEntry>,
@@ -555,7 +599,9 @@ impl Policy {
             principal: principal.to_owned(),
             role,
             rules: Arc::new(rules),
+            extra_secrets: Arc::from(self.secrets.clone()),
             paths: paths.clone(),
+            protected_cache: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -567,7 +613,19 @@ pub struct Grant {
     principal: String,
     role: String,
     rules: Arc<Role>,
+    extra_secrets: Arc<[PathRoot]>,
     paths: Paths,
+    protected_cache: Arc<OnceLock<CachedProtected>>,
+}
+
+/// Protected directories, secret locations, and configured roots resolved once for the lifetime of
+/// a [`Grant`] so repeated `check_path` and directory-walk checks avoid re-resolving dozens of
+/// paths on every call.
+#[derive(Debug)]
+struct CachedProtected {
+    own_dirs: Vec<Result<OwnDir, (Place, PathBuf, Unresolved)>>,
+    secrets: Vec<SecretPlace>,
+    resolved_roots: Vec<Resolved>,
 }
 
 /// Whether a path is wanted for reading or for writing.
@@ -578,6 +636,17 @@ pub enum Access {
     /// The tool will create, change, move or remove it. One that removes, moves or replaces
     /// everything under it asks [`Grant::check_tree`] as well.
     Write,
+}
+
+/// Kind of filesystem entry a tool is about to create, replace, or link at a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Dir,
+    /// A symbolic link (regardless of what it points to).
+    Symlink,
 }
 
 /// A place a tool that acts on a whole tree treats with care, as [`Grant::protected`] names it.
@@ -697,23 +766,24 @@ impl Grant {
             )
             .with_hint("Write the path from the root of the file system, or from ~."));
         }
-        if names_a_stream(expanded.as_os_str().as_encoded_bytes(), Platform::HOST) {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!(
-                    "{} names an alternate data stream, which Legion does not open.",
-                    given.display()
-                ),
-            )
-            .with_hint("Name the file itself: on Windows a colon after the drive selects a stream inside a file."));
-        }
+        validate_platform_path(
+            expanded.as_os_str().as_encoded_bytes(),
+            given,
+            Platform::HOST,
+        )?;
 
         let Some(roots) = &self.rules.paths else {
             let resolved =
                 resolve_keeping_last(&expanded).map_err(|error| error.unconfined(given))?;
+            let resolved_path = resolved.path();
+            validate_platform_path(
+                resolved_path.as_os_str().as_encoded_bytes(),
+                given,
+                Platform::HOST,
+            )?;
             self.keep_out_of_own_dirs(&resolved, given, access)?;
             self.keep_out_of_secret_locations(&resolved, given, access, &[])?;
-            return Ok(resolved.path());
+            return Ok(resolved_path);
         };
         let denied = |reason: &str| {
             ErrorBody::new(
@@ -774,9 +844,15 @@ impl Grant {
                 return Err(outside());
             }
         }
+        let resolved_path = resolved.path();
+        validate_platform_path(
+            resolved_path.as_os_str().as_encoded_bytes(),
+            given,
+            Platform::HOST,
+        )?;
         self.keep_out_of_own_dirs(&resolved, given, access)?;
         self.keep_out_of_secret_locations(&resolved, given, access, &resolved_roots)?;
-        Ok(resolved.path())
+        Ok(resolved_path)
     }
 
     /// Whether a path is one of the places a tool must not remove, move or replace as a whole, or a
@@ -824,15 +900,18 @@ impl Grant {
                 return Ok(Some(Place::Home));
             }
         }
-        for dir in self.own_dirs().map_err(|(_, error)| unclear(error))? {
+        let cache = self.protected_cache();
+        for entry in &cache.own_dirs {
+            let dir = entry
+                .as_ref()
+                .map_err(|(_, _, error)| unclear(error.clone()))?;
             if holds(&dir.resolved) {
                 return Ok(Some(dir.place));
             }
         }
         if !self.allows_effect(Effect::Admin) {
-            let resolved_roots = self.resolved_roots_best_effort();
-            for secret in self.secret_locations() {
-                if secret_explicitly_opted_in_whole(&secret, &resolved_roots) {
+            for secret in &cache.secrets {
+                if secret_explicitly_opted_in_whole(secret, &cache.resolved_roots) {
                     continue;
                 }
                 if holds(&secret.resolved) {
@@ -882,59 +961,290 @@ impl Grant {
         .with_details(json!({"path": path, "place": format!("{place:?}").to_lowercase()})))
     }
 
+    /// Refuses creating, replacing, or linking any path that is — or holds — Legion's own
+    /// configuration/state directories or a non-opted-in secret location, for roles without
+    /// `effect:admin`.
+    ///
+    /// Unlike [`Grant::protected`], this never exempts a symbolic link at the target path: a
+    /// symlink may never be created at a secret location or any proper ancestor of one, whatever
+    /// it points to. When `create_parents` is `true`, every missing parent directory that would be
+    /// created is checked with the same rule.
+    pub fn check_create(
+        &self,
+        path: &Path,
+        kind: CreateKind,
+        create_parents: bool,
+    ) -> Result<(), ErrorBody> {
+        if self.allows_effect(Effect::Admin) {
+            return Ok(());
+        }
+        let unclear = |error: Unresolved| match error {
+            Unresolved::Invalid(error) => error,
+            Unresolved::Unclear(code, reason) => ErrorBody::new(
+                code,
+                format!("{} cannot be checked: {reason}.", path.display()),
+            ),
+        };
+        let resolved = resolve_keeping_last(path).map_err(unclear)?;
+        let cache = self.protected_cache();
+        let own: Vec<&OwnDir> = cache
+            .own_dirs
+            .iter()
+            .map(|entry| {
+                entry.as_ref().map_err(|(_, dir, error)| {
+                    let reason = match error {
+                        Unresolved::Invalid(error) => error.message.clone(),
+                        Unresolved::Unclear(_, reason) => reason.clone(),
+                    };
+                    ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may not create or replace {}: Legion's own directory {} cannot be resolved ({reason}).",
+                            self.principal,
+                            path.display(),
+                            dir.display()
+                        ),
+                    )
+                    .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let secrets: Vec<&SecretPlace> = cache
+            .secrets
+            .iter()
+            .filter(|secret| !secret_explicitly_opted_in_whole(secret, &cache.resolved_roots))
+            .collect();
+        let home_resolved = self.paths.home().and_then(|home| resolve(home).ok());
+
+        let check_one = |candidate: &Resolved,
+                         candidate_kind: CreateKind,
+                         is_parent: bool|
+         -> Result<(), ErrorBody> {
+            let identity = if candidate.missing.is_empty() && candidate.link.is_none() {
+                Handle::from_path(&candidate.existing).ok()
+            } else {
+                None
+            };
+            let holds = |place: &Resolved| {
+                within_protected(place, candidate, Platform::HOST)
+                    || identity.as_ref().is_some_and(|id| {
+                        place
+                            .existing
+                            .ancestors()
+                            .any(|anc| Handle::from_path(anc).is_ok_and(|h| h == *id))
+                    })
+            };
+            let at_or_above_home = home_resolved.as_ref().is_some_and(&holds);
+            let exempt_existing_home_dir = candidate_kind != CreateKind::Symlink
+                && at_or_above_home
+                && candidate.missing.is_empty()
+                && candidate.link.is_none();
+
+            for dir in &own {
+                let touches = within_protected(candidate, &dir.resolved, Platform::HOST)
+                    || holds(&dir.resolved);
+                if touches && !exempt_existing_home_dir {
+                    let what = if is_parent {
+                        format!(
+                            "creating missing parent {} would create an ancestor of {}",
+                            candidate.path().display(),
+                            dir.place.describe()
+                        )
+                    } else {
+                        format!("it is or holds {}", dir.place.describe())
+                    };
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may not create or replace {}: {what}.",
+                            self.principal,
+                            path.display()
+                        ),
+                    )
+                    .with_hint("Only a role that allows effect:admin may change Legion's own files or their ancestors.")
+                    .with_details(json!({
+                        "path": path,
+                        "place": format!("{:?}", dir.place).to_lowercase(),
+                    })));
+                }
+            }
+
+            for secret in &secrets {
+                let touches = within_protected(candidate, &secret.resolved, Platform::HOST)
+                    || holds(&secret.resolved);
+                if touches && !exempt_existing_home_dir {
+                    let what = if candidate_kind == CreateKind::Symlink {
+                        format!(
+                            "a symbolic link may not be placed at or above secret location {}",
+                            secret.label
+                        )
+                    } else if is_parent {
+                        format!(
+                            "creating missing parent {} would create an ancestor of secret location {}",
+                            candidate.path().display(),
+                            secret.label
+                        )
+                    } else {
+                        format!("it is or holds secret location {}", secret.label)
+                    };
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may not create or replace {}: {what}.",
+                            self.principal,
+                            path.display()
+                        ),
+                    )
+                    .with_hint(format!(
+                        "Only roles with effect:admin, or roles whose `paths` explicitly names {}, may create or replace it or its missing parents.",
+                        secret.label
+                    ))
+                    .with_details(json!({
+                        "path": path,
+                        "place": "secret",
+                        "secret": secret.label,
+                    })));
+                }
+            }
+            Ok(())
+        };
+
+        check_one(&resolved, kind, false)?;
+
+        if create_parents && resolved.missing.len() > 1 {
+            for prefix_len in 1..resolved.missing.len() {
+                let parent_resolved = Resolved {
+                    existing: resolved.existing.clone(),
+                    missing: resolved.missing[..prefix_len].to_vec(),
+                    link: None,
+                };
+                check_one(&parent_resolved, CreateKind::Dir, true)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolves and caches Legion's own directories, secret locations, and configured roots once
+    /// for the lifetime of this [`Grant`].
+    fn protected_cache(&self) -> &CachedProtected {
+        self.protected_cache.get_or_init(|| CachedProtected {
+            own_dirs: self.compute_own_dirs(),
+            secrets: self.compute_secret_locations(),
+            resolved_roots: self.resolved_roots_best_effort(),
+        })
+    }
+
     /// Pre-resolved filter over Legion's own directories and well-known secret locations for
     /// recursive directory walks (`fs.list`, `fs.find`, `fs.grep`, `fs.copy`, `fs.manifest`).
     ///
     /// Returns an empty filter (blocks nothing) for roles that allow `effect:admin`.
+    /// If Legion's own configuration or state directory cannot be resolved, keeps a raw-path
+    /// fallback entry and fails closed so walk entries are never treated as safe when in doubt.
     pub fn protected_filter(&self) -> ProtectedFilter {
         if self.allows_effect(Effect::Admin) {
             return ProtectedFilter::allow_all();
         }
+        let cache = self.protected_cache();
         let mut entries = Vec::new();
-        if let Ok(own) = self.own_dirs() {
-            for dir in own {
-                let reason = format!(
-                    "{}, which only a role that allows effect:admin may read or change",
-                    dir.place.describe()
-                );
-                entries.push(ProtectedEntry {
-                    place: dir.place,
-                    reason,
-                    resolved: dir.resolved,
-                    identity: dir.identity,
-                });
+        let mut fail_closed_reason: Option<(Place, String)> = None;
+        for entry in &cache.own_dirs {
+            match entry {
+                Ok(dir) => {
+                    let reason = format!(
+                        "{}, which only a role that allows effect:admin may read or change",
+                        dir.place.describe()
+                    );
+                    entries.push(ProtectedEntry {
+                        place: dir.place,
+                        reason,
+                        raw_path: dir.dir.clone(),
+                        resolved: dir.resolved.clone(),
+                        identity: dir.identity.clone(),
+                        #[cfg(unix)]
+                        dev_ino: dir.dev_ino,
+                    });
+                }
+                Err((place, dir, error)) => {
+                    let reason = format!(
+                        "{}, which only a role that allows effect:admin may read or change",
+                        place.describe()
+                    );
+                    let detail = match error {
+                        Unresolved::Invalid(err) => err.message.as_str(),
+                        Unresolved::Unclear(_, msg) => msg.as_str(),
+                    };
+                    entries.push(ProtectedEntry {
+                        place: *place,
+                        reason,
+                        raw_path: dir.clone(),
+                        resolved: raw_fallback_resolved(dir),
+                        identity: None,
+                        #[cfg(unix)]
+                        dev_ino: None,
+                    });
+                    if fail_closed_reason.is_none() {
+                        fail_closed_reason = Some((
+                            *place,
+                            format!(
+                                "{} ({}) could not be resolved ({detail}), so paths cannot be told apart from it",
+                                place.describe(),
+                                dir.display()
+                            ),
+                        ));
+                    }
+                }
             }
         }
-        let resolved_roots = self.resolved_roots_best_effort();
-        for secret in self.secret_locations() {
-            if secret_explicitly_opted_in_whole(&secret, &resolved_roots) {
+        for secret in &cache.secrets {
+            if secret_explicitly_opted_in_whole(secret, &cache.resolved_roots) {
                 continue;
             }
             let reason = format!(
-                "~/{} is on Legion's list of secret locations; name it explicitly in the role's `paths` to allow access",
-                secret.rel
+                "{} is on Legion's list of secret locations; name it explicitly in the role's `paths` to allow access",
+                secret.label
             );
             entries.push(ProtectedEntry {
                 place: Place::Secret,
                 reason,
-                resolved: secret.resolved,
-                identity: secret.identity,
+                raw_path: secret.raw_path.clone(),
+                resolved: secret.resolved.clone(),
+                identity: secret.identity.clone(),
+                #[cfg(unix)]
+                dev_ino: secret.dev_ino,
             });
         }
-        let explicit_roots = resolved_roots
-            .into_iter()
+        let explicit_roots = cache
+            .resolved_roots
+            .iter()
             .map(|root| {
                 let id = if root.missing.is_empty() {
-                    Handle::from_path(&root.existing).ok()
+                    Handle::from_path(&root.existing).ok().map(Arc::new)
                 } else {
                     None
                 };
-                (root, id)
+                #[cfg(unix)]
+                let dev_ino = if root.missing.is_empty() {
+                    std::fs::symlink_metadata(&root.existing)
+                        .ok()
+                        .map(|m| (m.dev(), m.ino()))
+                } else {
+                    None
+                };
+                ExplicitRoot {
+                    resolved: root.clone(),
+                    identity: id,
+                    #[cfg(unix)]
+                    dev_ino,
+                }
             })
             .collect();
+        let has_identities = entries.iter().any(|entry| entry.identity.is_some());
         ProtectedFilter {
             entries,
             explicit_roots,
+            has_identities,
+            fail_closed_reason,
         }
     }
 
@@ -952,30 +1262,50 @@ impl Grant {
             .collect()
     }
 
-    /// Well-known secret locations under `self.paths.home()`, resolved as far as they exist.
-    fn secret_locations(&self) -> Vec<SecretPlace> {
-        let Some(home) = self.paths.home() else {
-            return Vec::new();
-        };
-        SECRET_LOCATIONS
-            .iter()
-            .filter_map(|rel| {
+    /// Well-known secret locations under `self.paths.home()` plus any top-level `secrets` from
+    /// `policy.toml`, resolved as far as they exist.
+    ///
+    /// A secret location that cannot be resolved (for example a dangling symlink or an unreadable
+    /// parent) is never silently dropped: it falls back to `resolve_keeping_last` and then to a
+    /// lexical raw path so both `check_path` and directory walks still block it.
+    fn compute_secret_locations(&self) -> Vec<SecretPlace> {
+        let mut places = Vec::with_capacity(SECRET_LOCATIONS.len() + self.extra_secrets.len());
+        let home_resolved = self.paths.home().and_then(|home| resolve(home).ok());
+        if let Some(home) = self.paths.home() {
+            for rel in SECRET_LOCATIONS {
                 let full = rel
                     .split('/')
                     .fold(home.to_path_buf(), |acc, part| acc.join(part));
-                let resolved = resolve(&full).ok()?;
-                let identity = if resolved.missing.is_empty() {
-                    Handle::from_path(&resolved.existing).ok()
-                } else {
-                    None
-                };
-                Some(SecretPlace {
-                    rel,
-                    resolved,
-                    identity,
-                })
-            })
-            .collect()
+                let resolved = resolve(&full)
+                    .or_else(|_| resolve_keeping_last(&full))
+                    .unwrap_or_else(|_| match &home_resolved {
+                        Some(base) => {
+                            let mut missing = base.missing.clone();
+                            missing.extend(rel.split('/').map(OsString::from));
+                            Resolved {
+                                existing: base.existing.clone(),
+                                missing,
+                                link: None,
+                            }
+                        }
+                        None => raw_fallback_resolved(&full),
+                    });
+                places.push(build_secret_place(format!("~/{rel}"), full, resolved));
+            }
+        }
+        for extra in self.extra_secrets.iter() {
+            let full = expand_tilde(Path::new(extra.as_str()), self.paths.home())
+                .unwrap_or_else(|_| PathBuf::from(extra.as_str()));
+            let resolved = resolve(&full)
+                .or_else(|_| resolve_keeping_last(&full))
+                .unwrap_or_else(|_| raw_fallback_resolved(&full));
+            places.push(build_secret_place(
+                extra.as_str().to_owned(),
+                full,
+                resolved,
+            ));
+        }
+        places
     }
 
     /// Refuses access to well-known secret locations for roles without `effect:admin`, unless the
@@ -990,7 +1320,7 @@ impl Grant {
         if self.allows_effect(Effect::Admin) {
             return Ok(());
         }
-        let secrets = self.secret_locations();
+        let secrets = &self.protected_cache().secrets;
         if secrets.is_empty() {
             return Ok(());
         }
@@ -1006,11 +1336,11 @@ impl Grant {
                 .ancestors()
                 .filter_map(|ancestor| Handle::from_path(ancestor).ok())
                 .collect();
-            for secret in &secrets {
-                let inside_secret = within(place, &secret.resolved, Platform::HOST)
+            for secret in secrets {
+                let inside_secret = within_protected(place, &secret.resolved, Platform::HOST)
                     || secret
                         .identity
-                        .as_ref()
+                        .as_deref()
                         .is_some_and(|identity| ancestors.contains(identity));
                 if !inside_secret {
                     continue;
@@ -1021,38 +1351,46 @@ impl Grant {
                 return Err(ErrorBody::new(
                     ErrorCode::Denied,
                     format!(
-                        "{} may not {} {}: ~/{} is on Legion's list of secret locations.",
+                        "{} may not {} {}: {} is on Legion's list of secret locations.",
                         self.principal,
                         access.verb(),
                         given.display(),
-                        secret.rel
+                        secret.label
                     ),
                 )
                 .with_hint(format!(
-                    "Only roles with effect:admin may touch secret locations by default. To allow this role, the owner can name ~/{} (or a path inside it) explicitly in the role's `paths` in policy.toml.",
-                    secret.rel
+                    "Only roles with effect:admin may touch secret locations by default. To allow this role, the owner can name {} (or a path inside it) explicitly in the role's `paths` in policy.toml.",
+                    secret.label
                 ))
                 .with_details(json!({
                     "path": resolved.path(),
-                    "secret": format!("~/{}", secret.rel),
+                    "secret": secret.label,
                 })));
             }
         }
         Ok(())
     }
 
-    /// The node's configuration and state directories, resolved as far as they exist, with the
-    /// identity of each that does.
-    fn own_dirs(&self) -> Result<Vec<OwnDir>, (PathBuf, Unresolved)> {
+    /// The node's configuration and state directories, resolved individually as far as they exist,
+    /// with the identity of each that does.
+    fn compute_own_dirs(&self) -> Vec<Result<OwnDir, (Place, PathBuf, Unresolved)>> {
         [
             (Place::Config, self.paths.config_dir()),
             (Place::State, self.paths.state_dir()),
         ]
         .into_iter()
         .map(|(place, dir)| {
-            let resolved = resolve(dir).map_err(|error| (dir.to_path_buf(), error))?;
+            let resolved = resolve(dir).map_err(|error| (place, dir.to_path_buf(), error))?;
             let identity = if resolved.missing.is_empty() {
-                Handle::from_path(&resolved.existing).ok()
+                Handle::from_path(&resolved.existing).ok().map(Arc::new)
+            } else {
+                None
+            };
+            #[cfg(unix)]
+            let dev_ino = if resolved.missing.is_empty() {
+                std::fs::symlink_metadata(&resolved.existing)
+                    .ok()
+                    .map(|m| (m.dev(), m.ino()))
             } else {
                 None
             };
@@ -1061,6 +1399,8 @@ impl Grant {
                 dir: dir.to_path_buf(),
                 resolved,
                 identity,
+                #[cfg(unix)]
+                dev_ino,
             })
         })
         .collect()
@@ -1089,17 +1429,24 @@ impl Grant {
                 ),
             )
         };
-        let own = self.own_dirs().map_err(|(dir, error)| {
-            let reason = match error {
-                Unresolved::Invalid(error) => error.message,
-                Unresolved::Unclear(_, reason) => reason,
-            };
-            refuse(format!(
-                "Legion's own directory {} cannot be resolved ({reason}), so no path can be told apart from it",
-                dir.display()
-            ))
-            .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
-        })?;
+        let own: Vec<&OwnDir> = self
+            .protected_cache()
+            .own_dirs
+            .iter()
+            .map(|entry| {
+                entry.as_ref().map_err(|(_, dir, error)| {
+                    let reason = match error {
+                        Unresolved::Invalid(error) => error.message.clone(),
+                        Unresolved::Unclear(_, reason) => reason.clone(),
+                    };
+                    refuse(format!(
+                        "Legion's own directory {} cannot be resolved ({reason}), so no path can be told apart from it",
+                        dir.display()
+                    ))
+                    .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
+                })
+            })
+            .collect::<Result<_, _>>()?;
         let mut places = vec![Cow::Borrowed(resolved)];
         if resolved.link.is_some() {
             let target = link_target(resolved).map_err(|_| {
@@ -1114,10 +1461,10 @@ impl Grant {
                 .filter_map(|ancestor| Handle::from_path(ancestor).ok())
                 .collect();
             for dir in &own {
-                let inside = within(place, &dir.resolved, Platform::HOST)
+                let inside = within_protected(place, &dir.resolved, Platform::HOST)
                     || dir
                         .identity
-                        .as_ref()
+                        .as_deref()
                         .is_some_and(|identity| ancestors.contains(identity));
                 if inside {
                     return Err(refuse(format!(
@@ -1135,21 +1482,60 @@ impl Grant {
 }
 
 /// One of the node's own directories.
+#[derive(Debug)]
 struct OwnDir {
     place: Place,
     /// As the node's paths name it.
     dir: PathBuf,
     resolved: Resolved,
     /// Which directory it is, when it exists, so a second name for it is known for what it is.
-    identity: Option<Handle>,
+    identity: Option<Arc<Handle>>,
+    #[cfg(unix)]
+    dev_ino: Option<(u64, u64)>,
 }
 
-/// One well-known secret location resolved against the node's home directory.
+/// One built-in or policy-configured secret location resolved as far as it exists.
+#[derive(Debug)]
 struct SecretPlace {
-    rel: &'static str,
+    label: String,
+    raw_path: PathBuf,
     resolved: Resolved,
-    identity: Option<Handle>,
+    identity: Option<Arc<Handle>>,
+    #[cfg(unix)]
+    dev_ino: Option<(u64, u64)>,
 }
+
+fn build_secret_place(label: String, raw_path: PathBuf, resolved: Resolved) -> SecretPlace {
+    let identity = if resolved.missing.is_empty() && resolved.link.is_none() {
+        Handle::from_path(&resolved.existing).ok().map(Arc::new)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let dev_ino = if resolved.missing.is_empty() && resolved.link.is_none() {
+        std::fs::symlink_metadata(&resolved.existing)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    } else {
+        None
+    };
+    SecretPlace {
+        label,
+        raw_path,
+        resolved,
+        identity,
+        #[cfg(unix)]
+        dev_ino,
+    }
+}
+
+/// Reason reported in `skipped` when a walk entry cannot be inspected to verify it is not protected.
+const UNINSPECTABLE_PATH_REASON: &str =
+    "path could not be inspected to verify it is not a protected location";
+
+/// Reason reported in `skipped` when a symbolic link's target cannot be resolved during a walk.
+const UNRESOLVABLE_LINK_REASON: &str =
+    "symbolic link target could not be resolved to verify it is not a protected location";
 
 /// Pre-resolved filter built by [`Grant::protected_filter`] so recursive directory walks skip
 /// Legion's own configuration/state directories and secret locations using the exact same rules as
@@ -1157,15 +1543,28 @@ struct SecretPlace {
 #[derive(Debug)]
 pub struct ProtectedFilter {
     entries: Vec<ProtectedEntry>,
-    explicit_roots: Vec<(Resolved, Option<Handle>)>,
+    explicit_roots: Vec<ExplicitRoot>,
+    has_identities: bool,
+    fail_closed_reason: Option<(Place, String)>,
+}
+
+#[derive(Debug)]
+struct ExplicitRoot {
+    resolved: Resolved,
+    identity: Option<Arc<Handle>>,
+    #[cfg(unix)]
+    dev_ino: Option<(u64, u64)>,
 }
 
 #[derive(Debug)]
 struct ProtectedEntry {
     place: Place,
     reason: String,
+    raw_path: PathBuf,
     resolved: Resolved,
-    identity: Option<Handle>,
+    identity: Option<Arc<Handle>>,
+    #[cfg(unix)]
+    dev_ino: Option<(u64, u64)>,
 }
 
 impl ProtectedFilter {
@@ -1174,69 +1573,208 @@ impl ProtectedFilter {
         ProtectedFilter {
             entries: Vec::new(),
             explicit_roots: Vec::new(),
+            has_identities: false,
+            fail_closed_reason: None,
         }
     }
 
-    /// Whether this filter has no protected locations to skip.
+    /// Whether this filter has no protected locations to skip and no fail-closed condition.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.fail_closed_reason.is_none()
     }
 
     /// Returns the matching protected [`Place`] and human-readable reason if `path` (or the target
     /// of `path` when it is a symbolic link) must be skipped during a directory walk.
+    ///
+    /// Because the walk root already passed [`Grant::check_path`] and every ancestor directory
+    /// above `path` was already checked and pruned if blocked, normal entries are checked using
+    /// only their own identity and path without re-resolving or walking ancestors. When a path or
+    /// link target cannot be inspected or resolved, this fails closed after checking raw paths.
     pub fn blocked(&self, path: &Path) -> Option<(Place, &str)> {
-        if self.entries.is_empty() {
+        let mut ignored = 0usize;
+        self.blocked_counting(path, &mut ignored)
+    }
+
+    /// Like [`ProtectedFilter::blocked`], counting every filesystem call performed so tests can
+    /// verify the per-entry I/O bound deterministically.
+    fn blocked_counting(&self, path: &Path, fs_calls: &mut usize) -> Option<(Place, &str)> {
+        if self.is_empty() {
             return None;
         }
-        let resolved = resolve_keeping_last(path).ok()?;
-        let mut candidates = vec![Cow::Borrowed(&resolved)];
-        if resolved.link.is_some()
-            && let Ok(target) = link_target(&resolved)
-        {
-            candidates.push(Cow::Owned(target));
-        }
-        for candidate in &candidates {
-            let candidate_id = if candidate.missing.is_empty() {
-                Handle::from_path(&candidate.existing).ok()
+        *fs_calls += 1;
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                if let Some(hit) = self.match_path_only(path) {
+                    return Some(hit);
+                }
+                if let Some((place, ref reason)) = self.fail_closed_reason {
+                    return Some((place, reason.as_str()));
+                }
+                return Some((Place::Secret, UNINSPECTABLE_PATH_REASON));
+            }
+        };
+
+        if meta.file_type().is_symlink() {
+            // Check the symlink path itself first (0 extra FS calls), then follow where it leads.
+            if let Some(hit) = self.match_path_only(path) {
+                return Some(hit);
+            }
+            *fs_calls += 1;
+            let raw_target = match std::fs::read_link(path) {
+                Ok(target) => target,
+                Err(_) => return Some((Place::Secret, UNRESOLVABLE_LINK_REASON)),
+            };
+            let joined = match path.parent() {
+                Some(parent) => parent.join(raw_target),
+                None => raw_target,
+            };
+            *fs_calls += 1;
+            let target = match resolve(&joined) {
+                Ok(target) => target,
+                Err(_) => {
+                    if let Some(hit) = self.match_path_only(&joined) {
+                        return Some(hit);
+                    }
+                    if let Some((place, ref reason)) = self.fail_closed_reason {
+                        return Some((place, reason.as_str()));
+                    }
+                    return Some((Place::Secret, UNRESOLVABLE_LINK_REASON));
+                }
+            };
+            let target_id = if target.missing.is_empty() && self.has_identities {
+                *fs_calls += 1;
+                Handle::from_path(&target.existing).ok()
             } else {
                 None
             };
+            let target_ancestors: Vec<Handle> = if self.has_identities {
+                target
+                    .existing
+                    .ancestors()
+                    .filter_map(|anc| {
+                        *fs_calls += 1;
+                        Handle::from_path(anc).ok()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             for entry in &self.entries {
-                let matches_entry = within(candidate, &entry.resolved, Platform::HOST)
-                    || (candidate_id.is_some() && candidate_id == entry.identity)
-                    || entry.identity.as_ref().is_some_and(|id| {
-                        candidate
-                            .existing
-                            .ancestors()
-                            .any(|anc| Handle::from_path(anc).is_ok_and(|h| h == *id))
-                    });
+                let matches_entry = within_protected(&target, &entry.resolved, Platform::HOST)
+                    || (target_id.is_some() && target_id.as_ref() == entry.identity.as_deref())
+                    || entry
+                        .identity
+                        .as_deref()
+                        .is_some_and(|id| target_ancestors.contains(id));
                 if !matches_entry {
                     continue;
                 }
-                if entry.place == Place::Secret {
-                    let opted_in = self.explicit_roots.iter().any(|(root, root_id)| {
-                        let root_inside_secret =
-                            root_is_within_secret(root, &entry.resolved, entry.identity.as_ref());
-                        if !root_inside_secret {
-                            return false;
-                        }
-                        within(candidate, root, Platform::HOST)
-                            || root_id.as_ref().is_some_and(|rid| {
-                                candidate_id.as_ref() == Some(rid)
-                                    || candidate
-                                        .existing
-                                        .ancestors()
-                                        .any(|anc| Handle::from_path(anc).is_ok_and(|h| h == *rid))
-                            })
-                    });
-                    if opted_in {
-                        continue;
-                    }
+                if entry.place == Place::Secret
+                    && self.target_opted_in(entry, &target, target_id.as_ref(), &target_ancestors)
+                {
+                    continue;
                 }
                 return Some((entry.place, entry.reason.as_str()));
             }
+            if let Some((place, ref reason)) = self.fail_closed_reason {
+                return Some((place, reason.as_str()));
+            }
+            return None;
+        }
+
+        // Normal file or directory: compare ONLY this entry's own identity and path.
+        #[cfg(unix)]
+        let dev_ino = Some((meta.dev(), meta.ino()));
+        #[cfg(not(unix))]
+        let entry_handle = if self.has_identities {
+            *fs_calls += 1;
+            Handle::from_path(path).ok()
+        } else {
+            None
+        };
+
+        for entry in &self.entries {
+            #[cfg(unix)]
+            let id_match = entry.dev_ino.is_some() && entry.dev_ino == dev_ino;
+            #[cfg(not(unix))]
+            let id_match =
+                entry.identity.is_some() && entry.identity.as_deref() == entry_handle.as_ref();
+
+            let matches_entry = id_match
+                || raw_path_within_resolved(path, &entry.resolved, Platform::HOST)
+                || raw_path_within_raw(path, &entry.raw_path, Platform::HOST);
+            if !matches_entry {
+                continue;
+            }
+            if entry.place == Place::Secret {
+                let opted_in = self.explicit_roots.iter().any(|root| {
+                    if !root_is_within_secret(
+                        &root.resolved,
+                        &entry.resolved,
+                        entry.identity.as_deref(),
+                    ) {
+                        return false;
+                    }
+                    #[cfg(unix)]
+                    let root_id_match = root.dev_ino.is_some() && root.dev_ino == dev_ino;
+                    #[cfg(not(unix))]
+                    let root_id_match = root.identity.is_some()
+                        && root.identity.as_deref() == entry_handle.as_ref();
+                    root_id_match || raw_path_within_resolved(path, &root.resolved, Platform::HOST)
+                });
+                if opted_in {
+                    continue;
+                }
+            }
+            return Some((entry.place, entry.reason.as_str()));
+        }
+        if let Some((place, ref reason)) = self.fail_closed_reason {
+            return Some((place, reason.as_str()));
         }
         None
+    }
+
+    fn match_path_only(&self, path: &Path) -> Option<(Place, &str)> {
+        for entry in &self.entries {
+            let matches_entry = raw_path_within_resolved(path, &entry.resolved, Platform::HOST)
+                || raw_path_within_raw(path, &entry.raw_path, Platform::HOST);
+            if !matches_entry {
+                continue;
+            }
+            if entry.place == Place::Secret
+                && self.explicit_roots.iter().any(|root| {
+                    root_is_within_secret(
+                        &root.resolved,
+                        &entry.resolved,
+                        entry.identity.as_deref(),
+                    ) && raw_path_within_resolved(path, &root.resolved, Platform::HOST)
+                })
+            {
+                continue;
+            }
+            return Some((entry.place, entry.reason.as_str()));
+        }
+        None
+    }
+
+    fn target_opted_in(
+        &self,
+        entry: &ProtectedEntry,
+        target: &Resolved,
+        target_id: Option<&Handle>,
+        target_ancestors: &[Handle],
+    ) -> bool {
+        self.explicit_roots.iter().any(|root| {
+            if !root_is_within_secret(&root.resolved, &entry.resolved, entry.identity.as_deref()) {
+                return false;
+            }
+            within_protected(target, &root.resolved, Platform::HOST)
+                || root
+                    .identity
+                    .as_deref()
+                    .is_some_and(|rid| target_id == Some(rid) || target_ancestors.contains(rid))
+        })
     }
 
     /// Convenience wrapper returning whether `path` is blocked.
@@ -1265,9 +1803,9 @@ fn root_is_within_secret(
 /// Whether any configured root explicitly names the entire `secret` location itself.
 fn secret_explicitly_opted_in_whole(secret: &SecretPlace, resolved_roots: &[Resolved]) -> bool {
     resolved_roots.iter().any(|root| {
-        let same_path = within(root, &secret.resolved, Platform::HOST)
-            && within(&secret.resolved, root, Platform::HOST);
-        let same_handle = secret.identity.as_ref().is_some_and(|sid| {
+        let same_path = within_protected(root, &secret.resolved, Platform::HOST)
+            && within_protected(&secret.resolved, root, Platform::HOST);
+        let same_handle = secret.identity.as_deref().is_some_and(|sid| {
             root.missing.is_empty() && Handle::from_path(&root.existing).ok().as_ref() == Some(sid)
         });
         same_path || same_handle
@@ -1283,10 +1821,10 @@ fn secret_explicitly_opted_in_for_place(
     resolved_roots: &[Resolved],
 ) -> bool {
     resolved_roots.iter().any(|root| {
-        if !root_is_within_secret(root, &secret.resolved, secret.identity.as_ref()) {
+        if !root_is_within_secret(root, &secret.resolved, secret.identity.as_deref()) {
             return false;
         }
-        within(place, root, Platform::HOST)
+        within_protected(place, root, Platform::HOST)
             || (root.missing.is_empty()
                 && Handle::from_path(&root.existing)
                     .ok()
@@ -1371,7 +1909,7 @@ impl Resolved {
 }
 
 /// Why a path could not be resolved.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Unresolved {
     /// The path is wrong as written, whoever asks.
     Invalid(ErrorBody),
@@ -1389,6 +1927,27 @@ impl Unresolved {
                 format!("{} cannot be used: {reason}.", given.display()),
             ),
         }
+    }
+}
+
+/// Lexical fallback [`Resolved`] when a path cannot be resolved on disk (for example a dangling
+/// symlink or an unreadable parent), preserving its volume/root prefix and normal components so
+/// raw-path comparisons still work.
+fn raw_fallback_resolved(path: &Path) -> Resolved {
+    let mut existing = PathBuf::new();
+    let mut missing = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(prefix) => existing.push(prefix.as_os_str()),
+            Component::RootDir => existing.push(comp.as_os_str()),
+            Component::Normal(name) => missing.push(name.to_owned()),
+            Component::CurDir | Component::ParentDir => {}
+        }
+    }
+    Resolved {
+        existing,
+        missing,
+        link: None,
     }
 }
 
@@ -1596,6 +2155,104 @@ fn names_a_stream(path: &[u8], platform: Platform) -> bool {
     platform == Platform::Windows && volume(path, platform).1.contains(&b':')
 }
 
+/// Pure platform-specific path component check run by [`Grant::check_path`].
+///
+/// On Windows, Win32 silently strips trailing dots and spaces from path components (so `.kube.`
+/// opens `.kube` and `.ssh ` opens `.ssh`), treats a colon after the drive/share prefix as an NTFS
+/// alternate data stream, and redirects reserved DOS device names (`CON`, `NUL`, `COM1`..`COM9`,
+/// `LPT1`..`LPT9`, etc.) regardless of extension. Parameterised by [`Platform`] so every rule is
+/// tested on every host OS.
+fn validate_platform_path(
+    path: &[u8],
+    display: &Path,
+    platform: Platform,
+) -> Result<(), ErrorBody> {
+    if platform != Platform::Windows {
+        return Ok(());
+    }
+    if names_a_stream(path, platform) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "{} names an alternate data stream, which Legion does not open.",
+                display.display()
+            ),
+        )
+        .with_hint(
+            "Name the file itself: on Windows a colon after the drive selects a stream inside a file.",
+        ));
+    }
+    let (_, rest) = volume(path, platform);
+    for comp in rest
+        .split(|byte| platform.separates(*byte))
+        .filter(|part| !part.is_empty())
+    {
+        if comp == b"." || comp == b".." {
+            continue;
+        }
+        if comp.ends_with(b".") || comp.ends_with(b" ") {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "{} has path component {:?} ending in a dot or space, which Windows silently strips.",
+                    display.display(),
+                    String::from_utf8_lossy(comp)
+                ),
+            )
+            .with_hint("Remove trailing dots and spaces from every path component on Windows."));
+        }
+        if is_windows_reserved_device_name(comp) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "{} uses the reserved Windows device name {:?}.",
+                    display.display(),
+                    String::from_utf8_lossy(comp)
+                ),
+            )
+            .with_hint(
+                "Avoid reserved Windows device names (CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM1-COM9, LPT1-LPT9) in path components.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `comp` matches a Win32 reserved device name (case-insensitively, ignoring any extension
+/// or trailing dots/spaces).
+fn is_windows_reserved_device_name(comp: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(comp) else {
+        return false;
+    };
+    let stem = text
+        .trim_end_matches(['.', ' '])
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ');
+    if stem.is_empty() {
+        return false;
+    }
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+        || stem.eq_ignore_ascii_case("CONIN$")
+        || stem.eq_ignore_ascii_case("CONOUT$")
+    {
+        return true;
+    }
+    if stem.len() > 3
+        && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
+    {
+        let mut chars = stem[3..].chars();
+        if let (Some(digit), None) = (chars.next(), chars.next()) {
+            return matches!(digit, '1'..='9' | '\u{00B9}' | '\u{00B2}' | '\u{00B3}');
+        }
+    }
+    false
+}
+
 /// The volume of a resolved path and its names, from the top down.
 fn names_of(resolved: &Resolved, platform: Platform) -> (Vec<u8>, Vec<Name<'_>>) {
     let (volume, rest) = volume(resolved.existing.as_os_str().as_encoded_bytes(), platform);
@@ -1630,6 +2287,72 @@ fn within(path: &Resolved, root: &Resolved, platform: Platform) -> bool {
             .iter()
             .zip(&path_names)
             .all(|(root, name)| same_name(*root, *name, platform))
+}
+
+/// Like [`within`], ignoring whether either side existed when resolved so a cached protected
+/// location still matches on case-insensitive platforms if it is created after the grant.
+fn within_protected(path: &Resolved, root: &Resolved, platform: Platform) -> bool {
+    let (path_volume, path_names) = names_of(path, platform);
+    let (root_volume, root_names) = names_of(root, platform);
+    path_volume == root_volume
+        && path_names.len() >= root_names.len()
+        && root_names
+            .iter()
+            .zip(&path_names)
+            .all(|(root, name)| same_name_ignoring_existence(root.bytes, name.bytes, platform))
+}
+
+/// Pure in-memory prefix check comparing a raw `path` against a resolved protected `root`.
+fn raw_path_within_resolved(path: &Path, root: &Resolved, platform: Platform) -> bool {
+    let (path_volume, path_rest) = volume(path.as_os_str().as_encoded_bytes(), platform);
+    let (root_volume, root_names) = names_of(root, platform);
+    if path_volume != root_volume {
+        return false;
+    }
+    let path_parts: Vec<&[u8]> = path_rest
+        .split(|byte| platform.separates(*byte))
+        .filter(|part| !part.is_empty())
+        .collect();
+    path_parts.len() >= root_names.len()
+        && root_names
+            .iter()
+            .zip(&path_parts)
+            .all(|(root_name, part)| same_name_ignoring_existence(root_name.bytes, part, platform))
+}
+
+/// Pure in-memory prefix check comparing two raw paths.
+fn raw_path_within_raw(path: &Path, root: &Path, platform: Platform) -> bool {
+    let (path_volume, path_rest) = volume(path.as_os_str().as_encoded_bytes(), platform);
+    let (root_volume, root_rest) = volume(root.as_os_str().as_encoded_bytes(), platform);
+    if path_volume != root_volume {
+        return false;
+    }
+    let path_parts: Vec<&[u8]> = path_rest
+        .split(|byte| platform.separates(*byte))
+        .filter(|part| !part.is_empty())
+        .collect();
+    let root_parts: Vec<&[u8]> = root_rest
+        .split(|byte| platform.separates(*byte))
+        .filter(|part| !part.is_empty())
+        .collect();
+    path_parts.len() >= root_parts.len()
+        && root_parts
+            .iter()
+            .zip(&path_parts)
+            .all(|(r, p)| same_name_ignoring_existence(r, p, platform))
+}
+
+fn same_name_ignoring_existence(a: &[u8], b: &[u8], platform: Platform) -> bool {
+    if a == b {
+        return true;
+    }
+    if !platform.ignores_case() {
+        return false;
+    }
+    match (std::str::from_utf8(a), std::str::from_utf8(b)) {
+        (Ok(a), Ok(b)) => a.to_lowercase() == b.to_lowercase(),
+        _ => false,
+    }
 }
 
 fn same_name(a: Name<'_>, b: Name<'_>, platform: Platform) -> bool {
@@ -2681,5 +3404,477 @@ role = "partial_optin"
                 .is_none()
         );
         assert!(owner.protected_filter().is_empty());
+    }
+
+    #[test]
+    fn check_create_refuses_symlinks_entries_and_missing_parents_of_secret_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = under(dir.path());
+        let home = paths.home().unwrap();
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+
+        let policy = policy(
+            r#"
+default = "owner"
+
+[roles.wide]
+allow = ["effect:read", "effect:write", "effect:destroy"]
+
+[principals.wide]
+role = "wide"
+"#,
+        );
+        let wide = policy.grant("wide", &paths);
+        let owner = policy.grant("owner", &paths);
+
+        // `~/.codex` is absent, and is the proper ancestor of secret `~/.codex/auth.json`.
+        // Every entry kind (symlink, dir, file) at `~/.codex` is refused.
+        for kind in [CreateKind::Symlink, CreateKind::Dir, CreateKind::File] {
+            let err = wide
+                .check_create(&home.join(".codex"), kind, false)
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{kind:?}");
+            assert!(err.message.contains(".codex/auth.json"), "{}", err.message);
+        }
+
+        // Creating a file or directory under missing `~/.codex` with create_parents=true is refused.
+        let err = wide
+            .check_create(
+                &home.join(".codex").join("other.txt"),
+                CreateKind::File,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        let err = wide
+            .check_create(&home.join(".codex").join("sub"), CreateKind::Dir, true)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // A symlink at existing `~/.config` (ancestor of `~/.config/gh`) is refused.
+        assert_eq!(
+            wide.check_create(&home.join(".config"), CreateKind::Symlink, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        // Creating a sibling file inside ALREADY-EXISTING `~/.config` is allowed.
+        assert!(
+            wide.check_create(
+                &home.join(".config").join("myapp").join("settings.toml"),
+                CreateKind::File,
+                true,
+            )
+            .is_ok()
+        );
+        // Normal files under `~/projects` are allowed.
+        assert!(
+            wide.check_create(
+                &home.join("projects").join("sub").join("a.txt"),
+                CreateKind::File,
+                true,
+            )
+            .is_ok()
+        );
+        // Admin (owner) is allowed.
+        assert!(
+            owner
+                .check_create(&home.join(".codex"), CreateKind::Symlink, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn windows_path_validation_refuses_trailing_dot_space_and_reserved_devices_on_every_platform() {
+        let check = |raw: &str, platform: Platform| {
+            validate_platform_path(raw.as_bytes(), Path::new(raw), platform)
+        };
+
+        for bad in [
+            r"C:\Users\me\.kube.\config",
+            r"C:\Users\me\.ssh \authorized_keys",
+            r"C:\Users\me\projects\file.",
+            r"C:\Users\me\projects\file ",
+            r"C:\Users\me\projects\...",
+            r"\\?\C:\Users\me\.kube.\config",
+            r"\\server\share\.ssh \id_ed25519",
+            r"C:\Users\me\projects\CON",
+            r"C:\Users\me\projects\nul.txt",
+            r"C:\Users\me\projects\COM1.log",
+            "C:\\Users\\me\\projects\\com\u{00B9}",
+            r"C:\Users\me\projects\LPT9",
+            "C:\\Users\\me\\projects\\lpt\u{00B3}.dat",
+            r"C:\Users\me\projects\CONIN$",
+            r"C:\Users\me\projects\CONOUT$",
+            r"C:\Users\me\projects\aux .txt",
+            r"C:\Users\me\projects\prn",
+            r"C:\Users\me\projects\file.txt:stream",
+        ] {
+            let err = check(bad, Platform::Windows).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad}");
+        }
+
+        for good_windows in [
+            r"C:\Users\me\.kube\config",
+            r"C:\Users\me\.ssh\authorized_keys",
+            r"C:\Users\me\projects\..\ok\file.txt",
+            r"C:\Users\me\projects\.\file.txt",
+            r"C:\Users\me\projects\console.txt",
+            r"C:\Users\me\projects\COM0",
+            r"\\?\C:\Users\me\projects\readme.md",
+        ] {
+            assert!(
+                check(good_windows, Platform::Windows).is_ok(),
+                "{good_windows}"
+            );
+        }
+
+        // Unix and macOS do not strip trailing dots/spaces or reserve DOS device names.
+        for non_windows in [Platform::Unix, Platform::Mac] {
+            for path in [
+                "/home/me/.kube./config",
+                "/home/me/.ssh /authorized_keys",
+                "/home/me/projects/CON",
+                "/home/me/projects/file:stream",
+            ] {
+                assert!(check(path, non_windows).is_ok(), "{non_windows:?} {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn protected_filter_caches_identities_and_bounds_fs_calls_per_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = under(dir.path());
+        let home = paths.home().unwrap();
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+        // Populate several real secret locations on disk.
+        let secret_dirs = [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".kube",
+            ".config/gh",
+            ".config/gcloud",
+        ];
+        for rel in secret_dirs {
+            std::fs::create_dir_all(home.join(rel)).unwrap();
+        }
+        std::fs::write(home.join(".claude.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
+
+        // Create 200 regular files nested 5 directories deep under ~/projects.
+        let deep_root = home.join("projects/a/b/c/d");
+        std::fs::create_dir_all(&deep_root).unwrap();
+        let mut normal_entries = Vec::new();
+        for i in 0..200 {
+            let file = deep_root.join(format!("file_{i:03}.txt"));
+            std::fs::write(&file, b"ok").unwrap();
+            normal_entries.push(file);
+        }
+
+        let policy = policy(
+            r#"
+default = "owner"
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+[principals.wide]
+role = "wide"
+"#,
+        );
+        let wide = policy.grant("wide", &paths);
+        let filter = wide.protected_filter();
+
+        // Walking 200 deep entries must do O(1) filesystem calls per entry (<= 1 on Unix, <= 2 on Windows).
+        let max_per_entry = if cfg!(unix) { 1 } else { 2 };
+        let mut total_calls = 0usize;
+        for entry in &normal_entries {
+            let mut calls = 0usize;
+            assert!(
+                filter.blocked_counting(entry, &mut calls).is_none(),
+                "{}",
+                entry.display()
+            );
+            assert!(
+                calls <= max_per_entry,
+                "expected <= {max_per_entry} fs calls for {}, got {calls}",
+                entry.display()
+            );
+            total_calls += calls;
+        }
+        assert!(total_calls <= normal_entries.len() * max_per_entry);
+
+        // Every secret location and Legion's own dirs are still blocked in O(1) calls.
+        for secret in [
+            home.join(".ssh"),
+            home.join(".gnupg"),
+            home.join(".aws"),
+            home.join(".kube"),
+            home.join(".claude.json"),
+            home.join(".codex/auth.json"),
+            home.join(".config/gh"),
+            home.join(".config/gcloud"),
+        ] {
+            let mut calls = 0usize;
+            let hit = filter.blocked_counting(&secret, &mut calls);
+            assert_eq!(
+                hit.map(|(p, _)| p),
+                Some(Place::Secret),
+                "{}",
+                secret.display()
+            );
+            assert!(calls <= max_per_entry, "{}: {calls}", secret.display());
+        }
+        for own in [paths.config_dir(), paths.state_dir()] {
+            let mut calls = 0usize;
+            assert!(filter.blocked_counting(own, &mut calls).is_some());
+            assert!(calls <= max_per_entry, "{}: {calls}", own.display());
+        }
+
+        // A secret location created AFTER the grant's cache was populated is still caught by check_path.
+        std::fs::write(home.join(".netrc"), "machine example").unwrap();
+        assert_eq!(
+            wide.check_path("~/.netrc", Access::Read).unwrap_err().code,
+            ErrorCode::Denied
+        );
+    }
+
+    #[test]
+    fn walk_helpers_fail_closed_with_raw_path_fallback_when_resolution_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = under(dir.path());
+        let home = paths.home().unwrap();
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+        let policy = policy(
+            r#"
+default = "owner"
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+[principals.wide]
+role = "wide"
+"#,
+        );
+
+        // 1. `blocked` fails closed when a path cannot be inspected, falling back to raw-path match first.
+        let wide = policy.grant("wide", &paths);
+        let filter = wide.protected_filter();
+        let missing_secret = home.join(".ssh").join("id_ed25519");
+        let (place, reason) = filter
+            .blocked(&missing_secret)
+            .expect("missing secret path must be blocked by raw fallback");
+        assert_eq!(place, Place::Secret);
+        assert!(reason.contains(".ssh"), "{reason}");
+
+        let missing_normal = home.join("projects").join("vanished.txt");
+        let (_, reason) = filter
+            .blocked(&missing_normal)
+            .expect("uninspectable path must fail closed");
+        assert!(reason.contains("could not be inspected"), "{reason}");
+
+        // 2. Unresolvable symlink loop in walk fails closed; dangling secret location (`~/.ssh`) is NOT dropped.
+        #[cfg(unix)]
+        {
+            let loop_a = home.join("projects").join("loop_a");
+            let loop_b = home.join("projects").join("loop_b");
+            std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+            std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+            let (_, reason) = filter
+                .blocked(&loop_a)
+                .expect("unresolvable symlink loop must fail closed in walk");
+            assert!(reason.contains("could not be resolved"), "{reason}");
+
+            // Make `~/.ssh` itself a dangling symlink so `resolve(&full)` fails: `compute_secret_locations`
+            // must NOT silently drop `~/.ssh`!
+            let ssh_path = home.join(".ssh");
+            std::os::unix::fs::symlink(dir.path().join("missing_ssh_target"), &ssh_path).unwrap();
+            let wide2 = policy.grant("wide", &paths);
+            let filter2 = wide2.protected_filter();
+            let (place, reason) = filter2
+                .blocked(&ssh_path)
+                .expect("dangling ~/.ssh must still be blocked");
+            assert_eq!(place, Place::Secret);
+            assert!(reason.contains(".ssh"), "{reason}");
+
+            // 3. Unresolvable `config_dir` (dangling symlink) must NOT be dropped by `protected_filter`:
+            // raw-path matches `config_dir` directly AND other paths fail closed with a clear reason.
+            let broken_dir = tempfile::tempdir().unwrap();
+            let broken_paths = under(broken_dir.path());
+            let broken_home = broken_paths.home().unwrap();
+            std::fs::create_dir_all(broken_home.join("projects")).unwrap();
+            std::fs::write(broken_home.join("projects").join("ok.txt"), b"ok").unwrap();
+            std::fs::create_dir_all(broken_paths.config_dir().parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(
+                broken_dir.path().join("missing_config_target"),
+                broken_paths.config_dir(),
+            )
+            .unwrap();
+            let broken_grant = policy.grant("wide", &broken_paths);
+            let broken_filter = broken_grant.protected_filter();
+            assert!(!broken_filter.is_empty());
+            let (cfg_place, cfg_reason) = broken_filter
+                .blocked(broken_paths.config_dir())
+                .expect("unresolvable config_dir must still be blocked by raw path");
+            assert_eq!(cfg_place, Place::Config);
+            assert!(cfg_reason.contains("configuration"), "{cfg_reason}");
+
+            let (other_place, other_reason) = broken_filter
+                .blocked(&broken_home.join("projects").join("ok.txt"))
+                .expect("unresolved own_dir must fail closed for walk entries");
+            assert_eq!(other_place, Place::Config);
+            assert!(
+                other_reason.contains("could not be resolved"),
+                "{other_reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_secret_locations_and_top_level_policy_secrets_are_enforced_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = under(dir.path());
+        let home = paths.home().unwrap();
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::create_dir_all(home.join("extra").join("vault")).unwrap();
+        std::fs::write(home.join("extra").join("vault").join("key.pem"), "SECRET").unwrap();
+        std::fs::write(home.join(".npmrc"), "//registry/:_authToken=x").unwrap();
+        std::fs::write(home.join(".bash_history"), "ls\n").unwrap();
+
+        // Every newly required entry is present in SECRET_LOCATIONS.
+        for required in [
+            ".config/rclone",
+            ".config/op",
+            ".vault-token",
+            ".terraform.d/credentials.tfrc.json",
+            ".cargo/credentials.toml",
+            ".pypirc",
+            ".config/microsoft-edge",
+            ".thunderbird",
+            "Library/Application Support/BraveSoftware/Brave-Browser",
+            "Library/Application Support/Microsoft Edge",
+            "Library/Cookies",
+            "Library/Containers/com.apple.Safari/Data/Library/Cookies",
+            "AppData/Roaming/Microsoft/Credentials",
+            "AppData/Roaming/Microsoft/Protect",
+            "AppData/Local/Microsoft/Credentials",
+            "AppData/Local/BraveSoftware/Brave-Browser/User Data",
+        ] {
+            assert!(
+                SECRET_LOCATIONS.contains(&required),
+                "SECRET_LOCATIONS missing {required}"
+            );
+        }
+
+        // Without custom `secrets`, `.npmrc` and `.bash_history` are deliberately NOT blocked,
+        // while newly added built-ins such as `.config/rclone`, `.cargo/credentials.toml`, and
+        // `.vault-token` ARE blocked.
+        let default_pol = policy(
+            r#"
+default = "owner"
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+[principals.wide]
+role = "wide"
+"#,
+        );
+        let wide_default = default_pol.grant("wide", &paths);
+        assert!(wide_default.check_path("~/.npmrc", Access::Read).is_ok());
+        assert!(
+            wide_default
+                .check_path("~/.bash_history", Access::Read)
+                .is_ok()
+        );
+        for builtin in [
+            "~/.config/rclone/rclone.conf",
+            "~/.config/op/config",
+            "~/.vault-token",
+            "~/.terraform.d/credentials.tfrc.json",
+            "~/.cargo/credentials.toml",
+            "~/.pypirc",
+            "~/.config/microsoft-edge/Default/Cookies",
+            "~/.thunderbird/profiles.ini",
+        ] {
+            assert_eq!(
+                wide_default
+                    .check_path(builtin, Access::Read)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Denied,
+                "{builtin}"
+            );
+        }
+
+        // Top-level `secrets = [...]` in policy.toml is enforced identically to built-ins across
+        // check_path, check_create, protected/check_tree, protected_filter, and role opt-in.
+        let custom_pol = policy(
+            r#"
+default = "owner"
+secrets = ["~/.npmrc", "~/extra/vault", "~/missing_parent/token.txt"]
+
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+
+[roles.home_only]
+allow = ["effect:read"]
+paths = ["~/**"]
+
+[roles.vault_reader]
+allow = ["effect:read"]
+paths = ["~/extra/vault/**"]
+
+[principals.wide]
+role = "wide"
+
+[principals.homey]
+role = "home_only"
+
+[principals.vault]
+role = "vault_reader"
+"#,
+        );
+        let wide = custom_pol.grant("wide", &paths);
+        let homey = custom_pol.grant("homey", &paths);
+        let vault = custom_pol.grant("vault", &paths);
+        let owner = custom_pol.grant("owner", &paths);
+
+        assert_eq!(
+            wide.check_path("~/.npmrc", Access::Read).unwrap_err().code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            homey
+                .check_path("~/extra/vault/key.pem", Access::Read)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            wide.check_create(&home.join("missing_parent"), CreateKind::Symlink, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            wide.protected(&home.join("extra").join("vault")).unwrap(),
+            Some(Place::Secret)
+        );
+        assert_eq!(
+            wide.protected_filter()
+                .blocked(&home.join("extra").join("vault"))
+                .map(|(p, _)| p),
+            Some(Place::Secret)
+        );
+        assert!(
+            vault
+                .check_path("~/extra/vault/key.pem", Access::Read)
+                .is_ok()
+        );
+        assert!(owner.check_path("~/.npmrc", Access::Read).is_ok());
     }
 }

@@ -52,7 +52,7 @@ use crate::guard::{Expected, Guarded, Watch};
 use legion_core::audit::{self, AuditLog, Entry as AuditEntry, Outcome};
 use legion_core::config::ConfigStore;
 use legion_core::policy::Policy;
-use legion_core::{Access, Door, Grant, Paths};
+use legion_core::{Access, CreateKind, Door, Grant, Paths};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
 use legion_xfer::{
@@ -795,10 +795,12 @@ fn put<R: BufRead, W: Write>(
     output: &mut W,
 ) -> Result<(), Failure> {
     let target = grant.check_path(path, Access::Write)?;
+    grant.check_create(&target, CreateKind::File, true)?;
     // The partial file beside the target is created, continued, truncated and removed, so it is
     // held to what the target is: beside a role's root, it is outside it.
     let part = legion_xfer::part_path(&target).map_err(xfer_error)?;
     grant.check_path(&part, Access::Write)?;
+    grant.check_create(&part, CreateKind::File, true)?;
     let hash: Hash = hash.parse().map_err(xfer_error)?;
     if fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
         return Err(Failure::Reply(
@@ -897,6 +899,9 @@ fn unpack<R: BufRead, W: Write>(
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Write)?;
+    if fs::symlink_metadata(&root).is_err() {
+        grant.check_create(&root, CreateKind::Dir, true)?;
+    }
     let mut plan = HashMap::with_capacity(entries.len());
     for entry in entries {
         let name = legion_xfer::validate_relative_path(&entry.path).map_err(xfer_error)?;
@@ -948,7 +953,12 @@ fn unpack<R: BufRead, W: Write>(
                 return false;
             }
             drop(watch);
-            match checked(grant, &root, rel, Access::Write) {
+            let create_kind = match kind {
+                EntryKind::File => CreateKind::File,
+                EntryKind::Dir => CreateKind::Dir,
+                EntryKind::Symlink => CreateKind::Symlink,
+            };
+            match checked_create(grant, &root, rel, create_kind) {
                 Ok(_) => true,
                 Err(error) => {
                     refused.insert(rel.to_owned(), error.message);
@@ -1265,10 +1275,18 @@ fn named(grant: &Grant, root: &Path, name: &str, access: Access) -> Result<PathB
         .map_err(|error| Named::Refused(error.message))
 }
 
-/// A relative name under `root`, validated as a transfer path and checked for `access`.
-fn checked(grant: &Grant, root: &Path, name: &str, access: Access) -> Result<PathBuf, ErrorBody> {
+/// A relative name under `root`, validated as a transfer path and checked for creating or
+/// replacing an entry of `kind` (including any missing parent directories).
+fn checked_create(
+    grant: &Grant,
+    root: &Path,
+    name: &str,
+    kind: CreateKind,
+) -> Result<PathBuf, ErrorBody> {
     let path = resolve_relative_path(root, name).map_err(xfer_error)?;
-    grant.check_path(&path, access)
+    let checked = grant.check_path(&path, Access::Write)?;
+    grant.check_create(&checked, kind, true)?;
+    Ok(checked)
 }
 
 fn io_error(action: &str, path: &Path, error: &io::Error) -> ErrorBody {

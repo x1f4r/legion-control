@@ -65,6 +65,10 @@ fn main() -> ExitCode {
             "fleet_sync_expect_absent_race_directional_status_and_only_one_side",
             fleet_sync_expect_absent_race_directional_status_and_only_one_side,
         ),
+        (
+            "non_admin_cannot_create_or_link_secret_ancestors_in_any_tool",
+            non_admin_cannot_create_or_link_secret_ancestors_in_any_tool,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -366,6 +370,27 @@ fn meta_init_empty_idempotent_and_generated_roles() {
     let ed_exec = home.run(&["exec.run", "cmd=echo hi", "--as", "writer"]);
     assert_eq!(ed_exec.code, 1);
     assert_eq!(ed_exec.json()["code"], json!("denied"));
+    let ed_proj_add = home.run(&[
+        "proj.add",
+        "name=x",
+        "path=~/projects/app",
+        "--as",
+        "writer",
+    ]);
+    assert_eq!(ed_proj_add.code, 1);
+    assert_eq!(ed_proj_add.json()["code"], json!("denied"));
+    let ed_xfer = home.run(&[
+        "fs.transfer",
+        "from=~/projects/app/hello.txt",
+        "to=~/projects/app/hello2.txt",
+        "--as",
+        "writer",
+    ]);
+    assert_eq!(ed_xfer.code, 1);
+    assert_eq!(ed_xfer.json()["code"], json!("denied"));
+    let ed_audit = home.run(&["audit.tail", "--as", "writer"]);
+    assert_eq!(ed_audit.code, 1);
+    assert_eq!(ed_audit.json()["code"], json!("denied"));
     let ed_admin = home.run(&["token.list", "--as", "writer"]);
     assert_eq!(ed_admin.code, 1);
     assert_eq!(ed_admin.json()["code"], json!("denied"));
@@ -956,6 +981,36 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
             .starts_with("fleet: ")),
         "{quick_checks:?}"
     );
+
+    // Roles that allow a specific built-in exec tool (`proj.pull`) or a live exec extension
+    // (`ops.deploy` matched by `ops.*`) are both caught and named in the warning.
+    let defined = laptop.run(&[
+        "ext.define",
+        "name=ops.deploy",
+        "description=Deploy service.",
+        "effect=exec",
+        "cmd=echo deploy",
+    ]);
+    assert_eq!(defined.code, 0, "{}", defined.stdout);
+    let mut policy = fs::read_to_string(config_dir(&laptop).join("policy.toml")).unwrap();
+    policy.push_str(
+        "\n[roles.puller]\nallow = [\"proj.pull\"]\n\
+         [roles.deployer]\nallow = [\"ops.*\"]\n",
+    );
+    laptop.write_config("policy.toml", &policy);
+
+    let after_ext = laptop.run(&["meta.doctor", "quick=true"]);
+    assert_eq!(after_ext.code, 0, "{}", after_ext.stderr);
+    let ext_warn = after_ext.json()["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == json!("policy exec roles"))
+        .unwrap()
+        .clone();
+    let ext_detail = ext_warn["detail"].as_str().unwrap();
+    assert!(ext_detail.contains("puller (proj.pull)"), "{ext_warn}");
+    assert!(ext_detail.contains("deployer (ops.deploy)"), "{ext_warn}");
 }
 
 fn secret_locations_refused_and_skipped_in_recursive_tools() {
@@ -1127,6 +1182,49 @@ role = \"ssh_allowed\"
     // Owner (admin) is not blocked.
     let owner_read = home.run(&["fs.read", "path=~/.ssh/id_ed25519"]);
     assert_eq!(owner_read.code, 0, "{}", owner_read.stdout);
+
+    // Top-level `secrets = [...]` in policy.toml behaves identically to built-in secret locations.
+    fs::write(user_home.join(".npmrc"), "//registry/:_authToken=secret").unwrap();
+    fs::create_dir_all(user_home.join("custom_vault")).unwrap();
+    fs::write(user_home.join("custom_vault").join("secret.txt"), "VAULT").unwrap();
+    // `.npmrc` is NOT blocked until the owner adds it to `secrets`.
+    assert_eq!(
+        home.run(&["fs.read", "path=~/.npmrc", "--as", "wide"]).code,
+        0
+    );
+
+    home.write_config(
+        "policy.toml",
+        "\
+default = \"owner\"
+secrets = [\"~/.npmrc\", \"~/custom_vault\", \"~/missing_vault/key.pem\"]
+
+[roles.wide]
+allow = [\"effect:read\", \"effect:write\"]
+
+[principals.wide]
+role = \"wide\"
+",
+    );
+    let denied_npmrc = home.run(&["fs.read", "path=~/.npmrc", "--as", "wide"]);
+    assert_eq!(denied_npmrc.code, 1);
+    assert_eq!(denied_npmrc.json()["code"], json!("denied"));
+
+    let denied_parent = home.run(&["fs.mkdir", "path=~/missing_vault", "--as", "wide"]);
+    assert_eq!(denied_parent.code, 1);
+    assert_eq!(denied_parent.json()["code"], json!("denied"));
+
+    let listed_custom = home.run(&["fs.list", "path=~", "hidden=true", "--as", "wide"]);
+    assert_eq!(listed_custom.code, 0, "{}", listed_custom.stdout);
+    assert!(
+        listed_custom.json()["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.ends_with("custom_vault"))),
+        "{}",
+        listed_custom.stdout
+    );
 }
 
 fn fleet_sync_ext_define_dotted_filename_runs_on_peer() {
@@ -1536,4 +1634,153 @@ fn fleet_sync_expect_absent_race_directional_status_and_only_one_side() {
         desc.contains("only_here") && desc.contains("only_there"),
         "{desc}"
     );
+}
+
+fn non_admin_cannot_create_or_link_secret_ancestors_in_any_tool() {
+    let home = Home::new();
+    let user_home = home.home();
+
+    home.write_config(
+        "policy.toml",
+        "\
+default = \"owner\"
+
+[roles.wide]
+allow = [\"effect:read\", \"effect:write\", \"effect:destroy\"]
+
+[principals.wide]
+role = \"wide\"
+",
+    );
+
+    let fake = user_home.join("projects").join("fake");
+    let src = user_home.join("projects").join("src");
+    let src_file = user_home.join("projects").join("payload.txt");
+    let src_dir = user_home.join("projects").join("plain_dir");
+    fs::create_dir_all(&fake).unwrap();
+    fs::create_dir_all(src.join(".gemini")).unwrap();
+    fs::create_dir_all(src.join(".local").join("share")).unwrap();
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(&src_file, "payload").unwrap();
+    fs::write(src.join(".docker"), "not-a-dir").unwrap();
+    fs::write(src.join(".local").join("share").join("note.txt"), "hi").unwrap();
+    fs::write(src.join("ok.txt"), "allowed").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&fake, src.join(".codex")).unwrap();
+        std::os::unix::fs::symlink(&fake, user_home.join("projects").join("codex_link")).unwrap();
+    }
+
+    // 1. unpack (`fs.transfer` directory into `~/`): refuses `.codex` symlink, `.gemini` dir,
+    // `.docker` file, and `.local/share/note.txt` (missing parent `.local/share`), while still
+    // transferring benign `ok.txt`.
+    let xfer_dir = home.run(&[
+        "fs.transfer",
+        "from=~/projects/src/",
+        "to=~/",
+        "--as",
+        "wide",
+    ]);
+    assert_eq!(xfer_dir.code, 0, "{}", xfer_dir.stdout);
+    assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    assert!(fs::symlink_metadata(user_home.join(".gemini")).is_err());
+    assert!(fs::symlink_metadata(user_home.join(".docker")).is_err());
+    assert!(fs::symlink_metadata(user_home.join(".local")).is_err());
+    assert_eq!(
+        fs::read_to_string(user_home.join("ok.txt")).unwrap(),
+        "allowed"
+    );
+
+    // 2. put (`fs.transfer` single file to `~/.codex` and `~/.codex/note.txt`): refused.
+    for target in ["~/.codex", "~/.codex/note.txt"] {
+        let put_res = home.run(&[
+            "fs.transfer",
+            "from=~/projects/payload.txt",
+            &format!("to={target}"),
+            "--as",
+            "wide",
+        ]);
+        assert_eq!(put_res.code, 1, "put {target}: {}", put_res.stdout);
+        assert_eq!(put_res.json()["code"], json!("denied"), "put {target}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
+
+    // 3. fs.write with parents=true to `~/.codex/note.txt` and direct file `~/.codex`: refused.
+    for args in [
+        vec![
+            "fs.write",
+            "path=~/.codex/note.txt",
+            "content=hi",
+            "parents=true",
+            "--as",
+            "wide",
+        ],
+        vec!["fs.write", "path=~/.codex", "content=hi", "--as", "wide"],
+    ] {
+        let res = home.run(&args);
+        assert_eq!(res.code, 1, "{args:?}: {}", res.stdout);
+        assert_eq!(res.json()["code"], json!("denied"), "{args:?}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
+
+    // 4. fs.mkdir on `~/.codex` and `~/.codex/sub` (parents=true): refused.
+    for target in ["~/.codex", "~/.codex/sub"] {
+        let res = home.run(&[
+            "fs.mkdir",
+            &format!("path={target}"),
+            "parents=true",
+            "--as",
+            "wide",
+        ]);
+        assert_eq!(res.code, 1, "mkdir {target}: {}", res.stdout);
+        assert_eq!(res.json()["code"], json!("denied"), "mkdir {target}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
+
+    // 5. fs.copy file, directory, and symlink to `~/.codex`: all refused.
+    // Windows cannot create the link without privilege, so the symlink case runs on Unix only.
+    let copy_sources: &[(&str, &str, bool)] = if cfg!(unix) {
+        &[
+            ("file", "~/projects/payload.txt", false),
+            ("dir", "~/projects/plain_dir", true),
+            ("symlink", "~/projects/codex_link", false),
+        ]
+    } else {
+        &[
+            ("file", "~/projects/payload.txt", false),
+            ("dir", "~/projects/plain_dir", true),
+        ]
+    };
+    for &(label, from, recursive) in copy_sources {
+        let from_arg = format!("from={from}");
+        let mut args = vec!["fs.copy", &from_arg, "to=~/.codex", "--as", "wide"];
+        if recursive {
+            args.push("recursive=true");
+        }
+        let res = home.run(&args);
+        assert_eq!(res.code, 1, "copy {label}: {}", res.stdout);
+        assert_eq!(res.json()["code"], json!("denied"), "copy {label}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
+
+    // 6. fs.move file, directory, and symlink to `~/.codex`: all refused.
+    let move_sources: &[(&str, &str)] = if cfg!(unix) {
+        &[
+            ("file", "~/projects/payload.txt"),
+            ("dir", "~/projects/plain_dir"),
+            ("symlink", "~/projects/codex_link"),
+        ]
+    } else {
+        &[
+            ("file", "~/projects/payload.txt"),
+            ("dir", "~/projects/plain_dir"),
+        ]
+    };
+    for &(label, from) in move_sources {
+        let from_arg = format!("from={from}");
+        let res = home.run(&["fs.move", &from_arg, "to=~/.codex", "--as", "wide"]);
+        assert_eq!(res.code, 1, "move {label}: {}", res.stdout);
+        assert_eq!(res.json()["code"], json!("denied"), "move {label}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
 }

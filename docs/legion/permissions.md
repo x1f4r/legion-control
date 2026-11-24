@@ -125,16 +125,31 @@ legion: denied: agent:wide may not read ~/.ssh/id_ed25519: ~/.ssh is on Legion's
   Only roles with effect:admin may touch secret locations by default. To allow this role, the owner can name ~/.ssh (or a path inside it) explicitly in the role's `paths` in policy.toml.
 ```
 
+The list also covers package-registry credentials (`~/.cargo/credentials.toml`, `~/.pypirc`),
+`~/.config/rclone`, `~/.config/op`, `~/.vault-token`, Terraform's credentials file, mail profiles
+and, on Windows, the operating system's credential stores. `.npmrc` and shell history files are
+deliberately left out because they cause too many false positives. An owner can protect them, or
+any other path, with a top-level `secrets = ["~/extra/path"]` in `policy.toml`; such a path is
+treated exactly like the built-in list.
+
+Two limits remain. A hard link to a secret file made outside Legion cannot be detected by any path
+check. And a role without the admin effect cannot create a secret location that does not exist
+yet, or a link in its place: planting `~/.ssh/authorized_keys` would be as bad as reading a key.
+
 ## The three ready-made roles
 
 `legion init` writes a starter `policy.toml` with `default = "owner"` and three roles:
 
 - **`observer`**: `allow = ["effect:read"]`, `deny = ["audit.*"]`, `paths = ["~/projects/**"]`.
-  May look without changing anything (system facts, job/service/project status, and files under
-  `paths`, never Legion's audit log). A real boundary when paired with a pinned door.
-- **`editor`**: `allow = ["effect:read", "effect:write"]`, `paths = ["~/projects/**"]`. May read
-  and modify files inside `paths`, with no `exec`, `destroy`, `power`, or `admin`. A real boundary
-  for file work through a pinned door.
+  May look without changing anything: system facts, files under `paths`, job, service and project
+  status, and also every process's command line (with secret-looking values replaced), service
+  logs, every principal's job commands and output, the fleet's layout and the definitions of
+  extension tools. It can run any extension tool declared `read`. Never Legion's audit log. A real boundary when paired with a pinned door.
+- **`editor`**: `allow = ["effect:read", "effect:write"]`,
+  `deny = ["audit.*", "proj.add", "proj.remove", "fs.transfer"]`, `paths = ["~/projects/**"]`. May
+  read and modify files inside `paths`, with no `exec`, `destroy`, `power`, or `admin`; it cannot
+  change which projects are registered or send files to other machines. A real boundary for file
+  work through a pinned door.
 - **`operator`**: `allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]`,
   `deny = ["effect:power", "effect:admin"]`. Everything except power and administration. Because
   `operator` can run commands, it is as strong as the OS account and could change Legion's own

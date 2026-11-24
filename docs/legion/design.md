@@ -339,8 +339,12 @@ What the effects do and do not promise:
 - **Secret locations are refused without `admin`.** File tools refuse well-known credential
   directories and files under the home directory (such as `~/.ssh`, `~/.aws`, agent credentials,
   and browser profiles), and recursive walks skip them, unless the role allows `effect:admin` or
-  names the location explicitly in its `paths` (a broad root like `~/**` does not opt in). This
-  safety net constrains file tools only and does not bind a role with `exec`.
+  names the location explicitly in its `paths` (a broad root like `~/**` does not opt in). `.npmrc`
+  and shell history files are deliberately excluded to avoid false positives; an owner can add
+  extra locations at the top level of `policy.toml` with `secrets = ["~/extra/path"]`, which are
+  enforced identically to the built-in list. This safety net constrains file tools only and does
+  not bind a role with `exec`. A hard link to a secret file made outside Legion cannot be detected
+  by any path check.
 
 A door that pinned a principal ignores a different `as` in the request. Only the built-in owner
 role may act as someone else: a role that could act as anyone would be the owner under another

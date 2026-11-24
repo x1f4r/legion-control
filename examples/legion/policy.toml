@@ -14,7 +14,7 @@ paths = ["~/projects/**"]
 # Real boundary when paired with a restricted SSH key (`legion gate`) or HTTP bearer token.
 [roles.editor]
 allow = ["effect:read", "effect:write"]
-deny = ["audit.*", "fs.remove"]
+deny = ["audit.*", "proj.add", "proj.remove", "fs.transfer"]
 paths = ["~/projects/**"]
 
 # Full working access except power and administration.
