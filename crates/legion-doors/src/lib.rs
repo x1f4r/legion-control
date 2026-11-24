@@ -7,6 +7,7 @@
 //! binary wires a door to stdin and stdout or to a socket and nothing more, which keeps each door
 //! testable over an in-memory pipe.
 
+pub mod http;
 pub mod mcp;
 
 use legion_core::policy::Policy;
