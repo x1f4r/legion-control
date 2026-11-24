@@ -135,18 +135,18 @@ Takes no arguments.
 
 Effect: `admin`
 
-Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves a unique `device:<name>` principal and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true. A paired device may create invites only on the node it is connected to directly (not forwarded via `on=`).
+Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves a unique `device:<name>` principal and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role or any admin (owner-strength) role requires an owner caller and allow_owner=true. A paired device may create invites only on the node it is connected to directly (not forwarded via `on=`).
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `principal` | `string` | no | - | Existing principal in policy.toml the paired device will act as. Give either `principal`, or both `role` and `name`. |
-| `role` | `string` | no | - | Role from policy.toml (or built-in `owner` with allow_owner=true, or `nobody`) for a new `device:<name>` principal created atomically in policy.toml. Requires `name` and an owner caller. |
+| `role` | `string` | no | - | Role from policy.toml (or built-in `owner`, or `nobody`) for a new `device:<name>` principal created atomically in policy.toml. Requires `name` and an owner caller (plus `allow_owner=true` for `owner` or any admin owner-strength role). |
 | `name` | `string` | no | - | Device name used to create principal `device:<name>` when pairing with `role`. |
 | `valid_minutes` | `integer` | no | `15` | Minutes until the invite expires, from 1 to 1440 (default 15). Range: 1 to 1440. |
 | `host` | `array of string` | no | - | Host name or IP address (a single string or a list of strings) to put in the invite, overriding `[devices] hosts` in `node.toml` and automatic Tailscale/hostname detection. |
 | `port` | `integer` | no | - | SSH port on this machine (defaults to `[devices] port` in `node.toml`, or 22). Range: 1 to 65535. |
 | `user` | `string` | no | - | OS account name on this machine (defaults to `[devices] user` in `node.toml` or the account legion runs as). |
-| `allow_owner` | `boolean` | no | `false` | Allow inviting a device as a principal with the owner role, which may do everything the account can. Off unless given as true. |
+| `allow_owner` | `boolean` | no | `false` | Allow inviting a device with the `owner` role or any admin (owner-strength) role, which can change who may do what. Off unless given as true. |
 
 ### `device.list`
 
@@ -172,15 +172,15 @@ Remove a paired device by name or pairing id, or revoke a pending pairing invite
 
 Effect: `admin`
 
-Change a paired device's role (only for a dedicated `device:*` principal marked with `device = "<pairing_id>"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a currently quarantined descendant (`confirm=true`, owner role only; confirmation records `confirmed_at` locally on this node and is refused if the device is not quarantined) in devices.toml, reconciling authorized_keys and pushing role or name changes to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for the owner role) and every `device.set` call is refused through an expiring credential.
+Change a paired device's role (only for a dedicated `device:*` principal marked with `device = "<pairing_id>"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a currently quarantined descendant (`confirm=true`, owner role only; confirmation records `confirmed_at` locally on this node and is refused if the device is not quarantined) in devices.toml, reconciling authorized_keys and pushing role or name changes to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for `owner` or any admin owner-strength role) and every `device.set` call is refused through an expiring credential.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `name` | `string` | no | - | Paired device name to update, as `device.list` shows it. Give `name` or `id`, not both. |
 | `id` | `string` | no | - | Pairing id (32 lowercase hex characters) of the device to update. Give `name` or `id`, not both. |
-| `role` | `string` | no | - | New role from `policy.toml` (or built-in `owner` with `allow_owner=true`, or `nobody`). Updates the device's principal in `policy.toml` and `devices.toml`. |
+| `role` | `string` | no | - | New role from `policy.toml` (or built-in `owner`, or `nobody`). Updates the device's principal in `policy.toml` and `devices.toml`. Setting `owner` or any admin (owner-strength) role requires `allow_owner=true`. |
 | `rename` | `string` | no | - | New device name (sanitised to lowercase ASCII letters, digits, and `-`). |
-| `allow_owner` | `boolean` | no | `false` | Allow setting the device's role to `owner`, which may do everything the account can. Off unless given as true. |
+| `allow_owner` | `boolean` | no | `false` | Allow setting the device's role to `owner` or any admin (owner-strength) role, which can change who may do what. Off unless given as true. |
 | `confirm` | `boolean` | no | `false` | Explicitly confirm a quarantined paired device so it becomes active again (owner role only). Off unless given as true. |
 
 ## exec
@@ -1049,14 +1049,14 @@ List the processes running on this machine, busiest first, with their id, parent
 
 Effect: `admin`
 
-Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any when the caller has the owner role. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for a principal with the owner role is the keys to the machine (whoever holds it may do anything the account can, from anywhere the server is published), so only a caller with the owner role may make one, and only with allow_owner true. A token made by a call that came with an expiring token expires no later.
+Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any when the caller has the owner role. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for a principal with the owner role or any admin (owner-strength) role is the keys to the machine (whoever holds it may change who may do what and do anything the account can, from anywhere the server is published), so only a caller with the owner role may make one, and only with allow_owner true. A token made by a call that came with an expiring token expires no later.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `name` | `string` | yes | - | What to call the token, such as phone: lower-case letters, digits, - and _. |
 | `principal` | `string` | yes | - | The principal every request with the token acts as. policy.toml must name it, which is what gives it a role. |
 | `expires_days` | `integer` | no | - | Days until the token stops working; it never does when left out. Minimum: 0. |
-| `allow_owner` | `boolean` | no | `false` | Allow a token for owner, which may do everything. Off unless given as true. |
+| `allow_owner` | `boolean` | no | `false` | Allow a token for `owner` or any admin (owner-strength) role, which can change who may do what. Off unless given as true. |
 
 ### `token.list`
 
