@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use legion_core::{BoxFuture, Ctx, Registry, Tool, ToolError, input_schema, parse_args};
 use legion_proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
-use legion_xfer::{Entry, Hash, Manifest, PlanConflict, PlanOptions, SkippedEntry};
+use legion_xfer::{
+    CaseCollision, Entry, EntryKind, Hash, Manifest, Plan, PlanConflict, PlanOptions, SkippedEntry,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -615,7 +617,7 @@ impl Transfer<'_> {
         } else {
             self.manifest(to, args).await?
         };
-        let plan = legion_xfer::plan::plan(
+        let mut plan = legion_xfer::plan::plan(
             &source,
             &dest,
             &PlanOptions {
@@ -623,6 +625,19 @@ impl Transfer<'_> {
                 delete: args.delete,
             },
         );
+        let listed: HashMap<&str, &Entry> = source
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        // Where letter case is ignored, two names that differ only in case are one file, so
+        // sending both would overwrite one with the other on every run. Neither is sent. Where
+        // that cannot be told, the destination is taken to ignore case: holding back is safer.
+        let caseless = there.case_insensitive.unwrap_or(true);
+        let mut conflicts = plan.conflicts.clone();
+        if caseless {
+            conflicts.extend(hold_back_case_collisions(&mut plan, &listed, &to.machine));
+        }
         let mut report = TransferReport {
             from: from.named(),
             to: to.named(),
@@ -633,7 +648,6 @@ impl Transfer<'_> {
         let mut skipped: Vec<SkippedEntry> = Vec::new();
         skipped.extend(on(&from.machine, source.skipped));
         skipped.extend(on(&to.machine, dest.skipped));
-        let conflicts = plan.conflicts.clone();
         if args.dry_run {
             report.files_sent = plan.totals.files_to_send;
             report.bytes_sent = plan.totals.bytes_to_send;
@@ -667,11 +681,6 @@ impl Transfer<'_> {
         if rounds.is_empty() && missing {
             rounds.push(&[]);
         }
-        let listed: HashMap<&str, &Entry> = source
-            .entries
-            .iter()
-            .map(|entry| (entry.path.as_str(), entry))
-            .collect();
         for names in rounds {
             let budget = archive_budget(names, &listed);
             let done = self
@@ -681,8 +690,13 @@ impl Transfer<'_> {
             report.files_sent += done.files;
             report.bytes_sent += done.bytes;
             skipped.extend(on(&to.machine, done.skipped));
+            if caseless {
+                conflicts.extend(case_conflicts(&done.case_collisions, &to.machine));
+            }
         }
         meter.emit(true);
+        conflicts.sort();
+        conflicts.dedup();
         report.deleted += self.delete(to, &extras, &mut skipped).await?;
         report.conflicts = report.list(conflicts);
         report.skipped = report.list(skipped);
@@ -810,6 +824,67 @@ impl Transfer<'_> {
     async fn open(&self, end: &End, header: Value) -> Result<Conn, ErrorBody> {
         Conn::open(self.fleet, self.ctx, self.sent, end, header).await
     }
+}
+
+/// Takes out of the plan every entry whose name differs only in letter case from another's, at
+/// either end, with whatever is under it, and says why for each.
+fn hold_back_case_collisions(
+    plan: &mut Plan,
+    listed: &HashMap<&str, &Entry>,
+    machine: &str,
+) -> Vec<PlanConflict> {
+    let conflicts = case_conflicts(&plan.case_collisions, machine);
+    if conflicts.is_empty() {
+        return conflicts;
+    }
+    let held: HashSet<&str> = conflicts.iter().map(|c| c.path.as_str()).collect();
+    let is_held = |path: &str| {
+        let mut at = path;
+        loop {
+            if held.contains(at) {
+                return true;
+            }
+            match at.rsplit_once('/') {
+                Some((parent, _)) => at = parent,
+                None => return false,
+            }
+        }
+    };
+    plan.send.retain(|path| !is_held(path));
+    plan.delete.retain(|path| !is_held(path));
+    let files: Vec<&&Entry> = plan
+        .send
+        .iter()
+        .filter_map(|path| listed.get(path.as_str()))
+        .filter(|entry| entry.kind == EntryKind::File)
+        .collect();
+    plan.totals.files_to_send = files.len() as u64;
+    plan.totals.bytes_to_send = files.iter().map(|entry| entry.size).sum();
+    plan.totals.entries_to_delete = plan.delete.len() as u64;
+    conflicts
+}
+
+/// One conflict for each name in each collision.
+fn case_conflicts(collisions: &[CaseCollision], machine: &str) -> Vec<PlanConflict> {
+    let mut conflicts = Vec::new();
+    for collision in collisions {
+        for path in &collision.paths {
+            let others: Vec<&str> = collision
+                .paths
+                .iter()
+                .filter(|other| *other != path)
+                .map(String::as_str)
+                .collect();
+            conflicts.push(PlanConflict {
+                path: path.clone(),
+                reason: format!(
+                    "its name differs only in letter case from {}, and the file system on {machine} cannot hold both names; rename one of them to send both",
+                    others.join(", ")
+                ),
+            });
+        }
+    }
+    conflicts
 }
 
 /// Whether removing `path` makes room for an entry about to be sent: the entry itself, of another

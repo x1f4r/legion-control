@@ -200,6 +200,34 @@ fn stat_describes_files_directories_and_missing_paths() {
 }
 
 #[test]
+fn stat_tells_whether_a_directory_ignores_letter_case_without_writing() {
+    let node = Node::new();
+    let dir = node.home().join("projects");
+    fs::write(dir.join("Probe.txt"), b"").unwrap();
+    let ignores_case = dir.join("probe.txt").exists();
+    fs::remove_file(dir.join("Probe.txt")).unwrap();
+    let before: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+
+    for path in ["~/projects", "~/projects/not/yet"] {
+        let ran = node.run(None, &json!({"op": "stat", "path": path}), b"");
+        let (line, _) = ran.ok().first();
+        assert_eq!(
+            line["case_insensitive"],
+            json!(ignores_case),
+            "{path}: {line}"
+        );
+    }
+    let after: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn get_sends_the_size_then_the_bytes_from_the_offset() {
     let node = Node::new();
     let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();

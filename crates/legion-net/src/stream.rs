@@ -41,7 +41,9 @@ use legion_core::policy::Policy;
 use legion_core::{Access, Door, Grant, Paths};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
-use legion_xfer::{Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, resolve_relative_path};
+use legion_xfer::{
+    CaseCollision, Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, resolve_relative_path,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -162,7 +164,7 @@ impl Op {
 }
 
 /// What `stat` says about a path.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct StatReply {
     /// `file`, `dir`, `symlink` (one that leads nowhere), `other` or `missing`, after following a
     /// last part that is a symbolic link.
@@ -176,6 +178,11 @@ pub(crate) struct StatReply {
     /// The length of a partial file a `put` left beside it, which the next one continues from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<u64>,
+    /// For a directory, or a path that does not exist yet, whether the file system it is or
+    /// would be on ignores letter case, so two names that differ only in case are one there.
+    /// Absent when that cannot be told without writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_insensitive: Option<bool>,
 }
 
 /// The line that ends a `manifest`.
@@ -234,6 +241,9 @@ pub(crate) struct UnpackDone {
     /// Entries the archive carried that were not planned, refused and drained unread.
     #[serde(default)]
     pub unplanned: Vec<String>,
+    /// Entries of the archive whose names differ only in letter case.
+    #[serde(default)]
+    pub case_collisions: Vec<CaseCollision>,
 }
 
 /// The line that ends a `delete`.
@@ -546,10 +556,9 @@ fn stat<W: Write>(
                 output,
                 &StatReply {
                     kind: "missing".to_owned(),
-                    size: 0,
-                    mode: None,
-                    hash: None,
                     partial: partial(),
+                    case_insensitive: case_insensitive(&path),
+                    ..StatReply::default()
                 },
             );
         }
@@ -559,10 +568,8 @@ fn stat<W: Write>(
     let answer = if kind.is_dir() {
         StatReply {
             kind: "dir".to_owned(),
-            size: 0,
-            mode: None,
-            hash: None,
-            partial: None,
+            case_insensitive: case_insensitive(&path),
+            ..StatReply::default()
         }
     } else if kind.is_file() {
         let hash = checksum && if_size.is_none_or(|size| size == found.len());
@@ -581,6 +588,7 @@ fn stat<W: Write>(
             mode: entry.as_ref().and_then(|entry| entry.mode),
             hash: entry.and_then(|entry| entry.hash),
             partial: partial(),
+            case_insensitive: None,
         }
     } else {
         StatReply {
@@ -590,13 +598,58 @@ fn stat<W: Write>(
                 "other"
             }
             .to_owned(),
-            size: 0,
-            mode: None,
-            hash: None,
-            partial: None,
+            ..StatReply::default()
         }
     };
     reply(output, &answer)
+}
+
+/// Whether the file system holding `path`, or the nearest directory above it that exists,
+/// ignores letter case, told without writing anything: a name there, one of its entries or of the
+/// directories above it, is looked up again with the case of its letters flipped, and the two are
+/// the same file only where case is ignored. `None` when no name nearby has a letter to flip.
+fn case_insensitive(path: &Path) -> Option<bool> {
+    let dir = path
+        .ancestors()
+        .find(|dir| fs::metadata(dir).is_ok_and(|meta| meta.is_dir()))?;
+    let inside = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .take(64)
+        .filter_map(Result::ok)
+        .map(|entry| entry.path());
+    let above = dir.ancestors().map(Path::to_path_buf);
+    for candidate in inside.chain(above) {
+        // A link and what it leads to are the same file whatever their names.
+        if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            continue;
+        }
+        let (Some(parent), Some(name)) = (
+            candidate.parent(),
+            candidate.file_name().and_then(|name| name.to_str()),
+        ) else {
+            continue;
+        };
+        let flipped: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        if flipped == name {
+            continue;
+        }
+        let twin = parent.join(flipped);
+        return Some(
+            fs::symlink_metadata(&twin).is_ok()
+                && same_file::is_same_file(&candidate, &twin).unwrap_or(false),
+        );
+    }
+    None
 }
 
 fn get<W: Write>(grant: &Grant, path: &str, offset: u64, output: &mut W) -> Result<(), Failure> {
@@ -794,6 +847,7 @@ fn unpack<R: BufRead, W: Write>(
             bytes: report.bytes,
             skipped,
             unplanned,
+            case_collisions: report.case_collisions,
         },
     )
 }

@@ -75,6 +75,10 @@ fn main() -> ExitCode {
             extra_entries_go_only_once_everything_new_has_arrived,
         ),
         (
+            "names_that_differ_only_in_case_are_held_back_where_they_would_collide",
+            names_that_differ_only_in_case_are_held_back_where_they_would_collide,
+        ),
+        (
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
             gate_serves_only_the_connectors_commands_pinned_to_its_principal,
         ),
@@ -232,6 +236,17 @@ fn evil(behaviour: &str, mut command: Command) -> ExitCode {
                 }
                 writeln!(out, "{reply}").unwrap();
             }
+        }
+        // Says its file system ignores letter case, as macOS and Windows usually do.
+        ("caseless", "stat") => {
+            let mut line = String::new();
+            replies.read_line(&mut line).unwrap();
+            let mut reply: Value = serde_json::from_str(&line).unwrap();
+            if reply.get("kind").is_some() {
+                reply["case_insensitive"] = json!(true);
+            }
+            writeln!(out, "{reply}").unwrap();
+            std::io::copy(&mut replies, &mut out).unwrap();
         }
         // Sends more than the size it announced.
         ("extra-bytes", "get") => {
@@ -1374,4 +1389,74 @@ fn extra_entries_go_only_once_everything_new_has_arrived() {
         b"in"
     );
     assert!(!there.join("extra.txt").exists());
+}
+
+fn names_that_differ_only_in_case_are_held_back_where_they_would_collide() {
+    let laptop = node("laptop");
+    let mac = node("mac");
+    let pi = node("pi");
+    fleet(
+        &laptop,
+        &[
+            ("mac", &mac, "evil", vec!["caseless".to_owned()]),
+            ("pi", &pi, "node", vec![]),
+        ],
+    );
+    // The source must hold both names, which a file system that ignores case cannot.
+    fs::write(laptop.home().join("Probe"), b"").unwrap();
+    if laptop.home().join("probe").exists() {
+        return;
+    }
+    let src = laptop.home().join("docs");
+    fs::create_dir_all(src.join("Notes")).unwrap();
+    fs::create_dir_all(src.join("notes")).unwrap();
+    fs::write(src.join("Readme.md"), b"upper").unwrap();
+    fs::write(src.join("readme.md"), b"lower").unwrap();
+    fs::write(src.join("Notes/a.txt"), b"a").unwrap();
+    fs::write(src.join("notes/b.txt"), b"b").unwrap();
+    fs::write(src.join("plain.txt"), b"plain").unwrap();
+
+    let first = ok(&transfer(
+        &laptop,
+        json!({"from": "~/docs", "to": "mac:~/docs"}),
+        &[],
+    ));
+    assert_eq!(first["files_sent"], 1, "{first}");
+    let conflicts = first["conflicts"].as_array().unwrap();
+    let held: Vec<&str> = conflicts
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    for name in ["Readme.md", "readme.md", "Notes", "notes"] {
+        assert!(held.contains(&name), "{name} missing from {held:?}");
+    }
+    assert!(
+        conflicts[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot hold both"),
+        "{first}"
+    );
+    let dst = mac.home().join("docs");
+    assert!(dst.join("plain.txt").exists());
+    for name in ["Readme.md", "readme.md", "Notes", "notes"] {
+        assert!(!dst.join(name).exists(), "{name} was sent");
+    }
+    // A second run sends nothing and says the same.
+    let second = ok(&transfer(
+        &laptop,
+        json!({"from": "~/docs", "to": "mac:~/docs"}),
+        &[],
+    ));
+    assert_eq!(second["files_sent"], 0, "{second}");
+    assert_eq!(second["conflicts"], first["conflicts"]);
+
+    // A file system that tells them apart takes both.
+    let both = ok(&transfer(
+        &laptop,
+        json!({"from": "~/docs", "to": "pi:~/docs"}),
+        &[],
+    ));
+    assert_eq!(both["files_sent"], 5, "{both}");
+    assert_eq!(both["conflicts"], json!([]), "{both}");
 }
