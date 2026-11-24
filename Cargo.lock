@@ -523,6 +523,7 @@ dependencies = [
  "dunce",
  "gethostname",
  "jiff",
+ "legion-os",
  "legion-proto",
  "same-file",
  "schemars",
