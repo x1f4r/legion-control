@@ -604,6 +604,7 @@ dependencies = [
  "legion-core",
  "legion-os",
  "legion-proto",
+ "nix",
  "regex",
  "schemars",
  "serde",
