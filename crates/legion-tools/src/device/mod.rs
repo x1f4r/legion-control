@@ -1831,26 +1831,26 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 );
                 let quarantined_after = registry::quarantined_devices(&devices_file);
 
-                let resulting_bytes = devices_file.to_toml_string().len();
-                if resulting_bytes > registry::MAX_DEVICES_TOML_BYTES {
-                    return Err(RemoveBlockingError::BeforeSave(
-                        registry::devices_size_limit_error(resulting_bytes),
-                    ));
-                }
+                let reserved_bytes = registry::devices_reserved_bytes(&devices_file);
                 if !caller.is_owner()
-                    && resulting_bytes > registry::NON_OWNER_DEVICES_TOML_LIMIT_BYTES
+                    && reserved_bytes > registry::NON_OWNER_DEVICES_TOML_LIMIT_BYTES
                 {
                     return Err(RemoveBlockingError::BeforeSave(
                         registry::non_owner_devices_half_limit_error(
                             "remove a device",
-                            resulting_bytes,
+                            reserved_bytes,
                         ),
                     ));
                 }
 
-                // 1. Write the tombstone to `devices.toml` FIRST.
-                save_devices_locked(&paths, &devices_file)
-                    .map_err(RemoveBlockingError::BeforeSave)?;
+                // 1. Write the tombstone to `devices.toml` FIRST. Turning a live entry into a
+                //    tombstone is NEVER blocked by the 1 MiB size limit.
+                registry::save_devices_locked_with_policy(
+                    &paths,
+                    &devices_file,
+                    registry::SaveSizePolicy::AllowTombstoneOnly,
+                )
+                .map_err(RemoveBlockingError::BeforeSave)?;
 
                 let primary_target =
                     sessions::SessionTarget::new(entry.name.clone(), Some(pairing_id.clone()));
@@ -5675,11 +5675,12 @@ role = \"ops\"
                 .expect_err("non-owner remove past 512 KiB must be refused");
             assert_eq!(rm_err.code, ErrorCode::Denied, "{rm_err:?}");
             assert!(
-                rm_err
-                    .hint
-                    .as_deref()
-                    .is_some_and(|hint| hint.to_ascii_lowercase().contains("owner")),
-                "expected hint mentioning owner tidy-up: {rm_err:?}"
+                rm_err.hint.as_deref().is_some_and(|hint| hint
+                    .to_ascii_lowercase()
+                    .contains("owner")
+                    && hint.contains("device.remove")
+                    && !hint.to_ascii_lowercase().contains("tidy")),
+                "expected honest owner size-limit hint: {rm_err:?}"
             );
 
             let owner_rm = h
@@ -6011,5 +6012,216 @@ allow = [\"effect:read\", \"effect:write\"]
 
         let rem = h.call("device.remove", json!({"id": id})).await.unwrap();
         assert_eq!(rem["removed"], json!(true), "{rem}");
+    }
+
+    #[tokio::test]
+    async fn f2_owner_remove_succeeds_at_one_mib_and_live_addition_respects_tombstone_reserve() {
+        use crate::device::enrol::run_enrol;
+        use crate::device::keys::ed25519_public_key_from_seed;
+        use crate::device::registry::{DeviceTombstone, FleetDevice, MAX_DEVICES_TOML_BYTES};
+
+        let h = Harness::new();
+        let long_node = "n".repeat(63);
+        let orig_node_toml =
+            std::fs::read_to_string(h.node.paths().config_file("node.toml")).unwrap();
+        std::fs::write(
+            h.node.paths().config_file("node.toml"),
+            orig_node_toml.replace("name = \"tower\"", &format!("name = \"{long_node}\"")),
+        )
+        .unwrap();
+        let long_owner = format!("owner-{}", "o".repeat(120));
+        std::fs::write(
+            h.node.paths().config_file("policy.toml"),
+            format!(
+                "\
+default = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+
+[principals.\"{long_owner}\"]
+role = \"owner\"
+"
+            ),
+        )
+        .unwrap();
+
+        let ts = "2026-11-24T10:00:00Z";
+        let live_id = "aa".repeat(16);
+        let live_dev = FleetDevice {
+            name: "x".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0xaa; 32]),
+            principal: "owner".to_owned(),
+            role: None,
+            paired_at: ts.to_owned(),
+            paired_on: "a".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: ts.to_owned(),
+            updated_on: "a".to_owned(),
+            name_updated_at: ts.to_owned(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: ts.to_owned(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
+        };
+        let make_tomb = |idx: u32, pad_len: usize| DeviceTombstone {
+            name: format!("d{idx:04}-{}", "p".repeat(pad_len)),
+            principal: "owner".to_owned(),
+            fingerprint: Some("SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            paired_at: Some(ts.to_owned()),
+            paired_on: Some("tower".to_owned()),
+            paired_by: None,
+            removed_by: None,
+            removed_at: ts.to_owned(),
+            removed_on: "tower".to_owned(),
+        };
+
+        // 1. Seed devices.toml right under 1 MiB (within ~64 bytes of MAX_DEVICES_TOML_BYTES)
+        //    containing live device `x`. Removing `x` as owner (producing a larger tombstone with
+        //    fingerprint + long removed_by + 63-char removed_on) pushes raw bytes > 1 MiB, and
+        //    MUST STILL SUCCEED!
+        let per_tomb = {
+            let mut one = DevicesFile::default();
+            one.removed
+                .insert(format!("f{:031x}", 0u32), make_tomb(0, 100));
+            one.to_toml_string().len() - "version = 1\n".len()
+        };
+        let mut near_one_mib = DevicesFile::default();
+        near_one_mib.devices.insert(live_id.clone(), live_dev);
+        let init_count = ((MAX_DEVICES_TOML_BYTES - 2500) / per_tomb) as u32;
+        for i in 0..init_count {
+            near_one_mib
+                .removed
+                .insert(format!("f{i:031x}"), make_tomb(i, 100));
+        }
+        let mut idx = init_count;
+        loop {
+            let mut probe = near_one_mib.clone();
+            probe
+                .removed
+                .insert(format!("f{idx:031x}"), make_tomb(idx, 100));
+            if probe.to_toml_string().len() > MAX_DEVICES_TOML_BYTES - 600 {
+                break;
+            }
+            near_one_mib = probe;
+            idx += 1;
+        }
+        // Top off with a minimal-overhead tombstone (no fingerprint/paired_at/paired_on) padded
+        // right up to `MAX_DEVICES_TOML_BYTES - 10`.
+        let make_bare_tomb = |i: u32, pad: usize| DeviceTombstone {
+            name: format!("b{i:04}-{}", "p".repeat(pad)),
+            principal: "owner".to_owned(),
+            fingerprint: None,
+            paired_at: None,
+            paired_on: None,
+            paired_by: None,
+            removed_by: None,
+            removed_at: ts.to_owned(),
+            removed_on: "a".to_owned(),
+        };
+        let bare_len = {
+            let mut probe = near_one_mib.clone();
+            probe
+                .removed
+                .insert(format!("f{idx:031x}"), make_bare_tomb(idx, 0));
+            probe.to_toml_string().len() - near_one_mib.to_toml_string().len()
+        };
+        while MAX_DEVICES_TOML_BYTES - near_one_mib.to_toml_string().len() > bare_len + 115 {
+            near_one_mib
+                .removed
+                .insert(format!("f{idx:031x}"), make_bare_tomb(idx, 10));
+            idx += 1;
+        }
+        let remaining = MAX_DEVICES_TOML_BYTES - near_one_mib.to_toml_string().len();
+        if remaining > bare_len + 10 {
+            let pad = (remaining - bare_len - 10).min(115);
+            near_one_mib
+                .removed
+                .insert(format!("f{idx:031x}"), make_bare_tomb(idx, pad));
+        }
+        let seeded_text = near_one_mib.to_toml_string();
+        assert!(
+            seeded_text.len() <= MAX_DEVICES_TOML_BYTES
+                && seeded_text.len() > MAX_DEVICES_TOML_BYTES - 64,
+            "seeded size = {}",
+            seeded_text.len()
+        );
+        std::fs::write(h.node.paths().config_file(DevicesFile::FILE), &seeded_text).unwrap();
+
+        let mut rm_call = Call::new(Door::Cli, "device.remove", json!({"id": live_id}));
+        rm_call.pinned = Some(long_owner.clone());
+        rm_call.pairing_id = Some("bb".repeat(16));
+        let rm_res = h
+            .node
+            .call(rm_call)
+            .await
+            .expect("owner device.remove MUST succeed even when file sits right at 1 MiB");
+        assert_eq!(rm_res["removed"], json!(true), "{rm_res}");
+        let after_rm_bytes = std::fs::read(h.node.paths().config_file(DevicesFile::FILE)).unwrap();
+        assert!(
+            after_rm_bytes.len() > MAX_DEVICES_TOML_BYTES,
+            "test precondition: resulting tombstone file should have crossed 1 MiB (got {})",
+            after_rm_bytes.len()
+        );
+
+        // 2. Seed devices.toml with ~700 bytes of raw headroom (< WORST_CASE_TOMBSTONE_BYTES,
+        //    > actual live entry size of ~450 bytes). Adding a new live device fits raw < 1 MiB
+        //    but breaks the tombstone reserve and MUST be refused with an honest hint!
+        let mut reserve_full = DevicesFile::default();
+        let reserve_init = ((MAX_DEVICES_TOML_BYTES - 2500) / per_tomb) as u32;
+        for i in 0..reserve_init {
+            reserve_full
+                .removed
+                .insert(format!("e{i:031x}"), make_tomb(i, 100));
+        }
+        let mut r_idx = reserve_init;
+        loop {
+            let mut probe = reserve_full.clone();
+            probe
+                .removed
+                .insert(format!("e{r_idx:031x}"), make_tomb(r_idx, 100));
+            if probe.to_toml_string().len() > MAX_DEVICES_TOML_BYTES - 650 {
+                break;
+            }
+            reserve_full = probe;
+            r_idx += 1;
+        }
+        let reserve_text = reserve_full.to_toml_string();
+        assert!(
+            reserve_text.len() <= MAX_DEVICES_TOML_BYTES - 600
+                && reserve_text.len() >= MAX_DEVICES_TOML_BYTES - 1050,
+            "reserve test seeded size = {}",
+            reserve_text.len()
+        );
+        std::fs::write(h.node.paths().config_file(DevicesFile::FILE), &reserve_text).unwrap();
+
+        let inv = h
+            .call(
+                "device.invite",
+                json!({"principal": "owner", "allow_owner": true}),
+            )
+            .await
+            .unwrap();
+        let inv_id = inv["id"].as_str().unwrap().to_owned();
+        let req = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": inv_id, "public_key": ed25519_public_key_from_seed(&[0xcc; 32]), "name": "z"})
+        );
+        let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
+        let err = match reply {
+            crate::device::enrol::EnrolReply::Err { error, .. } => error,
+            other => panic!("enrol breaking tombstone reserve must be refused, got {other:?}"),
+        };
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{err:?}");
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("device.remove")
+                && hint.contains("ever had")
+                && !hint.to_ascii_lowercase().contains("tidy")
+                && !hint.to_ascii_lowercase().contains("prune"),
+            "size error hint must be honest (no tidy/prune, mention device.remove and lifetime fleet bound): {err:?}"
+        );
     }
 }

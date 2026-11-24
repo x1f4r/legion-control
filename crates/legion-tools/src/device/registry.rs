@@ -53,12 +53,28 @@ const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_FUTURE_SKEW: SignedDuration = SignedDuration::from_mins(10);
 
 /// Hard byte limit for `devices.toml` (matches `config.write`'s 1 MiB document cap). Any change
-/// whose serialized `devices.toml` would exceed this is refused BEFORE saving so a node never
-/// writes a file that can no longer be pushed across the fleet.
+/// that adds or alters a live entry must fit within this limit with every live entry counted at
+/// [`WORST_CASE_TOMBSTONE_BYTES`], so removing every live device always fits by construction.
+/// Pure tombstone saves and merges (which only turn live entries into tombstones or add
+/// tombstones) are never refused for size.
 pub const MAX_DEVICES_TOML_BYTES: usize = 1024 * 1024;
 
-/// Half of [`MAX_DEVICES_TOML_BYTES`] (512 KiB). Once `devices.toml` would exceed this size,
-/// non-owner callers cannot enrol or remove devices until an owner tidies up.
+/// Worst-case serialized byte footprint of a single `[removed.<id>]` tombstone entry in
+/// `devices.toml`, derived from the exact TOML format and enforced maximum field lengths:
+/// 32-hex pairing id, `name` (128 bytes), `principal` (128 ASCII chars), `SHA256:` Ed25519
+/// fingerprint (50 ASCII chars), RFC 3339 nanosecond timestamps (`paired_at` / `removed_at`, 30
+/// chars each), `NodeName` (`paired_on` / `removed_on`, 63 chars each), and `paired_by` /
+/// `removed_by` (128-char principal + 32-hex device each) = 1,049 bytes.
+pub const WORST_CASE_TOMBSTONE_BYTES: usize = 1049;
+
+/// Guaranteed minimum number of devices (live + removed over the lifetime of a fleet) that fit
+/// within [`MAX_DEVICES_TOML_BYTES`] even at maximum field lengths.
+pub const MIN_GUARANTEED_FLEET_DEVICES: usize = MAX_DEVICES_TOML_BYTES / WORST_CASE_TOMBSTONE_BYTES;
+
+/// Half of [`MAX_DEVICES_TOML_BYTES`] (512 KiB). Once `devices.toml` (including the worst-case
+/// tombstone reserve for live entries) would exceed this size, non-owner callers cannot enrol or
+/// remove devices; owner callers remain able to add within the 1 MiB reserve and remove without
+/// size restriction.
 pub const NON_OWNER_DEVICES_TOML_LIMIT_BYTES: usize = MAX_DEVICES_TOML_BYTES / 2;
 
 /// Maximum number of concurrent pending pairing invites a non-owner principal may hold.
@@ -181,31 +197,33 @@ pub fn inspect_rollback_failures(paths: &Paths) -> Vec<RollbackFailureRecord> {
     }
 }
 
-/// Error returned when a change would make `devices.toml` exceed [`MAX_DEVICES_TOML_BYTES`].
-pub fn devices_size_limit_error(bytes: usize) -> ErrorBody {
+/// Error returned when a change adding or altering a live device would make `devices.toml`
+/// (including the worst-case tombstone reserve for live entries) exceed
+/// [`MAX_DEVICES_TOML_BYTES`].
+pub fn devices_size_limit_error(reserved_bytes: usize) -> ErrorBody {
     ErrorBody::new(
         ErrorCode::InvalidArgs,
         format!(
-            "devices.toml would be {bytes} bytes, exceeding the {MAX_DEVICES_TOML_BYTES}-byte (1 MiB) configuration limit."
+            "devices.toml would require {reserved_bytes} bytes (including tombstone reserve for live devices), exceeding the {MAX_DEVICES_TOML_BYTES}-byte (1 MiB) configuration limit."
         ),
     )
-    .with_hint(
-        "Tombstones in devices.toml are permanent so removed devices cannot return and quarantine cannot be lifted; keep the fleet registry below 1 MiB or tidy obsolete entries as owner.",
-    )
+    .with_hint(format!(
+        "Tombstones in devices.toml are permanent so removed devices cannot return and quarantine cannot be lifted; the 1 MiB limit bounds how many devices a fleet has ever had (at least {MIN_GUARANTEED_FLEET_DEVICES} devices even at maximum field lengths). An owner can still remove existing devices with `legion device.remove`, which is never blocked by size."
+    ))
 }
 
-/// Error returned when a non-owner operation would leave `devices.toml` past
-/// [`NON_OWNER_DEVICES_TOML_LIMIT_BYTES`].
-pub fn non_owner_devices_half_limit_error(action: &str, bytes: usize) -> ErrorBody {
+/// Error returned when a non-owner operation would leave `devices.toml` (including the worst-case
+/// tombstone reserve for live entries) past [`NON_OWNER_DEVICES_TOML_LIMIT_BYTES`].
+pub fn non_owner_devices_half_limit_error(action: &str, reserved_bytes: usize) -> ErrorBody {
     ErrorBody::new(
         ErrorCode::Denied,
         format!(
-            "Cannot {action}: devices.toml would be {bytes} bytes, past the {NON_OWNER_DEVICES_TOML_LIMIT_BYTES}-byte (512 KiB) non-owner limit."
+            "Cannot {action}: devices.toml would require {reserved_bytes} bytes (including tombstone reserve for live devices), past the {NON_OWNER_DEVICES_TOML_LIMIT_BYTES}-byte (512 KiB) non-owner limit."
         ),
     )
-    .with_hint(
-        "An owner must tidy up devices.toml before non-owner callers can enrol or remove devices.",
-    )
+    .with_hint(format!(
+        "Tombstones in devices.toml are permanent and the 1 MiB limit bounds how many devices a fleet has ever had (at least {MIN_GUARANTEED_FLEET_DEVICES} devices at maximum field lengths). Only an owner may add devices up to the 1 MiB reserve or remove devices with `legion device.remove` (never blocked by size for an owner)."
+    ))
 }
 
 /// Fleet-wide paired device registry (`devices.toml`), stored beside `policy.toml`.
@@ -598,6 +616,102 @@ impl Document for DevicesFile {
     }
 }
 
+fn build_live_device_table(dev: &FleetDevice) -> Table {
+    let mut t = Table::new();
+    t["name"] = value(dev.name.as_str());
+    t["public_key"] = value(dev.public_key.as_str());
+    t["principal"] = value(dev.principal.as_str());
+    if let Some(role) = &dev.role {
+        t["role"] = value(role.as_str());
+    }
+    t["paired_at"] = value(dev.paired_at.as_str());
+    t["paired_on"] = value(dev.paired_on.as_str());
+    if let Some(paired_by) = &dev.paired_by {
+        let mut inline = InlineTable::new();
+        inline.insert("principal", paired_by.principal.as_str().into());
+        if let Some(dev_id) = &paired_by.device {
+            inline.insert("device", dev_id.as_str().into());
+        }
+        t["paired_by"] = value(inline);
+    }
+    if let Some(confirmed_by) = &dev.confirmed_by {
+        t["confirmed_by"] = value(confirmed_by.as_str());
+    }
+    if let Some(confirmed_at) = &dev.confirmed_at {
+        t["confirmed_at"] = value(confirmed_at.as_str());
+    }
+    t["updated_at"] = value(dev.updated_at.as_str());
+    t["updated_on"] = value(dev.updated_on.as_str());
+    t["name_updated_at"] = value(dev.name_updated_at.as_str());
+    t["name_updated_on"] = value(dev.name_updated_on.as_str());
+    t["role_updated_at"] = value(dev.role_updated_at.as_str());
+    t["role_updated_on"] = value(dev.role_updated_on.as_str());
+    if dev.conflict {
+        t["conflict"] = value(true);
+    }
+    t
+}
+
+/// Serialized byte length of a single `[devices.<id>]` entry as emitted by
+/// [`DevicesFile::to_toml_string`] (including its leading blank-line separator).
+fn serialized_live_entry_bytes(id: &str, dev: &FleetDevice) -> usize {
+    let mut doc = DocumentMut::new();
+    doc["version"] = value(i64::from(DEVICES_VERSION));
+    let mut devices_table = Table::new();
+    devices_table.set_implicit(true);
+    devices_table.insert(id, Item::Table(build_live_device_table(dev)));
+    doc.insert("devices", Item::Table(devices_table));
+    let mut text = doc.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.len().saturating_sub("version = 1\n".len())
+}
+
+/// Computes the serialized byte budget of `devices` with every live entry counted at the greater
+/// of its actual serialized size and [`WORST_CASE_TOMBSTONE_BYTES`].
+///
+/// Whenever `devices_reserved_bytes(devices) <= MAX_DEVICES_TOML_BYTES`, BOTH the current file
+/// AND the file after turning every live entry into a worst-case tombstone fit under 1 MiB.
+pub fn devices_reserved_bytes(devices: &DevicesFile) -> usize {
+    let actual = devices.to_toml_string().len();
+    if devices.devices.is_empty() {
+        return actual;
+    }
+    let mut reserve_extra = 0usize;
+    for (id, dev) in &devices.devices {
+        let entry_bytes = serialized_live_entry_bytes(id, dev);
+        if WORST_CASE_TOMBSTONE_BYTES > entry_bytes {
+            reserve_extra = reserve_extra.saturating_add(WORST_CASE_TOMBSTONE_BYTES - entry_bytes);
+        }
+    }
+    actual.saturating_add(reserve_extra)
+}
+
+/// Returns `true` when transitioning from `previous` to `next` neither adds a new live device
+/// nor alters any existing live device — i.e. its only effect is turning live entries into
+/// tombstones or adding/merging tombstones.
+pub fn is_tombstone_only_change(previous: Option<&DevicesFile>, next: &DevicesFile) -> bool {
+    match previous {
+        Some(prev) => next
+            .devices
+            .iter()
+            .all(|(id, entry)| prev.devices.get(id) == Some(entry)),
+        None => next.devices.is_empty(),
+    }
+}
+
+/// Size-enforcement policy for [`save_devices_locked_with_policy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveSizePolicy {
+    /// Enforce [`MAX_DEVICES_TOML_BYTES`] against [`devices_reserved_bytes`] (used for any change
+    /// that adds or alters a live entry).
+    CheckReserve,
+    /// Skip the 1 MiB size limit (used ONLY when the change is purely turning live entries into
+    /// tombstones or adding tombstones).
+    AllowTombstoneOnly,
+}
+
 impl DevicesFile {
     /// Returns `true` when there are neither live devices nor tombstones.
     pub fn is_empty(&self) -> bool {
@@ -614,39 +728,7 @@ impl DevicesFile {
             let mut devices_table = Table::new();
             devices_table.set_implicit(true);
             for (id, dev) in &self.devices {
-                let mut t = Table::new();
-                t["name"] = value(dev.name.as_str());
-                t["public_key"] = value(dev.public_key.as_str());
-                t["principal"] = value(dev.principal.as_str());
-                if let Some(role) = &dev.role {
-                    t["role"] = value(role.as_str());
-                }
-                t["paired_at"] = value(dev.paired_at.as_str());
-                t["paired_on"] = value(dev.paired_on.as_str());
-                if let Some(paired_by) = &dev.paired_by {
-                    let mut inline = InlineTable::new();
-                    inline.insert("principal", paired_by.principal.as_str().into());
-                    if let Some(dev_id) = &paired_by.device {
-                        inline.insert("device", dev_id.as_str().into());
-                    }
-                    t["paired_by"] = value(inline);
-                }
-                if let Some(confirmed_by) = &dev.confirmed_by {
-                    t["confirmed_by"] = value(confirmed_by.as_str());
-                }
-                if let Some(confirmed_at) = &dev.confirmed_at {
-                    t["confirmed_at"] = value(confirmed_at.as_str());
-                }
-                t["updated_at"] = value(dev.updated_at.as_str());
-                t["updated_on"] = value(dev.updated_on.as_str());
-                t["name_updated_at"] = value(dev.name_updated_at.as_str());
-                t["name_updated_on"] = value(dev.name_updated_on.as_str());
-                t["role_updated_at"] = value(dev.role_updated_at.as_str());
-                t["role_updated_on"] = value(dev.role_updated_on.as_str());
-                if dev.conflict {
-                    t["conflict"] = value(true);
-                }
-                devices_table.insert(id, Item::Table(t));
+                devices_table.insert(id, Item::Table(build_live_device_table(dev)));
             }
             doc.insert("devices", Item::Table(devices_table));
         }
@@ -1279,13 +1361,27 @@ pub fn load_devices_raw(paths: &Paths) -> Result<Option<DevicesFile>, ErrorBody>
     }
 }
 
-/// Validates, backs up, and atomically writes `config/devices.toml`. Caller must hold
-/// [`lock_config`]. Returns the canonical TOML text written.
+/// Validates, backs up, and atomically writes `config/devices.toml`, enforcing the 1 MiB limit
+/// with worst-case tombstone reserve for every live entry. Caller must hold [`lock_config`].
+/// Returns the canonical TOML text written.
 pub fn save_devices_locked(paths: &Paths, devices: &DevicesFile) -> Result<String, ErrorBody> {
+    save_devices_locked_with_policy(paths, devices, SaveSizePolicy::CheckReserve)
+}
+
+/// Validates, backs up, and atomically writes `config/devices.toml` under `size_policy`. Caller
+/// must hold [`lock_config`]. Returns the canonical TOML text written.
+pub fn save_devices_locked_with_policy(
+    paths: &Paths,
+    devices: &DevicesFile,
+    size_policy: SaveSizePolicy,
+) -> Result<String, ErrorBody> {
     let target = paths.config_file(DevicesFile::FILE);
     let text = devices.to_toml_string();
-    if text.len() > MAX_DEVICES_TOML_BYTES {
-        return Err(devices_size_limit_error(text.len()));
+    if size_policy == SaveSizePolicy::CheckReserve {
+        let reserved = devices_reserved_bytes(devices);
+        if reserved > MAX_DEVICES_TOML_BYTES {
+            return Err(devices_size_limit_error(reserved));
+        }
     }
     parse::<DevicesFile>(&target, text.as_bytes())?;
 
@@ -3041,7 +3137,15 @@ pub fn apply_devices_merge_blocking(
         .collect();
 
     // Write `devices.toml` FIRST (tombstone first, then policy and authorized_keys).
-    let canonical = save_devices_locked(paths, &merged).map_err(MergeApplyError::BeforeSave)?;
+    // A merge whose only effect is turning live entries into tombstones or adding tombstones is
+    // NEVER refused for size.
+    let size_policy = if is_tombstone_only_change(Some(&local), &merged) {
+        SaveSizePolicy::AllowTombstoneOnly
+    } else {
+        SaveSizePolicy::CheckReserve
+    };
+    let canonical = save_devices_locked_with_policy(paths, &merged, size_policy)
+        .map_err(MergeApplyError::BeforeSave)?;
     let backup = had_existing_file.then(|| {
         paths
             .state_dir()
@@ -4632,5 +4736,99 @@ device = \"{id_victim}\"
             original,
             "existing devices.toml on disk must stay untouched when >1 MiB save is refused"
         );
+    }
+
+    #[test]
+    fn worst_case_tombstone_reserve_bounds_all_max_field_removals() {
+        // Construct a single tombstone with every field at its maximum enforced length.
+        let max_id = "f".repeat(32);
+        let max_tomb = DeviceTombstone {
+            name: "a".repeat(128),
+            principal: "p".repeat(128),
+            fingerprint: Some(format!("SHA256:{}", "A".repeat(43))),
+            paired_at: Some("9999-12-30T21:59:59.999999999Z".to_owned()),
+            paired_on: Some("n".repeat(63)),
+            paired_by: Some(PairedBy {
+                principal: "c".repeat(128),
+                device: Some("d".repeat(32)),
+            }),
+            removed_by: Some(PairedBy {
+                principal: "r".repeat(128),
+                device: Some("e".repeat(32)),
+            }),
+            removed_at: "9999-12-30T21:59:59.999999999Z".to_owned(),
+            removed_on: "m".repeat(63),
+        };
+        let mut one = DevicesFile::default();
+        one.removed.insert(max_id.clone(), max_tomb.clone());
+        parse::<DevicesFile>(Path::new("devices.toml"), one.to_toml_string().as_bytes())
+            .expect("worst-case tombstone must parse and validate cleanly");
+        let single_entry_bytes = one.to_toml_string().len() - "version = 1\n".len();
+        assert!(
+            single_entry_bytes <= WORST_CASE_TOMBSTONE_BYTES,
+            "single max-field tombstone is {single_entry_bytes} bytes, exceeding WORST_CASE_TOMBSTONE_BYTES ({WORST_CASE_TOMBSTONE_BYTES})"
+        );
+
+        // Fill a DevicesFile with live devices up to the reserve ceiling; turning EVERY live
+        // device into a worst-case max-field tombstone MUST still fit under MAX_DEVICES_TOML_BYTES!
+        let mut live_full = DevicesFile::default();
+        let max_live_count =
+            (MAX_DEVICES_TOML_BYTES - "version = 1\n".len()) / WORST_CASE_TOMBSTONE_BYTES;
+        for idx in 0..max_live_count {
+            let id = format!("{idx:032x}");
+            let mut dev = sample_device((idx % 250) as u8, "a", None, "2026-11-24T10:00:00Z", "a");
+            dev.principal = "owner".to_owned();
+            live_full.devices.insert(id, dev);
+        }
+        assert!(
+            devices_reserved_bytes(&live_full) <= MAX_DEVICES_TOML_BYTES,
+            "reserved={} > max={MAX_DEVICES_TOML_BYTES}",
+            devices_reserved_bytes(&live_full)
+        );
+        // Adding one more live device pushes reserved over MAX_DEVICES_TOML_BYTES even though raw
+        // bytes are way under 1 MiB.
+        let mut one_over = live_full.clone();
+        let mut extra = sample_device(251, "b", None, "2026-11-24T10:00:00Z", "a");
+        extra.principal = "owner".to_owned();
+        one_over
+            .devices
+            .insert(format!("{:032x}", max_live_count), extra);
+        assert!(one_over.to_toml_string().len() < MAX_DEVICES_TOML_BYTES);
+        assert!(devices_reserved_bytes(&one_over) > MAX_DEVICES_TOML_BYTES);
+
+        // Turn every live entry in `live_full` into a max-field tombstone -> raw size <= 1 MiB!
+        let mut all_tombstoned = DevicesFile::default();
+        for id in live_full.devices.keys() {
+            all_tombstoned.removed.insert(id.clone(), max_tomb.clone());
+        }
+        assert!(
+            all_tombstoned.to_toml_string().len() <= MAX_DEVICES_TOML_BYTES,
+            "turning all live devices into worst-case tombstones produced {} bytes > {MAX_DEVICES_TOML_BYTES}",
+            all_tombstoned.to_toml_string().len()
+        );
+
+        // Verify `is_tombstone_only_change` classification.
+        assert!(is_tombstone_only_change(Some(&live_full), &all_tombstoned));
+        assert!(!is_tombstone_only_change(Some(&live_full), &one_over));
+        assert!(is_tombstone_only_change(None, &all_tombstoned));
+        assert!(!is_tombstone_only_change(None, &live_full));
+
+        // Verify size-limit error hints never mention pruning or tidying, and name device.remove
+        // and the guaranteed fleet device count.
+        let count_str = MIN_GUARANTEED_FLEET_DEVICES.to_string();
+        for err in [
+            devices_size_limit_error(MAX_DEVICES_TOML_BYTES + 1),
+            non_owner_devices_half_limit_error("enrol", NON_OWNER_DEVICES_TOML_LIMIT_BYTES + 1),
+        ] {
+            let hint = err.hint.as_deref().unwrap_or("");
+            assert!(
+                hint.contains("device.remove")
+                    && hint.contains(&count_str)
+                    && hint.contains("ever had")
+                    && !hint.to_ascii_lowercase().contains("tidy")
+                    && !hint.to_ascii_lowercase().contains("prune"),
+                "unexpected size-limit hint: {err:?}"
+            );
+        }
     }
 }

@@ -267,7 +267,12 @@ impl SharedDocument {
         is_builtin: &dyn Fn(&str) -> bool,
     ) -> Result<(), ErrorBody> {
         if content.len() > MAX_DOCUMENT_BYTES {
-            let err = ErrorBody::new(
+            if *self == Self::Devices {
+                return Err(legion_tools::device::registry::devices_size_limit_error(
+                    content.len(),
+                ));
+            }
+            return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
                 format!(
                     "{} exceeds the {} byte configuration limit ({} bytes given).",
@@ -275,14 +280,7 @@ impl SharedDocument {
                     MAX_DOCUMENT_BYTES,
                     content.len()
                 ),
-            );
-            return Err(if *self == Self::Devices {
-                err.with_hint(
-                    "Tombstones in devices.toml are permanent so removed devices cannot return; inspect devices.toml for unexpectedly large or corrupted entries.",
-                )
-            } else {
-                err
-            });
+            ));
         }
         match self {
             Self::Devices => {
@@ -825,16 +823,14 @@ async fn apply_local_write(
                 "Run `config.write devices.toml` as the owner, or manage paired devices through `device.invite`, `device.set`, and `device.remove`.",
             ));
         }
-        if content.len() > MAX_DOCUMENT_BYTES {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!(
-                    "devices.toml exceeds the {MAX_DOCUMENT_BYTES} byte configuration limit ({} bytes given).",
-                    content.len()
-                ),
-            )
-            .with_hint(
-                "Tombstones in devices.toml are permanent so removed devices cannot return; inspect devices.toml for unexpectedly large or corrupted entries.",
+        // Bound raw incoming parse size to protect memory, while allowing valid tombstone-only
+        // `devices.toml` payloads slightly above 1 MiB to reach the merge (which never refuses
+        // tombstone-only changes for size, and still enforces the 1 MiB tombstone-reserve limit
+        // whenever any live entry is added or modified).
+        const MAX_DEVICES_PARSE_BYTES: usize = MAX_DOCUMENT_BYTES * 4;
+        if content.len() > MAX_DEVICES_PARSE_BYTES {
+            return Err(legion_tools::device::registry::devices_size_limit_error(
+                content.len(),
             ));
         }
         if let Some(ref expected) = expect_hash {
@@ -847,7 +843,15 @@ async fn apply_local_write(
             })?;
         }
         let target = doc.config_path(ctx.paths().config_dir());
-        let incoming = parse::<DevicesFile>(&target, content.as_bytes())?;
+        let incoming = match parse::<DevicesFile>(&target, content.as_bytes()) {
+            Ok(parsed) => parsed,
+            Err(_) if content.len() > MAX_DOCUMENT_BYTES => {
+                return Err(legion_tools::device::registry::devices_size_limit_error(
+                    content.len(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let node_file = ctx.config().get::<NodeFile>()?;
         let paths = ctx.paths().clone();
         let paths_for_sessions = paths.clone();
@@ -3915,10 +3919,10 @@ role = \"phone_admin\"
         assert_eq!(err.code, ErrorCode::InvalidArgs);
         assert!(
             err.message.contains("configuration limit")
-                && err
-                    .hint
-                    .as_deref()
-                    .is_some_and(|h| h.contains("permanent") && !h.contains("prune_tombstones")),
+                && err.hint.as_deref().is_some_and(|h| h.contains("permanent")
+                    && h.contains("device.remove")
+                    && !h.to_ascii_lowercase().contains("prune")
+                    && !h.to_ascii_lowercase().contains("tidy")),
             "expected clear permanent-tombstone size limit error: {err:?}"
         );
     }
@@ -4697,5 +4701,239 @@ role = \"ops\"
             "local confirmation must be cleared when incoming entry changes public_key: {dev2:?}"
         );
         assert_eq!(dev2.confirmed_at, None);
+    }
+
+    #[tokio::test]
+    async fn f2_tombstone_only_merge_into_near_full_peer_succeeds_and_live_addition_breaking_reserve_is_refused()
+     {
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{DeviceTombstone, FleetDevice, PairedBy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(paths.config_file("policy.toml"), "default = \"owner\"\n").unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        let ts = "2026-11-24T10:00:00Z";
+        let live_id = "aa".repeat(16);
+        let unseen_id = "cc".repeat(16);
+        let make_tomb = |idx: u32, pad_len: usize| DeviceTombstone {
+            name: format!("d{idx:04}-{}", "p".repeat(pad_len)),
+            principal: "owner".to_owned(),
+            fingerprint: Some("SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            paired_at: Some(ts.to_owned()),
+            paired_on: Some("box-a".to_owned()),
+            paired_by: None,
+            removed_by: None,
+            removed_at: ts.to_owned(),
+            removed_on: "box-a".to_owned(),
+        };
+
+        // 1. Seed peer right under 1 MiB with live device `x`.
+        let per_tomb = {
+            let mut one = DevicesFile::default();
+            one.removed
+                .insert(format!("f{:031x}", 0u32), make_tomb(0, 100));
+            one.to_toml_string().len() - "version = 1\n".len()
+        };
+        let mut near_full = DevicesFile::default();
+        near_full.devices.insert(
+            live_id.clone(),
+            FleetDevice {
+                name: "x".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0xaa; 32]),
+                principal: "owner".to_owned(),
+                role: None,
+                paired_at: ts.to_owned(),
+                paired_on: "a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: ts.to_owned(),
+                updated_on: "a".to_owned(),
+                name_updated_at: ts.to_owned(),
+                name_updated_on: "a".to_owned(),
+                role_updated_at: ts.to_owned(),
+                role_updated_on: "a".to_owned(),
+                conflict: false,
+            },
+        );
+        let init_count = ((MAX_DOCUMENT_BYTES - 2500) / per_tomb) as u32;
+        for i in 0..init_count {
+            near_full
+                .removed
+                .insert(format!("f{i:031x}"), make_tomb(i, 100));
+        }
+        let mut idx = init_count;
+        loop {
+            let mut probe = near_full.clone();
+            probe
+                .removed
+                .insert(format!("f{idx:031x}"), make_tomb(idx, 100));
+            if probe.to_toml_string().len() > MAX_DOCUMENT_BYTES - 600 {
+                break;
+            }
+            near_full = probe;
+            idx += 1;
+        }
+        let make_bare_tomb = |i: u32, pad: usize| DeviceTombstone {
+            name: format!("b{i:04}-{}", "p".repeat(pad)),
+            principal: "owner".to_owned(),
+            fingerprint: None,
+            paired_at: None,
+            paired_on: None,
+            paired_by: None,
+            removed_by: None,
+            removed_at: ts.to_owned(),
+            removed_on: "a".to_owned(),
+        };
+        let bare_len = {
+            let mut probe = near_full.clone();
+            probe
+                .removed
+                .insert(format!("f{idx:031x}"), make_bare_tomb(idx, 0));
+            probe.to_toml_string().len() - near_full.to_toml_string().len()
+        };
+        while MAX_DOCUMENT_BYTES - near_full.to_toml_string().len() > bare_len + 115 {
+            near_full
+                .removed
+                .insert(format!("f{idx:031x}"), make_bare_tomb(idx, 10));
+            idx += 1;
+        }
+        let remaining = MAX_DOCUMENT_BYTES - near_full.to_toml_string().len();
+        if remaining > bare_len + 10 {
+            let pad = (remaining - bare_len - 10).min(115);
+            near_full
+                .removed
+                .insert(format!("f{idx:031x}"), make_bare_tomb(idx, pad));
+        }
+        std::fs::write(
+            paths.config_file("devices.toml"),
+            near_full.to_toml_string(),
+        )
+        .unwrap();
+
+        // Tombstone-only merge turning `x` into a larger tombstone AND adding an unseen tombstone
+        // pushes merged bytes strictly > 1 MiB and MUST SUCCEED.
+        let mut tomb_only = DevicesFile::default();
+        tomb_only.removed.insert(
+            live_id.clone(),
+            DeviceTombstone {
+                name: "x".to_owned(),
+                principal: "owner".to_owned(),
+                fingerprint: None,
+                paired_at: None,
+                paired_on: None,
+                paired_by: None,
+                removed_by: Some(PairedBy {
+                    principal: format!("owner-{}", "o".repeat(120)),
+                    device: Some("bb".repeat(16)),
+                }),
+                removed_at: "2026-11-24T10:05:00Z".to_owned(),
+                removed_on: "n".repeat(63),
+            },
+        );
+        tomb_only
+            .removed
+            .insert(unseen_id.clone(), make_tomb(9999, 80));
+
+        node.call(Call::new(
+            Door::Cli,
+            "config.write",
+            json!({
+                "document": "devices.toml",
+                "content": tomb_only.to_toml_string(),
+            }),
+        ))
+        .await
+        .expect("tombstone-only merge into near-full peer MUST never be refused for size");
+
+        let after_bytes = std::fs::read(paths.config_file("devices.toml")).unwrap();
+        assert!(
+            after_bytes.len() > MAX_DOCUMENT_BYTES,
+            "merged tombstone file should exceed 1 MiB (got {})",
+            after_bytes.len()
+        );
+        let after: DevicesFile = parse(&paths.config_file("devices.toml"), &after_bytes).unwrap();
+        assert!(after.devices.is_empty());
+        assert!(after.removed.contains_key(&live_id));
+        assert!(after.removed.contains_key(&unseen_id));
+
+        // 2. Seed peer with ~700 bytes of raw headroom (< worst-case tombstone reserve, > actual
+        //    live entry bytes): adding a live entry via config.write MUST be refused!
+        let mut reserve_peer = DevicesFile::default();
+        let reserve_init = ((MAX_DOCUMENT_BYTES - 2500) / per_tomb) as u32;
+        for i in 0..reserve_init {
+            reserve_peer
+                .removed
+                .insert(format!("e{i:031x}"), make_tomb(i, 100));
+        }
+        let mut r_idx = reserve_init;
+        loop {
+            let mut probe = reserve_peer.clone();
+            probe
+                .removed
+                .insert(format!("e{r_idx:031x}"), make_tomb(r_idx, 100));
+            if probe.to_toml_string().len() > MAX_DOCUMENT_BYTES - 650 {
+                break;
+            }
+            reserve_peer = probe;
+            r_idx += 1;
+        }
+        std::fs::write(
+            paths.config_file("devices.toml"),
+            reserve_peer.to_toml_string(),
+        )
+        .unwrap();
+
+        let mut add_live = DevicesFile::default();
+        add_live.devices.insert(
+            "dd".repeat(16),
+            FleetDevice {
+                name: "z".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0xdd; 32]),
+                principal: "owner".to_owned(),
+                role: None,
+                paired_at: ts.to_owned(),
+                paired_on: "a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: ts.to_owned(),
+                updated_on: "a".to_owned(),
+                name_updated_at: ts.to_owned(),
+                name_updated_on: "a".to_owned(),
+                role_updated_at: ts.to_owned(),
+                role_updated_on: "a".to_owned(),
+                conflict: false,
+            },
+        );
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({
+                    "document": "devices.toml",
+                    "content": add_live.to_toml_string(),
+                }),
+            ))
+            .await
+            .expect_err("adding a live entry that breaks tombstone reserve MUST fail");
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{err:?}");
     }
 }

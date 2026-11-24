@@ -27,10 +27,10 @@ use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_inv
 use super::registry::{
     DeviceRegistryPushAudit, DevicesFile, FleetDevice, FleetPushOutcome, MAX_DEVICES_TOML_BYTES,
     NON_OWNER_DEVICES_TOML_LIMIT_BYTES, PairedBy, adopt_legacy_devices_from_auth_keys,
-    attach_rollback_failures, devices_size_limit_error, format_precise_rfc3339, load_devices_raw,
-    lock_config, non_owner_devices_half_limit_error, push_devices_to_fleet,
-    reconcile_authorized_keys_in_memory, restore_file_snapshot, save_devices_locked,
-    upsert_device_principal_locked,
+    attach_rollback_failures, devices_reserved_bytes, devices_size_limit_error,
+    format_precise_rfc3339, load_devices_raw, lock_config, non_owner_devices_half_limit_error,
+    push_devices_to_fleet, reconcile_authorized_keys_in_memory, restore_file_snapshot,
+    save_devices_locked, upsert_device_principal_locked,
 };
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
@@ -671,18 +671,18 @@ fn process_enrol_blocking(
         },
     );
 
-    let resulting_bytes = devices.to_toml_string().len();
-    if resulting_bytes > MAX_DEVICES_TOML_BYTES {
-        return fail_with_sweep(Some(principal), devices_size_limit_error(resulting_bytes));
+    let reserved_bytes = devices_reserved_bytes(&devices);
+    if reserved_bytes > MAX_DEVICES_TOML_BYTES {
+        return fail_with_sweep(Some(principal), devices_size_limit_error(reserved_bytes));
     }
     let creator_is_owner = match invite.created_by.as_deref() {
         Some(creator) => policy.role_of(creator).0 == OWNER,
         None => true,
     };
-    if !creator_is_owner && resulting_bytes > NON_OWNER_DEVICES_TOML_LIMIT_BYTES {
+    if !creator_is_owner && reserved_bytes > NON_OWNER_DEVICES_TOML_LIMIT_BYTES {
         return fail_with_sweep(
             Some(principal),
-            non_owner_devices_half_limit_error("enrol a new device", resulting_bytes),
+            non_owner_devices_half_limit_error("enrol a new device", reserved_bytes),
         );
     }
 
