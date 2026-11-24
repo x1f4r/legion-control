@@ -360,7 +360,7 @@ pub struct ActionResult {
 }
 
 /// Start of a log window: an RFC 3339 timestamp or a positive duration in seconds.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum SinceArg {
     /// Duration in seconds before now, such as `300` for the last five minutes.
@@ -382,9 +382,10 @@ struct LogsArgs {
     #[serde(default = "default_logs_limit")]
     #[schemars(range(min = 1, max = 2000))]
     lines: u32,
-    /// Start of the log window: an RFC 3339 timestamp (such as `2026-11-23T22:00:00Z`) or a
-    /// positive duration in seconds (such as `300`).
+    /// Start of the log window: an RFC 3339 UTC timestamp (such as `2026-11-23T22:00:00Z`) or a
+    /// positive duration in seconds (such as `"300"` or `300`).
     #[serde(default)]
+    #[schemars(with = "Option<String>")]
     since: Option<SinceArg>,
 }
 

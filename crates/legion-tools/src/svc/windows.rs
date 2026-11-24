@@ -210,12 +210,17 @@ pub(crate) fn control_cmd(name: &str, action: Action) -> CmdSpec {
 }
 
 /// Builds the PowerShell command for best-effort event log lookup via `Get-WinEvent`.
+///
+/// Caps both the number of returned events (`-MaxEvents`) and each event's `Message` length inside
+/// PowerShell before `ConvertTo-Json`, so large event logs cannot overflow the capture buffer and
+/// break JSON parsing.
 pub(crate) fn logs_cmd(name: &str, lines: usize, since: Option<Timestamp>) -> CmdSpec {
     const SCRIPT: &str = "\
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); \
 $ErrorActionPreference = 'Stop'; \
 $n = $env:LEGION_SVC_NAME; \
 $max = [int]$env:LEGION_SVC_LINES; \
+$msgCap = 2048; \
 $start = if ($env:LEGION_SVC_SINCE) { [DateTimeOffset]::Parse($env:LEGION_SVC_SINCE).UtcDateTime } else { $null }; \
 $f1 = @{ LogName = 'System', 'Application'; ProviderName = $n }; \
 if ($start) { $f1['StartTime'] = $start }; \
@@ -225,19 +230,22 @@ try { \
 } catch { \
   $f2 = @{ LogName = 'System'; ProviderName = 'Service Control Manager' }; \
   if ($start) { $f2['StartTime'] = $start }; \
+  $scan = [Math]::Min($max * 5, 5000); \
   try { \
-    $events = @(Get-WinEvent -FilterHashtable $f2 -MaxEvents ($max * 5) -ErrorAction Stop | \
+    $events = @(Get-WinEvent -FilterHashtable $f2 -MaxEvents $scan -ErrorAction Stop | \
       Where-Object { $_.Message -and $_.Message.IndexOf($n, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | \
       Select-Object -First $max) \
   } catch { $events = @() } \
 }; \
 $events | ForEach-Object { \
+  $msg = if ($_.Message) { ($_.Message -replace '[\\r\\n]+', ' ').Trim() } else { '' }; \
+  if ($msg.Length -gt $msgCap) { $msg = $msg.Substring(0, $msgCap) + ' ... [truncated]' }; \
   [PSCustomObject]@{ \
     TimeCreated = $_.TimeCreated.ToUniversalTime().ToString('o'); \
     Level = $_.LevelDisplayName; \
     Provider = $_.ProviderName; \
     Id = $_.Id; \
-    Message = $_.Message \
+    Message = $msg \
   } \
 } | ConvertTo-Json -Compress";
     let mut cmd = ps_cmd(SCRIPT)
@@ -437,10 +445,18 @@ pub(crate) fn parse_event_log_json(
         });
     }
     let parsed: OneOrMany<PsEventRow> = serde_json::from_str(trimmed).map_err(|error| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("Could not parse Windows Event Log JSON: {error}."),
-        )
+        if stream_truncated {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                "Windows Event Log output exceeded the capture limit before JSON finished.",
+            )
+            .with_hint("Ask for fewer `lines` or pass a narrower `since` window.")
+        } else {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Could not parse Windows Event Log JSON: {error}."),
+            )
+        }
     })?;
     let mut rows = parsed.into_vec();
     let mut truncated = stream_truncated;
@@ -645,6 +661,8 @@ mod tests {
         let ts: Timestamp = "2026-11-23T22:00:00Z".parse().unwrap();
         let logs = logs_cmd("Spooler", 25, Some(ts));
         assert!(logs.args[3].contains("Get-WinEvent"));
+        assert!(logs.args[3].contains("-MaxEvents"));
+        assert!(logs.args[3].contains("$msg.Substring(0, $msgCap)"));
         assert!(logs.env.contains(&(
             "LEGION_SVC_SINCE".to_owned(),
             "2026-11-23T22:00:00Z".to_owned()

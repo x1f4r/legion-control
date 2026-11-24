@@ -111,18 +111,23 @@ impl Backend for Systemd {
         since: Option<Timestamp>,
     ) -> BoxFuture<'a, Result<BackendLogs, ErrorBody>> {
         Box::pin(async move {
-            // Ask for one extra line so we can tell whether older entries were omitted.
+            // Ask for one extra entry so we can tell whether older entries were omitted.
             let ask = lines.saturating_add(1);
             let cmd = logs_cmd(name, scope, ask, since);
             let out = run_cmd(ctx, &cmd, QUERY_TIMEOUT, LOGS_CAPTURE_LIMIT).await?;
             if !out.success() {
                 return Err(classify_journal_error(&out.stderr.text, scope, name));
             }
-            Ok(parse_journal_lines(
-                &out.stdout.text,
-                lines,
-                out.stdout.truncated,
-            ))
+            let parsed = parse_journal_json(&out.stdout.text, lines, out.stdout.truncated);
+            // A user outside `systemd-journal`/`adm` often gets exit code 0 with no entries and
+            // a permission hint on stderr; report `denied` instead of a misleading empty list.
+            if scope == Scope::System
+                && parsed.lines.is_empty()
+                && is_journal_permission_hint(&out.stderr.text)
+            {
+                return Err(journal_permission_denied(scope, name, &out.stderr.text));
+            }
+            Ok(parsed)
         })
     }
 }
@@ -194,7 +199,10 @@ pub(crate) fn control_cmd(name: &str, scope: Scope, action: Action, use_sudo: bo
     }
 }
 
-/// Builds `journalctl [--user] --no-pager --output=short-iso --utc --unit=<name> -n <n> [--since=@<ts>]`.
+/// Builds `journalctl [--user] --no-pager --output=json --unit=<name> -n <n> [--since=@<ts>]`.
+///
+/// JSON output puts one journal record on each line so multi-line messages stay intact as a
+/// single entry instead of being split and miscounted.
 pub(crate) fn logs_cmd(
     name: &str,
     scope: Scope,
@@ -206,8 +214,7 @@ pub(crate) fn logs_cmd(
         args.push("--user".to_owned());
     }
     args.push("--no-pager".to_owned());
-    args.push("--output=short-iso".to_owned());
-    args.push("--utc".to_owned());
+    args.push("--output=json".to_owned());
     args.push(format!("--unit={name}"));
     args.push("-n".to_owned());
     args.push(lines.to_string());
@@ -496,25 +503,84 @@ pub(crate) fn parse_show(
     })
 }
 
-/// Parses `journalctl` output lines, keeping up to `limit` newest lines.
-pub(crate) fn parse_journal_lines(text: &str, limit: usize, stream_truncated: bool) -> BackendLogs {
-    let mut lines: Vec<String> = text
-        .lines()
-        .map(|line| line.trim_end_matches('\r'))
-        .filter(|line| {
-            !line.is_empty() && *line != "-- No entries --" && *line != "-- Journal begins"
-        })
-        .filter(|line| !line.starts_with("-- Journal begins") && !line.starts_with("-- Boot "))
-        .map(str::to_owned)
-        .collect();
+/// Parses newline-delimited JSON records from `journalctl --output=json`, counting whole entries
+/// rather than raw newlines so multi-line log messages stay intact.
+pub(crate) fn parse_journal_json(text: &str, limit: usize, stream_truncated: bool) -> BackendLogs {
+    let mut entries = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        entries.push(render_journal_entry(&obj));
+    }
 
     let mut truncated = stream_truncated;
-    if lines.len() > limit {
+    if entries.len() > limit {
         truncated = true;
-        let drop_count = lines.len() - limit;
-        lines.drain(..drop_count);
+        let drop_count = entries.len() - limit;
+        entries.drain(..drop_count);
     }
-    BackendLogs { lines, truncated }
+    BackendLogs {
+        lines: entries,
+        truncated,
+    }
+}
+
+fn render_journal_entry(obj: &serde_json::Map<String, Value>) -> String {
+    let ts = obj
+        .get("__REALTIME_TIMESTAMP")
+        .and_then(Value::as_str)
+        .and_then(|us| us.parse::<i64>().ok())
+        .and_then(|us| Timestamp::from_microsecond(us).ok())
+        .map(|ts| ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string());
+
+    let ident = obj
+        .get("SYSLOG_IDENTIFIER")
+        .or_else(|| obj.get("_COMM"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+
+    let pid = obj
+        .get("_PID")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+
+    let msg = match obj.get("MESSAGE") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => {
+            let bytes: Vec<u8> = arr
+                .iter()
+                .filter_map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        _ => String::new(),
+    };
+
+    let mut prefix = String::new();
+    if let Some(ts) = ts {
+        prefix.push_str(&ts);
+    }
+    if let Some(ident) = ident {
+        if !prefix.is_empty() {
+            prefix.push(' ');
+        }
+        prefix.push_str(ident);
+        if let Some(pid) = pid {
+            prefix.push('[');
+            prefix.push_str(pid);
+            prefix.push(']');
+        }
+    }
+    if prefix.is_empty() {
+        msg
+    } else {
+        format!("{prefix}: {msg}")
+    }
 }
 
 /// Converts a systemd timestamp such as `Mon 2026-11-23 22:59:06 UTC` to RFC 3339 UTC.
@@ -643,21 +709,35 @@ pub(crate) fn classify_error(
     ErrorBody::new(ErrorCode::Failed, detail)
 }
 
+/// Whether `journalctl` stderr indicates the caller lacks permission to read system journal
+/// messages (which `journalctl` often prints while still exiting with status 0).
+pub(crate) fn is_journal_permission_hint(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("not seeing messages from other users and the system")
+        || lower.contains("insufficient permissions")
+        || lower.contains("permission denied")
+        || (lower.contains("users in groups") && lower.contains("systemd-journal"))
+}
+
+fn journal_permission_denied(scope: Scope, name: &str, stderr: &str) -> ErrorBody {
+    let trimmed = stderr.trim();
+    ErrorBody::new(
+        ErrorCode::Denied,
+        format!(
+            "Permission denied reading journal logs for {} service {name:?}.",
+            scope.as_str()
+        ),
+    )
+    .with_hint(
+        "Add the account legion runs as to the `systemd-journal` (or `adm`) group to read system service logs.",
+    )
+    .with_details(json!({"stderr": trimmed}))
+}
+
 fn classify_journal_error(stderr: &str, scope: Scope, name: &str) -> ErrorBody {
     let trimmed = stderr.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.contains("insufficient permissions") || lower.contains("permission denied") {
-        return ErrorBody::new(
-            ErrorCode::Denied,
-            format!(
-                "Permission denied reading journal logs for {} service {name:?}.",
-                scope.as_str()
-            ),
-        )
-        .with_hint(
-            "Add the account legion runs as to the `systemd-journal` (or `adm`) group to read system service logs.",
-        )
-        .with_details(json!({"stderr": trimmed}));
+    if is_journal_permission_hint(trimmed) {
+        return journal_permission_denied(scope, name, trimmed);
     }
     if scope == Scope::User && is_missing_user_manager(trimmed) {
         return ErrorBody::new(
@@ -956,14 +1036,40 @@ InvocationID=abc123
     }
 
     #[test]
-    fn parse_journal_lines_handles_no_entries_and_truncation() {
-        let empty = parse_journal_lines("-- No entries --\n", 10, false);
+    fn parse_journal_json_keeps_multiline_entries_intact_and_counts_records() {
+        let empty = parse_journal_json("", 10, false);
         assert!(empty.lines.is_empty());
         assert!(!empty.truncated);
 
-        let sample = "line 1\nline 2\nline 3\n";
-        let cut = parse_journal_lines(sample, 2, false);
-        assert_eq!(cut.lines, ["line 2", "line 3"]);
-        assert!(cut.truncated);
+        // Two JSON records where the first has a three-line message: limit=2 must keep both
+        // entries intact and report truncated=false.
+        let sample = "\
+{\"__REALTIME_TIMESTAMP\":\"1795474746000000\",\"SYSLOG_IDENTIFIER\":\"worker\",\"_PID\":\"42\",\"MESSAGE\":\"line one\\nline two\\nline three\"}
+{\"__REALTIME_TIMESTAMP\":\"1795474747000000\",\"SYSLOG_IDENTIFIER\":\"worker\",\"_PID\":\"42\",\"MESSAGE\":[104,105]}
+";
+        let both = parse_journal_json(sample, 2, false);
+        assert!(!both.truncated);
+        assert_eq!(both.lines.len(), 2);
+        assert!(both.lines[0].contains("worker[42]: line one\nline two\nline three"));
+        assert!(both.lines[1].contains("worker[42]: hi"));
+
+        // Limit=1 drops the older record as a whole and marks truncated=true.
+        let one = parse_journal_json(sample, 1, false);
+        assert!(one.truncated);
+        assert_eq!(one.lines.len(), 1);
+        assert!(one.lines[0].ends_with(": hi"));
+
+        // Journalctl exit-0 stderr permission hint is detected as `denied`.
+        let hint = "Hint: You are currently not seeing messages from other users and the system.\nUsers in groups 'adm', 'systemd-journal', 'wheel' can see all messages.\n";
+        assert!(is_journal_permission_hint(hint));
+        let denied = journal_permission_denied(Scope::System, "nginx.service", hint);
+        assert_eq!(denied.code, ErrorCode::Denied);
+        assert!(
+            denied
+                .hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("systemd-journal")
+        );
     }
 }

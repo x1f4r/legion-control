@@ -29,8 +29,8 @@ pub(crate) const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-stream capture cap for `list` and `status` commands (2 MiB).
 pub(crate) const QUERY_CAPTURE_LIMIT: usize = 2 * 1024 * 1024;
 
-/// Per-stream capture cap for `logs` commands (4 MiB).
-pub(crate) const LOGS_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+/// Per-stream capture cap for `logs` commands (8 MiB, enough for up to 2000 bounded JSON entries).
+pub(crate) const LOGS_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 
 /// A system command ready to run with exact argv (never a shell string) and explicit environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
