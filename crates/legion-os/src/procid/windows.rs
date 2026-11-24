@@ -5,17 +5,13 @@
 //! reuse, and calls `TerminateProcess` through that handle—eliminating bare-PID TOCTOU races.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
-
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::win_proc::{self, TerminateOutcome};
 use crate::{OsError, Result};
 
 use super::{KillTreeReport, ProcessId, is_alive};
 
-const BOOT_ID_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -24,31 +20,11 @@ pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>
 }
 
 pub(super) fn boot_id() -> Result<String> {
-    // Always use one single source and format (`boot-ticks-<ticks>` from Win32_OperatingSystem
-    // LastBootUpTime) with a hard timeout so a stalled WMI service cannot hang a caller and two
-    // incompatible boot-id formats are never mixed. Callers compare with `procid::same_boot`.
-    let mut cmd = std::process::Command::new("powershell.exe");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks",
-    ])
-    .env_remove("PSModulePath")
-    .creation_flags(CREATE_NO_WINDOW.0);
-
-    let stdout = super::run_command_stdout_with_timeout(cmd, BOOT_ID_TIMEOUT, "powershell.exe")?;
-    let ticks = stdout.trim();
-    if !ticks.is_empty()
-        && ticks.bytes().all(|b| b.is_ascii_digit())
-        && ticks.parse::<u64>().is_ok()
-    {
-        return Ok(format!("boot-ticks-{ticks}"));
-    }
-
-    Err(OsError::Platform {
-        detail: format!("unexpected Windows LastBootUpTime output: {ticks:?}"),
-    })
+    // Query `NtQuerySystemInformation(SystemTimeOfDayInformation)` directly without spawning
+    // PowerShell/WMI: `BootTime - BootTimeBias` stays constant across NTP or dual-boot wall-clock
+    // steps of any magnitude.
+    let unbiased = win_proc::query_unbiased_boot_time()?;
+    Ok(format!("boot-win-{unbiased}"))
 }
 
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {

@@ -125,9 +125,11 @@ pub fn is_alive(identity: &ProcessId) -> bool {
 ///
 /// - **Linux:** `/proc/sys/kernel/random/boot_id` (kernel UUID, unaffected by clock steps).
 /// - **macOS:** `sysctl -n kern.bootsessionuuid` (kernel UUID, unaffected by clock steps).
-/// - **Windows:** `boot-ticks-<ticks>` from `Win32_OperatingSystem.LastBootUpTime` UTC ticks
-///   (single source and format; compare with [`same_boot`] so minor NTP clock steps do not look
-///   like a reboot).
+/// - **Windows:** `boot-win-<unbiased_ticks>` computed from
+///   `NtQuerySystemInformation(SystemTimeOfDayInformation)` as `BootTime - BootTimeBias`, which
+///   stays invariant across NTP and dual-boot wall-clock steps of any size. Note that Windows Fast
+///   Startup (hybrid shutdown) hibernates the kernel session rather than performing a cold boot,
+///   so the kernel boot timestamp—and therefore this ID—persists across a Fast Startup cycle.
 pub fn boot_id() -> Result<String> {
     if let Some(cached) = CACHED_BOOT_ID.get() {
         return Ok(cached.clone());
@@ -139,10 +141,10 @@ pub fn boot_id() -> Result<String> {
 
 /// Compare two boot identifiers returned by [`boot_id`].
 ///
-/// UUID-based boot IDs (Linux `boot_id` and macOS `kern.bootsessionuuid`) require exact equality.
-/// Time-derived boot IDs (`boot-ticks-<ticks>` on Windows and `boot-sec-<secs>` on fallback Unix
-/// platforms) allow up to 5 seconds of clock-step tolerance so routine NTP adjustments do not
-/// falsely indicate a reboot.
+/// Clock-step-invariant boot IDs (Linux `boot_id`, macOS `kern.bootsessionuuid`, and Windows
+/// `boot-win-<unbiased_ticks>`) require exact equality. Legacy or fallback time-derived boot IDs
+/// (`boot-ticks-<ticks>` and `boot-sec-<secs>`) allow up to 5 seconds of clock-step tolerance so
+/// routine NTP adjustments do not falsely indicate a reboot.
 pub fn same_boot(a: &str, b: &str) -> bool {
     let a = a.trim();
     let b = b.trim();
@@ -232,6 +234,17 @@ async fn kill_tree_impl(_identity: &ProcessId, _grace: Duration) -> Result<KillT
     Err(OsError::Unsupported {
         detail: "process tree termination is not supported on this platform".into(),
     })
+}
+
+/// Recover the clock-step-invariant Windows boot timestamp from `SYSTEM_TIMEOFDAY_INFORMATION`'s
+/// `BootTime` and `BootTimeBias` fields.
+///
+/// `NtSetSystemTime` applies the same signed delta to both `KeBootTime` and `KeBootTimeBias`
+/// (with two's-complement wrap on `u64` for backward steps), so wrapping subtraction cancels any
+/// wall-clock adjustment of arbitrary size.
+#[allow(dead_code)]
+pub(crate) const fn unbiased_windows_boot_ticks(boot_time: i64, boot_time_bias: u64) -> u64 {
+    (boot_time as u64).wrapping_sub(boot_time_bias)
 }
 
 /// Parse `(state, start_ticks)` from a Linux `/proc/<pid>/stat` line.
@@ -385,7 +398,13 @@ mod tests {
         assert!(same_boot(uuid_a, uuid_a));
         assert!(!same_boot(uuid_a, uuid_b));
 
-        // Windows LastBootUpTime ticks allow up to 5 seconds of clock-step drift.
+        // Windows unbiased boot IDs are clock-step-invariant and require exact equality.
+        let win_a = "boot-win-133700000000000000";
+        let win_b = "boot-win-133700000000000001";
+        assert!(same_boot(win_a, win_a));
+        assert!(!same_boot(win_a, win_b));
+
+        // Legacy Windows LastBootUpTime ticks allow up to 5 seconds of clock-step drift.
         let base_ticks: u64 = 638_600_000_000_000_000;
         let a = format!("boot-ticks-{base_ticks}");
         let drift_3s = format!("boot-ticks-{}", base_ticks + 3 * TICKS_PER_SEC);
@@ -406,6 +425,27 @@ mod tests {
         assert!(!same_boot(&a, uuid_a));
         assert!(!same_boot(&a, "boot-sec-1700000000"));
         assert!(!same_boot("boot-ticks-abc", "boot-ticks-abc-2"));
+    }
+
+    #[test]
+    fn unbiased_windows_boot_ticks_cancels_positive_and_negative_clock_steps() {
+        let initial_boot: i64 = 133_700_000_000_000_000;
+        let base = unbiased_windows_boot_ticks(initial_boot, 0);
+        assert_eq!(base, initial_boot as u64);
+
+        // +2 hour dual-boot RTC jump (both BootTime and BootTimeBias increase by +7200s).
+        let plus_2h: i64 = 7_200 * TICKS_PER_SEC as i64;
+        assert_eq!(
+            unbiased_windows_boot_ticks(initial_boot + plus_2h, plus_2h as u64),
+            base
+        );
+
+        // -2 hour backward clock step (BootTime decreases, BootTimeBias wraps in two's complement).
+        let minus_2h: i64 = -7_200 * TICKS_PER_SEC as i64;
+        assert_eq!(
+            unbiased_windows_boot_ticks(initial_boot + minus_2h, minus_2h as u64),
+            base
+        );
     }
 
     #[tokio::test]

@@ -6,9 +6,13 @@
 
 #![allow(unsafe_code)]
 
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 
+use windows::Wdk::System::SystemInformation::{
+    NtQuerySystemInformation, SystemTimeOfDayInformation,
+};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME,
     HANDLE, STILL_ACTIVE,
@@ -95,6 +99,64 @@ fn is_still_running(handle: HANDLE, exit_filetime: u64) -> bool {
     // mutable `u32`.
     let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok();
     ok && exit_code == STILL_ACTIVE.0 as u32
+}
+
+/// Layout of Windows `SYSTEM_TIMEOFDAY_INFORMATION` (48 bytes on all supported Windows versions).
+#[repr(C)]
+#[derive(Default)]
+struct SystemTimeOfDayInfo {
+    boot_time: i64,
+    current_time: i64,
+    time_zone_bias: i64,
+    time_zone_id: u32,
+    reserved: u32,
+    boot_time_bias: u64,
+    sleep_time_bias: u64,
+}
+
+/// Query the clock-step-invariant Windows boot timestamp (`BootTime - BootTimeBias`).
+///
+/// Whenever `NtSetSystemTime` adjusts the system wall clock (NTP or dual-boot RTC jump), the
+/// kernel shifts both `KeBootTime` and `KeBootTimeBias` by the exact same delta, so subtracting
+/// `boot_time_bias` recovers the original boot timestamp unchanged across wall-clock steps of
+/// any magnitude.
+pub(crate) fn query_unbiased_boot_time() -> Result<u64> {
+    let mut info = SystemTimeOfDayInfo::default();
+    let mut returned = 0u32;
+    let buf_len = size_of::<SystemTimeOfDayInfo>() as u32;
+
+    // SAFETY: `info` is an initialized 48-byte `SystemTimeOfDayInfo` struct matching the Windows
+    // `SYSTEM_TIMEOFDAY_INFORMATION` ABI, `buf_len` is its exact byte size, and `returned` is a
+    // valid mutable `u32`.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SystemTimeOfDayInformation,
+            (&mut info as *mut SystemTimeOfDayInfo).cast::<c_void>(),
+            buf_len,
+            &mut returned,
+        )
+    };
+    if let Err(err) = status.ok() {
+        return Err(OsError::Platform {
+            detail: format!("NtQuerySystemInformation(SystemTimeOfDayInformation) failed: {err}"),
+        });
+    }
+    if (returned as usize) < size_of::<SystemTimeOfDayInfo>() || info.boot_time <= 0 {
+        return Err(OsError::Platform {
+            detail: format!(
+                "NtQuerySystemInformation(SystemTimeOfDayInformation) returned incomplete data (bytes={returned}, boot_time={})",
+                info.boot_time
+            ),
+        });
+    }
+
+    let unbiased = crate::procid::unbiased_windows_boot_ticks(info.boot_time, info.boot_time_bias);
+    if unbiased == 0 {
+        return Err(OsError::Platform {
+            detail: "NtQuerySystemInformation produced zero unbiased boot time".into(),
+        });
+    }
+    Ok(unbiased)
 }
 
 /// Read the exact 100-ns `FILETIME` creation timestamp from a borrowed process handle (for example
