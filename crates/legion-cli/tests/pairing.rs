@@ -3389,8 +3389,11 @@ role = \"phone_admin\"
         DeviceTombstone {
             name: "old-owner".to_owned(),
             principal: "owner".to_owned(),
+            fingerprint: None,
             paired_at: None,
             paired_on: None,
+            paired_by: None,
+            removed_by: None,
             removed_at: now_str,
             removed_on: "b".to_owned(),
         },

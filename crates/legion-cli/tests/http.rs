@@ -2255,8 +2255,11 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
         legion_tools::device::registry::DeviceTombstone {
             name: "drop-fwd".to_owned(),
             principal: "phone".to_owned(),
+            fingerprint: None,
             paired_at: Some(now.clone()),
             paired_on: Some("laptop".to_owned()),
+            paired_by: None,
+            removed_by: None,
             removed_at: now.clone(),
             removed_on: "laptop".to_owned(),
         },

@@ -1591,6 +1591,11 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     }
     let node_file = ctx.config().get::<NodeFile>()?;
     let policy = ctx.config().get::<Policy>()?;
+    let caller_principal_for_tomb = ctx.principal().to_owned();
+    let caller_device_id_for_tomb = ctx
+        .pairing_id()
+        .map(str::to_owned)
+        .or_else(|| policy.device_owner(ctx.principal()).map(str::to_owned));
     let node_name = ctx.node_name().to_owned();
     let valid_node_name = NodeName::try_from(node_name.clone())
         .map(|n| n.as_str().to_owned())
@@ -1698,8 +1703,14 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     DeviceTombstone {
                         name: entry.name.clone(),
                         principal: entry.principal.clone(),
+                        fingerprint: Some(DevicesFile::fingerprint_of(&entry)),
                         paired_at: Some(entry.paired_at),
                         paired_on: Some(entry.paired_on),
+                        paired_by: entry.paired_by,
+                        removed_by: Some(registry::PairedBy {
+                            principal: caller_principal_for_tomb,
+                            device: caller_device_id_for_tomb,
+                        }),
                         removed_at,
                         removed_on: valid_node_name.clone(),
                     },
@@ -2898,13 +2909,35 @@ role = "owner"
         assert_eq!(devices[0]["fingerprint"], json!(device_key1.fingerprint));
         assert_eq!(devices[1]["name"], json!("my-pixel-2"));
 
-        // device.remove removes the named device and keeps the foreign line + second device.
+        // device.remove removes the named device and keeps the foreign line + second device,
+        // recording key fingerprint, pairing provenance, and remover in the tombstone.
         let removed = h
             .call("device.remove", json!({"name": "my-pixel"}))
             .await
             .unwrap();
         assert_eq!(removed["kind"], json!("device"));
         assert_eq!(removed["removed"], json!(true));
+        let removed_id = removed["id"].as_str().unwrap();
+        let saved_after_rm: registry::DevicesFile = legion_core::config::parse(
+            &h.node.paths().config_file("devices.toml"),
+            &std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        let tomb = saved_after_rm.removed.get(removed_id).unwrap();
+        assert_eq!(tomb.name, "my-pixel");
+        assert_eq!(tomb.principal, "phone");
+        assert_eq!(
+            tomb.fingerprint.as_deref(),
+            Some(device_key1.fingerprint.as_str())
+        );
+        assert_eq!(
+            tomb.paired_by.as_ref().map(|p| p.principal.as_str()),
+            Some("owner")
+        );
+        assert_eq!(
+            tomb.removed_by.as_ref().map(|p| p.principal.as_str()),
+            Some("owner")
+        );
         let auth_after = std::fs::read_to_string(&h.auth_keys).unwrap();
         assert!(auth_after.contains(&foreign));
         assert!(!auth_after.contains("legion-device:my-pixel\n"));
@@ -4581,13 +4614,17 @@ allow = ["effect:read", "effect:write"]
             },
         );
         let dev_a = devices_file.devices.remove(&id_a).unwrap();
+        let dev_a_fp = registry::DevicesFile::fingerprint_of(&dev_a);
         devices_file.removed.insert(
             id_a.clone(),
             registry::DeviceTombstone {
                 name: dev_a.name,
                 principal: dev_a.principal,
+                fingerprint: Some(dev_a_fp),
                 paired_at: Some(dev_a.paired_at),
                 paired_on: Some(dev_a.paired_on),
+                paired_by: dev_a.paired_by,
+                removed_by: None,
                 removed_at: b_paired_at.clone(),
                 removed_on: "other".to_owned(),
             },

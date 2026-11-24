@@ -137,12 +137,21 @@ pub struct DeviceTombstone {
     pub name: String,
     /// Principal pinned at the time of removal.
     pub principal: String,
+    /// `SHA256:...` fingerprint of the removed device's public key, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     /// RFC 3339 UTC timestamp when the device was originally paired, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paired_at: Option<String>,
     /// Node name where the device was originally paired, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paired_on: Option<String>,
+    /// Who originally created the removed device (principal and optional creator device id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_by: Option<PairedBy>,
+    /// Who removed the device (principal and optional removing device id), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_by: Option<PairedBy>,
     /// RFC 3339 UTC timestamp when the device was removed.
     pub removed_at: String,
     /// Node name where the device was removed.
@@ -267,6 +276,15 @@ impl Document for DevicesFile {
                 .map_err(|e| format!("removed.{id}.name: {}", e.message))?;
             Principal::parse(&tomb.principal)
                 .map_err(|e| format!("removed.{id}.principal: {}", e.message))?;
+            if let Some(fp) = &tomb.fingerprint
+                && (fp.is_empty()
+                    || fp.len() > 128
+                    || fp.chars().any(|c| c.is_control() || c.is_whitespace()))
+            {
+                return Err(format!(
+                    "removed.{id}.fingerprint is not a valid key fingerprint"
+                ));
+            }
             if let Some(paired_at) = &tomb.paired_at {
                 paired_at
                     .parse::<Timestamp>()
@@ -275,6 +293,22 @@ impl Document for DevicesFile {
             if let Some(paired_on) = &tomb.paired_on {
                 NodeName::try_from(paired_on.clone())
                     .map_err(|e| format!("removed.{id}.paired_on: {e}"))?;
+            }
+            if let Some(paired_by) = &tomb.paired_by {
+                Principal::parse(&paired_by.principal)
+                    .map_err(|e| format!("removed.{id}.paired_by.principal: {}", e.message))?;
+                if let Some(dev_id) = &paired_by.device {
+                    validate_pairing_id(dev_id)
+                        .map_err(|e| format!("removed.{id}.paired_by.device: {}", e.message))?;
+                }
+            }
+            if let Some(removed_by) = &tomb.removed_by {
+                Principal::parse(&removed_by.principal)
+                    .map_err(|e| format!("removed.{id}.removed_by.principal: {}", e.message))?;
+                if let Some(dev_id) = &removed_by.device {
+                    validate_pairing_id(dev_id)
+                        .map_err(|e| format!("removed.{id}.removed_by.device: {}", e.message))?;
+                }
             }
             tomb.removed_at
                 .parse::<Timestamp>()
@@ -339,11 +373,30 @@ impl DevicesFile {
                 let mut t = Table::new();
                 t["name"] = value(tomb.name.as_str());
                 t["principal"] = value(tomb.principal.as_str());
+                if let Some(fingerprint) = &tomb.fingerprint {
+                    t["fingerprint"] = value(fingerprint.as_str());
+                }
                 if let Some(paired_at) = &tomb.paired_at {
                     t["paired_at"] = value(paired_at.as_str());
                 }
                 if let Some(paired_on) = &tomb.paired_on {
                     t["paired_on"] = value(paired_on.as_str());
+                }
+                if let Some(paired_by) = &tomb.paired_by {
+                    let mut inline = InlineTable::new();
+                    inline.insert("principal", paired_by.principal.as_str().into());
+                    if let Some(dev_id) = &paired_by.device {
+                        inline.insert("device", dev_id.as_str().into());
+                    }
+                    t["paired_by"] = value(inline);
+                }
+                if let Some(removed_by) = &tomb.removed_by {
+                    let mut inline = InlineTable::new();
+                    inline.insert("principal", removed_by.principal.as_str().into());
+                    if let Some(dev_id) = &removed_by.device {
+                        inline.insert("device", dev_id.as_str().into());
+                    }
+                    t["removed_by"] = value(inline);
                 }
                 t["removed_at"] = value(tomb.removed_at.as_str());
                 t["removed_on"] = value(tomb.removed_on.as_str());
@@ -477,8 +530,25 @@ fn tombstone_sort_key(t: &DeviceTombstone) -> impl Ord + '_ {
         t.removed_on.as_str(),
         t.name.as_str(),
         t.principal.as_str(),
+        t.fingerprint.as_deref().unwrap_or(""),
         t.paired_at.as_deref().unwrap_or(""),
         t.paired_on.as_deref().unwrap_or(""),
+        t.paired_by
+            .as_ref()
+            .map(|p| p.principal.as_str())
+            .unwrap_or(""),
+        t.paired_by
+            .as_ref()
+            .and_then(|p| p.device.as_deref())
+            .unwrap_or(""),
+        t.removed_by
+            .as_ref()
+            .map(|p| p.principal.as_str())
+            .unwrap_or(""),
+        t.removed_by
+            .as_ref()
+            .and_then(|p| p.device.as_deref())
+            .unwrap_or(""),
     )
 }
 
@@ -621,6 +691,41 @@ pub fn inspect_quarantined_devices(paths: &Paths) -> Vec<(String, String, String
             (name, id, reason)
         })
         .collect()
+}
+
+/// Rewrites incoming tombstone identity and pairing-provenance fields from the local registry
+/// whenever the tombstoned pairing id already exists locally (live or already tombstoned).
+///
+/// Applied unconditionally at every merge for every caller (including `owner`) so an incoming
+/// tombstone can never name a different principal than the device it removes or corrupt an
+/// existing local tombstone's principal.
+pub fn rewrite_tombstones_from_local(local: &DevicesFile, incoming: &mut DevicesFile) {
+    for (id, tomb) in &mut incoming.removed {
+        if let Some(local_live) = local.devices.get(id) {
+            tomb.name = local_live.name.clone();
+            tomb.principal = local_live.principal.clone();
+            tomb.fingerprint = Some(DevicesFile::fingerprint_of(local_live));
+            tomb.paired_at = Some(local_live.paired_at.clone());
+            tomb.paired_on = Some(local_live.paired_on.clone());
+            tomb.paired_by = local_live.paired_by.clone();
+        } else if let Some(local_tomb) = local.removed.get(id) {
+            let same_principal = tomb.principal == local_tomb.principal;
+            tomb.name = local_tomb.name.clone();
+            tomb.principal = local_tomb.principal.clone();
+            if local_tomb.fingerprint.is_some() || !same_principal {
+                tomb.fingerprint = local_tomb.fingerprint.clone();
+            }
+            if local_tomb.paired_at.is_some() || !same_principal {
+                tomb.paired_at = local_tomb.paired_at.clone();
+            }
+            if local_tomb.paired_on.is_some() || !same_principal {
+                tomb.paired_on = local_tomb.paired_on.clone();
+            }
+            if local_tomb.paired_by.is_some() || !same_principal {
+                tomb.paired_by = local_tomb.paired_by.clone();
+            }
+        }
+    }
 }
 
 /// Pure CRDT merge of two [`DevicesFile`] states.
@@ -2338,6 +2443,11 @@ pub fn apply_devices_merge_blocking(
     )
     .map_err(MergeApplyError::BeforeSave)?;
 
+    // For every caller including owner, any tombstone replacing a local live entry (or matching an
+    // existing local tombstone) takes its identity and pairing provenance from the local entry so
+    // a tombstone can never name a different principal than the device it removes.
+    rewrite_tombstones_from_local(&local, &mut prepared_incoming);
+
     let merged = merge_devices(&local, &prepared_incoming);
 
     // Every registry-owned (marked) principal belongs to exactly one pairing id: refuse, for
@@ -2735,8 +2845,11 @@ mod tests {
         DeviceTombstone {
             name: name.to_owned(),
             principal: format!("device:{name}"),
+            fingerprint: None,
             paired_at: Some("2026-11-24T10:00:00Z".to_owned()),
             paired_on: Some("tower".to_owned()),
+            paired_by: None,
+            removed_by: None,
             removed_at: removed_at.to_owned(),
             removed_on: node.to_owned(),
         }
@@ -2829,13 +2942,28 @@ mod tests {
                         .then(|| (*rng.pick(&nodes)).to_owned());
                     let removed_at = *rng.pick(&times);
                     let removed_on = *rng.pick(&nodes);
+                    let fingerprint = rng
+                        .next()
+                        .is_multiple_of(2)
+                        .then(|| format!("SHA256:fp{}", rng.next() % 3));
+                    let paired_by = rng.next().is_multiple_of(2).then(|| PairedBy {
+                        principal: (*rng.pick(&creator_principals)).to_owned(),
+                        device: rng.next().is_multiple_of(2).then(|| rng.pick(&ids).clone()),
+                    });
+                    let removed_by = rng.next().is_multiple_of(2).then(|| PairedBy {
+                        principal: (*rng.pick(&creator_principals)).to_owned(),
+                        device: rng.next().is_multiple_of(2).then(|| rng.pick(&ids).clone()),
+                    });
                     file.removed.insert(
                         id.clone(),
                         DeviceTombstone {
                             name: name.to_owned(),
                             principal: principal.to_owned(),
+                            fingerprint,
                             paired_at,
                             paired_on,
+                            paired_by,
+                            removed_by,
                             removed_at: removed_at.to_owned(),
                             removed_on: removed_on.to_owned(),
                         },
@@ -2909,8 +3037,17 @@ mod tests {
         let tomb_base = DeviceTombstone {
             name: "alpha".to_owned(),
             principal: "device:alpha".to_owned(),
+            fingerprint: Some("SHA256:alpha".to_owned()),
             paired_at: Some("2026-11-24T09:00:00Z".to_owned()),
             paired_on: Some("mac".to_owned()),
+            paired_by: Some(PairedBy {
+                principal: "owner".to_owned(),
+                device: None,
+            }),
+            removed_by: Some(PairedBy {
+                principal: "owner".to_owned(),
+                device: None,
+            }),
             removed_at: "2026-11-24T10:00:00Z".to_owned(),
             removed_on: "pi".to_owned(),
         };
@@ -2923,8 +3060,21 @@ mod tests {
         push_tomb(|t| t.removed_on = "tower".to_owned());
         push_tomb(|t| t.name = "beta".to_owned());
         push_tomb(|t| t.principal = "device:beta".to_owned());
+        push_tomb(|t| t.fingerprint = Some("SHA256:beta".to_owned()));
         push_tomb(|t| t.paired_at = Some("2026-11-24T09:30:00Z".to_owned()));
         push_tomb(|t| t.paired_on = Some("tower".to_owned()));
+        push_tomb(|t| {
+            t.paired_by = Some(PairedBy {
+                principal: "owner".to_owned(),
+                device: Some(sample_id(1)),
+            });
+        });
+        push_tomb(|t| {
+            t.removed_by = Some(PairedBy {
+                principal: "owner".to_owned(),
+                device: Some(sample_id(2)),
+            });
+        });
 
         let mut tomb_base_file = DevicesFile::default();
         tomb_base_file.removed.insert(id.clone(), tomb_base);
@@ -3590,5 +3740,191 @@ role = \"observer\"
                 "{peer}: {entry:?}"
             );
         }
+    }
+
+    #[test]
+    fn tombstone_replacing_live_entry_rewrites_identity_fields_and_protects_victim() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        std::fs::write(&auth_keys, "").unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        let node_toml =
+            format!("name = \"tower\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n");
+        std::fs::write(paths.config_file("node.toml"), &node_toml).unwrap();
+        let node_file: NodeFile =
+            parse(&paths.config_file("node.toml"), node_toml.as_bytes()).unwrap();
+
+        let id_x = sample_id(0x51);
+        let id_victim = sample_id(0x52);
+        let id_parent = sample_id(0x50);
+        let now_str = format_precise_rfc3339(Timestamp::now());
+        let later_str = next_updated_timestamp(Some(&now_str)).unwrap();
+
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "\
+default = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+
+[principals.\"device:x\"]
+role = \"observer\"
+device = \"{id_x}\"
+
+[principals.\"device:victim\"]
+role = \"observer\"
+device = \"{id_victim}\"
+"
+            ),
+        )
+        .unwrap();
+
+        let mut initial = DevicesFile::default();
+        let mut dev_x = sample_device(0x51, "x", Some("observer"), &now_str, "tower");
+        dev_x.paired_at = now_str.clone();
+        dev_x.paired_on = "tower".to_owned();
+        dev_x.paired_by = Some(PairedBy {
+            principal: "phone".to_owned(),
+            device: Some(id_parent.clone()),
+        });
+        let mut dev_victim = sample_device(0x52, "victim", Some("observer"), &now_str, "tower");
+        dev_victim.paired_at = now_str.clone();
+        dev_victim.paired_on = "tower".to_owned();
+        initial.devices.insert(id_x.clone(), dev_x.clone());
+        initial
+            .devices
+            .insert(id_victim.clone(), dev_victim.clone());
+        {
+            let _lock = lock_config(&paths).unwrap();
+            save_devices_locked(&paths, &initial).unwrap();
+        }
+        reconcile_devices_and_auth_keys_blocking(&paths, "tower", &node_file, false).unwrap();
+        let auth_before = std::fs::read_to_string(&auth_keys).unwrap();
+        assert!(auth_before.contains("legion-device:x"));
+        assert!(auth_before.contains("legion-device:victim"));
+
+        // Crafted incoming tombstone for `id_x` lies about `name` and `principal`, naming
+        // `device:victim` instead of `device:x`.
+        let mut crafted = DevicesFile::default();
+        crafted.removed.insert(
+            id_x.clone(),
+            DeviceTombstone {
+                name: "victim".to_owned(),
+                principal: "device:victim".to_owned(),
+                fingerprint: Some("SHA256:forged".to_owned()),
+                paired_at: Some("2020-01-01T00:00:00Z".to_owned()),
+                paired_on: Some("forged".to_owned()),
+                paired_by: None,
+                removed_by: Some(PairedBy {
+                    principal: "owner".to_owned(),
+                    device: None,
+                }),
+                removed_at: later_str.clone(),
+                removed_on: "pi".to_owned(),
+            },
+        );
+
+        let outcome = apply_devices_merge_blocking(
+            &paths,
+            "tower",
+            &node_file,
+            &crafted,
+            |_| Ok(()),
+            |_, _, _, _| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("merge should succeed while rewriting forged tombstone identity from local live x");
+
+        let saved_tomb = outcome
+            .devices
+            .removed
+            .get(&id_x)
+            .expect("x must be tombstoned");
+        assert_eq!(
+            saved_tomb.principal, "device:x",
+            "tombstone principal must be rewritten from local live entry x, never trusted from incoming: {saved_tomb:?}"
+        );
+        assert_eq!(saved_tomb.name, "x", "{saved_tomb:?}");
+        assert_eq!(
+            saved_tomb.fingerprint.as_deref(),
+            Some(DevicesFile::fingerprint_of(&dev_x).as_str()),
+            "tombstone fingerprint must be rewritten from local live entry x"
+        );
+        assert_eq!(saved_tomb.paired_at.as_deref(), Some(now_str.as_str()));
+        assert_eq!(saved_tomb.paired_on.as_deref(), Some("tower"));
+        assert_eq!(saved_tomb.paired_by, dev_x.paired_by);
+
+        // Victim must remain live, active in authorized_keys, and accepted by legion gate.
+        assert!(outcome.devices.devices.contains_key(&id_victim));
+        let auth_after = std::fs::read_to_string(&auth_keys).unwrap();
+        assert!(!auth_after.contains("legion-device:x"));
+        assert!(
+            auth_after.contains("legion-device:victim"),
+            "victim must stay active in authorized_keys:\n{auth_after}"
+        );
+        verify_gate_device(
+            &paths,
+            "tower",
+            &node_file,
+            "victim",
+            &id_victim,
+            "device:victim",
+            None,
+        )
+        .expect("victim must remain accepted by gate");
+
+        // A second forged tombstone for already-tombstoned `id_x` with an earlier timestamp and
+        // `principal = "device:victim"` must ALSO not corrupt the existing local tombstone.
+        let earlier_str = format_precise_rfc3339(
+            Timestamp::now()
+                .checked_sub(SignedDuration::from_secs(60))
+                .unwrap(),
+        );
+        let mut second_forged = DevicesFile::default();
+        second_forged.removed.insert(
+            id_x.clone(),
+            DeviceTombstone {
+                name: "victim".to_owned(),
+                principal: "device:victim".to_owned(),
+                fingerprint: Some("SHA256:forged2".to_owned()),
+                paired_at: None,
+                paired_on: None,
+                paired_by: None,
+                removed_by: None,
+                removed_at: earlier_str,
+                removed_on: "a-peer".to_owned(),
+            },
+        );
+        let outcome2 = apply_devices_merge_blocking(
+            &paths,
+            "tower",
+            &node_file,
+            &second_forged,
+            |_| Ok(()),
+            |_, _, _, _| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("second merge should succeed without corrupting local tombstone");
+        assert_eq!(
+            outcome2.devices.removed.get(&id_x).unwrap().principal,
+            "device:x",
+            "existing local tombstone principal must not be overwritten by a forged incoming tombstone"
+        );
+        verify_gate_device(
+            &paths,
+            "tower",
+            &node_file,
+            "victim",
+            &id_victim,
+            "device:victim",
+            None,
+        )
+        .expect("victim must still be accepted by gate");
     }
 }

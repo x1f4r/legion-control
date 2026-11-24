@@ -2570,8 +2570,11 @@ device = \"{pad_id}\"
             DeviceTombstone {
                 name: "old".to_owned(),
                 principal: "device:old".to_owned(),
+                fingerprint: None,
                 paired_at: None,
                 paired_on: None,
+                paired_by: None,
+                removed_by: None,
                 removed_at: now,
                 removed_on: "tower".to_owned(),
             },
