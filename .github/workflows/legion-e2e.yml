@@ -259,6 +259,11 @@ jobs:
         shell: bash
         run: |
           set -u
+          # A run that failed before the sshd step exported E2E_DIR has nothing of its own to keep.
+          if [ -z "${E2E_DIR:-}" ]; then
+            echo 'The run stopped before the far node was set up; there is nothing to gather.'
+            exit 0
+          fi
           out="$E2E_DIR/work/artifacts"
           mkdir -p "$out"
           if [ "$RUNNER_OS" = Windows ]; then
