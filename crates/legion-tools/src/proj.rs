@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode, EventKind};
 use legion_core::{Access, CancellationToken, Ctx, Grant, Registry, ToolError, parse_args};
@@ -601,16 +601,23 @@ async fn clone(ctx: &Ctx, args: CloneArgs) -> Result<Cloned, ToolError> {
     }
     .run();
     tokio::pin!(run);
-    let mut lines = Lines::default();
+    let mut progress = Progress::default();
+    let send = |lines: Vec<String>| {
+        for line in lines {
+            ctx.emit(EventKind::Progress, Value::String(line));
+        }
+    };
     let output = loop {
         tokio::select! {
-            Some(chunk) = receiver.recv() => lines.push(ctx, &chunk.bytes),
-            output = &mut run => break output?,
+            Some(chunk) = receiver.recv() => send(progress.push(&chunk.bytes, Instant::now())),
+            output = &mut run => break output,
         }
     };
     while let Ok(chunk) = receiver.try_recv() {
-        lines.push(ctx, &chunk.bytes);
+        send(progress.push(&chunk.bytes, Instant::now()));
     }
+    send(progress.finish().into_iter().collect());
+    let output = output?;
     if output.exit_code != Some(0) {
         return Err(remote_error(
             &format!("{} could not be cloned from {repo}", args.project),
@@ -719,15 +726,25 @@ fn repo_source(repo: &str) -> Result<RepoSource, ErrorBody> {
     ))
 }
 
-/// Splits git's progress output, which redraws one line with carriage returns, into the lines a
-/// person would have seen, each sent as a progress event.
+/// The least time between two progress events: about five a second.
+const PROGRESS_EVERY: Duration = Duration::from_millis(200);
+/// The most of an unfinished line kept while waiting for its end.
+const PROGRESS_LINE: usize = 4096;
+
+/// Turns git's progress output, which redraws one line with carriage returns many times a second,
+/// into the lines a person would have seen, at a pace a caller can follow: a line that arrives
+/// sooner than [`PROGRESS_EVERY`] after the last one sent is held, replaced by any newer one, and
+/// sent when the pace allows or the clone ends.
 #[derive(Default)]
-struct Lines {
+struct Progress {
     pending: Vec<u8>,
+    held: Option<String>,
+    sent_at: Option<Instant>,
 }
 
-impl Lines {
-    fn push(&mut self, ctx: &Ctx, bytes: &[u8]) {
+impl Progress {
+    /// Takes output read at `now` and returns the lines to send.
+    fn push(&mut self, bytes: &[u8], now: Instant) -> Vec<String> {
         self.pending.extend_from_slice(bytes);
         while let Some(end) = self
             .pending
@@ -735,12 +752,34 @@ impl Lines {
             .position(|byte| matches!(byte, b'\r' | b'\n'))
         {
             let line: Vec<u8> = self.pending.drain(..=end).collect();
-            let text = String::from_utf8_lossy(&line);
-            let text = text.trim();
+            let text = String::from_utf8_lossy(&line).trim().to_owned();
             if !text.is_empty() {
-                ctx.emit(EventKind::Progress, Value::String(text.to_owned()));
+                self.held = Some(text);
             }
         }
+        // A line this long is no progress line; only its end can still matter.
+        if self.pending.len() > PROGRESS_LINE {
+            let excess = self.pending.len() - PROGRESS_LINE;
+            self.pending.drain(..excess);
+        }
+        let due = self
+            .sent_at
+            .is_none_or(|sent| now.duration_since(sent) >= PROGRESS_EVERY);
+        match self.held.take() {
+            Some(line) if due => {
+                self.sent_at = Some(now);
+                vec![line]
+            }
+            held => {
+                self.held = held;
+                Vec::new()
+            }
+        }
+    }
+
+    /// The last line held back, to send once the output has ended.
+    fn finish(&mut self) -> Option<String> {
+        self.held.take()
     }
 }
 
@@ -1554,6 +1593,40 @@ mod tests {
             Path::new("/home/me/site.git")
                 .is_absolute()
                 .then(|| RepoSource::Local("/home/me/site.git".to_owned()))
+        );
+    }
+
+    #[test]
+    fn progress_is_throttled_and_its_buffer_bounded() {
+        let start = std::time::Instant::now();
+        let mut progress = Progress::default();
+        let mut sent = Vec::new();
+        for percent in 0..=100 {
+            let line = format!("Receiving objects: {percent:3}% ({percent}/100)\r");
+            sent.extend(progress.push(line.as_bytes(), start));
+        }
+        assert_eq!(sent, ["Receiving objects:   0% (0/100)"]);
+        let later = start + PROGRESS_EVERY;
+        assert_eq!(
+            progress.push(b"Resolving deltas: 50%\r", later),
+            ["Resolving deltas: 50%"]
+        );
+        progress.push(b"Resolving deltas: 100%, done.\n", later);
+        assert_eq!(
+            progress.finish().as_deref(),
+            Some("Resolving deltas: 100%, done.")
+        );
+        assert_eq!(progress.finish(), None);
+
+        // Output that never ends a line cannot grow the buffer without bound.
+        let mut endless = Progress::default();
+        for _ in 0..1000 {
+            endless.push(&[b'x'; 1000], start);
+        }
+        assert!(
+            endless.pending.len() <= PROGRESS_LINE,
+            "{}",
+            endless.pending.len()
         );
     }
 
