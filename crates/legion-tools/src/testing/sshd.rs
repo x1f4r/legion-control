@@ -68,7 +68,13 @@ impl TestSshd {
         };
 
         let user = legion_os::user::current_username().map_err(|e| e.to_string())?;
-        let dir = TempDir::new().map_err(|e| format!("create sshd tempdir: {e}"))?;
+        let dir = if let Some(base) = std::env::var_os("CARGO_TARGET_TMPDIR") {
+            let base_path = PathBuf::from(base);
+            let _ = fs::create_dir_all(&base_path);
+            tempfile::tempdir_in(&base_path).map_err(|e| format!("create sshd tempdir: {e}"))?
+        } else {
+            TempDir::new().map_err(|e| format!("create sshd tempdir: {e}"))?
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -78,15 +84,20 @@ impl TestSshd {
         if let Some(parent) = authorized_keys.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("create authorized_keys parent: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
         if !authorized_keys.exists() {
             fs::write(&authorized_keys, b"")
                 .map_err(|e| format!("create empty authorized_keys: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600));
-            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600));
         }
 
         let host_key = dir.path().join("host_ed25519");
@@ -465,7 +476,7 @@ fn render_sshd_config(
     );
     let _ = writeln!(cfg, "PidFile none");
     let _ = writeln!(cfg, "UsePAM no");
-    let _ = writeln!(cfg, "StrictModes no");
+    let _ = writeln!(cfg, "StrictModes yes");
     let _ = writeln!(cfg, "PubkeyAuthentication yes");
     let _ = writeln!(cfg, "PasswordAuthentication no");
     let _ = writeln!(cfg, "KbdInteractiveAuthentication no");

@@ -59,7 +59,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         return;
     }
 
-    let home = Home::new();
+    let home = Home::new_strict();
     let auth_keys = home.home().join("test_authorized_keys");
     let foreign_comment = "# foreign key kept verbatim\n";
     let foreign_pub = ed25519_public_key_from_seed(&[7_u8; 32]);
@@ -927,7 +927,7 @@ fn device_invite_scans_live_sshd_host_keys_without_configured_host_keys() {
         return;
     }
 
-    let home = Home::new();
+    let home = Home::new_strict();
     let auth_keys = home.home().join("scan_authorized_keys");
     let home_dir_str = home.home().to_string_lossy().into_owned();
     let Some(sshd) = TestSshd::start(auth_keys.clone(), &[("HOME", &home_dir_str)])
