@@ -48,6 +48,10 @@ use serde_json::{Value, json};
 /// transfer sends in batches well below this; anything longer is a client gone wrong.
 pub const LONGEST_HEADER: usize = 64 * 1024 * 1024;
 
+/// How much output is gathered before it is written: a file's bytes go out in large writes, and
+/// a listing's lines are not written one by one.
+const OUTPUT_BUFFER: usize = 64 * 1024;
+
 /// How much of the input an `unpack` reads past the end of its archive before it stops waiting
 /// for the sender to finish: the padding a tar writer adds is a few blocks.
 const MOST_TRAILING: u64 = 1024 * 1024;
@@ -260,7 +264,7 @@ pub fn serve<R: Read, W: Write>(
 ) -> Result<(), ErrorBody> {
     let started = Instant::now();
     let mut input = BufReader::new(input);
-    let mut output = BufWriter::new(output);
+    let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
     let (header, recorded) = match read_header(&mut input) {
         Ok(read) => read,
         Err(error) => {
