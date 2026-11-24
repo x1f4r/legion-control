@@ -13,7 +13,6 @@ use legion_core::Document;
 use legion_core::config::NodeName;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_os::OsError;
-use legion_os::atomic::{WriteOptions, write_atomic};
 use legion_os::lock::{FileLock, LockMode};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -269,9 +268,11 @@ pub(super) fn update<T>(
                 other => failed(&format!("{} cannot be locked", lock.display()), &other),
             }
         })?;
+    // A missing file is the empty default; one that exists must parse, empty or not, since an
+    // editor caught half way through rewriting it can leave it empty for a moment.
     let text = match std::fs::read(file) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(failed(
                 &format!("{} cannot be read", file.display()),
@@ -279,19 +280,22 @@ pub(super) fn update<T>(
             ));
         }
     };
-    let current = legion_core::config::parse::<ProjectsFile>(file, &text)?;
+    let current = match &text {
+        Some(bytes) => legion_core::config::parse::<ProjectsFile>(file, bytes)?,
+        None => ProjectsFile::default(),
+    };
     let (edits, out) = plan(&current)?;
     if edits.is_empty() {
         return Ok(out);
     }
     // parse() has just accepted the bytes as UTF-8.
-    let text = String::from_utf8_lossy(&text);
+    let text = String::from_utf8_lossy(text.as_deref().unwrap_or_default());
     let edited = apply(file, &text, &edits)?;
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|error| failed(&format!("{} cannot be created", dir.display()), &error))?;
     }
-    write_atomic(file, edited.as_bytes(), WriteOptions::default())
+    legion_core::config::write_atomically(file, edited.as_bytes())
         .map_err(|error| failed(&format!("{} cannot be written", file.display()), &error))?;
     Ok(out)
 }
@@ -366,7 +370,15 @@ fn apply_one(doc: &mut DocumentMut, edit: &Edit) -> Result<(), String> {
             Ok(())
         }
         Edit::Forget { name } => {
-            if let Some(Item::Table(removed)) = projects.remove(name.as_str()) {
+            let removed = projects.remove(name.as_str());
+            // A file whose last project went would say nothing, which the loader refuses as a
+            // file caught half written; an empty `[projects]` table says there are none.
+            if projects.is_empty()
+                && let Some(Item::Table(projects)) = root.get_mut("projects")
+            {
+                projects.set_implicit(false);
+            }
+            if let Some(Item::Table(removed)) = removed {
                 keep_leading_comments(doc, &removed);
             }
             Ok(())
@@ -548,7 +560,7 @@ on = { pi = "/home/me/notes" }
         assert_eq!(site.tasks["build"].timeout_s, Some(1800.0));
         assert_eq!(file.path_on("notes.d", "pi"), Some("/home/me/notes"));
         assert_eq!(file.path_on("notes.d", "tower"), None);
-        assert!(parse("").unwrap().projects.is_empty());
+        assert!(parse("[projects]\n").unwrap().projects.is_empty());
     }
 
     #[test]
@@ -739,6 +751,50 @@ on = { pi = "/home/me/notes" }
         assert!(!parsed.projects.contains_key("site"));
         assert!(parsed.projects.contains_key("notes.d"));
         assert!(gone.contains("# The machines' projects."), "{gone}");
+    }
+
+    #[test]
+    fn forgetting_the_last_project_leaves_a_file_the_loader_reads() {
+        let file = Path::new("projects.toml");
+        let text = "# Mine.\n\n[projects.site]\nrepo = \"https://git.example/me/site.git\"\n";
+        let gone = apply(
+            file,
+            text,
+            &[Edit::Forget {
+                name: "site".into(),
+            }],
+        )
+        .unwrap();
+        assert!(parse(&gone).unwrap().projects.is_empty(), "{gone}");
+        assert!(gone.contains("# Mine."), "{gone}");
+        let dotted = apply(
+            file,
+            "[projects.site.on]\ntower = \"/x\"\n",
+            &[Edit::Forget {
+                name: "site".into(),
+            }],
+        )
+        .unwrap();
+        assert!(parse(&dotted).unwrap().projects.is_empty(), "{dotted}");
+    }
+
+    #[test]
+    fn a_missing_file_is_created_and_an_empty_one_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config").join("projects.toml");
+        let lock = dir.path().join("state").join("projects.lock");
+        let edits = || vec![set("site", "tower", Some("/x"))];
+        update(&file, &lock, |_| Ok((edits(), ()))).unwrap();
+        assert_eq!(
+            parse(&std::fs::read_to_string(&file).unwrap())
+                .unwrap()
+                .path_on("site", "tower"),
+            Some("/x")
+        );
+        std::fs::write(&file, "").unwrap();
+        let error = update(&file, &lock, |_| Ok((edits(), ()))).unwrap_err();
+        assert!(error.message.contains("says nothing"), "{}", error.message);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
     }
 
     #[test]
