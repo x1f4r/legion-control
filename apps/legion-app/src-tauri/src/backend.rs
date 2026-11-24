@@ -205,6 +205,9 @@ pub struct AppState {
     /// Populated when `needs == Some(Needs::Repair)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair: Option<RepairInfo>,
+    /// True when this platform has a built-in camera QR scanner (`android` and `ios`).
+    #[serde(default)]
+    pub can_scan: bool,
 }
 
 /// Identifier of an in-flight call for cancellation.
@@ -301,6 +304,7 @@ impl Backend for Unpaired {
                 nodes: Vec::new(),
                 needs: Some(Needs::Pairing),
                 repair: None,
+                can_scan: cfg!(any(target_os = "android", target_os = "ios")),
             })
         })
     }
@@ -402,6 +406,7 @@ mod tests {
             nodes: Vec::new(),
             needs: Some(Needs::Pairing),
             repair: None,
+            can_scan: true,
         };
         let json = serde_json::to_value(&unpaired)?;
         assert_eq!(json["ready"], false);
@@ -420,6 +425,7 @@ mod tests {
             }],
             needs: None,
             repair: None,
+            can_scan: false,
         };
         let ready_json = serde_json::to_value(&ready)?;
         assert_eq!(ready_json["ready"], true);

@@ -549,7 +549,7 @@ function App() {
       <${IconSprite} />
       ${booting
         ? html`
-            <div class="app">
+            <div class="app standalone">
               <header class="bar"><h1 class="wordmark"><b>▍</b>Legion</h1></header>
               <main class="main"><div class="empty">Connecting…</div></main>
             </div>
@@ -628,7 +628,13 @@ function App() {
                               onSelectNode=${
                                 link.kind === 'app' && typeof link.selectNode === 'function'
                                   ? async (node) => {
-                                      cache.clear();
+                                      if (refreshAbortRef.current) {
+                                        refreshAbortRef.current.abort();
+                                        refreshAbortRef.current = null;
+                                      }
+                                      refreshInFlightRef.current = false;
+                                      sessionCache.clear();
+                                      persistentCache.clear();
                                       setSnapshot(null);
                                       setTools([]);
                                       const next = await link.selectNode(node);

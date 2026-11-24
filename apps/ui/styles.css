@@ -237,6 +237,10 @@ textarea {
     grid-template: "nav bar" auto "nav main" minmax(0, 1fr) / 84px minmax(0, 1fr);
   }
 
+  .app.standalone {
+    grid-template: "bar" auto "main" minmax(0, 1fr) / minmax(0, 1fr);
+  }
+
   .nav {
     flex-direction: column;
     justify-content: flex-start;
@@ -829,6 +833,12 @@ button.row:active {
 .chip-action {
   border: 0;
   cursor: pointer;
+}
+
+.start-column {
+  width: 100%;
+  max-width: 540px;
+  margin: 0 auto;
 }
 
 .start-heading {

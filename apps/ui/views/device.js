@@ -110,8 +110,10 @@ export function DeviceView({
                             <div class="title mono">
                               ${n.node}
                               ${idx === 0 ? html`<span class="chip">active</span>` : null}
+                              ${n.temporary ? html`<span class="chip fx write">temporary</span>` : null}
                             </div>
                             <div class="sub">${n.principal} · ${n.role} · ${n.via}</div>
+                            ${n.path ? html`<div class="sub mono">${n.path}</div>` : null}
                           </div>
                           ${idx > 0 && onSelectNode
                             ? html`

@@ -11,16 +11,22 @@ an internal `Backend` trait.
   `legion pair` invite (via camera QR scan on Android or pasted invite text), generates an Ed25519
   device key on first use, and keeps its configuration (`LinkConfig`, active node, and node
   metadata) in `legion-app.json` inside the platform app data directory.
-- **Desktop local pipe:** On Linux, macOS and Windows, if a `legion` binary is present on `PATH`
-  or in a standard user/system install location, the app is ready immediately over a local
-  `legion rpc` child process without pairing, while still allowing additional SSH nodes to be
+- **Desktop local pipe:** On Linux, macOS and Windows, if a `legion` binary is present on an
+  absolute `PATH` entry or in a standard user/system install location, the app resolves its
+  canonical path, runs that exact executable over a local `legion rpc` pipe without pairing, and
+  displays the resolved path under This device while still allowing additional SSH nodes to be
   paired.
 - **Streaming, failover, and reconnect:** Tool calls stream live output over Tauri IPC channels
-  with caller-scoped cancellation, fail over to another configured node on unreachable/timeout
-  errors, and reconnect transparently after backgrounding or a dropped node-side session.
-- **Revocation and unpairing:** If a node revokes the device (`legion device.remove`), the app
-  shows a calm error with a direct path back to pairing. Unpairing forgets the node locally and
-  prints the `legion device.remove` command to revoke the key on the node as well.
+  with caller-scoped cancellation. Failover to another configured node only runs when a request
+  never left this device (`details.sent == false`), preserves the originally intended target node,
+  and marks the failover switch as temporary in memory without persisting it. On mobile resume from
+  background, cached sessions are closed before refreshing.
+- **State safety, revocation, and unpairing:** If `legion-app.json` is damaged or written by a
+  newer schema version, the app enters repair mode, refuses writes, and offers an explicit repair
+  action that moves the file aside to `legion-app.json.damaged-<timestamp>` without deleting it. If
+  a node revokes the device (`legion device.remove`), the app shows a calm error with a direct path
+  back to pairing. Unpairing forgets the node locally and prints the `legion device.remove` command
+  to revoke the key on the node as well.
 
 Its Rust crate (`apps/legion-app/src-tauri`) is its own Cargo workspace with its own `Cargo.lock`,
 excluded from the root workspace so building the `legion` node binary never pulls in a web view.
@@ -84,11 +90,14 @@ harmless one-time log.
 
 ### Platform behaviour notes
 
-- **Android safe areas and back navigation:** On Android 17, `MainActivity.kt` enables edge-to-edge
-  layout and observes `WindowInsetsCompat` (`systemBars() | displayCutout()`) on `window.decorView`
-  without replacing the WebView's own insets listener. Chromium populates CSS `env(safe-area-inset-*)`
-  natively, and `MainActivity.kt` also publishes `--safe-area-inset-{top,right,bottom,left}`.
-  System back walks the web view history before exiting.
+- **Android safe areas, bridge, and back navigation:** On Android 17, `MainActivity.kt` enables
+  edge-to-edge layout and observes `WindowInsetsCompat` (`systemBars() | displayCutout()`) on
+  `window.decorView` without replacing the WebView's own insets listener. Insets, device model, and
+  the local-network runtime permission flow use an origin-restricted `WebViewCompat`
+  `WebMessageListener` and document-start script scoped to `http://tauri.localhost` and
+  `https://tauri.localhost`. Debug builds carry `.debug` as their `applicationIdSuffix` so they can
+  coexist with a signed release install without sharing app data. System back walks the web view
+  history before exiting.
 - **iOS and iPadOS safe areas, theme and back gesture:** The web view loads with `viewport-fit=cover`
   so CSS `env(safe-area-inset-*)` clears the Dynamic Island/notch and home indicator on iPhone and
   status/home bars on iPad, and follows system light/dark appearance automatically. Both iPhone and
@@ -107,9 +116,11 @@ harmless one-time log.
 - **Desktop window and single instance:** Desktop builds default to `1080x740` (above the `820px`
   wide-layout breakpoint) with a `360x540` minimum and register `tauri-plugin-single-instance` so
   a second launch focuses the existing main window.
-- **Content Security Policy:** `tauri.conf.json` enforces `default-src 'none'` and restricts
-  scripts, styles and images to `'self'` plus `tauri:` (needed for Apple `WKWebView` custom-scheme
-  assets) and `connect-src` to Tauri's IPC endpoints.
+- **WebView isolation and Content Security Policy:** `tauri.conf.json` enforces `default-src 'none'`,
+  restricts scripts, styles and images to `'self'` plus `tauri:` (needed for Apple `WKWebView`
+  custom-scheme assets), sets `connect-src` to Tauri's IPC endpoints, and adds
+  `form-action 'none'; base-uri 'none'; frame-ancestors 'none'`. `lib.rs` attaches `on_navigation`
+  to allow only the bundled app origin and denies all `on_new_window` requests.
 
 ## Building
 

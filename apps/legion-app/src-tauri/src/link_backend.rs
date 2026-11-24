@@ -629,6 +629,7 @@ fn resolve_active_node(data: &AppStoreData, local_program: Option<&str>) -> Opti
 }
 
 fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppState {
+    let can_scan = cfg!(any(target_os = "android", target_os = "ios"));
     if let Some(err) = &state.store_error {
         return AppState {
             ready: false,
@@ -638,6 +639,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
                 message: err.message.clone(),
                 path: store_path.display().to_string(),
             }),
+            can_scan,
         };
     }
 
@@ -698,6 +700,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         nodes,
         needs,
         repair: None,
+        can_scan,
     }
 }
 

@@ -185,8 +185,10 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
   }
 
   if (needsPairing) {
+    const canScan = linkState?.can_scan !== false;
+    const isDesktopFirstStart = !canScan && !onCancel && !linkState?.ready;
     return html`
-      <div class="app">
+      <div class="app standalone">
         <header class="bar">
           ${onCancel
             ? html`
@@ -198,74 +200,93 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
           <h1 class="wordmark"><b>▍</b>Legion</h1>
         </header>
         <main class="main">
-          ${archivedInfo?.archivedTo
-            ? html`
-                <div class="notice">
-                  <strong>Damaged state file moved aside</strong>
-                  <span>
-                    Saved at <code>${archivedInfo.archivedTo}</code>. Previously paired machines
-                    still list this device until removed there with <code>legion device.remove</code>.
-                  </span>
-                </div>
-              `
-            : null}
-          <h2 class="start-heading">Pair this device with one of your machines.</h2>
-          <p class="lede">One is enough: through it you reach the others. On that machine, run</p>
-          <div class="code">
-            <code>legion pair --as phone</code>
-            <${CopyButton} text="legion pair --as phone" label="Copy command" iconOnly=${true} />
-          </div>
-          <p class="lede spaced">It shows a code. Scan it here, or paste the line under it.</p>
-          <label class="field">
-            <span>Name this device</span>
-            <input
-              type="text"
-              value=${deviceName}
-              onInput=${(e) => setDeviceName(e.target.value)}
-              placeholder="phone"
-            />
-          </label>
-          ${error ? html`<${Notice} error=${error} />` : null}
-          <div class="actions">
-            <button type="button" class="btn primary" disabled=${busy} onClick=${onScan}>
-              Scan the code
-            </button>
-            <button
-              type="button"
-              class="btn"
-              disabled=${busy}
-              onClick=${() => setPasteOpen((v) => !v)}
-            >
-              Paste invite
-            </button>
-          </div>
-          ${pasteOpen
-            ? html`
-                <form onSubmit=${submitInvite}>
-                  <label class="field">
-                    <span>Invite</span>
-                    <textarea
-                      ref=${inviteInputRef}
-                      value=${invite}
-                      onInput=${(e) => setInvite(e.target.value)}
-                      placeholder="Paste the invite line from legion pair"
-                      required
-                    ></textarea>
-                  </label>
-                  <div class="actions">
-                    <button type="submit" class="btn primary" disabled=${busy}>
-                      ${busy ? 'Pairing…' : 'Pair device'}
-                    </button>
+          <div class="start-column">
+            ${archivedInfo?.archivedTo
+              ? html`
+                  <div class="notice">
+                    <strong>Damaged state file moved aside</strong>
+                    <span>
+                      Saved at <code>${archivedInfo.archivedTo}</code>. Previously paired machines
+                      still list this device until removed there with <code>legion device.remove</code>.
+                    </span>
                   </div>
-                </form>
-              `
-            : null}
-          <div class="notice spaced-lg">
-            <strong>What pairing allows</strong>
-            <span>
-              This device gets its own key. It can only use Legion on that machine, as the role you
-              name, and you can remove it there at any time.
-            </span>
+                `
+              : null}
+            <h2 class="start-heading">Pair this device with one of your machines.</h2>
+            ${isDesktopFirstStart
+              ? html`
+                  <p class="lede">
+                    No local <code>legion</code> installation was found on this computer — see
+                    <code>docs/legion/getting-started.md</code> to install it here, or pair with
+                    another machine below.
+                  </p>
+                `
+              : null}
+            <p class="lede">One is enough: through it you reach the others. On that machine, run</p>
+            <div class="code">
+              <code>legion pair --as phone</code>
+              <${CopyButton} text="legion pair --as phone" label="Copy command" iconOnly=${true} />
+            </div>
+            <p class="lede spaced">
+              ${canScan
+                ? 'It shows a code. Scan it here, or paste the line under it.'
+                : 'It prints an invite line. Paste it below.'}
+            </p>
+            <label class="field">
+              <span>Name this device</span>
+              <input
+                type="text"
+                value=${deviceName}
+                onInput=${(e) => setDeviceName(e.target.value)}
+                placeholder=${canScan ? 'phone' : 'computer'}
+              />
+            </label>
+            ${error ? html`<${Notice} error=${error} />` : null}
+            <div class="actions">
+              ${canScan
+                ? html`
+                    <button type="button" class="btn primary" disabled=${busy} onClick=${onScan}>
+                      Scan the code
+                    </button>
+                  `
+                : null}
+              <button
+                type="button"
+                class=${canScan ? 'btn' : 'btn primary'}
+                disabled=${busy}
+                onClick=${() => setPasteOpen((v) => !v)}
+              >
+                Paste invite
+              </button>
+            </div>
+            ${pasteOpen
+              ? html`
+                  <form onSubmit=${submitInvite}>
+                    <label class="field">
+                      <span>Invite</span>
+                      <textarea
+                        ref=${inviteInputRef}
+                        value=${invite}
+                        onInput=${(e) => setInvite(e.target.value)}
+                        placeholder="Paste the invite line from legion pair"
+                        required
+                      ></textarea>
+                    </label>
+                    <div class="actions">
+                      <button type="submit" class="btn primary" disabled=${busy}>
+                        ${busy ? 'Pairing…' : 'Pair device'}
+                      </button>
+                    </div>
+                  </form>
+                `
+              : null}
+            <div class="notice spaced-lg">
+              <strong>What pairing allows</strong>
+              <span>
+                This device gets its own key. It can only use Legion on that machine, as the role you
+                name, and you can remove it there at any time.
+              </span>
+            </div>
           </div>
         </main>
       </div>
@@ -273,47 +294,49 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
   }
 
   return html`
-    <div class="app">
+    <div class="app standalone">
       <header class="bar">
         <h1 class="wordmark"><b>▍</b>Legion</h1>
       </header>
       <main class="main">
-        <h2 class="start-heading">Connect this browser to ${nodeName}.</h2>
-        <p class="lede">On that machine, make a token for this browser and paste it here.</p>
-        <div class="code">
-          <code>legion token.add phone phone</code>
-          <${CopyButton} text="legion token.add phone phone" label="Copy command" iconOnly=${true} />
-        </div>
-        <form onSubmit=${submitToken}>
-          <div class="field">
-            <label htmlFor="start-token" class="field-label">
-              <span>Token</span>
-            </label>
-            <input
-              id="start-token"
-              type="password"
-              autocomplete="off"
-              spellcheck="false"
-              value=${token}
-              onInput=${(e) => setToken(e.target.value)}
-              placeholder="lgn_…"
-              required
-            />
-            <small>Kept in this browser only. You can remove it anytime under This device.</small>
+        <div class="start-column">
+          <h2 class="start-heading">Connect this browser to ${nodeName}.</h2>
+          <p class="lede">On that machine, make a token for this browser and paste it here.</p>
+          <div class="code">
+            <code>legion token.add phone phone</code>
+            <${CopyButton} text="legion token.add phone phone" label="Copy command" iconOnly=${true} />
           </div>
-          ${error ? html`<${Notice} error=${error} />` : null}
-          <div class="actions">
-            <button type="submit" class="btn primary" disabled=${busy}>
-              ${busy ? 'Connecting…' : 'Connect'}
-            </button>
+          <form onSubmit=${submitToken}>
+            <div class="field">
+              <label htmlFor="start-token" class="field-label">
+                <span>Token</span>
+              </label>
+              <input
+                id="start-token"
+                type="password"
+                autocomplete="off"
+                spellcheck="false"
+                value=${token}
+                onInput=${(e) => setToken(e.target.value)}
+                placeholder="lgn_…"
+                required
+              />
+              <small>Kept in this browser only. You can remove it anytime under This device.</small>
+            </div>
+            ${error ? html`<${Notice} error=${error} />` : null}
+            <div class="actions">
+              <button type="submit" class="btn primary" disabled=${busy}>
+                ${busy ? 'Connecting…' : 'Connect'}
+              </button>
+            </div>
+          </form>
+          <div class="notice spaced-lg">
+            <strong>What a token allows</strong>
+            <span>
+              Everything this browser does runs as the role you gave the token, and that machine
+              keeps a record. Remove the token there and this browser is locked out at once.
+            </span>
           </div>
-        </form>
-        <div class="notice spaced-lg">
-          <strong>What a token allows</strong>
-          <span>
-            Everything this browser does runs as the role you gave the token, and that machine
-            keeps a record. Remove the token there and this browser is locked out at once.
-          </span>
         </div>
       </main>
     </div>
