@@ -248,9 +248,15 @@ pub fn put<R: Read>(
         });
     }
 
-    if let Some(m) = mode {
-        platform::set_mode(&partial, m & 0o777)?;
-    }
+    let final_mode = match mode {
+        Some(m) => m & 0o777,
+        None => fs::symlink_metadata(path)
+            .ok()
+            .and_then(|meta| platform::entry_mode(&meta))
+            .map(|m| m & 0o777)
+            .unwrap_or(0o644),
+    };
+    platform::set_mode(&partial, final_mode)?;
 
     platform::replace_file(&partial, path)?;
     let parent = match path.parent() {
@@ -268,11 +274,7 @@ pub fn put<R: Read>(
 
 fn open_partial_at_offset(target: &Path, partial: &Path, size: u64, offset: u64) -> Result<File> {
     if offset == 0 {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(partial)
-        {
+        match platform::create_new_private(partial) {
             Ok(file) => Ok(file),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 let meta = fs::symlink_metadata(partial).map_err(|e| classify_io(partial, e))?;
@@ -286,11 +288,13 @@ fn open_partial_at_offset(target: &Path, partial: &Path, size: u64, offset: u64)
                 if actual > size {
                     // A stale partial file larger than the whole incoming file cannot be a valid
                     // prefix of this transfer; truncate and start cleanly from offset 0.
-                    return OpenOptions::new()
+                    let file = OpenOptions::new()
                         .write(true)
                         .truncate(true)
                         .open(partial)
-                        .map_err(|e| classify_io(partial, e));
+                        .map_err(|e| classify_io(partial, e))?;
+                    platform::set_mode(partial, 0o600)?;
+                    return Ok(file);
                 }
                 if actual != 0 {
                     return Err(Error::BadOffset {
@@ -299,10 +303,12 @@ fn open_partial_at_offset(target: &Path, partial: &Path, size: u64, offset: u64)
                         actual,
                     });
                 }
-                OpenOptions::new()
+                let file = OpenOptions::new()
                     .write(true)
                     .open(partial)
-                    .map_err(|e| classify_io(partial, e))
+                    .map_err(|e| classify_io(partial, e))?;
+                platform::set_mode(partial, 0o600)?;
+                Ok(file)
             }
             Err(err) => Err(classify_io(partial, err)),
         }
@@ -642,5 +648,77 @@ mod tests {
 
         assert_eq!(fs::read(&dst).unwrap(), payload);
         assert!(!stale.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_creates_private_partial_and_resolves_final_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let new_file = dir.path().join("fresh.bin");
+        let payload = b"secret while in flight";
+        let hash = hash_bytes(payload);
+
+        // Interrupted put leaves a 0o600 partial file.
+        let _ = put(
+            &new_file,
+            payload.len() as u64,
+            hash,
+            0,
+            Cursor::new(&payload[..6]),
+            None,
+        );
+        let partial = part_path(&new_file).unwrap();
+        let part_mode = fs::metadata(&partial).unwrap().permissions().mode() & 0o777;
+        assert_eq!(part_mode, 0o600);
+
+        // Completing without an explicit mode defaults to 0o644 for a new file.
+        put(
+            &new_file,
+            payload.len() as u64,
+            hash,
+            6,
+            Cursor::new(&payload[6..]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&new_file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        // Replacing an existing file with mode=None preserves its existing mode.
+        let existing = dir.path().join("script.sh");
+        fs::write(&existing, b"old").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o750)).unwrap();
+        put(
+            &existing,
+            payload.len() as u64,
+            hash,
+            0,
+            Cursor::new(payload),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+
+        // Explicit mode overrides the existing target's mode.
+        put(
+            &existing,
+            payload.len() as u64,
+            hash,
+            0,
+            Cursor::new(payload),
+            Some(0o640),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 }

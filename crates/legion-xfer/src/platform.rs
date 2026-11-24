@@ -1,6 +1,7 @@
 //! Platform-specific filesystem hooks isolated behind uniform signatures.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -67,6 +68,23 @@ pub(crate) fn entry_mode(meta: &fs::Metadata) -> Option<u32> {
 #[cfg(not(unix))]
 pub(crate) fn entry_mode(_meta: &fs::Metadata) -> Option<u32> {
     None
+}
+
+/// Creates a brand-new file with mode `0o600` on Unix so in-flight partial data is private.
+#[cfg(unix)]
+pub(crate) fn create_new_private(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Creates a brand-new file on non-Unix platforms.
+#[cfg(not(unix))]
+pub(crate) fn create_new_private(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 /// Applies POSIX permission bits on Unix; no-op on non-Unix platforms.
