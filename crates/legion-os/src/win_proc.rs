@@ -99,7 +99,6 @@ fn is_still_running(handle: HANDLE, exit_filetime: u64) -> bool {
 
 /// Read the exact 100-ns `FILETIME` creation timestamp from a borrowed process handle (for example
 /// `std::process::Child::as_handle()`).
-#[allow(dead_code)]
 pub(crate) fn creation_time_from_handle(handle: BorrowedHandle<'_>) -> Result<u64> {
     let raw = HANDLE(handle.as_raw_handle());
     let (creation, _exit) = query_times_raw(raw, "child process handle")?;

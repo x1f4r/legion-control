@@ -10,10 +10,11 @@
 //! under the WMI service host outside the caller's job so it outlives the SSH session.
 
 use std::io;
+use std::os::windows::io::AsHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use windows::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
@@ -21,6 +22,7 @@ use windows::Win32::System::Threading::{
 
 use crate::procid::{self, ProcessId};
 use crate::shell::ResolvedCommand;
+use crate::win_proc;
 use crate::{OsError, Result};
 
 use super::{DetachOptions, build_wmi_create_script, build_wmi_launcher_script, open_append_stdio};
@@ -59,11 +61,13 @@ pub(super) async fn spawn_detached(
     match spawn_result {
         Ok(child) => {
             let pid = child.id();
-            let identity = lookup_or_fallback_identity(pid)?;
+            // Read the exact 100-ns FILETIME creation timestamp directly from the process handle we
+            // already hold; this stays valid even if the child exits immediately and never guesses.
+            let start_time = win_proc::creation_time_from_handle(child.as_handle())?;
             // Dropping std::process::Child on Windows closes our process handle without killing
             // the detached child.
             drop(child);
-            Ok(identity)
+            Ok(ProcessId::new(pid, start_time))
         }
         Err(err) if is_breakaway_refused(&err) => spawn_via_wmi(resolved, options).await,
         Err(err) => Err(OsError::from_spawn_io(program_display, err)),
@@ -169,7 +173,9 @@ async fn spawn_via_wmi(resolved: &ResolvedCommand, options: &DetachOptions) -> R
             ),
         })?;
 
-    lookup_or_fallback_identity(pid)
+    procid::of_pid_including_zombie(pid)?.ok_or_else(|| OsError::Platform {
+        detail: format!("could not read process creation time for detached pid {pid}"),
+    })
 }
 
 fn absolutize(path: &Path) -> Result<PathBuf> {
@@ -179,16 +185,4 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|err| OsError::from_io("cannot determine current directory", err))?;
     Ok(cwd.join(path))
-}
-
-fn lookup_or_fallback_identity(pid: u32) -> Result<ProcessId> {
-    if let Ok(Some(identity)) = procid::of_pid_including_zombie(pid) {
-        return Ok(identity);
-    }
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(1)
-        .max(1);
-    Ok(ProcessId::new(pid, now_secs))
 }
