@@ -718,9 +718,13 @@ fn stat<W: Write>(
 }
 
 /// Whether the file system holding `path`, or the nearest directory above it that exists,
-/// ignores letter case, told without writing anything: a name there, one of its entries or of the
-/// directories above it, is looked up again with the case of its letters flipped, and the two are
-/// the same file only where case is ignored. `None` when no name nearby has a letter to flip.
+/// ignores letter case, told without writing anything: a name in that directory is looked up again
+/// with the case of its letters flipped, and the two are the same file only where case is ignored.
+///
+/// Only names inside the directory are on its file system: the directory's own name, and those
+/// above it, are in the directory that holds it, which a mount point's is not. `None` when the
+/// directory holds no name with a letter to flip, which a transfer takes as ignoring case, since
+/// that only holds back names that would collide.
 fn case_insensitive(path: &Path) -> Option<bool> {
     let dir = path
         .ancestors()
@@ -731,8 +735,7 @@ fn case_insensitive(path: &Path) -> Option<bool> {
         .take(64)
         .filter_map(Result::ok)
         .map(|entry| entry.path());
-    let above = dir.ancestors().map(Path::to_path_buf);
-    for candidate in inside.chain(above) {
+    for candidate in inside {
         // A link and what it leads to are the same file whatever their names.
         if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink()) {
             continue;

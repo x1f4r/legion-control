@@ -222,7 +222,6 @@ fn stat_tells_whether_a_directory_ignores_letter_case_without_writing() {
     let dir = node.home().join("projects");
     fs::write(dir.join("Probe.txt"), b"").unwrap();
     let ignores_case = dir.join("probe.txt").exists();
-    fs::remove_file(dir.join("Probe.txt")).unwrap();
     let before: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -242,6 +241,13 @@ fn stat_tells_whether_a_directory_ignores_letter_case_without_writing() {
         .map(|e| e.unwrap().path())
         .collect();
     assert_eq!(before, after);
+
+    // An empty directory says nothing about its own file system: one mounted there may differ
+    // from the one its name is in. It is left unsaid, which a transfer takes as ignoring case.
+    let ran = node.run(None, &json!({"op": "stat", "path": "~/other"}), b"");
+    let (line, _) = ran.ok().first();
+    assert_eq!(line["kind"], "dir");
+    assert!(line.get("case_insensitive").is_none(), "{line}");
 }
 
 #[cfg(unix)]
