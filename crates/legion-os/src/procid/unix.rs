@@ -1,6 +1,8 @@
 //! Unix process identity, boot identity, and process-tree termination.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
@@ -460,6 +462,117 @@ fn has_live_group_or_session_member(
     false
 }
 
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod linux_pidfd {
+    use std::io;
+
+    use nix::errno::Errno;
+    use nix::sys::signal::Signal;
+
+    use crate::procid::ProcessId;
+
+    /// Owned Linux `pidfd` pinning a specific kernel `struct pid` instance so `pidfd_send_signal`
+    /// can never hit a recycled PID even after the target exits and is reaped.
+    pub(super) struct PidFd(libc::c_int);
+
+    impl Drop for PidFd {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is an owned file descriptor returned by `SYS_pidfd_open` and is
+            // closed exactly once on drop.
+            let _ = unsafe { libc::close(self.0) };
+        }
+    }
+
+    pub(super) enum VerifiedOpen {
+        Pinned(PidFd),
+        GoneOrMismatch,
+        FallbackToPid,
+    }
+
+    impl PidFd {
+        pub(super) fn send_signal(&self, sig: Signal) -> std::result::Result<(), Errno> {
+            self.send_raw(sig as libc::c_int)
+        }
+
+        pub(super) fn send_raw(&self, sig: libc::c_int) -> std::result::Result<(), Errno> {
+            // SAFETY: `self.0` is a valid pidfd, `info` is null (kernel fills default siginfo),
+            // and `flags` is 0 as required by `pidfd_send_signal(2)`.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0,
+                    sig,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0 as libc::c_uint,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                let raw = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EINVAL);
+                Err(Errno::from_raw(raw))
+            }
+        }
+    }
+
+    /// Open a `pidfd` for `identity.pid` and verify `identity.start_time` WHILE holding the fd.
+    ///
+    /// Once verified, `PidFd::send_signal` is immune to PID reuse: if the original process exits
+    /// and another process reuses its PID number, the pidfd still refers to the exited instance
+    /// and `pidfd_send_signal` returns `ESRCH`.
+    pub(super) fn open_verified(identity: &ProcessId) -> VerifiedOpen {
+        let Ok(raw_pid) = libc::c_int::try_from(identity.pid) else {
+            return VerifiedOpen::GoneOrMismatch;
+        };
+        // SAFETY: `SYS_pidfd_open` takes a plain `pid_t` and flags (0); the kernel automatically
+        // sets `O_CLOEXEC` on the returned file descriptor.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw_pid, 0 as libc::c_uint) };
+        if fd < 0 {
+            let raw_err = io::Error::last_os_error().raw_os_error();
+            return match raw_err {
+                Some(libc::ESRCH) => VerifiedOpen::GoneOrMismatch,
+                _ => VerifiedOpen::FallbackToPid,
+            };
+        }
+
+        let pidfd = PidFd(fd as libc::c_int);
+        match crate::procid::of_pid(identity.pid) {
+            Ok(Some(observed)) if identity.matches(&observed) => VerifiedOpen::Pinned(pidfd),
+            _ => VerifiedOpen::GoneOrMismatch,
+        }
+    }
+}
+
+fn signal_verified_once(identity: &ProcessId, sig: Signal) -> std::result::Result<bool, Errno> {
+    #[cfg(target_os = "linux")]
+    match linux_pidfd::open_verified(identity) {
+        linux_pidfd::VerifiedOpen::Pinned(pidfd) => {
+            return match pidfd.send_signal(sig) {
+                Ok(()) => Ok(false),
+                Err(Errno::ESRCH) => Ok(true),
+                Err(err) => Err(err),
+            };
+        }
+        linux_pidfd::VerifiedOpen::GoneOrMismatch => return Ok(true),
+        linux_pidfd::VerifiedOpen::FallbackToPid => {}
+    }
+
+    if !is_alive(identity) {
+        return Ok(true);
+    }
+    let Ok(raw) = i32::try_from(identity.pid) else {
+        return Ok(true);
+    };
+    match kill(Pid::from_raw(raw), sig) {
+        Ok(()) => Ok(false),
+        Err(Errno::ESRCH) => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
 pub(super) async fn kill_process(
     identity: &ProcessId,
     force: bool,
@@ -476,6 +589,50 @@ pub(super) async fn kill_process(
     } else {
         Signal::SIGTERM
     };
+
+    #[cfg(target_os = "linux")]
+    let (already_gone, pinned_pidfd): (bool, Option<Arc<linux_pidfd::PidFd>>) =
+        tokio::task::spawn_blocking(move || -> Result<(bool, Option<Arc<linux_pidfd::PidFd>>)> {
+            match linux_pidfd::open_verified(&identity) {
+                linux_pidfd::VerifiedOpen::Pinned(pidfd) => {
+                    let pidfd = Arc::new(pidfd);
+                    match pidfd.send_signal(initial_sig) {
+                        Ok(()) => Ok((false, Some(pidfd))),
+                        Err(Errno::ESRCH) => Ok((true, None)),
+                        Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                            detail: format!("permission denied signaling process {}", identity.pid),
+                            source: None,
+                        }),
+                        Err(err) => Err(OsError::Platform {
+                            detail: format!("failed signaling process {}: {err}", identity.pid),
+                        }),
+                    }
+                }
+                linux_pidfd::VerifiedOpen::GoneOrMismatch => Ok((true, None)),
+                linux_pidfd::VerifiedOpen::FallbackToPid => {
+                    if !is_alive(&identity) {
+                        return Ok((true, None));
+                    }
+                    match kill(nix_pid, initial_sig) {
+                        Ok(()) => Ok((false, None)),
+                        Err(Errno::ESRCH) => Ok((true, None)),
+                        Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                            detail: format!("permission denied signaling process {}", identity.pid),
+                            source: None,
+                        }),
+                        Err(err) => Err(OsError::Platform {
+                            detail: format!("failed signaling process {}: {err}", identity.pid),
+                        }),
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_process worker task failed: {err}"),
+        })??;
+
+    #[cfg(not(target_os = "linux"))]
     let already_gone = tokio::task::spawn_blocking(move || -> Result<bool> {
         if !is_alive(&identity) {
             return Ok(true);
@@ -521,6 +678,24 @@ pub(super) async fn kill_process(
         }
 
         let gone_on_escalate = tokio::task::spawn_blocking(move || -> Result<bool> {
+            #[cfg(target_os = "linux")]
+            if let Some(pidfd) = pinned_pidfd {
+                return match pidfd.send_signal(Signal::SIGKILL) {
+                    Ok(()) => Ok(false),
+                    Err(Errno::ESRCH) => Ok(true),
+                    Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                        detail: format!("permission denied escalating process {}", identity.pid),
+                        source: None,
+                    }),
+                    Err(err) => Err(OsError::Platform {
+                        detail: format!(
+                            "failed sending SIGKILL to process {}: {err}",
+                            identity.pid
+                        ),
+                    }),
+                };
+            }
+
             if !is_alive(&identity) {
                 return Ok(true);
             }
@@ -573,10 +748,83 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
     let identity = *identity;
     let own_pid = std::process::id();
 
-    // Run the initial identity check, full-table descendant/session/group discovery, and SIGTERM
-    // wave off the async worker thread. Even if the root already exited, any surviving processes
-    // still in its session (`sid == root.pid`) or process group (`pgid == root.pid`) started at or
-    // after `root.start_time` are discovered and stopped.
+    // Run the initial identity check (pinning the root via `pidfd_open` on Linux), full-table
+    // descendant discovery, and SIGTERM wave off the async worker thread.
+    #[cfg(target_os = "linux")]
+    let (mut tracked, target_pgid, root_pidfd): (
+        HashMap<u32, ProcessId>,
+        Option<Pid>,
+        Option<Arc<linux_pidfd::PidFd>>,
+    ) = tokio::task::spawn_blocking(move || {
+        let (root_alive, root_pidfd) = match linux_pidfd::open_verified(&identity) {
+            linux_pidfd::VerifiedOpen::Pinned(fd) => (true, Some(Arc::new(fd))),
+            linux_pidfd::VerifiedOpen::GoneOrMismatch => match super::of_pid(identity.pid) {
+                Ok(Some(_)) | Err(_) => return (HashMap::new(), None, None),
+                Ok(None) => (false, None),
+            },
+            linux_pidfd::VerifiedOpen::FallbackToPid => match super::of_pid(identity.pid) {
+                Ok(Some(observed)) if identity.matches(&observed) => (true, None),
+                Ok(Some(_)) | Err(_) => return (HashMap::new(), None, None),
+                Ok(None) => (false, None),
+            },
+        };
+
+        let own_pgid = getpgrp();
+        let own_sid = getsid(None).ok();
+        let allow_group = root_nix_pid != own_pgid;
+        let allow_session = Some(root_nix_pid) != own_sid;
+
+        let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
+        if root_alive {
+            tracked.insert(identity.pid, identity);
+        }
+
+        let found_in_group = collect_tree_into(
+            &identity,
+            root_nix_pid,
+            allow_group,
+            allow_session,
+            own_pid,
+            &mut tracked,
+        );
+
+        let target_pgid = if allow_group {
+            let live_leader = root_alive && getpgid(Some(root_nix_pid)).ok() == Some(root_nix_pid);
+            if live_leader || found_in_group {
+                Some(root_nix_pid)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if tracked.is_empty() && target_pgid.is_none() {
+            return (tracked, None, None);
+        }
+
+        if let Some(pgid) = target_pgid
+            && root_not_recycled(&identity)
+        {
+            let _ = killpg(pgid, Signal::SIGTERM);
+        }
+        if let Some(ref pidfd) = root_pidfd {
+            let _ = pidfd.send_signal(Signal::SIGTERM);
+        }
+        signal_tracked(
+            &tracked,
+            Signal::SIGTERM,
+            own_pid,
+            root_pidfd.as_ref().map(|_| identity.pid),
+        );
+        (tracked, target_pgid, root_pidfd)
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("kill_tree worker task failed: {err}"),
+    })?;
+
+    #[cfg(not(target_os = "linux"))]
     let (mut tracked, target_pgid) = tokio::task::spawn_blocking(move || {
         let root_alive = match super::of_pid(identity.pid) {
             Ok(Some(observed)) if identity.matches(&observed) => true,
@@ -628,7 +876,7 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         {
             let _ = killpg(pgid, Signal::SIGTERM);
         }
-        signal_tracked(&tracked, Signal::SIGTERM, own_pid);
+        signal_tracked(&tracked, Signal::SIGTERM, own_pid, None);
         (tracked, target_pgid)
     })
     .await
@@ -686,7 +934,16 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
                 let _ = killpg(pgid, Signal::SIGKILL);
             }
         }
-        signal_tracked(&tracked, Signal::SIGKILL, own_pid);
+        #[cfg(target_os = "linux")]
+        let skip_pid = if let Some(ref pidfd) = root_pidfd {
+            let _ = pidfd.send_signal(Signal::SIGKILL);
+            Some(identity.pid)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let skip_pid = None;
+        signal_tracked(&tracked, Signal::SIGKILL, own_pid, skip_pid);
         tracked
     })
     .await
@@ -759,17 +1016,17 @@ fn tracked_is_gone(identity: &ProcessId, target_pgid: Option<Pid>, tracked: &[Pr
     true
 }
 
-fn signal_tracked(tracked: &HashMap<u32, ProcessId>, sig: Signal, own_pid: u32) {
+fn signal_tracked(
+    tracked: &HashMap<u32, ProcessId>,
+    sig: Signal,
+    own_pid: u32,
+    already_signaled_pid: Option<u32>,
+) {
     for proc_id in tracked.values() {
-        if proc_id.pid == own_pid {
+        if proc_id.pid == own_pid || already_signaled_pid == Some(proc_id.pid) {
             continue;
         }
-        if !is_alive(proc_id) {
-            continue;
-        }
-        if let Ok(raw) = i32::try_from(proc_id.pid) {
-            let _ = kill(Pid::from_raw(raw), sig);
-        }
+        let _ = signal_verified_once(proc_id, sig);
     }
 }
 
@@ -890,4 +1147,38 @@ fn collect_tree_into(
     }
 
     found_in_group
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_pidfd_verifies_identity_and_rejects_mismatch_or_absent() {
+        let me = crate::procid::current().unwrap();
+        match linux_pidfd::open_verified(&me) {
+            linux_pidfd::VerifiedOpen::Pinned(pidfd) => {
+                // Signal 0 validates the pidfd without delivering a signal.
+                assert!(pidfd.send_raw(0).is_ok());
+            }
+            linux_pidfd::VerifiedOpen::FallbackToPid => {
+                // Permitted only on kernels/sandboxes where `pidfd_open` is unavailable.
+            }
+            linux_pidfd::VerifiedOpen::GoneOrMismatch => {
+                panic!("pidfd_open unexpectedly rejected current process {me}");
+            }
+        }
+
+        let mismatched = ProcessId::new(me.pid, me.start_time.wrapping_add(1));
+        assert!(matches!(
+            linux_pidfd::open_verified(&mismatched),
+            linux_pidfd::VerifiedOpen::GoneOrMismatch | linux_pidfd::VerifiedOpen::FallbackToPid
+        ));
+
+        let absent = ProcessId::new(i32::MAX as u32, 1);
+        assert!(matches!(
+            linux_pidfd::open_verified(&absent),
+            linux_pidfd::VerifiedOpen::GoneOrMismatch | linux_pidfd::VerifiedOpen::FallbackToPid
+        ));
+    }
 }
