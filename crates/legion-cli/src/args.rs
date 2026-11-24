@@ -76,7 +76,7 @@ pub enum GateHome {
     },
 }
 
-/// `legion gate --as P [--device NAME] [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`
+/// `legion gate --as P [--device NAME --pairing ID] [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`
 /// or `legion gate --enrol ID [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`.
 #[derive(Debug, PartialEq)]
 pub enum GateCommand {
@@ -86,6 +86,9 @@ pub enum GateCommand {
         pinned: String,
         /// Optional paired device name for live-session tracking and immediate revocation.
         device: Option<String>,
+        /// Per-pairing random identifier paired with `--device`, preventing re-pairing under the
+        /// same device name from reviving an earlier removed connection.
+        pairing: Option<String>,
         /// Optional pinned OS account name (used on shared `administrators_authorized_keys`).
         account: Option<String>,
         /// Pinned Legion home directories (`--home` or `--config-dir`/`--state-dir`).
@@ -494,11 +497,12 @@ pub fn command_help(name: &str) -> Option<&'static str> {
     }
 }
 
-/// `legion gate --as PRINCIPAL [--device NAME] [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`
+/// `legion gate --as PRINCIPAL [--device NAME --pairing ID] [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`
 /// or `--enrol ID [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`.
 fn gate(rest: &[String]) -> Result<Command, UsageError> {
     let mut pinned = None;
     let mut device = None;
+    let mut pairing = None;
     let mut account = None;
     let mut enrol_id = None;
     let mut home: Option<PathBuf> = None;
@@ -536,6 +540,14 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
                     .map_err(|error| UsageError(format!("--device: {}", error.message)))?;
                 if device.replace(value).is_some() {
                     return Err(UsageError("--device is given twice.".to_owned()));
+                }
+            }
+            "--pairing" => {
+                let value = take_value(name)?;
+                legion_tools::device::keys::validate_pairing_id(&value)
+                    .map_err(|error| UsageError(format!("--pairing: {}", error.message)))?;
+                if pairing.replace(value).is_some() {
+                    return Err(UsageError("--pairing is given twice.".to_owned()));
                 }
             }
             "--account" => {
@@ -612,16 +624,25 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
         }
     };
     match (pinned, enrol_id) {
-        (Some(pinned), None) => Ok(Command::Gate(GateCommand::As {
-            pinned,
-            device,
-            account,
-            home: gate_home,
-        })),
-        (None, Some(id)) => {
-            if device.is_some() {
+        (Some(pinned), None) => {
+            if device.is_some() != pairing.is_some() {
                 return Err(UsageError(
-                    "--device is only valid with `gate --as`, not `gate --enrol`.".to_owned(),
+                    "gate requires --device and --pairing to be given together.".to_owned(),
+                ));
+            }
+            Ok(Command::Gate(GateCommand::As {
+                pinned,
+                device,
+                pairing,
+                account,
+                home: gate_home,
+            }))
+        }
+        (None, Some(id)) => {
+            if device.is_some() || pairing.is_some() {
+                return Err(UsageError(
+                    "--device and --pairing are only valid with `gate --as`, not `gate --enrol`."
+                        .to_owned(),
                 ));
             }
             Ok(Command::Gate(GateCommand::Enrol {
@@ -1573,6 +1594,7 @@ mod tests {
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
                 device: None,
+                pairing: None,
                 account: None,
                 home: GateHome::Default,
             }))
@@ -1590,6 +1612,8 @@ mod tests {
                 "agent:example",
                 "--device",
                 "pixel",
+                "--pairing",
+                "0123456789abcdef0123456789abcdef",
                 "--account",
                 "me",
                 "--home",
@@ -1598,6 +1622,7 @@ mod tests {
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
                 device: Some("pixel".into()),
+                pairing: Some("0123456789abcdef0123456789abcdef".into()),
                 account: Some("me".into()),
                 home: GateHome::Root(abs_home.clone()),
             }))
@@ -1609,6 +1634,8 @@ mod tests {
                 "agent:example",
                 "--device",
                 "pixel",
+                "--pairing",
+                "fedcba9876543210fedcba9876543210",
                 "--config-dir",
                 &abs_cfg_str,
                 "--state-dir",
@@ -1617,6 +1644,7 @@ mod tests {
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
                 device: Some("pixel".into()),
+                pairing: Some("fedcba9876543210fedcba9876543210".into()),
                 account: None,
                 home: GateHome::Split {
                     config_dir: abs_cfg,
@@ -1674,6 +1702,23 @@ mod tests {
                 &abs_state_str,
             ],
             &["gate", "--as", "phone", "--device", "../escape"],
+            &["gate", "--as", "phone", "--device", "pixel"],
+            &[
+                "gate",
+                "--as",
+                "phone",
+                "--pairing",
+                "0123456789abcdef0123456789abcdef",
+            ],
+            &[
+                "gate",
+                "--as",
+                "phone",
+                "--device",
+                "pixel",
+                "--pairing",
+                "bad/id",
+            ],
             &["gate", "--as", "phone", "--account", "-bad"],
             &["gate", "--as", "phone", "--account", "has space"],
             &[

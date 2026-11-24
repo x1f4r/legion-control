@@ -389,11 +389,12 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
     assert_eq!(enrolled.role, "operator");
     assert_eq!(enrolled.device, "link-phone");
 
-    // Verify the installed forced command carries `--as`, `--device`, and `--home`.
+    // Verify the installed forced command carries `--as`, `--device`, `--pairing`, and `--home`.
     let installed_auth = fs::read_to_string(&auth_keys).unwrap();
     assert!(
         installed_auth.contains("--as phone")
             && installed_auth.contains("--device link-phone")
+            && installed_auth.contains("--pairing ")
             && installed_auth.contains("--home "),
         "unexpected authorized_keys line:\n{installed_auth}"
     );

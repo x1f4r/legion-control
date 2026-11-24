@@ -70,6 +70,9 @@ pub struct DeviceRecord {
     pub added: String,
     /// `SHA256:...` fingerprint of the device's public key.
     pub fingerprint: String,
+    /// Random per-pairing identifier pinned via `--pairing <id>` in `authorized_keys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_id: Option<String>,
 }
 
 /// Returns the owner-only lock file path placed beside `write_path` so distinct Legion homes

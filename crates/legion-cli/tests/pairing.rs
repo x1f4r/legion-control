@@ -830,7 +830,12 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
 
     let my_pub = ed25519_public_key_from_seed(&[21_u8; 32]);
     let other_pub = ed25519_public_key_from_seed(&[22_u8; 32]);
-    let exe = Path::new("/usr/local/bin/legion");
+    let exe = Path::new(env!("CARGO_BIN_EXE_legion"));
+    let shell = if cfg!(windows) {
+        legion_tools::device::authkeys::ForcedCommandShell::WindowsCmd
+    } else {
+        legion_tools::device::authkeys::ForcedCommandShell::Posix
+    };
     let pinned_home = legion_tools::device::authkeys::PinnedHome::Root(
         home.state().parent().unwrap().to_path_buf(),
     );
@@ -839,9 +844,10 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
         "phone",
         &my_pub,
         "my-phone",
+        "11111111111111111111111111111111",
         &pinned_home,
         Some(&me),
-        legion_tools::device::authkeys::ForcedCommandShell::Posix,
+        shell,
     )
     .unwrap();
     let other_line = legion_tools::device::authkeys::format_device_line(
@@ -849,9 +855,10 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
         "phone",
         &other_pub,
         "other-phone",
+        "22222222222222222222222222222222",
         &pinned_home,
         Some(&other_account),
-        legion_tools::device::authkeys::ForcedCommandShell::Posix,
+        shell,
     )
     .unwrap();
     std::fs::write(&auth_keys, format!("{my_line}\n{other_line}\n")).unwrap();
@@ -1511,7 +1518,9 @@ fn real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels(
     .unwrap();
 
     // Helper to enrol a fresh device key under `label` via real sshd.
+    let key_seq = std::sync::atomic::AtomicUsize::new(0);
     let enrol_device = |label: &str| -> std::path::PathBuf {
+        let seq = key_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let invite_run = home.run(&[
             "device.invite",
             "principal=phone",
@@ -1525,10 +1534,10 @@ fn real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels(
             invite_run.stdout, invite_run.stderr
         );
         let payload = InvitePayload::decode(invite_run.json()["invite"].as_str().unwrap()).unwrap();
-        let temp_key = client_dir.path().join(format!("{label}_temp_key"));
+        let temp_key = client_dir.path().join(format!("{label}_{seq}_temp_key"));
         write_openssh_ed25519_private_key(&temp_key, &payload.decode_seed().unwrap(), label)
             .unwrap();
-        let device_key = client_dir.path().join(format!("{label}_ed25519"));
+        let device_key = client_dir.path().join(format!("{label}_{seq}_ed25519"));
         let device_pub =
             generate_ed25519_keypair(sshd.ssh_keygen_bin(), &device_key, label).unwrap();
 
@@ -1814,6 +1823,68 @@ fn real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels(
         "refused gate must not write RPC output: {:?}",
         String::from_utf8_lossy(&after_fresh.stdout)
     );
+    // The refusing gate must also end its verified parent sshd connection so the ControlMaster
+    // cannot linger afterwards.
+    let fresh_dead_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < fresh_dead_deadline && ctl_is_alive(&fresh_ctl.ctl_path) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ctl_is_alive(&fresh_ctl.ctl_path),
+        "never-used ControlMaster stayed alive after refusing gate exited"
+    );
+
+    // 4. Re-pairing under the exact same device name and principal MUST NOT revive an earlier
+    //    removed pairing's open ControlMaster connection (each pairing carries its own random
+    //    `--pairing <id>`), and the refusing gate must terminate the stale parent sshd too.
+    let repair_old_key = enrol_device("mux-repair");
+    let repair_old_ctl = start_master(&repair_old_key, "repair-old");
+    assert!(ctl_is_alive(&repair_old_ctl.ctl_path));
+
+    let rm_repair = home.run(&["device.remove", "name=mux-repair"]);
+    assert_eq!(rm_repair.code, 0, "rm_repair: {}", rm_repair.stderr);
+
+    // Pair a brand-new phone under the EXACT SAME name (`mux-repair`) and principal (`phone`).
+    let repair_new_key = enrol_device("mux-repair");
+
+    let old_after_repair = run_whoami_via_ctl(&repair_old_ctl.ctl_path);
+    assert!(
+        !old_after_repair.status.success(),
+        "old ControlMaster was revived after re-pairing under the same name! stdout={} stderr={}",
+        String::from_utf8_lossy(&old_after_repair.stdout),
+        String::from_utf8_lossy(&old_after_repair.stderr)
+    );
+    let repair_stderr = String::from_utf8_lossy(&old_after_repair.stderr);
+    assert!(
+        repair_stderr.contains("no longer authorized"),
+        "expected pairing-mismatch refusal on stderr, got: {repair_stderr:?}"
+    );
+    assert!(
+        old_after_repair.stdout.is_empty(),
+        "refused old pairing must not emit RPC output: {:?}",
+        String::from_utf8_lossy(&old_after_repair.stdout)
+    );
+    let repair_dead_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < repair_dead_deadline && ctl_is_alive(&repair_old_ctl.ctl_path)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ctl_is_alive(&repair_old_ctl.ctl_path),
+        "old ControlMaster stayed alive after re-pair refusal"
+    );
+
+    // The newly paired device under the same name still connects and works normally.
+    let new_ctl = start_master(&repair_new_key, "repair-new");
+    let new_ok = run_whoami_via_ctl(&new_ctl.ctl_path);
+    assert!(
+        new_ok.status.success(),
+        "newly paired mux-repair failed: {}",
+        String::from_utf8_lossy(&new_ok.stderr)
+    );
+    let new_reply: Value =
+        serde_json::from_str(String::from_utf8_lossy(&new_ok.stdout).trim()).unwrap();
+    assert_eq!(new_reply["result"]["principal"], json!("phone"));
 
     // Unrelated bystander ControlMaster and the sshd listener must both remain intact.
     assert!(
@@ -1846,11 +1917,14 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
 
     let key_a = ed25519_public_key_from_seed(&[31_u8; 32]);
     let key_b = ed25519_public_key_from_seed(&[32_u8; 32]);
+    let pairing_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let pairing_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let line_a = legion_tools::device::authkeys::format_device_line(
         exe,
         "phone",
         &key_a,
         "job-phone",
+        pairing_a,
         &pinned_home,
         None,
         shell,
@@ -1861,6 +1935,7 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
         "phone",
         &key_b,
         "other-phone",
+        pairing_b,
         &pinned_home,
         None,
         shell,
@@ -1890,7 +1965,7 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
         "sleep 30"
     };
 
-    let start_job_via_gate = |device: &str| -> String {
+    let start_job_via_gate = |device: &str, pairing_id: &str| -> String {
         let mut child = home
             .command(&[
                 "gate",
@@ -1898,6 +1973,8 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
                 "phone",
                 "--device",
                 device,
+                "--pairing",
+                pairing_id,
                 "--home",
                 &home_root.to_string_lossy(),
             ])
@@ -1935,8 +2012,8 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
             .to_owned()
     };
 
-    let job_a = start_job_via_gate("job-phone");
-    let job_b = start_job_via_gate("other-phone");
+    let job_a = start_job_via_gate("job-phone", pairing_a);
+    let job_b = start_job_via_gate("other-phone", pairing_b);
     let owner_job_run = home.run(&["job.start", &format!("cmd={sleep_cmd}")]);
     assert_eq!(
         owner_job_run.code, 0,

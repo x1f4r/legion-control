@@ -23,7 +23,7 @@ use super::authkeys::{
     resolve_safe_write_path, resolve_target, verify_exe_not_group_or_world_writable,
     verify_owner_matches_euid,
 };
-use super::keys::{validate_ed25519_public_key, validate_invite_id};
+use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
     unique_device_name,
@@ -456,12 +456,17 @@ fn process_enrol_blocking(
             Ok(shell) => shell,
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
         };
+        let pairing_id = match generate_pairing_id() {
+            Ok(id) => id,
+            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
+        };
         let pinned_home = PinnedHome::from_paths(paths);
         let permanent_line = match format_device_line(
             &exe,
             &principal,
             &validated_key.canonical,
             &device_name,
+            &pairing_id,
             &pinned_home,
             pinned_account.as_deref(),
             shell,
@@ -486,6 +491,7 @@ fn process_enrol_blocking(
                 principal: principal.clone(),
                 added,
                 fingerprint: validated_key.fingerprint.clone(),
+                pairing_id: Some(pairing_id),
             },
         );
 

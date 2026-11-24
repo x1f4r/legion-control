@@ -409,6 +409,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     principal,
                     home,
                     account,
+                    ..
                 } => {
                     if !line_matches_account(
                         account.as_deref(),
@@ -1992,14 +1993,24 @@ role = "owner"
                 windows_admin_acl: false,
             };
             let id = format!("rollback{label}");
+            let fake_exe = if cfg!(windows) {
+                dir.path().join("legion.exe")
+            } else {
+                dir.path().join("legion")
+            };
+            let shell = if cfg!(windows) {
+                ForcedCommandShell::WindowsCmd
+            } else {
+                ForcedCommandShell::Posix
+            };
             let invite_line = format_invite_line(
-                std::path::Path::new("/home/me/.local/bin/legion"),
+                &fake_exe,
                 &id,
                 exp,
                 &eph.public_key,
                 &PinnedHome::from_paths(&paths),
                 None,
-                ForcedCommandShell::Posix,
+                shell,
             )
             .unwrap();
             let record = InviteRecord {

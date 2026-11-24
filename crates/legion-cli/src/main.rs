@@ -223,11 +223,12 @@ async fn run(command: Command) -> ExitCode {
         Command::Gate(GateCommand::As {
             pinned,
             device,
+            pairing,
             account,
             ..
         }) => {
             let shutdown = install_shutdown_token();
-            gate(node, router, pinned, device, account, shutdown).await
+            gate(node, router, pinned, device, pairing, account, shutdown).await
         }
         Command::Gate(GateCommand::Enrol { id, account, .. }) => {
             let shutdown = install_shutdown_token();
@@ -337,6 +338,7 @@ async fn gate(
     router: Arc<dyn Router>,
     pinned: String,
     device: Option<String>,
+    pairing: Option<String>,
     account: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
@@ -369,7 +371,7 @@ async fn gate(
     } else {
         None
     };
-    if let Some(device_name) = device.as_deref() {
+    if let (Some(device_name), Some(pairing_id)) = (device.as_deref(), pairing.as_deref()) {
         let auth_check = node
             .config()
             .get::<legion_core::config::NodeFile>()
@@ -378,16 +380,17 @@ async fn gate(
                     node.paths(),
                     &node_file,
                     device_name,
+                    pairing_id,
                     &pinned,
                     account.as_deref(),
                 )
             });
         if let Err(error) = auth_check {
-            if let Some(mut guard) = session.take() {
-                guard.cancel_connection_record();
-            }
-            router.shutdown().await;
             err(&format!("legion gate: {}\n", error.message));
+            router.shutdown().await;
+            if let Some(guard) = session.take() {
+                guard.reject_and_terminate_parent().await;
+            }
             return ExitCode::from(FAILED);
         }
     }

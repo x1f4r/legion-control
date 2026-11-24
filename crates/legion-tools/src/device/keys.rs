@@ -192,6 +192,41 @@ pub fn validate_invite_id(id: &str) -> Result<(), ErrorBody> {
     Ok(())
 }
 
+/// Generates a random per-pairing identifier (128 bits, 32 lowercase hex characters) embedded in
+/// `legion gate --as ... --device <name> --pairing <id>` so re-pairing under the same device name
+/// and principal can never revive an earlier revoked pairing's open SSH connection.
+pub(crate) fn generate_pairing_id() -> Result<String, ErrorBody> {
+    let mut bytes = [0_u8; INVITE_ID_BYTES];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("The operating system gave no random bytes for the pairing id: {error}."),
+        )
+    })?;
+    let mut out = String::with_capacity(INVITE_ID_BYTES * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
+}
+
+/// Validates a per-pairing identifier passed via `--pairing <id>` (32 lowercase hex characters).
+pub fn validate_pairing_id(id: &str) -> Result<(), ErrorBody> {
+    let valid_hex = id.len() == INVITE_ID_BYTES * 2
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !valid_hex {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("{id:?} is not a valid pairing id."),
+        )
+        .with_hint("Pairing ids are generated automatically during device enrolment."));
+    }
+    Ok(())
+}
+
 /// Encodes a raw 32-byte Ed25519 public key into the 51-byte OpenSSH wire blob.
 pub fn encode_ed25519_wire_blob(public_key: &[u8; 32]) -> [u8; ED25519_WIRE_BLOB_LEN] {
     let mut blob = [0_u8; ED25519_WIRE_BLOB_LEN];

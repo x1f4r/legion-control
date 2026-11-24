@@ -562,7 +562,15 @@ pub fn format_forced_command(
     args: &[&str],
     shell: ForcedCommandShell,
 ) -> Result<String, ErrorBody> {
-    if !exe.is_absolute() && !looks_windows_absolute(exe) {
+    let exe_is_abs = match shell {
+        ForcedCommandShell::Posix => {
+            exe.is_absolute() || looks_posix_absolute(exe) || looks_windows_absolute(exe)
+        }
+        ForcedCommandShell::WindowsCmd | ForcedCommandShell::WindowsPowerShell => {
+            exe.is_absolute() || looks_windows_absolute(exe)
+        }
+    };
+    if !exe_is_abs {
         return Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
@@ -711,6 +719,10 @@ pub fn format_forced_command(
     Ok(command.replace('"', "\\\""))
 }
 
+fn looks_posix_absolute(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| s.starts_with('/'))
+}
+
 fn looks_windows_absolute(path: &Path) -> bool {
     let Some(text) = path.to_str() else {
         return false;
@@ -800,17 +812,19 @@ pub fn verify_gate_account(expected: Option<&str>) -> Result<(), ErrorBody> {
 }
 
 /// Verifies that `authorized_keys` still contains a Legion-managed device line for `device`
-/// pinned to `principal`, `paths`, and `account` (when present or required on Windows's shared
-/// `administrators_authorized_keys`).
+/// pinned to `pairing_id`, `principal`, `paths`, and `account` (when present or required on
+/// Windows's shared `administrators_authorized_keys`).
 ///
-/// Called by `legion gate --as <principal> --device <name>` immediately after registering its
-/// session record so a gate starting on an already-open multiplexed SSH connection (`ControlMaster`)
-/// or racing with `device.remove` refuses to serve once the line has been removed. Strictly
-/// read-only.
+/// Called by `legion gate --as <principal> --device <name> --pairing <id>` immediately after
+/// registering its session record so a gate starting on an already-open multiplexed SSH connection
+/// (`ControlMaster`) or racing with `device.remove` refuses to serve once that specific pairing
+/// has been removed—even if a new device is later paired under the same name and principal.
+/// Strictly read-only.
 pub fn verify_device_authorized(
     paths: &Paths,
     node_file: &NodeFile,
     device: &str,
+    pairing_id: &str,
     principal: &str,
     account: Option<&str>,
 ) -> Result<(), ErrorBody> {
@@ -829,11 +843,13 @@ pub fn verify_device_authorized(
             &line.kind,
             LineKind::Device {
                 name,
+                pairing_id: line_pairing,
                 principal: line_principal,
                 home,
                 account: line_account,
                 ..
             } if name == device
+                && line_pairing == pairing_id
                 && line_principal == principal
                 && line_matches_home(home.as_ref(), paths)
                 && line_matches_account(
@@ -984,27 +1000,34 @@ pub fn format_invite_line(
 
 /// Formats a permanent paired device line for `authorized_keys`.
 ///
-/// Includes `--device <device_name>` so `legion gate --as` tracks live sessions for immediate
-/// revocation by `device.remove`, and always pins `pinned_home` (`--home <root>` or
+/// Includes `--device <device_name> --pairing <pairing_id>` so `legion gate --as` tracks live
+/// sessions for immediate revocation by `device.remove` and verifies that this exact pairing is
+/// still present in `authorized_keys` (so re-pairing under the same name cannot revive a revoked
+/// connection), and always pins `pinned_home` (`--home <root>` or
 /// `--config-dir <cfg> --state-dir <st>`) so `legion gate --as` always reads the same Legion home
 /// regardless of `sshd`'s session environment or `AcceptEnv`. When `account` is `Some` (such as on
 /// Windows's shared `administrators_authorized_keys`), appends `--account <name>` so no other
 /// account on the same machine can authenticate with this key.
+#[allow(clippy::too_many_arguments)]
 pub fn format_device_line(
     exe: &Path,
     principal: &str,
     pubkey: &str,
     device_name: &str,
+    pairing_id: &str,
     pinned_home: &PinnedHome,
     account: Option<&str>,
     shell: ForcedCommandShell,
 ) -> Result<String, ErrorBody> {
+    crate::device::keys::validate_pairing_id(pairing_id)?;
     let mut owned_args = vec![
         "gate".to_owned(),
         "--as".to_owned(),
         principal.to_owned(),
         "--device".to_owned(),
         device_name.to_owned(),
+        "--pairing".to_owned(),
+        pairing_id.to_owned(),
     ];
     if let Some(acct) = account {
         validate_account_name(acct)?;
@@ -1038,14 +1061,17 @@ pub enum LineKind {
         /// Pinned `--account` name extracted from the forced command, when present.
         account: Option<String>,
     },
-    /// Paired device line with `restrict`, an exact `legion gate --as <principal> --device <name>`
-    /// command, and a matching `legion-device:<name>` comment.
+    /// Paired device line with `restrict`, an exact
+    /// `legion gate --as <principal> --device <name> --pairing <id>` command, and a matching
+    /// `legion-device:<name>` comment.
     Device {
         /// Device name after `legion-device:` (matches `--device <name>`).
         name: String,
+        /// Per-pairing random identifier extracted from `--pairing <id>`.
+        pairing_id: String,
         /// Base64 key blob on the line.
         key_b64: String,
-        /// Principal extracted from `command="... gate --as <principal> --device <name>"`.
+        /// Principal extracted from `command="... gate --as <principal> --device <name> --pairing <id>"`.
         principal: String,
         /// Pinned Legion home (`--home` or `--config-dir`/`--state-dir`) from the forced command.
         home: Option<PinnedHome>,
@@ -1568,11 +1594,16 @@ fn classify_line(raw: &[u8]) -> LineKind {
     if let Some(name) = comment.strip_prefix(DEVICE_COMMENT_PREFIX)
         && !name.is_empty()
         && !name.chars().any(char::is_whitespace)
-        && let GateCommandMode::Device { principal, device } = parsed_cmd.mode
+        && let GateCommandMode::Device {
+            principal,
+            device,
+            pairing_id,
+        } = parsed_cmd.mode
         && device == name
     {
         return LineKind::Device {
             name: name.to_owned(),
+            pairing_id,
             key_b64: key_b64.to_owned(),
             principal,
             home: parsed_cmd.home,
@@ -1727,8 +1758,14 @@ fn parse_openssh_options(options: &str) -> Option<Vec<(String, Option<String>)>>
 }
 
 enum GateCommandMode {
-    Device { principal: String, device: String },
-    Invite { id: String },
+    Device {
+        principal: String,
+        device: String,
+        pairing_id: String,
+    },
+    Invite {
+        id: String,
+    },
 }
 
 struct ParsedGateCommand {
@@ -1739,7 +1776,7 @@ struct ParsedGateCommand {
 
 fn exe_looks_like_legion(exe: &str) -> bool {
     let path = Path::new(exe);
-    if !path.is_absolute() && !looks_windows_absolute(path) {
+    if !path.is_absolute() && !looks_posix_absolute(path) && !looks_windows_absolute(path) {
         return false;
     }
     let basename = exe.rsplit(['/', '\\']).next().unwrap_or("");
@@ -1752,8 +1789,8 @@ fn exe_looks_like_legion(exe: &str) -> bool {
 }
 
 /// Strictly parses an unescaped forced command and returns `Some` only when it is an exact
-/// `legion gate --as <principal> --device <name>` or `legion gate --enrol <id>` invocation with
-/// no unknown flags, extra arguments, duplicate flags, or shell operators.
+/// `legion gate --as <principal> --device <name> --pairing <id>` or `legion gate --enrol <id>`
+/// invocation with no unknown flags, extra arguments, duplicate flags, or shell operators.
 fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
     let tokens = split_forced_command_tokens_strict(command)?;
     let (exe, subcmd, rest) = if tokens.first().map(String::as_str) == Some("&") {
@@ -1773,6 +1810,7 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
 
     let mut principal: Option<String> = None;
     let mut device: Option<String> = None;
+    let mut pairing_id: Option<String> = None;
     let mut enrol_id: Option<String> = None;
     let mut home_root: Option<PathBuf> = None;
     let mut config_dir: Option<PathBuf> = None;
@@ -1804,6 +1842,13 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
                 }
                 device = Some(value.to_owned());
             }
+            "--pairing" => {
+                if pairing_id.is_some() || crate::device::keys::validate_pairing_id(value).is_err()
+                {
+                    return None;
+                }
+                pairing_id = Some(value.to_owned());
+            }
             "--enrol" => {
                 if enrol_id.is_some()
                     || value.is_empty()
@@ -1817,7 +1862,7 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
                 let p = Path::new(value);
                 if home_root.is_some()
                     || value.is_empty()
-                    || (!p.is_absolute() && !looks_windows_absolute(p))
+                    || (!p.is_absolute() && !looks_posix_absolute(p) && !looks_windows_absolute(p))
                 {
                     return None;
                 }
@@ -1827,7 +1872,7 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
                 let p = Path::new(value);
                 if config_dir.is_some()
                     || value.is_empty()
-                    || (!p.is_absolute() && !looks_windows_absolute(p))
+                    || (!p.is_absolute() && !looks_posix_absolute(p) && !looks_windows_absolute(p))
                 {
                     return None;
                 }
@@ -1837,7 +1882,7 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
                 let p = Path::new(value);
                 if state_dir.is_some()
                     || value.is_empty()
-                    || (!p.is_absolute() && !looks_windows_absolute(p))
+                    || (!p.is_absolute() && !looks_posix_absolute(p) && !looks_windows_absolute(p))
                 {
                     return None;
                 }
@@ -1864,9 +1909,13 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
         _ => return None,
     };
 
-    let mode = match (principal, device, enrol_id) {
-        (Some(principal), Some(device), None) => GateCommandMode::Device { principal, device },
-        (None, None, Some(id)) => GateCommandMode::Invite { id },
+    let mode = match (principal, device, pairing_id, enrol_id) {
+        (Some(principal), Some(device), Some(pairing_id), None) => GateCommandMode::Device {
+            principal,
+            device,
+            pairing_id,
+        },
+        (None, None, None, Some(id)) => GateCommandMode::Invite { id },
         _ => return None,
     };
     Some(ParsedGateCommand {
@@ -2175,6 +2224,7 @@ mod tests {
             "agent:example",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
             "pixel",
+            "0123456789abcdef0123456789abcdef",
             &PinnedHome::Root(PathBuf::from(r"C:\Users\me\O'Neil\Legion Home")),
             Some("O'Neil"),
             ForcedCommandShell::WindowsPowerShell,
@@ -2186,11 +2236,13 @@ mod tests {
             LineKind::Device {
                 name,
                 principal,
+                pairing_id,
                 home: Some(PinnedHome::Root(h)),
                 account: Some(a),
                 ..
             } if name == "pixel"
                 && principal == "agent:example"
+                && pairing_id == "0123456789abcdef0123456789abcdef"
                 && h == Path::new(r"C:\Users\me\O'Neil\Legion Home")
                 && a == "O'Neil"
         ));
@@ -2220,6 +2272,7 @@ mod tests {
             "agent:example",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
             "pixel",
+            "0123456789abcdef0123456789abcdef",
             &PinnedHome::Root(PathBuf::from(r"C:\Users\me\Legion Home")),
             Some("me"),
             ForcedCommandShell::Posix,
@@ -2235,11 +2288,13 @@ mod tests {
             LineKind::Device {
                 name,
                 principal,
+                pairing_id,
                 home: Some(PinnedHome::Root(h)),
                 account: Some(a),
                 ..
             } if name == "pixel"
                 && principal == "agent:example"
+                && pairing_id == "0123456789abcdef0123456789abcdef"
                 && h == Path::new(r"C:\Users\me\Legion Home")
                 && a == "me"
         ));
@@ -2250,6 +2305,7 @@ mod tests {
             "phone",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
             "pixel",
+            "0123456789abcdef0123456789abcdef",
             &PinnedHome::Split {
                 config_dir: PathBuf::from("/home/me/.config/legion"),
                 state_dir: PathBuf::from("/home/me/.local/state/legion"),
@@ -2270,10 +2326,12 @@ mod tests {
             LineKind::Device {
                 name,
                 principal,
+                pairing_id,
                 home: Some(PinnedHome::Split { config_dir, state_dir }),
                 ..
             } if name == "pixel"
                 && principal == "phone"
+                && pairing_id == "0123456789abcdef0123456789abcdef"
                 && config_dir == Path::new("/home/me/.config/legion")
                 && state_dir == Path::new("/home/me/.local/state/legion")
         ));
@@ -2299,7 +2357,7 @@ mod tests {
 
     #[test]
     fn foreign_lines_comments_and_missing_trailing_newline_are_preserved_byte_for_byte() {
-        let initial = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nrestrict,command=\"/home/me/legion gate --as phone --device pixel\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:pixel\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
+        let initial = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nrestrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:pixel\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
         let mut parsed = AuthKeysFile::parse(initial);
         assert_eq!(parsed.lines.len(), 5);
         assert_eq!(parsed.lines[0].kind, LineKind::Foreign);
@@ -2328,7 +2386,7 @@ mod tests {
     fn appending_to_file_without_trailing_newline_inserts_separator() {
         let initial = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 foreign";
         let mut parsed = AuthKeysFile::parse(initial);
-        parsed.append_line("restrict,command=\"/home/me/legion gate --as phone --device tablet\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:tablet");
+        parsed.append_line("restrict,command=\"/home/me/legion gate --as phone --device tablet --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:tablet");
         let bytes = parsed.to_bytes();
         let text = std::str::from_utf8(&bytes).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -2774,35 +2832,42 @@ Match Group users
             format!(
                 "environment=\"FOO=restrict\",command=\"/home/me/legion gate --as phone --device pixel\" {key} legion-device:pixel\n"
             ),
-            // Earlier-branch line missing `--device <name>` is not recognised as a Legion line.
+            // Earlier-branch line missing `--device <name>` or `--pairing <id>` is not recognised.
             format!(
                 "restrict,command=\"/home/me/legion gate --as phone\" {key} legion-device:legacy\n"
             ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --home /home/me/legion\" {key} legion-device:pixel\n"
+            ),
             // Mismatched `--device` vs comment name.
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device other\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device other --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" {key} legion-device:pixel\n"
+            ),
+            // Invalid `--pairing` value.
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing not-hex --home /home/me/legion\" {key} legion-device:pixel\n"
             ),
             // Shell chaining / metacharacters appended to gate command.
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel; id\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef; id\" {key} legion-device:pixel\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel && id\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef && id\" {key} legion-device:pixel\n"
             ),
             // Unknown flag or extra positional argument.
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --unknown\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef --unknown\" {key} legion-device:pixel\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel extra\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef extra\" {key} legion-device:pixel\n"
             ),
             // Duplicate `command=` option.
             format!(
-                "restrict,command=\"/bin/sh\",command=\"/home/me/legion gate --as phone --device pixel\" {key} legion-device:pixel\n"
+                "restrict,command=\"/bin/sh\",command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef\" {key} legion-device:pixel\n"
             ),
             // Wrong executable (not legion).
             format!(
-                "restrict,command=\"/usr/bin/other gate --as phone --device pixel\" {key} legion-device:pixel\n"
+                "restrict,command=\"/usr/bin/other gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef\" {key} legion-device:pixel\n"
             ),
             // Hand-written invite comment without restrict or with mismatched --enrol id.
             format!("{key} legion-invite:abc123\n"),
@@ -2815,7 +2880,7 @@ Match Group users
                 "restrict,command=\"/home/me/legion gate --enrol pixel\" {key} legion-device:pixel\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device abc123\" {key} legion-invite:abc123\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device abc123 --pairing 0123456789abcdef0123456789abcdef\" {key} legion-invite:abc123\n"
             ),
         ];
 
@@ -2835,6 +2900,7 @@ Match Group users
             "phone",
             key,
             "pixel",
+            "0123456789abcdef0123456789abcdef",
             &PinnedHome::Root(PathBuf::from("/home/me/legion")),
             None,
             ForcedCommandShell::Posix,
@@ -2843,69 +2909,123 @@ Match Group users
         let parsed_dev = AuthKeysFile::parse(format!("{valid_device}\n").as_bytes());
         assert!(matches!(
             &parsed_dev.lines[0].kind,
-            LineKind::Device { name, .. } if name == "pixel"
+            LineKind::Device { name, pairing_id, .. }
+                if name == "pixel" && pairing_id == "0123456789abcdef0123456789abcdef"
         ));
     }
 
     #[test]
-    fn verify_device_authorized_requires_matching_device_principal_home_and_account() {
+    fn verify_device_authorized_requires_matching_device_principal_pairing_home_and_account() {
         let dir = tempfile::tempdir().unwrap();
         let home_a = dir.path().join("legion-a");
         let home_b = dir.path().join("legion-b");
         let paths_a = Paths::from_explicit_home(&home_a).unwrap();
         let paths_b = Paths::from_explicit_home(&home_b).unwrap();
         let auth_path = dir.path().join("authorized_keys");
+        let fake_exe = if cfg!(windows) {
+            dir.path().join("legion.exe")
+        } else {
+            dir.path().join("legion")
+        };
+        let shell = if cfg!(windows) {
+            ForcedCommandShell::WindowsCmd
+        } else {
+            ForcedCommandShell::Posix
+        };
 
         let mut node_file = NodeFile::default();
         node_file.devices.authorized_keys = Some(auth_path.display().to_string());
 
         let key =
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000";
+        let pairing_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let pairing_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let line_a = format_device_line(
-            Path::new("/usr/local/bin/legion"),
+            &fake_exe,
             "phone",
             key,
             "pixel",
+            pairing_a,
             &PinnedHome::from_paths(&paths_a),
             None,
-            ForcedCommandShell::Posix,
+            shell,
         )
         .unwrap();
         std::fs::write(&auth_path, format!("{line_a}\n")).unwrap();
 
         // Exact match succeeds.
-        assert!(verify_device_authorized(&paths_a, &node_file, "pixel", "phone", None).is_ok());
+        assert!(
+            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_a, "phone", None)
+                .is_ok()
+        );
 
-        // Mismatched device name, principal, home, or account all fail with Denied.
+        // Mismatched device name, principal, pairing id, home, or account all fail with Denied.
         assert_eq!(
-            verify_device_authorized(&paths_a, &node_file, "other", "phone", None)
+            verify_device_authorized(&paths_a, &node_file, "other", pairing_a, "phone", None)
                 .unwrap_err()
                 .code,
             ErrorCode::Denied
         );
         assert_eq!(
-            verify_device_authorized(&paths_a, &node_file, "pixel", "owner", None)
+            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_a, "owner", None)
                 .unwrap_err()
                 .code,
             ErrorCode::Denied
         );
         assert_eq!(
-            verify_device_authorized(&paths_b, &node_file, "pixel", "phone", None)
+            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_b, "phone", None)
                 .unwrap_err()
                 .code,
             ErrorCode::Denied
         );
         assert_eq!(
-            verify_device_authorized(&paths_a, &node_file, "pixel", "phone", Some("alice"))
+            verify_device_authorized(&paths_b, &node_file, "pixel", pairing_a, "phone", None)
                 .unwrap_err()
                 .code,
             ErrorCode::Denied
+        );
+        assert_eq!(
+            verify_device_authorized(
+                &paths_a,
+                &node_file,
+                "pixel",
+                pairing_a,
+                "phone",
+                Some("alice")
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::Denied
+        );
+
+        // Re-pairing under the same name and principal with a new pairing id refuses the old id.
+        let line_repaired = format_device_line(
+            &fake_exe,
+            "phone",
+            key,
+            "pixel",
+            pairing_b,
+            &PinnedHome::from_paths(&paths_a),
+            None,
+            shell,
+        )
+        .unwrap();
+        std::fs::write(&auth_path, format!("{line_repaired}\n")).unwrap();
+        assert_eq!(
+            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_a, "phone", None)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert!(
+            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_b, "phone", None)
+                .is_ok()
         );
 
         // Removing the line immediately causes refusal.
         std::fs::write(&auth_path, "# empty\n").unwrap();
-        let err =
-            verify_device_authorized(&paths_a, &node_file, "pixel", "phone", None).unwrap_err();
+        let err = verify_device_authorized(&paths_a, &node_file, "pixel", pairing_b, "phone", None)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::Denied);
         assert!(
             err.message.contains("no longer authorized"),

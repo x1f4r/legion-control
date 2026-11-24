@@ -340,10 +340,12 @@ python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert len(d["invites"])
 
 ctl_active="/tmp/lgm-active-$$.sock"
 ctl_fresh="/tmp/lgm-fresh-$$.sock"
+ctl_repair_old="/tmp/lgm-repair-old-$$.sock"
 cleanup_ctls() {
   ssh -S "$ctl_active" -O exit me@127.0.0.1 >/dev/null 2>&1 || true
   ssh -S "$ctl_fresh" -O exit me@127.0.0.1 >/dev/null 2>&1 || true
-  rm -f "$ctl_active" "$ctl_fresh"
+  ssh -S "$ctl_repair_old" -O exit me@127.0.0.1 >/dev/null 2>&1 || true
+  rm -f "$ctl_active" "$ctl_fresh" "$ctl_repair_old"
 }
 trap cleanup_ctls EXIT
 
@@ -457,7 +459,107 @@ fresh_rc=$?
 set -e
 [[ "$fresh_rc" -ne 0 ]] || { echo "never-used ControlMaster unexpectedly succeeded after device.remove!" >&2; exit 1; }
 [[ "$fresh_stderr" == *"no longer authorized"* ]] || { echo "expected gate re-check refusal, got: $fresh_stderr" >&2; exit 1; }
-echo "    never-used ControlMaster gate re-check refusal verified"
+fresh_dead=0
+for _ in $(seq 1 50); do
+  if ! ssh -S "$ctl_fresh" -O check me@127.0.0.1 >/dev/null 2>&1; then
+    fresh_dead=1
+    break
+  fi
+  sleep 0.1
+done
+[[ "$fresh_dead" -eq 1 ]] || { echo "never-used ControlMaster stayed alive after gate refusal!" >&2; exit 1; }
+echo "    never-used ControlMaster gate re-check refusal and parent sshd teardown verified"
+
+# 7c. Re-pairing under the exact same device name and principal MUST NOT revive an earlier
+#     removed pairing's open ControlMaster (each pairing has its own random `--pairing <id>`).
+enrol_named_device() {
+  local dev_name="$1"
+  local prefix="$2"
+  local inv_json
+  inv_json="$(legion device.invite principal=phone host=127.0.0.1 port=2222 --json)"
+  printf '%s\n' "$inv_json" > "$work/${prefix}_inv.json"
+  python3 - "$work/${prefix}_inv.json" "$work/${prefix}_temp_key" "$work/${prefix}_inv_id" <<'PY'
+import base64, json, os, struct, subprocess, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    invite = json.load(fh)["invite"]
+raw = invite[len("legion-invite-1."):]
+raw += "=" * ((4 - len(raw) % 4) % 4)
+payload = json.loads(base64.urlsafe_b64decode(raw).decode("utf-8"))
+seed = base64.b64decode(payload["key"])
+pkcs8 = bytes.fromhex("302e020100300506032b657004220420") + seed
+pub32 = subprocess.run(
+    ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+    input=pkcs8, stdout=subprocess.PIPE, check=True,
+).stdout[-32:]
+def ssh_str(data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + data
+pub_blob = ssh_str(b"ssh-ed25519") + ssh_str(pub32)
+priv = b"\x11\x22\x33\x44" * 2 + ssh_str(b"ssh-ed25519") + ssh_str(pub32) + ssh_str(seed + pub32) + ssh_str(b"repair")
+pad = 1
+while len(priv) % 8 != 0:
+    priv += bytes([pad])
+    pad += 1
+blob = b"openssh-key-v1\x00" + ssh_str(b"none") + ssh_str(b"none") + ssh_str(b"") + struct.pack(">I", 1) + ssh_str(pub_blob) + ssh_str(priv)
+b64 = base64.b64encode(blob).decode("ascii")
+lines = [b64[i:i + 70] for i in range(0, len(b64), 70)]
+pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END OPENSSH PRIVATE KEY-----\n"
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="ascii") as fh:
+    fh.write(pem)
+with open(sys.argv[3], "w", encoding="utf-8") as fh:
+    fh.write(payload["id"])
+PY
+  ssh-keygen -q -t ed25519 -N '' -C "${prefix}@test" -f "$work/${prefix}_key"
+  local dev_pub req
+  dev_pub="$(cat "$work/${prefix}_key.pub")"
+  req="$(python3 -c 'import json,sys; print(json.dumps({"enrol":1,"id":sys.argv[1],"public_key":sys.argv[2],"name":sys.argv[3]}))' "$(cat "$work/${prefix}_inv_id")" "$dev_pub" "$dev_name")"
+  printf '%s\n' "$req" | "${ssh_base[@]}" -i "$work/${prefix}_temp_key" me@127.0.0.1 >/dev/null
+}
+
+enrol_named_device "container-repair" "repair_old"
+ssh -T -f -N \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes \
+  -o "UserKnownHostsFile=$work/known_hosts" \
+  -o GlobalKnownHostsFile=none \
+  -o ConnectTimeout=10 \
+  -o ControlMaster=yes \
+  -o ControlPersist=yes \
+  -S "$ctl_repair_old" \
+  -p 2222 \
+  -i "$work/repair_old_key" \
+  me@127.0.0.1
+
+legion device.remove name=container-repair --json >/dev/null
+enrol_named_device "container-repair" "repair_new"
+
+set +e
+repair_stderr="$(
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"call","params":{"tool":"meta.whoami","args":{}}}' \
+  | ssh -T -o BatchMode=yes -o ControlMaster=no -S "$ctl_repair_old" me@127.0.0.1 'legion rpc' 2>&1 >/dev/null
+)"
+repair_rc=$?
+set -e
+[[ "$repair_rc" -ne 0 ]] || { echo "old ControlMaster was revived after re-pairing under the same name!" >&2; exit 1; }
+[[ "$repair_stderr" == *"no longer authorized"* ]] || { echo "expected pairing-mismatch refusal, got: $repair_stderr" >&2; exit 1; }
+repair_dead=0
+for _ in $(seq 1 50); do
+  if ! ssh -S "$ctl_repair_old" -O check me@127.0.0.1 >/dev/null 2>&1; then
+    repair_dead=1
+    break
+  fi
+  sleep 0.1
+done
+[[ "$repair_dead" -eq 1 ]] || { echo "old ControlMaster stayed alive after re-pair refusal!" >&2; exit 1; }
+
+repair_new_out="$(
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"call","params":{"tool":"meta.whoami","args":{}}}' \
+  | "${ssh_base[@]}" -i "$work/repair_new_key" me@127.0.0.1 'legion rpc'
+)"
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["result"]["principal"]=="phone", r' "$repair_new_out"
+legion device.remove name=container-repair --json >/dev/null
+echo "    same-name re-pair isolation verified"
 
 # 8. sshd itself enforces a past 12-digit expiry-time without Z.
 inv2_json="$(legion device.invite principal=phone host=127.0.0.1 port=2222 --json)"

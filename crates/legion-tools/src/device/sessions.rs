@@ -104,6 +104,7 @@ pub fn validate_device_label(name: &str) -> Result<(), ErrorBody> {
 pub struct DeviceSessionGuard {
     path: PathBuf,
     conn_path: Option<PathBuf>,
+    parent_sshd: Option<ProcessId>,
 }
 
 impl DeviceSessionGuard {
@@ -170,15 +171,30 @@ impl DeviceSessionGuard {
             None
         };
 
-        Ok(DeviceSessionGuard { path, conn_path })
+        Ok(DeviceSessionGuard {
+            path,
+            conn_path,
+            parent_sshd,
+        })
     }
 
-    /// Removes the persisted parent `sshd` connection record written during [`Self::register`].
-    ///
-    /// Called when `legion gate` refuses to serve after finding the device is no longer authorized.
-    pub fn cancel_connection_record(&mut self) {
+    /// Cleans up this gate's session and connection records and terminates its verified
+    /// same-account parent `sshd` connection process (when one exists) so a revoked multiplexed
+    /// `ControlMaster` connection cannot linger after the gate refuses to serve.
+    pub async fn reject_and_terminate_parent(mut self) {
         if let Some(conn_path) = self.conn_path.take() {
             let _ = remove_ignoring_not_found(&conn_path);
+        }
+        let _ = remove_ignoring_not_found(&self.path);
+        if let Some(sshd_id) = self.parent_sshd.take()
+            && procid::verify_same_account_sshd(&sshd_id)
+        {
+            // Give sshd a brief beat to forward our flushed stderr refusal over the channel before
+            // tearing down the connection.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if procid::verify_same_account_sshd(&sshd_id) {
+                let _ = procid::kill_process(&sshd_id, false, Duration::from_secs(1)).await;
+            }
         }
     }
 
