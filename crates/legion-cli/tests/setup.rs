@@ -1182,6 +1182,49 @@ role = \"ssh_allowed\"
     // Owner (admin) is not blocked.
     let owner_read = home.run(&["fs.read", "path=~/.ssh/id_ed25519"]);
     assert_eq!(owner_read.code, 0, "{}", owner_read.stdout);
+
+    // Top-level `secrets = [...]` in policy.toml behaves identically to built-in secret locations.
+    fs::write(user_home.join(".npmrc"), "//registry/:_authToken=secret").unwrap();
+    fs::create_dir_all(user_home.join("custom_vault")).unwrap();
+    fs::write(user_home.join("custom_vault").join("secret.txt"), "VAULT").unwrap();
+    // `.npmrc` is NOT blocked until the owner adds it to `secrets`.
+    assert_eq!(
+        home.run(&["fs.read", "path=~/.npmrc", "--as", "wide"]).code,
+        0
+    );
+
+    home.write_config(
+        "policy.toml",
+        "\
+default = \"owner\"
+secrets = [\"~/.npmrc\", \"~/custom_vault\", \"~/missing_vault/key.pem\"]
+
+[roles.wide]
+allow = [\"effect:read\", \"effect:write\"]
+
+[principals.wide]
+role = \"wide\"
+",
+    );
+    let denied_npmrc = home.run(&["fs.read", "path=~/.npmrc", "--as", "wide"]);
+    assert_eq!(denied_npmrc.code, 1);
+    assert_eq!(denied_npmrc.json()["code"], json!("denied"));
+
+    let denied_parent = home.run(&["fs.mkdir", "path=~/missing_vault", "--as", "wide"]);
+    assert_eq!(denied_parent.code, 1);
+    assert_eq!(denied_parent.json()["code"], json!("denied"));
+
+    let listed_custom = home.run(&["fs.list", "path=~", "hidden=true", "--as", "wide"]);
+    assert_eq!(listed_custom.code, 0, "{}", listed_custom.stdout);
+    assert!(
+        listed_custom.json()["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.ends_with("custom_vault"))),
+        "{}",
+        listed_custom.stdout
+    );
 }
 
 fn fleet_sync_ext_define_dotted_filename_runs_on_peer() {

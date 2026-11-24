@@ -96,9 +96,12 @@ paths = ["~/projects/**"]
 ### Built-in secret locations
 
 Even when a role has broad or unconfined `paths`, Legion refuses file-tool access to a built-in
-list of well-known secret locations — SSH keys, GPG keyrings, cloud and git credentials, password
-stores, AI agents' credential files, and browser profiles — for every role that does not allow
-`effect:admin`, unless that role's `paths` explicitly names the location.
+list of well-known secret locations — SSH keys, GPG keyrings, cloud, package-registry, and git
+credentials, password stores, AI agents' credential files, mail and browser profiles, and OS
+credential stores — for every role that does not allow `effect:admin`, unless that role's `paths`
+explicitly names the location. `.npmrc` and shell history files are deliberately excluded because
+they cause too many false positives; an owner can protect them or any other path with top-level
+`secrets = ["~/extra/path"]` in `policy.toml`, which is treated identically to the built-in list.
 
 ## The three ready-made roles
 

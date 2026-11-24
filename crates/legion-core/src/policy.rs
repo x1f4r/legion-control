@@ -55,6 +55,12 @@ pub const NOBODY: &str = "nobody";
 /// inside it (a broad root such as `~/**` does not count). This is a guard rail for file tools; it
 /// does not bind a role that allows `effect:exec`.
 ///
+/// Deliberately NOT covered: `.npmrc` and shell history files (`.bash_history`, `.zsh_history`,
+/// fish/PowerShell history), because they cause too many false positives in normal development.
+/// Owners who want to protect those or any other custom path can add top-level
+/// `secrets = ["~/extra/path"]` in `policy.toml`, which is enforced identically to the built-in
+/// list.
+///
 /// | Path (relative to `~`) | What lives there |
 /// | --- | --- |
 /// | `.ssh` | SSH private keys and client configuration |
@@ -67,6 +73,12 @@ pub const NOBODY: &str = "nobody";
 /// | `.git-credentials` | Git credential-store tokens |
 /// | `.config/gh` | GitHub CLI authentication tokens |
 /// | `.config/gcloud` | Google Cloud SDK credentials |
+/// | `.config/rclone` | rclone remote storage credentials |
+/// | `.config/op` | 1Password CLI session and configuration |
+/// | `.vault-token` | HashiCorp Vault authentication token |
+/// | `.terraform.d/credentials.tfrc.json` | Terraform CLI registry tokens |
+/// | `.cargo/credentials.toml` | Cargo registry tokens |
+/// | `.pypirc` | PyPI upload tokens and credentials |
 /// | `.password-store` | `pass` encrypted password store |
 /// | `.local/share/keyrings` | Linux desktop keyrings |
 /// | `Library/Keychains` | macOS Keychain databases |
@@ -79,14 +91,24 @@ pub const NOBODY: &str = "nobody";
 /// | `.local/share/opencode/auth.json` | OpenCode authentication tokens |
 /// | `.config/github-copilot` | GitHub Copilot CLI tokens |
 /// | `.mozilla` | Firefox browser profiles (Linux) |
+/// | `.thunderbird` | Thunderbird mail profiles and credentials |
 /// | `.config/google-chrome` | Google Chrome profiles (Linux) |
 /// | `.config/chromium` | Chromium profiles (Linux) |
 /// | `.config/BraveSoftware/Brave-Browser` | Brave browser profiles (Linux) |
+/// | `.config/microsoft-edge` | Microsoft Edge profiles (Linux) |
 /// | `Library/Application Support/Google/Chrome` | Google Chrome profiles (macOS) |
 /// | `Library/Application Support/Firefox` | Firefox profiles (macOS) |
+/// | `Library/Application Support/BraveSoftware/Brave-Browser` | Brave browser profiles (macOS) |
+/// | `Library/Application Support/Microsoft Edge` | Microsoft Edge profiles (macOS) |
+/// | `Library/Cookies` | Safari and WebKit cookies (macOS) |
+/// | `Library/Containers/com.apple.Safari/Data/Library/Cookies` | Safari sandboxed cookies (macOS) |
 /// | `AppData/Local/Google/Chrome/User Data` | Google Chrome profiles (Windows) |
 /// | `AppData/Local/Microsoft/Edge/User Data` | Microsoft Edge profiles (Windows) |
+/// | `AppData/Local/BraveSoftware/Brave-Browser/User Data` | Brave browser profiles (Windows) |
 /// | `AppData/Roaming/Mozilla/Firefox` | Firefox profiles (Windows) |
+/// | `AppData/Roaming/Microsoft/Credentials` | Windows Credential Manager roaming store |
+/// | `AppData/Roaming/Microsoft/Protect` | Windows DPAPI master keys |
+/// | `AppData/Local/Microsoft/Credentials` | Windows Credential Manager local store |
 pub const SECRET_LOCATIONS: &[&str] = &[
     ".ssh",
     ".gnupg",
@@ -98,6 +120,12 @@ pub const SECRET_LOCATIONS: &[&str] = &[
     ".git-credentials",
     ".config/gh",
     ".config/gcloud",
+    ".config/rclone",
+    ".config/op",
+    ".vault-token",
+    ".terraform.d/credentials.tfrc.json",
+    ".cargo/credentials.toml",
+    ".pypirc",
     ".password-store",
     ".local/share/keyrings",
     "Library/Keychains",
@@ -110,14 +138,24 @@ pub const SECRET_LOCATIONS: &[&str] = &[
     ".local/share/opencode/auth.json",
     ".config/github-copilot",
     ".mozilla",
+    ".thunderbird",
     ".config/google-chrome",
     ".config/chromium",
     ".config/BraveSoftware/Brave-Browser",
+    ".config/microsoft-edge",
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Firefox",
+    "Library/Application Support/BraveSoftware/Brave-Browser",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Cookies",
+    "Library/Containers/com.apple.Safari/Data/Library/Cookies",
     "AppData/Local/Google/Chrome/User Data",
     "AppData/Local/Microsoft/Edge/User Data",
+    "AppData/Local/BraveSoftware/Brave-Browser/User Data",
     "AppData/Roaming/Mozilla/Firefox",
+    "AppData/Roaming/Microsoft/Credentials",
+    "AppData/Roaming/Microsoft/Protect",
+    "AppData/Local/Microsoft/Credentials",
 ];
 
 /// `policy.toml`.
@@ -127,6 +165,10 @@ pub struct Policy {
     /// The principal of a caller who names none; `owner` when absent.
     #[serde(default)]
     pub default: Option<Principal>,
+    /// Extra secret locations (absolute or starting with `~`) treated identically to
+    /// [`SECRET_LOCATIONS`] for every role without `effect:admin`.
+    #[serde(default)]
+    pub secrets: Vec<PathRoot>,
     /// The principals this node knows, each with its role.
     #[serde(default)]
     pub principals: BTreeMap<Principal, PrincipalEntry>,
@@ -557,6 +599,7 @@ impl Policy {
             principal: principal.to_owned(),
             role,
             rules: Arc::new(rules),
+            extra_secrets: Arc::from(self.secrets.clone()),
             paths: paths.clone(),
             protected_cache: Arc::new(OnceLock::new()),
         }
@@ -570,6 +613,7 @@ pub struct Grant {
     principal: String,
     role: String,
     rules: Arc<Role>,
+    extra_secrets: Arc<[PathRoot]>,
     paths: Paths,
     protected_cache: Arc<OnceLock<CachedProtected>>,
 }
@@ -1031,17 +1075,17 @@ impl Grant {
                 if touches && !exempt_existing_home_dir {
                     let what = if candidate_kind == CreateKind::Symlink {
                         format!(
-                            "a symbolic link may not be placed at or above secret location ~/{}",
-                            secret.rel
+                            "a symbolic link may not be placed at or above secret location {}",
+                            secret.label
                         )
                     } else if is_parent {
                         format!(
-                            "creating missing parent {} would create an ancestor of secret location ~/{}",
+                            "creating missing parent {} would create an ancestor of secret location {}",
                             candidate.path().display(),
-                            secret.rel
+                            secret.label
                         )
                     } else {
-                        format!("it is or holds secret location ~/{}", secret.rel)
+                        format!("it is or holds secret location {}", secret.label)
                     };
                     return Err(ErrorBody::new(
                         ErrorCode::Denied,
@@ -1052,13 +1096,13 @@ impl Grant {
                         ),
                     )
                     .with_hint(format!(
-                        "Only roles with effect:admin, or roles whose `paths` explicitly names ~/{}, may create or replace it or its missing parents.",
-                        secret.rel
+                        "Only roles with effect:admin, or roles whose `paths` explicitly names {}, may create or replace it or its missing parents.",
+                        secret.label
                     ))
                     .with_details(json!({
                         "path": path,
                         "place": "secret",
-                        "secret": format!("~/{}", secret.rel),
+                        "secret": secret.label,
                     })));
                 }
             }
@@ -1157,8 +1201,8 @@ impl Grant {
                 continue;
             }
             let reason = format!(
-                "~/{} is on Legion's list of secret locations; name it explicitly in the role's `paths` to allow access",
-                secret.rel
+                "{} is on Legion's list of secret locations; name it explicitly in the role's `paths` to allow access",
+                secret.label
             );
             entries.push(ProtectedEntry {
                 place: Place::Secret,
@@ -1218,19 +1262,17 @@ impl Grant {
             .collect()
     }
 
-    /// Well-known secret locations under `self.paths.home()`, resolved as far as they exist.
+    /// Well-known secret locations under `self.paths.home()` plus any top-level `secrets` from
+    /// `policy.toml`, resolved as far as they exist.
     ///
     /// A secret location that cannot be resolved (for example a dangling symlink or an unreadable
     /// parent) is never silently dropped: it falls back to `resolve_keeping_last` and then to a
     /// lexical raw path so both `check_path` and directory walks still block it.
     fn compute_secret_locations(&self) -> Vec<SecretPlace> {
-        let Some(home) = self.paths.home() else {
-            return Vec::new();
-        };
-        let home_resolved = resolve(home).ok();
-        SECRET_LOCATIONS
-            .iter()
-            .map(|rel| {
+        let mut places = Vec::with_capacity(SECRET_LOCATIONS.len() + self.extra_secrets.len());
+        let home_resolved = self.paths.home().and_then(|home| resolve(home).ok());
+        if let Some(home) = self.paths.home() {
+            for rel in SECRET_LOCATIONS {
                 let full = rel
                     .split('/')
                     .fold(home.to_path_buf(), |acc, part| acc.join(part));
@@ -1248,29 +1290,22 @@ impl Grant {
                         }
                         None => raw_fallback_resolved(&full),
                     });
-                let identity = if resolved.missing.is_empty() && resolved.link.is_none() {
-                    Handle::from_path(&resolved.existing).ok().map(Arc::new)
-                } else {
-                    None
-                };
-                #[cfg(unix)]
-                let dev_ino = if resolved.missing.is_empty() && resolved.link.is_none() {
-                    std::fs::symlink_metadata(&resolved.existing)
-                        .ok()
-                        .map(|m| (m.dev(), m.ino()))
-                } else {
-                    None
-                };
-                SecretPlace {
-                    rel,
-                    raw_path: full,
-                    resolved,
-                    identity,
-                    #[cfg(unix)]
-                    dev_ino,
-                }
-            })
-            .collect()
+                places.push(build_secret_place(format!("~/{rel}"), full, resolved));
+            }
+        }
+        for extra in self.extra_secrets.iter() {
+            let full = expand_tilde(Path::new(extra.as_str()), self.paths.home())
+                .unwrap_or_else(|_| PathBuf::from(extra.as_str()));
+            let resolved = resolve(&full)
+                .or_else(|_| resolve_keeping_last(&full))
+                .unwrap_or_else(|_| raw_fallback_resolved(&full));
+            places.push(build_secret_place(
+                extra.as_str().to_owned(),
+                full,
+                resolved,
+            ));
+        }
+        places
     }
 
     /// Refuses access to well-known secret locations for roles without `effect:admin`, unless the
@@ -1316,20 +1351,20 @@ impl Grant {
                 return Err(ErrorBody::new(
                     ErrorCode::Denied,
                     format!(
-                        "{} may not {} {}: ~/{} is on Legion's list of secret locations.",
+                        "{} may not {} {}: {} is on Legion's list of secret locations.",
                         self.principal,
                         access.verb(),
                         given.display(),
-                        secret.rel
+                        secret.label
                     ),
                 )
                 .with_hint(format!(
-                    "Only roles with effect:admin may touch secret locations by default. To allow this role, the owner can name ~/{} (or a path inside it) explicitly in the role's `paths` in policy.toml.",
-                    secret.rel
+                    "Only roles with effect:admin may touch secret locations by default. To allow this role, the owner can name {} (or a path inside it) explicitly in the role's `paths` in policy.toml.",
+                    secret.label
                 ))
                 .with_details(json!({
                     "path": resolved.path(),
-                    "secret": format!("~/{}", secret.rel),
+                    "secret": secret.label,
                 })));
             }
         }
@@ -1459,15 +1494,39 @@ struct OwnDir {
     dev_ino: Option<(u64, u64)>,
 }
 
-/// One well-known secret location resolved against the node's home directory.
+/// One built-in or policy-configured secret location resolved as far as it exists.
 #[derive(Debug)]
 struct SecretPlace {
-    rel: &'static str,
+    label: String,
     raw_path: PathBuf,
     resolved: Resolved,
     identity: Option<Arc<Handle>>,
     #[cfg(unix)]
     dev_ino: Option<(u64, u64)>,
+}
+
+fn build_secret_place(label: String, raw_path: PathBuf, resolved: Resolved) -> SecretPlace {
+    let identity = if resolved.missing.is_empty() && resolved.link.is_none() {
+        Handle::from_path(&resolved.existing).ok().map(Arc::new)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    let dev_ino = if resolved.missing.is_empty() && resolved.link.is_none() {
+        std::fs::symlink_metadata(&resolved.existing)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    } else {
+        None
+    };
+    SecretPlace {
+        label,
+        raw_path,
+        resolved,
+        identity,
+        #[cfg(unix)]
+        dev_ino,
+    }
 }
 
 /// Reason reported in `skipped` when a walk entry cannot be inspected to verify it is not protected.
@@ -3674,5 +3733,148 @@ role = "wide"
                 "{other_reason}"
             );
         }
+    }
+
+    #[test]
+    fn expanded_secret_locations_and_top_level_policy_secrets_are_enforced_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = under(dir.path());
+        let home = paths.home().unwrap();
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::create_dir_all(home.join("extra").join("vault")).unwrap();
+        std::fs::write(home.join("extra").join("vault").join("key.pem"), "SECRET").unwrap();
+        std::fs::write(home.join(".npmrc"), "//registry/:_authToken=x").unwrap();
+        std::fs::write(home.join(".bash_history"), "ls\n").unwrap();
+
+        // Every newly required entry is present in SECRET_LOCATIONS.
+        for required in [
+            ".config/rclone",
+            ".config/op",
+            ".vault-token",
+            ".terraform.d/credentials.tfrc.json",
+            ".cargo/credentials.toml",
+            ".pypirc",
+            ".config/microsoft-edge",
+            ".thunderbird",
+            "Library/Application Support/BraveSoftware/Brave-Browser",
+            "Library/Application Support/Microsoft Edge",
+            "Library/Cookies",
+            "Library/Containers/com.apple.Safari/Data/Library/Cookies",
+            "AppData/Roaming/Microsoft/Credentials",
+            "AppData/Roaming/Microsoft/Protect",
+            "AppData/Local/Microsoft/Credentials",
+            "AppData/Local/BraveSoftware/Brave-Browser/User Data",
+        ] {
+            assert!(
+                SECRET_LOCATIONS.contains(&required),
+                "SECRET_LOCATIONS missing {required}"
+            );
+        }
+
+        // Without custom `secrets`, `.npmrc` and `.bash_history` are deliberately NOT blocked,
+        // while newly added built-ins such as `.config/rclone`, `.cargo/credentials.toml`, and
+        // `.vault-token` ARE blocked.
+        let default_pol = policy(
+            r#"
+default = "owner"
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+[principals.wide]
+role = "wide"
+"#,
+        );
+        let wide_default = default_pol.grant("wide", &paths);
+        assert!(wide_default.check_path("~/.npmrc", Access::Read).is_ok());
+        assert!(
+            wide_default
+                .check_path("~/.bash_history", Access::Read)
+                .is_ok()
+        );
+        for builtin in [
+            "~/.config/rclone/rclone.conf",
+            "~/.config/op/config",
+            "~/.vault-token",
+            "~/.terraform.d/credentials.tfrc.json",
+            "~/.cargo/credentials.toml",
+            "~/.pypirc",
+            "~/.config/microsoft-edge/Default/Cookies",
+            "~/.thunderbird/profiles.ini",
+        ] {
+            assert_eq!(
+                wide_default
+                    .check_path(builtin, Access::Read)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Denied,
+                "{builtin}"
+            );
+        }
+
+        // Top-level `secrets = [...]` in policy.toml is enforced identically to built-ins across
+        // check_path, check_create, protected/check_tree, protected_filter, and role opt-in.
+        let custom_pol = policy(
+            r#"
+default = "owner"
+secrets = ["~/.npmrc", "~/extra/vault", "~/missing_parent/token.txt"]
+
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+
+[roles.home_only]
+allow = ["effect:read"]
+paths = ["~/**"]
+
+[roles.vault_reader]
+allow = ["effect:read"]
+paths = ["~/extra/vault/**"]
+
+[principals.wide]
+role = "wide"
+
+[principals.homey]
+role = "home_only"
+
+[principals.vault]
+role = "vault_reader"
+"#,
+        );
+        let wide = custom_pol.grant("wide", &paths);
+        let homey = custom_pol.grant("homey", &paths);
+        let vault = custom_pol.grant("vault", &paths);
+        let owner = custom_pol.grant("owner", &paths);
+
+        assert_eq!(
+            wide.check_path("~/.npmrc", Access::Read).unwrap_err().code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            homey
+                .check_path("~/extra/vault/key.pem", Access::Read)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            wide.check_create(&home.join("missing_parent"), CreateKind::Symlink, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            wide.protected(&home.join("extra").join("vault")).unwrap(),
+            Some(Place::Secret)
+        );
+        assert_eq!(
+            wide.protected_filter()
+                .blocked(&home.join("extra").join("vault"))
+                .map(|(p, _)| p),
+            Some(Place::Secret)
+        );
+        assert!(
+            vault
+                .check_path("~/extra/vault/key.pem", Access::Read)
+                .is_ok()
+        );
+        assert!(owner.check_path("~/.npmrc", Access::Read).is_ok());
     }
 }
