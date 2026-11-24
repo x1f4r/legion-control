@@ -14,12 +14,15 @@ running `legion serve`.
 
 `legion mcp` has two modes:
 
-- **Compact mode (`legion mcp --as <principal> --compact`)**: exposes three meta-tools instead of
+- **Compact mode (`legion mcp --as <principal> --compact`)**: exposes four meta-tools instead of
   the full registry:
-  - `legion_tools` (`readOnlyHint: true`) — list the tools this principal may call (optional
-    `family` filter such as `"fs"` or `"power"`).
+  - `legion_tools` (`readOnlyHint: true`) — list the tools this principal may call, each with its
+    effect (optional `family` filter such as `"fs"` or `"power"`).
   - `legion_describe` (`readOnlyHint: true`) — return one tool's description, effect, and input
     JSON Schema.
+  - `legion_read` (`readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`) — run
+    an allowed tool whose effect is `read`, with optional `args` and optional `on`. Any other
+    tool is refused without running, with the code `denied` and a hint to use `legion_call`.
   - `legion_call` (`readOnlyHint: false`, `destructiveHint: true`) — run any allowed tool by name,
     with optional `args` and optional `on`.
 - **Full mode (`legion mcp --as <principal>`)**: exposes every allowed tool individually, replacing
@@ -30,8 +33,21 @@ running `legion serve`.
 
 **Compact mode is the default when registering with `legion agents add`** because Legion ships more
 than seventy built-in tools: loading every schema into every conversation consumes thousands of
-tokens of context before the first user prompt. In compact mode the agent carries three small
+tokens of context before the first user prompt. In compact mode the agent carries four small
 schemas and fetches only the schemas it actually needs with `legion_describe`.
+
+**Use `legion_read` for tools whose effect is `read`, and `legion_call` for every other.** Both
+take the same arguments. `legion_call` can run anything, so it is annotated as destructive, and a
+client that approves only read-only tools without asking stops at it: Codex in non-interactive
+mode refuses it outright ("MCP tool call requires approval, but approval policy is never"), even
+for `meta.whoami`. `legion_read` is annotated read-only because it keeps that promise: the door
+looks up the tool's effect when it is called (from this node's spec, or for a tool that exists
+only on the machine `on` names, from what that machine reports) and refuses anything that is not
+`read`, or whose effect it cannot establish, before the call reaches a node. The refusal is the
+door's own, like a malformed `on`, so it writes no audit line; a call it does run is authorised by
+the policy and audited exactly as through `legion_call`. The annotation is a promise about the
+tool, never a way past the policy. For an extension tool, `read` is what the machine's owner
+declared in `tools.d`, so it is that owner's promise.
 
 Over HTTP (`legion serve`), request compact mode with `/mcp?compact=1` or the header
 `Legion-Compact: 1`.
@@ -94,7 +110,7 @@ Drop `--dry-run` to execute it. Common flags:
 ## How an agent should work with Legion
 
 1. **Start with `meta.whoami`.** Call `meta_whoami` (full mode) or
-   `legion_call(tool="meta.whoami")` (compact mode) at the start of a task. It returns your
+   `legion_read(tool="meta.whoami")` (compact mode) at the start of a task. It returns your
    `principal`, `role`, `node`, `paths` (if confined), and the exact list of `tools` you are
    allowed to call on this node.
 2. **Discover before guessing.** In compact mode, call `legion_tools` (pass `family="fs"`,
