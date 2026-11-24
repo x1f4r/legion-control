@@ -411,13 +411,14 @@ mod enrol_client {
     use legion_proto::{ErrorBody, ErrorCode};
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
-    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio_util::sync::CancellationToken;
 
     use super::{Enrolled, Invite};
     use crate::key::DeviceKey;
     use crate::session::{Line, TransportHandle, read_line};
     use crate::ssh::{SshTimeouts, open_exec_raw};
+    use crate::stderr::StderrTail;
 
     const ENROL_COMMAND: &str = "legion enrol";
     const MAX_REPLY_LINE: usize = 64 * 1024;
@@ -493,13 +494,45 @@ mod enrol_client {
                 }
             })?;
 
-        let (reader, mut writer, mut handle) = pipe.into_parts();
+        let (reader, writer, mut handle) = pipe.into_parts();
         let stderr = handle.stderr_tail();
+        let result = enrol_exchange(
+            reader,
+            writer,
+            Some(&mut handle),
+            Some(&stderr),
+            invite,
+            &public_key,
+            name,
+            timeouts.handshake,
+            cancel,
+        )
+        .await;
+        Box::new(handle).close(CLOSE_GRACE).await;
+        result
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn enrol_exchange<R, W>(
+        reader: R,
+        mut writer: W,
+        mut handle: Option<&mut dyn TransportHandle>,
+        stderr: Option<&std::sync::Arc<StderrTail>>,
+        invite: &Invite,
+        public_key: &str,
+        name: &str,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<Enrolled, ErrorBody>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let target = invite.target();
         let req = EnrolRequest {
             enrol: 1,
             id: &invite.id,
-            public_key: &public_key,
+            public_key,
             name,
         };
         let mut line = serde_json::to_string(&req).map_err(|err| {
@@ -536,8 +569,11 @@ mod enrol_client {
             loop {
                 match read_line(&mut buf_reader, &mut reply_buf, MAX_REPLY_LINE).await {
                     Ok(Line::End) => {
-                        let (_, stderr_text) =
-                            handle.collect_exit_info(Duration::from_millis(200)).await;
+                        let stderr_text = if let Some(h) = handle.as_mut() {
+                            h.collect_exit_info(Duration::from_millis(200)).await.1
+                        } else {
+                            stderr.map_or_else(String::new, |s| s.text())
+                        };
                         let mut err = ErrorBody::new(
                             ErrorCode::Unreachable,
                             format!(
@@ -599,14 +635,14 @@ mod enrol_client {
             }
         };
 
-        let result = tokio::select! {
+        tokio::select! {
             biased;
             () = cancel.cancelled() => Err(ErrorBody::new(
                 ErrorCode::Cancelled,
                 format!("Enrolment with {} was cancelled.", invite.node),
             )
             .with_machine(&invite.node)),
-            res = tokio::time::timeout(timeouts.handshake, exchange) => match res {
+            res = tokio::time::timeout(timeout, exchange) => match res {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     let mut err = ErrorBody::new(
@@ -614,22 +650,17 @@ mod enrol_client {
                         format!(
                             "Timed out waiting for {} to confirm enrolment after {}s.",
                             invite.node,
-                            timeouts.handshake.as_secs_f64()
+                            timeout.as_secs_f64()
                         ),
                     )
                     .with_machine(&invite.node);
-                    let text = stderr.text();
-                    if !text.is_empty() {
+                    if let Some(text) = stderr.map(|s| s.text()).filter(|t| !t.is_empty()) {
                         err = err.with_hint(format!("Remote stderr: {text}"));
                     }
                     Err(err)
                 }
             }
-        };
-
-        drop(writer);
-        Box::new(handle).close(CLOSE_GRACE).await;
-        result
+        }
     }
 
     fn parse_enrol_response(
@@ -638,16 +669,19 @@ mod enrol_client {
         target: super::SshTarget,
     ) -> Result<Enrolled, ErrorBody> {
         if resp.ok {
-            let node = resp.node.unwrap_or_else(|| invite.node.clone());
-            let principal = resp.principal.unwrap_or_else(|| invite.principal.clone());
+            let node = resp.node.unwrap_or_default();
+            let principal = resp.principal.unwrap_or_default();
             let role = resp.role.unwrap_or_default();
             let device = resp.device.unwrap_or_default();
-            if role.is_empty() || device.is_empty() {
+            if node.is_empty() || principal.is_empty() || role.is_empty() || device.is_empty() {
                 return Err(ErrorBody::new(
                     ErrorCode::Failed,
-                    format!("{node} sent an incomplete enrolment reply."),
+                    format!(
+                        "{} sent an incomplete enrolment reply (requires node, principal, role, and device).",
+                        invite.node
+                    ),
                 )
-                .with_machine(&node));
+                .with_machine(&invite.node));
             }
             return Ok(Enrolled {
                 node,
@@ -876,5 +910,156 @@ mod tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(!rendered.contains(&invite.key), "{rendered}");
         assert!(rendered.contains("tower"), "{rendered}");
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn enrol_exchange_handles_ok_error_incomplete_and_garbage() {
+        use std::time::Duration;
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio_util::sync::CancellationToken;
+
+        let invite = sample_invite();
+        let pub_line = format!("{SAMPLE_HOST_KEY} phone");
+
+        // 1. Happy path: ok: true with all required fields; verify exact wire request.
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let req_line = lines.next_line().await.unwrap().unwrap();
+            let req: serde_json::Value = serde_json::from_str(&req_line).unwrap();
+            assert_eq!(req["enrol"], json!(1));
+            assert_eq!(req["id"], json!("inv-01"));
+            assert_eq!(req["name"], json!("phone"));
+            assert!(
+                req["public_key"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(" phone")
+            );
+            server_w
+                .write_all(
+                    br#"{"ok":true,"node":"tower","principal":"phone","role":"observer","device":"phone-1"}"#,
+                )
+                .await
+                .unwrap();
+            server_w.write_all(b"\n").await.unwrap();
+            server_w.flush().await.unwrap();
+        });
+        let enrolled = enrol_client::enrol_exchange(
+            client_r,
+            client_w,
+            None,
+            None,
+            &invite,
+            &pub_line,
+            "phone",
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        server_task.await.unwrap();
+        assert_eq!(enrolled.node, "tower");
+        assert_eq!(enrolled.principal, "phone");
+        assert_eq!(enrolled.role, "observer");
+        assert_eq!(enrolled.device, "phone-1");
+        assert_eq!(enrolled.target, invite.target());
+
+        // 2. ok: true missing `node` or `principal` is rejected.
+        for incomplete in [
+            r#"{"ok":true,"principal":"phone","role":"observer","device":"phone"}"#,
+            r#"{"ok":true,"node":"tower","role":"observer","device":"phone"}"#,
+        ] {
+            let (client, server) = tokio::io::duplex(4 * 1024);
+            let (client_r, client_w) = tokio::io::split(client);
+            let (server_r, mut server_w) = tokio::io::split(server);
+            let line = format!("{incomplete}\n");
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(server_r).lines();
+                let _ = lines.next_line().await;
+                let _ = server_w.write_all(line.as_bytes()).await;
+            });
+            let err = enrol_client::enrol_exchange(
+                client_r,
+                client_w,
+                None,
+                None,
+                &invite,
+                &pub_line,
+                "phone",
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed, "{incomplete}");
+        }
+
+        // 3. ok: false returns the node's structured error.
+        let (client, server) = tokio::io::duplex(4 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await;
+            let _ = server_w
+                .write_all(
+                    b"{\"ok\":false,\"error\":{\"code\":\"denied\",\"message\":\"Invite expired.\",\"hint\":\"Run legion pair again.\"}}\n",
+                )
+                .await;
+        });
+        let err = enrol_client::enrol_exchange(
+            client_r,
+            client_w,
+            None,
+            None,
+            &invite,
+            &pub_line,
+            "phone",
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert_eq!(err.message, "Invite expired.");
+        assert_eq!(err.hint.as_deref(), Some("Run legion pair again."));
+
+        // 4. Garbage lines beyond noise limit fail cleanly.
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await;
+            for i in 0..40 {
+                if server_w
+                    .write_all(format!("not json garbage {i}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let err = enrol_client::enrol_exchange(
+            client_r,
+            client_w,
+            None,
+            None,
+            &invite,
+            &pub_line,
+            "phone",
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(err.hint.is_some());
     }
 }
