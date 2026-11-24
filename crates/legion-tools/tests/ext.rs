@@ -72,6 +72,15 @@ fn main() -> ExitCode {
             "hot_added_and_edited_files_are_picked_up_without_restart",
             || Box::pin(hot_added_and_edited_files_are_picked_up_without_restart()),
         ),
+        (
+            "oversized_string_args_are_refused_by_default_and_passed_on_stdin_when_opted_in",
+            || {
+                Box::pin(
+                    oversized_string_args_are_refused_by_default_and_passed_on_stdin_when_opted_in(
+                    ),
+                )
+            },
+        ),
     ];
     support::main(tests)
 }
@@ -99,6 +108,24 @@ fn run_helper(args: &[String]) -> ExitCode {
                 "env": legion_env,
                 "stdin": stdin_json,
                 "cwd": cwd,
+            });
+            let _ = writeln!(stdout, "{out}");
+        }
+        // Emits LEGION_* env vars and summary lengths/edges of stdin JSON (stays under stdout cap).
+        "inspect_large" => {
+            let mut stdin_bytes = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut stdin_bytes);
+            let stdin_json: Value = serde_json::from_slice(&stdin_bytes).unwrap_or(Value::Null);
+            let legion_env: BTreeMap<String, String> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("LEGION_"))
+                .collect();
+            let payload = stdin_json["payload"].as_str().unwrap_or_default();
+            let out = json!({
+                "env": legion_env,
+                "payload_len": payload.len(),
+                "payload_starts_with": &payload[..payload.len().min(6)],
+                "payload_ends_with": &payload[payload.len().saturating_sub(6)..],
+                "tag": stdin_json["tag"],
             });
             let _ = writeln!(stdout, "{out}");
         }
@@ -1004,4 +1031,69 @@ async fn hot_added_and_edited_files_are_picked_up_without_restart() {
     // Delete -> immediately gone.
     std::fs::remove_file(&file).unwrap();
     assert!(fixture.node.spec("live.echo").is_err());
+}
+
+async fn oversized_string_args_are_refused_by_default_and_passed_on_stdin_when_opted_in() {
+    let fixture = Fixture::new();
+    let marker = fixture.dir.path().join("oversized-should-not-run");
+    let huge = format!("HEAD--{}--TAIL", "a".repeat(200 * 1024));
+
+    // Default policy refuses oversized string argument before starting the command.
+    fixture
+        .call(
+            "ext.define",
+            json!({
+                "name": "size.refuse",
+                "description": "Refuses large string args by default.",
+                "effect": "write",
+                "run": helper_argv("touch", &[&marker.to_string_lossy()]),
+                "params": {
+                    "payload": {"type": "string", "required": true}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let err = fixture
+        .call("size.refuse", json!({"payload": huge}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgs, "{err:?}");
+    assert!(err.message.contains("`payload`"), "{}", err.message);
+    assert!(err.message.contains("stdin"), "{}", err.message);
+    assert!(
+        !marker.exists(),
+        "command should not have started for oversized env arg"
+    );
+
+    // With large = "stdin", oversized string omits LEGION_ARG_PAYLOAD, sets
+    // LEGION_ARG_PAYLOAD_OMITTED=1, and still arrives intact on stdin JSON.
+    fixture
+        .call(
+            "ext.define",
+            json!({
+                "name": "size.stdin",
+                "description": "Accepts large string args via stdin.",
+                "effect": "read",
+                "run": helper_argv("inspect_large", &[]),
+                "params": {
+                    "payload": {"type": "string", "required": true, "large": "stdin"},
+                    "tag": {"type": "string", "default": "ok"}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let out = fixture
+        .call("size.stdin", json!({"payload": huge}))
+        .await
+        .unwrap();
+    let env = out["env"].as_object().unwrap();
+    assert!(!env.contains_key("LEGION_ARG_PAYLOAD"), "{env:?}");
+    assert_eq!(env.get("LEGION_ARG_PAYLOAD_OMITTED"), Some(&json!("1")));
+    assert_eq!(env.get("LEGION_ARG_TAG"), Some(&json!("ok")));
+    assert_eq!(out["payload_len"], json!(huge.len()));
+    assert_eq!(out["payload_starts_with"], json!("HEAD--"));
+    assert_eq!(out["payload_ends_with"], json!("--TAIL"));
+    assert_eq!(out["tag"], json!("ok"));
 }

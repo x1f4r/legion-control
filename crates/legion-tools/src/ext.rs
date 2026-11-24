@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use self::def::{
-    ExtensionDef, ParamDef, ParamType, ParamValue, TimeoutSeconds, parse_toml_with_reserved,
+    ExtensionDef, LargeArgPolicy, ParamDef, ParamType, ParamValue, TimeoutSeconds,
+    parse_toml_with_reserved,
 };
 use self::store::{ExtensionStore, load_snapshot};
 
@@ -215,6 +216,11 @@ struct ParamArg {
     /// Allowed string values, only valid when `type` is `string`.
     #[serde(rename = "enum", default)]
     enum_values: Option<Vec<String>>,
+    /// How to handle string values over 32 KiB for the environment: `refuse` (default) fails with
+    /// `invalid_args`; `stdin` omits `LEGION_ARG_<NAME>`, sets `LEGION_ARG_<NAME>_OMITTED=1`, and
+    /// still passes the full value on stdin. Only valid when `type` is `string`.
+    #[serde(default)]
+    large: Option<LargeArgPolicy>,
 }
 
 /// Arguments of `ext.define`.
@@ -283,6 +289,7 @@ async fn define(ctx: &Ctx, args: DefineArgs) -> Result<Defined, ToolError> {
                 required: arg.required,
                 default,
                 enum_values: arg.enum_values,
+                large: arg.large,
             },
         );
     }

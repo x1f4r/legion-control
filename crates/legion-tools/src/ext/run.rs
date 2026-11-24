@@ -50,6 +50,7 @@ impl ExtensionTool {
     /// Runs the extension command after validating arguments.
     async fn execute(&self, ctx: &Ctx, args: Value) -> Result<Value, ToolError> {
         let resolved = self.def.validate_args(args)?;
+        let arg_envs = self.def.prepare_arg_env(&resolved)?;
         let (command, program) = command_of(&self.def)?;
         let cwd = resolve_cwd(self.def.cwd.as_deref(), ctx.paths().home())?;
         let timeout_s = self.def.effective_timeout_s();
@@ -83,7 +84,7 @@ impl ExtensionTool {
                 OsString::from(ctx.node_name()),
             ),
         ];
-        for (key, value) in ExtensionDef::arg_env_vars(&resolved) {
+        for (key, value) in arg_envs {
             envs.push((OsString::from(key), OsString::from(value)));
         }
 
