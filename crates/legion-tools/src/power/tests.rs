@@ -316,7 +316,7 @@ async fn a_refusal_without_sudo_is_denied_and_names_the_setting() {
                 stderr: "Access is denied.(5)\r\n".to_owned(),
                 ..Reply::new(&["shutdown"], 5, "")
             },
-            strings(&["shutdown", "/r", "/t", "3", "/d", "p:0:0"]),
+            strings(&["shutdown", "/r", "/t", "3"]),
         ),
     };
     let fixture =

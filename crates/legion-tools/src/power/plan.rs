@@ -237,9 +237,8 @@ pub fn action_plan(
                         "-accepteula".to_owned(),
                     ]
                 }
-                // p:0:0 records the restart as planned rather than unexpected.
-                Action::Restart => strings(&["shutdown", "/r", "/t", &delay, "/d", "p:0:0"]),
-                Action::Shutdown => strings(&["shutdown", "/s", "/t", &delay, "/d", "p:0:0"]),
+                Action::Restart => strings(&["shutdown", "/r", "/t", &delay]),
+                Action::Shutdown => strings(&["shutdown", "/s", "/t", &delay]),
             };
             Ok(ActionPlan {
                 argv,
@@ -520,10 +519,7 @@ mod tests {
     #[test]
     fn windows_lets_shutdown_and_psshutdown_take_the_delay_and_ignores_sudo() {
         let restart = plan(Platform::Windows, Action::Restart, true);
-        assert_eq!(
-            restart.argv,
-            strings(&["shutdown", "/r", "/t", "3", "/d", "p:0:0"])
-        );
+        assert_eq!(restart.argv, strings(&["shutdown", "/r", "/t", "3"]));
         assert_eq!(restart.timing, Timing::SelfTimed);
         assert_eq!(restart.check, None);
         let off = action_plan(
@@ -535,10 +531,7 @@ mod tests {
             &everything,
         )
         .unwrap();
-        assert_eq!(
-            off.argv,
-            strings(&["shutdown", "/s", "/t", "10", "/d", "p:0:0"])
-        );
+        assert_eq!(off.argv, strings(&["shutdown", "/s", "/t", "10"]));
         let sleep = plan(Platform::Windows, Action::Sleep, false);
         assert_eq!(
             sleep.argv,
