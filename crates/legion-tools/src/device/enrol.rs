@@ -668,6 +668,7 @@ fn process_enrol_blocking(
             role_updated_at: precise_now,
             role_updated_on: valid_node_name.clone(),
             conflict: false,
+            role_conflict: false,
         },
     );
 

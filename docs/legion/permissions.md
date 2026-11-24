@@ -292,20 +292,33 @@ pairings on a registry-owned principal. Each registry-owned `device:*` principal
 **exactly one** pairing id across the lifetime of the fleet: every merge (including owner writes)
 refuses assigning a marked, live, or previously tombstoned `device:*` principal to a different
 pairing id, and reconciliation never re-creates a `device:*` principal for a different id than the
-one that owned it. Merging `devices.toml` via `fleet.sync` or `config.write` refuses incoming
-timestamps more than 10 minutes in the future, refuses introducing duplicate live public keys,
-always merges with the local file (tombstones always win and can never be dropped by syncing).
-During a live-entry merge for the same pairing id, mutable fields (`name` and `role`) merge
-independently using their own `(name_updated_at, name_updated_on)` and
-`(role_updated_at, role_updated_on)` stamps (legacy entries with only `updated_at`/`updated_on`
-parse with both per-field stamps equal to `updated_at`/`updated_on`), so a stale rename pushed with
-node authority can never raise a role lowered on a peer, and a stale role change can never undo a
-newer rename. Immutable identity and pairing-provenance fields (`id`, `public_key`, `principal`,
-`paired_at`, `paired_on`, `paired_by`) must agree across peers; any disagreement is treated as a
-**conflict** (`conflict = true`, never "newest wins") — local confirmation is cleared with a
-warning, no `authorized_keys` line is written, any owned `device:*` principal stays restricted to
-`nobody`, `device.set` refuses changes, `legion gate` denies connections, and both `device.list`
-and `meta.doctor` flag the entry until it is removed with `legion device.remove`. Merging also
+one that owned it. Merging `devices.toml` via `fleet.sync` or `config.write` requires canonical RFC 3339 UTC
+timestamps (no offsets, RFC 9557 timezone annotations, or trailing fractional zeros) and refuses
+incoming timestamps more than 10 minutes in the future, refuses introducing duplicate live public
+keys, refuses live entries in the older single-stamp format without per-field `name_updated_*` and
+`role_updated_*` stamps (accepted only when loading this node's own local `devices.toml` for
+migration, with a hint to update the sending machine), and always merges with the local file
+(tombstones always win and can never be dropped by syncing). Whenever a push, pull, or
+`config.write` is refused for any reason affecting live entries (size reserve, principal or key
+collision, expiring credential, legacy single-stamp format, live timestamp skew, etc.), the
+receiving node still applies and reconciles any tombstones in that request (never refused for size)
+and ends active sessions for removed or newly quarantined devices, while the sender reports that
+peer as `partial` (removals delivered, live changes refused, and why; `device.remove` does not list
+a `partial` peer in `still_trusted_by`). During a live-entry merge for the same pairing id, mutable
+fields (`name` and `role`) merge independently using their own `(name_updated_at, name_updated_on)`
+and `(role_updated_at, role_updated_on)` stamps, so a stale rename pushed with node authority can
+never raise a role lowered on a peer, and a stale role change can never undo a newer rename. When
+two peers disagree on `role` with equal `role_updated_at` and equal `role_updated_on`, the larger
+role string does not win: the entry is marked `role_conflict = true` (inactive — no
+`authorized_keys` line, `nobody` in `policy.toml`, denied by `legion gate`, flagged in
+`device.list` and `meta.doctor`) until an owner resolves it with `legion device.set id=<id>
+role=<role>` (advancing `role_updated_at`) or removes the device. Immutable identity and
+pairing-provenance fields (`id`, `public_key`, `principal`, `paired_at`, `paired_on`, `paired_by`)
+must agree across peers; any disagreement is treated as an immutable **conflict** (`conflict =
+true`, never "newest wins") — local confirmation is cleared with a warning, no `authorized_keys`
+line is written, any owned `device:*` principal stays restricted to `nobody`, `device.set` refuses
+all changes, `legion gate` denies connections, and both `device.list` and `meta.doctor` flag the
+entry until it is removed with `legion device.remove`. Merging also
 refuses setting `confirmed_by`/`confirmed_at` or dropping `paired_by` on an existing entry even for
 owner callers (confirmation is only allowed through `device.set confirm=true`), rewrites any
 incoming tombstone matching a local live entry or local tombstone so its identity and pairing
