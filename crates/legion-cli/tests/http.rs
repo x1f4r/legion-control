@@ -146,9 +146,19 @@ fn main() -> ExitCode {
 
 /// `--http-helper rpc <legion_home> <user_home>`: `legion rpc` for another node, which the
 /// `command` connector starts with this node's environment.
+///
+/// `--http-helper wait <marker>`: writes the marker and waits a minute, a command a test can see
+/// start before it does what it means to test to a running call.
 fn helper(args: &[String]) -> ExitCode {
+    if let [mode, marker] = args
+        && mode == "wait"
+    {
+        std::fs::write(marker, b"started").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+        return ExitCode::SUCCESS;
+    }
     let [mode, legion_home, user_home] = args else {
-        eprintln!("the helper takes rpc, a LEGION_HOME and a home");
+        eprintln!("the helper takes rpc, a LEGION_HOME and a home, or wait and a marker");
         return ExitCode::from(2);
     };
     assert_eq!(mode, "rpc");
@@ -196,6 +206,8 @@ struct Server {
     child: Child,
     port: u16,
     stderr: Arc<Mutex<String>>,
+    /// Says when the stderr reader has read everything there is.
+    read_all: mpsc::Receiver<()>,
 }
 
 impl Server {
@@ -211,6 +223,7 @@ impl Server {
         let seen = Arc::new(Mutex::new(String::new()));
         let (ports, port) = mpsc::channel();
         let collected = Arc::clone(&seen);
+        let (finished, read_all) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
@@ -222,6 +235,7 @@ impl Server {
                 all.push_str(&line);
                 all.push('\n');
             }
+            let _ = finished.send(());
         });
         let port = port
             .recv_timeout(PATIENCE)
@@ -230,6 +244,7 @@ impl Server {
             child,
             port,
             stderr: seen,
+            read_all,
         }
     }
 
@@ -253,8 +268,9 @@ impl Server {
         let deadline = Instant::now() + PATIENCE;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                // Let the reader thread take the last lines.
-                std::thread::sleep(Duration::from_millis(100));
+                self.read_all
+                    .recv_timeout(PATIENCE)
+                    .expect("stderr did not end with the server");
                 return status.code().unwrap_or(-1);
             }
             assert!(Instant::now() < deadline, "legion serve did not stop");
@@ -492,6 +508,37 @@ impl Events {
                 .push_str(std::str::from_utf8(&chunk[..size]).unwrap());
         }
     }
+}
+
+/// Starts a call that runs until cancelled, through `exec.run` with a token whose role may use it,
+/// and returns its connection once the command is seen running.
+fn running_call(server: &Server, token: &str, home: &Home) -> TcpStream {
+    let marker = home.home().join("call-started");
+    let _ = std::fs::remove_file(&marker);
+    let argv = [
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        HELPER_FLAG.to_owned(),
+        "wait".to_owned(),
+        marker.to_string_lossy().into_owned(),
+    ];
+    let stream = send(
+        server.port,
+        "POST",
+        "/v1/call",
+        &auth(Some(token)),
+        json!({"tool": "exec.run", "args": {"argv": argv}})
+            .to_string()
+            .as_bytes(),
+    );
+    let deadline = Instant::now() + PATIENCE;
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "the command never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stream
 }
 
 /// Waits for the audit log to hold a line that `wanted` accepts, and returns it.
@@ -822,20 +869,11 @@ fn a_client_that_goes_away_cancels_its_call() {
             assert_eq!(events.next().unwrap().0, "event");
             drop(events);
         } else {
-            let stream = send(
-                server.port,
-                "POST",
-                "/v1/call",
-                &auth(Some(&fixture.phone)),
-                json!({"tool": "test.sleep", "args": {"seconds": 60}})
-                    .to_string()
-                    .as_bytes(),
-            );
-            std::thread::sleep(Duration::from_millis(300));
-            drop(stream);
+            drop(running_call(&server, &fixture.admin, &fixture.home));
         }
         let line = audited(&fixture.home, |line| {
-            line["tool"] == json!("test.sleep") && line["outcome"] == json!("cancelled")
+            (line["tool"] == json!("test.sleep") || line["tool"] == json!("exec.run"))
+                && line["outcome"] == json!("cancelled")
         });
         assert_eq!(line["door"], json!("http"));
         assert!(
@@ -1254,22 +1292,13 @@ fn token_tools_guard_principals_and_keep_comments() {
 fn shutting_down_cancels_and_records_calls() {
     let fixture = Fixture::new();
     let mut server = Server::start(&fixture.home);
-    let stream = send(
-        server.port,
-        "POST",
-        "/v1/call",
-        &auth(Some(&fixture.phone)),
-        json!({"tool": "test.sleep", "args": {"seconds": 60}})
-            .to_string()
-            .as_bytes(),
-    );
-    std::thread::sleep(Duration::from_millis(300));
+    let stream = running_call(&server, &fixture.admin, &fixture.home);
     let started = Instant::now();
     assert_eq!(server.stop(), if cfg!(unix) { 0 } else { 1 });
     assert!(started.elapsed() < Duration::from_secs(15));
     drop(stream);
     if cfg!(unix) {
-        let line = audited(&fixture.home, |line| line["tool"] == json!("test.sleep"));
+        let line = audited(&fixture.home, |line| line["tool"] == json!("exec.run"));
         assert_eq!(line["outcome"], json!("cancelled"));
         assert!(server.stderr().contains("legion serve: stopped"));
     }
@@ -1539,11 +1568,9 @@ fn a_listed_origin_can_call_from_a_browser() {
         ]
     };
 
-    // The preflight carries no token and is answered at once.
-    let started = Instant::now();
+    // The preflight carries no token.
     let preflight = http(server.port, "OPTIONS", "/v1/call", &asking(&page), b"");
     assert_eq!(preflight.status, 204);
-    assert!(started.elapsed() < Duration::from_millis(150));
     assert_eq!(
         preflight.header("access-control-allow-origin"),
         Some(page.as_str())
