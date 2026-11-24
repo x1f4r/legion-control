@@ -44,6 +44,13 @@ pub const DEVICE_PRINCIPAL_PREFIX: &str = "device:";
 /// Maximum length of a role name recorded in `devices.toml`.
 const MAX_ROLE_NAME_LEN: usize = 128;
 
+/// Maximum length of a key fingerprint recorded in a tombstone (`SHA256:` + 43 base64 chars = 50).
+const MAX_TOMBSTONE_FINGERPRINT_LEN: usize = 50;
+
+/// Maximum length of a canonical RFC 3339 UTC timestamp with a 4-digit year and nanosecond
+/// precision (`YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`).
+const MAX_CANONICAL_TIMESTAMP_LEN: usize = 30;
+
 /// Longest time an operation waits for `state/sync/config.lock`.
 const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -532,10 +539,8 @@ impl Document for DevicesFile {
                 validate_role_name(role)
                     .map_err(|e| format!("devices.{id}.role: {}", e.message))?;
             }
-            entry
-                .paired_at
-                .parse::<Timestamp>()
-                .map_err(|e| format!("devices.{id}.paired_at is not RFC 3339 UTC: {e}"))?;
+            validate_canonical_timestamp(&entry.paired_at)
+                .map_err(|e| format!("devices.{id}.paired_at: {e}"))?;
             NodeName::try_from(entry.paired_on.clone())
                 .map_err(|e| format!("devices.{id}.paired_on: {e}"))?;
             if let Some(paired_by) = &entry.paired_by {
@@ -551,31 +556,24 @@ impl Document for DevicesFile {
                     .map_err(|e| format!("devices.{id}.confirmed_by: {}", e.message))?;
             }
             if let Some(confirmed_at) = &entry.confirmed_at {
-                confirmed_at
-                    .parse::<Timestamp>()
-                    .map_err(|e| format!("devices.{id}.confirmed_at is not RFC 3339 UTC: {e}"))?;
+                validate_canonical_timestamp(confirmed_at)
+                    .map_err(|e| format!("devices.{id}.confirmed_at: {e}"))?;
             }
             if entry.confirmed_by.is_some() != entry.confirmed_at.is_some() {
                 return Err(format!(
                     "devices.{id}: confirmed_by and confirmed_at must either both be set or both be omitted"
                 ));
             }
-            entry
-                .updated_at
-                .parse::<Timestamp>()
-                .map_err(|e| format!("devices.{id}.updated_at is not RFC 3339 UTC: {e}"))?;
+            validate_canonical_timestamp(&entry.updated_at)
+                .map_err(|e| format!("devices.{id}.updated_at: {e}"))?;
             NodeName::try_from(entry.updated_on.clone())
                 .map_err(|e| format!("devices.{id}.updated_on: {e}"))?;
-            entry
-                .name_updated_at
-                .parse::<Timestamp>()
-                .map_err(|e| format!("devices.{id}.name_updated_at is not RFC 3339 UTC: {e}"))?;
+            validate_canonical_timestamp(&entry.name_updated_at)
+                .map_err(|e| format!("devices.{id}.name_updated_at: {e}"))?;
             NodeName::try_from(entry.name_updated_on.clone())
                 .map_err(|e| format!("devices.{id}.name_updated_on: {e}"))?;
-            entry
-                .role_updated_at
-                .parse::<Timestamp>()
-                .map_err(|e| format!("devices.{id}.role_updated_at is not RFC 3339 UTC: {e}"))?;
+            validate_canonical_timestamp(&entry.role_updated_at)
+                .map_err(|e| format!("devices.{id}.role_updated_at: {e}"))?;
             NodeName::try_from(entry.role_updated_on.clone())
                 .map_err(|e| format!("devices.{id}.role_updated_on: {e}"))?;
             if entry.conflict && (entry.confirmed_by.is_some() || entry.confirmed_at.is_some()) {
@@ -592,17 +590,18 @@ impl Document for DevicesFile {
                 .map_err(|e| format!("removed.{id}.principal: {}", e.message))?;
             if let Some(fp) = &tomb.fingerprint
                 && (fp.is_empty()
-                    || fp.len() > 128
-                    || fp.chars().any(|c| c.is_control() || c.is_whitespace()))
+                    || fp.len() > MAX_TOMBSTONE_FINGERPRINT_LEN
+                    || !fp
+                        .bytes()
+                        .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\'))
             {
                 return Err(format!(
                     "removed.{id}.fingerprint is not a valid key fingerprint"
                 ));
             }
             if let Some(paired_at) = &tomb.paired_at {
-                paired_at
-                    .parse::<Timestamp>()
-                    .map_err(|e| format!("removed.{id}.paired_at is not RFC 3339 UTC: {e}"))?;
+                validate_canonical_timestamp(paired_at)
+                    .map_err(|e| format!("removed.{id}.paired_at: {e}"))?;
             }
             if let Some(paired_on) = &tomb.paired_on {
                 NodeName::try_from(paired_on.clone())
@@ -624,9 +623,8 @@ impl Document for DevicesFile {
                         .map_err(|e| format!("removed.{id}.removed_by.device: {}", e.message))?;
                 }
             }
-            tomb.removed_at
-                .parse::<Timestamp>()
-                .map_err(|e| format!("removed.{id}.removed_at is not RFC 3339 UTC: {e}"))?;
+            validate_canonical_timestamp(&tomb.removed_at)
+                .map_err(|e| format!("removed.{id}.removed_at: {e}"))?;
             NodeName::try_from(tomb.removed_on.clone())
                 .map_err(|e| format!("removed.{id}.removed_on: {e}"))?;
         }
@@ -808,6 +806,27 @@ impl DevicesFile {
     }
 }
 
+/// Validates that `raw` is a canonical RFC 3339 UTC timestamp with a 4-digit non-negative year
+/// (`YYYY-MM-DDTHH:MM:SS(.f+)?Z`, uppercase `T` and `Z`, no numeric offset, no RFC 9557 timezone
+/// or calendar annotations, and no trailing fractional zeros), matching `jiff::Timestamp::to_string()`.
+///
+/// This guarantees every stored timestamp is at most 30 bytes (matching
+/// [`WORST_CASE_TOMBSTONE_BYTES`]) and has a unique textual form per instant.
+pub fn validate_canonical_timestamp(raw: &str) -> Result<Timestamp, String> {
+    let ts = raw
+        .parse::<Timestamp>()
+        .map_err(|e| format!("is not valid RFC 3339 UTC: {e}"))?;
+    if raw.len() > MAX_CANONICAL_TIMESTAMP_LEN
+        || !raw.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        || ts.to_string() != raw
+    {
+        return Err(format!(
+            "must be canonical RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ` or fractional without trailing zeros, no offset or RFC 9557 annotation; canonical form is {ts})"
+        ));
+    }
+    Ok(ts)
+}
+
 /// Formats `time` as RFC 3339 UTC, keeping sub-second precision when non-zero so rapid edits
 /// remain strictly ordered.
 pub fn format_precise_rfc3339(time: Timestamp) -> String {
@@ -867,10 +886,10 @@ pub fn validate_incoming_timestamps(
 ) -> Result<(), ErrorBody> {
     let limit = now.checked_add(MAX_FUTURE_SKEW).unwrap_or(Timestamp::MAX);
     let check = |section: &str, id: &str, field: &str, raw: &str| -> Result<(), ErrorBody> {
-        let parsed = raw.parse::<Timestamp>().map_err(|error| {
+        let parsed = validate_canonical_timestamp(raw).map_err(|error| {
             ErrorBody::new(
                 ErrorCode::InvalidArgs,
-                format!("devices.toml {section}.{id}.{field} ({raw:?}) is not valid RFC 3339 UTC: {error}."),
+                format!("devices.toml {section}.{id}.{field} ({raw:?}) {error}."),
             )
         })?;
         if parsed > limit {
@@ -1999,7 +2018,8 @@ pub fn adopt_legacy_devices_from_auth_keys(
             .added
             .parse::<Timestamp>()
             .ok()
-            .map(|_| matched_state.added.clone())
+            .filter(|ts| validate_canonical_timestamp(&format_precise_rfc3339(*ts)).is_ok())
+            .map(format_precise_rfc3339)
             .unwrap_or_else(|| now_str.clone());
         let role = if principal.starts_with(DEVICE_PRINCIPAL_PREFIX)
             && policy.principals.keys().any(|p| p.as_str() == principal)
@@ -3448,7 +3468,7 @@ mod tests {
         let nodes = ["tower", "pi", "mac"];
         // Small timestamp pools so tie-breaks trigger frequently across all remaining fields.
         let paired_times = ["2026-11-24T09:00:00Z", "2026-11-24T09:30:00Z"];
-        let times = ["2026-11-24T10:00:00Z", "2026-11-24T10:00:00.500000000Z"];
+        let times = ["2026-11-24T10:00:00Z", "2026-11-24T10:00:00.5Z"];
         let creator_principals = ["owner", "device:pixel"];
         let confirmed_opts: [Option<&str>; 2] = [None, Some("owner")];
 
@@ -4846,6 +4866,177 @@ device = \"{id_victim}\"
                     && !hint.to_ascii_lowercase().contains("tidy")
                     && !hint.to_ascii_lowercase().contains("prune"),
                 "unexpected size-limit hint: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_canonical_timestamps_are_rejected_on_live_and_tombstone_fields() {
+        let non_canonical = [
+            "2026-11-24T10:00:00Z[UTC]",
+            "2026-11-24T10:00:00Z[America/New_York][u-ca=iso8601]",
+            "2026-11-24T10:00:00+00:00",
+            "2026-11-24T12:00:00+02:00",
+            "2026-11-24t10:00:00z",
+            "2026-11-24 10:00:00Z",
+            "2026-11-24T10:00:00.000Z",
+            "2026-11-24T10:00:00.500Z",
+            "-000001-01-01T00:00:00Z",
+        ];
+        let base_ts = "2026-11-24T10:00:00Z";
+        let now: Timestamp = "2026-11-24T10:05:00Z".parse().unwrap();
+        let id = "11".repeat(16);
+
+        let make_live = || {
+            let mut d = sample_device(1, "phone", Some("observer"), base_ts, "box");
+            d.confirmed_by = Some("owner".to_owned());
+            d.confirmed_at = Some(base_ts.to_owned());
+            d
+        };
+        let make_tomb = || DeviceTombstone {
+            name: "old".to_owned(),
+            principal: "device:old".to_owned(),
+            fingerprint: Some("SHA256:alpha".to_owned()),
+            paired_at: Some(base_ts.to_owned()),
+            paired_on: Some("box".to_owned()),
+            paired_by: None,
+            removed_by: None,
+            removed_at: base_ts.to_owned(),
+            removed_on: "box".to_owned(),
+        };
+
+        // Canonical timestamps pass validation.
+        for good in [
+            "2026-11-24T10:00:00Z",
+            "2026-11-24T10:00:00.5Z",
+            "2026-11-24T10:00:00.123456789Z",
+        ] {
+            let mut file = DevicesFile::default();
+            let mut dev = make_live();
+            dev.paired_at = good.to_owned();
+            dev.confirmed_at = Some(good.to_owned());
+            dev.updated_at = good.to_owned();
+            dev.name_updated_at = good.to_owned();
+            dev.role_updated_at = good.to_owned();
+            file.devices.insert(id.clone(), dev);
+            parse::<DevicesFile>(Path::new("devices.toml"), file.to_toml_string().as_bytes())
+                .unwrap_or_else(|e| panic!("canonical {good} must pass: {e:?}"));
+            validate_incoming_timestamps(&file, now)
+                .unwrap_or_else(|e| panic!("canonical {good} must pass incoming check: {e:?}"));
+        }
+
+        // Every non-canonical form is rejected on every live timestamp field.
+        type LiveMutator = (&'static str, fn(&mut FleetDevice, &str));
+        type TombMutator = (&'static str, fn(&mut DeviceTombstone, &str));
+        for bad in non_canonical {
+            let live_mutators: [LiveMutator; 5] = [
+                ("paired_at", |d, s| d.paired_at = s.to_owned()),
+                ("confirmed_at", |d, s| d.confirmed_at = Some(s.to_owned())),
+                ("updated_at", |d, s| d.updated_at = s.to_owned()),
+                ("name_updated_at", |d, s| d.name_updated_at = s.to_owned()),
+                ("role_updated_at", |d, s| d.role_updated_at = s.to_owned()),
+            ];
+            for (field, mutate) in live_mutators {
+                let mut file = DevicesFile::default();
+                let mut dev = make_live();
+                mutate(&mut dev, bad);
+                file.devices.insert(id.clone(), dev);
+                assert!(
+                    parse::<DevicesFile>(
+                        Path::new("devices.toml"),
+                        file.to_toml_string().as_bytes()
+                    )
+                    .is_err(),
+                    "live {field} accepted non-canonical timestamp {bad:?}"
+                );
+                assert!(
+                    validate_incoming_timestamps(&file, now).is_err(),
+                    "validate_incoming_timestamps accepted non-canonical live {field} {bad:?}"
+                );
+            }
+
+            let tomb_mutators: [TombMutator; 2] = [
+                ("paired_at", |t, s| t.paired_at = Some(s.to_owned())),
+                ("removed_at", |t, s| t.removed_at = s.to_owned()),
+            ];
+            for (field, mutate) in tomb_mutators {
+                let mut file = DevicesFile::default();
+                let mut tomb = make_tomb();
+                mutate(&mut tomb, bad);
+                file.removed.insert(id.clone(), tomb);
+                assert!(
+                    parse::<DevicesFile>(
+                        Path::new("devices.toml"),
+                        file.to_toml_string().as_bytes()
+                    )
+                    .is_err(),
+                    "tombstone {field} accepted non-canonical timestamp {bad:?}"
+                );
+                assert!(
+                    validate_incoming_timestamps(&file, now).is_err(),
+                    "validate_incoming_timestamps accepted non-canonical tombstone {field} {bad:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tombstone_fingerprint_validation_and_true_max_length_bound() {
+        let max_id = "f".repeat(32);
+        let valid_ts = "9999-12-30T21:59:59.999999999Z";
+        let make_max_tomb = |name: String, fp: String| DeviceTombstone {
+            name,
+            principal: "p".repeat(128),
+            fingerprint: Some(fp),
+            paired_at: Some(valid_ts.to_owned()),
+            paired_on: Some("n".repeat(63)),
+            paired_by: Some(PairedBy {
+                principal: "c".repeat(128),
+                device: Some("d".repeat(32)),
+            }),
+            removed_by: Some(PairedBy {
+                principal: "r".repeat(128),
+                device: Some("e".repeat(32)),
+            }),
+            removed_at: valid_ts.to_owned(),
+            removed_on: "m".repeat(63),
+        };
+
+        // Oversized (>50 chars) or TOML-escaped (`"`, `\`) fingerprints must be rejected so no
+        // valid tombstone can ever exceed WORST_CASE_TOMBSTONE_BYTES.
+        for bad_fp in [
+            format!("SHA256:{}", "A".repeat(44)),
+            "x".repeat(128),
+            "SHA256:abc\"def".to_owned(),
+            "SHA256:abc\\def".to_owned(),
+        ] {
+            let mut file = DevicesFile::default();
+            file.removed.insert(
+                max_id.clone(),
+                make_max_tomb("a".repeat(128), bad_fp.clone()),
+            );
+            assert!(
+                parse::<DevicesFile>(Path::new("devices.toml"), file.to_toml_string().as_bytes())
+                    .is_err(),
+                "fingerprint {bad_fp:?} must be rejected by DevicesFile::validate"
+            );
+        }
+
+        // True max-length valid tombstones (both 128-byte ASCII name and 128-byte 4-byte UTF-8
+        // name) must serialize within WORST_CASE_TOMBSTONE_BYTES.
+        let max_fp = format!("SHA256:{}", "A".repeat(43));
+        for max_name in ["a".repeat(128), "🦀".repeat(32)] {
+            assert_eq!(max_name.len(), 128);
+            let mut file = DevicesFile::default();
+            file.removed
+                .insert(max_id.clone(), make_max_tomb(max_name, max_fp.clone()));
+            let toml = file.to_toml_string();
+            parse::<DevicesFile>(Path::new("devices.toml"), toml.as_bytes())
+                .expect("max-length valid tombstone must parse cleanly");
+            let single_entry_bytes = toml.len() - "version = 1\n".len();
+            assert_eq!(
+                single_entry_bytes, WORST_CASE_TOMBSTONE_BYTES,
+                "max-length valid tombstone should exactly match WORST_CASE_TOMBSTONE_BYTES"
             );
         }
     }

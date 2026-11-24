@@ -4936,4 +4936,94 @@ role = \"ops\"
             .expect_err("adding a live entry that breaks tombstone reserve MUST fail");
         assert_eq!(err.code, ErrorCode::InvalidArgs, "{err:?}");
     }
+
+    #[tokio::test]
+    async fn config_write_rejects_non_canonical_rfc9557_and_offset_timestamps() {
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        std::fs::write(&auth_keys, "").unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(paths.config_file("policy.toml"), "default = \"owner\"\n").unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        let key = ed25519_public_key_from_seed(&[0x44; 32]);
+        let id = "44".repeat(16);
+        for bad_ts in [
+            "2026-11-24T10:00:00Z[UTC]",
+            "2026-11-24T10:00:00Z[Etc/UTC][u-ca=iso8601]",
+            "2026-11-24T12:00:00+02:00",
+            "2026-11-24T10:00:00.000Z",
+        ] {
+            let live_toml = format!(
+                "\
+version = 1
+
+[devices.{id}]
+name = \"phone\"
+public_key = \"{key}\"
+principal = \"owner\"
+paired_at = \"{bad_ts}\"
+paired_on = \"box-a\"
+updated_at = \"2026-11-24T10:00:00Z\"
+updated_on = \"box-a\"
+name_updated_at = \"2026-11-24T10:00:00Z\"
+name_updated_on = \"box-a\"
+role_updated_at = \"2026-11-24T10:00:00Z\"
+role_updated_on = \"box-a\"
+"
+            );
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.write",
+                    json!({"document": "devices.toml", "content": live_toml}),
+                ))
+                .await
+                .expect_err("non-canonical live timestamp must be refused");
+            assert!(
+                err.message.contains("canonical RFC 3339 UTC"),
+                "{bad_ts}: {err:?}"
+            );
+
+            let tomb_toml = format!(
+                "\
+version = 1
+
+[removed.{id}]
+name = \"phone\"
+principal = \"owner\"
+removed_at = \"{bad_ts}\"
+removed_on = \"box-a\"
+"
+            );
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.write",
+                    json!({"document": "devices.toml", "content": tomb_toml}),
+                ))
+                .await
+                .expect_err("non-canonical tombstone timestamp must be refused");
+            assert!(
+                err.message.contains("canonical RFC 3339 UTC"),
+                "{bad_ts}: {err:?}"
+            );
+        }
+    }
 }
