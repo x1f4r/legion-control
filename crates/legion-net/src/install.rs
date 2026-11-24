@@ -717,12 +717,23 @@ if (Test-Path -LiteralPath $dest) {{ \
   [System.IO.File]::Move($src, $dest) \
 }}; \
 $norm = $dir.TrimEnd('\\'); \
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User'); \
-$entries = @(); \
-if (-not [string]::IsNullOrEmpty($userPath)) {{ $entries = @($userPath -split ';' | Where-Object {{ -not [string]::IsNullOrWhiteSpace($_) }}) }}; \
-$found = $false; \
-foreach ($e in $entries) {{ if ($e.Trim().TrimEnd('\\').Equals($norm, [System.StringComparison]::OrdinalIgnoreCase)) {{ $found = $true; break }} }}; \
-if (-not $found) {{ [Environment]::SetEnvironmentVariable('Path', (($entries + @($dir)) -join ';'), 'User') }}"
+$envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true); \
+if ($null -eq $envKey) {{ $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }}; \
+try {{ \
+  $existingVal = $envKey.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); \
+  $valueKind = [Microsoft.Win32.RegistryValueKind]::ExpandString; \
+  $rawPath = ''; \
+  if ($null -ne $existingVal) {{ $valueKind = $envKey.GetValueKind('Path'); $rawPath = [string] $existingVal }}; \
+  $entries = @(); \
+  if (-not [string]::IsNullOrEmpty($rawPath)) {{ $entries = @($rawPath -split ';' | Where-Object {{ -not [string]::IsNullOrWhiteSpace($_) }}) }}; \
+  $found = $false; \
+  foreach ($e in $entries) {{ \
+    $rn = $e.Trim().TrimEnd('\\'); \
+    $en = [Environment]::ExpandEnvironmentVariables($e).Trim().TrimEnd('\\'); \
+    if ($rn.Equals($norm, [System.StringComparison]::OrdinalIgnoreCase) -or $en.Equals($norm, [System.StringComparison]::OrdinalIgnoreCase)) {{ $found = $true; break }} \
+  }}; \
+  if (-not $found) {{ $envKey.SetValue('Path', (($entries + @($dir)) -join ';'), $valueKind) }} \
+}} finally {{ if ($null -ne $envKey) {{ $envKey.Close() }} }}"
     );
     Ok(encode_powershell_command(&script))
 }
@@ -1822,7 +1833,10 @@ mod tests {
         assert!(win_fin.contains(".legion-install-fedcba9876543210.exe"));
         assert!(win_fin.contains("legion.exe.old."));
         assert!(win_fin.contains("($dest + '.prev')"));
-        assert!(win_fin.contains("SetEnvironmentVariable('Path'"));
+        assert!(win_fin.contains("DoNotExpandEnvironmentNames"));
+        assert!(win_fin.contains("GetValueKind('Path')"));
+        assert!(win_fin.contains("SetValue('Path'"));
+        assert!(!win_fin.contains("SetEnvironmentVariable('Path'"));
 
         let win_roll = decode_powershell_command(&windows_rollback_command(None).unwrap());
         assert!(win_roll.contains("$prev = $dest + '.prev'"));

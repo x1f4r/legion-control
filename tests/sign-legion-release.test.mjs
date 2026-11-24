@@ -116,3 +116,13 @@ test('install scripts enforce HTTPS-only TLS 1.2 downloads and silent PowerShell
   assert.match(ps1, /\$ProgressPreference\s*=\s*'SilentlyContinue'/);
   assert.match(ps1, /Tls12/);
 });
+
+test('install/legion.ps1 preserves REG_EXPAND_SZ and unexpanded PATH variables', () => {
+  const ps1 = fs.readFileSync(new URL('../install/legion.ps1', import.meta.url), 'utf8');
+  assert.match(ps1, /OpenSubKey\('Environment',\s*\$true\)/);
+  assert.match(ps1, /DoNotExpandEnvironmentNames/);
+  assert.match(ps1, /GetValueKind\('Path'\)/);
+  assert.match(ps1, /RegistryValueKind\]::ExpandString/);
+  assert.match(ps1, /SetValue\('Path'/);
+  assert.doesNotMatch(ps1, /SetEnvironmentVariable\('Path'/);
+});

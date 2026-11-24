@@ -249,29 +249,48 @@ Verify manually before installing:
         $stagedPath = $null
     }
 
-    # Add %LOCALAPPDATA%\legion to the user PATH once, comparing case-insensitively without trailing
-    # backslashes so repeated runs never duplicate entries.
+    # Add %LOCALAPPDATA%\legion to HKCU\Environment\Path without expanding existing %VAR% entries
+    # or changing REG_EXPAND_SZ to REG_SZ.
     $normalizedInstall = $installDir.TrimEnd('\')
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $entries = @()
-    if (-not [string]::IsNullOrEmpty($userPath)) {
-        $entries = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    }
     $alreadyOnPath = $false
-    foreach ($entry in $entries) {
-        if ($entry.Trim().TrimEnd('\').Equals($normalizedInstall, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $alreadyOnPath = $true
-            break
-        }
+    $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    if ($null -eq $envKey) {
+        $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
     }
-    if (-not $alreadyOnPath) {
-        $updatedEntries = @($entries) + @($installDir)
-        $newUserPath = $updatedEntries -join ';'
-        [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
-        if ([string]::IsNullOrEmpty($env:Path)) {
-            $env:Path = $installDir
-        } else {
-            $env:Path = "$env:Path;$installDir"
+    try {
+        $existingVal = $envKey.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $valueKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        $rawPath = ''
+        if ($null -ne $existingVal) {
+            $valueKind = $envKey.GetValueKind('Path')
+            $rawPath = [string] $existingVal
+        }
+        $entries = @()
+        if (-not [string]::IsNullOrEmpty($rawPath)) {
+            $entries = @($rawPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+        foreach ($entry in $entries) {
+            $rawNorm = $entry.Trim().TrimEnd('\')
+            $expNorm = [Environment]::ExpandEnvironmentVariables($entry).Trim().TrimEnd('\')
+            if ($rawNorm.Equals($normalizedInstall, [System.StringComparison]::OrdinalIgnoreCase) -or
+                $expNorm.Equals($normalizedInstall, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $alreadyOnPath = $true
+                break
+            }
+        }
+        if (-not $alreadyOnPath) {
+            $updatedEntries = @($entries) + @($installDir)
+            $newUserPath = $updatedEntries -join ';'
+            $envKey.SetValue('Path', $newUserPath, $valueKind)
+            if ([string]::IsNullOrEmpty($env:Path)) {
+                $env:Path = $installDir
+            } else {
+                $env:Path = "$env:Path;$installDir"
+            }
+        }
+    } finally {
+        if ($null -ne $envKey) {
+            $envKey.Close()
         }
     }
 
