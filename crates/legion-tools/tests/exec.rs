@@ -344,6 +344,17 @@ async fn a_confined_role_runs_only_in_its_paths() {
         .unwrap();
     assert_eq!(ran["exit_code"], json!(0));
 
+    // Without `cwd` the command starts in the first root, not in legion's own directory.
+    let ran = fixture
+        .call_as("agent:claude", "exec.run", helper("cwd", &[]))
+        .await
+        .unwrap();
+    let started = std::path::PathBuf::from(ran["stdout"].as_str().unwrap());
+    assert_eq!(
+        dunce_like(&started),
+        dunce_like(&fixture.home().join("projects"))
+    );
+
     let error = fixture
         .call_as(
             "agent:claude",

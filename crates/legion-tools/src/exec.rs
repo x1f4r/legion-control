@@ -11,6 +11,7 @@ mod text;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -30,7 +31,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "exec.run",
         Effect::Exec,
-        "Run a command that finishes and return its exit code and output. Give `argv` to run a program with exactly these arguments, or `cmd` to hand one line to the platform shell (sh on Linux and macOS, PowerShell on Windows). The command is stopped, with everything it started, when `timeout_s` passes or the call is cancelled; a non-zero exit or a timeout is reported in the result, not as an error. Output is streamed as stdout and stderr events while it runs and capped at `max_output` bytes per stream, keeping the start and the end. Not for anything meant to keep running, such as a server or a watcher: that belongs to job.start.",
+        "Run a command that finishes and return its exit code and output. Give `argv` to run a program with exactly these arguments, or `cmd` to hand one line to the platform shell (sh on Linux and macOS, PowerShell on Windows). The command is stopped, with everything it started, when `timeout_s` passes or the call is cancelled; a non-zero exit or a timeout is reported in the result, not as an error. Output is streamed as stdout and stderr events while it runs and capped at `max_output` bytes per stream, keeping the start and the end. Not for anything meant to keep running, such as a server or a watcher: that belongs to job.start. A command can do anything the account can, so a role's `paths` decide only the directory it starts in (the first of them when `cwd` is absent), and a role that must stay confined should not be given exec.",
         run_command,
     );
 }
@@ -47,7 +48,8 @@ struct RunArgs {
     /// or `cmd`, not both.
     #[serde(default)]
     argv: Option<Vec<String>>,
-    /// The absolute directory to run in; legion's own when absent.
+    /// The absolute directory to run in. When absent: the first of the role's `paths` if it has
+    /// any, otherwise legion's own.
     #[serde(default)]
     cwd: Option<String>,
     /// Environment variables to set on top of legion's own.
@@ -99,11 +101,7 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
     let timeout = timeout_of(args.timeout_s)?;
     let limit = max_output_of(args.max_output)?;
     let env = env_of(args.env.unwrap_or_default())?;
-    let cwd = args
-        .cwd
-        .as_deref()
-        .map(|cwd| ctx.grant().check_path(cwd, Access::Read))
-        .transpose()?;
+    let cwd = start_dir(ctx, args.cwd.as_deref())?;
 
     // Each stream is forwarded as events until `limit` bytes have gone out, so a flood of output
     // costs the caller no more than the captured text does.
@@ -180,6 +178,20 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
         ));
     }
     Ok(ran(output))
+}
+
+/// Where the command starts: `cwd` when given, checked like any path a tool is handed; otherwise
+/// the first of the role's roots when it has any, and legion's own directory when it has none.
+///
+/// A role's `paths` cannot keep a command inside them, since a command can go anywhere the account
+/// can; starting it in a root keeps a cooperating caller where it was meant to work.
+fn start_dir(ctx: &Ctx, cwd: Option<&str>) -> Result<Option<PathBuf>, ErrorBody> {
+    let grant = ctx.grant();
+    let first_root = || grant.roots().and_then(|roots| roots.into_iter().next());
+    match cwd.map(str::to_owned).or_else(first_root) {
+        Some(dir) => grant.check_path(dir, Access::Read).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn ran(output: RunOutput) -> Ran {
