@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use legion_core::{CANCEL_GRACE, CancellationToken, Event, EventSink, VERSION};
 use legion_proto::{
-    CallParams, CancelParams, ErrorBody, ErrorCode, EventParams, HelloParams, HelloResult, Id,
-    Notification, Outcome, PROTOCOL, Request, Response, method,
+    CallParams, CancelParams, Effect, ErrorBody, ErrorCode, EventParams, HelloParams, HelloResult,
+    Id, Notification, Outcome, PROTOCOL, Request, Response, ToolsResult, method,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -113,6 +113,7 @@ pub struct Session {
     death_error: Arc<Mutex<Option<ErrorBody>>>,
     pipe: Arc<tokio::sync::Mutex<Option<PipeHandle>>>,
     reader_task: Mutex<Option<JoinHandle<()>>>,
+    tools_cache: tokio::sync::Mutex<Option<HashMap<String, Effect>>>,
 }
 
 impl Session {
@@ -319,6 +320,7 @@ impl Session {
             death_error,
             pipe: pipe_arc,
             reader_task: Mutex::new(Some(reader_handle)),
+            tools_cache: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -396,6 +398,45 @@ impl Session {
         })?;
         self.request(method::CALL, params_value, cancel, events, true)
             .await
+    }
+
+    /// Queries and caches the remote node's `tools` list so a forwarding node can authorise an
+    /// extension tool that exists only on the target by the effect the target reports for it.
+    pub async fn tool_effect(
+        &self,
+        tool: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<Effect>, CallError> {
+        let mut cache = self.tools_cache.lock().await;
+        if let Some(map) = cache.as_ref() {
+            return Ok(map.get(tool).copied());
+        }
+        let value = self
+            .request(
+                method::TOOLS,
+                json!({}),
+                cancel,
+                EventSink::discard(),
+                false,
+            )
+            .await?;
+        let parsed: ToolsResult = serde_json::from_value(value).map_err(|err| {
+            CallError::Remote(
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} returned a malformed tools reply: {err}.", self.machine),
+                )
+                .with_machine(&self.machine),
+            )
+        })?;
+        let map: HashMap<String, Effect> = parsed
+            .tools
+            .into_iter()
+            .map(|spec| (spec.name, spec.effect))
+            .collect();
+        let effect = map.get(tool).copied();
+        *cache = Some(map);
+        Ok(effect)
     }
 
     async fn request(

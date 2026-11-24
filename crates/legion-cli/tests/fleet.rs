@@ -43,6 +43,10 @@ fn main() -> ExitCode {
             forwards_principal_and_applies_remote_policy_with_machine,
         ),
         (
+            "forwarded_calls_are_authorised_and_audited_on_the_forwarding_node",
+            forwarded_calls_are_authorised_and_audited_on_the_forwarding_node,
+        ),
+        (
             "forwards_events_and_cancellation_to_remote_node",
             forwards_events_and_cancellation_to_remote_node,
         ),
@@ -264,6 +268,83 @@ fn run_helper(args: &[String]) -> ExitCode {
             append_line(Path::new(&rest[0]), "attempt");
             eprintln!("{}", rest[1]);
             ExitCode::from(1)
+        }
+        // ext-tools <call_log>
+        // Serves a fake remote node advertising extension tools `ext.probe` (read) and
+        // `ext.zap` (exec) so forwarding-node extension authorisation can be tested end to end.
+        "ext-tools" => {
+            let call_log = Path::new(&rest[0]);
+            let mut stdout = std::io::stdout().lock();
+            for line in BufReader::new(std::io::stdin()).lines() {
+                let Ok(line) = line else { break };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let reply = match req["method"].as_str().unwrap_or_default() {
+                    "hello" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "node": "extbox",
+                            "version": "0.1.0",
+                            "protocol": 1,
+                            "os": std::env::consts::OS,
+                            "arch": std::env::consts::ARCH,
+                            "systems": []
+                        }
+                    }),
+                    "tools" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "ext.probe",
+                                    "description": "Read-only extension.",
+                                    "effect": "read",
+                                    "input_schema": {"type": "object"}
+                                },
+                                {
+                                    "name": "ext.zap",
+                                    "description": "Exec extension.",
+                                    "effect": "exec",
+                                    "input_schema": {"type": "object"}
+                                }
+                            ]
+                        }
+                    }),
+                    "call" => {
+                        let tool = req["params"]["tool"].as_str().unwrap_or_default();
+                        append_line(call_log, tool);
+                        if tool == "ext.probe" || tool == "ext.zap" {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {"ran": tool}
+                            })
+                        } else {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32000,
+                                    "message": format!("There is no tool called {tool}."),
+                                    "data": {
+                                        "code": "unknown_tool",
+                                        "message": format!("There is no tool called {tool}."),
+                                        "machine": "extbox"
+                                    }
+                                }
+                            })
+                        }
+                    }
+                    _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                writeln!(stdout, "{reply}").unwrap();
+                stdout.flush().unwrap();
+            }
+            ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown helper mode: {other}");
@@ -540,6 +621,18 @@ fn forwards_principal_and_applies_remote_policy_with_machine() {
     let pi = Home::new();
     laptop.write_config("node.toml", "name = \"laptop\"\n");
     pi.write_config("node.toml", "name = \"pi\"\n");
+    // laptop allows `phone` both read and write, while pi confines `phone` to read only, so a
+    // call to `test.write_path` passes laptop's policy and is denied by pi's policy.
+    laptop.write_config(
+        "policy.toml",
+        r#"
+[principals.phone]
+role = "writer"
+
+[roles.writer]
+allow = ["effect:read", "effect:write"]
+"#,
+    );
     pi.write_config(
         "policy.toml",
         r#"
@@ -578,10 +671,6 @@ allow = ["effect:read"]
     assert_eq!(err["machine"], json!("pi"));
 
     // Pinned MCP session cannot escalate on the remote node.
-    laptop.write_config(
-        "policy.toml",
-        "[principals.phone]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
-    );
     let mut mcp = McpClient::start(&laptop, &["--as", "phone"]);
     let (res, _) = mcp.call_with_events("meta_whoami", json!({"on": "pi"}), None);
     assert_eq!(res["isError"], json!(false));
@@ -596,6 +685,217 @@ allow = ["effect:read"]
     assert_eq!(denied_body["code"], json!("denied"));
     assert_eq!(denied_body["machine"], json!("pi"));
     assert_eq!(mcp.finish(), 0);
+}
+
+fn forwarded_calls_are_authorised_and_audited_on_the_forwarding_node() {
+    let laptop = Home::new();
+    let pi = Home::new();
+    let pi_spawns = laptop.state().join("pi-auth-spawns.log");
+    let ext_calls = laptop.state().join("ext-calls.log");
+    fs::create_dir_all(laptop.state()).unwrap();
+
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    laptop.write_config(
+        "policy.toml",
+        r#"
+[principals."agent:x"]
+role = "observer"
+
+[roles.observer]
+allow = ["effect:read"]
+"#,
+    );
+    pi.write_config(
+        "policy.toml",
+        r#"
+[principals."agent:x"]
+role = "observer"
+
+[roles.observer]
+allow = ["effect:read"]
+"#,
+    );
+    let ext_argv = helper_argv("ext-tools", &[ext_calls.to_string_lossy().into_owned()]);
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.extbox]\ncommand = {}\n",
+            toml_argv(&run_argv(&pi, Some(&pi_spawns))),
+            toml_argv(&ext_argv),
+        ),
+    );
+
+    // 1. Role `nobody` (unnamed principal on pinned `legion rpc --as stranger`) is denied before
+    //    spawning `pi` and audited on `laptop`.
+    let mut stranger_rpc = laptop.session(&["--as", "stranger"]);
+    stranger_rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "meta.version", "on": "pi"}),
+    ));
+    let (reply, _) = stranger_rpc.reply_to(&json!(1));
+    assert_eq!(reply["error"]["data"]["code"], json!("denied"), "{reply}");
+    assert_eq!(
+        reply["error"]["data"]["machine"],
+        json!("laptop"),
+        "{reply}"
+    );
+    assert_eq!(
+        count_lines(&pi_spawns),
+        0,
+        "denied forward must not spawn remote connector"
+    );
+    // Fan-out as `nobody` denies without spawning `pi` and writes one audit line per machine.
+    stranger_rpc.send_json(&rpc_request(
+        json!(2),
+        "call",
+        json!({"tool": "meta.version", "on": ["laptop", "pi"]}),
+    ));
+    let (fan_denied, _) = stranger_rpc.reply_to(&json!(2));
+    assert_eq!(
+        fan_denied["result"]["results"]["laptop"]["error"]["code"],
+        json!("denied"),
+        "{fan_denied}"
+    );
+    assert_eq!(
+        fan_denied["result"]["results"]["pi"]["error"]["code"],
+        json!("denied"),
+        "{fan_denied}"
+    );
+    assert_eq!(count_lines(&pi_spawns), 0);
+    assert_eq!(stranger_rpc.finish(), 0);
+
+    let audit = laptop.audit();
+    assert_eq!(audit.len(), 3, "{audit:?}");
+    assert_eq!(audit[0]["door"], json!("rpc"));
+    assert_eq!(audit[0]["principal"], json!("stranger"));
+    assert_eq!(audit[0]["tool"], json!("meta.version"));
+    assert_eq!(audit[0]["target"], json!("pi"));
+    assert_eq!(audit[0]["outcome"], json!("denied"));
+
+    // 2. Allowed principal `agent:x` via `legion rpc --as agent:x` is audited on laptop with
+    //    door, principal, tool, target and outcome; disallowed tool is blocked on laptop.
+    let mut agent_rpc = laptop.session(&["--as", "agent:x"]);
+    agent_rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "meta.version", "on": "pi"}),
+    ));
+    let (ok_reply, _) = agent_rpc.reply_to(&json!(1));
+    assert_eq!(ok_reply["result"]["node"], json!("pi"), "{ok_reply}");
+
+    agent_rpc.send_json(&rpc_request(
+        json!(2),
+        "call",
+        json!({"tool": "test.write_path", "args": {"path": "~/a"}, "on": "pi"}),
+    ));
+    let (write_denied, _) = agent_rpc.reply_to(&json!(2));
+    assert_eq!(
+        write_denied["error"]["data"]["code"],
+        json!("denied"),
+        "{write_denied}"
+    );
+    assert_eq!(
+        write_denied["error"]["data"]["machine"],
+        json!("laptop"),
+        "{write_denied}"
+    );
+
+    // Fan-out as `agent:x` audits one line per machine on laptop.
+    agent_rpc.send_json(&rpc_request(
+        json!(3),
+        "call",
+        json!({"tool": "meta.version", "on": ["laptop", "pi"]}),
+    ));
+    let (fan_ok, _) = agent_rpc.reply_to(&json!(3));
+    assert_eq!(
+        fan_ok["result"]["results"]["laptop"]["ok"]["node"],
+        json!("laptop")
+    );
+    assert_eq!(fan_ok["result"]["results"]["pi"]["ok"]["node"], json!("pi"));
+
+    // 3. Extension tools on `extbox`: `agent:x` (`effect:read`) is allowed `ext.probe` (read),
+    //    denied `ext.zap` (exec) without calling it, and denied `ext.unknown` (unknown effect).
+    agent_rpc.send_json(&rpc_request(
+        json!(4),
+        "call",
+        json!({"tool": "ext.probe", "on": "extbox"}),
+    ));
+    let (ext_ok, _) = agent_rpc.reply_to(&json!(4));
+    assert_eq!(ext_ok["result"]["ran"], json!("ext.probe"), "{ext_ok}");
+
+    agent_rpc.send_json(&rpc_request(
+        json!(5),
+        "call",
+        json!({"tool": "ext.zap", "on": "extbox"}),
+    ));
+    let (ext_zap_denied, _) = agent_rpc.reply_to(&json!(5));
+    assert_eq!(
+        ext_zap_denied["error"]["data"]["code"],
+        json!("denied"),
+        "{ext_zap_denied}"
+    );
+    assert_eq!(
+        ext_zap_denied["error"]["data"]["machine"],
+        json!("laptop"),
+        "{ext_zap_denied}"
+    );
+
+    agent_rpc.send_json(&rpc_request(
+        json!(6),
+        "call",
+        json!({"tool": "ext.unknown", "on": "extbox"}),
+    ));
+    let (ext_unknown_denied, _) = agent_rpc.reply_to(&json!(6));
+    assert_eq!(
+        ext_unknown_denied["error"]["data"]["code"],
+        json!("denied"),
+        "{ext_unknown_denied}"
+    );
+    assert_eq!(agent_rpc.finish(), 0);
+
+    // Only `ext.probe` was actually sent as a call to extbox; `ext.zap` and `ext.unknown` were
+    // blocked by laptop after inspecting `tools`.
+    let called = fs::read_to_string(&ext_calls).unwrap();
+    assert_eq!(called.lines().collect::<Vec<_>>(), vec!["ext.probe"]);
+
+    // Owner (`allow = ["*"]`) can forward `ext.unknown` to extbox (which returns `unknown_tool`).
+    let owner_ext = laptop.run(&["ext.unknown", "--on", "extbox"]);
+    assert_eq!(owner_ext.code, 1, "{}", owner_ext.stdout);
+    assert_eq!(owner_ext.json()["code"], json!("unknown_tool"));
+
+    // Confirm audit lines on laptop include forwarded `agent:x` calls targeting `pi` and `extbox`.
+    let audit = laptop.audit();
+    assert!(
+        audit.iter().any(|e| {
+            e["principal"] == json!("agent:x")
+                && e["door"] == json!("rpc")
+                && e["tool"] == json!("meta.version")
+                && e["target"] == json!("pi")
+                && e["outcome"] == json!("ok")
+        }),
+        "{audit:?}"
+    );
+    assert!(
+        audit.iter().any(|e| {
+            e["principal"] == json!("agent:x")
+                && e["door"] == json!("rpc")
+                && e["tool"] == json!("test.write_path")
+                && e["target"] == json!("pi")
+                && e["outcome"] == json!("denied")
+        }),
+        "{audit:?}"
+    );
+    assert!(
+        audit.iter().any(|e| {
+            e["principal"] == json!("agent:x")
+                && e["tool"] == json!("ext.probe")
+                && e["target"] == json!("extbox")
+                && e["outcome"] == json!("ok")
+        }),
+        "{audit:?}"
+    );
 }
 
 fn forwards_events_and_cancellation_to_remote_node() {

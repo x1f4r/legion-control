@@ -194,7 +194,7 @@ impl Node {
             None => error.with_machine(name.clone()),
         });
 
-        let entry = Entry {
+        self.append_audit_entry(Entry {
             time: audit::now(),
             principal,
             door,
@@ -210,7 +210,45 @@ impl Node {
                 .as_ref()
                 .err()
                 .map(|error| audit::redact_message(&error.message)),
-        };
+        })
+        .await;
+        result
+    }
+
+    /// Appends one routed or forwarded call to this node's audit log, applying the same redaction
+    /// and stderr fallback as [`Node::call`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_audit(
+        &self,
+        target: String,
+        principal: Option<String>,
+        door: Door,
+        tool: String,
+        args: &Value,
+        started: Instant,
+        result: &Result<Value, ErrorBody>,
+    ) {
+        self.append_audit_entry(Entry {
+            time: audit::now(),
+            principal,
+            door,
+            tool,
+            target,
+            outcome: match result {
+                Ok(_) => Outcome::Ok,
+                Err(error) => Outcome::Error(error.code),
+            },
+            duration: (started.elapsed().as_secs_f64() * 1e6).round() / 1e6,
+            args: audit::redact(args),
+            message: result
+                .as_ref()
+                .err()
+                .map(|error| audit::redact_message(&error.message)),
+        })
+        .await;
+    }
+
+    async fn append_audit_entry(&self, entry: Entry) {
         let log = self.inner.audit.clone();
         let written = tokio::task::spawn_blocking(move || log.append(&entry)).await;
         // stderr is for people; a call whose audit line is lost still happened, so it is reported
@@ -226,7 +264,6 @@ impl Node {
         if let Some(problem) = problem {
             let _ = std::io::Write::write_all(&mut std::io::stderr(), problem.as_bytes());
         }
-        result
     }
 
     /// Everything [`Node::call`] does but the audit: the principal, once known, and the outcome.

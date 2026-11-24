@@ -302,6 +302,8 @@ impl Fleet {
     /// Runs `call` on a single named machine (locally if `machine` is this node, otherwise over
     /// the pooled session, or through an explicit `via` relay).
     ///
+    /// Before forwarding, this node authorises the call against its own policy for the caller's
+    /// principal and appends one audit line for the forward with the target machine and outcome.
     /// A node never runs a call locally when `machine` is not this node and is missing from
     /// `fleet.toml`: unknown names fail with `not_found` carrying this node's name.
     pub async fn call_machine(
@@ -314,13 +316,74 @@ impl Fleet {
         if machine == here {
             return node.call(call).await;
         }
-        let fleet_file = node
+        let started = Instant::now();
+        let auth = match authorize_for_forward(node, &call) {
+            Ok(auth) => auth,
+            Err((principal, err)) => {
+                node.record_audit(
+                    machine.to_owned(),
+                    principal,
+                    call.door,
+                    call.tool,
+                    &call.args,
+                    started,
+                    &Err(err.clone()),
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        self.call_remote_authorized(node, machine, call, auth, started)
+            .await
+    }
+
+    async fn call_remote_authorized(
+        &self,
+        node: &Node,
+        machine: &str,
+        call: Call,
+        auth: ForwardAuth,
+        started: Instant,
+    ) -> Result<Value, ErrorBody> {
+        let here = node.name();
+        let door = call.door;
+        let tool = call.tool.clone();
+        let args = call.args.clone();
+        let principal = auth.principal().to_owned();
+        let result = match node
             .config()
             .get::<FleetFile>()
-            .map_err(|err| ensure_machine(err, &here))?;
-        let (direct_machine, direct_entry, relayed) = resolve_route(&fleet_file, machine, &here)?;
-        self.forward_one(node, machine, direct_machine, direct_entry, relayed, call)
-            .await
+            .map_err(|err| ensure_machine(err, &here))
+            .and_then(|fleet_file| {
+                let (direct_machine, direct_entry, relayed) =
+                    resolve_route(&fleet_file, machine, &here)?;
+                Ok((direct_machine.to_owned(), direct_entry.clone(), relayed))
+            }) {
+            Ok((direct_machine, direct_entry, relayed)) => {
+                self.forward_authorized(
+                    node,
+                    machine,
+                    &direct_machine,
+                    &direct_entry,
+                    relayed,
+                    call,
+                    auth,
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
+        node.record_audit(
+            machine.to_owned(),
+            Some(principal),
+            door,
+            tool,
+            &args,
+            started,
+            &result,
+        )
+        .await;
+        result
     }
 
     /// Probes one machine with `hello` (or `meta.version` through its relay when configured with
@@ -523,7 +586,8 @@ impl Fleet {
         while closing.join_next().await.is_some() {}
     }
 
-    async fn forward_one(
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_authorized(
         &self,
         node: &Node,
         machine: &str,
@@ -531,6 +595,7 @@ impl Fleet {
         direct_entry: &MachineEntry,
         relayed: bool,
         call: Call,
+        auth: ForwardAuth,
     ) -> Result<Value, ErrorBody> {
         let here = node.name();
         if relayed && direct_machine == here {
@@ -556,15 +621,32 @@ impl Fleet {
             .with_machine(machine));
         }
 
-        // Resolve the effective principal locally so a pinned door cannot be bypassed on forward
-        // and invalid policy.toml fails closed before anything leaves this node.
-        let policy = node
-            .config()
-            .get::<Policy>()
-            .map_err(|err| ensure_machine(err, &here))?;
-        let principal = policy
-            .resolve(call.as_principal.as_deref(), call.pinned.as_deref())
-            .map_err(|err| err.with_machine(&here))?;
+        let principal = match auth {
+            ForwardAuth::Authorized { principal } => principal,
+            ForwardAuth::NeedsRemoteEffect { principal, policy } => {
+                if relayed {
+                    // Cannot inspect the final target's tool list through a relay before forwarding,
+                    // so its effect is unknown here and only a `*` role may forward it.
+                    policy
+                        .authorize_name(&principal, &call.tool, None, node.paths())
+                        .map_err(|err| err.with_machine(&here))?;
+                    principal
+                } else {
+                    let effect = self
+                        .query_remote_effect(
+                            direct_machine,
+                            direct_entry,
+                            &call.tool,
+                            call.cancel.clone(),
+                        )
+                        .await?;
+                    policy
+                        .authorize_name(&principal, &call.tool, effect, node.paths())
+                        .map_err(|err| err.with_machine(&here))?;
+                    principal
+                }
+            }
+        };
 
         let params = CallParams {
             tool: call.tool,
@@ -584,6 +666,41 @@ impl Fleet {
             call.events.for_machine(machine),
         )
         .await
+    }
+
+    async fn query_remote_effect(
+        &self,
+        machine: &str,
+        entry: &MachineEntry,
+        tool: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<legion_proto::Effect>, ErrorBody> {
+        let slot = self.slot(machine);
+        let live = self
+            .get_or_open(machine, entry, None, cancel.clone())
+            .await?;
+        match live.session.tool_effect(tool, cancel.clone()).await {
+            Ok(effect) => Ok(effect),
+            Err(CallError::NotWritten(_)) => {
+                self.invalidate_if_same(&slot, &live.session);
+                let fresh = self
+                    .get_or_open(machine, entry, None, cancel.clone())
+                    .await?;
+                match fresh.session.tool_effect(tool, cancel).await {
+                    Ok(effect) => Ok(effect),
+                    Err(CallError::LostInFlight(err) | CallError::NotWritten(err)) => {
+                        self.invalidate_if_same(&slot, &fresh.session);
+                        Err(ensure_machine(err, machine))
+                    }
+                    Err(CallError::Remote(err)) => Err(ensure_machine(err, machine)),
+                }
+            }
+            Err(CallError::LostInFlight(err)) => {
+                self.invalidate_if_same(&slot, &live.session);
+                Err(ensure_machine(err, machine))
+            }
+            Err(CallError::Remote(err)) => Err(ensure_machine(err, machine)),
+        }
     }
 
     async fn execute_on_machine(
@@ -932,10 +1049,35 @@ impl Fleet {
     }
 
     async fn fan_out(&self, node: &Node, call: Call, machines: Vec<String>) -> RouteOutcome {
+        let started = Instant::now();
+        let here = node.name();
+        let auth = match authorize_for_forward(node, &call) {
+            Ok(auth) => auth,
+            Err((principal, err)) => {
+                let mut results = BTreeMap::new();
+                for machine in machines {
+                    node.record_audit(
+                        machine.clone(),
+                        principal.clone(),
+                        call.door,
+                        call.tool.clone(),
+                        &call.args,
+                        started,
+                        &Err(err.clone()),
+                    )
+                    .await;
+                    results.insert(machine, Err(err.clone()));
+                }
+                return RouteOutcome::Many(results);
+            }
+        };
+
         let mut set = JoinSet::new();
         for machine in machines {
             let fleet = self.clone();
             let node = node.clone();
+            let here = here.clone();
+            let auth = auth.clone();
             let sub_call = Call {
                 tool: call.tool.clone(),
                 args: call.args.clone(),
@@ -947,10 +1089,14 @@ impl Fleet {
                 hops: call.hops,
             };
             set.spawn(async move {
-                let outcome = fleet
-                    .call_machine(&node, &machine, sub_call)
-                    .await
-                    .map_err(|err| ensure_machine(err, &machine));
+                let outcome = if machine == here {
+                    node.call(sub_call).await
+                } else {
+                    fleet
+                        .call_remote_authorized(&node, &machine, sub_call, auth, started)
+                        .await
+                        .map_err(|err| ensure_machine(err, &machine))
+                };
                 (machine, outcome)
             });
         }
@@ -962,6 +1108,65 @@ impl Fleet {
             }
         }
         RouteOutcome::Many(results)
+    }
+}
+
+#[derive(Clone)]
+enum ForwardAuth {
+    /// Authorized locally by the local tool spec or a wildcard `*` role.
+    Authorized { principal: String },
+    /// Tool does not exist in this node's registry; check the target's reported effect before
+    /// sending `call`.
+    NeedsRemoteEffect {
+        principal: String,
+        policy: Arc<Policy>,
+    },
+}
+
+impl ForwardAuth {
+    fn principal(&self) -> &str {
+        match self {
+            ForwardAuth::Authorized { principal }
+            | ForwardAuth::NeedsRemoteEffect { principal, .. } => principal,
+        }
+    }
+}
+
+fn authorize_for_forward(
+    node: &Node,
+    call: &Call,
+) -> Result<ForwardAuth, (Option<String>, ErrorBody)> {
+    let here = node.name();
+    let policy = node
+        .config()
+        .get::<Policy>()
+        .map_err(|err| (call.pinned.clone(), ensure_machine(err, &here)))?;
+    let principal = match policy.resolve(call.as_principal.as_deref(), call.pinned.as_deref()) {
+        Ok(principal) => principal,
+        Err(err) => {
+            let caller = call
+                .pinned
+                .clone()
+                .unwrap_or_else(|| policy.default_principal().to_owned());
+            return Err((Some(caller), err.with_machine(&here)));
+        }
+    };
+    if let Some(tool) = node.registry().get(&call.tool) {
+        policy
+            .authorize(&principal, tool.spec(), node.paths())
+            .map_err(|err| (Some(principal.clone()), err.with_machine(&here)))?;
+        return Ok(ForwardAuth::Authorized { principal });
+    }
+    // Tool exists only on the target (or does not exist).
+    match policy.authorize_name(&principal, &call.tool, None, node.paths()) {
+        Ok(_) => Ok(ForwardAuth::Authorized { principal }),
+        Err(denied) => {
+            if policy.could_allow_with_remote_effect(&principal, &call.tool) {
+                Ok(ForwardAuth::NeedsRemoteEffect { principal, policy })
+            } else {
+                Err((Some(principal), denied.with_machine(&here)))
+            }
+        }
     }
 }
 
