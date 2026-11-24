@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -125,4 +126,32 @@ test('install/legion.ps1 preserves REG_EXPAND_SZ and unexpanded PATH variables',
   assert.match(ps1, /RegistryValueKind\]::ExpandString/);
   assert.match(ps1, /SetValue\('Path'/);
   assert.doesNotMatch(ps1, /SetEnvironmentVariable\('Path'/);
+});
+
+test('install/legion.sh wraps execution in main() and refuses a directory destination cleanly', () => {
+  const shPath = new URL('../install/legion.sh', import.meta.url);
+  const sh = fs.readFileSync(shPath, 'utf8');
+  const lines = sh.split(/\r?\n/).filter((line) => line.trim() !== '');
+  assert.equal(lines[lines.length - 1], 'main "$@"');
+  assert.match(sh, /^main\(\) \{/m);
+
+  if (process.platform === 'win32') return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-sh-dir-test-'));
+  try {
+    const destDir = path.join(dir, '.local', 'bin', 'legion');
+    fs.mkdirSync(destDir, { recursive: true });
+    const fakeBin = path.join(dir, 'fake-legion');
+    fs.writeFileSync(fakeBin, '#!/bin/sh\necho legion 0.2.0\n', { mode: 0o755 });
+
+    const run = spawnSync('sh', [shPath.pathname, '--from', fakeBin], {
+      env: { ...process.env, HOME: dir },
+      encoding: 'utf8',
+    });
+    assert.notEqual(run.status, 0);
+    assert.match(run.stderr, /is a directory/);
+    assert.deepEqual(fs.readdirSync(destDir), []);
+    assert.deepEqual(fs.readdirSync(path.join(dir, '.local', 'bin')), ['legion']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

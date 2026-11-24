@@ -29,8 +29,6 @@ cleanup() {
   fi
 }
 
-trap cleanup EXIT HUP INT TERM
-
 die() {
   printf 'install/legion.sh: %s\n' "$1" >&2
   exit 1
@@ -320,106 +318,119 @@ EOF
   exit 1
 }
 
-VERSION=''
-FROM_FILE=''
-INSECURE_SKIP_VERIFY=0
+main() {
+  trap cleanup EXIT HUP INT TERM
 
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --version)
-      [ "$#" -ge 2 ] || die "--version requires an argument."
-      VERSION="$2"
-      shift 2
-      ;;
-    --version=*)
-      VERSION="${1#--version=}"
-      shift
-      ;;
-    --from)
-      [ "$#" -ge 2 ] || die "--from requires a file path."
-      FROM_FILE="$2"
-      shift 2
-      ;;
-    --from=*)
-      FROM_FILE="${1#--from=}"
-      shift
-      ;;
-    --insecure-skip-verify)
-      INSECURE_SKIP_VERIFY=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
+  VERSION=''
+  FROM_FILE=''
+  INSECURE_SKIP_VERIFY=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --version)
+        [ "$#" -ge 2 ] || die "--version requires an argument."
+        VERSION="$2"
+        shift 2
+        ;;
+      --version=*)
+        VERSION="${1#--version=}"
+        shift
+        ;;
+      --from)
+        [ "$#" -ge 2 ] || die "--from requires a file path."
+        FROM_FILE="$2"
+        shift 2
+        ;;
+      --from=*)
+        FROM_FILE="${1#--from=}"
+        shift
+        ;;
+      --insecure-skip-verify)
+        INSECURE_SKIP_VERIFY=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1 (run with --help for usage)."
+        ;;
+    esac
+  done
+
+  if [ -n "$FROM_FILE" ] && [ -n "$VERSION" ]; then
+    die "Pass either --from or --version, not both."
+  fi
+
+  if [ -z "${HOME:-}" ]; then
+    die "HOME is not set; cannot determine ~/.local/bin."
+  fi
+
+  INSTALL_DIR="${HOME}/.local/bin"
+  DEST="${INSTALL_DIR}/legion"
+
+  if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; then
+    die "$INSTALL_DIR exists and is not a directory."
+  fi
+  if [ -d "$DEST" ]; then
+    die "$DEST is a directory; refusing to overwrite it."
+  fi
+
+  if [ -n "$FROM_FILE" ]; then
+    if [ ! -f "$FROM_FILE" ]; then
+      die "Source file does not exist or is not a regular file: $FROM_FILE"
+    fi
+    if [ ! -s "$FROM_FILE" ]; then
+      die "Source file is empty: $FROM_FILE"
+    fi
+    SOURCE_BIN="$FROM_FILE"
+  else
+    TARGET="$(detect_target)"
+    if [ -n "$VERSION" ]; then
+      VERSION="$(normalize_version "$VERSION")"
+    else
+      VERSION="$(resolve_latest_version)"
+    fi
+    TAG="legion-v${VERSION}"
+    ASSET="legion-${VERSION}-${TARGET}"
+    BASE_URL="${REPO_URL}/releases/download/${TAG}"
+
+    TMP_DIR="$(mktemp -d)"
+    SUMS_FILE="${TMP_DIR}/SHA256SUMS"
+    DOWNLOADED_BIN="${TMP_DIR}/${ASSET}"
+
+    fetch_to_file "${BASE_URL}/SHA256SUMS" "$SUMS_FILE" \
+      || die "Failed to download ${BASE_URL}/SHA256SUMS."
+    fetch_to_file "${BASE_URL}/${ASSET}" "$DOWNLOADED_BIN" \
+      || die "Failed to download ${BASE_URL}/${ASSET}."
+
+    verify_checksum "$DOWNLOADED_BIN" "$SUMS_FILE" "$ASSET"
+    verify_release_trust "$DOWNLOADED_BIN" "$SUMS_FILE" "$BASE_URL" "$TAG"
+    SOURCE_BIN="$DOWNLOADED_BIN"
+  fi
+
+  # Stage beside the destination so mv is an atomic rename on the same filesystem, leaving any
+  # existing installation untouched if copying or setting permissions fails.
+  mkdir -p "$INSTALL_DIR"
+  STAGED_FILE="$(mktemp "${INSTALL_DIR}/.legion.tmp.XXXXXX")"
+  cp "$SOURCE_BIN" "$STAGED_FILE"
+  chmod 0755 "$STAGED_FILE"
+  mv -f "$STAGED_FILE" "$DEST"
+  STAGED_FILE=''
+
+  INSTALLED_VERSION="$("$DEST" --version)" \
+    || die "Installed $DEST, but running it with --version failed."
+  printf 'Installed %s to %s\n' "$INSTALLED_VERSION" "$DEST"
+
+  case ":${PATH:-}:" in
+    *":${INSTALL_DIR}:"*) ;;
     *)
-      die "Unknown argument: $1 (run with --help for usage)."
+      printf '\nNote: %s is not on your PATH.\n' "$INSTALL_DIR"
+      printf 'Add it to your shell profile so legion can be run by name:\n'
+      printf '  export PATH="$HOME/.local/bin:$PATH"\n'
       ;;
   esac
-done
+}
 
-if [ -n "$FROM_FILE" ] && [ -n "$VERSION" ]; then
-  die "Pass either --from or --version, not both."
-fi
-
-if [ -z "${HOME:-}" ]; then
-  die "HOME is not set; cannot determine ~/.local/bin."
-fi
-
-INSTALL_DIR="${HOME}/.local/bin"
-DEST="${INSTALL_DIR}/legion"
-
-if [ -n "$FROM_FILE" ]; then
-  if [ ! -f "$FROM_FILE" ]; then
-    die "Source file does not exist or is not a regular file: $FROM_FILE"
-  fi
-  if [ ! -s "$FROM_FILE" ]; then
-    die "Source file is empty: $FROM_FILE"
-  fi
-  SOURCE_BIN="$FROM_FILE"
-else
-  TARGET="$(detect_target)"
-  if [ -n "$VERSION" ]; then
-    VERSION="$(normalize_version "$VERSION")"
-  else
-    VERSION="$(resolve_latest_version)"
-  fi
-  TAG="legion-v${VERSION}"
-  ASSET="legion-${VERSION}-${TARGET}"
-  BASE_URL="${REPO_URL}/releases/download/${TAG}"
-
-  TMP_DIR="$(mktemp -d)"
-  SUMS_FILE="${TMP_DIR}/SHA256SUMS"
-  DOWNLOADED_BIN="${TMP_DIR}/${ASSET}"
-
-  fetch_to_file "${BASE_URL}/SHA256SUMS" "$SUMS_FILE" \
-    || die "Failed to download ${BASE_URL}/SHA256SUMS."
-  fetch_to_file "${BASE_URL}/${ASSET}" "$DOWNLOADED_BIN" \
-    || die "Failed to download ${BASE_URL}/${ASSET}."
-
-  verify_checksum "$DOWNLOADED_BIN" "$SUMS_FILE" "$ASSET"
-  verify_release_trust "$DOWNLOADED_BIN" "$SUMS_FILE" "$BASE_URL" "$TAG"
-  SOURCE_BIN="$DOWNLOADED_BIN"
-fi
-
-# Stage beside the destination so mv is an atomic rename on the same filesystem, leaving any
-# existing installation untouched if copying or setting permissions fails.
-mkdir -p "$INSTALL_DIR"
-STAGED_FILE="$(mktemp "${INSTALL_DIR}/.legion.tmp.XXXXXX")"
-cp "$SOURCE_BIN" "$STAGED_FILE"
-chmod 0755 "$STAGED_FILE"
-mv -f "$STAGED_FILE" "$DEST"
-STAGED_FILE=''
-
-INSTALLED_VERSION="$("$DEST" --version)" \
-  || die "Installed $DEST, but running it with --version failed."
-printf 'Installed %s to %s\n' "$INSTALLED_VERSION" "$DEST"
-
-case ":${PATH:-}:" in
-  *":${INSTALL_DIR}:"*) ;;
-  *)
-    printf '\nNote: %s is not on your PATH.\n' "$INSTALL_DIR"
-    printf 'Add it to your shell profile so legion can be run by name:\n'
-    printf '  export PATH="$HOME/.local/bin:$PATH"\n'
-    ;;
-esac
+main "$@"
