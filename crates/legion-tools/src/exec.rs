@@ -147,30 +147,34 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
     let mut running = tokio::spawn(run(options));
 
     let mut decoders: [text::Decoder; 2] = Default::default();
-    let mut emit = |chunk: OutputChunk| {
-        let index = stream_index(chunk.stream);
-        let text = decoders[index].push(&chunk.bytes);
+    let kinds = [EventKind::Stdout, EventKind::Stderr];
+    let mut emit = |stream: OutputStream, bytes: Option<&[u8]>| {
+        let index = stream_index(stream);
+        let text = match bytes {
+            Some(bytes) => decoders[index].push(bytes),
+            None => decoders[index].finish(),
+        };
         if !text.is_empty() {
-            let kind = match chunk.stream {
-                OutputStream::Stdout => EventKind::Stdout,
-                OutputStream::Stderr => EventKind::Stderr,
-            };
-            ctx.emit(kind, Value::String(text));
+            ctx.emit(kinds[index], Value::String(text));
         }
     };
     // On a cancel the run is told to stop the tree, and is still awaited: it returns once the tree
     // is gone, so nothing the command started outlives the call's answer.
     let finished = loop {
         tokio::select! {
-            Some(chunk) = receiver.recv() => emit(chunk),
+            Some(chunk) = receiver.recv() => emit(chunk.stream, Some(&chunk.bytes)),
             finished = &mut running => break finished,
             () = ctx.cancelled(), if !cancel.is_cancelled() => cancel.cancel(),
         }
     };
     // Everything read before the run returned is delivered before the result.
     while let Ok(chunk) = receiver.try_recv() {
-        emit(chunk);
+        emit(chunk.stream, Some(&chunk.bytes));
     }
+    // A character the stream never finished is a replacement character in the captured text, and
+    // so in the events too.
+    emit(OutputStream::Stdout, None);
+    emit(OutputStream::Stderr, None);
 
     let output = finished
         .map_err(|error| {

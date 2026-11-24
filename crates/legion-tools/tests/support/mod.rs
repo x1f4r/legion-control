@@ -115,6 +115,10 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
             let value = env::var(&args[0]).unwrap_or_default();
             let _ = write!(stdout, "{value}");
         }
+        // Writes `ok` and the first byte of a two-byte character it never finishes.
+        "cut-short" => {
+            let _ = stdout.write_all(b"ok\xc3");
+        }
         // Writes the given number of bytes to stdout: a start marker, `x`s, an end marker.
         "flood" => {
             let size: usize = args[0].parse().unwrap();

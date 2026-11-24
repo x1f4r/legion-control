@@ -247,6 +247,20 @@ async fn output_is_streamed_as_events() {
         ran["stderr"].as_str().unwrap()
     );
 
+    // A character the output never finishes ends both the events and the result the same way.
+    let events = Events::default();
+    let ran = fixture
+        .call_with(
+            "exec.run",
+            helper("cut-short", &[]),
+            &events,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ran["stdout"], json!("ok\u{fffd}"));
+    assert_eq!(events.text(EventKind::Stdout), "ok\u{fffd}");
+
     // Events stop once the capture limit is passed, so a flood reaches the caller bounded.
     let events = Events::default();
     fixture
