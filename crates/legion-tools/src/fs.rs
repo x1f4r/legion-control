@@ -8,6 +8,7 @@
 mod manage;
 mod platform;
 mod read;
+mod search;
 mod write;
 
 use std::ffi::OsString;
@@ -31,6 +32,7 @@ pub fn register(registry: &mut Registry) {
     read::register(registry);
     write::register(registry);
     manage::register(registry);
+    search::register(registry);
 }
 
 /// The kind of a filesystem entry, reported without following symbolic links.
