@@ -23,8 +23,8 @@ use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS, DuplicateHandle,
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, RPC_E_DISCONNECTED, RPC_E_TOO_LATE,
-    STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, RPC_E_DISCONNECTED, STATUS_BUFFER_TOO_SMALL,
+    STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE,
 };
 use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
@@ -33,8 +33,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-    CoInitializeSecurity, CoSetProxyBlanket, CoUninitialize, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
-    RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+    CoSetProxyBlanket, CoUninitialize, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
+    RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -1049,28 +1049,8 @@ pub(crate) fn wmi_create_process(
     }
     let _com_guard = ComMtaGuard;
 
-    // `CoInitializeSecurity` is process-wide; `RPC_E_TOO_LATE` simply means another component
-    // already initialized COM security and is not an error.
-    // SAFETY: Null security descriptor uses the process default token with impersonation.
-    if let Err(err) = unsafe {
-        CoInitializeSecurity(
-            None,
-            -1,
-            None,
-            None,
-            RPC_C_AUTHN_LEVEL_DEFAULT,
-            RPC_C_IMP_LEVEL_IMPERSONATE,
-            None,
-            EOAC_NONE,
-            None,
-        )
-    } && err.code() != RPC_E_TOO_LATE
-    {
-        return Err(WmiCreateError::NotStarted {
-            transient: false,
-            detail: format!("CoInitializeSecurity failed: {err}"),
-        });
-    }
+    // Avoid calling process-wide `CoInitializeSecurity` with a null security descriptor; rely on
+    // `CoSetProxyBlanket` on the `IWbemServices` proxy returned by local `ROOT\CIMV2` instead.
 
     // SAFETY: `WbemLocator` is a standard system COM class returning `IWbemLocator`.
     let locator: IWbemLocator = unsafe {
