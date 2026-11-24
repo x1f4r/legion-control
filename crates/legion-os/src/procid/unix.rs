@@ -188,24 +188,41 @@ const fn libc_esrch() -> i32 {
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod macos_proc {
-    use std::mem::{size_of, zeroed};
+    use std::mem::{offset_of, size_of, zeroed};
 
-    use crate::procid::ProcessId;
+    use crate::procid::{
+        MACOS_SZOMB, MacosProcSample, ProcessId, macos_start_time_us, resolve_macos_pid_identity,
+    };
     use crate::{OsError, Result};
 
-    // Darwin `<sys/proc.h>` `SZOMB` state indicating an exited, unreaped zombie process.
-    const SZOMB: u32 = 5;
+    /// Minimal ABI-matching layout for Darwin 64-bit `struct kinfo_proc` (`<sys/sysctl.h>` +
+    /// `<sys/proc.h>`, 648 bytes on both `aarch64-apple-darwin` and `x86_64-apple-darwin`).
+    ///
+    /// Verified field offsets:
+    /// - `0..16`: `kp_proc.p_un.__p_starttime` (`libc::timeval`: `tv_sec: i64`, `tv_usec: i32`)
+    /// - `36`: `kp_proc.p_stat` (`libc::c_char`; `SZOMB == 5`)
+    /// - `40..44`: `kp_proc.p_pid` (`libc::pid_t`)
+    #[repr(C)]
+    struct KinfoProc {
+        p_starttime: libc::timeval,
+        _pad_to_stat: [u8; 20],
+        p_stat: libc::c_char,
+        _pad_to_pid: [u8; 3],
+        p_pid: libc::pid_t,
+        _tail: [u8; 648 - 44],
+    }
 
-    pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
-        let Ok(raw_pid) = i32::try_from(pid) else {
-            return Err(OsError::InvalidArgument {
-                detail: format!("pid {pid} exceeds Unix pid_t range"),
-            });
-        };
+    const _: () = {
+        assert!(size_of::<KinfoProc>() == 648);
+        assert!(offset_of!(KinfoProc, p_starttime) == 0);
+        assert!(offset_of!(KinfoProc, p_stat) == 36);
+        assert!(offset_of!(KinfoProc, p_pid) == 40);
+    };
 
+    pub(super) fn query_bsd_info(raw_pid: i32) -> Option<MacosProcSample> {
         // SAFETY: `libc::proc_bsdinfo` is a plain C struct safe to zero-initialize; `proc_pidinfo`
-        // writes at most `size_of::<libc::proc_bsdinfo>()` bytes into `info` and returns the byte
-        // count written (0 or negative when the PID does not exist or cannot be queried).
+        // receives its exact byte size `expected`, writes at most `expected` bytes into `info`,
+        // and we accept the result only when the return value equals `expected`.
         let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
         let expected = size_of::<libc::proc_bsdinfo>() as libc::c_int;
         let written = unsafe {
@@ -218,19 +235,69 @@ mod macos_proc {
             )
         };
         if written != expected {
-            return Ok(None);
+            return None;
         }
-        if !include_zombie && info.pbi_status == SZOMB {
-            return Ok(None);
+        let start_us = macos_start_time_us(info.pbi_start_tvsec, info.pbi_start_tvusec)?;
+        Some(MacosProcSample {
+            status: info.pbi_status,
+            start_us,
+        })
+    }
+
+    pub(super) fn query_kinfo(raw_pid: i32) -> Option<MacosProcSample> {
+        let mut mib: [libc::c_int; 4] = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            raw_pid,
+        ];
+        // SAFETY: `KinfoProc` is a plain `#[repr(C)]` struct matching Darwin's 648-byte
+        // `struct kinfo_proc` ABI (checked by compile-time size/offset assertions above) and is
+        // safe to zero-initialize. `size` is initialized to `size_of::<KinfoProc>()` so `sysctl`
+        // writes at most `size_of::<KinfoProc>()` bytes into `kp`. We validate both the `rc == 0`
+        // return code and that the kernel wrote a full struct (`size >= size_of::<KinfoProc>()`;
+        // `sysctl` returns `rc == 0, size == 0` for a nonexistent PID).
+        let mut kp: KinfoProc = unsafe { zeroed() };
+        let mut size: libc::size_t = size_of::<KinfoProc>();
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                (&mut kp as *mut KinfoProc).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || size < size_of::<KinfoProc>() || kp.p_pid != raw_pid {
+            return None;
         }
-        let start_us = info
-            .pbi_start_tvsec
-            .saturating_mul(1_000_000)
-            .saturating_add(info.pbi_start_tvusec);
-        if start_us == 0 {
-            return Ok(None);
-        }
-        Ok(Some(ProcessId::new(pid, start_us)))
+        let tv_sec = u64::try_from(kp.p_starttime.tv_sec).ok()?;
+        let tv_usec = u64::try_from(kp.p_starttime.tv_usec).ok()?;
+        let start_us = macos_start_time_us(tv_sec, tv_usec)?;
+        let status = u32::from(kp.p_stat as u8);
+        Some(MacosProcSample { status, start_us })
+    }
+
+    pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
+        let Ok(raw_pid) = i32::try_from(pid) else {
+            return Err(OsError::InvalidArgument {
+                detail: format!("pid {pid} exceeds Unix pid_t range"),
+            });
+        };
+
+        let bsd_info = query_bsd_info(raw_pid);
+        let kinfo = if bsd_info.is_none() {
+            query_kinfo(raw_pid)
+        } else {
+            None
+        };
+        Ok(resolve_macos_pid_identity(
+            pid,
+            include_zombie,
+            bsd_info,
+            kinfo,
+        ))
     }
 
     pub(super) fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
@@ -248,16 +315,10 @@ mod macos_proc {
                 expected,
             )
         };
-        if written != expected || info.pbi_status == SZOMB {
+        if written != expected || info.pbi_status == MACOS_SZOMB {
             return None;
         }
-        let start_us = info
-            .pbi_start_tvsec
-            .saturating_mul(1_000_000)
-            .saturating_add(info.pbi_start_tvusec);
-        if start_us == 0 {
-            return None;
-        }
+        let start_us = macos_start_time_us(info.pbi_start_tvsec, info.pbi_start_tvusec)?;
         Some((info.pbi_ppid, start_us))
     }
 
@@ -747,7 +808,9 @@ pub(super) async fn kill_process(
         }
         match kill(nix_pid, initial_sig) {
             Ok(()) => Ok(false),
-            Err(Errno::ESRCH) => Ok(true),
+            // On macOS, `kill` can return `ESRCH` while a process is in `P_WEXIT` before its
+            // descriptors are closed; settle until `is_alive` reports false too.
+            Err(Errno::ESRCH) => Ok(!is_alive(&identity)),
             Err(Errno::EPERM) => Err(OsError::PermissionDenied {
                 detail: format!("permission denied signaling process {}", identity.pid),
                 source: None,
@@ -809,7 +872,7 @@ pub(super) async fn kill_process(
             }
             match kill(nix_pid, Signal::SIGKILL) {
                 Ok(()) => Ok(false),
-                Err(Errno::ESRCH) => Ok(true),
+                Err(Errno::ESRCH) => Ok(!is_alive(&identity)),
                 Err(Errno::EPERM) => Err(OsError::PermissionDenied {
                     detail: format!("permission denied escalating process {}", identity.pid),
                     source: None,
@@ -1542,5 +1605,26 @@ mod tests {
             linux_pidfd::open_verified(&absent),
             linux_pidfd::VerifiedOpen::GoneOrMismatch | linux_pidfd::VerifiedOpen::FallbackToPid
         ));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn macos_bsd_info_and_kinfo_match_for_current_process() {
+        let pid = std::process::id();
+        let raw_pid = i32::try_from(pid).unwrap();
+        let bsd = macos_proc::query_bsd_info(raw_pid).expect("proc_pidinfo failed for self");
+        let kinfo = macos_proc::query_kinfo(raw_pid).expect("sysctl kinfo_proc failed for self");
+        assert_eq!(
+            bsd.start_us, kinfo.start_us,
+            "proc_pidinfo and kinfo_proc derived different start times"
+        );
+        assert_ne!(bsd.status, crate::procid::MACOS_SZOMB);
+        assert_ne!(kinfo.status, crate::procid::MACOS_SZOMB);
+
+        assert_eq!(macos_proc::query_kinfo(i32::MAX), None);
     }
 }
