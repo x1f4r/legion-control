@@ -25,6 +25,7 @@ mod api;
 mod gate;
 mod reply;
 mod sessions;
+mod ui;
 
 use std::future::Future;
 use std::io::{self, Write as _};
@@ -36,8 +37,8 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, CONTENT_TYPE, HeaderValue,
-    ORIGIN, VARY, WWW_AUTHENTICATE,
+    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, CONTENT_SECURITY_POLICY,
+    CONTENT_TYPE, HeaderValue, REFERRER_POLICY, VARY, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{Method, Response, StatusCode};
 use axum::middleware::{self, Next};
@@ -372,12 +373,21 @@ async fn gate(
             "Pages from that origin may not use this server.",
         )
     } else {
-        accepted_origin = request.headers().get(ORIGIN).cloned();
+        accepted_origin = gate::listed_origin(request.headers(), &config);
         if method == Method::OPTIONS && accepted_origin.is_some() {
             // A browser's preflight carries no token; a listed origin is told what it may send.
             preflight()
         } else if method == Method::GET && path == "/v1/health" {
             next.run(request).await
+        } else if config.ui
+            && (method == Method::GET || method == Method::HEAD)
+            && let Some(asset) = ui::serve(
+                request.uri().path(),
+                request.headers(),
+                method == Method::HEAD,
+            )
+        {
+            asset
         } else {
             let tokens = shared
                 .node
@@ -403,8 +413,14 @@ async fn gate(
             }
         }
     };
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(ui::CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     if let Some(origin) = accepted_origin {
-        let headers = response.headers_mut();
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         headers.insert(
             ACCESS_CONTROL_EXPOSE_HEADERS,

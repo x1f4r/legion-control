@@ -310,3 +310,32 @@ jobs:
           persist-credentials: false
       - name: Build the Mac app without installing it
         run: bash mac/build.sh --no-install
+
+  ui-browser:
+    name: UI browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+      - name: Build release legion binary
+        run: cargo build --release --locked --bin legion
+      - name: Install browser test driver
+        run: npm --prefix apps/ui/test ci
+      - name: Run headless browser end-to-end test
+        run: node --test apps/ui/test/browser.test.mjs

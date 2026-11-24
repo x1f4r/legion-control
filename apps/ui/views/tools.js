@@ -1,0 +1,628 @@
+// Tools screen: searchable family catalog, JSON Schema form builder, target picker, and result view.
+
+import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
+import { CodeText, Notice, ResultView } from './common.js';
+import { splitFirstSentence } from '../lib/format.js';
+import { routeHref } from '../lib/route.js';
+import {
+  buildArgs,
+  describePowerConfirm,
+  describeSchema,
+  groupToolsByFamily,
+  hasDryRun,
+  initialValues,
+  needsConfirmation,
+  parseRawArgs,
+  unavailableReason,
+  valuesFromArgs,
+} from '../lib/schema.js';
+
+function FieldHelp({ description }) {
+  if (!description) return null;
+  const { first, rest } = splitFirstSentence(description);
+  return html`
+    <small><${CodeText} text=${first} /></small>
+    ${rest
+      ? html`
+          <details class="more">
+            <summary>More</summary>
+            <p><${CodeText} text=${rest} /></p>
+          </details>
+        `
+      : null}
+  `;
+}
+
+function FieldInput({ field, value, onChange, error, idPrefix }) {
+  const id = `${idPrefix}-${field.name}`;
+  const placeholder =
+    field.defaultValue !== undefined ? String(field.defaultValue) : undefined;
+  const helpParts = splitFirstSentence(field.description);
+
+  if (field.kind === 'boolean') {
+    return html`
+      <div>
+        <label class="switch" htmlFor=${id}>
+          <span>
+            <span class="mono">${field.name}</span>
+            ${field.required ? html` <em class="dim">required</em>` : null}
+            ${helpParts.first
+              ? html`<small class="help"><${CodeText} text=${helpParts.first} /></small>`
+              : null}
+          </span>
+          <input
+            id=${id}
+            type="checkbox"
+            checked=${Boolean(value)}
+            onChange=${(e) => onChange(e.target.checked)}
+          />
+        </label>
+        ${helpParts.rest
+          ? html`
+              <details class="more">
+                <summary>More</summary>
+                <p><${CodeText} text=${helpParts.rest} /></p>
+              </details>
+            `
+          : null}
+        ${error ? html`<small class="field-err">${error}</small>` : null}
+      </div>
+    `;
+  }
+
+  if (field.kind === 'object') {
+    const obj = value && typeof value === 'object' ? value : {};
+    return html`
+      <div class="field">
+        <span>
+          ${field.name}
+          <em>${field.required ? 'required' : 'optional'}</em>
+        </span>
+        <${FieldHelp} description=${field.description} />
+        <div class="nested">
+          ${field.fields.map(
+            (sub) => html`
+              <${FieldInput}
+                key=${sub.name}
+                field=${sub}
+                value=${obj[sub.name]}
+                onChange=${(nextVal) => onChange({ ...obj, [sub.name]: nextVal })}
+                idPrefix=${id}
+              />
+            `,
+          )}
+        </div>
+        ${error ? html`<small class="field-err">${error}</small>` : null}
+      </div>
+    `;
+  }
+
+  return html`
+    <div class="field">
+      <label htmlFor=${id} class="field-label">
+        <span>
+          ${field.name}
+          <em>${field.required ? 'required' : 'optional'}</em>
+        </span>
+      </label>
+      ${field.kind === 'enum'
+        ? html`
+            <select id=${id} value=${value ?? ''} onChange=${(e) => onChange(e.target.value)}>
+              <option value="">${placeholder ? `Default (${placeholder})` : 'Choose…'}</option>
+              ${field.enumValues.map(
+                (opt) => html`<option key=${opt} value=${opt}>${opt}</option>`,
+              )}
+            </select>
+          `
+        : field.kind === 'string-array' || field.kind === 'json'
+          ? html`
+              <textarea
+                id=${id}
+                value=${value ?? ''}
+                onInput=${(e) => onChange(e.target.value)}
+                placeholder=${field.kind === 'string-array' ? 'One item per line' : '{}'}
+              ></textarea>
+            `
+          : html`
+              <input
+                id=${id}
+                type="text"
+                inputMode=${field.kind === 'integer'
+                  ? 'numeric'
+                  : field.kind === 'number'
+                    ? 'decimal'
+                    : undefined}
+                value=${value ?? ''}
+                onInput=${(e) => onChange(e.target.value)}
+                placeholder=${placeholder}
+                autocomplete="off"
+                spellcheck="false"
+              />
+            `}
+      <${FieldHelp} description=${field.description} />
+      ${error ? html`<small class="field-err">${error}</small>` : null}
+    </div>
+  `;
+}
+
+function ToolDetail({
+  tool,
+  allowed,
+  nodeInfo,
+  machines,
+  runningJobs,
+  link,
+  onRequestConfirm,
+}) {
+  const fields = useMemo(() => describeSchema(tool.input_schema), [tool.name]);
+  const descParts = useMemo(() => splitFirstSentence(tool.description), [tool.description]);
+  const [values, setValues] = useState(() => initialValues(tool.input_schema));
+  const [rawMode, setRawMode] = useState(false);
+  const [rawText, setRawText] = useState('{}');
+  const [targetMode, setTargetMode] = useState('local');
+  const [multiTargets, setMultiTargets] = useState([]);
+  const [fieldErrors, setFieldErrors] = useState({});
+  const [running, setRunning] = useState(false);
+  const [events, setEvents] = useState([]);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const abortRef = useRef(null);
+
+  const localNode = nodeInfo?.node || 'this node';
+  const machineNames = (machines || []).map((m) => m.name);
+  const remoteNames = machineNames.filter((n) => n !== localNode);
+  const isSingleRemote =
+    targetMode !== 'local' && targetMode !== 'all' && targetMode !== 'multi';
+
+  useEffect(() => {
+    return () => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+        abortRef.current = null;
+      }
+    };
+  }, []);
+
+  function toggleRaw(nextRaw) {
+    setError(null);
+    setFieldErrors({});
+    if (nextRaw) {
+      const built = buildArgs(tool.input_schema, values);
+      setRawText(JSON.stringify(built.args || {}, null, 2));
+      setRawMode(true);
+    } else {
+      const parsed = parseRawArgs(rawText);
+      if (!parsed.ok) {
+        setError({ code: 'invalid_args', message: parsed.error, hint: null });
+        return;
+      }
+      setValues(valuesFromArgs(tool.input_schema, parsed.args));
+      setRawMode(false);
+    }
+  }
+
+  function resolveOn() {
+    if (targetMode === 'local') return undefined;
+    if (targetMode === 'all') return 'all';
+    if (targetMode === 'multi') {
+      if (multiTargets.length === 0) return undefined;
+      if (multiTargets.length === 1) {
+        return multiTargets[0] === localNode ? undefined : multiTargets[0];
+      }
+      return multiTargets;
+    }
+    return targetMode === localNode ? undefined : targetMode;
+  }
+
+  function targetLabel() {
+    if (targetMode === 'local') return localNode;
+    if (targetMode === 'all') return 'all machines';
+    if (targetMode === 'multi') return multiTargets.length ? multiTargets.join(', ') : localNode;
+    return targetMode;
+  }
+
+  function collectArgs() {
+    if (rawMode) {
+      const parsed = parseRawArgs(rawText);
+      if (!parsed.ok) {
+        setError({ code: 'invalid_args', message: parsed.error, hint: null });
+        return null;
+      }
+      setFieldErrors({});
+      return parsed.args;
+    }
+    const built = buildArgs(tool.input_schema, values);
+    if (!built.ok) {
+      setFieldErrors(built.errors);
+      setError({
+        code: 'invalid_args',
+        message: 'Check the highlighted fields before running.',
+        hint: null,
+      });
+      return null;
+    }
+    setFieldErrors({});
+    return built.args;
+  }
+
+  async function executeCall(args) {
+    if (abortRef.current) abortRef.current.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setRunning(true);
+    setError(null);
+    setResult(null);
+    setEvents([]);
+
+    try {
+      const out = await link.call(tool.name, args, {
+        on: resolveOn(),
+        signal: ctrl.signal,
+        onEvent(evt) {
+          if (evt) setEvents((prev) => [...prev, evt]);
+        },
+      });
+      setResult(out);
+      return out;
+    } catch (err) {
+      setError(err);
+      return null;
+    } finally {
+      abortRef.current = null;
+      setRunning(false);
+    }
+  }
+
+  function handleRun(dryOnly) {
+    setError(null);
+    if (running && abortRef.current) {
+      abortRef.current.abort();
+      return;
+    }
+    const args = collectArgs();
+    if (!args) return;
+
+    const toolHasDry = hasDryRun(tool.input_schema);
+    if (dryOnly && toolHasDry) {
+      executeCall({ ...args, dry_run: true });
+      return;
+    }
+
+    const effectiveDry = toolHasDry && Boolean(args.dry_run);
+    if (needsConfirmation(tool.effect) && !effectiveDry) {
+      const where = targetLabel();
+      const targetOn = resolveOn();
+      const targetJobs = (runningJobs || []).filter(
+        (j) =>
+          where === 'all machines' ||
+          j.machine === where ||
+          (Array.isArray(targetOn) && targetOn.includes(j.machine)),
+      );
+      const matchedMachines = (machines || []).filter(
+        (m) =>
+          where === 'all machines' ||
+          m.name === where ||
+          (Array.isArray(targetOn) && targetOn.includes(m.name)),
+      );
+      const busyReasons = matchedMachines.flatMap((m) => m.busyReasons || []);
+      const copy = describePowerConfirm(tool.name, where, args, targetJobs, busyReasons);
+      onRequestConfirm({
+        title: copy.title,
+        summary: copy.summary,
+        jobs: tool.effect === 'power' && tool.name !== 'power.wake' ? targetJobs : [],
+        tool: tool.name,
+        effect: tool.effect,
+        confirmLabel: copy.confirmLabel,
+        canDryRun: toolHasDry,
+        async onDryRun() {
+          return executeCall({ ...args, dry_run: true });
+        },
+        async onConfirm() {
+          await executeCall(args);
+        },
+      });
+      return;
+    }
+
+    executeCall(args);
+  }
+
+  const toolHasDry = hasDryRun(tool.input_schema);
+  const danger = needsConfirmation(tool.effect);
+  const visibleFields = fields.filter((f) => !(danger && f.name === 'dry_run'));
+  const where = targetLabel();
+  const actionButtonLabel = danger
+    ? describePowerConfirm(tool.name, where, values).buttonLabel
+    : 'Run';
+  const canSubmit = allowed || isSingleRemote;
+
+  function toggleMulti(name) {
+    setMultiTargets((prev) =>
+      prev.includes(name) ? prev.filter((item) => item !== name) : [...prev, name],
+    );
+  }
+
+  return html`
+    <div>
+      <p class="lede"><${CodeText} text=${descParts.first} /></p>
+      ${descParts.rest
+        ? html`
+            <details class="more">
+              <summary>More about this tool</summary>
+              <p><${CodeText} text=${descParts.rest} /></p>
+            </details>
+          `
+        : null}
+
+      ${!allowed && !isSingleRemote
+        ? html`
+            <${Notice}
+              kind="warn"
+              title="Unavailable for this device."
+              hint=${unavailableReason(tool, nodeInfo?.whoami)}
+            />
+          `
+        : null}
+
+      <label class="field" htmlFor="tool-target-on">
+        <span>on <em>where to run it</em></span>
+        <select
+          id="tool-target-on"
+          value=${targetMode}
+          onChange=${(e) => {
+            setTargetMode(e.target.value);
+            setError(null);
+            setResult(null);
+          }}
+        >
+          <option value="local">${localNode} (this node)</option>
+          ${remoteNames.map((name) => html`<option key=${name} value=${name}>${name}</option>`)}
+          ${machineNames.length > 1
+            ? html`<option value="all">All machines</option>`
+            : null}
+          ${machineNames.length > 1
+            ? html`<option value="multi">Choose several machines…</option>`
+            : null}
+        </select>
+        ${isSingleRemote
+          ? html`
+              <small>
+                ${`Showing tools from ${localNode}; ${targetMode} checks its own tools and permissions when you run.`}
+              </small>
+            `
+          : null}
+      </label>
+
+      ${targetMode === 'multi'
+        ? html`
+            <div class="chips" role="group" aria-label="Select target machines">
+              ${machineNames.map((name) => {
+                const active = multiTargets.includes(name);
+                return html`
+                  <button
+                    type="button"
+                    key=${name}
+                    class="chip-btn"
+                    aria-pressed=${active ? 'true' : 'false'}
+                    onClick=${() => toggleMulti(name)}
+                  >
+                    ${name}
+                  </button>
+                `;
+              })}
+            </div>
+          `
+        : null}
+
+      <label class="switch">
+        <span>Edit arguments as raw JSON</span>
+        <input
+          type="checkbox"
+          checked=${rawMode}
+          onChange=${(e) => toggleRaw(e.target.checked)}
+        />
+      </label>
+
+      <form
+        onSubmit=${(e) => {
+          e.preventDefault();
+          handleRun(false);
+        }}
+      >
+        ${rawMode
+          ? html`
+              <label class="field" htmlFor="tool-raw-json">
+                <span>arguments <em>JSON object</em></span>
+                <textarea
+                  id="tool-raw-json"
+                  value=${rawText}
+                  onInput=${(e) => setRawText(e.target.value)}
+                  spellcheck="false"
+                ></textarea>
+              </label>
+            `
+          : visibleFields.map(
+              (field) => html`
+                <${FieldInput}
+                  key=${field.name}
+                  field=${field}
+                  value=${values[field.name]}
+                  error=${fieldErrors[field.name]}
+                  idPrefix="arg"
+                  onChange=${(nextVal) =>
+                    setValues((prev) => ({ ...prev, [field.name]: nextVal }))}
+                />
+              `,
+            )}
+
+        ${error ? html`<${Notice} error=${error} />` : null}
+
+        <div class="actions">
+          ${danger && toolHasDry
+            ? html`
+                <button
+                  type="button"
+                  class="btn"
+                  disabled=${!canSubmit || running}
+                  onClick=${() => handleRun(true)}
+                >
+                  Try it (dry run)
+                </button>
+              `
+            : null}
+          <button
+            type="submit"
+            class=${running ? 'btn danger' : danger ? 'btn danger' : 'btn primary'}
+            disabled=${!canSubmit && !running}
+          >
+            ${running ? 'Stop' : actionButtonLabel}
+          </button>
+        </div>
+      </form>
+
+      ${events.length > 0
+        ? html`
+            <p class="label">Events</p>
+            <pre class="out wrap">
+${events.map(
+              (evt, i) =>
+                html`<span key=${i} class=${evt.kind === 'stderr' ? 'err' : ''}>
+${evt.machine ? `[${evt.machine}] ` : ''}${typeof evt.data === 'string'
+                  ? evt.data
+                  : JSON.stringify(evt.data) + '\n'}</span>`,
+            )}</pre>
+          `
+        : null}
+
+      ${result !== null ? html`<${ResultView} value=${result} />` : null}
+    </div>
+  `;
+}
+
+export function ToolsView({
+  route,
+  tools,
+  allowedSet,
+  nodeInfo,
+  snapshot,
+  link,
+  wide,
+  onRequestConfirm,
+}) {
+  const [query, setQuery] = useState('');
+  const allowedList = useMemo(
+    () => (allowedSet ? Array.from(allowedSet) : null),
+    [allowedSet],
+  );
+  const groups = useMemo(
+    () => groupToolsByFamily(tools || [], query, allowedList, nodeInfo?.whoami),
+    [tools, query, allowedList, nodeInfo?.whoami],
+  );
+
+  const selectedName = wide ? route.tool || tools?.[0]?.name || null : route.tool || null;
+  const selectedTool = (tools || []).find((t) => t.name === selectedName) || null;
+  const selectedAllowed = selectedTool && allowedSet ? allowedSet.has(selectedTool.name) : true;
+
+  const listPane = html`
+    <section>
+      <input
+        class="input"
+        type="search"
+        value=${query}
+        onInput=${(e) => setQuery(e.target.value)}
+        placeholder="Search tools"
+        aria-label="Search tools"
+      />
+
+      ${!tools || tools.length === 0
+        ? html`<div class="empty">No tools available.</div>`
+        : groups.length === 0
+          ? html`<div class="empty">No tools match "${query}".</div>`
+          : groups.map(
+              (group) => html`
+                <div key=${group.family}>
+                  <p class="label">${group.family}</p>
+                  <div class="list">
+                    ${group.tools.map((tool) => {
+                      const selected = wide && tool.name === selectedName;
+                      const cls = [
+                        'row',
+                        !tool.allowed ? 'off' : '',
+                        selected ? 'selected' : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ');
+                      return html`
+                        <a
+                          key=${tool.name}
+                          class=${cls}
+                          href=${routeHref({ section: 'tools', tool: tool.name })}
+                          aria-current=${selected ? 'true' : undefined}
+                        >
+                          <span class="body">
+                            <span class="title mono">
+                              <span>${tool.name}</span>
+                              <span class=${`chip fx ${tool.effect}`}>${tool.effect}</span>
+                              ${!tool.allowed ? html`<span class="chip">unavailable</span>` : null}
+                            </span>
+                            <span class="sub">
+                              ${tool.allowed
+                                ? html`<${CodeText} text=${tool.summary} />`
+                                : tool.reason}
+                            </span>
+                          </span>
+                        </a>
+                      `;
+                    })}
+                  </div>
+                </div>
+              `,
+            )}
+    </section>
+  `;
+
+  if (wide) {
+    return html`
+      <div class="split">
+        ${listPane}
+        <section>
+          ${selectedTool
+            ? html`
+                <h2 class="pane-title">
+                  <span>${selectedTool.name}</span>
+                  <span class=${`chip fx ${selectedTool.effect}`}>${selectedTool.effect}</span>
+                </h2>
+                <${ToolDetail}
+                  key=${selectedTool.name}
+                  tool=${selectedTool}
+                  allowed=${selectedAllowed}
+                  nodeInfo=${nodeInfo}
+                  machines=${snapshot?.machines || []}
+                  runningJobs=${snapshot?.runningJobs || []}
+                  link=${link}
+                  onRequestConfirm=${onRequestConfirm}
+                />
+              `
+            : html`<div class="empty">Select a tool to run it.</div>`}
+        </section>
+      </div>
+    `;
+  }
+
+  if (route.tool && selectedTool) {
+    return html`
+      <${ToolDetail}
+        key=${selectedTool.name}
+        tool=${selectedTool}
+        allowed=${selectedAllowed}
+        nodeInfo=${nodeInfo}
+        machines=${snapshot?.machines || []}
+        runningJobs=${snapshot?.runningJobs || []}
+        link=${link}
+        onRequestConfirm=${onRequestConfirm}
+      />
+    `;
+  }
+
+  return listPane;
+}
