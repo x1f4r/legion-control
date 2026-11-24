@@ -2,21 +2,25 @@
 //!
 //! Subcommands:
 //! - `link keygen <file>`
-//! - `link enrol <invite text> --key <file> --name <name> --out <config.json>`
+//! - `link enrol [--invite-file <path|->] --key <file> --name <name> --out <config.json>`
 //! - `link tools --config <config.json> [--node N] [--on M]`
 //! - `link call --config <config.json> [--node N] [--on M] <tool> '<json args>'`
+//!
+//! Invites carry a secret temporary key and are therefore read from `--invite-file <path>` or
+//! stdin (`--invite-file -`, the default), never from a command-line argument.
 //!
 //! Prints exactly one JSON document to stdout per run. Exit codes: 0 on success, 1 on link/node
 //! error, 2 on usage error.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
 use legion_link::proto::{ErrorBody, ErrorCode, Target};
 use legion_link::{
-    CancellationToken, DeviceKey, Invite, Link, LinkConfig, NodeLink, SshTimeouts, enrol,
+    CancellationToken, DeviceKey, Invite, Link, LinkConfig, MAX_INVITE_LEN, NodeLink, SshTimeouts,
+    enrol,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -82,7 +86,7 @@ fn cmd_keygen(args: &[String]) -> Result<Value, RunError> {
 }
 
 async fn cmd_enrol(args: &[String]) -> Result<Value, RunError> {
-    let mut invite_text: Option<String> = None;
+    let mut invite_file: Option<String> = None;
     let mut key_path: Option<String> = None;
     let mut name: Option<String> = None;
     let mut out_path: Option<String> = None;
@@ -90,6 +94,9 @@ async fn cmd_enrol(args: &[String]) -> Result<Value, RunError> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--invite-file" => {
+                invite_file = Some(next_value(args, &mut i, "--invite-file")?);
+            }
             "--key" => {
                 key_path = Some(next_value(args, &mut i, "--key")?);
             }
@@ -99,28 +106,26 @@ async fn cmd_enrol(args: &[String]) -> Result<Value, RunError> {
             "--out" => {
                 out_path = Some(next_value(args, &mut i, "--out")?);
             }
+            "-" => {
+                invite_file = Some("-".to_owned());
+            }
             other if other.starts_with('-') => {
                 return Err(usage(&format!("Unknown option {other:?} for `enrol`.")));
             }
-            positional => {
-                if invite_text.is_some() {
-                    return Err(usage(
-                        "Usage: link enrol <invite text> --key <file> --name <name> --out <config.json>",
-                    ));
-                }
-                invite_text = Some(positional.to_owned());
+            _ => {
+                return Err(usage(
+                    "Do not pass the invite text as a command-line argument (it carries a secret key). Use `--invite-file <path>` or pipe it on stdin (`--invite-file -`).",
+                ));
             }
         }
         i += 1;
     }
 
-    let invite_text = invite_text.ok_or_else(|| {
-        usage("Usage: link enrol <invite text> --key <file> --name <name> --out <config.json>")
-    })?;
     let key_path = key_path.ok_or_else(|| usage("`enrol` requires `--key <file>`."))?;
     let name = name.ok_or_else(|| usage("`enrol` requires `--name <name>`."))?;
     let out_path = out_path.ok_or_else(|| usage("`enrol` requires `--out <config.json>`."))?;
 
+    let invite_text = read_invite(invite_file.as_deref())?;
     let invite = Invite::parse(&invite_text).map_err(RunError::Failed)?;
     let key_pem = fs::read_to_string(&key_path).map_err(|err| {
         RunError::Failed(
@@ -245,6 +250,44 @@ async fn cmd_call(args: &[String]) -> Result<Value, RunError> {
         .await;
     link.close().await;
     result.map_err(RunError::Failed)
+}
+
+fn read_invite(path: Option<&str>) -> Result<String, RunError> {
+    let limit = (MAX_INVITE_LEN + 64) as u64;
+    match path {
+        None | Some("-") => {
+            let mut buf = String::new();
+            io::stdin()
+                .take(limit)
+                .read_to_string(&mut buf)
+                .map_err(|err| {
+                    RunError::Failed(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("Could not read invite from stdin: {err}."),
+                    ))
+                })?;
+            Ok(buf)
+        }
+        Some(file) => {
+            let f = fs::File::open(file).map_err(|err| {
+                RunError::Failed(
+                    ErrorBody::new(
+                        ErrorCode::NotFound,
+                        format!("Could not open invite file {file:?}: {err}."),
+                    )
+                    .with_hint("Pass `--invite-file <path>` or pipe the invite on stdin."),
+                )
+            })?;
+            let mut buf = String::new();
+            f.take(limit).read_to_string(&mut buf).map_err(|err| {
+                RunError::Failed(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Could not read invite file {file:?}: {err}."),
+                ))
+            })?;
+            Ok(buf)
+        }
+    }
 }
 
 fn next_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, RunError> {
