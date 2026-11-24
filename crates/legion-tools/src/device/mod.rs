@@ -180,20 +180,39 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
 
     let user = match args.user {
         Some(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty()
-                || trimmed.len() > 128
-                || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+            if raw.is_empty()
+                || raw.len() > 128
+                || raw.starts_with('-')
+                || raw.chars().any(|c| c.is_control() || c.is_whitespace())
             {
                 return Err(ErrorBody::new(
                     ErrorCode::InvalidArgs,
                     format!("{raw:?} is not a valid SSH user name."),
                 )
-                .with_hint("Pass the OS account name with no spaces or control characters."));
+                .with_hint(
+                    "Pass an OS account name that does not start with `-` and contains no spaces or control characters.",
+                ));
             }
-            trimmed.to_owned()
+            raw
         }
-        None => resolve_default_ssh_user(ctx.paths().home(), legion_os::user::effective_uid())?,
+        None => {
+            let detected =
+                resolve_default_ssh_user(ctx.paths().home(), legion_os::user::effective_uid())?;
+            if detected.starts_with('-')
+                || detected
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Detected SSH user name {detected:?} is not safe to place in an invite."
+                    ),
+                )
+                .with_hint("Pass a valid `user` explicitly to device.invite."));
+            }
+            detected
+        }
     };
 
     let hosts = resolve_hosts(args.host, ctx.cancel_token().child_token()).await?;
@@ -1237,6 +1256,28 @@ role = "owner"
     #[tokio::test]
     async fn missing_host_keys_fails_with_clear_error_and_hint() {
         let h = Harness::new();
+        // Reject leading `-`, whitespace, and control chars in `user` and `host`.
+        for (bad_args, label) in [
+            (
+                json!({"principal": "phone", "host": "tower.example", "user": "-oProxyCommand=id"}),
+                "user leading dash",
+            ),
+            (
+                json!({"principal": "phone", "host": "tower.example", "user": "bad user"}),
+                "user whitespace",
+            ),
+            (
+                json!({"principal": "phone", "host": "tower.example", "user": "bad\nuser"}),
+                "user control",
+            ),
+            (
+                json!({"principal": "phone", "host": "-oProxyCommand=id", "user": "me"}),
+                "host leading dash",
+            ),
+        ] {
+            let err = h.call("device.invite", bad_args).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{label}: {err:?}");
+        }
         let missing = h.dir.path().join("no_such_host_key.pub");
         let auth_escaped = h.auth_keys.display().to_string().replace('\\', "\\\\");
         let miss_escaped = missing.display().to_string().replace('\\', "\\\\");

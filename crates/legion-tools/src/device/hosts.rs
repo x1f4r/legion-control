@@ -66,12 +66,18 @@ pub(crate) async fn resolve_hosts(
     Ok(vec![system_hostname()])
 }
 
+fn is_valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_HOST_LEN
+        && !host.starts_with('-')
+        && !host.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 /// Validates explicitly provided `host` entries and deduplicates them in order.
 pub(crate) fn validate_explicit_hosts(raw_hosts: Vec<String>) -> Result<Vec<String>, ErrorBody> {
     let mut out = Vec::new();
     for raw in raw_hosts {
-        let host = raw.trim();
-        if host.is_empty() {
+        if raw.trim().is_empty() {
             return Err(
                 ErrorBody::new(ErrorCode::InvalidArgs, "host entries must not be empty.")
                     .with_hint(
@@ -79,16 +85,17 @@ pub(crate) fn validate_explicit_hosts(raw_hosts: Vec<String>) -> Result<Vec<Stri
                     ),
             );
         }
-        if host.len() > MAX_HOST_LEN || host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        if !is_valid_host(&raw) {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
-                format!("{host:?} is not a valid host name or address."),
+                format!("{raw:?} is not a valid host name or address."),
             )
-            .with_hint("Use a host name or IP address with no spaces or control characters."));
+            .with_hint(
+                "Use a host name or IP address that does not start with `-` and contains no spaces or control characters.",
+            ));
         }
-        let owned = host.to_owned();
-        if !out.contains(&owned) {
-            out.push(owned);
+        if !out.contains(&raw) {
+            out.push(raw);
         }
     }
     if out.is_empty() {
@@ -136,17 +143,13 @@ pub fn parse_tailscale_self_hosts(json: &str) -> Vec<String> {
     };
 
     let mut hosts = Vec::new();
-    let dns = self_node.dns_name.trim().trim_end_matches('.');
-    if !dns.is_empty() && !dns.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    let dns = self_node.dns_name.trim_end_matches('.');
+    if is_valid_host(dns) {
         hosts.push(dns.to_owned());
     }
     for raw_ip in self_node.tailscale_ips {
-        let ip = raw_ip.trim();
-        if !ip.is_empty()
-            && !ip.chars().any(|c| c.is_control() || c.is_whitespace())
-            && !hosts.iter().any(|existing| existing == ip)
-        {
-            hosts.push(ip.to_owned());
+        if is_valid_host(&raw_ip) && !hosts.iter().any(|existing| existing == &raw_ip) {
+            hosts.push(raw_ip);
         }
     }
     hosts
@@ -155,7 +158,7 @@ pub fn parse_tailscale_self_hosts(json: &str) -> Vec<String> {
 fn system_hostname() -> String {
     let raw = gethostname::gethostname().to_string_lossy().into_owned();
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    if !is_valid_host(trimmed) {
         "localhost".to_owned()
     } else {
         trimmed.to_owned()
@@ -199,6 +202,16 @@ mod tests {
             }
         }"#;
         assert_eq!(parse_tailscale_self_hosts(ips_only), vec!["100.64.0.10"]);
+
+        // Hostile Tailscale output (leading `-`, whitespace, control chars) is filtered out.
+        let hostile = r#"{
+            "BackendState": "Running",
+            "Self": {
+                "DNSName": "-oProxyCommand=id.tailnet.example.",
+                "TailscaleIPs": ["-bad", "100.64.0.10 bad", "100.64.0.11\n", "100.64.0.12"]
+            }
+        }"#;
+        assert_eq!(parse_tailscale_self_hosts(hostile), vec!["100.64.0.12"]);
     }
 
     #[test]
@@ -214,6 +227,8 @@ mod tests {
         );
         assert!(validate_explicit_hosts(vec![]).is_err());
         assert!(validate_explicit_hosts(vec!["  ".to_owned()]).is_err());
+        assert!(validate_explicit_hosts(vec!["-oProxyCommand=id".to_owned()]).is_err());
+        assert!(validate_explicit_hosts(vec!["-tower.example".to_owned()]).is_err());
         assert!(validate_explicit_hosts(vec!["bad host".to_owned()]).is_err());
         assert!(validate_explicit_hosts(vec!["bad\nhost".to_owned()]).is_err());
     }
