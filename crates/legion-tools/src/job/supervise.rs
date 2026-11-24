@@ -708,4 +708,75 @@ mod tests {
         let content = fs::read_to_string(tmp.path().join(LOG_FILE)).unwrap();
         assert_eq!(content, "0123456789abcdefghij\n");
     }
+
+    #[tokio::test]
+    async fn late_starting_supervisor_refuses_to_run_after_recorded_startup_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let id = "late-start-job";
+        let dir = job_dir(&state_dir, id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let sentinel = tmp.path().join("must-not-exist.txt");
+        let cmd = if cfg!(windows) {
+            format!(
+                "Set-Content -LiteralPath '{}' -Value 'ran'",
+                sentinel.display()
+            )
+        } else {
+            format!("printf ran > '{}'", sentinel.display())
+        };
+        let record = JobRecord {
+            id: id.to_owned(),
+            name: "late-start".to_owned(),
+            key: Some("late-key".to_owned()),
+            cmd: Some(cmd),
+            argv: None,
+            cwd: None,
+            env_names: vec!["SECRET".to_owned()],
+            principal: "owner".to_owned(),
+            device: None,
+            created: now_rfc3339(),
+            boot_id: "test-boot".to_owned(),
+            exclusive: false,
+            launching: None,
+            detach: None,
+        };
+        write_job_record(&dir, &record).unwrap();
+        store::write_env_file(
+            &dir,
+            &std::collections::BTreeMap::from([("SECRET".to_owned(), "value".to_owned())]),
+        )
+        .unwrap();
+
+        // Simulate `job.start` recording startup failure after `spawn_detached` timed out.
+        let startup_exit = ExitRecord {
+            outcome: ExitOutcome::Failed,
+            exit_code: None,
+            signal: None,
+            finished: now_rfc3339(),
+            forced: false,
+            startup_failed: true,
+            detail: Some("Could not launch the detached job supervisor: timed out.".to_owned()),
+        };
+        write_exit_record(&dir, &startup_exit).unwrap();
+
+        // A supervisor process starting late after that timeout must exit without running the
+        // command, remove `env.json`, and leave the recorded startup failure untouched.
+        supervise_with_cap(&state_dir, id, MAX_LOG_FILE_BYTES)
+            .await
+            .unwrap();
+
+        assert!(
+            !sentinel.exists(),
+            "late-starting supervisor must never execute a job whose startup already failed"
+        );
+        assert!(
+            !dir.join(store::ENV_FILE).exists(),
+            "late-starting supervisor should clean up env.json"
+        );
+        let preserved = read_exit_record(&dir).expect("exit.json must remain");
+        assert!(preserved.startup_failed);
+        assert_eq!(preserved.outcome, ExitOutcome::Failed);
+    }
 }
