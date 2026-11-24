@@ -33,7 +33,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::io::SyncIoBridge;
 
 use crate::config::{FleetFile, validate_machine_name};
-use crate::connector::{PipeHandle, Subcommand};
+use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
     self, DeleteDone, GetReady, Host, ManifestDone, PackReady, PutDone, PutReady, StatReply,
@@ -419,13 +419,15 @@ async fn transfer(
         ctx,
         sent: &sent,
     };
-    let work = job.run(&from, &to, &args);
     // A cancel drops the work, and with it every pipe it holds: each end sees its input end
     // without the rest of what it expected, so none renames anything into place that was not
     // complete, and each is then given time to clean up and stop before the transfer replies.
-    let finished = tokio::select! {
-        report = work => Some(report),
-        () = ctx.cancelled() => None,
+    let finished = {
+        let work = job.run(&from, &to, &args);
+        tokio::select! {
+            report = work => Some(report),
+            () = ctx.cancelled() => None,
+        }
     };
     let stopped = sent.settle().await;
     let Some(report) = finished else {
@@ -1175,11 +1177,34 @@ impl Conn {
     ) -> Result<Conn, ErrorBody> {
         header["protocol"] = json!(stream::STREAM_PROTOCOL);
         let (reader, writer, process): (BoxRead, BoxWrite, Process) = if end.remote {
+            let op = header
+                .get("op")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ErrorBody::new(ErrorCode::Internal, "Stream header is missing its op name.")
+                        .with_machine(ctx.node_name())
+                })?
+                .to_owned();
+            let (underlying_tool, underlying_effect) = stream::op_tool(&op).ok_or_else(|| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("Stream header has unknown op {op:?}."),
+                )
+                .with_machine(ctx.node_name())
+            })?;
+            let recorded = header.clone();
             // The other node decides whether the caller may act as this principal, as it does
             // for a forwarded call.
             header["as"] = json!(ctx.principal());
             let pipe = fleet
-                .open_pipe(ctx, &end.machine, Subcommand::Stream)
+                .open_stream_pipe(
+                    ctx,
+                    &end.machine,
+                    &op,
+                    underlying_tool,
+                    underlying_effect,
+                    &recorded,
+                )
                 .await?;
             let (stdin, stdout, handle) = pipe.into_parts();
             (Box::new(stdout), Box::new(stdin), Process::Remote(handle))
@@ -1585,11 +1610,7 @@ async fn read_line<R: AsyncBufRead + Unpin>(
 }
 
 fn with_machine(error: ErrorBody, machine: &str) -> ErrorBody {
-    if error.machine.is_some() {
-        error
-    } else {
-        error.with_machine(machine)
-    }
+    error.with_machine(machine)
 }
 
 /// Where a relay broke.

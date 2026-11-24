@@ -210,3 +210,106 @@ async fn events_reach_a_client_that_asked_for_progress_and_no_other() {
         ]
     );
 }
+
+#[tokio::test]
+async fn extension_tool_is_visible_and_callable_through_mcp_without_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("policy.toml"),
+        "[principals.observer]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+    )
+    .unwrap();
+    let node = Node::new(Paths::under(dir.path()), legion_tools::registry());
+    let door = McpDoor::new(
+        node.clone(),
+        Arc::new(legion_core::Local),
+        Options {
+            pinned: Some("observer".to_owned()),
+            compact: false,
+        },
+    )
+    .unwrap();
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (server_in, server_out) = tokio::io::split(server);
+    let serving = tokio::spawn(door.serve(server_in, server_out));
+    let (client_in, mut client_out) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_in).lines();
+
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"}
+    }});
+    client_out
+        .write_all(format!("{init}\n").as_bytes())
+        .await
+        .unwrap();
+    let _ = lines.next_line().await.unwrap().unwrap();
+    client_out
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+
+    // Add two extensions AFTER the MCP door has already started: one read, one exec.
+    let tools_d = node.paths().tools_dir();
+    std::fs::create_dir_all(&tools_d).unwrap();
+    #[cfg(unix)]
+    let cmd = "printf '{\"who\":\"%s\",\"arg\":\"%s\"}' \"$LEGION_PRINCIPAL\" \"$LEGION_ARG_TAG\"";
+    #[cfg(windows)]
+    let cmd = "Write-Output ('{\"who\":\"' + $env:LEGION_PRINCIPAL + '\",\"arg\":\"' + $env:LEGION_ARG_TAG + '\"}')";
+    std::fs::write(
+        tools_d.join("custom.hello.toml"),
+        format!(
+            "name = \"custom.hello\"\ndescription = \"Says hello.\"\neffect = \"read\"\ncmd = {}\n[params.tag]\ntype = \"string\"\nrequired = true\n",
+            serde_json::to_string(cmd).unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        tools_d.join("custom.danger.toml"),
+        "name = \"custom.danger\"\ndescription = \"Runs something.\"\neffect = \"exec\"\ncmd = \"echo no\"\n",
+    )
+    .unwrap();
+
+    // tools/list sees custom_hello (read) and hides custom_danger (exec) for observer.
+    let list_req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+    client_out
+        .write_all(format!("{list_req}\n").as_bytes())
+        .await
+        .unwrap();
+    let list_reply: Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let names: Vec<&str> = list_reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"custom_hello"), "{names:?}");
+    assert!(!names.contains(&"custom_danger"), "{names:?}");
+
+    // Call custom_hello through MCP.
+    let call_req = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "custom_hello",
+        "arguments": {"tag": "mcp-live"}
+    }});
+    client_out
+        .write_all(format!("{call_req}\n").as_bytes())
+        .await
+        .unwrap();
+    let call_reply: Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(
+        call_reply["result"]["isError"],
+        json!(false),
+        "{call_reply}"
+    );
+    let body: Value =
+        serde_json::from_str(call_reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body, json!({"who": "observer", "arg": "mcp-live"}));
+
+    client_out.shutdown().await.unwrap();
+    serving.await.unwrap().unwrap();
+}

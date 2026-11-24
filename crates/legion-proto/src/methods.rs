@@ -38,6 +38,14 @@ pub struct HelloResult {
     pub arch: String,
     /// The systems this machine can boot into, as `node.toml` names them; empty until it does.
     pub systems: Vec<String>,
+    /// Which system of the machine answered, as its `node.toml` names it; absent until it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    /// An identifier of the machine's current boot, which changes on every restart, so a caller
+    /// can tell a machine that came back from one that never went down; absent when the node
+    /// cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 
 /// `tools` params: none yet.

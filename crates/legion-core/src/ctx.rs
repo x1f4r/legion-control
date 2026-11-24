@@ -12,7 +12,7 @@ use crate::config::ConfigStore;
 use crate::node::Node;
 use crate::paths::Paths;
 use crate::policy::Grant;
-use crate::registry::DocumentInfo;
+use crate::registry::{DocumentInfo, SourceCheck};
 
 /// How a call arrived. Recorded in the audit log, and the reason a principal can be trusted as far
 /// as it is: a local shell is the owner, a pinned ssh key or token is a wall.
@@ -93,8 +93,8 @@ impl EventSink {
         EventSink::default()
     }
 
-    /// Returns a sink that tags emitted events with `machine` unless an event already carries a
-    /// machine from a deeper hop.
+    /// Returns a sink that stamps emitted events with `machine`, overwriting any label the emitter
+    /// supplied so a remote cannot forge another machine's name.
     #[must_use]
     pub fn for_machine(&self, machine: impl Into<Arc<str>>) -> EventSink {
         EventSink {
@@ -112,12 +112,12 @@ impl EventSink {
         });
     }
 
-    /// Delivers one [`Event`], preserving its `machine` when already set and otherwise using the
-    /// machine bound to this sink.
+    /// Delivers one [`Event`], overwriting its `machine` with the machine bound to this sink when
+    /// one is set.
     pub fn emit_event(&self, mut event: Event) {
         if let Some(deliver) = &self.deliver {
-            if event.machine.is_none() {
-                event.machine = self.machine.as_deref().map(str::to_owned);
+            if let Some(machine) = &self.machine {
+                event.machine = Some(machine.to_string());
             }
             deliver(event);
         }
@@ -143,9 +143,16 @@ pub struct Ctx {
     pub(crate) grant: Grant,
     pub(crate) cancel: CancellationToken,
     pub(crate) events: EventSink,
+    pub(crate) hops: u32,
 }
 
 impl Ctx {
+    /// The node running this call, for tools that authorise or audit forwarded operations against
+    /// this node's live policy and audit log.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// The name of the node the tool runs on.
     pub fn node_name(&self) -> &str {
         &self.name
@@ -166,6 +173,12 @@ impl Ctx {
         self.node.paths()
     }
 
+    /// An identifier of the machine's current boot, the one `hello` reports; `None` when the
+    /// platform will not say.
+    pub fn boot_id(&self) -> Option<String> {
+        self.node.boot_id()
+    }
+
     /// The principal the call acts as.
     pub fn principal(&self) -> &str {
         self.grant.principal()
@@ -174,6 +187,12 @@ impl Ctx {
     /// The door the call came through.
     pub fn door(&self) -> Door {
         self.door
+    }
+
+    /// How many nodes have already forwarded the call this tool is running for; `0` when the call
+    /// started on this node.
+    pub fn hops(&self) -> u32 {
+        self.hops
     }
 
     /// What the call is allowed. File tools check every path with
@@ -208,9 +227,14 @@ impl Ctx {
         self.events.emit(kind, data);
     }
 
-    /// Every tool the node offers.
+    /// Every tool the node offers, built-ins and reloadable extensions alike.
     pub fn tools(&self) -> Vec<ToolSpec> {
-        self.node.registry().specs()
+        self.node.specs()
+    }
+
+    /// Whether `name` is registered as a built-in tool on this node.
+    pub fn has_builtin(&self, name: &str) -> bool {
+        self.node.registry().get(name).is_some()
     }
 
     /// The node's configuration files.
@@ -221,6 +245,11 @@ impl Ctx {
     /// The configuration documents the node reads.
     pub fn documents(&self) -> &[DocumentInfo] {
         self.node.registry().documents()
+    }
+
+    /// Health checks reported by reloadable tool sources.
+    pub fn source_checks(&self) -> Vec<SourceCheck> {
+        self.node.source_checks()
     }
 }
 

@@ -191,7 +191,7 @@ fn on_runs_here_for_this_node_and_reports_unknown_machines_as_not_found() {
     assert_eq!(unknown.code, 1);
     let error = unknown.json();
     assert_eq!(error["code"], json!("not_found"));
-    assert_eq!(error["machine"], json!("pi"));
+    assert_eq!(error["machine"], json!("tower"));
     assert!(error["hint"].as_str().unwrap().contains("tower"), "{error}");
 
     // Partial fan-out success exits 0 and returns per-machine outcomes.
@@ -211,10 +211,12 @@ fn on_runs_here_for_this_node_and_reports_unknown_machines_as_not_found() {
         json!("not_found")
     );
 
-    // Empty fleet.toml returns an empty fan-out object.
+    // Empty fleet.toml still runs on this node for `--on all`.
     let empty_all = home.run(&["meta.version", "--on", "all"]);
     assert_eq!(empty_all.code, 0, "{}", empty_all.stdout);
-    assert_eq!(empty_all.json(), json!({"results": {}}));
+    let results = &empty_all.json()["results"];
+    assert_eq!(results.as_object().unwrap().len(), 1, "{results}");
+    assert_eq!(results["tower"]["ok"]["node"], json!("tower"));
 }
 
 #[test]

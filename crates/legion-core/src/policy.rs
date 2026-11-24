@@ -343,18 +343,88 @@ impl Policy {
         spec: &ToolSpec,
         paths: &Paths,
     ) -> Result<Grant, ErrorBody> {
+        self.authorize_name(principal, &spec.name, Some(spec.effect), paths)
+    }
+
+    /// Whether `principal` may call `tool`, given its `effect` when known.
+    ///
+    /// When `effect` is `Some`, this behaves identically to [`Policy::authorize`]. When `effect`
+    /// is `None` (a tool that exists only on another node whose effect could not be determined),
+    /// any matching `deny` rule or any `deny` rule over an effect refuses the call, and only a
+    /// wildcard `*` rule in `allow` permits it.
+    pub fn authorize_name(
+        &self,
+        principal: &str,
+        tool: &str,
+        effect: Option<Effect>,
+        paths: &Paths,
+    ) -> Result<Grant, ErrorBody> {
         let grant = self.grant(principal, paths);
-        let tool = &spec.name;
         let role = &grant.role;
-        if let Some(rule) = grant.rules.deny.iter().find(|rule| rule.matches(spec)) {
+        if let Some(effect) = effect {
+            let matches_rule = |rule: &Rule| match rule {
+                Rule::Effect(of) => *of == effect,
+                Rule::Tools(pattern) => glob::matches(pattern, tool),
+            };
+            if let Some(rule) = grant.rules.deny.iter().find(|rule| matches_rule(rule)) {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "{principal} may not use {tool}: its role {role} denies it with the rule {rule}."
+                    ),
+                )
+                .with_hint(
+                    "Ask the owner of this machine to change policy.toml if it should be allowed.",
+                )
+                .with_details(json!({"principal": principal, "role": role, "tool": tool, "rule": rule.to_string()})));
+            }
+            if grant.rules.allow.iter().any(matches_rule) {
+                return Ok(grant);
+            }
+            let (message, hint) = if role == NOBODY
+                && !self.principals.keys().any(|p| p.as_str() == principal)
+            {
+                (
+                    format!(
+                        "{principal} may not use {tool}: policy.toml does not name {principal}, so it has the role nobody, which allows nothing."
+                    ),
+                    format!(
+                        "Add [principals.\"{principal}\"] with a role to policy.toml, or call without --as."
+                    ),
+                )
+            } else {
+                (
+                    format!(
+                        "{principal} may not use {tool}: its role {role} allows no rule that matches it (its effect is {effect})."
+                    ),
+                    "Ask the owner of this machine to change policy.toml if it should be allowed."
+                        .to_owned(),
+                )
+            };
+            return Err(ErrorBody::new(ErrorCode::Denied, message)
+                .with_hint(hint)
+                .with_details(json!({"principal": principal, "role": role, "tool": tool})));
+        }
+
+        // Effect unknown (extension tool not registered locally and not reported by the target).
+        if let Some(rule) = grant.rules.deny.iter().find(|rule| match rule {
+            Rule::Tools(pattern) => glob::matches(pattern, tool),
+            Rule::Effect(_) => true,
+        }) {
             return Err(ErrorBody::new(
                 ErrorCode::Denied,
-                format!("{principal} may not use {tool}: its role {role} denies it with the rule {rule}."),
+                format!(
+                    "{principal} may not use {tool}: its role {role} denies it (rule {rule}) and its effect is not known here."
+                ),
             )
             .with_hint("Ask the owner of this machine to change policy.toml if it should be allowed.")
             .with_details(json!({"principal": principal, "role": role, "tool": tool, "rule": rule.to_string()})));
         }
-        if grant.rules.allow.iter().any(|rule| rule.matches(spec)) {
+        let allows_all =
+            grant.rules.allow.iter().any(
+                |rule| matches!(rule, Rule::Tools(pattern) if pattern.chars().all(|c| c == '*')),
+            );
+        if allows_all {
             return Ok(grant);
         }
         let (message, hint) = if role == NOBODY
@@ -371,8 +441,7 @@ impl Policy {
         } else {
             (
                 format!(
-                    "{principal} may not use {tool}: its role {role} allows no rule that matches it (its effect is {}).",
-                    spec.effect
+                    "{principal} may not use {tool}: its effect is not known on this node and role {role} does not allow `*`."
                 ),
                 "Ask the owner of this machine to change policy.toml if it should be allowed."
                     .to_owned(),
@@ -381,6 +450,25 @@ impl Policy {
         Err(ErrorBody::new(ErrorCode::Denied, message)
             .with_hint(hint)
             .with_details(json!({"principal": principal, "role": role, "tool": tool})))
+    }
+
+    /// Whether `principal` might be allowed to call `tool` once the target reports its effect.
+    ///
+    /// Returns `false` when `tool` is already denied by name/glob or when no allow rule could
+    /// match it for any effect, so a forwarding node can fail closed without contacting the target.
+    pub fn could_allow_with_remote_effect(&self, principal: &str, tool: &str) -> bool {
+        let (_, rules) = self.role_of(principal);
+        let denied_by_name = rules
+            .deny
+            .iter()
+            .any(|rule| matches!(rule, Rule::Tools(pattern) if glob::matches(pattern, tool)));
+        if denied_by_name {
+            return false;
+        }
+        rules.allow.iter().any(|rule| match rule {
+            Rule::Effect(_) => true,
+            Rule::Tools(pattern) => glob::matches(pattern, tool),
+        })
     }
 
     /// The grant a principal has, whatever it calls; what `meta.whoami` reports.
@@ -1750,6 +1838,114 @@ paths = ["~/**"]
         assert!(!allows("most", Effect::Admin));
         assert!(!allows("files", Effect::Write));
         assert!(!allows("stranger", Effect::Read));
+    }
+
+    #[test]
+    fn unknown_effect_tools_require_star_without_effect_denies_and_accept_reported_effect() {
+        let policy = policy(
+            r#"
+[principals.observer]
+role = "observer"
+
+[principals.ext_only]
+role = "ext_only"
+
+[principals.most]
+role = "most"
+
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.ext_only]
+allow = ["ext.*"]
+deny = ["ext.blocked"]
+
+[roles.most]
+allow = ["*"]
+deny = ["effect:admin"]
+"#,
+        );
+        let paths = nowhere();
+
+        // Unknown effect: only wildcard `*` without effect-level deny rules passes.
+        assert!(
+            policy
+                .authorize_name("owner", "ext.probe", None, &paths)
+                .is_ok()
+        );
+        assert_eq!(
+            policy
+                .authorize_name("most", "ext.probe", None, &paths)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            policy
+                .authorize_name("observer", "ext.probe", None, &paths)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            policy
+                .authorize_name("ext_only", "ext.probe", None, &paths)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            policy
+                .authorize_name("stranger", "ext.probe", None, &paths)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+
+        // Pre-connect check: roles that cannot match fail without opening a session.
+        assert!(policy.could_allow_with_remote_effect("observer", "ext.probe"));
+        assert!(policy.could_allow_with_remote_effect("ext_only", "ext.probe"));
+        assert!(!policy.could_allow_with_remote_effect("ext_only", "ext.blocked"));
+        assert!(!policy.could_allow_with_remote_effect("ext_only", "other.tool"));
+        assert!(!policy.could_allow_with_remote_effect("stranger", "ext.probe"));
+
+        // Once the target reports the extension tool's effect, name and effect rules both apply.
+        assert!(
+            policy
+                .authorize_name("observer", "ext.probe", Some(Effect::Read), &paths)
+                .is_ok()
+        );
+        assert_eq!(
+            policy
+                .authorize_name("observer", "ext.zap", Some(Effect::Exec), &paths)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert!(
+            policy
+                .authorize_name("ext_only", "ext.probe", Some(Effect::Exec), &paths)
+                .is_ok()
+        );
+        assert_eq!(
+            policy
+                .authorize_name("ext_only", "ext.blocked", Some(Effect::Read), &paths)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert!(
+            policy
+                .authorize_name("most", "ext.probe", Some(Effect::Read), &paths)
+                .is_ok()
+        );
+        assert_eq!(
+            policy
+                .authorize_name("most", "ext.admin", Some(Effect::Admin), &paths)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The node: the one place a call is resolved, authorised, run and audited, whichever door it came
 //! through.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,8 @@ use crate::config::{ConfigStore, NodeFile, NodeName};
 use crate::ctx::{Ctx, Door, EventSink};
 use crate::paths::Paths;
 use crate::policy::Policy;
-use crate::registry::Registry;
+use crate::registry::{Registry, SourceCheck};
+use crate::tool::Tool;
 
 /// The version of legion this is; every crate in the workspace shares it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -135,18 +137,53 @@ impl Node {
         }
     }
 
-    /// Every tool's spec, sorted by name.
+    /// Every tool's spec, sorted by name: built-in tools first, then any reloadable sources.
+    /// Built-in tools always win if a source offers the same name.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.inner.registry.specs()
+        let mut by_name: BTreeMap<String, ToolSpec> = self
+            .inner
+            .registry
+            .specs()
+            .into_iter()
+            .map(|spec| (spec.name.clone(), spec))
+            .collect();
+        for source in self.inner.registry.sources() {
+            for spec in source.specs(&self.inner.paths, &self.inner.registry) {
+                by_name.entry(spec.name.clone()).or_insert(spec);
+            }
+        }
+        by_name.into_values().collect()
     }
 
     /// One tool's spec, or the `unknown_tool` error a call to it would get.
     pub fn spec(&self, tool: &str) -> Result<ToolSpec, ErrorBody> {
         let name = self.name();
-        match self.inner.registry.get(tool) {
+        match self.resolve_tool(tool) {
             Some(found) => Ok(found.spec().clone()),
             None => Err(self.unknown_tool(tool, &name).with_machine(name)),
         }
+    }
+
+    /// Health checks reported by reloadable tool sources, for `meta.doctor`.
+    pub fn source_checks(&self) -> Vec<SourceCheck> {
+        let mut checks = Vec::new();
+        for source in self.inner.registry.sources() {
+            checks.extend(source.checks(&self.inner.paths, &self.inner.registry));
+        }
+        checks
+    }
+
+    /// Looks up a tool in the built-in registry first, then in reloadable sources.
+    fn resolve_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if let Some(found) = self.inner.registry.get(name) {
+            return Some(Arc::clone(found));
+        }
+        for source in self.inner.registry.sources() {
+            if let Some(found) = source.get(&self.inner.paths, &self.inner.registry, name) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// Answers a `hello`, refusing a client that speaks another protocol.
@@ -163,14 +200,41 @@ impl Node {
             .with_machine(self.name())
             .with_details(serde_json::json!({"supported": [PROTOCOL]})));
         }
+        let file = self.inner.config.get::<NodeFile>().ok();
+        let system = file
+            .as_ref()
+            .and_then(|file| file.system.as_ref())
+            .map(NodeName::to_string);
+        // This system and every one it can restart into, as node.toml names them.
+        let mut systems: Vec<String> = system.iter().cloned().collect();
+        for target in file.iter().flat_map(|file| file.boot.keys()) {
+            if !systems.contains(target) {
+                systems.push(target.clone());
+            }
+        }
         Ok(HelloResult {
             node: self.name(),
             version: VERSION.to_owned(),
             protocol: PROTOCOL,
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
-            systems: Vec::new(),
+            systems,
+            system,
+            boot_id: self.boot_id(),
         })
+    }
+
+    /// An identifier of the machine's current boot, which changes on every restart; `None` when
+    /// the platform will not say.
+    pub fn boot_id(&self) -> Option<String> {
+        #[cfg(feature = "testing")]
+        if let Some(file) = std::env::var_os("LEGION_TEST_BOOT_ID_FILE") {
+            // Read on every call, so a test can change it under a running node.
+            return std::fs::read_to_string(file)
+                .ok()
+                .map(|text| text.trim().to_owned());
+        }
+        legion_os::procid::boot_id().ok()
     }
 
     /// Runs one call on this node: decides who it acts as, checks that the policy allows it, runs
@@ -194,7 +258,7 @@ impl Node {
             None => error.with_machine(name.clone()),
         });
 
-        let entry = Entry {
+        self.append_audit_entry(Entry {
             time: audit::now(),
             principal,
             door,
@@ -210,7 +274,45 @@ impl Node {
                 .as_ref()
                 .err()
                 .map(|error| audit::redact_message(&error.message)),
-        };
+        })
+        .await;
+        result
+    }
+
+    /// Appends one routed or forwarded call to this node's audit log, applying the same redaction
+    /// and stderr fallback as [`Node::call`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_audit(
+        &self,
+        target: String,
+        principal: Option<String>,
+        door: Door,
+        tool: String,
+        args: &Value,
+        started: Instant,
+        result: &Result<Value, ErrorBody>,
+    ) {
+        self.append_audit_entry(Entry {
+            time: audit::now(),
+            principal,
+            door,
+            tool,
+            target,
+            outcome: match result {
+                Ok(_) => Outcome::Ok,
+                Err(error) => Outcome::Error(error.code),
+            },
+            duration: (started.elapsed().as_secs_f64() * 1e6).round() / 1e6,
+            args: audit::redact(args),
+            message: result
+                .as_ref()
+                .err()
+                .map(|error| audit::redact_message(&error.message)),
+        })
+        .await;
+    }
+
+    async fn append_audit_entry(&self, entry: Entry) {
         let log = self.inner.audit.clone();
         let written = tokio::task::spawn_blocking(move || log.append(&entry)).await;
         // stderr is for people; a call whose audit line is lost still happened, so it is reported
@@ -226,7 +328,6 @@ impl Node {
         if let Some(problem) = problem {
             let _ = std::io::Write::write_all(&mut std::io::stderr(), problem.as_bytes());
         }
-        result
     }
 
     /// Everything [`Node::call`] does but the audit: the principal, once known, and the outcome.
@@ -245,7 +346,7 @@ impl Node {
                 return (Some(caller), Err(error));
             }
         };
-        let Some(tool) = self.inner.registry.get(&call.tool) else {
+        let Some(tool) = self.resolve_tool(&call.tool) else {
             return (Some(principal), Err(self.unknown_tool(&call.tool, name)));
         };
         let grant = match policy.authorize(&principal, tool.spec(), &self.inner.paths) {
@@ -263,6 +364,7 @@ impl Node {
             grant,
             cancel: call.cancel.clone(),
             events: call.events,
+            hops: call.hops,
         };
         let work = tool.call(&ctx, call.args);
         tokio::pin!(work);
@@ -282,10 +384,10 @@ impl Node {
 
     fn unknown_tool(&self, tool: &str, name: &str) -> ErrorBody {
         let family = tool.split('.').next().unwrap_or_default();
-        let siblings: Vec<&str> = self
-            .inner
-            .registry
-            .names()
+        let siblings: Vec<String> = self
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
             .filter(|known| known.split('.').next() == Some(family))
             .collect();
         let hint = if siblings.is_empty() {
@@ -306,4 +408,42 @@ fn cancelled(tool: &str) -> ErrorBody {
         ErrorCode::Cancelled,
         format!("The call to {tool} was cancelled before it finished."),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use legion_proto::HelloParams;
+
+    use super::*;
+
+    fn hello_params() -> HelloParams {
+        HelloParams {
+            client: "test".to_owned(),
+            version: "0".to_owned(),
+            protocol: PROTOCOL,
+        }
+    }
+
+    #[test]
+    fn hello_names_the_system_its_targets_and_the_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new(Paths::under(dir.path()), Registry::new());
+        let bare = node.hello(&hello_params()).unwrap();
+        assert_eq!(bare.system, None);
+        assert!(bare.systems.is_empty());
+        assert_eq!(bare.boot_id, node.boot_id());
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            assert!(bare.boot_id.is_some_and(|id| !id.is_empty()));
+        }
+
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config").join("node.toml"),
+            "system = \"linux\"\nbusy = \"none\"\n[boot.windows]\nefi_label = \"Windows Boot Manager\"\n[boot.linux]\narm = [\"a\"]\nverify = [\"v\"]\n",
+        )
+        .unwrap();
+        let named = node.hello(&hello_params()).unwrap();
+        assert_eq!(named.system.as_deref(), Some("linux"));
+        assert_eq!(named.systems, ["linux", "windows"]);
+    }
 }

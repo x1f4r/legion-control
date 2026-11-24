@@ -472,3 +472,161 @@ async fn the_name_comes_from_node_toml_and_follows_its_edits() {
     assert_eq!(fixture.node.name(), host);
     assert!(fixture.call("t.echo", json!({})).await.is_ok());
 }
+
+struct DynamicTool {
+    spec: legion_core::proto::ToolSpec,
+    reply: Value,
+}
+
+impl legion_core::Tool for DynamicTool {
+    fn spec(&self) -> &legion_core::proto::ToolSpec {
+        &self.spec
+    }
+
+    fn call<'a>(
+        &'a self,
+        _ctx: &'a Ctx,
+        _args: Value,
+    ) -> legion_core::BoxFuture<'a, Result<Value, ToolError>> {
+        let reply = self.reply.clone();
+        Box::pin(async move { Ok(reply) })
+    }
+}
+
+#[derive(Clone, Default)]
+struct DynamicSource {
+    tools: Arc<Mutex<Vec<Arc<DynamicTool>>>>,
+}
+
+impl DynamicSource {
+    fn set(&self, tools: Vec<Arc<DynamicTool>>) {
+        *self.tools.lock().unwrap() = tools;
+    }
+}
+
+impl legion_core::ToolSource for DynamicSource {
+    fn get(
+        &self,
+        _paths: &Paths,
+        _builtins: &Registry,
+        name: &str,
+    ) -> Option<Arc<dyn legion_core::Tool>> {
+        self.tools
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.spec.name == name)
+            .map(|tool| Arc::clone(tool) as Arc<dyn legion_core::Tool>)
+    }
+
+    fn specs(&self, _paths: &Paths, _builtins: &Registry) -> Vec<legion_core::proto::ToolSpec> {
+        self.tools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.spec.clone())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn reloadable_sources_are_consulted_after_builtins_with_the_same_policy_and_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = DynamicSource::default();
+    let mut registry = Registry::new();
+    registry.add_fn("t.echo", Effect::Read, "Built-in echo.", echo);
+    registry.add_source(source.clone());
+    let node = Node::new(Paths::under(dir.path()), registry);
+
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    legion_core::config::write_atomically(&config.join("policy.toml"), POLICY.as_bytes()).unwrap();
+
+    // Initially absent.
+    assert!(node.spec("custom.ping").is_err());
+
+    // Added at runtime: visible in specs, spec, and call without restarting the node.
+    // A colliding built-in name is shadowed by the built-in in both specs and call.
+    source.set(vec![
+        Arc::new(DynamicTool {
+            spec: legion_core::proto::ToolSpec {
+                name: "custom.ping".to_owned(),
+                description: "Pings.".to_owned(),
+                effect: Effect::Read,
+                input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            },
+            reply: json!({"pong": true}),
+        }),
+        Arc::new(DynamicTool {
+            spec: legion_core::proto::ToolSpec {
+                name: "custom.run".to_owned(),
+                description: "Runs.".to_owned(),
+                effect: Effect::Exec,
+                input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            },
+            reply: json!({"ran": true}),
+        }),
+        Arc::new(DynamicTool {
+            spec: legion_core::proto::ToolSpec {
+                name: "t.echo".to_owned(),
+                description: "Shadow attempt.".to_owned(),
+                effect: Effect::Exec,
+                input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            },
+            reply: json!({"shadowed": true}),
+        }),
+    ]);
+
+    let names: Vec<String> = node.specs().into_iter().map(|s| s.name).collect();
+    assert_eq!(names, ["custom.ping", "custom.run", "t.echo"]);
+    assert_eq!(node.spec("t.echo").unwrap().description, "Built-in echo.");
+    assert_eq!(
+        node.call(Call::new(Door::Cli, "t.echo", json!({"x": 1})))
+            .await
+            .unwrap(),
+        json!({"x": 1})
+    );
+
+    // Policy applies by declared effect.
+    let mut read_call = Call::new(Door::Mcp, "custom.ping", json!({}));
+    read_call.as_principal = Some("phone".to_owned());
+    assert_eq!(node.call(read_call).await.unwrap(), json!({"pong": true}));
+
+    let mut exec_call = Call::new(Door::Mcp, "custom.run", json!({}));
+    exec_call.as_principal = Some("phone".to_owned());
+    assert_eq!(
+        node.call(exec_call).await.unwrap_err().code,
+        ErrorCode::Denied
+    );
+
+    // Sibling hint includes dynamic tools.
+    let typo = node
+        .call(Call::new(Door::Cli, "custom.pin", json!({})))
+        .await
+        .unwrap_err();
+    assert_eq!(typo.code, ErrorCode::UnknownTool);
+    assert!(typo.hint.as_deref().unwrap().contains("custom.ping"));
+
+    // Removed at runtime: disappears immediately.
+    source.set(Vec::new());
+    assert!(node.spec("custom.ping").is_err());
+    assert_eq!(
+        node.call(Call::new(Door::Cli, "custom.ping", json!({})))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::UnknownTool
+    );
+
+    // Every call was audited.
+    let audit: Vec<Value> = std::fs::read_to_string(dir.path().join("state").join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(audit.len(), 5);
+    assert_eq!(audit[1]["tool"], json!("custom.ping"));
+    assert_eq!(audit[1]["outcome"], json!("ok"));
+    assert_eq!(audit[2]["tool"], json!("custom.run"));
+    assert_eq!(audit[2]["outcome"], json!("denied"));
+}

@@ -5,14 +5,19 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use legion_core::proto::EventKind;
-use legion_core::{Call, Door, EventSink, Node, Router};
+use legion_core::{Call, CancellationToken, Door, EventSink, Node, Router};
 use serde_json::{Map, Value};
 
 use crate::args::CpCommand;
 use crate::{err, print_outcome, render, run_call};
 
 /// Runs the transfer and prints its result as `legion fs.transfer …` would.
-pub async fn run(node: &Node, router: &dyn Router, command: CpCommand) -> ExitCode {
+pub async fn run(
+    node: &Node,
+    router: &dyn Router,
+    command: CpCommand,
+    shutdown: CancellationToken,
+) -> ExitCode {
     let mut args = Map::new();
     args.insert("from".to_owned(), Value::String(command.from));
     args.insert("to".to_owned(), Value::String(command.to));
@@ -37,7 +42,7 @@ pub async fn run(node: &Node, router: &dyn Router, command: CpCommand) -> ExitCo
             }
         });
     }
-    let outcome = run_call(node, router, call, None).await;
+    let outcome = run_call(node, router, call, None, shutdown).await;
     line.clear();
     print_outcome(outcome, command.json)
 }

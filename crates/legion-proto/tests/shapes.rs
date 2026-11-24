@@ -211,6 +211,8 @@ fn hello() {
             os: "linux".into(),
             arch: "x86_64".into(),
             systems: vec![],
+            system: None,
+            boot_id: None,
         },
         json!({
             "node": "tower",
@@ -219,6 +221,28 @@ fn hello() {
             "os": "linux",
             "arch": "x86_64",
             "systems": []
+        }),
+    );
+    pin(
+        HelloResult {
+            node: "tower".into(),
+            version: "0.1.0".into(),
+            protocol: 1,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            systems: vec!["linux".into(), "windows".into()],
+            system: Some("linux".into()),
+            boot_id: Some("0f5b7c1e-2d1a-4c8e-9b3f-5a6d7e8f9012".into()),
+        },
+        json!({
+            "node": "tower",
+            "version": "0.1.0",
+            "protocol": 1,
+            "os": "linux",
+            "arch": "x86_64",
+            "systems": ["linux", "windows"],
+            "system": "linux",
+            "boot_id": "0f5b7c1e-2d1a-4c8e-9b3f-5a6d7e8f9012"
         }),
     );
 }

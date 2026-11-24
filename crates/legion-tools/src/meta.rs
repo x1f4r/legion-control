@@ -149,6 +149,14 @@ async fn doctor(ctx: &Ctx, _args: NoArgs) -> Result<Doctor, ToolError> {
         };
         checks.push(check);
     }
+    for source in ctx.source_checks() {
+        checks.push(Check {
+            name: source.name,
+            ok: source.ok,
+            detail: source.detail,
+            hint: source.hint,
+        });
+    }
     Ok(Doctor {
         ok: checks.iter().all(|check| check.ok),
         node: ctx.node_name().to_owned(),

@@ -7,9 +7,11 @@
 
 pub mod audit;
 pub mod exec;
+pub mod ext;
 pub mod fs;
 pub mod job;
 pub mod meta;
+pub mod power;
 pub mod proj;
 pub mod svc;
 pub mod sys;
@@ -32,6 +34,8 @@ pub fn register_all(registry: &mut Registry) {
     svc::register(registry);
     xfer::register(registry);
     token::register(registry);
+    power::register(registry);
+    ext::register(registry);
     #[cfg(feature = "testing")]
     testing::register(registry);
 }

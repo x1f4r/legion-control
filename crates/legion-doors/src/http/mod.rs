@@ -24,6 +24,7 @@
 mod api;
 mod gate;
 mod reply;
+mod sessions;
 
 use std::future::Future;
 use std::io::{self, Write as _};
@@ -33,7 +34,11 @@ use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::header::{ALLOW, HeaderValue, WWW_AUTHENTICATE};
+use axum::http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, HeaderValue, ORIGIN, VARY,
+    WWW_AUTHENTICATE,
+};
 use axum::http::{Method, Response, StatusCode};
 use axum::middleware::{self, Next};
 use axum::routing::{any, get, post};
@@ -43,7 +48,9 @@ use legion_core::config::NodeFile;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::tokens::Tokens;
 use legion_core::{CANCEL_GRACE, Node, Router};
+use rmcp::model::ClientJsonRpcMessage;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::session::{SessionId, SessionManager};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -51,6 +58,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use self::gate::Refusal;
+use self::sessions::{Abandonable, SessionRef, Sessions};
 use crate::Authenticated;
 use crate::mcp::{HttpLink, McpDoor};
 
@@ -80,6 +88,12 @@ const REFUSAL_DELAY: Duration = Duration::from_millis(200);
 /// How long shutting down waits for connections to close and calls to be recorded: the time a
 /// cancelled call has to stop, and a little more.
 const DRAIN: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(2));
+
+/// How often sessions are checked for a token that went and for idleness.
+const SWEEP: Duration = Duration::from_secs(10);
+
+/// The header that carries an MCP session's id.
+const SESSION_HEADER: &str = "mcp-session-id";
 
 /// The header that asks for compact MCP, for clients that cannot add a query to their URL.
 const COMPACT_HEADER: &str = "legion-compact";
@@ -121,8 +135,8 @@ pub fn listen_address(text: &str) -> Result<SocketAddr, ErrorBody> {
 pub struct HttpDoor {
     node: Node,
     router: Arc<dyn Router>,
-    full: Arc<crate::mcp::catalog::Catalog>,
-    compact: Arc<crate::mcp::catalog::Catalog>,
+    full: Arc<crate::mcp::catalog::CatalogCache>,
+    compact: Arc<crate::mcp::catalog::CatalogCache>,
 }
 
 impl HttpDoor {
@@ -160,7 +174,7 @@ impl HttpDoor {
             limit: Arc::new(Semaphore::new(MAX_CALLS)),
         };
         let calls = TaskTracker::new();
-        let mcp = |compact: bool, catalog: Arc<crate::mcp::catalog::Catalog>| {
+        let mcp = |compact: bool, catalog: Arc<crate::mcp::catalog::CatalogCache>| {
             let (node, router, link, calls) = (
                 self.node.clone(),
                 Arc::clone(&self.router),
@@ -173,7 +187,10 @@ impl HttpDoor {
                 .disable_allowed_origins()
                 .with_cancellation_token(link.shutdown.child_token())
                 .with_max_request_body_bytes(MAX_BODY);
-            StreamableHttpService::new(
+            let mut sessions = LocalSessionManager::default();
+            sessions.session_config.keep_alive = Some(sessions::IDLE);
+            let sessions = Arc::new(sessions);
+            let service = StreamableHttpService::new(
                 move || {
                     Ok(McpDoor::for_http(
                         node.clone(),
@@ -184,13 +201,18 @@ impl HttpDoor {
                         calls.clone(),
                     ))
                 },
-                Arc::new(LocalSessionManager::default()),
+                Arc::clone(&sessions),
                 config,
-            )
+            );
+            (service, sessions)
         };
+        let (mcp_full, managers_full) = mcp(false, Arc::clone(&self.full));
+        let (mcp_compact, managers_compact) = mcp(true, Arc::clone(&self.compact));
         let shared = Arc::new(Shared {
-            mcp_full: mcp(false, Arc::clone(&self.full)),
-            mcp_compact: mcp(true, Arc::clone(&self.compact)),
+            mcp_full,
+            mcp_compact,
+            managers: [managers_full, managers_compact],
+            sessions: Sessions::default(),
             node: self.node.clone(),
             router: Arc::clone(&self.router),
             port: local.port(),
@@ -205,6 +227,17 @@ impl HttpDoor {
             .fallback(not_found)
             .layer(middleware::from_fn_with_state(Arc::clone(&shared), gate))
             .with_state(Arc::clone(&shared));
+
+        // Ends sessions whose token went or that went idle, even when no request comes to notice.
+        let sweeping = Arc::clone(&shared);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = sweeping.link.shutdown.cancelled() => break,
+                    () = tokio::time::sleep(SWEEP) => sweeping.end_stale_sessions().await,
+                }
+            }
+        });
 
         let connections = TaskTracker::new();
         let closing = CancellationToken::new();
@@ -271,6 +304,30 @@ pub(crate) struct Shared {
     calls: TaskTracker,
     mcp_full: StreamableHttpService<McpDoor, LocalSessionManager>,
     mcp_compact: StreamableHttpService<McpDoor, LocalSessionManager>,
+    /// The session managers behind the full and the compact endpoint, in that order.
+    managers: [Arc<LocalSessionManager>; 2],
+    /// Which token opened each session.
+    sessions: Sessions,
+}
+
+impl Shared {
+    fn manager(&self, compact: bool) -> &LocalSessionManager {
+        &self.managers[usize::from(compact)]
+    }
+
+    async fn close(&self, ended: Vec<SessionRef>) {
+        for session in ended {
+            let id: SessionId = session.id.into();
+            let _ = self.manager(session.compact).close_session(&id).await;
+        }
+    }
+
+    /// Ends the sessions of tokens that were removed, replaced or have expired, and idle ones.
+    async fn end_stale_sessions(&self) {
+        let tokens = self.node.config().get::<Tokens>().ok();
+        let ended = self.sessions.stale(tokens.as_deref());
+        self.close(ended).await;
+    }
 }
 
 /// Every request passes here first: the Host, the Origin and then the token are checked, and one
@@ -291,7 +348,12 @@ async fn gate(
         .map(|file| file.serve.clone())
         .unwrap_or_default();
     let mut principal = None;
-    let response = if !gate::host_allowed(request.headers(), request.uri(), shared.port, &config) {
+    // The origin of a page allowed to call, which its responses name so the browser shows them to
+    // it. Only read once the gate has let the origin through.
+    let origin = request.headers().get(ORIGIN).cloned();
+    let mut response = if let Some(problem) = gate::malformed(request.headers(), request.uri()) {
+        reply::refusal(StatusCode::BAD_REQUEST, ErrorCode::InvalidArgs, problem)
+    } else if !gate::host_allowed(request.headers(), shared.port, &config) {
         reply::refusal(
             StatusCode::MISDIRECTED_REQUEST,
             ErrorCode::Denied,
@@ -303,6 +365,9 @@ async fn gate(
             ErrorCode::Denied,
             "Pages from that origin may not use this server.",
         )
+    } else if method == Method::OPTIONS && request.headers().contains_key(ORIGIN) {
+        // A browser's preflight carries no token; a listed origin is told what it may send.
+        preflight()
     } else if method == Method::GET && path == "/v1/health" {
         next.run(request).await
     } else {
@@ -319,8 +384,8 @@ async fn gate(
             });
         match gate::principal(request.headers(), &tokens) {
             Ok(found) => {
-                principal = Some(found.clone());
-                request.extensions_mut().insert(Authenticated(found));
+                principal = Some(found.principal.clone());
+                request.extensions_mut().insert(found);
                 next.run(request).await
             }
             Err(refusal) => {
@@ -329,6 +394,21 @@ async fn gate(
             }
         }
     };
+    if let Some(origin) = origin
+        && gate::origin_allowed(&origin_only(&origin), &config)
+        && !matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::MISDIRECTED_REQUEST
+        )
+    {
+        let headers = response.headers_mut();
+        headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        headers.insert(
+            ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("Mcp-Session-Id, WWW-Authenticate"),
+        );
+        headers.append(VARY, HeaderValue::from_static("Origin"));
+    }
     log(&format!(
         "{method} {path} {} {} {}ms",
         response.status().as_u16(),
@@ -336,6 +416,34 @@ async fn gate(
         started.elapsed().as_millis()
     ));
     response
+}
+
+/// The answer to a listed origin's preflight: the methods and request headers this API takes.
+/// Never a wildcard, and never credentials: the token travels in `Authorization`, which a page
+/// sets itself, so a browser's cookies have no part in it.
+fn preflight() -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    let headers = response.headers_mut();
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, DELETE"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(
+            "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Last-Event-ID, Legion-Compact",
+        ),
+    );
+    headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
+    response
+}
+
+/// A header map holding only `origin`, to ask the gate about it.
+fn origin_only(origin: &HeaderValue) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(ORIGIN, origin.clone());
+    headers
 }
 
 /// 401, saying a token is needed or that the one given will not do, and never which of the two
@@ -366,32 +474,124 @@ fn unauthorized(refusal: &Refusal) -> Response<Body> {
 /// `/mcp`: the MCP door over streamable HTTP.
 ///
 /// The server offers no stream of its own, so `GET` is 405 as the specification asks of such a
-/// server. The body is read here, bounded and with a deadline, before the SDK sees the request.
+/// server, and so is every method but `POST` and `DELETE`, answered here rather than by the SDK,
+/// which would offer `GET`. The body is read here, bounded and with a deadline, before the SDK sees the request.
 async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Response<Body> {
-    if request.method() == Method::GET {
+    if request.method() != Method::POST && request.method() != Method::DELETE {
         let mut response = reply::refusal(
             StatusCode::METHOD_NOT_ALLOWED,
             ErrorCode::Unsupported,
-            "This server offers no event stream of its own; send MCP messages with POST.",
+            "MCP here takes POST, and DELETE to end a session; this server offers no event stream of its own.",
         );
         response
             .headers_mut()
             .insert(ALLOW, HeaderValue::from_static("POST, DELETE"));
         return response;
     }
+    let Some(who) = request.extensions().get::<Authenticated>().cloned() else {
+        return reply::error(&ErrorBody::new(
+            ErrorCode::Internal,
+            "The request reached MCP without a principal.",
+        ));
+    };
     let compact = wants_compact(&request);
+    shared.end_stale_sessions().await;
+    // A session that is not this token's is answered exactly as one that does not exist.
+    let session = match request.headers().get(SESSION_HEADER).map(|id| id.to_str()) {
+        None => None,
+        Some(Ok(id)) if shared.sessions.admit(id, &who, compact) => Some(id.to_owned()),
+        Some(_) => return session_not_found(),
+    };
+    let deleting = request.method() == Method::DELETE;
     let (parts, body) = request.into_parts();
     let bytes = match read_body(body).await {
         Ok(bytes) => bytes,
         Err(response) => return *response,
     };
+    if session.is_none() && opens_session(&bytes) {
+        match shared.sessions.make_room(&who) {
+            Some(ended) => shared.close(ended).await,
+            None => {
+                return reply::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &ErrorBody::new(
+                        ErrorCode::Busy,
+                        "The server holds as many MCP sessions as it allows.",
+                    )
+                    .with_hint(
+                        "End sessions that are no longer needed, or wait for idle ones to expire.",
+                    ),
+                );
+            }
+        }
+    }
+    let request_id = session.as_ref().and_then(|_| request_id(&bytes));
     let request = Request::from_parts(parts, Body::from(bytes));
     let service = if compact {
         &shared.mcp_compact
     } else {
         &shared.mcp_full
     };
-    service.handle(request).await.map(Body::new)
+    let response = service.handle(request).await;
+    if let (Some(id), Some(request_id)) = (&session, request_id) {
+        // A client that goes away while a request in its session is answered has cancelled it.
+        let manager = Arc::clone(&shared.managers[usize::from(compact)]);
+        let id: SessionId = id.as_str().into();
+        return response.map(|body| {
+            Body::new(Abandonable::new(body, move || {
+                let cancel = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": request_id, "reason": "The client went away."}
+                });
+                let (Ok(handle), Ok(cancel)) = (
+                    tokio::runtime::Handle::try_current(),
+                    serde_json::from_value::<ClientJsonRpcMessage>(cancel),
+                ) else {
+                    return;
+                };
+                handle.spawn(async move {
+                    let _ = manager.accept_message(&id, cancel).await;
+                });
+            }))
+        });
+    }
+    match &session {
+        None => {
+            if let Some(id) = response
+                .headers()
+                .get(SESSION_HEADER)
+                .and_then(|id| id.to_str().ok())
+            {
+                shared.sessions.bind(id.to_owned(), who, compact);
+            }
+        }
+        Some(id) if deleting && response.status().is_success() => shared.sessions.forget(id),
+        Some(_) => {}
+    }
+    response.map(Body::new)
+}
+
+/// What the SDK answers for a session it does not know, word for word, so a session another
+/// token holds cannot be told from one that does not exist.
+fn session_not_found() -> Response<Body> {
+    let mut response = Response::new(Body::from("Not Found: Session not found"));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response
+}
+
+/// The id of a request, when the message is one rather than a notification or a reply.
+fn request_id(body: &[u8]) -> Option<serde_json::Value> {
+    let message = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    message.get("method")?;
+    message.get("id").cloned()
+}
+
+/// Whether a message opens a session: an `initialize` request.
+fn opens_session(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|message| {
+        message.get("method").and_then(|method| method.as_str()) == Some("initialize")
+    })
 }
 
 /// Whether the client asked for compact MCP, with `?compact=1` or the `Legion-Compact` header.

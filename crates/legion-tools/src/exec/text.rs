@@ -10,14 +10,14 @@
 /// `String::from_utf8_lossy` returns for the whole stream, which is how the captured output is
 /// decoded, so the events and the result agree.
 #[derive(Debug, Default)]
-pub(super) struct Decoder {
+pub(crate) struct Decoder {
     pending: Vec<u8>,
 }
 
 impl Decoder {
     /// The text `bytes` complete, holding back a character cut off at the end. Bytes that are not
     /// UTF-8 become U+FFFD.
-    pub(super) fn push(&mut self, bytes: &[u8]) -> String {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> String {
         self.pending.extend_from_slice(bytes);
         let mut text = String::new();
         let mut rest: &[u8] = &self.pending;
@@ -51,7 +51,7 @@ impl Decoder {
 
     /// What is still held back once the stream has ended: a character it never finished, as
     /// U+FFFD.
-    pub(super) fn finish(&mut self) -> String {
+    pub(crate) fn finish(&mut self) -> String {
         let text = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
         text
