@@ -5,10 +5,13 @@ node, adding other machines, and reading the errors you are most likely to see.
 
 ## Install
 
-Release binaries are published under `legion-v*` tags on GitHub alongside `SHA256SUMS`, an offline
-Ed25519 signature (`SHA256SUMS.sig`, signed with the owner's offline key whose public key is
-compiled into `legion` from `contract/release-public-key.pem`), and GitHub build provenance
-attestations. Five targets are built in CI:
+Release binaries are published under `legion-v*` tags on GitHub once the owner has tagged and signed
+a release, alongside `SHA256SUMS`, an offline Ed25519 signature (`SHA256SUMS.sig`, signed with the
+owner's offline key whose public key is compiled into `legion` from
+`contract/release-public-key.pem`), and GitHub build provenance attestations. Until a signed release
+is published (or whenever you want to install a local build), install from a file with `--from` (in
+the install scripts) or `from=` (in `meta.update` and `fleet.install`). Five targets are built in
+CI:
 
 | Platform | Target triple | Asset name |
 | --- | --- | --- |
@@ -45,8 +48,10 @@ What `install/legion.sh` does:
      installing and prints how to install `gh` or OpenSSL 3 (for example `brew install openssl` on
      macOS), or pass `--insecure-skip-verify` to install with SHA-256 checking only.
 - Refuses a directory destination, stages the binary beside `~/.local/bin/legion` with mode `0755`,
-  atomically renames it into place, runs `~/.local/bin/legion --version`, and prints a reminder if
-  `~/.local/bin` is not on your `PATH`.
+  atomically renames it into place, runs `~/.local/bin/legion --version` (which prints
+  `legion <version> (<12-character commit>[, modified])` when built from git or with
+  `LEGION_BUILD_REV`; `meta.version` and `hello` report the same commit string in `build`), and
+  prints a reminder if `~/.local/bin` is not on your `PATH`.
 
 Useful options:
 

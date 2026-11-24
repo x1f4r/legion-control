@@ -69,6 +69,10 @@ fn main() -> ExitCode {
             "non_admin_cannot_create_or_link_secret_ancestors_in_any_tool",
             non_admin_cannot_create_or_link_secret_ancestors_in_any_tool,
         ),
+        (
+            "meta_update_from_local_binary_replaces_temp_copy_and_keeps_prev",
+            meta_update_from_local_binary_replaces_temp_copy_and_keeps_prev,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -175,6 +179,45 @@ fn run_helper(args: &[String]) -> ExitCode {
         "fail" => {
             eprintln!("connection refused");
             ExitCode::from(1)
+        }
+        // wrong-protocol: answers hello claiming an unsupported protocol version.
+        "wrong-protocol" => {
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            println!(
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "node": "oldbox",
+                        "version": "0.0.1",
+                        "protocol": 99,
+                        "os": "linux",
+                        "arch": "x86_64",
+                        "systems": []
+                    }
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        // bad-hello: answers hello with a malformed result object.
+        "bad-hello" => {
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            println!(
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"unexpected": true}
+                })
+            );
+            ExitCode::SUCCESS
         }
         // fake-claude <state_file> <log_file> <argv...>
         "fake-claude" => {
@@ -937,11 +980,12 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
     );
     laptop.write_config("fleet.toml", &fleet_toml);
 
-    // Full doctor pings fleet machines concurrently and warns on operator allowing exec (even with no paths).
+    // Full doctor pings fleet machines concurrently: an unreachable machine is a warning (leaving
+    // the node healthy) and operator allowing exec is warned too.
     let full = laptop.run(&["meta.doctor"]);
     assert_eq!(full.code, 0, "{}", full.stderr);
     let full_json = full.json();
-    assert_eq!(full_json["ok"], json!(false), "{full_json}");
+    assert_eq!(full_json["ok"], json!(true), "{full_json}");
     let checks = full_json["checks"].as_array().unwrap();
 
     let pi_check = checks
@@ -953,7 +997,13 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
         .iter()
         .find(|c| c["name"] == json!("fleet: ghost"))
         .unwrap();
-    assert_eq!(ghost_check["ok"], json!(false), "{ghost_check}");
+    assert_eq!(ghost_check["ok"], json!(true), "{ghost_check}");
+    assert_eq!(ghost_check["warning"], json!(true), "{ghost_check}");
+    let ghost_detail = ghost_check["detail"].as_str().unwrap();
+    assert!(
+        ghost_detail.contains("ghost") && ghost_detail.contains("off"),
+        "{ghost_check}"
+    );
 
     let policy_warn = checks
         .iter()
@@ -967,6 +1017,40 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
         detail.contains("as strong as the account, admin included"),
         "{policy_warn}"
     );
+
+    // A machine answering with a different protocol or an unparseable hello reply stays a failure.
+    let self_bin = std::env::current_exe().unwrap();
+    let helper_argv = |mode: &str| {
+        vec![
+            self_bin.display().to_string(),
+            HELPER_FLAG.to_owned(),
+            mode.to_owned(),
+        ]
+    };
+    let bad_fleet_toml = format!(
+        "[machines.oldbox]\ncommand = {}\n\n[machines.garbled]\ncommand = {}\n",
+        toml_argv(&helper_argv("wrong-protocol")),
+        toml_argv(&helper_argv("bad-hello")),
+    );
+    laptop.write_config("fleet.toml", &bad_fleet_toml);
+    let bad_proto = laptop.run(&["meta.doctor"]);
+    assert_eq!(bad_proto.code, 0, "{}", bad_proto.stderr);
+    let bad_json = bad_proto.json();
+    assert_eq!(bad_json["ok"], json!(false), "{bad_json}");
+    let bad_checks = bad_json["checks"].as_array().unwrap();
+    let oldbox = bad_checks
+        .iter()
+        .find(|c| c["name"] == json!("fleet: oldbox"))
+        .unwrap();
+    assert_eq!(oldbox["ok"], json!(false), "{oldbox}");
+    let garbled = bad_checks
+        .iter()
+        .find(|c| c["name"] == json!("fleet: garbled"))
+        .unwrap();
+    assert_eq!(garbled["ok"], json!(false), "{garbled}");
+
+    // Restore original fleet.toml before testing quick=true.
+    laptop.write_config("fleet.toml", &fleet_toml);
 
     // quick=true skips fleet reachability checks so the local node reports healthy.
     let quick = laptop.run(&["meta.doctor", "quick=true"]);
@@ -1783,4 +1867,79 @@ role = \"wide\"
         assert_eq!(res.json()["code"], json!("denied"), "move {label}");
         assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
     }
+}
+
+fn meta_update_from_local_binary_replaces_temp_copy_and_keeps_prev() {
+    let dir = tempfile::tempdir().unwrap();
+    let install_dir = dir.path().join("install");
+    let build_dir = dir.path().join("build");
+    let legion_home = dir.path().join("legion-home");
+    let user_home = dir.path().join("user-home");
+    fs::create_dir_all(&install_dir).unwrap();
+    fs::create_dir_all(&build_dir).unwrap();
+    fs::create_dir_all(&user_home).unwrap();
+
+    let exe_name = if cfg!(windows) {
+        "legion.exe"
+    } else {
+        "legion"
+    };
+    let installed_bin = install_dir.join(exe_name);
+    let candidate_bin = build_dir.join(exe_name);
+    fs::copy(LEGION_BIN, &installed_bin).unwrap();
+    fs::copy(LEGION_BIN, &candidate_bin).unwrap();
+
+    let run_copy = |args: &[&str]| {
+        let out = Command::new(&installed_bin)
+            .args(args)
+            .env("LEGION_HOME", &legion_home)
+            .env("HOME", &user_home)
+            .env("USERPROFILE", &user_home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        (out.status.code().unwrap_or(1), stdout, stderr)
+    };
+
+    let from_arg = format!("from={}", candidate_bin.display());
+
+    // `from` and `version` together fail with invalid_args.
+    let (code, stdout, _) = run_copy(&["meta.update", &from_arg, "version=0.2.0"]);
+    assert_eq!(code, 1, "{stdout}");
+    let err: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(err["code"], json!("invalid_args"), "{err}");
+
+    // Dry run succeeds without writing `.prev`.
+    let (code, stdout, stderr) = run_copy(&["meta.update", &from_arg, "dry_run=true"]);
+    assert_eq!(code, 0, "stderr: {stderr}, stdout: {stdout}");
+    let dry: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(dry["dry_run"], json!(true), "{dry}");
+    assert_eq!(dry["updated"], json!(false), "{dry}");
+    assert_eq!(dry["installed_version"], json!(env!("CARGO_PKG_VERSION")));
+    assert!(!install_dir.join(format!("{exe_name}.prev")).exists());
+
+    // Real local update replaces the temp copy and keeps `.prev`.
+    let (code, stdout, stderr) = run_copy(&["meta.update", &from_arg]);
+    assert_eq!(code, 0, "stderr: {stderr}, stdout: {stdout}");
+    let updated: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(updated["dry_run"], json!(false), "{updated}");
+    assert_eq!(updated["updated"], json!(true), "{updated}");
+    assert_eq!(
+        updated["installed_version"],
+        json!(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        updated.get("build").and_then(Value::as_str),
+        legion_core::BUILD
+    );
+    assert!(install_dir.join(format!("{exe_name}.prev")).is_file());
+    assert!(
+        legion_home
+            .join("state")
+            .join("version-floor.json")
+            .is_file()
+    );
 }

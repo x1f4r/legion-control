@@ -7,7 +7,7 @@ use std::io;
 use std::path::Path;
 
 use legion_core::proto::{Effect, PROTOCOL};
-use legion_core::{Ctx, Door, NoArgs, Registry, ToolError, VERSION};
+use legion_core::{BUILD, Ctx, Door, NoArgs, Registry, ToolError, VERSION};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +34,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.doctor",
         Effect::Read,
-        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml answers (unless quick=true). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
+        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
     init::register(registry);
@@ -48,6 +48,9 @@ pub struct Version {
     pub name: &'static str,
     /// The version of legion.
     pub version: &'static str,
+    /// The source revision of legion, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<&'static str>,
     /// The protocol it speaks.
     pub protocol: u32,
     /// The node's name.
@@ -62,6 +65,7 @@ async fn version(ctx: &Ctx, _args: NoArgs) -> Result<Version, ToolError> {
     Ok(Version {
         name: "legion",
         version: VERSION,
+        build: BUILD,
         protocol: PROTOCOL,
         node: ctx.node_name().to_owned(),
         os: ctx.os(),

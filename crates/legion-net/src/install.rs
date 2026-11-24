@@ -25,7 +25,8 @@ use legion_tools::binfmt::verify_binary_matches_target;
 use legion_tools::floor::{SemVer, check_version_transition, commit_floor, machine_floor_path};
 use legion_tools::trust::RELEASE_PUBLIC_KEY;
 use legion_tools::update::{
-    ReleaseFetcher, SystemFetcher, artifact_url, dist_cache_binary, normalize_version, random_hex,
+    ParsedVersion, ReleaseFetcher, SystemFetcher, artifact_url, dist_cache_binary,
+    normalize_version, parse_legion_version_line, parse_legion_version_output, random_hex,
     resolve_release_binary_with_key, resolve_target_for,
 };
 use schemars::JsonSchema;
@@ -154,6 +155,9 @@ pub struct InstallResult {
     pub target: String,
     /// Version reported by the machine's new `legion rpc` session (or planned version on dry run).
     pub installed_version: String,
+    /// Source revision reported by the newly installed binary, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     /// Version previously installed on the machine, if an existing `legion` answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_version: Option<String>,
@@ -273,12 +277,12 @@ pub trait InstallBackend: Send + Sync {
     ) -> BoxFuture<'a, Result<(), ErrorBody>>;
 
     /// Evicts any cached session for `machine`, opens a fresh normal `legion rpc` session, and
-    /// returns the `version` reported by the remote node's `hello` handshake.
+    /// returns the `version` and optional `build` reported by the remote node's `hello` handshake.
     fn verify_session_version<'a>(
         &'a self,
         machine: &'a str,
         cancel: CancellationToken,
-    ) -> BoxFuture<'a, Result<String, ErrorBody>>;
+    ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>>;
 }
 
 struct BackendFetcher<'a>(&'a dyn InstallBackend);
@@ -455,7 +459,7 @@ impl InstallBackend for SystemInstallBackend {
         &'a self,
         machine: &'a str,
         cancel: CancellationToken,
-    ) -> BoxFuture<'a, Result<String, ErrorBody>> {
+    ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>> {
         Box::pin(async move {
             // Evict any cached connection so the verification handshake runs against the freshly
             // installed binary.
@@ -465,7 +469,11 @@ impl InstallBackend for SystemInstallBackend {
                 .fleet
                 .session_for(&store, &self.here, machine, cancel)
                 .await?;
-            Ok(session.info().hello.version.clone())
+            let hello = &session.info().hello;
+            Ok(ParsedVersion {
+                version: hello.version.clone(),
+                build: hello.build.clone(),
+            })
         })
     }
 }
@@ -933,18 +941,10 @@ pub fn parse_powershell_probe(output: &str) -> Result<DetectedPlatform, ErrorBod
     })
 }
 
-/// Parses `legion --version` output (`"legion 0.1.0"`) into the bare version string.
+/// Parses `legion --version` output (`"legion 0.1.0"` or `"legion 0.1.0 (<rev>[, modified])"`)
+/// into the bare version string.
 pub fn parse_version_output(output: &str) -> Option<String> {
-    for line in output.lines().rev() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("legion ") {
-            let ver = rest.split_whitespace().next().unwrap_or("");
-            if !ver.is_empty() && normalize_version(ver).is_ok() {
-                return Some(ver.to_owned());
-            }
-        }
-    }
-    None
+    parse_legion_version_output(output)
 }
 
 /// Core implementation of `fleet.install`, parameterized over [`InstallBackend`] so tests run
@@ -1114,6 +1114,7 @@ async fn run_fleet_install_with_key(
             arch: platform.arch.to_owned(),
             target: platform.target.to_owned(),
             installed_version: planned_version,
+            build: None,
             previous_version,
             path: remote_display_path,
             source: Some(source_desc),
@@ -1237,7 +1238,7 @@ async fn run_fleet_install_with_key(
             .with_hint("The binary could not run on the target machine; the previous installation was left untouched.")
             .with_machine(args.machine.clone()));
         }
-        let staged_ver = parse_version_output(&out.stdout).ok_or_else(|| {
+        let staged_parsed = parse_legion_version_line(&out.stdout).ok_or_else(|| {
             ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
@@ -1249,18 +1250,18 @@ async fn run_fleet_install_with_key(
             .with_machine(args.machine.clone())
         })?;
         if let Some(exp) = &expected_version {
-            if !versions_match(&staged_ver, exp) {
+            if !versions_match(&staged_parsed.version, exp) {
                 return Err(ErrorBody::new(
                     ErrorCode::Failed,
                     format!(
-                        "Staged binary on {} reported version {staged_ver}, expected {exp}.",
-                        args.machine
+                        "Staged binary on {} reported version {}, expected {exp}.",
+                        args.machine, staged_parsed.version
                     ),
                 )
                 .with_hint("Nothing was replaced on the remote machine.")
                 .with_machine(args.machine.clone()));
             }
-        } else if let Ok(staged_semver) = SemVer::parse(&staged_ver) {
+        } else if let Ok(staged_semver) = SemVer::parse(&staged_parsed.version) {
             check_version_transition(
                 &staged_semver,
                 previous_semver.as_ref(),
@@ -1269,17 +1270,19 @@ async fn run_fleet_install_with_key(
             )
             .map_err(|err| err.with_machine(args.machine.clone()))?;
         }
-        Ok(staged_ver)
+        Ok(staged_parsed)
     }
     .await;
 
-    let verified_expected_version = match staged_check {
-        Ok(ver) => ver,
+    let verified_staged = match staged_check {
+        Ok(parsed) => parsed,
         Err(err) => {
             cleanup_remote_temp(backend, &ssh_target, platform.remote_os, &temp_name).await;
             return Err(err);
         }
     };
+    let verified_expected_version = verified_staged.version;
+    let staged_build = verified_staged.build;
 
     let finalize_cmd = match platform.remote_os {
         RemoteOs::Unix => unix_finalize_command(&temp_name, program.as_deref())?,
@@ -1329,9 +1332,9 @@ async fn run_fleet_install_with_key(
         return Err(err);
     }
 
-    let installed_version = match backend.verify_session_version(&args.machine, cancel).await {
-        Ok(ver) if versions_match(&ver, &verified_expected_version) => ver,
-        Ok(ver) => {
+    let verified_session = match backend.verify_session_version(&args.machine, cancel).await {
+        Ok(parsed) if versions_match(&parsed.version, &verified_expected_version) => parsed,
+        Ok(parsed) => {
             let rollback_note = attempt_remote_rollback(
                 backend,
                 &ssh_target,
@@ -1344,8 +1347,8 @@ async fn run_fleet_install_with_key(
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
-                    "Installed legion {verified_expected_version} to {remote_display_path} on {}, but a new session answered with version {ver}.{rollback_note}",
-                    args.machine
+                    "Installed legion {verified_expected_version} to {remote_display_path} on {}, but a new session answered with version {}.{rollback_note}",
+                    args.machine, parsed.version
                 ),
             )
             .with_hint(
@@ -1376,6 +1379,8 @@ async fn run_fleet_install_with_key(
             .with_machine(args.machine.clone()));
         }
     };
+    let installed_version = verified_session.version;
+    let installed_build = verified_session.build.or(staged_build);
 
     if let Ok(installed_semver) = SemVer::parse(&installed_version) {
         commit_floor(&floor_path, &installed_semver, args.allow_downgrade)?;
@@ -1387,6 +1392,7 @@ async fn run_fleet_install_with_key(
         arch: platform.arch.to_owned(),
         target: platform.target.to_owned(),
         installed_version,
+        build: installed_build,
         previous_version,
         path: remote_display_path,
         source: None,
@@ -1896,6 +1902,7 @@ mod tests {
         previous_version_output: Option<String>,
         staged_version_output: Option<RemoteCommandOutput>,
         session_version_after_install: String,
+        session_build_after_install: Option<String>,
         fail_finalize: bool,
         fail_session: bool,
         ssh_log: Mutex<Vec<(String, String)>>,
@@ -1923,6 +1930,7 @@ mod tests {
                 previous_version_output: previous.map(|v| format!("legion {v}\n")),
                 staged_version_output: None,
                 session_version_after_install: session_after.to_owned(),
+                session_build_after_install: None,
                 fail_finalize: false,
                 fail_session: false,
                 ssh_log: Mutex::new(Vec::new()),
@@ -1956,6 +1964,7 @@ mod tests {
                 previous_version_output: previous.map(|v| format!("legion {v}\r\n")),
                 staged_version_output: None,
                 session_version_after_install: session_after.to_owned(),
+                session_build_after_install: None,
                 fail_finalize: false,
                 fail_session: false,
                 ssh_log: Mutex::new(Vec::new()),
@@ -2123,7 +2132,7 @@ mod tests {
             &'a self,
             machine: &'a str,
             _cancel: CancellationToken,
-        ) -> BoxFuture<'a, Result<String, ErrorBody>> {
+        ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>> {
             Box::pin(async move {
                 self.session_checks.lock().unwrap().push(machine.to_owned());
                 if self.fail_session {
@@ -2132,7 +2141,10 @@ mod tests {
                         format!("Remote legion session failed to start on {machine}"),
                     ));
                 }
-                Ok(self.session_version_after_install.clone())
+                Ok(ParsedVersion {
+                    version: self.session_version_after_install.clone(),
+                    build: self.session_build_after_install.clone(),
+                })
             })
         }
     }
@@ -2831,5 +2843,60 @@ program = "/opt/legion/legion"
                 .any(|(_, cmd)| cmd.contains("mv -f \"$d.prev\" \"$d\"")),
             "expected remote rollback from .prev"
         );
+    }
+
+    #[tokio::test]
+    async fn parses_old_and_new_version_lines_and_reports_installed_build() {
+        assert_eq!(
+            parse_version_output("legion 0.1.0\n").as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(
+            parse_version_output("legion 0.1.0 (a59ec0d12345)\n").as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(
+            parse_version_output("legion 0.1.0 (a59ec0d12345, modified)\r\n").as_deref(),
+            Some("0.1.0")
+        );
+
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let local_bin = dir.path().join("legion-rebuilt");
+        fs::write(
+            &local_bin,
+            fake_binary("x86_64-unknown-linux-musl", b"rebuilt-same-version"),
+        )
+        .unwrap();
+
+        let mut backend = FakeInstallBackend::linux_x86_64("0.1.0", None, "0.1.0");
+        backend.previous_version_output = Some("legion 0.1.0 (111111111111)\n".to_owned());
+        backend.staged_version_output = Some(RemoteCommandOutput {
+            success: true,
+            stdout: "legion 0.1.0 (222222222222, modified)\n".to_owned(),
+            stderr: String::new(),
+        });
+        backend.session_build_after_install = Some("222222222222, modified".to_owned());
+
+        let res = run_fleet_install(
+            &paths,
+            &fleet,
+            "laptop",
+            &backend,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.previous_version.as_deref(), Some("0.1.0"));
+        assert_eq!(res.installed_version, "0.1.0");
+        assert_eq!(res.build.as_deref(), Some("222222222222, modified"));
     }
 }

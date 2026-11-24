@@ -103,6 +103,8 @@ test('legion release workflow enforces main ancestry, --latest=false, and --prer
   assert.doesNotMatch(workflow, /--draft=false\s+dist\//);
   assert.match(workflow, /gh release edit legion-vX\.Y\.Z --draft=false --latest=false/);
   assert.doesNotMatch(workflow, /actions\/cache/);
+  const buildRevMatches = workflow.match(/LEGION_BUILD_REV:\s*\$\{\{\s*github\.sha\s*\}\}/g) ?? [];
+  assert.equal(buildRevMatches.length, 3, 'every release build step must set LEGION_BUILD_REV from github.sha');
 });
 
 test('install scripts enforce HTTPS-only TLS 1.2 downloads and silent PowerShell progress', () => {
@@ -165,4 +167,28 @@ test('install scripts handle Rosetta 2 on macOS and honest x64 emulation on Wind
 
   const ps1 = fs.readFileSync(repoFile('install/legion.ps1'), 'utf8');
   assert.match(ps1, /'ARM64'\s*\{[\s\S]*Write-Warning[\s\S]*x86_64-pc-windows-msvc/);
+});
+
+test('install/legion.sh --from accepts both old and build-tagged --version outputs', () => {
+  if (process.platform === 'win32') return;
+  const shPath = repoFile('install/legion.sh');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-sh-ver-test-'));
+  try {
+    for (const line of [
+      'legion 0.1.0',
+      'legion 0.1.0 (a59ec0d12345)',
+      'legion 0.1.0 (a59ec0d12345, modified)',
+    ]) {
+      const fakeBin = path.join(dir, 'fake-legion');
+      fs.writeFileSync(fakeBin, `#!/bin/sh\nprintf '%s\\n' '${line}'\n`, { mode: 0o755 });
+      const run = spawnSync('sh', [shPath, '--from', fakeBin], {
+        env: { ...process.env, HOME: dir },
+        encoding: 'utf8',
+      });
+      assert.equal(run.status, 0, run.stderr);
+      assert.ok(run.stdout.includes(`Installed ${line} to `), run.stdout);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

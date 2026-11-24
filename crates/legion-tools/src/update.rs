@@ -65,7 +65,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.update",
         Effect::Admin,
-        "Replace this node's legion binary with an offline-signed GitHub release artifact. Requires a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it; to install an unsigned local build use fleet.install with from=<local file> or install scripts with --from), verifies SHA-256, and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.",
+        "Replace this node's legion binary with an offline-signed GitHub release artifact or a local binary passed with `from`. Release downloads require a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it) and SHA-256 verification; passing `from=<local file>` installs an unsigned binary that the admin naming the file vouches for. Checks binary format and architecture, enforces downgrade protection unless `allow_downgrade` is set, stages and runs `--version` preflight, keeps the previous binary as `.prev` (restoring it if the replaced binary does not run), and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.",
         meta_update,
     );
 }
@@ -75,10 +75,15 @@ pub fn register(registry: &mut Registry) {
 #[serde(deny_unknown_fields)]
 pub struct UpdateArgs {
     /// Release version to install (for example `0.2.0` or `legion-v0.2.0`). Defaults to the
-    /// highest published stable `legion-v*` semantic version.
+    /// highest published stable `legion-v*` semantic version. Cannot be combined with `from`.
     #[serde(default)]
     pub version: Option<String>,
-    /// Resolve the target release and report what would be replaced without downloading or writing.
+    /// Local path on this node to a `legion` binary already built for this machine. Cannot be
+    /// combined with `version`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Resolve the target release or local binary and report what would be replaced without
+    /// downloading or writing.
     #[serde(default)]
     pub dry_run: bool,
     /// Permit replacing with a version older than the running binary or the recorded version floor.
@@ -93,6 +98,9 @@ pub struct UpdateResult {
     pub previous_version: String,
     /// Version installed (or planned when `dry_run` is true).
     pub installed_version: String,
+    /// Source revision reported by the newly installed binary, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     /// Release target triple selected for this node.
     pub target: String,
     /// Path to the executable that was (or would be) replaced.
@@ -694,28 +702,118 @@ pub fn prev_binary_path(target_exe: &Path) -> Option<PathBuf> {
     Some(parent.join(format!("{file_name}.prev")))
 }
 
-/// Parses `legion --version` output (`"legion 0.2.0"`) into the bare version string.
-pub fn parse_legion_version_output(output: &str) -> Option<String> {
+/// Parsed version and optional build string from `legion --version` output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedVersion {
+    /// Bare semantic version string (for example `"0.1.0"`).
+    pub version: String,
+    /// Optional build revision inside trailing parentheses (for example `"a59ec0d12345"` or
+    /// `"a59ec0d12345, modified"`).
+    pub build: Option<String>,
+}
+
+/// Parses `legion --version` output in either the old (`"legion 0.2.0"`) or new
+/// (`"legion 0.2.0 (a59ec0d12345[, modified])"`) form into a [`ParsedVersion`].
+pub fn parse_legion_version_line(output: &str) -> Option<ParsedVersion> {
     for line in output.lines().rev() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("legion ") {
-            let ver = rest.split_whitespace().next().unwrap_or("");
+            let rest = rest.trim_start();
+            let (ver, tail) = match rest.find(char::is_whitespace) {
+                Some(idx) => (&rest[..idx], rest[idx..].trim()),
+                None => (rest, ""),
+            };
             if !ver.is_empty() && normalize_version(ver).is_ok() {
-                return Some(ver.to_owned());
+                let build = tail
+                    .strip_prefix('(')
+                    .and_then(|inner| inner.strip_suffix(')'))
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_owned);
+                return Some(ParsedVersion {
+                    version: ver.to_owned(),
+                    build,
+                });
             }
         }
     }
     None
 }
 
-/// Runs a staged `legion` binary with `--version` and verifies that it exits 0 and reports
-/// `expected_version`.
-pub async fn verify_staged_binary_version(
-    staged: &Path,
-    expected_version: &str,
+/// Parses `legion --version` output (`"legion 0.2.0"` or `"legion 0.2.0 (<rev>[, modified])"`)
+/// into the bare version string.
+pub fn parse_legion_version_output(output: &str) -> Option<String> {
+    parse_legion_version_line(output).map(|parsed| parsed.version)
+}
+
+/// Resolves and validates a local `from` binary path (absolute or starting with `~`), ensuring it
+/// points to an existing non-empty regular file.
+pub fn resolve_local_binary(paths: &Paths, raw: &str) -> Result<PathBuf, ErrorBody> {
+    let path = expand_local_path(paths, raw)?;
+    let meta = fs::metadata(&path).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::NotFound,
+            format!("Local binary {} cannot be read: {err}.", path.display()),
+        )
+        .with_hint("Pass an existing compiled legion binary to `from`.")
+    })?;
+    if !meta.is_file() {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("`from` path {} is not a regular file.", path.display()),
+        )
+        .with_hint("Pass the path to the legion executable itself, not a directory."));
+    }
+    if meta.len() == 0 {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("`from` file {} is empty.", path.display()),
+        )
+        .with_hint("Build or download a valid legion binary first."));
+    }
+    Ok(path)
+}
+
+fn expand_local_path(paths: &Paths, raw: &str) -> Result<PathBuf, ErrorBody> {
+    if raw.is_empty() {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "`from` path cannot be empty.",
+        ));
+    }
+    let resolved = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        let home = paths.home().ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                "Cannot expand `~` in `from`: home directory is not set.",
+            )
+            .with_hint("Pass an absolute path to `from`.")
+        })?;
+        if raw == "~" {
+            home.to_path_buf()
+        } else {
+            home.join(&raw[2..])
+        }
+    } else {
+        PathBuf::from(raw)
+    };
+    if !resolved.is_absolute() {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("`from` path {raw:?} must be absolute (or start with `~`)."),
+        )
+        .with_hint("Pass an absolute path or a path starting with `~`."));
+    }
+    Ok(resolved)
+}
+
+/// Runs `binary --version` with a bounded timeout and parses the reported version and optional
+/// build revision.
+pub async fn probe_binary_version(
+    binary: &Path,
     cancel: CancellationToken,
-) -> Result<(), ErrorBody> {
-    let options = RunOptions::new(CommandSpec::argv(staged, ["--version"]))
+) -> Result<ParsedVersion, ErrorBody> {
+    let options = RunOptions::new(CommandSpec::argv(binary, ["--version"]))
         .c_locale()
         .timeout(PREFLIGHT_TIMEOUT)
         .cancel(cancel);
@@ -724,10 +822,10 @@ pub async fn verify_staged_binary_version(
             ErrorCode::Failed,
             format!(
                 "Staged binary {} could not be executed for --version preflight: {err}.",
-                staged.display()
+                binary.display()
             ),
         )
-        .with_hint("The downloaded binary may not match this platform; nothing was replaced.")
+        .with_hint("The binary may not match this platform; nothing was replaced.")
     })?;
     if output.cancelled {
         return Err(ErrorBody::new(
@@ -740,7 +838,7 @@ pub async fn verify_staged_binary_version(
             ErrorCode::Timeout,
             format!(
                 "Staged binary {} timed out while running --version.",
-                staged.display()
+                binary.display()
             ),
         )
         .with_hint("Nothing was replaced."));
@@ -756,31 +854,45 @@ pub async fn verify_staged_binary_version(
             ErrorCode::Failed,
             format!(
                 "Staged binary {} failed --version preflight ({reason}).",
-                staged.display()
+                binary.display()
             ),
         )
         .with_hint("Nothing was replaced."));
     }
-    let reported = parse_legion_version_output(&output.stdout.text).ok_or_else(|| {
+    parse_legion_version_line(&output.stdout.text).ok_or_else(|| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!(
                 "Staged binary {} did not print a valid `legion <version>` line on --version.",
-                staged.display()
+                binary.display()
             ),
         )
         .with_hint("Nothing was replaced.")
-    })?;
-    let matches = match (SemVer::parse(&reported), SemVer::parse(expected_version)) {
+    })
+}
+
+/// Runs a staged `legion` binary with `--version` and verifies that it exits 0 and reports
+/// `expected_version`.
+pub async fn verify_staged_binary_version(
+    staged: &Path,
+    expected_version: &str,
+    cancel: CancellationToken,
+) -> Result<(), ErrorBody> {
+    let reported = probe_binary_version(staged, cancel).await?;
+    let matches = match (
+        SemVer::parse(&reported.version),
+        SemVer::parse(expected_version),
+    ) {
         (Ok(a), Ok(b)) => a == b,
-        _ => reported == expected_version,
+        _ => reported.version == expected_version,
     };
     if !matches {
         return Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
-                "Staged binary {} reported version {reported}, expected {expected_version}.",
-                staged.display()
+                "Staged binary {} reported version {}, expected {expected_version}.",
+                staged.display(),
+                reported.version
             ),
         )
         .with_hint("Nothing was replaced."));
@@ -979,6 +1091,87 @@ fn commit_staged_executable(
     Ok(())
 }
 
+/// Restores `<exe>.prev` over `target_exe` after a failed post-replacement verification.
+fn restore_prev_backup(target_exe: &Path, rename_old_first: bool) -> Result<(), ErrorBody> {
+    let prev_path = prev_binary_path(target_exe).ok_or_else(|| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Cannot determine `.prev` backup path for {}.",
+                target_exe.display()
+            ),
+        )
+    })?;
+    if !prev_path.is_file() {
+        return Err(ErrorBody::new(
+            ErrorCode::NotFound,
+            format!(
+                "Previous binary backup {} does not exist.",
+                prev_path.display()
+            ),
+        ));
+    }
+    let parent = target_exe.parent().ok_or_else(|| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Cannot determine the directory containing {}.",
+                target_exe.display()
+            ),
+        )
+    })?;
+    let file_name = target_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Executable path {} has no valid filename.",
+                    target_exe.display()
+                ),
+            )
+        })?;
+
+    if rename_old_first && target_exe.exists() {
+        let token = random_hex(8)?;
+        let old_path = parent.join(format!("{file_name}{OLD_BINARY_MARKER}{token}"));
+        replace_file(target_exe, &old_path).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Could not move broken binary {} aside during rollback: {err}.",
+                    target_exe.display()
+                ),
+            )
+        })?;
+        if let Err(err) = replace_file(&prev_path, target_exe) {
+            let _ = replace_file(&old_path, target_exe);
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Could not restore {} from {}: {err}.",
+                    target_exe.display(),
+                    prev_path.display()
+                ),
+            ));
+        }
+        let _ = fs::remove_file(&old_path);
+    } else {
+        replace_file(&prev_path, target_exe).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Could not restore {} from {}: {err}.",
+                    target_exe.display(),
+                    prev_path.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Replaces `target_exe` with the contents of `new_binary` atomically, keeping one previous
 /// generation beside it as `<exe>.prev`.
 pub fn replace_executable(
@@ -988,6 +1181,33 @@ pub fn replace_executable(
 ) -> Result<(), ErrorBody> {
     let staged_guard = stage_executable_beside(target_exe, new_binary)?;
     commit_staged_executable(staged_guard, target_exe, rename_old_first)
+}
+
+trait BinaryProber: Send + Sync {
+    fn probe<'a>(
+        &'a self,
+        binary: &'a Path,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>>;
+}
+
+struct SystemProber;
+
+impl BinaryProber for SystemProber {
+    fn probe<'a>(
+        &'a self,
+        binary: &'a Path,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>> {
+        Box::pin(async move { probe_binary_version(binary, cancel).await })
+    }
+}
+
+fn versions_match(actual: &str, expected: &str) -> bool {
+    match (SemVer::parse(actual), SemVer::parse(expected)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => actual.trim() == expected.trim(),
+    }
 }
 
 async fn meta_update(ctx: &Ctx, args: UpdateArgs) -> Result<UpdateResult, ToolError> {
@@ -1022,7 +1242,8 @@ pub async fn run_meta_update(
     args: UpdateArgs,
     cancel: CancellationToken,
 ) -> Result<UpdateResult, ErrorBody> {
-    run_meta_update_with_key(
+    let prober = SystemProber;
+    run_meta_update_inner(
         paths,
         fetcher,
         os,
@@ -1031,7 +1252,7 @@ pub async fn run_meta_update(
         current_exe,
         rename_old_first,
         &RELEASE_PUBLIC_KEY,
-        true,
+        Some(&prober),
         args,
         cancel,
     )
@@ -1056,6 +1277,7 @@ async fn detect_macos_rosetta(os: &str, arch: &str, cancel: CancellationToken) -
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn run_meta_update_with_key(
     paths: &Paths,
     fetcher: &dyn ReleaseFetcher,
@@ -1069,19 +1291,195 @@ async fn run_meta_update_with_key(
     args: UpdateArgs,
     cancel: CancellationToken,
 ) -> Result<UpdateResult, ErrorBody> {
+    let prober = SystemProber;
+    let prober_ref: Option<&dyn BinaryProber> = if run_staged_preflight {
+        Some(&prober)
+    } else {
+        None
+    };
+    run_meta_update_inner(
+        paths,
+        fetcher,
+        os,
+        arch,
+        current_version,
+        current_exe,
+        rename_old_first,
+        public_key,
+        prober_ref,
+        args,
+        cancel,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_meta_update_inner(
+    paths: &Paths,
+    fetcher: &dyn ReleaseFetcher,
+    os: &str,
+    arch: &str,
+    current_version: &str,
+    current_exe: &Path,
+    rename_old_first: bool,
+    public_key: &[u8; 32],
+    prober: Option<&dyn BinaryProber>,
+    args: UpdateArgs,
+    cancel: CancellationToken,
+) -> Result<UpdateResult, ErrorBody> {
+    if args.from.is_some() && args.version.is_some() {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "meta.update accepts either `from` or `version`, not both.",
+        )
+        .with_hint("Pass `from` for a local binary or `version` for a GitHub release."));
+    }
+
     let current_exe = legion_core::validate_recorded_exe(current_exe)?;
     let macos_translated = detect_macos_rosetta(os, arch, cancel.clone()).await;
     let resolved = resolve_target_for(os, arch, macos_translated)?;
     let target = resolved.target;
     let note = resolved.note.map(str::to_owned);
+    let current_semver = SemVer::parse(current_version).ok();
+    let floor_path = node_floor_path(paths);
+
+    if let Some(from_raw) = args.from {
+        let local_bin = resolve_local_binary(paths, &from_raw)?;
+        verify_binary_matches_target(&local_bin, target)?;
+
+        if args.dry_run {
+            let (planned_version, planned_build) = if let Some(prober) = prober {
+                match prober.probe(&local_bin, cancel).await {
+                    Ok(parsed) => {
+                        let semver = SemVer::parse(&parsed.version)?;
+                        check_version_transition(
+                            &semver,
+                            current_semver.as_ref(),
+                            &floor_path,
+                            args.allow_downgrade,
+                        )?;
+                        (parsed.version, parsed.build)
+                    }
+                    Err(err) if err.code == ErrorCode::Cancelled => return Err(err),
+                    Err(_) => ("local".to_owned(), None),
+                }
+            } else {
+                ("local".to_owned(), None)
+            };
+            return Ok(UpdateResult {
+                previous_version: current_version.to_owned(),
+                installed_version: planned_version,
+                build: planned_build,
+                target: target.to_owned(),
+                path: current_exe.display().to_string(),
+                dry_run: true,
+                updated: false,
+                note,
+            });
+        }
+
+        let target_exe_stage = current_exe.clone();
+        let staged_guard = tokio::task::spawn_blocking(move || {
+            stage_executable_beside(&target_exe_stage, &local_bin)
+        })
+        .await
+        .map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Staging the legion binary stopped unexpectedly: {err}."),
+            )
+        })??;
+
+        let reported = match prober {
+            Some(prober) => prober.probe(&staged_guard.path, cancel.clone()).await?,
+            None => ParsedVersion {
+                version: "local".to_owned(),
+                build: None,
+            },
+        };
+        let desired_semver = if reported.version == "local" && prober.is_none() {
+            None
+        } else {
+            let semver = SemVer::parse(&reported.version)?;
+            check_version_transition(
+                &semver,
+                current_semver.as_ref(),
+                &floor_path,
+                args.allow_downgrade,
+            )?;
+            Some(semver)
+        };
+
+        let target_exe_commit = current_exe.clone();
+        tokio::task::spawn_blocking(move || {
+            commit_staged_executable(staged_guard, &target_exe_commit, rename_old_first)
+        })
+        .await
+        .map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Replacing the legion binary stopped unexpectedly: {err}."),
+            )
+        })??;
+
+        let installed = if let Some(prober) = prober {
+            match prober.probe(&current_exe, cancel).await {
+                Ok(parsed) if versions_match(&parsed.version, &reported.version) => ParsedVersion {
+                    version: parsed.version,
+                    build: parsed.build.or(reported.build),
+                },
+                Ok(parsed) => {
+                    let rollback_note =
+                        attempt_local_rollback(&current_exe, rename_old_first).await;
+                    return Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "Replaced {} with legion {}, but running it reported version {}.{rollback_note}",
+                            current_exe.display(),
+                            reported.version,
+                            parsed.version
+                        ),
+                    ));
+                }
+                Err(err) => {
+                    let rollback_note =
+                        attempt_local_rollback(&current_exe, rename_old_first).await;
+                    return Err(ErrorBody::new(
+                        err.code,
+                        format!(
+                            "Replaced {}, but the new binary did not run: {}{rollback_note}",
+                            current_exe.display(),
+                            err.message
+                        ),
+                    ));
+                }
+            }
+        } else {
+            reported
+        };
+
+        if let Some(semver) = desired_semver {
+            commit_floor(&floor_path, &semver, args.allow_downgrade)?;
+        }
+
+        return Ok(UpdateResult {
+            previous_version: current_version.to_owned(),
+            installed_version: installed.version,
+            build: installed.build,
+            target: target.to_owned(),
+            path: current_exe.display().to_string(),
+            dry_run: false,
+            updated: true,
+            note,
+        });
+    }
+
     let explicit_version = args.version.is_some();
     let desired_version = match args.version {
         Some(raw) => normalize_version(&raw)?,
         None => fetcher.latest_version(cancel.clone()).await?,
     };
     let desired_semver = SemVer::parse(&desired_version)?;
-    let current_semver = SemVer::parse(current_version).ok();
-    let floor_path = node_floor_path(paths);
 
     // When asking for "latest" and already at or above it, check only if a downgrade would happen:
     // if the node is newer than the highest published release, refuse a silent downgrade unless
@@ -1094,6 +1492,7 @@ async fn run_meta_update_with_key(
         return Ok(UpdateResult {
             previous_version: current_version.to_owned(),
             installed_version: desired_version,
+            build: None,
             target: target.to_owned(),
             path: current_exe.display().to_string(),
             dry_run: args.dry_run,
@@ -1113,6 +1512,7 @@ async fn run_meta_update_with_key(
         return Ok(UpdateResult {
             previous_version: current_version.to_owned(),
             installed_version: desired_version,
+            build: None,
             target: target.to_owned(),
             path: current_exe.display().to_string(),
             dry_run: true,
@@ -1146,8 +1546,21 @@ async fn run_meta_update_with_key(
         )
     })??;
 
-    if run_staged_preflight {
-        verify_staged_binary_version(&staged_guard.path, &desired_version, cancel).await?;
+    let mut installed_build = None;
+    if let Some(prober) = prober {
+        let reported = prober.probe(&staged_guard.path, cancel.clone()).await?;
+        if !versions_match(&reported.version, &desired_version) {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Staged binary {} reported version {}, expected {desired_version}.",
+                    staged_guard.path.display(),
+                    reported.version
+                ),
+            )
+            .with_hint("Nothing was replaced."));
+        }
+        installed_build = reported.build;
     }
 
     let target_exe_commit = current_exe.clone();
@@ -1162,17 +1575,67 @@ async fn run_meta_update_with_key(
         )
     })??;
 
+    if let Some(prober) = prober {
+        match prober.probe(&current_exe, cancel).await {
+            Ok(parsed) if versions_match(&parsed.version, &desired_version) => {
+                if parsed.build.is_some() {
+                    installed_build = parsed.build;
+                }
+            }
+            Ok(parsed) => {
+                let rollback_note = attempt_local_rollback(&current_exe, rename_old_first).await;
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Replaced {} with legion {desired_version}, but running it reported version {}.{rollback_note}",
+                        current_exe.display(),
+                        parsed.version
+                    ),
+                ));
+            }
+            Err(err) => {
+                let rollback_note = attempt_local_rollback(&current_exe, rename_old_first).await;
+                return Err(ErrorBody::new(
+                    err.code,
+                    format!(
+                        "Replaced {}, but the new binary did not run: {}{rollback_note}",
+                        current_exe.display(),
+                        err.message
+                    ),
+                ));
+            }
+        }
+    }
+
     commit_floor(&floor_path, &desired_semver, args.allow_downgrade)?;
 
     Ok(UpdateResult {
         previous_version: current_version.to_owned(),
         installed_version: desired_version,
+        build: installed_build,
         target: target.to_owned(),
         path: current_exe.display().to_string(),
         dry_run: false,
         updated: true,
         note,
     })
+}
+
+async fn attempt_local_rollback(target_exe: &Path, rename_old_first: bool) -> String {
+    let exe = target_exe.to_path_buf();
+    let prev_display = prev_binary_path(target_exe)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| format!("{}.prev", target_exe.display()));
+    match tokio::task::spawn_blocking(move || restore_prev_backup(&exe, rename_old_first)).await {
+        Ok(Ok(())) => {
+            format!(" The previous binary was automatically restored from {prev_display}.")
+        }
+        Ok(Err(err)) => format!(
+            " Automatic rollback from {prev_display} failed: {}",
+            err.message
+        ),
+        Err(err) => format!(" Automatic rollback from {prev_display} failed: {err}."),
+    }
 }
 
 fn curl_api_args(url: &str) -> [&str; 20] {
@@ -1577,6 +2040,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: None,
+                from: None,
                 dry_run: true,
                 allow_downgrade: false,
             },
@@ -1607,6 +2071,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: None,
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -1638,6 +2103,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -1707,6 +2173,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -1753,6 +2220,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -1781,6 +2249,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -1829,6 +2298,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: None,
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -1853,6 +2323,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: true,
             },
@@ -1914,6 +2385,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -1939,6 +2411,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.3.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -1968,6 +2441,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.3.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -2014,6 +2488,7 @@ mod tests {
             false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
+                from: None,
                 dry_run: false,
                 allow_downgrade: false,
             },
@@ -2097,5 +2572,338 @@ mod tests {
         assert_eq!(win_arm.arch, "x86_64");
         assert_eq!(win_arm.target, "x86_64-pc-windows-msvc");
         assert!(win_arm.note.unwrap().contains("emulation"));
+    }
+
+    struct ScriptedProber {
+        outcomes: std::sync::Mutex<std::collections::VecDeque<Result<ParsedVersion, ErrorBody>>>,
+    }
+
+    impl ScriptedProber {
+        fn new(outcomes: Vec<Result<ParsedVersion, ErrorBody>>) -> Self {
+            Self {
+                outcomes: std::sync::Mutex::new(outcomes.into()),
+            }
+        }
+    }
+
+    impl BinaryProber for ScriptedProber {
+        fn probe<'a>(
+            &'a self,
+            _binary: &'a Path,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>> {
+            Box::pin(async move {
+                self.outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| {
+                        Err(ErrorBody::new(ErrorCode::Internal, "unexpected probe call"))
+                    })
+            })
+        }
+    }
+
+    #[test]
+    fn parse_legion_version_accepts_old_and_new_forms() {
+        assert_eq!(
+            parse_legion_version_line("legion 0.1.0\n"),
+            Some(ParsedVersion {
+                version: "0.1.0".to_owned(),
+                build: None,
+            })
+        );
+        assert_eq!(
+            parse_legion_version_line("legion 0.1.0 (a59ec0d12345)\n"),
+            Some(ParsedVersion {
+                version: "0.1.0".to_owned(),
+                build: Some("a59ec0d12345".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_legion_version_line(
+                "MOTD banner\r\nlegion 0.2.0-rc.1 (a59ec0d12345, modified)\r\n"
+            ),
+            Some(ParsedVersion {
+                version: "0.2.0-rc.1".to_owned(),
+                build: Some("a59ec0d12345, modified".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_legion_version_output("legion 0.1.0 (a59ec0d12345, modified)\n").as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(parse_legion_version_line("not legion\n"), None);
+    }
+
+    #[tokio::test]
+    async fn meta_update_from_local_file_checks_format_downgrade_dry_run_and_rollback() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("home"));
+        let install_dir = dir.path().join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        let exe = install_dir.join("legion");
+        let original = b"original-legion-0.2.0".to_vec();
+        fs::write(&exe, &original).unwrap();
+
+        let target = "x86_64-unknown-linux-musl";
+        let mut local_bytes = crate::binfmt::synthetic_header_for_target(target);
+        local_bytes.extend_from_slice(b"local-legion-0.3.0");
+        let local_bin = dir.path().join("legion-local");
+        fs::write(&local_bin, &local_bytes).unwrap();
+
+        let fetcher = FakeFetcher::new("0.9.9", HashMap::new());
+
+        // 1. `from` and `version` together are invalid_args.
+        let both = run_meta_update_inner(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.2.0",
+            &exe,
+            false,
+            &RELEASE_PUBLIC_KEY,
+            None,
+            UpdateArgs {
+                version: Some("0.3.0".to_owned()),
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(both.code, ErrorCode::InvalidArgs);
+
+        // 2. Relative, missing, directory, and empty `from` paths are refused.
+        for (bad_path, expected_code) in [
+            ("relative/legion".to_owned(), ErrorCode::InvalidArgs),
+            (
+                dir.path().join("does-not-exist").display().to_string(),
+                ErrorCode::NotFound,
+            ),
+            (dir.path().display().to_string(), ErrorCode::InvalidArgs),
+        ] {
+            let err = run_meta_update_inner(
+                &paths,
+                &fetcher,
+                "linux",
+                "x86_64",
+                "0.2.0",
+                &exe,
+                false,
+                &RELEASE_PUBLIC_KEY,
+                None,
+                UpdateArgs {
+                    version: None,
+                    from: Some(bad_path),
+                    dry_run: false,
+                    allow_downgrade: false,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, expected_code);
+        }
+
+        // 3. Wrong architecture local binary is refused before staging.
+        let wrong_arch_bin = dir.path().join("legion-arm64");
+        fs::write(
+            &wrong_arch_bin,
+            crate::binfmt::synthetic_header_for_target("aarch64-unknown-linux-musl"),
+        )
+        .unwrap();
+        let wrong_arch_err = run_meta_update_inner(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.2.0",
+            &exe,
+            false,
+            &RELEASE_PUBLIC_KEY,
+            None,
+            UpdateArgs {
+                version: None,
+                from: Some(wrong_arch_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_arch_err.code, ErrorCode::InvalidArgs);
+        assert!(wrong_arch_err.message.contains("aarch64"));
+        assert_eq!(fs::read(&exe).unwrap(), original);
+
+        // 4. Dry run reports planned version and build without modifying exe, .prev, or downloads.
+        let parsed_030 = || ParsedVersion {
+            version: "0.3.0".to_owned(),
+            build: Some("a59ec0d12345".to_owned()),
+        };
+        let dry_prober = ScriptedProber::new(vec![Ok(parsed_030())]);
+        let dry = run_meta_update_inner(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.2.0",
+            &exe,
+            false,
+            &RELEASE_PUBLIC_KEY,
+            Some(&dry_prober),
+            UpdateArgs {
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: true,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(dry.dry_run && !dry.updated);
+        assert_eq!(dry.installed_version, "0.3.0");
+        assert_eq!(dry.build.as_deref(), Some("a59ec0d12345"));
+        assert_eq!(fetcher.download_count(), 0);
+        assert_eq!(fs::read(&exe).unwrap(), original);
+        assert!(!prev_binary_path(&exe).unwrap().exists());
+
+        // 5. Downgrade via `from` is refused unless `allow_downgrade` is set.
+        let down_prober = ScriptedProber::new(vec![Ok(ParsedVersion {
+            version: "0.1.0".to_owned(),
+            build: None,
+        })]);
+        let down_err = run_meta_update_inner(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.2.0",
+            &exe,
+            false,
+            &RELEASE_PUBLIC_KEY,
+            Some(&down_prober),
+            UpdateArgs {
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(down_err.code, ErrorCode::InvalidArgs);
+        assert_eq!(fs::read(&exe).unwrap(), original);
+
+        // 6. If the newly placed binary fails to run after swap, `.prev` is restored automatically.
+        let rollback_prober = ScriptedProber::new(vec![
+            Ok(parsed_030()),
+            Err(ErrorBody::new(
+                ErrorCode::Failed,
+                "exec failed after commit",
+            )),
+        ]);
+        let rollback_err = run_meta_update_inner(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.2.0",
+            &exe,
+            false,
+            &RELEASE_PUBLIC_KEY,
+            Some(&rollback_prober),
+            UpdateArgs {
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rollback_err.code, ErrorCode::Failed);
+        assert!(
+            rollback_err.message.contains("restored") && rollback_err.message.contains(".prev"),
+            "{}",
+            rollback_err.message
+        );
+        assert_eq!(fs::read(&exe).unwrap(), original);
+
+        // 7. Successful local install saves `.prev`, replaces `exe`, reports `build`, and commits
+        // the version floor.
+        let ok_prober = ScriptedProber::new(vec![Ok(parsed_030()), Ok(parsed_030())]);
+        let ok = run_meta_update_inner(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.2.0",
+            &exe,
+            false,
+            &RELEASE_PUBLIC_KEY,
+            Some(&ok_prober),
+            UpdateArgs {
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok.updated && !ok.dry_run);
+        assert_eq!(ok.previous_version, "0.2.0");
+        assert_eq!(ok.installed_version, "0.3.0");
+        assert_eq!(ok.build.as_deref(), Some("a59ec0d12345"));
+        assert_eq!(fetcher.download_count(), 0);
+        assert_eq!(fs::read(&exe).unwrap(), local_bytes);
+        assert_eq!(fs::read(prev_binary_path(&exe).unwrap()).unwrap(), original);
+        assert_eq!(
+            crate::floor::read_floor(&node_floor_path(&paths)),
+            crate::floor::FloorState::Recorded(SemVer::parse("0.3.0").unwrap())
+        );
+
+        // 8. Downgrade below the recorded floor with `from` succeeds when `allow_downgrade=true`.
+        let parsed_010 = || ParsedVersion {
+            version: "0.1.0".to_owned(),
+            build: None,
+        };
+        let allow_prober = ScriptedProber::new(vec![Ok(parsed_010()), Ok(parsed_010())]);
+        let downgraded = run_meta_update_inner(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.3.0",
+            &exe,
+            false,
+            &RELEASE_PUBLIC_KEY,
+            Some(&allow_prober),
+            UpdateArgs {
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: true,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(downgraded.updated);
+        assert_eq!(downgraded.installed_version, "0.1.0");
+        assert_eq!(downgraded.build, None);
+        assert_eq!(
+            crate::floor::read_floor(&node_floor_path(&paths)),
+            crate::floor::FloorState::Recorded(SemVer::parse("0.1.0").unwrap())
+        );
     }
 }

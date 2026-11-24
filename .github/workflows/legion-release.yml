@@ -159,6 +159,8 @@ jobs:
       - name: Build release binary (zigbuild)
         if: matrix.use_zigbuild
         shell: bash
+        env:
+          LEGION_BUILD_REV: ${{ github.sha }}
         run: |
           set -euo pipefail
           cargo zigbuild --release --locked --target "${{ matrix.target }}" -p legion-cli
@@ -168,6 +170,7 @@ jobs:
         env:
           # Statically link the MSVC C runtime so target Windows machines need no VC++ redistributable.
           RUSTFLAGS: -C target-feature=+crt-static
+          LEGION_BUILD_REV: ${{ github.sha }}
         run: |
           set -euo pipefail
           cargo build --release --locked --target "${{ matrix.target }}" -p legion-cli
@@ -176,6 +179,7 @@ jobs:
         shell: bash
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
+          LEGION_BUILD_REV: ${{ github.sha }}
         run: |
           set -euo pipefail
           cargo build --release --locked --target "${{ matrix.target }}" -p legion-cli
