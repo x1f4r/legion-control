@@ -306,6 +306,26 @@ pub(crate) fn sanitize_scope_prefix(raw: &str) -> String {
     out
 }
 
+/// Return `true` when `systemd-run --help` advertises `--expand-environment`.
+#[allow(dead_code)]
+pub(crate) fn systemd_help_supports_expand_env_no(help: &str) -> bool {
+    help.contains("--expand-environment")
+}
+
+/// Parse the leading major version number from `systemd-run --version` (for example
+/// `"systemd 255 (255.4-1ubuntu8)"` -> `Some(255)`).
+#[allow(dead_code)]
+pub(crate) fn parse_systemd_major_version(output: &str) -> Option<u32> {
+    let first_line = output.lines().next()?.trim();
+    let rest = first_line.strip_prefix("systemd")?.trim_start();
+    let token = rest.split_ascii_whitespace().next()?;
+    let digits: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok()
+}
+
 /// Parse the `populated` flag (`0` or `1`) from a Linux cgroup v2 `cgroup.events` file.
 #[allow(dead_code)]
 pub(crate) fn parse_cgroup_events_populated(contents: &str) -> Option<bool> {
@@ -1289,6 +1309,20 @@ mod tests {
             Some(false)
         );
         assert_eq!(parse_cgroup_events_populated("frozen 0\n"), None);
+
+        assert!(systemd_help_supports_expand_env_no(
+            "  --expand-environment=BOOL  Control expansion\n"
+        ));
+        assert!(!systemd_help_supports_expand_env_no("  --scope\n"));
+        assert_eq!(
+            parse_systemd_major_version("systemd 262 (262.1-1-arch)\n+PAM\n"),
+            Some(262)
+        );
+        assert_eq!(
+            parse_systemd_major_version("systemd 254~rc1 (254)\n"),
+            Some(254)
+        );
+        assert_eq!(parse_systemd_major_version("unknown"), None);
     }
 
     #[tokio::test]

@@ -91,6 +91,9 @@ fn main() -> ExitCode {
             "detach_duplicate_names_get_distinct_scopes_and_isolate_stop",
             || Box::pin(test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop()),
         ),
+        ("detach_preserves_dollar_signs_in_argv_and_shell", || {
+            Box::pin(test_detach_preserves_dollar_signs_in_argv_and_shell())
+        }),
         (
             "detach_does_not_inherit_extra_open_file_descriptors",
             || Box::pin(test_detach_does_not_inherit_extra_open_file_descriptors()),
@@ -202,6 +205,7 @@ fn run_helper(mode: &str) -> ExitCode {
         "report_open_fds" => helper_report_open_fds(&args),
         "env_remove_driver" => helper_env_remove_driver(&args),
         "dump_env_vars" => helper_dump_env_vars(&args),
+        "dump_argv" => helper_dump_argv(&args),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -669,6 +673,14 @@ fn helper_dump_env_vars(_args: &[String]) -> ExitCode {
         println!("{key}={val}");
     }
     let _ = io::stdout().flush();
+    ExitCode::SUCCESS
+}
+
+fn helper_dump_argv(args: &[String]) -> ExitCode {
+    let out_file = Path::new(&args[0]);
+    let joined = args[1..].join("\n") + "\n";
+    write_atomic(out_file, joined.as_bytes(), WriteOptions::default())
+        .expect("failed to write argv dump");
     ExitCode::SUCCESS
 }
 
@@ -1284,6 +1296,60 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
         .unwrap();
     assert!(r1.all_gone);
     assert!(!procid::is_alive(&h1.process));
+}
+
+async fn test_detach_preserves_dollar_signs_in_argv_and_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv_out = dir.path().join("argv-dollars.txt");
+    let argv_out_str = argv_out.to_string_lossy().into_owned();
+
+    // 1. Exact argv with `$$`, `$HOME`, `${X}`, and a lone `$`.
+    let (spec, env_vars) = helper_spec("dump_argv", &[&argv_out_str, "$$", "$HOME", "${X}", "$"]);
+    let handle = spawn_detached(
+        DetachOptions::new(spec)
+            .name("dollar-argv")
+            .envs(env_vars)
+            .env("X", "must-not-expand"),
+    )
+    .await
+    .unwrap();
+
+    let got = wait_for_detached_file(&argv_out, Duration::from_secs(5), &handle, &[]).await;
+    let lines: Vec<&str> = got.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["$$", "$HOME", "${X}", "$"],
+        "systemd-run or launcher rewrote `$` arguments: {lines:?}"
+    );
+
+    // 2. Shell command containing `$$`, `$HOME`, `${X}`, and a lone `$` in single quotes.
+    #[cfg(unix)]
+    {
+        let shell_out = dir.path().join("shell-dollars.txt");
+        let shell_handle = spawn_detached(
+            DetachOptions::new(CommandSpec::shell(
+                "printf '%s|%s|%s|%s\\n' '$$' '$HOME' '${X}' '$'",
+            ))
+            .name("dollar-shell")
+            .env("X", "must-not-expand")
+            .stdout_path(&shell_out),
+        )
+        .await
+        .unwrap();
+
+        let shell_text = wait_for_detached_file(
+            &shell_out,
+            Duration::from_secs(5),
+            &shell_handle,
+            &[&shell_out],
+        )
+        .await;
+        assert_eq!(
+            shell_text.trim(),
+            "$$|$HOME|${X}|$",
+            "systemd-run corrupted `$` inside shell command string"
+        );
+    }
 }
 
 async fn test_detach_does_not_inherit_extra_open_file_descriptors() {

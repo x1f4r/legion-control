@@ -11,6 +11,8 @@
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use process_wrap::std::{CommandWrap, ProcessSession};
@@ -25,6 +27,9 @@ use super::{DetachHandle, DetachOptions, ScopeProbeOverride, open_append_stdio};
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_USER_SCOPE_ARGS: &[&str] = &["--user", "--scope", "--quiet", "--collect"];
+
+#[cfg(target_os = "linux")]
+static SYSTEMD_SUPPORTS_EXPAND_ENV_NO: OnceLock<bool> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_CMD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -162,6 +167,7 @@ pub(super) async fn spawn_detached(
         {
             let (unit_stem, full_unit) = super::resolve_scope_unit_name(options.name.as_deref())?;
             let unit_arg = format!("--unit={unit_stem}");
+            let expand_env_no = systemd_supports_expand_env_no().await;
             let pipe_systemd_stderr = options.stderr_path.is_none();
             let scope_stderr = if pipe_systemd_stderr {
                 Stdio::piped()
@@ -170,6 +176,11 @@ pub(super) async fn spawn_detached(
             };
             let wrap = CommandWrap::with_new("systemd-run", |cmd| {
                 cmd.args(SYSTEMD_USER_SCOPE_ARGS);
+                if expand_env_no {
+                    // Systemd >= 254 expands `$VAR`, `${VAR}`, and `$$` in target argv by default;
+                    // disable expansion so literal arguments and shell scripts arrive untouched.
+                    cmd.arg("--expand-environment=no");
+                }
                 cmd.arg(&unit_arg);
                 cmd.arg("--");
                 if pipe_systemd_stderr {
@@ -805,6 +816,50 @@ mod close_fds {
             None
         }
     }
+}
+
+/// Detect once whether `systemd-run` supports `--expand-environment=no` (added in systemd 254;
+/// older systemd versions do not expand `$` in `--scope` target argv).
+#[cfg(target_os = "linux")]
+async fn systemd_supports_expand_env_no() -> bool {
+    if let Some(&cached) = SYSTEMD_SUPPORTS_EXPAND_ENV_NO.get() {
+        return cached;
+    }
+
+    let mut supported = false;
+    let mut help_cmd = tokio::process::Command::new("systemd-run");
+    help_cmd
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Ok(Ok(output)) = tokio::time::timeout(SYSTEMD_CMD_TIMEOUT, help_cmd.output()).await
+        && output.status.success()
+        && super::systemd_help_supports_expand_env_no(&String::from_utf8_lossy(&output.stdout))
+    {
+        supported = true;
+    }
+
+    if !supported {
+        let mut ver_cmd = tokio::process::Command::new("systemd-run");
+        ver_cmd
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if let Ok(Ok(output)) = tokio::time::timeout(SYSTEMD_CMD_TIMEOUT, ver_cmd.output()).await
+            && output.status.success()
+            && super::parse_systemd_major_version(&String::from_utf8_lossy(&output.stdout))
+                .is_some_and(|major| major >= 254)
+        {
+            supported = true;
+        }
+    }
+
+    let _ = SYSTEMD_SUPPORTS_EXPAND_ENV_NO.set(supported);
+    supported
 }
 
 #[cfg(target_os = "linux")]
