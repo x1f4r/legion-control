@@ -42,19 +42,21 @@ class MainActivity : TauriActivity() {
   }
 
   @Volatile
-  private var latestInsets: InsetValues = InsetValues(0f, 0f, 0f, 0f)
+  private var latestInsets: InsetValues = InsetValues(0f, 0f, 0f, 0f, 0f)
 
   private data class InsetValues(
     val top: Float,
     val right: Float,
     val bottom: Float,
     val left: Float,
+    val imeBottom: Float,
   ) {
     fun toJsonArray(): JSONArray = JSONArray().apply {
       put(top.toDouble())
       put(right.toDouble())
       put(bottom.toDouble())
       put(left.toDouble())
+      put(imeBottom.toDouble())
     }
   }
 
@@ -126,12 +128,14 @@ class MainActivity : TauriActivity() {
       val bars = windowInsets.getInsets(
         WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
       )
+      val ime = windowInsets.getInsets(WindowInsetsCompat.Type.ime())
       val density = view.resources.displayMetrics.density.coerceAtLeast(1f)
       latestInsets = InsetValues(
         top = bars.top / density,
         right = bars.right / density,
         bottom = bars.bottom / density,
         left = bars.left / density,
+        imeBottom = ime.bottom / density,
       )
       pushInsetsToWebView()
       windowInsets
@@ -249,7 +253,7 @@ class MainActivity : TauriActivity() {
         var pending = {};
 
         function applyInsets(values){
-          if (!Array.isArray(values) || values.length !== 4) return;
+          if (!Array.isArray(values) || values.length < 4) return;
           cachedInsets = values;
           var r = document.documentElement;
           if (!r) return;
@@ -257,6 +261,7 @@ class MainActivity : TauriActivity() {
           r.style.setProperty('--safe-area-inset-right', Number(values[1]).toFixed(2) + 'px');
           r.style.setProperty('--safe-area-inset-bottom', Number(values[2]).toFixed(2) + 'px');
           r.style.setProperty('--safe-area-inset-left', Number(values[3]).toFixed(2) + 'px');
+          r.style.setProperty('--ime-inset-bottom', Number(values[4] || 0).toFixed(2) + 'px');
           window.dispatchEvent(new Event('legion-insets'));
         }
 
