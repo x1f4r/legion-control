@@ -711,6 +711,7 @@ dependencies = [
 name = "legion-net"
 version = "0.1.0"
 dependencies = [
+ "jiff",
  "legion-core",
  "legion-os",
  "legion-proto",
@@ -722,6 +723,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "toml_edit",
 ]
 
