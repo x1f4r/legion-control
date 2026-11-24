@@ -177,6 +177,26 @@ fn parse_prefixed_u64(value: &str, prefix: &str) -> Option<u64> {
     rest.parse::<u64>().ok()
 }
 
+/// Return `Some(reason)` if `identity` refers to a protected process that callers should refuse to
+/// terminate, or `None` otherwise.
+///
+/// Always protects:
+/// - PID 0 and the current process
+/// - Any ancestor of the current process (walking the parent chain up to the root)
+/// - **Unix:** PID 1 (`init` / `systemd` / `launchd`)
+/// - **Windows:** PID 4 (`System`), any process marked critical by the kernel
+///   (`IsProcessCritical`), and core session processes (`csrss`, `wininit`, `smss`, `lsass`,
+///   `services`, `winlogon`)
+pub fn is_protected(identity: &ProcessId) -> Option<&'static str> {
+    if identity.pid == 0 {
+        return Some("kernel / idle process (pid 0)");
+    }
+    if identity.pid == std::process::id() {
+        return Some("current process");
+    }
+    is_protected_impl(identity)
+}
+
 /// Stop a single verified process without signaling its process group or walking descendants.
 ///
 /// Returns `Ok(true)` once the exact process identified by `identity` is no longer alive
@@ -255,6 +275,16 @@ fn read_boot_id_impl() -> Result<String> {
 }
 
 #[cfg(any(unix, windows))]
+fn is_protected_impl(identity: &ProcessId) -> Option<&'static str> {
+    platform::is_protected(identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_protected_impl(_identity: &ProcessId) -> Option<&'static str> {
+    None
+}
+
+#[cfg(any(unix, windows))]
 async fn kill_process_impl(identity: &ProcessId, force: bool, grace: Duration) -> Result<bool> {
     platform::kill_process(identity, force, grace).await
 }
@@ -289,19 +319,44 @@ pub(crate) const fn unbiased_windows_boot_ticks(boot_time: i64, boot_time_bias: 
     (boot_time as u64).wrapping_sub(boot_time_bias)
 }
 
-/// Parse `(state, start_ticks)` from a Linux `/proc/<pid>/stat` line.
+/// Return `true` when `image_path` names one of the Windows core session executables that must
+/// never be terminated (`csrss`, `wininit`, `smss`, `lsass`, `services`, `winlogon`).
+#[allow(dead_code)]
+pub(crate) fn is_windows_core_session_image(image_path: &str) -> bool {
+    let file_name = image_path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(image_path)
+        .trim();
+    let lower = file_name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    matches!(
+        stem,
+        "csrss" | "wininit" | "smss" | "lsass" | "services" | "winlogon"
+    )
+}
+
+/// Parse `(state, ppid, start_ticks)` from a Linux `/proc/<pid>/stat` line.
 ///
 /// The command name in field 2 is wrapped in parentheses and may itself contain spaces and
-/// parentheses, so parsing anchors at the last `)` before reading field 3 (`state`) and
-/// field 22 (`starttime`).
+/// parentheses, so parsing anchors at the last `)` before reading field 3 (`state`), field 4
+/// (`ppid`), and field 22 (`starttime`).
 #[allow(dead_code)]
-pub(crate) fn parse_linux_proc_stat(contents: &str) -> Option<(char, u64)> {
+pub(crate) fn parse_linux_proc_stat_full(contents: &str) -> Option<(char, u32, u64)> {
     let close = contents.rfind(')')?;
     let rest = contents.get(close + 1..)?.trim_start();
     let mut fields = rest.split_ascii_whitespace();
     let state = fields.next()?.chars().next()?;
-    // Field 3 (index 0) was consumed above; field 22 is index 19, which is 18 skips further.
-    let start_ticks = fields.nth(18)?.parse::<u64>().ok()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    // Fields 3 and 4 (indices 0 and 1) were consumed above; field 22 is index 19, which is 17 skips further.
+    let start_ticks = fields.nth(17)?.parse::<u64>().ok()?;
+    Some((state, ppid, start_ticks))
+}
+
+/// Parse `(state, start_ticks)` from a Linux `/proc/<pid>/stat` line.
+#[allow(dead_code)]
+pub(crate) fn parse_linux_proc_stat(contents: &str) -> Option<(char, u64)> {
+    let (state, _ppid, start_ticks) = parse_linux_proc_stat_full(contents)?;
     Some((state, start_ticks))
 }
 
@@ -423,13 +478,60 @@ mod tests {
 
     #[test]
     fn parse_linux_proc_stat_handles_parens_and_spaces_in_comm() {
-        let line = "12345 (my (weird) proc) S 1 12345 12345 0 -1 4194304 100 0 0 0 10 5 0 0 20 0 1 0 987654321 1024 50";
+        let line = "12345 (my (weird) proc) S 777 12345 12345 0 -1 4194304 100 0 0 0 10 5 0 0 20 0 1 0 987654321 1024 50";
         assert_eq!(parse_linux_proc_stat(line), Some(('S', 987_654_321)));
+        assert_eq!(
+            parse_linux_proc_stat_full(line),
+            Some(('S', 777, 987_654_321))
+        );
 
         let zombie = "99 (defunct) Z 1 99 99 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 42 0 0";
         assert_eq!(parse_linux_proc_stat(zombie), Some(('Z', 42)));
 
         assert_eq!(parse_linux_proc_stat("malformed"), None);
+    }
+
+    #[test]
+    fn is_protected_identifies_self_ancestors_and_core_system_processes() {
+        let me = current().unwrap();
+        assert!(is_protected(&me).is_some());
+        assert!(is_protected(&ProcessId::new(0, 1)).is_some());
+
+        #[cfg(unix)]
+        {
+            assert!(is_protected(&ProcessId::new(1, 1)).is_some());
+            // Walk up to our immediate parent and confirm it is protected when alive.
+            let ppid = nix::unistd::getppid().as_raw() as u32;
+            if let Ok(Some(parent_id)) = of_pid(ppid) {
+                assert!(
+                    is_protected(&parent_id).is_some(),
+                    "parent process {parent_id} should be protected"
+                );
+            }
+        }
+
+        // Non-existent high PID is not protected.
+        assert!(is_protected(&ProcessId::new(i32::MAX as u32, 1)).is_none());
+
+        // Windows core session image matcher (platform-independent helper).
+        for path in [
+            r"C:\Windows\System32\csrss.exe",
+            r"C:\Windows\System32\WININIT.EXE",
+            "smss.exe",
+            r"\SystemRoot\System32\lsass.exe",
+            "services.exe",
+            "winlogon",
+        ] {
+            assert!(is_windows_core_session_image(path), "expected {path}");
+        }
+        for path in [
+            r"C:\Users\me\worker.exe",
+            "lsass_helper.exe",
+            "my-services.exe",
+            "",
+        ] {
+            assert!(!is_windows_core_session_image(path), "unexpected {path}");
+        }
     }
 
     #[test]

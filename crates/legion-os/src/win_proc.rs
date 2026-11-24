@@ -22,9 +22,11 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_BASIC_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    GetExitCodeProcess, GetProcessTimes, IsProcessCritical, OpenProcess, PROCESS_BASIC_INFORMATION,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess,
 };
+use windows::core::{BOOL, PWSTR};
 
 use crate::procid::ProcessId;
 use crate::{OsError, Result};
@@ -381,6 +383,96 @@ pub(crate) fn snapshot_processes() -> Result<Vec<ProcessSnapshotEntry>> {
     }
 
     Ok(out)
+}
+
+/// Check whether a verified Windows process is marked critical by the kernel (`IsProcessCritical`)
+/// or belongs to the core Windows session executable set (`csrss`, `wininit`, `smss`, `lsass`,
+/// `services`, `winlogon`).
+pub(crate) fn check_protected_system_process(identity: &ProcessId) -> Option<&'static str> {
+    // SAFETY: `OpenProcess` takes plain integer arguments and the returned handle is immediately
+    // wrapped in `OwnedHandle`.
+    let handle =
+        match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, identity.pid) } {
+            Ok(h) => OwnedHandle(h),
+            Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                // Protected Process Light (PPL) system processes such as csrss/smss/lsass can refuse
+                // OpenProcess for unprivileged callers; fall back to ToolHelp32's image name.
+                if let Some(exe_name) = snapshot_exe_name(identity.pid)
+                    && crate::procid::is_windows_core_session_image(&exe_name)
+                {
+                    return Some("Windows core session process");
+                }
+                return None;
+            }
+            Err(_) => return None,
+        };
+
+    let Ok((creation, exit_ft)) = query_times_raw(handle.0, &format!("pid {}", identity.pid))
+    else {
+        return None;
+    };
+    if !is_still_running(handle.0, exit_ft) || creation != identity.start_time {
+        return None;
+    }
+
+    let mut critical = BOOL::default();
+    // SAFETY: `handle.0` has `PROCESS_QUERY_LIMITED_INFORMATION` (the minimum right required by
+    // `IsProcessCritical`) and `critical` is a valid mutable `BOOL`.
+    if unsafe { IsProcessCritical(handle.0, &mut critical) }.is_ok() && critical.as_bool() {
+        return Some("Windows critical system process");
+    }
+
+    if let Some(image_path) = query_image_name_raw(handle.0)
+        && crate::procid::is_windows_core_session_image(&image_path)
+    {
+        return Some("Windows core session process");
+    }
+
+    None
+}
+
+fn query_image_name_raw(handle: HANDLE) -> Option<String> {
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION`, `buf` has capacity `len` UTF-16
+    // code units, and `QueryFullProcessImageNameW` writes at most `len` units and updates `len`.
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR::from_raw(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    let slice = buf.get(..(len as usize))?;
+    Some(String::from_utf16_lossy(slice))
+}
+
+fn snapshot_exe_name(target_pid: u32) -> Option<String> {
+    // SAFETY: `CreateToolhelp32Snapshot` takes plain integer arguments and returns an owned handle.
+    let snapshot = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `snapshot.0` is valid and `entry.dwSize` is initialized to `size_of::<PROCESSENTRY32W>()`.
+    unsafe { Process32FirstW(snapshot.0, &mut entry) }.ok()?;
+    loop {
+        if entry.th32ProcessID == target_pid {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            return Some(String::from_utf16_lossy(&entry.szExeFile[..end]));
+        }
+        // SAFETY: `snapshot.0` is valid and `entry` remains properly sized.
+        if unsafe { Process32NextW(snapshot.0, &mut entry) }.is_err() {
+            break;
+        }
+    }
+    None
 }
 
 /// Open `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verify its

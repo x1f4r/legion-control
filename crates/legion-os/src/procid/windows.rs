@@ -15,6 +15,56 @@ use super::{KillTreeReport, ProcessId, is_alive};
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_WALK_PASSES: usize = 8;
+const MAX_ANCESTOR_HOPS: usize = 256;
+
+pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
+    if identity.pid == 4 {
+        return Some("Windows System process (pid 4)");
+    }
+    if is_ancestor_of_current(identity) {
+        return Some("ancestor of current process");
+    }
+    win_proc::check_protected_system_process(identity)
+}
+
+fn is_ancestor_of_current(identity: &ProcessId) -> bool {
+    let own_pid = std::process::id();
+    let OpenPinnedOutcome::Pinned(self_proc) = win_proc::open_pinned(own_pid, false) else {
+        return false;
+    };
+    let mut parent_pid = self_proc.parent_pid;
+    let mut child_start = self_proc.id.start_time;
+    drop(self_proc);
+
+    let mut seen = HashSet::new();
+    seen.insert(own_pid);
+
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if parent_pid == 0 || parent_pid == 4 || !seen.insert(parent_pid) {
+            break;
+        }
+        match win_proc::open_pinned(parent_pid, false) {
+            OpenPinnedOutcome::Pinned(parent_proc) => {
+                // Stop if `parent_pid` has been recycled by a process newer than its child.
+                if parent_proc.id.start_time > child_start {
+                    break;
+                }
+                if parent_proc.id.pid == identity.pid
+                    && parent_proc.id.start_time == identity.start_time
+                {
+                    return true;
+                }
+                child_start = parent_proc.id.start_time;
+                parent_pid = parent_proc.parent_pid;
+            }
+            OpenPinnedOutcome::AccessDenied => {
+                return parent_pid == identity.pid;
+            }
+            OpenPinnedOutcome::Gone | OpenPinnedOutcome::Failed => break,
+        }
+    }
+    false
+}
 
 pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
     win_proc::query_process_identity(pid, include_zombie)

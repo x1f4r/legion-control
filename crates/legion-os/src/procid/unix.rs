@@ -14,6 +14,121 @@ use super::{KillTreeReport, ProcessId, is_alive};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_ANCESTOR_HOPS: usize = 256;
+
+pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
+    if identity.pid == 1 {
+        return Some("init process (pid 1)");
+    }
+    if is_ancestor_of_current(identity) {
+        return Some("ancestor of current process");
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_and_start(pid: u32) -> Option<(u32, u64)> {
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (state, ppid, start_ticks) = super::parse_linux_proc_stat_full(&contents)?;
+    if matches!(state, 'Z' | 'X' | 'x') {
+        return None;
+    }
+    Some((ppid, start_ticks))
+}
+
+#[cfg(target_os = "linux")]
+fn is_ancestor_of_current(identity: &ProcessId) -> bool {
+    let Some((mut parent_pid, mut child_start)) = linux_parent_and_start(std::process::id()) else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    seen.insert(std::process::id());
+
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        match linux_parent_and_start(parent_pid) {
+            Some((next_ppid, parent_start)) => {
+                // A genuine ancestor cannot have started after its child.
+                if parent_start > child_start {
+                    break;
+                }
+                if parent_pid == identity.pid && parent_start == identity.start_time {
+                    return true;
+                }
+                child_start = parent_start;
+                parent_pid = next_ppid;
+            }
+            None => {
+                // Under Linux `hidepid`, reading a privileged ancestor's `/proc/<pid>/stat` can
+                // fail even though our own `ppid` revealed it; err on the side of protecting it.
+                return parent_pid == identity.pid;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn is_ancestor_of_current(identity: &ProcessId) -> bool {
+    let Some((mut parent_pid, mut child_start)) = macos_proc::parent_and_start(std::process::id())
+    else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    seen.insert(std::process::id());
+
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        match macos_proc::parent_and_start(parent_pid) {
+            Some((next_ppid, parent_start)) => {
+                if parent_start > child_start {
+                    break;
+                }
+                if parent_pid == identity.pid && parent_start == identity.start_time {
+                    return true;
+                }
+                child_start = parent_start;
+                parent_pid = next_ppid;
+            }
+            None => return parent_pid == identity.pid,
+        }
+    }
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_ancestor_of_current(identity: &ProcessId) -> bool {
+    let Ok(mut system) = System::new() else {
+        return false;
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    let mut cur = sysinfo::Pid::from_u32(std::process::id());
+    let mut seen = HashSet::new();
+    seen.insert(cur.as_u32());
+
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        let Some(parent) = system.process(cur).and_then(|p| p.parent()) else {
+            break;
+        };
+        let parent_pid = parent.as_u32();
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        if parent_pid == identity.pid {
+            return match super::of_pid(parent_pid) {
+                Ok(Some(observed)) => identity.matches(&observed),
+                _ => true,
+            };
+        }
+        cur = parent;
+    }
+    false
+}
 
 #[cfg(target_os = "linux")]
 pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
@@ -94,6 +209,34 @@ mod macos_proc {
             return Ok(None);
         }
         Ok(Some(ProcessId::new(pid, start_us)))
+    }
+
+    pub(super) fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
+        let raw_pid = i32::try_from(pid).ok()?;
+        // SAFETY: `libc::proc_bsdinfo` is a plain C struct safe to zero-initialize; `proc_pidinfo`
+        // writes at most `size_of::<libc::proc_bsdinfo>()` bytes into `info`.
+        let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+        let expected = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                raw_pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                expected,
+            )
+        };
+        if written != expected || info.pbi_status == SZOMB {
+            return None;
+        }
+        let start_us = info
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec);
+        if start_us == 0 {
+            return None;
+        }
+        Some((info.pbi_ppid, start_us))
     }
 }
 

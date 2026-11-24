@@ -1070,6 +1070,14 @@ async fn test_procid_kill_process_stops_only_verified_target_and_respects_force(
         parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(5)).await);
     assert!(procid::is_alive(&parent_id));
     assert!(procid::is_alive(&grandchild_id));
+    assert!(
+        procid::is_protected(&parent_id).is_none(),
+        "ordinary child process {parent_id} must not be marked protected"
+    );
+    assert!(
+        procid::is_protected(&grandchild_id).is_none(),
+        "ordinary grandchild process {grandchild_id} must not be marked protected"
+    );
 
     let mismatched = ProcessId::new(parent_id.pid, parent_id.start_time.wrapping_add(7));
     assert!(
