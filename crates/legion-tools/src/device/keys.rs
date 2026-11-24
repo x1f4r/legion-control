@@ -398,7 +398,7 @@ fn looks_like_second_key_token(token: &str) -> bool {
 pub struct ResolvedHostKeys {
     /// Ordered public host keys (`"<type> <base64>"`).
     pub keys: Vec<String>,
-    /// Source label: `"configured"`, `"ssh-keyscan+files"`, `"ssh-keyscan"`, or `"files"`.
+    /// Source label: `"configured"`, `"ssh-keyscan+files"`, `"ssh-keyscan only"`, or `"files"`.
     pub source: String,
 }
 
@@ -412,8 +412,8 @@ pub struct ResolvedHostKeys {
 ///   - When both sources return keys, pins only keys present in both (`source =
 ///     "ssh-keyscan+files"`); if the intersection is empty, refuses so a non-privileged listener on
 ///     a loopback port cannot substitute its own host key, and hints to set `[devices] host_keys`.
-///   - Uses `ssh-keyscan` alone (`source = "ssh-keyscan"`) only when no default host-key files can
-///     be read.
+///   - Uses `ssh-keyscan` alone (`source = "ssh-keyscan only"`) only when no default host-key files
+///     can be read.
 ///   - Uses the default host-key files alone (`source = "files"`) when `ssh-keyscan` yields no
 ///     keys.
 pub async fn resolve_host_keys(
@@ -493,7 +493,7 @@ pub fn choose_auto_host_keys(
             }
             Ok(Some(ResolvedHostKeys {
                 keys: selected,
-                source: "ssh-keyscan".to_owned(),
+                source: "ssh-keyscan only".to_owned(),
             }))
         }
         (true, false) => {
@@ -949,7 +949,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(scan_only.keys, vec![ed.clone()]);
-        assert_eq!(scan_only.source, "ssh-keyscan");
+        assert_eq!(scan_only.source, "ssh-keyscan only");
 
         // Files alone when scan yields nothing.
         let files_only = choose_auto_host_keys(Vec::new(), vec![ed.clone()])

@@ -1050,7 +1050,7 @@ fn device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_ba
             invite_run.stdout, invite_run.stderr
         );
         let json = invite_run.json();
-        assert_eq!(json["host_keys_source"], json!("ssh-keyscan"));
+        assert_eq!(json["host_keys_source"], json!("ssh-keyscan only"));
         assert_eq!(json["host_keys"], json!([sshd.host_key_line()]));
         json
     };

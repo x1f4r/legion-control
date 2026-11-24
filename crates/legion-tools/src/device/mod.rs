@@ -133,8 +133,8 @@ pub struct InviteResult {
     pub user: String,
     /// Pinned SSH public host keys in the invite.
     pub host_keys: Vec<String>,
-    /// Where the pinned host keys came from (`configured`, `ssh-keyscan+files`, `ssh-keyscan`, or
-    /// `files`).
+    /// Where the pinned host keys came from (`configured`, `ssh-keyscan+files`, `ssh-keyscan only`,
+    /// or `files`).
     pub host_keys_source: String,
 }
 

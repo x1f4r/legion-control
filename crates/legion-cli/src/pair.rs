@@ -107,6 +107,10 @@ pub fn format_human(
     let role = field("role")?;
     let node = field("node")?;
     let expires = field("expires")?;
+    let keyscan_only = result
+        .get("host_keys_source")
+        .and_then(Value::as_str)
+        .is_some_and(|src| src == "ssh-keyscan only");
 
     let qr = render_qr(invite, invert)?;
     let on_flag = match on_machine {
@@ -120,6 +124,17 @@ pub fn format_human(
         "Device will act as {principal} (role: {role}) on {node}."
     );
     let _ = writeln!(text, "Invite valid until {expires} (single use).");
+    if keyscan_only {
+        text.push('\n');
+        let _ = writeln!(
+            text,
+            "Warning: host keys came from ssh-keyscan only because default sshd host-key files could not be read."
+        );
+        let _ = writeln!(
+            text,
+            "         Set [devices] host_keys in node.toml to pin host-key files explicitly if another local process could listen on this port."
+        );
+    }
     text.push('\n');
     text.push_str(&qr);
     text.push_str("\n\n");
@@ -211,5 +226,25 @@ mod tests {
         assert!(output.contains("legion-invite-1.eyJ2IjoxfQ"));
         assert!(output.contains("legion device.list"));
         assert!(output.contains("legion device.remove"));
+        assert!(!output.contains("Warning:"));
+
+        // When host keys come from ssh-keyscan alone, human output emits a prominent warning.
+        let warned = format_human(
+            &json!({
+                "invite": "legion-invite-1.eyJ2IjoxfQ",
+                "node": "tower",
+                "principal": "phone",
+                "role": "observer",
+                "expires": "2026-11-24T12:15:00Z",
+                "host_keys_source": "ssh-keyscan only"
+            }),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            warned.contains("Warning:") && warned.contains("ssh-keyscan only"),
+            "expected prominent ssh-keyscan only warning, got:\n{warned}"
+        );
     }
 }
