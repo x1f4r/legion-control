@@ -223,12 +223,7 @@ impl McpDoor {
         let tool = self.catalog.resolve(name);
         self.run(tool, Value::Object(args), on, context)
             .await
-            .map_err(|error| match error.code {
-                ErrorCode::UnknownTool => error.with_hint(
-                    "tools/list shows the tools here. Their names have an underscore where Legion's have a dot, such as meta_whoami for meta.whoami.",
-                ),
-                _ => error,
-            })
+            .map_err(|error| self.for_client(error, tool))
     }
 
     /// A call to one of the three tools compact mode serves.
@@ -267,10 +262,7 @@ impl McpDoor {
                 let on = self.on(args.on)?;
                 self.run(tool, tool_args, on, context)
                     .await
-                    .map_err(|error| match error.code {
-                        ErrorCode::UnknownTool => error.with_hint(LIST_COMPACT),
-                        _ => error,
-                    })
+                    .map_err(|error| self.for_client(error, tool))
             }
             other => {
                 let hint = match self
@@ -326,6 +318,20 @@ impl McpDoor {
         if let Some(family) = family
             && chosen.is_empty()
         {
+            if allowed.is_empty() {
+                return Err(self
+                    .door_error(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may use no tools on {}.",
+                            grant.principal(),
+                            self.node.name()
+                        ),
+                    )
+                    .with_hint(
+                        "The owner of this machine decides in policy.toml which tools each principal may use.",
+                    ));
+            }
             let mut families: Vec<&str> = allowed
                 .iter()
                 .filter_map(|entry| entry.spec.name.split('.').next())
@@ -342,6 +348,32 @@ impl McpDoor {
                 )));
         }
         to_object(&Listing { tools: chosen })
+    }
+
+    /// A call's error with any hint written for the command line rewritten to point at what an
+    /// MCP client has: `tools/list` and the tool's schema there, or `legion_tools` and
+    /// `legion_describe` in compact mode.
+    fn for_client(&self, error: ErrorBody, tool: &str) -> ErrorBody {
+        let hint = error.hint.as_deref().unwrap_or_default();
+        let compact = self.options.compact;
+        if error.code == ErrorCode::UnknownTool || hint.contains("`legion tools`") {
+            error.with_hint(if compact {
+                LIST_COMPACT
+            } else {
+                "tools/list shows the tools you may use here. Their names have an underscore where Legion's have a dot, such as meta_whoami for meta.whoami."
+            })
+        } else if hint.contains("`legion help ") {
+            error.with_hint(if compact {
+                format!("legion_describe with tool \"{tool}\" shows the arguments it takes.")
+            } else {
+                format!(
+                    "The input schema of {} in tools/list shows the arguments it takes.",
+                    catalog::mcp_name(tool)
+                )
+            })
+        } else {
+            error
+        }
     }
 
     /// The machines an `on` argument names.

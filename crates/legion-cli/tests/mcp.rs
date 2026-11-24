@@ -822,3 +822,51 @@ fn a_result_is_sent_once_as_compact_json() {
     assert_eq!(failed(&error)["code"], json!("invalid_args"));
     assert_eq!(mcp.finish().0, 0);
 }
+
+#[test]
+fn hints_point_at_what_an_mcp_client_has() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"tower\"\n");
+
+    let (mut full, _) = Mcp::initialized(&home, &[]);
+    let invalid = failed(&full.call("test_sleep", json!({"seconds": "long"})));
+    let hint = invalid["hint"].as_str().unwrap();
+    assert!(!hint.contains("legion help"), "{hint}");
+    assert!(
+        hint.contains("test_sleep") && hint.contains("tools/list"),
+        "{hint}"
+    );
+    let unknown = failed(&full.call("fs_nothing", json!({})));
+    assert!(
+        !unknown["hint"].as_str().unwrap().contains("legion tools"),
+        "{unknown}"
+    );
+    assert_eq!(full.finish().0, 0);
+
+    let (mut compact, _) = Mcp::initialized(&home, &["--compact"]);
+    let invalid = failed(&compact.call(
+        "legion_call",
+        json!({"tool": "test.sleep", "args": {"seconds": "long"}}),
+    ));
+    let hint = invalid["hint"].as_str().unwrap();
+    assert!(!hint.contains("legion help"), "{hint}");
+    assert!(
+        hint.contains("legion_describe") && hint.contains("\"test.sleep\""),
+        "{hint}"
+    );
+    assert_eq!(compact.finish().0, 0);
+
+    // A principal that may use nothing is told so, not shown an empty list of families.
+    let (mut stranger, _) = Mcp::initialized(&home, &["--compact", "--as", "stranger"]);
+    let none = failed(&stranger.call("legion_tools", json!({"family": "fs"})));
+    assert_eq!(none["code"], json!("denied"));
+    assert_eq!(
+        none["message"],
+        json!("stranger may use no tools on tower.")
+    );
+    assert!(
+        none["hint"].as_str().unwrap().contains("policy.toml"),
+        "{none}"
+    );
+    assert_eq!(stranger.finish().0, 0);
+}
