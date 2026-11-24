@@ -1355,9 +1355,7 @@ impl Grant {
         // file tools, not to roles that allow `exec`.)
         #[cfg(windows)]
         {
-            let program_data = std::env::var_os("ProgramData")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
+            let program_data = legion_os::user::windows_program_data_dir()
                 .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
             let full = program_data.join("ssh");
             let resolved = resolve(&full)

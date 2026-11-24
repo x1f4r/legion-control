@@ -625,12 +625,8 @@ pub fn read_host_keys(
 }
 
 fn default_ssh_host_key_dir() -> PathBuf {
-    if cfg!(windows) {
-        std::env::var_os("ProgramData")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join("ssh")
+    if let Some(program_data) = legion_os::user::windows_program_data_dir() {
+        program_data.join("ssh")
     } else {
         PathBuf::from("/etc/ssh")
     }

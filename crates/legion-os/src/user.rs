@@ -4,7 +4,7 @@
 //! macOS, and Windows.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{OsError, Result};
 
@@ -55,7 +55,9 @@ pub fn path_owner_uid(path: &Path) -> io::Result<Option<u32>> {
 /// Returns the operating-system account name that the current process runs as.
 ///
 /// On Unix, looks up the effective UID in the system user database first (falling back to `USER`
-/// and `LOGNAME` only when the lookup yields no entry). On Windows, reads `USERNAME`.
+/// and `LOGNAME` only when the lookup yields no entry). On Windows, resolves the current process
+/// token's user SID via `OpenProcessToken` + `GetTokenInformation(TokenUser)` + `LookupAccountSidW`
+/// first, falling back to `USERNAME` only when the Win32 API fails.
 pub fn current_username() -> Result<String> {
     #[cfg(unix)]
     {
@@ -78,6 +80,9 @@ pub fn current_username() -> Result<String> {
     }
     #[cfg(windows)]
     {
+        if let Some(name) = windows_impl::token_username() {
+            return Ok(name);
+        }
         if let Ok(value) = std::env::var("USERNAME") {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
@@ -85,8 +90,9 @@ pub fn current_username() -> Result<String> {
             }
         }
         Err(OsError::Platform {
-            detail: "cannot determine the current Windows account name (USERNAME is unset)"
-                .to_owned(),
+            detail:
+                "cannot determine the current Windows account name from process token or USERNAME"
+                    .to_owned(),
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -95,6 +101,30 @@ pub fn current_username() -> Result<String> {
             detail: "determining the current account name is not supported on this platform"
                 .to_owned(),
         })
+    }
+}
+
+/// Returns the Windows `ProgramData` directory via `SHGetKnownFolderPath(FOLDERID_ProgramData)`
+/// (falling back to the `ProgramData` environment variable and then `C:\ProgramData` only when
+/// the Win32 Shell API fails).
+///
+/// Always returns `None` on non-Windows platforms.
+pub fn windows_program_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        Some(
+            windows_impl::known_folder_program_data()
+                .or_else(|| {
+                    std::env::var_os("ProgramData")
+                        .filter(|v| !v.is_empty())
+                        .map(PathBuf::from)
+                })
+                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData")),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 
@@ -195,23 +225,152 @@ pub fn apply_windows_admin_ssh_acl(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 mod windows_impl {
-    use std::ffi::c_void;
+    use std::ffi::{OsString, c_void};
+    use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
 
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PATH_NOT_FOUND,
-        ERROR_SUCCESS, HANDLE,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
+        ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE,
     };
     use windows::Win32::Security::{
-        CreateWellKnownSid, EqualSid, GetTokenInformation, PSID, SECURITY_MAX_SID_SIZE,
-        TOKEN_GROUPS, TOKEN_QUERY, TokenGroups, WinBuiltinAdministratorsSid,
+        CreateWellKnownSid, EqualSid, GetTokenInformation, LookupAccountSidW, PSID,
+        SECURITY_MAX_SID_SIZE, SID_NAME_USE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups,
+        TokenUser, WinBuiltinAdministratorsSid,
     };
+    use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    use windows::core::{PCWSTR, PWSTR};
 
     use crate::{OsError, Result};
+
+    struct TokenGuard(HANDLE);
+    #[allow(unsafe_code)]
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                // SAFETY: `self.0` was obtained from `OpenProcessToken` and is closed once.
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    pub(super) fn token_username() -> Option<String> {
+        let mut token = HANDLE::default();
+        // SAFETY: `GetCurrentProcess()` returns the calling process pseudo-handle and `token` is
+        // immediately wrapped in `TokenGuard`.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
+        let _guard = TokenGuard(token);
+
+        let mut needed: u32 = 0;
+        // SAFETY: Querying required `TokenUser` buffer size with a null output pointer.
+        let first = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+        if let Err(err) = first
+            && err.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult()
+        {
+            return None;
+        }
+        if needed == 0 {
+            return None;
+        }
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0_usize; words];
+        // SAFETY: `buf` is `usize`-aligned with at least `needed` bytes of writable storage.
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr().cast::<c_void>()),
+                needed,
+                &mut needed,
+            )
+        }
+        .ok()?;
+
+        // SAFETY: `GetTokenInformation(TokenUser)` populated `TOKEN_USER` at the start of `buf`.
+        let user_sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        if user_sid.0.is_null() {
+            return None;
+        }
+
+        let mut name_len: u32 = 0;
+        let mut domain_len: u32 = 0;
+        let mut sid_use = SID_NAME_USE::default();
+        // SAFETY: Querying required buffer lengths for `LookupAccountSidW` with null output pointers.
+        let query = unsafe {
+            LookupAccountSidW(
+                PCWSTR::null(),
+                user_sid,
+                None,
+                &mut name_len,
+                None,
+                &mut domain_len,
+                &mut sid_use,
+            )
+        };
+        if let Err(err) = query
+            && err.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult()
+        {
+            return None;
+        }
+        if name_len == 0 {
+            return None;
+        }
+
+        let mut name_buf = vec![0_u16; name_len as usize];
+        let mut domain_buf = vec![0_u16; (domain_len as usize).max(1)];
+        let mut domain_cap = u32::try_from(domain_buf.len()).unwrap_or(u32::MAX);
+        // SAFETY: `name_buf` and `domain_buf` hold `name_len` and `domain_cap` UTF-16 code units.
+        unsafe {
+            LookupAccountSidW(
+                PCWSTR::null(),
+                user_sid,
+                Some(PWSTR::from_raw(name_buf.as_mut_ptr())),
+                &mut name_len,
+                Some(PWSTR::from_raw(domain_buf.as_mut_ptr())),
+                &mut domain_cap,
+                &mut sid_use,
+            )
+        }
+        .ok()?;
+
+        let slice = name_buf.get(..(name_len as usize))?;
+        let trimmed_len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+        let name = String::from_utf16_lossy(&slice[..trimmed_len]);
+        let trimmed = name.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
+    #[allow(unsafe_code)]
+    pub(super) fn known_folder_program_data() -> Option<PathBuf> {
+        // SAFETY: `SHGetKnownFolderPath` allocates a NUL-terminated UTF-16 string with the COM
+        // task allocator; the guard below frees it unconditionally via `CoTaskMemFree`.
+        let raw =
+            unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DEFAULT, None) }.ok()?;
+        struct CoTaskStr(PWSTR);
+        impl Drop for CoTaskStr {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: `self.0` was allocated by `SHGetKnownFolderPath` and is freed once.
+                    unsafe { CoTaskMemFree(Some(self.0.0.cast::<c_void>())) };
+                }
+            }
+        }
+        let guard = CoTaskStr(raw);
+        if guard.0.is_null() {
+            return None;
+        }
+        // SAFETY: `SHGetKnownFolderPath` returns a valid NUL-terminated UTF-16 string.
+        let wide = unsafe { guard.0.as_wide() };
+        if wide.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(OsString::from_wide(wide)))
+    }
 
     #[allow(unsafe_code)]
     pub(super) fn is_in_administrators_group() -> bool {
@@ -220,15 +379,6 @@ mod windows_impl {
         // `token` is a valid out-pointer closed unconditionally below.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
             return false;
-        }
-        struct TokenGuard(HANDLE);
-        impl Drop for TokenGuard {
-            fn drop(&mut self) {
-                if !self.0.is_invalid() {
-                    // SAFETY: `self.0` was obtained from `OpenProcessToken` and is closed once.
-                    let _ = unsafe { CloseHandle(self.0) };
-                }
-            }
         }
         let _guard = TokenGuard(token);
 
@@ -334,34 +484,48 @@ mod windows_impl {
         if cb_data == 0 {
             return Ok(Some(String::new()));
         }
-        let mut buf = vec![0_u16; (cb_data as usize).div_ceil(2)];
-        // SAFETY: `buf` holds at least `cb_data` bytes of writable UTF-16 storage.
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                PCWSTR::from_raw(subkey.as_ptr()),
-                PCWSTR::from_raw(value_name.as_ptr()),
-                flags,
-                None,
-                Some(buf.as_mut_ptr().cast::<c_void>()),
-                Some(&mut cb_data),
-            )
-        };
-        if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
-            return Ok(None);
+        // Loop on `ERROR_MORE_DATA` in case the registry value grows between the size probe and
+        // the read.
+        for _ in 0..4 {
+            let mut buf = vec![0_u16; (cb_data as usize).div_ceil(2)];
+            let mut out_bytes = u32::try_from(buf.len() * 2).unwrap_or(u32::MAX);
+            // SAFETY: `buf` holds at least `out_bytes` bytes of writable UTF-16 storage.
+            let status = unsafe {
+                RegGetValueW(
+                    HKEY_LOCAL_MACHINE,
+                    PCWSTR::from_raw(subkey.as_ptr()),
+                    PCWSTR::from_raw(value_name.as_ptr()),
+                    flags,
+                    None,
+                    Some(buf.as_mut_ptr().cast::<c_void>()),
+                    Some(&mut out_bytes),
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+                return Ok(None);
+            }
+            if status == ERROR_MORE_DATA {
+                cb_data = out_bytes.max(cb_data.saturating_mul(2));
+                continue;
+            }
+            if status != ERROR_SUCCESS {
+                return Err(OsError::Platform {
+                    detail: format!(
+                        "RegGetValueW(HKLM\\SOFTWARE\\OpenSSH\\DefaultShell) failed with Win32 error {}",
+                        status.0
+                    ),
+                });
+            }
+            let u16_len = (out_bytes as usize) / 2;
+            let slice = &buf[..u16_len.min(buf.len())];
+            let trimmed_len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+            return Ok(Some(String::from_utf16_lossy(&slice[..trimmed_len])));
         }
-        if status != ERROR_SUCCESS {
-            return Err(OsError::Platform {
-                detail: format!(
-                    "RegGetValueW(HKLM\\SOFTWARE\\OpenSSH\\DefaultShell) failed with Win32 error {}",
-                    status.0
-                ),
-            });
-        }
-        let u16_len = (cb_data as usize) / 2;
-        let slice = &buf[..u16_len.min(buf.len())];
-        let trimmed_len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-        Ok(Some(String::from_utf16_lossy(&slice[..trimmed_len])))
+        Err(OsError::Platform {
+            detail:
+                "RegGetValueW(HKLM\\SOFTWARE\\OpenSSH\\DefaultShell) kept returning ERROR_MORE_DATA"
+                    .to_owned(),
+        })
     }
 
     pub(super) fn apply_admin_ssh_acl(path: &Path) -> Result<()> {

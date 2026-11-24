@@ -83,9 +83,7 @@ pub fn resolve_target(paths: &Paths, node_file: &NodeFile) -> Result<AuthKeysTar
 }
 
 fn windows_program_data_ssh_dir() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+    legion_os::user::windows_program_data_dir()
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("ssh")
 }
