@@ -644,6 +644,8 @@ fn status_args(show_stash: bool) -> Vec<&'static str> {
         "--porcelain=v2",
         "--branch",
         "--ignore-submodules=all",
+        // Said outright, so a `status.showUntrackedFiles=no` cannot make a tree look clean.
+        "--untracked-files=normal",
     ];
     if show_stash {
         args.push("--show-stash");

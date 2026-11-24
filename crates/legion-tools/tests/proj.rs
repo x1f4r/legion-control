@@ -88,6 +88,7 @@ fn main() -> ExitCode {
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
+        ("untracked_files_count_whatever_the_repository_says", || Box::pin(untracked_files_count_whatever_the_repository_says())),
         ("remote_git_never_prompts_and_stops_when_cancelled", || {
             Box::pin(remote_git_never_prompts_and_stops_when_cancelled())
         }),
@@ -1390,4 +1391,17 @@ async fn remote_git_never_prompts_and_stops_when_cancelled() {
         !support::alive(pid),
         "ssh was left running after the call returned"
     );
+}
+
+async fn untracked_files_count_whatever_the_repository_says() {
+    let fixture = tower();
+    let app = fixture.home().join("app");
+    repo(&app);
+    git(&app, &["config", "status.showUntrackedFiles", "no"]);
+    std::fs::write(app.join("new.txt"), "new\n").unwrap();
+    fixture.write_config("projects.toml", "[projects.app.on]\ntower = \"~/app\"\n");
+    let status = fixture.call("proj.status", json!({})).await.unwrap();
+    let state = &entry(&status, "app")["git"];
+    assert_eq!(state["dirty"]["untracked"], json!(1), "{status:#}");
+    assert_eq!(state["clean"], json!(false), "{status:#}");
 }
