@@ -203,7 +203,10 @@ impl Node {
             },
             duration: (started.elapsed().as_secs_f64() * 1e6).round() / 1e6,
             args: recorded_args,
-            message: result.as_ref().err().map(|error| error.message.clone()),
+            message: result
+                .as_ref()
+                .err()
+                .map(|error| audit::redact_message(&error.message)),
         };
         let log = self.inner.audit.clone();
         let written = tokio::task::spawn_blocking(move || log.append(&entry)).await;
