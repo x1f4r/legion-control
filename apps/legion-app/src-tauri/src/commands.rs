@@ -7,8 +7,7 @@ use tauri::State;
 use tauri::ipc::Channel;
 
 use crate::backend::{
-    AppError, AppState, Backend, CallEvent, CallId, CallRequest, CancelResult, PairResult,
-    UnpairResult,
+    AppError, AppState, Backend, CallId, CallRequest, CancelResult, UnpairResult,
 };
 
 /// Shared backend state registered with Tauri.
@@ -28,26 +27,28 @@ pub async fn state(backend: State<'_, SharedBackend>) -> Result<AppState, AppErr
 #[tauri::command]
 pub async fn tools(
     backend: State<'_, SharedBackend>,
-    on: Option<String>,
+    on: Option<Value>,
 ) -> Result<Vec<Value>, AppError> {
     backend.0.tools(on).await
 }
 
-/// Invokes a Legion tool and streams live events to `channel`.
+/// Invokes a Legion tool and streams live events to `on_event`.
 #[tauri::command]
 pub async fn call(
     backend: State<'_, SharedBackend>,
+    id: Option<CallId>,
     tool: String,
     args: Option<Value>,
     on: Option<Value>,
-    channel: Channel<CallEvent>,
+    on_event: Channel<Value>,
 ) -> Result<Value, AppError> {
     let request = CallRequest {
+        id,
         tool,
         args: args.unwrap_or_else(|| Value::Object(Map::new())),
         on,
     };
-    backend.0.call(request, channel).await
+    backend.0.call(request, Some(on_event)).await
 }
 
 /// Cancels an in-flight tool call by identifier.
@@ -65,7 +66,7 @@ pub async fn pair(
     backend: State<'_, SharedBackend>,
     invite: String,
     name: Option<String>,
-) -> Result<PairResult, AppError> {
+) -> Result<AppState, AppError> {
     let resolved_name = name
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
@@ -80,6 +81,15 @@ pub async fn unpair(
     node: String,
 ) -> Result<UnpairResult, AppError> {
     backend.0.unpair(node).await
+}
+
+/// Switches which configured node calls are sent through by default.
+#[tauri::command]
+pub async fn select_node(
+    backend: State<'_, SharedBackend>,
+    node: String,
+) -> Result<AppState, AppError> {
+    backend.0.select_node(node).await
 }
 
 /// Returns a sensible default name for this device (model on mobile, host name on desktop).
@@ -108,7 +118,7 @@ pub fn default_device_name() -> String {
                 return model;
             }
         }
-        return "Android".to_owned();
+        "Android".to_owned()
     }
 
     #[cfg(not(target_os = "android"))]

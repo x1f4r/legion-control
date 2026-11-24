@@ -17,13 +17,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "=2.7.6", features = [] }
 
 [dependencies]
+legion-link = { path = "../../../crates/legion-link", features = ["ssh"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tauri = { version = "=2.12.7", features = [] }
 tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["sync", "time"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 gethostname = "1.1.0"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+legion-link = { path = "../../../crates/legion-link", features = ["ssh", "local"] }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "=2.5.3"

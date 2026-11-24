@@ -1,16 +1,18 @@
-//! Private JSON persistence for pairings and device state.
+//! Private JSON persistence for pairings, device key, and active node selection.
 //!
 //! All data lives in one file inside the platform's private app data directory and is updated by
 //! writing a sibling temporary file, syncing it to disk, and renaming it into place.
 
+use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use legion_link::LinkConfig;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::backend::{AppError, ErrorCode, NodeLink};
+use crate::backend::{AppError, ErrorCode};
 
 /// Current on-disk schema version.
 pub const STORE_VERSION: u32 = 1;
@@ -18,29 +20,81 @@ pub const STORE_VERSION: u32 = 1;
 /// Filename inside the platform's private app data directory.
 pub const STORE_FILENAME: &str = "legion-app.json";
 
-/// Persisted state owned by the native shell.
-///
-/// Stage two extends this structure with the device's Ed25519 key material and per-node connection
-/// details while preserving the single-file atomic layout.
+/// Non-secret display metadata recorded alongside each paired node in [`LinkConfig`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredNodeMeta {
+    /// Paired node name matching [`legion_link::NodeLink::node`].
+    pub node: String,
+    /// Role reported by the node when enrolled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Device name enrolled on the node (needed for `legion device.remove` reminders).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+/// Persisted state owned by the native shell.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppStoreData {
     /// Schema version for forward migration.
+    #[serde(default = "default_version")]
     pub version: u32,
-    /// Optional user-chosen label for this device.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_name: Option<String>,
-    /// Nodes paired with this device.
+    /// Serialized `legion-link` configuration (device key and paired SSH nodes).
     #[serde(default)]
-    pub nodes: Vec<NodeLink>,
+    pub link: LinkConfig,
+    /// Name of the active node preferred for calls when more than one node exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_node: Option<String>,
+    /// Non-secret metadata per paired node (role and enrolled device name).
+    #[serde(default)]
+    pub node_meta: Vec<StoredNodeMeta>,
+}
+
+fn default_version() -> u32 {
+    STORE_VERSION
 }
 
 impl Default for AppStoreData {
     fn default() -> Self {
         Self {
             version: STORE_VERSION,
-            device_name: None,
-            nodes: Vec::new(),
+            link: LinkConfig::default(),
+            current_node: None,
+            node_meta: Vec::new(),
         }
+    }
+}
+
+impl fmt::Debug for AppStoreData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppStoreData")
+            .field("version", &self.version)
+            .field("link", &self.link)
+            .field("current_node", &self.current_node)
+            .field("node_meta", &self.node_meta)
+            .finish()
+    }
+}
+
+impl AppStoreData {
+    /// Inserts or updates metadata for a paired node.
+    pub fn upsert_meta(&mut self, meta: StoredNodeMeta) {
+        if let Some(existing) = self.node_meta.iter_mut().find(|m| m.node == meta.node) {
+            *existing = meta;
+        } else {
+            self.node_meta.push(meta);
+        }
+    }
+
+    /// Removes metadata for a node, returning the removed record if present.
+    pub fn remove_meta(&mut self, node: &str) -> Option<StoredNodeMeta> {
+        let pos = self.node_meta.iter().position(|m| m.node == node)?;
+        Some(self.node_meta.remove(pos))
+    }
+
+    /// Looks up metadata for a node by name.
+    pub fn meta(&self, node: &str) -> Option<&StoredNodeMeta> {
+        self.node_meta.iter().find(|m| m.node == node)
     }
 }
 
@@ -165,6 +219,8 @@ impl AppStore {
 
 #[cfg(test)]
 mod tests {
+    use legion_link::{NodeLink as LinkNode, SshTarget};
+
     use super::*;
 
     #[test]
@@ -180,26 +236,30 @@ mod tests {
     fn atomic_save_and_reload_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let store = AppStore::in_dir(dir.path());
-        let initial = AppStoreData {
-            version: STORE_VERSION,
-            device_name: Some("laptop".to_owned()),
-            nodes: vec![NodeLink {
-                node: "tower".to_owned(),
-                principal: "phone".to_owned(),
-                role: "operator".to_owned(),
-                via: "ssh".to_owned(),
-            }],
-        };
+        let mut initial = AppStoreData::default();
+        initial.link.device_key = Some("PLACEHOLDER-PRIVATE-KEY".to_owned());
+        initial.link.upsert_node(LinkNode::ssh(
+            "tower",
+            SshTarget {
+                hosts: vec!["tower.example".to_owned()],
+                port: 22,
+                user: "me".to_owned(),
+                host_keys: vec!["ssh-ed25519 AAAA".to_owned()],
+            },
+            Some("phone".to_owned()),
+        ));
+        initial.current_node = Some("tower".to_owned());
+        initial.upsert_meta(StoredNodeMeta {
+            node: "tower".to_owned(),
+            role: Some("operator".to_owned()),
+            device: Some("my-phone".to_owned()),
+        });
 
         store.save(&initial)?;
         assert_eq!(store.load()?, initial);
 
-        let updated = AppStoreData {
-            device_name: Some("tablet".to_owned()),
-            ..initial
-        };
-        store.save(&updated)?;
-        assert_eq!(store.load()?, updated);
+        let debug_text = format!("{initial:?}");
+        assert!(!debug_text.contains("PLACEHOLDER-PRIVATE-KEY"));
 
         #[cfg(unix)]
         {

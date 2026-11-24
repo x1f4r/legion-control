@@ -2,14 +2,15 @@
 
 pub mod backend;
 pub mod commands;
+pub mod link_backend;
 pub mod store;
 
 use std::sync::Arc;
 
 use tauri::Manager;
 
-use crate::backend::Unpaired;
 use crate::commands::SharedBackend;
+use crate::link_backend::LinkBackend;
 use crate::store::AppStore;
 
 /// Registers the official `tauri-plugin-barcode-scanner` Kotlin plugin on Android and keeps its
@@ -31,13 +32,14 @@ fn android_barcode_scanner_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 /// Starts the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
-        .manage(SharedBackend(Arc::new(Unpaired)))
-        .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
-            app.manage(AppStore::in_dir(data_dir));
-            Ok(())
-        });
+    let builder = tauri::Builder::default().setup(|app| {
+        let data_dir = app.path().app_data_dir()?;
+        let store = AppStore::in_dir(data_dir);
+        let backend = LinkBackend::from_store(store.clone());
+        app.manage(store);
+        app.manage(SharedBackend(Arc::new(backend)));
+        Ok(())
+    });
 
     #[cfg(target_os = "android")]
     let builder = builder
@@ -49,6 +51,7 @@ pub fn run() {
             commands::cancel,
             commands::pair,
             commands::unpair,
+            commands::select_node,
             commands::device_name,
             commands::scan_invite,
         ]);
@@ -63,6 +66,7 @@ pub fn run() {
             commands::cancel,
             commands::pair,
             commands::unpair,
+            commands::select_node,
             commands::device_name,
             commands::scan_invite,
         ]);
@@ -75,6 +79,7 @@ pub fn run() {
         commands::cancel,
         commands::pair,
         commands::unpair,
+        commands::select_node,
         commands::device_name,
     ]);
 
