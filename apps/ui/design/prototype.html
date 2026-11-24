@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Legion interface: reference screens</title>
+<link rel="stylesheet" href="../styles.css">
+<style>
+  /* Only for laying the reference screens out side by side. Nothing here ships. */
+  body { padding: 28px; display: flex; flex-wrap: wrap; gap: 28px; align-items: flex-start; background: #000; height: auto; }
+  :root[data-theme="light"] body { background: #d9d6ce; }
+  .frame { position: relative; width: 390px; height: 800px; border-radius: 30px; overflow: hidden; outline: 1px solid #333; }
+  .frame.wide { width: 1100px; height: 720px; border-radius: 14px; }
+  .frame .shell { height: 100%; }
+  figcaption { font: 12px ui-monospace, monospace; color: #888; margin: 0 0 8px 6px; }
+  figure { margin: 0; }
+</style>
+
+<svg hidden>
+  <symbol id="i-machines" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><path d="M7 7.25h.01M7 16.75h.01"/></symbol>
+  <symbol id="i-jobs" viewBox="0 0 24 24"><path d="M4 6h10M4 12h16M4 18h7"/><circle cx="18" cy="6" r="2"/><circle cx="15" cy="18" r="2"/></symbol>
+  <symbol id="i-tools" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5"/></symbol>
+  <symbol id="i-device" viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2.5"/><path d="M11 17.5h2"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 5.5 8 12l6.5 6.5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v3.6h-3.6"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2"/><path d="M15.5 5.5h-9a2 2 0 0 0-2 2v9"/></symbol>
+</svg>
+
+<!-- ─────────────────────────────── Machines ─────────────────────────────── -->
+<figure>
+<figcaption>Machines: the first screen</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="bar">
+    <h1 class="wordmark"><b>▍</b>Legion</h1>
+    <span class="chip">operator</span>
+    <button class="btn icon" aria-label="Refresh"><svg><use href="#i-refresh"/></svg></button>
+  </header>
+  <main class="main">
+    <p class="label">Machines · 3 of 4 answering</p>
+    <div class="list">
+      <a class="row" href="#">
+        <span class="dot busy"></span>
+        <span class="body">
+          <span class="title mono">tower</span>
+          <span class="sub">Linux · x86_64 · 2 jobs running</span>
+        </span>
+        <span class="meters" aria-label="Processor 71%, memory 48%, disk 9%">
+          <span class="meter high" style="--v:71"><i></i></span>
+          <span class="meter" style="--v:48"><i></i></span>
+          <span class="meter" style="--v:9"><i></i></span>
+        </span>
+      </a>
+      <a class="row" href="#">
+        <span class="dot"></span>
+        <span class="body">
+          <span class="title mono">pi</span>
+          <span class="sub">Linux · aarch64 · up 41 days</span>
+        </span>
+        <span class="meters">
+          <span class="meter" style="--v:6"><i></i></span>
+          <span class="meter" style="--v:31"><i></i></span>
+          <span class="meter" style="--v:44"><i></i></span>
+        </span>
+      </a>
+      <a class="row" href="#">
+        <span class="dot"></span>
+        <span class="body">
+          <span class="title mono">studio</span>
+          <span class="sub">macOS · aarch64 · up 3 days</span>
+        </span>
+        <span class="meters">
+          <span class="meter" style="--v:12"><i></i></span>
+          <span class="meter high" style="--v:78"><i></i></span>
+          <span class="meter full" style="--v:93"><i></i></span>
+        </span>
+      </a>
+      <a class="row off" href="#">
+        <span class="dot off"></span>
+        <span class="body">
+          <span class="title mono">laptop</span>
+          <span class="sub">Did not answer · last seen 14 days ago</span>
+        </span>
+        <span class="chip">wake</span>
+      </a>
+    </div>
+
+    <p class="label">Running now</p>
+    <div class="list">
+      <a class="row" href="#">
+        <span class="body">
+          <span class="title mono">cargo build --release</span>
+          <span class="sub">tower · started 4 min ago</span>
+        </span>
+        <span class="end">4:12</span>
+      </a>
+      <a class="row" href="#">
+        <span class="body">
+          <span class="title mono">rsync photos/ nas:</span>
+          <span class="sub">tower · started 1 h ago</span>
+        </span>
+        <span class="end">1:03:40</span>
+      </a>
+    </div>
+  </main>
+  <nav class="nav">
+    <a href="#" aria-current="page"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#"><svg><use href="#i-jobs"/></svg>Jobs</a>
+    <a href="#"><svg><use href="#i-tools"/></svg>Tools</a>
+    <a href="#"><svg><use href="#i-device"/></svg>This device</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── One machine: run ─────────────────────────────── -->
+<figure>
+<figcaption>One machine: run a command</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="bar">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <span class="dot busy"></span>
+    <h1>tower</h1>
+  </header>
+  <main class="main">
+    <div class="tabs" role="tablist">
+      <button role="tab">Overview</button>
+      <button role="tab" aria-selected="true">Run</button>
+      <button role="tab">Files</button>
+      <button role="tab">Jobs</button>
+      <button role="tab">Services</button>
+      <button role="tab">Projects</button>
+      <button role="tab">Power</button>
+    </div>
+    <div class="prompt"><input value="df -h /" aria-label="Command"><button class="btn primary" style="min-height:36px;padding:0 14px">Run</button></div>
+    <label class="switch"><span>Keep running after I leave <small class="dim" style="display:block">Starts it as a job you can come back to.</small></span><input type="checkbox"></label>
+<pre class="out"><span class="meta">tower · ~ · exit 0 · 38 ms</span>
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p5  2.8T  247G  2.5T   9% /</pre>
+    <p class="label">Earlier</p>
+    <div class="list">
+      <button class="row"><span class="body"><span class="title mono">nvidia-smi</span><span class="sub">exit 0 · 2 min ago</span></span></button>
+      <button class="row"><span class="body"><span class="title mono">systemctl --user status legion-serve</span><span class="sub">exit 3 · 9 min ago</span></span></button>
+    </div>
+  </main>
+  <nav class="nav">
+    <a href="#" aria-current="page"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#"><svg><use href="#i-jobs"/></svg>Jobs</a>
+    <a href="#"><svg><use href="#i-tools"/></svg>Tools</a>
+    <a href="#"><svg><use href="#i-device"/></svg>This device</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Any tool, and asking first ─────────────────────────────── -->
+<figure>
+<figcaption>Any tool: a form from its schema, and asking before power</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="bar">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>power.restart</h1>
+    <span class="chip fx power">power</span>
+  </header>
+  <main class="main">
+    <p class="lede">Restart this machine, after checking that nothing important is running on it.</p>
+    <label class="field"><span>on <em>where to run it</em></span>
+      <select><option>tower</option></select></label>
+    <label class="field"><span>delay_s <em>optional</em></span>
+      <input inputmode="numeric" placeholder="0">
+      <small>Seconds to wait first. It can be cancelled until then.</small></label>
+    <label class="switch"><span class="mono" style="font-size:13px">force</span><input type="checkbox"></label>
+    <div class="actions">
+      <button class="btn">Try it (dry run)</button>
+      <button class="btn danger">Restart tower</button>
+    </div>
+  </main>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#"><svg><use href="#i-jobs"/></svg>Jobs</a>
+    <a href="#" aria-current="page"><svg><use href="#i-tools"/></svg>Tools</a>
+    <a href="#"><svg><use href="#i-device"/></svg>This device</a>
+  </nav>
+</div></div>
+<div class="scrim"><div class="sheet" role="dialog" aria-labelledby="ask">
+  <h2 id="ask">Restart tower now?</h2>
+  <p>Two jobs are running on it and will be interrupted.</p>
+  <div class="list">
+    <div class="row"><span class="body"><span class="title mono">cargo build --release</span><span class="sub">running for 4 min</span></span></div>
+    <div class="row"><span class="body"><span class="title mono">rsync photos/ nas:</span><span class="sub">running for 1 h</span></span></div>
+  </div>
+  <div class="actions">
+    <button class="btn">Cancel</button>
+    <button class="btn danger">Restart anyway</button>
+  </div>
+</div></div>
+</div>
+</figure>
+
+<!-- ─────────────────────────────── First start ─────────────────────────────── -->
+<figure>
+<figcaption>First start: pair this device</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="bar"><h1 class="wordmark"><b>▍</b>Legion</h1></header>
+  <main class="main">
+    <h2 style="font-size:26px;line-height:1.15;letter-spacing:-0.02em;margin:36px 2px 10px">Pair this phone with one of your machines.</h2>
+    <p class="lede">One is enough: through it you reach the others. On that machine, run</p>
+    <div class="code"><code>legion pair --as phone</code><button class="btn icon" aria-label="Copy"><svg><use href="#i-copy"/></svg></button></div>
+    <p class="lede" style="margin-top:14px">It shows a code. Scan it here, or paste the line under it.</p>
+    <div class="actions">
+      <button class="btn primary">Scan the code</button>
+      <button class="btn">Paste invite</button>
+    </div>
+    <div class="notice" style="margin-top:28px">
+      <strong>What pairing allows</strong>
+      <span>This phone gets its own key. It can only use Legion on that machine, as the role you name, and you can remove it there at any time.</span>
+    </div>
+  </main>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Wide ─────────────────────────────── -->
+<figure>
+<figcaption>Tablet and desktop: the list beside the machine</figcaption>
+<div class="frame wide"><div class="shell"><div class="app">
+  <header class="bar">
+    <h1 class="wordmark"><b>▍</b>Legion</h1>
+    <span class="chip">owner</span>
+    <button class="btn icon" aria-label="Refresh"><svg><use href="#i-refresh"/></svg></button>
+  </header>
+  <main class="main"><div class="split">
+    <section>
+      <p class="label">Machines · 3 of 4 answering</p>
+      <div class="list">
+        <a class="row" href="#" style="background:var(--raised)"><span class="dot busy"></span><span class="body"><span class="title mono">tower</span><span class="sub">Linux · x86_64 · 2 jobs running</span></span><span class="meters"><span class="meter high" style="--v:71"><i></i></span><span class="meter" style="--v:48"><i></i></span><span class="meter" style="--v:9"><i></i></span></span></a>
+        <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title mono">pi</span><span class="sub">Linux · aarch64 · up 41 days</span></span><span class="meters"><span class="meter" style="--v:6"><i></i></span><span class="meter" style="--v:31"><i></i></span><span class="meter" style="--v:44"><i></i></span></span></a>
+        <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title mono">studio</span><span class="sub">macOS · aarch64 · up 3 days</span></span><span class="meters"><span class="meter" style="--v:12"><i></i></span><span class="meter high" style="--v:78"><i></i></span><span class="meter full" style="--v:93"><i></i></span></span></a>
+        <a class="row off" href="#"><span class="dot off"></span><span class="body"><span class="title mono">laptop</span><span class="sub">Did not answer · last seen 14 days ago</span></span><span class="chip">wake</span></a>
+      </div>
+    </section>
+    <section>
+      <h2 class="pane-title"><span class="dot busy"></span>tower</h2>
+      <div class="tabs" role="tablist">
+        <button role="tab" aria-selected="true">Overview</button><button role="tab">Run</button><button role="tab">Files</button><button role="tab">Jobs</button><button role="tab">Services</button><button role="tab">Projects</button><button role="tab">Power</button>
+      </div>
+      <div class="list">
+        <div class="gauge"><header><span>Processor</span><span>71% · load 3.2 · 32 cores</span></header><div class="meter" style="--v:71"><i></i></div></div>
+        <div class="gauge"><header><span>Memory</span><span>29 of 60 GB</span></header><div class="meter" style="--v:48"><i></i></div></div>
+        <div class="gauge"><header><span>Disk <span class="mono dim">/</span></span><span>247 GB of 2.8 TB</span></header><div class="meter" style="--v:9"><i></i></div></div>
+        <div class="gauge"><header><span>Graphics memory</span><span>11 of 16 GB</span></header><div class="meter" style="--v:69"><i></i></div></div>
+      </div>
+      <p class="label">About</p>
+      <div class="list"><dl class="kv">
+        <dt>system</dt><dd>Linux 7.2 · x86_64</dd>
+        <dt>up</dt><dd>11 h 26 min</dd>
+        <dt>legion</dt><dd>0.1.0</dd>
+        <dt>busy</dt><dd>yes: 2 jobs</dd>
+      </dl></div>
+    </section>
+  </div></main>
+  <nav class="nav">
+    <a href="#" aria-current="page"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#"><svg><use href="#i-jobs"/></svg>Jobs</a>
+    <a href="#"><svg><use href="#i-tools"/></svg>Tools</a>
+    <a href="#"><svg><use href="#i-device"/></svg>Device</a>
+  </nav>
+</div></div></div>
+</figure>
+</html>

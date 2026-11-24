@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>Legion</title>
+  <rect width="512" height="512" rx="112" fill="#0d0e10"/>
+  <rect x="124" y="128" width="56" height="256" rx="14" fill="#b6f24a"/>
+  <rect x="224" y="128" width="164" height="48" rx="14" fill="#eceef0"/>
+  <rect x="224" y="232" width="116" height="48" rx="14" fill="#eceef0"/>
+  <rect x="228" y="340" width="156" height="40" rx="12" fill="none" stroke="#6c737c" stroke-width="8"/>
+</svg>
