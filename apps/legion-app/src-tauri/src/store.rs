@@ -74,6 +74,9 @@ pub struct StoredNodeMeta {
     /// Device name enrolled on the node (needed for `legion device.remove` reminders).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// RFC 3339 UTC timestamp of when `role` was last confirmed on this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_checked_at: Option<String>,
 }
 
 /// Persisted state owned by the native shell.
@@ -398,6 +401,7 @@ mod tests {
             node: "tower".to_owned(),
             role: Some("operator".to_owned()),
             device: Some("my-phone".to_owned()),
+            role_checked_at: Some("2026-11-24T23:00:00Z".to_owned()),
         });
 
         store.save(&initial)?;

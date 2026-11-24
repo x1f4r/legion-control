@@ -496,6 +496,7 @@ export function createMockLink(mode = '') {
   const isConflict = flags.has('conflict');
   const isPairedChange = flags.has('pairedchg');
   const isPartial = flags.has('partial');
+  const isPrimaryOffline = flags.has('aoff');
   const isAutoEnrol = flags.has('enrol');
   const isFirst = flags.has('first');
   const isRepair = flags.has('repair');
@@ -594,7 +595,10 @@ export function createMockLink(mode = '') {
 
   const machines = {
     tower: {
-      reachable: true,
+      reachable: !isPrimaryOffline,
+      error: isPrimaryOffline
+        ? { code: 'unreachable', message: 'tower did not answer.', hint: null, machine: 'tower' }
+        : null,
       sys: {
         node: 'tower',
         hostname: 'tower',
@@ -896,9 +900,10 @@ export function createMockLink(mode = '') {
           tools: allowedTools,
         };
       case 'fleet.list': {
+        const answering = isPrimaryOffline && activeNode === 'tower' ? 'pi' : activeNode;
         const list = [
-          { name: 'tower', this_node: activeNode === 'tower', systems: [{ name: 'linux', via: 'ssh', target: 'tower.example' }], wake_via: [] },
-          { name: 'pi', this_node: activeNode === 'pi', systems: [{ name: 'linux', via: 'ssh', target: 'pi.example' }], wake_via: [] },
+          { name: 'tower', this_node: answering === 'tower', systems: [{ name: 'linux', via: 'ssh', target: 'tower.example' }], wake_via: [] },
+          { name: 'pi', this_node: answering === 'pi', systems: [{ name: 'linux', via: 'ssh', target: 'pi.example' }], wake_via: [] },
           { name: 'studio', this_node: false, systems: [{ name: 'macos', via: 'ssh', target: 'studio.example' }], wake_via: [] },
           {
             name: 'laptop',
@@ -922,11 +927,14 @@ export function createMockLink(mode = '') {
             wake_via: [],
           });
         }
-        return { node: activeNode, machines: list };
+        return { node: answering, answered_by: answering, machines: list };
       }
       case 'fleet.ping': {
+        const answering = isPrimaryOffline && activeNode === 'tower' ? 'pi' : activeNode;
         const all = [
-          { machine: 'tower', reachable: true, node: 'tower', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 0 },
+          isPrimaryOffline
+            ? { machine: 'tower', reachable: false, error: machines.tower.error }
+            : { machine: 'tower', reachable: true, node: 'tower', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 0 },
           { machine: 'pi', reachable: true, node: 'pi', system: 'linux', version: '0.1.0', os: 'linux', arch: 'aarch64', latency_ms: 4 },
           { machine: 'studio', reachable: true, node: 'studio', system: 'macos', version: '0.1.0', os: 'macos', arch: 'aarch64', latency_ms: 11 },
           { machine: 'laptop', reachable: false, error: machines.laptop.error },
@@ -937,9 +945,9 @@ export function createMockLink(mode = '') {
         }
         if (Array.isArray(args?.machines) && args.machines.length > 0) {
           const wanted = new Set(args.machines);
-          return { results: all.filter((entry) => wanted.has(entry.machine)) };
+          return { answered_by: answering, results: all.filter((entry) => wanted.has(entry.machine)) };
         }
-        return { results: all.filter((entry) => entry.machine !== activeNode) };
+        return { answered_by: answering, results: all.filter((entry) => entry.machine !== answering) };
       }
       case 'fleet.add': {
         const addedName = String(args?.name || '').trim();
@@ -1307,8 +1315,6 @@ export function createMockLink(mode = '') {
   }
 
   const MOCK_ANY_NODE_TOOLS = new Set([
-    'meta.whoami',
-    'meta.version',
     'fleet.list',
     'fleet.ping',
     'device.endpoint',
@@ -1340,7 +1346,8 @@ export function createMockLink(mode = '') {
       }
       return { results };
     }
-    return resolveOne(on || activeNode, tool, args, onEvent);
+    const target = on || (isPrimaryOffline && activeNode === 'tower' ? 'pi' : activeNode);
+    return resolveOne(target, tool, args, onEvent);
   }
 
   async function state() {
@@ -1366,24 +1373,41 @@ export function createMockLink(mode = '') {
       };
     }
     const ordered = [activeNode, ...pairedNodes.filter((n) => n !== activeNode)];
+    const staleCheckedAt = isoAgo(600);
     const nodes = ordered.map((nodeName) => {
       const hasMachine = Boolean(machines[nodeName]?.reachable);
-      const whoami = hasMachine
-        ? resolveOne(nodeName, 'meta.whoami', {})
-        : {
+      const isOfflinePrimary = isPrimaryOffline && nodeName === 'tower';
+      const whoami = isOfflinePrimary
+        ? {
             principal: 'phone',
-            role,
-            door: kind === 'app' ? 'ssh' : 'mock',
-            node: nodeName,
+            role: 'operator',
+            door: 'ssh',
+            node: 'tower',
             delegate: false,
             paths: null,
-            tools: allowedTools,
-          };
+            tools: null,
+            stale: true,
+          }
+        : hasMachine
+          ? resolveOne(nodeName, 'meta.whoami', {})
+          : {
+              principal: 'phone',
+              role,
+              door: kind === 'app' ? 'ssh' : 'mock',
+              node: nodeName,
+              delegate: false,
+              paths: null,
+              tools: allowedTools,
+            };
       const base = {
         node: nodeName,
         principal: whoami.principal,
         role: whoami.role,
         via: kind === 'app' ? 'ssh' : 'mock',
+        reachable: !isOfflinePrimary,
+        whoamiStale: isOfflinePrimary,
+        roleCheckedAt: isOfflinePrimary ? staleCheckedAt : isoAgo(5),
+        role_checked_at: isOfflinePrimary ? staleCheckedAt : isoAgo(5),
         origin: isFleet
           ? nodeName === 'tower'
             ? 'paired'
@@ -1391,8 +1415,8 @@ export function createMockLink(mode = '') {
           : typeof window !== 'undefined'
             ? window.location.origin
             : `https://${nodeName}.example.ts.net`,
-        version: '0.1.0',
-        build: 'mock00000000',
+        version: isOfflinePrimary ? '' : '0.1.0',
+        build: isOfflinePrimary ? null : 'mock00000000',
         protocol: 1,
         whoami,
       };
@@ -1498,7 +1522,26 @@ export function createMockLink(mode = '') {
     };
   }
 
-  async function tools() {
+  async function tools(options = {}) {
+    if (kind === 'app' && !options?.on) {
+      throw {
+        code: 'invalid_args',
+        message: 'Listing tools requires a single target machine in `on`.',
+        hint: 'Pass `on: "<machine>"` to name the machine whose tool catalogue you want.',
+        machine: null,
+      };
+    }
+    const target = options?.on || activeNode;
+    if (machines[target] && !machines[target].reachable) {
+      throw (
+        machines[target].error || {
+          code: 'unreachable',
+          message: `${target} did not answer.`,
+          hint: null,
+          machine: target,
+        }
+      );
+    }
     return mockToolsList;
   }
 

@@ -53,6 +53,14 @@ function ThisDevicePage({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const whoami = nodeInfo?.whoami;
+  const unreachable = nodeInfo?.reachable === false;
+  const checkedAt = nodeInfo?.roleCheckedAt || nodeInfo?.role_checked_at || null;
+  const asOfSuffix =
+    unreachable || whoami?.stale
+      ? checkedAt
+        ? ` (as of ${formatRelativeTime(checkedAt)})`
+        : ' (last known)'
+      : '';
   const plainPerms = describePlainPermissions(whoami, tools);
   const roleLines = describeRoleAccess(whoami, tools);
 
@@ -80,6 +88,17 @@ function ThisDevicePage({
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
+      ${unreachable
+        ? html`
+            <${Notice}
+              title=${`${nodeInfo?.node || 'This machine'} is unreachable right now.`}
+              hint=${checkedAt
+                ? `Showing the last known role on ${nodeInfo?.node || 'this machine'} as of ${formatRelativeTime(checkedAt)}.`
+                : `Showing the last known role on ${nodeInfo?.node || 'this machine'}.`}
+              kind="warn"
+            />
+          `
+        : null}
 
       <p class="label">Identity</p>
       <div class="list">
@@ -87,13 +106,13 @@ function ThisDevicePage({
           <dt>${technical ? 'principal' : 'Name'}</dt>
           <dd>${whoami?.principal || nodeInfo?.principal || 'Unknown'}</dd>
           <dt>${technical ? 'node' : 'Connected to'}</dt>
-          <dd>${whoami?.node || nodeInfo?.node || 'Unknown'}</dd>
+          <dd>${nodeInfo?.node || whoami?.node || 'Unknown'}${unreachable ? ' (unreachable)' : ''}</dd>
           <dt>${technical ? 'access' : 'What it can do'}</dt>
-          <dd>${plainPerms}</dd>
+          <dd>${plainPerms}${asOfSuffix}</dd>
           ${technical
             ? html`
                 <dt>role</dt>
-                <dd>${whoami?.role || nodeInfo?.role || 'unknown'}</dd>
+                <dd>${whoami?.role || nodeInfo?.role || 'unknown'}${asOfSuffix}</dd>
                 <dt>door</dt>
                 <dd>${whoami?.door || link.kind}</dd>
                 <dt>allows</dt>
@@ -1832,7 +1851,12 @@ export function SettingsView({
 }) {
   const technical = Boolean(settings?.technical);
   const whoami = nodeInfo?.whoami;
+  const unreachable = nodeInfo?.reachable === false;
+  const checkedAt = nodeInfo?.roleCheckedAt || nodeInfo?.role_checked_at || null;
   const plainPerms = describePlainPermissions(whoami, tools);
+  const deviceSub = unreachable
+    ? `${nodeInfo?.node || 'Machine'} unreachable · ${plainPerms}${checkedAt ? ` (as of ${formatRelativeTime(checkedAt)})` : ' (last known)'}`
+    : `${whoami?.principal || nodeInfo?.principal || capitalize(deviceNoun)} · ${plainPerms}`;
   const nodeCount = (linkState?.nodes || []).length;
   const selectedPage = wide ? route.page || 'device' : route.page || null;
 
@@ -1848,9 +1872,7 @@ export function SettingsView({
         >
           <span class="body">
             <span class="title">This ${deviceNoun}</span>
-            <span class="sub">
-              ${whoami?.principal || nodeInfo?.principal || capitalize(deviceNoun)} · ${plainPerms}
-            </span>
+            <span class="sub">${deviceSub}</span>
           </span>
           <span class="chev" aria-hidden="true">›</span>
         </a>

@@ -35,14 +35,48 @@ const PREFERRED_RELAY_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Door-level discovery reads that genuinely mean "whichever node answers" when `on` is omitted.
 ///
-/// Every tool that acts on or reads from a specific machine (including `device.invite`,
-/// `device.list`, `device.remove`, `device.set`, `config.read`, etc.) must name its machine in
-/// `on`.
+/// Every tool that acts on or reads from a specific machine (including `meta.whoami`,
+/// `meta.version`, `device.invite`, `device.list`, `device.remove`, `device.set`, `config.read`,
+/// etc.) must name its machine in `on`.
 fn is_any_node_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "meta.whoami" | "meta.version" | "fleet.list" | "fleet.ping" | "device.endpoint"
-    )
+    matches!(tool, "fleet.list" | "fleet.ping" | "device.endpoint")
+}
+
+fn now_rfc3339_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86_400) as i64;
+    let sod = secs % 86_400;
+    let hour = sod / 3_600;
+    let minute = (sod % 3_600) / 60;
+    let second = sod % 60;
+    // Civil date from Unix epoch days (Howard Hinnant algorithm).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn label_discovery_result(tool: &str, answering: &str, mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "answered_by".to_owned(),
+            Value::String(answering.to_owned()),
+        );
+        if tool == "fleet.list" && !obj.contains_key("node") {
+            obj.insert("node".to_owned(), Value::String(answering.to_owned()));
+        }
+    }
+    value
 }
 
 /// Returns `true` only in debug builds when the loopback test switch is explicitly enabled (either
@@ -260,17 +294,22 @@ impl Backend for LinkBackend {
     fn tools(&self, on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
         Box::pin(async move {
             let (link, route_hint) = self.active_link_and_route_hint()?;
-            let Some(hint_name) = route_hint else {
+            if route_hint.is_none() {
                 return Err(AppError::not_paired());
-            };
-            let (answering, value) = link
-                .tools_any(Some(&hint_name), on)
-                .await
-                .map_err(AppError::from)?;
-            if answering != hint_name {
-                self.note_preferred_relay(&answering);
             }
-            let tools = value
+            let parsed_target = parse_optional_target(on).map_err(AppError::from)?;
+            let Some(Target::One(machine)) = parsed_target else {
+                return Err(AppError::new(
+                    ErrorCode::InvalidArgs,
+                    "Listing tools requires a single target machine in `on`.",
+                )
+                .with_hint(
+                    "Pass `on: \"<machine>\"` to name the machine whose tool catalogue you want.",
+                ));
+            };
+            let routed = link.tools_machine(&machine).await.map_err(AppError::from)?;
+            let tools = routed
+                .value
                 .get("tools")
                 .and_then(Value::as_array)
                 .cloned()
@@ -340,7 +379,7 @@ impl Backend for LinkBackend {
                     if answering != hint_name {
                         self.note_preferred_relay(&answering);
                     }
-                    Ok(value)
+                    Ok(label_discovery_result(&request.tool, &answering, value))
                 }
                 None => Err(AppError::new(
                     ErrorCode::InvalidArgs,
@@ -428,6 +467,7 @@ impl Backend for LinkBackend {
                 node: enrolled.node.clone(),
                 role: Some(enrolled.role.clone()),
                 device: Some(enrolled.device.clone()),
+                role_checked_at: Some(now_rfc3339_utc()),
             };
 
             // Compute, save, and swap under the single state lock while still holding mutate_lock.
@@ -922,6 +962,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             node: LOCAL_NODE_ID.to_owned(),
             principal: "local".to_owned(),
             role: "owner".to_owned(),
+            role_checked_at: None,
             via: "local".to_owned(),
             path: Some(local_path.clone()),
             origin: "paired".to_owned(),
@@ -1018,6 +1059,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             role: meta
                 .and_then(|m| m.role.clone())
                 .unwrap_or_else(|| "unknown".to_owned()),
+            role_checked_at: meta.and_then(|m| m.role_checked_at.clone()),
             via: via.to_owned(),
             path,
             origin: origin.to_owned(),
@@ -1231,11 +1273,13 @@ mod tests {
             node: "tower".to_owned(),
             role: Some("operator".to_owned()),
             device: Some("pixel-phone".to_owned()),
+            role_checked_at: None,
         });
         data.upsert_meta(StoredNodeMeta {
             node: "pi".to_owned(),
             role: Some("observer".to_owned()),
             device: Some("pixel-phone".to_owned()),
+            role_checked_at: None,
         });
         store.save(&data)?;
 
@@ -1794,8 +1838,15 @@ mod tests {
         assert_eq!(st.nodes[0].node, "tower");
         assert_eq!(st.nodes[1].node, "pi");
 
-        // Machine-scoped tools (including device.invite and device.list) without `on` are refused.
-        for tool in ["device.invite", "device.list", "sys.reboot"] {
+        // Machine-scoped tools (including meta.whoami, meta.version, device.invite, device.list)
+        // and the tool list without `on` are refused.
+        for tool in [
+            "meta.whoami",
+            "meta.version",
+            "device.invite",
+            "device.list",
+            "sys.reboot",
+        ] {
             let err = backend
                 .call(
                     CallRequest {
@@ -1813,6 +1864,33 @@ mod tests {
                 err.code,
                 ErrorCode::InvalidArgs,
                 "tool {tool} must require on"
+            );
+        }
+        let tools_err = backend
+            .tools(None)
+            .await
+            .err()
+            .ok_or("expected InvalidArgs when tools() omits on")?;
+        assert_eq!(tools_err.code, ErrorCode::InvalidArgs);
+
+        // Unqualified discovery reads (`fleet.list`, `fleet.ping`, `device.endpoint`) remain
+        // allowed and are labelled with the machine that answered.
+        for discovery in ["fleet.list", "fleet.ping", "device.endpoint"] {
+            let res = backend
+                .call(
+                    CallRequest {
+                        id: None,
+                        tool: discovery.to_owned(),
+                        args: serde_json::json!({}),
+                        on: None,
+                    },
+                    None,
+                )
+                .await?;
+            assert_eq!(
+                res.get("answered_by"),
+                Some(&Value::String("pi".to_owned())),
+                "discovery tool {discovery} must be labelled with answered_by"
             );
         }
 
@@ -1998,6 +2076,7 @@ mod tests {
             node: "tower".to_owned(),
             role: Some("owner".to_owned()),
             device: Some("pixel".to_owned()),
+            role_checked_at: None,
         });
         store.save(&initial)?;
 

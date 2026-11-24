@@ -320,17 +320,17 @@ test('refreshFleetProgressive preserves busyState (busy object reasons and unmon
   assert.deepEqual(pi.busyReasons, [probeReason]);
 });
 
-test('refreshFleetProgressive in app mode routes machine details directly and handles active node failover when A is off', async () => {
+test('refreshFleetProgressive in app mode keeps selected node fixed when A is off and B answers fleet.list', async () => {
   const seenOn = [];
-  const activeChanges = [];
   const link = {
     kind: 'app',
     async call(tool, args = {}, opts = {}) {
       seenOn.push({ tool, on: opts.on ?? null });
       if (tool === 'fleet.list') {
-        // Originally paired node tower is off; pi answered via failover.
+        // Originally selected node tower is off; pi answered discovery read.
         return {
           node: 'pi',
+          answered_by: 'pi',
           machines: [
             { name: 'pi', this_node: true, systems: [], wake_via: [] },
             { name: 'tower', this_node: false, systems: [], wake_via: [] },
@@ -340,6 +340,7 @@ test('refreshFleetProgressive in app mode routes machine details directly and ha
       if (tool === 'fleet.ping') {
         assert.deepEqual(args.machines, ['tower']);
         return {
+          answered_by: 'pi',
           results: [
             {
               machine: 'tower',
@@ -375,22 +376,18 @@ test('refreshFleetProgressive in app mode routes machine details directly and ha
   const finalSnap = await refreshFleetProgressive({
     link,
     localNode: 'tower',
-    onActiveNodeChanged(next) {
-      activeChanges.push(next);
-    },
     onUpdate() {},
     now: () => 1700000300000,
   });
 
-  assert.deepEqual(activeChanges, ['pi']);
   const pi = finalSnap.machines.find((m) => m.name === 'pi');
   const tower = finalSnap.machines.find((m) => m.name === 'tower');
   assert.equal(pi.reachable, true);
-  assert.equal(pi.thisNode, true);
+  assert.equal(pi.thisNode, false, 'answering peer must not become the selected node');
   assert.equal(pi.sys.node, 'pi');
   assert.equal(tower.reachable, false);
   assert.equal(tower.status, 'offline');
-  assert.equal(tower.thisNode, false);
+  assert.equal(tower.thisNode, true, 'selected node stays marked as selected even while offline');
   // In app mode, detail calls carry explicit `on: machine` so Link routes directly.
   assert.ok(seenOn.some((c) => c.tool === 'sys.info' && c.on === 'pi'));
 });

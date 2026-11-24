@@ -299,6 +299,9 @@ pub struct NodeLink {
     pub principal: String,
     /// Role granted to that principal.
     pub role: String,
+    /// RFC 3339 UTC timestamp when the stored role was last confirmed on this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_checked_at: Option<String>,
     /// Transport used to reach the node (`ssh` or `local`).
     pub via: String,
     /// Canonical path to the local `legion` binary when `via == "local"`.
@@ -587,6 +590,7 @@ mod tests {
                 node: "tower".to_owned(),
                 principal: "phone".to_owned(),
                 role: "operator".to_owned(),
+                role_checked_at: None,
                 via: "ssh".to_owned(),
                 path: None,
                 origin: "paired".to_owned(),

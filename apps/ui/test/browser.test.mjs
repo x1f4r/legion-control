@@ -1037,6 +1037,16 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText('This device may not see the roles on tower; ask the owner.').waitFor();
     await assertNoToolNames(p, 'fleet invite policy refused plain');
 
+    // 7. Unreachable selected node (`aoff`): keeps selected node (`tower`) shown as unreachable
+    //    with its last known role marked "as of <when>", never adopting answering peer (`pi`).
+    await p.goto(`${server.url}/?mock=fleet,aoff#/settings/device`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('tower is unreachable right now.').waitFor();
+    await p.getByText(/as of /i).first().waitFor();
+    await p.getByText('tower (unreachable)').waitFor();
+    await assertNoToolNames(p, 'offline selected node device page plain');
+
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);

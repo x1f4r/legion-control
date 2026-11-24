@@ -166,6 +166,90 @@ test('createAppLink exposes learn, acceptIdentityChange, and preserves last_pair
 
     await link.dismissIdentityChange('mini');
     assert.ok(calls.some((c) => c.command === 'dismiss_identity_change' && c.payload.node === 'mini'));
+
+    // state() must pass explicit `on: <selected node>` for meta.whoami and meta.version.
+    const whoamiCall = calls.find((c) => c.command === 'call' && c.payload.tool === 'meta.whoami');
+    const versionCall = calls.find((c) => c.command === 'call' && c.payload.tool === 'meta.version');
+    assert.equal(whoamiCall?.payload?.on, 'tower');
+    assert.equal(versionCall?.payload?.on, 'tower');
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});
+
+test('createAppLink state() keeps selected node unreachable with last known role and never substitutes another node', async () => {
+  const prevWindow = globalThis.window;
+  const seenCalls = [];
+  const checkedAt = '2026-11-24T22:00:00Z';
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          seenCalls.push({ command, payload });
+          if (command === 'state') {
+            return Promise.resolve({
+              ready: true,
+              nodes: [
+                {
+                  node: 'tower',
+                  principal: 'device:pixel',
+                  role: 'operator',
+                  role_checked_at: checkedAt,
+                  via: 'ssh',
+                },
+                {
+                  node: 'pi',
+                  principal: 'device:pixel',
+                  role: 'observer',
+                  via: 'ssh',
+                },
+              ],
+            });
+          }
+          if (command === 'call' && payload.tool === 'meta.whoami') {
+            assert.equal(payload.on, 'tower');
+            return Promise.reject({
+              code: 'unreachable',
+              message: 'Could not reach tower.',
+              machine: 'tower',
+            });
+          }
+          if (command === 'call' && payload.tool === 'meta.version') {
+            assert.equal(payload.on, 'tower');
+            return Promise.reject({
+              code: 'unreachable',
+              message: 'Could not reach tower.',
+              machine: 'tower',
+            });
+          }
+          return Promise.resolve({});
+        },
+        Channel: class FakeChannel {
+          constructor() {
+            this.onmessage = null;
+          }
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const st = await link.state();
+    assert.equal(st.ready, true);
+    assert.equal(st.error, undefined);
+    assert.equal(st.nodes[0].node, 'tower');
+    assert.equal(st.nodes[0].reachable, false);
+    assert.equal(st.nodes[0].whoamiStale, true);
+    assert.equal(st.nodes[0].role, 'operator');
+    assert.equal(st.nodes[0].roleCheckedAt, checkedAt);
+    assert.equal(st.nodes[0].whoami?.role, 'operator');
+    assert.equal(st.nodes[0].whoami?.stale, true);
+    assert.equal(st.nodes[1].node, 'pi');
   } finally {
     if (prevWindow === undefined) {
       delete globalThis.window;
