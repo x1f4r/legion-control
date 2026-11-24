@@ -131,6 +131,9 @@ UsePAM no
 Subsystem sftp internal-sftp
 LogLevel VERBOSE
 SSHD_CFG
+if /usr/sbin/sshd -G -f /dev/null -o PerSourcePenalties=no >/dev/null 2>&1; then
+  echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config_legion
+fi
 
 /usr/sbin/sshd -t -f /etc/ssh/sshd_config_legion
 /usr/sbin/sshd -f /etc/ssh/sshd_config_legion -E /tmp/sshd-legion.log
@@ -155,6 +158,9 @@ UsePAM no
 Subsystem sftp internal-sftp
 LogLevel VERBOSE
 SSHD_CFG2
+if /usr/sbin/sshd -G -f /dev/null -o PerSourcePenalties=no >/dev/null 2>&1; then
+  echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config_legion_2
+fi
 
 /usr/sbin/sshd -t -f /etc/ssh/sshd_config_legion_2
 /usr/sbin/sshd -f /etc/ssh/sshd_config_legion_2 -E /tmp/sshd-legion-2.log
