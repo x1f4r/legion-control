@@ -233,7 +233,7 @@ Discover peer machines from `tailscale status --json` using their MagicDNS names
 
 Effect: `admin`
 
-Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Detects the remote OS and architecture, fetches and verifies the matching release artifact against SHA256SUMS (or uses a cached copy or a local file passed via `from`), copies it atomically into place, and opens a normal session to verify the installed version.
+Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, and opens a normal session to verify the installed version.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -241,6 +241,7 @@ Install or upgrade the legion binary on a machine in fleet.toml using only ssh a
 | `version` | `string` | no | - | Release version to install (for example `0.2.0` or `legion-v0.2.0`). Defaults to the latest published `legion-v*` release. Cannot be combined with `from`. |
 | `from` | `string` | no | - | Local path on this node to a `legion` binary already built for the target machine. |
 | `dry_run` | `boolean` | no | `false` | Probe the remote machine and report what would be copied where without modifying it. |
+| `allow_downgrade` | `boolean` | no | `false` | Permit installing a version older than the machine's current version or recorded version floor. |
 
 ### `fleet.list`
 
@@ -579,7 +580,7 @@ Wait until a background job is no longer starting or running and return the same
 | --- | --- | --- |
 | `meta.doctor` | `read` | Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml answers (unless quick=true). |
 | `meta.init` | `admin` | Create starter node.toml and policy.toml files where they do not already exist, leaving every existing file untouched so it is safe to run again. |
-| `meta.update` | `admin` | Replace this node's legion binary with a verified GitHub release artifact (downloading and checking SHA256SUMS, then replacing atomically). |
+| `meta.update` | `admin` | Replace this node's legion binary with an offline-signed GitHub release artifact. |
 | `meta.version` | `read` | Say which build of legion this node runs, the protocol it speaks, and its operating system and architecture. |
 | `meta.whoami` | `read` | Say who the caller is on this node: the principal and role it acts as, the door it came through, the directories file tools are confined to, and the tools it may use. |
 
@@ -609,12 +610,13 @@ Create starter node.toml and policy.toml files where they do not already exist, 
 
 Effect: `admin`
 
-Replace this node's legion binary with a verified GitHub release artifact (downloading and checking SHA256SUMS, then replacing atomically). On Windows, renames the running executable aside first so it can be cleaned up on the next start.
+Replace this node's legion binary with an offline-signed GitHub release artifact. Requires a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it; to install an unsigned local build use fleet.install with from=<local file> or install scripts with --from), verifies SHA-256, and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `version` | `string` | no | - | Release version to install (for example `0.2.0` or `legion-v0.2.0`). Defaults to the latest published `legion-v*` release. |
+| `version` | `string` | no | - | Release version to install (for example `0.2.0` or `legion-v0.2.0`). Defaults to the highest published stable `legion-v*` semantic version. |
 | `dry_run` | `boolean` | no | `false` | Resolve the target release and report what would be replaced without downloading or writing. |
+| `allow_downgrade` | `boolean` | no | `false` | Permit replacing with a version older than the running binary or the recorded version floor. |
 
 ### `meta.version`
 
