@@ -991,7 +991,7 @@ fn format_handshake_unreachable(
             format!(
                 "Could not open a legion session on {machine}: received {lines} non-protocol lines ({bytes} bytes) before hello."
             ),
-            Some(json!({"reason": "non_protocol_output"})),
+            Some(json!({"reason": crate::REASON_NON_PROTOCOL_OUTPUT})),
         ),
         HandshakeFailure::BadHelloResult(reason) => (
             ErrorCode::Failed,

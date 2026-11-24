@@ -53,6 +53,25 @@ pub mod session;
 pub mod ssh;
 pub mod stderr;
 
+/// Structured `details.reason` for a pinned host key mismatch (`code: "denied"`).
+pub const REASON_HOST_KEY_MISMATCH: &str = "host_key_mismatch";
+/// Structured `details.reason` for rejected SSH key authentication on a low-level SSH open or
+/// invite enrolment (`code: "denied"`).
+pub const REASON_AUTH_FAILED: &str = "auth_failed";
+/// Structured `details.reason` emitted by [`Link`] when SSH key authentication to a paired node
+/// is rejected, indicating the device key was removed from or is unknown on that node
+/// (`code: "denied"`).
+pub const REASON_DEVICE_REMOVED_OR_UNKNOWN: &str = "device_removed_or_unknown";
+/// Structured `details.reason` for a DNS, TCP connect, or SSH handshake timeout
+/// (`code: "timeout"`).
+pub const REASON_TIMEOUT: &str = "timeout";
+/// Structured `details.reason` for an unreachable host or failed SSH transport/channel
+/// (`code: "unreachable"`).
+pub const REASON_UNREACHABLE: &str = "unreachable";
+/// Structured `details.reason` when the remote side emits too much non-protocol output before
+/// answering `hello` (`code: "unreachable"`).
+pub const REASON_NON_PROTOCOL_OUTPUT: &str = "non_protocol_output";
+
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
@@ -69,10 +88,7 @@ pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,
 };
 #[cfg(feature = "ssh")]
-pub use ssh::{
-    REASON_AUTH_FAILED, REASON_HOST_KEY_MISMATCH, REASON_TIMEOUT, REASON_UNREACHABLE, SshPipe,
-    SshPipeHandle,
-};
+pub use ssh::{SshPipe, SshPipeHandle};
 pub use stderr::StderrTail;
 
 /// Wire types re-exported from `legion-proto`.

@@ -840,7 +840,9 @@ impl Link {
                 .push(old);
         }
 
-        let session = (self.inner.opener)(entry.clone(), device_key, cancel).await?;
+        let session = (self.inner.opener)(entry.clone(), device_key, cancel)
+            .await
+            .map_err(|err| classify_open_error(node, err))?;
         let live = LiveSession {
             session: Arc::new(session),
             config_snapshot: entry,
@@ -1036,6 +1038,38 @@ pub fn parse_optional_target(on: Option<Value>) -> Result<Option<Target>, ErrorB
         ErrorBody::new(ErrorCode::InvalidArgs, format!("on: {reason}."))
             .with_hint("Give on as a machine name, comma-separated names, a list of names, or \"all\", or omit it.")
     })
+}
+
+fn classify_open_error(node: &str, mut err: ErrorBody) -> ErrorBody {
+    let is_auth_failed = err.code == ErrorCode::Denied
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some(crate::REASON_AUTH_FAILED);
+    if !is_auth_failed {
+        return err;
+    }
+    let mut details = err.details.take().unwrap_or_else(|| json!({}));
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert(
+            "reason".to_owned(),
+            json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN),
+        );
+    } else {
+        details = json!({ "reason": crate::REASON_DEVICE_REMOVED_OR_UNKNOWN });
+    }
+    let machine = err.machine.unwrap_or_else(|| node.to_owned());
+    ErrorBody::new(
+        ErrorCode::Denied,
+        format!(
+            "Device key was rejected by {node}; this device may have been removed or is not paired on the node."
+        ),
+    )
+    .with_hint("Pair this device again with a fresh invite from `legion pair` on the node.")
+    .with_machine(machine)
+    .with_details(details)
 }
 
 fn event_to_value(event: &Event) -> Value {
@@ -1879,6 +1913,91 @@ mod tests {
             .unwrap_err();
         assert_eq!(bad_key_err.code, ErrorCode::InvalidArgs);
         assert_eq!(broken_link.config(), broken_cfg);
+
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_device_key_on_reconnect_maps_to_device_removed_or_unknown() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let opens_c = Arc::clone(&opens);
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let attempt = opens_c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if attempt == 0 {
+                    // First session works, then drops after one call.
+                    let (r, w) = spawn_mock_node(entry.node.clone(), true, None);
+                    Session::open_io(r, w, &entry.node, None, Duration::from_secs(5), cancel).await
+                } else {
+                    // Reconnect sees SSH key auth rejected (key was removed on the node).
+                    Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        "SSH key authentication for me on tower.example.net:22 was rejected.",
+                    )
+                    .with_machine(&entry.node)
+                    .with_details(json!({
+                        "reason": crate::REASON_AUTH_FAILED,
+                        "user": "me",
+                        "host": "tower.example.net",
+                        "port": 22,
+                    })))
+                }
+            })
+        });
+
+        let link = Link::with_opener(test_config("tower"), LinkOptions::default(), opener);
+
+        // Initial call works.
+        let ok = link
+            .call("tower", "sys.info", json!({}), None, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(ok["ok"], json!(true));
+
+        // Let the reader observe EOF from the mock node.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Reconnect fails with `device_removed_or_unknown` and a hint to pair again.
+        let err = link
+            .call("tower", "sys.info", json!({}), None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert_eq!(err.machine.as_deref(), Some("tower"));
+        let details = err.details.as_ref().unwrap();
+        assert_eq!(
+            details["reason"],
+            json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+        );
+        assert_eq!(details["host"], json!("tower.example.net"));
+        assert_eq!(details["port"], json!(22));
+        assert_eq!(details["user"], json!("me"));
+        let hint = err.hint.as_deref().unwrap().to_ascii_lowercase();
+        assert!(hint.contains("pair"), "expected pair hint, got: {hint}");
+
+        // Non-auth errors such as host_key_mismatch are preserved untouched.
+        let mismatch_opener: SessionOpener = Arc::new(|entry, _, _| {
+            Box::pin(async move {
+                Err(ErrorBody::new(ErrorCode::Denied, "Host key mismatch.")
+                    .with_machine(&entry.node)
+                    .with_details(json!({
+                        "reason": crate::REASON_HOST_KEY_MISMATCH,
+                        "host": "tower.example.net",
+                        "port": 22,
+                    })))
+            })
+        });
+        let mismatch_link = Link::with_opener(
+            test_config("tower"),
+            LinkOptions::default(),
+            mismatch_opener,
+        );
+        let mismatch = mismatch_link.hello("tower").await.unwrap_err();
+        assert_eq!(mismatch.code, ErrorCode::Denied);
+        assert_eq!(
+            mismatch.details.as_ref().unwrap()["reason"],
+            json!(crate::REASON_HOST_KEY_MISMATCH)
+        );
 
         link.close().await;
     }
