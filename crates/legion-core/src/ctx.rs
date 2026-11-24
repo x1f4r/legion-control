@@ -139,6 +139,7 @@ pub struct Ctx {
     pub(crate) grant: Grant,
     pub(crate) cancel: CancellationToken,
     pub(crate) events: EventSink,
+    pub(crate) hops: u32,
 }
 
 impl Ctx {
@@ -170,6 +171,12 @@ impl Ctx {
     /// The door the call came through.
     pub fn door(&self) -> Door {
         self.door
+    }
+
+    /// How many nodes have already forwarded the call this tool is running for; `0` when the call
+    /// started on this node.
+    pub fn hops(&self) -> u32 {
+        self.hops
     }
 
     /// What the call is allowed. File tools check every path with

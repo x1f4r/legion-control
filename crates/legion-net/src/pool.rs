@@ -145,8 +145,8 @@ impl Fleet {
     }
 
     /// Runs a tool call on a remote `machine` from inside a tool, forwarding `ctx.principal()`,
-    /// cancellation, and events (tagged with `machine`), retrying once only if the session died
-    /// before any byte was written.
+    /// `ctx.hops() + 1`, cancellation, and events (tagged with `machine`), retrying once only if
+    /// the session died before any byte was written.
     pub async fn call_remote(
         &self,
         ctx: &Ctx,
@@ -155,6 +155,19 @@ impl Fleet {
         args: Value,
         events: EventSink,
     ) -> Result<Value, ErrorBody> {
+        let next_hops = ctx.hops().saturating_add(1);
+        if next_hops > MAX_HOPS {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Forwarding {tool} to {machine} exceeded the maximum of {MAX_HOPS} hops (possible routing loop)."
+                ),
+            )
+            .with_hint(
+                "Check fleet.toml and node.toml on the machines along the path so they do not forward to each other in a cycle.",
+            )
+            .with_machine(machine));
+        }
         let here = ctx.node_name();
         let fleet_file = ctx
             .config()
@@ -173,7 +186,7 @@ impl Fleet {
             args,
             as_principal: Some(ctx.principal().to_owned()),
             on: relayed.then(|| Target::One(machine.to_owned())),
-            hops: 1,
+            hops: next_hops,
         };
         self.execute_on_machine(
             direct_machine,
@@ -1371,5 +1384,144 @@ fn ping_failed(machine: &str, error: ErrorBody) -> PingOutcome {
         arch: None,
         latency_ms: None,
         error: Some(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use legion_core::{BoxFuture, Door, NoArgs, Registry, Tool, ToolError};
+    use legion_proto::{Effect, HelloResult, Id, PROTOCOL, Request, Response, ToolSpec};
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    use super::*;
+
+    struct RelayTool {
+        spec: ToolSpec,
+        fleet: Fleet,
+    }
+
+    impl Tool for RelayTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            ctx: &'a Ctx,
+            _args: Value,
+        ) -> BoxFuture<'a, Result<Value, ToolError>> {
+            Box::pin(async move {
+                self.fleet
+                    .call_remote(ctx, "pi", "meta.version", json!({}), EventSink::discard())
+                    .await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn call_remote_increments_ctx_hops_and_enforces_max_hops() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\nssh = \"pi.example\"\n",
+        )
+        .unwrap();
+
+        let fleet = Fleet::new(&paths);
+        let fleet_file = ConfigStore::new(paths.config_dir())
+            .get::<FleetFile>()
+            .unwrap();
+        let entry = fleet_file.machine("pi").unwrap();
+        let systems = entry.resolved_systems();
+
+        // Install an in-memory session for `pi` that echoes back `params.hops`.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await.unwrap().unwrap();
+            let hello = Response::ok(
+                Some(Id::Number(1)),
+                serde_json::to_value(HelloResult {
+                    node: "pi".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    protocol: PROTOCOL,
+                    os: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    systems: Vec::new(),
+                })
+                .unwrap(),
+            );
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Request = serde_json::from_str(&line).unwrap();
+                let seen_hops = req.params["hops"].as_u64().unwrap_or(0);
+                let reply = Response::ok(req.id, json!({"seen_hops": seen_hops}));
+                server_w
+                    .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                    .await
+                    .unwrap();
+                server_w.flush().await.unwrap();
+            }
+        });
+
+        let session = Session::open_io(
+            client_r,
+            client_w,
+            "pi",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let slot = fleet.slot("pi");
+        *slot.current.lock().unwrap() = Some(LiveEntry {
+            session: Arc::new(session),
+            systems_fingerprint: systems.clone(),
+            active_system: systems[0].clone(),
+            active_os: None,
+        });
+
+        let mut registry = Registry::new();
+        registry.add(RelayTool {
+            spec: ToolSpec {
+                name: "test.relay".to_owned(),
+                description: "Calls pi via Fleet::call_remote.".to_owned(),
+                effect: Effect::Read,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+            fleet: fleet.clone(),
+        });
+        let node = Node::new(paths, registry);
+
+        let mut call0 = Call::new(Door::Cli, "test.relay", json!({}));
+        call0.hops = 0;
+        let out0 = node.call(call0).await.unwrap();
+        assert_eq!(out0["seen_hops"], json!(1));
+
+        let mut call2 = Call::new(Door::Rpc, "test.relay", json!({}));
+        call2.hops = 2;
+        let out2 = node.call(call2).await.unwrap();
+        assert_eq!(out2["seen_hops"], json!(3));
+
+        let mut call_max = Call::new(Door::Rpc, "test.relay", json!({}));
+        call_max.hops = MAX_HOPS;
+        let err = node.call(call_max).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(err.message.contains("3 hops"), "{}", err.message);
+
+        fleet.close().await;
+        server_task.await.unwrap();
     }
 }

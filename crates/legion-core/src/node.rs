@@ -300,6 +300,7 @@ impl Node {
             grant,
             cancel: call.cancel.clone(),
             events: call.events,
+            hops: call.hops,
         };
         let work = tool.call(&ctx, call.args);
         tokio::pin!(work);
