@@ -356,25 +356,20 @@ impl McpDoor {
     }
 }
 
-/// A tool's outcome as an MCP result: the JSON object as indented text, which every client shows
-/// the model, and as structured content for clients that read that instead. A failure is the
-/// error object the same two ways, marked as an error.
+/// A tool's outcome as an MCP result: the JSON object as one line of text, which every client
+/// shows the model. It is not sent as structured content as well: no tool declares an output
+/// schema to check that against, and a client that passes on both would cost the model every
+/// byte twice. A failure is the error object, marked as an error.
 fn tool_result(outcome: Result<Value, ErrorBody>) -> CallToolResult {
-    let (value, failed) = match outcome {
-        Ok(value) => (value, false),
-        Err(error) => match serde_json::to_value(&error) {
-            Ok(value) => (value, true),
-            Err(_) => (json!({"code": "internal", "message": error.message}), true),
-        },
-    };
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    let mut result = if failed {
-        CallToolResult::error(vec![ContentBlock::text(text)])
-    } else {
-        CallToolResult::success(vec![ContentBlock::text(text)])
-    };
-    result.structured_content = Some(value);
-    result
+    match outcome {
+        Ok(value) => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
+        Err(error) => {
+            let text = serde_json::to_string(&error).unwrap_or_else(|_| {
+                json!({"code": "internal", "message": error.message}).to_string()
+            });
+            CallToolResult::error(vec![ContentBlock::text(text)])
+        }
+    }
 }
 
 fn to_object<T: Serialize>(value: &T) -> Result<Value, ErrorBody> {

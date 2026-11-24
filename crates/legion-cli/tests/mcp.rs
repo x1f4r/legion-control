@@ -195,20 +195,26 @@ impl Drop for Mcp {
     }
 }
 
-/// A successful tool result's object, checking that its text and structured content agree.
+/// The one JSON object a tool result carries: as one line of text, and only there.
+fn payload(result: &Value) -> Value {
+    assert_eq!(result.get("structuredContent"), None, "{result}");
+    let content = result["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1, "{result}");
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(!text.contains('\n'), "{text}");
+    serde_json::from_str(text).unwrap()
+}
+
+/// A successful tool result's object.
 fn ok(result: &Value) -> Value {
     assert_eq!(result["isError"], json!(false), "{result}");
-    let text = result["content"][0]["text"].as_str().unwrap();
-    let parsed: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed, result["structuredContent"], "{result}");
-    parsed
+    payload(result)
 }
 
 /// A failed tool result's error object, which must be a result and not a protocol error.
 fn failed(result: &Value) -> Value {
     assert_eq!(result["isError"], json!(true), "{result}");
-    let text = result["content"][0]["text"].as_str().unwrap();
-    let error: Value = serde_json::from_str(text).unwrap();
+    let error = payload(result);
     assert!(error["message"].is_string(), "{error}");
     error
 }
@@ -253,8 +259,6 @@ fn the_handshake_revision_lists_and_calls_the_tools() {
 
     let version = mcp.call("meta_version", json!({}));
     assert_eq!(version.get("resultType"), None);
-    let text = version["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("\n  \"name\": \"legion\""), "{text}");
     assert_eq!(ok(&version)["name"], json!("legion"));
     assert_eq!(
         ok(&mcp.call("meta_whoami", json!({})))["door"],
@@ -772,4 +776,24 @@ fn a_policy_that_does_not_parse_shows_nothing_and_every_call_says_why() {
         assert_eq!(failure["message"], error["message"], "{tool}");
     }
     assert_eq!(compact.finish().0, 0);
+}
+
+#[test]
+fn a_result_is_sent_once_as_compact_json() {
+    let home = Home::new();
+    let (mut mcp, _) = Mcp::initialized(&home, &[]);
+    let text = "x".repeat(200_000);
+    let echo = mcp.call("test_echo", json!({"text": text}));
+    assert_eq!(ok(&echo), json!({"text": text}));
+    // The reply is the payload once, plus the envelope around it.
+    let line = echo.to_string();
+    assert!(line.len() < text.len() + 200, "{} bytes", line.len());
+    assert_eq!(
+        echo["content"][0]["text"],
+        json!(json!({"text": text}).to_string())
+    );
+
+    let error = mcp.call("test_sleep", json!({"seconds": "long"}));
+    assert_eq!(failed(&error)["code"], json!("invalid_args"));
+    assert_eq!(mcp.finish().0, 0);
 }
