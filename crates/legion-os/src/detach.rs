@@ -1202,8 +1202,86 @@ fn is_safe_cmd_batch_arg(arg: &str) -> bool {
     })
 }
 
+/// Machine-readable stdout prefix emitted by the PowerShell `Invoke-CimMethod` fallback script:
+/// `LEGION_WMI_RESULT:<return_value>:<process_id>`.
+#[allow(dead_code)]
+pub(crate) const WMI_CIM_RESULT_PREFIX: &str = "LEGION_WMI_RESULT:";
+
+/// Parsed outcome of a PowerShell `Invoke-CimMethod` (`Win32_Process.Create`) invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WmiCimResult {
+    /// `ReturnValue == 0` and `ProcessId > 0`.
+    Started(u32),
+    /// Output proved a non-zero `ReturnValue` that cannot have started a process (`2`, `3`, `9`,
+    /// `21`) with `ProcessId == 0`.
+    NotStarted { return_value: u32, detail: String },
+    /// Anything else (transport failure, non-zero exit without a machine-readable result line,
+    /// `ReturnValue == 0` with `ProcessId == 0`, `ReturnValue == 8`, or any non-zero `ProcessId`
+    /// paired with a non-zero `ReturnValue`). Callers must wait for handoff and never fall back.
+    MaybeStarted { detail: String },
+}
+
+/// Parse stdout/stderr from [`build_wmi_create_script_for_cmdline`] into a strict [`WmiCimResult`].
+#[allow(dead_code)]
+pub(crate) fn parse_wmi_cim_output(stdout: &str, stderr: &str, exit_success: bool) -> WmiCimResult {
+    let result_line = stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(WMI_CIM_RESULT_PREFIX));
+
+    if let Some(payload) = result_line {
+        let mut parts = payload.split(':');
+        let rv = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+        let pid = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+        let extra = parts.next();
+
+        if let (Some(return_value), Some(process_id), None) = (rv, pid, extra) {
+            if return_value == 0 && process_id > 0 {
+                return WmiCimResult::Started(process_id);
+            }
+            if return_value != 0 && process_id == 0 {
+                return match classify_wmi_return_value(return_value) {
+                    WmiReturnValueClass::NotStarted { reason } => WmiCimResult::NotStarted {
+                        return_value,
+                        detail: format!(
+                            "Invoke-CimMethod Win32_Process.Create failed with ReturnValue={return_value} ({reason})"
+                        ),
+                    },
+                    WmiReturnValueClass::MaybeStarted { reason } => WmiCimResult::MaybeStarted {
+                        detail: format!(
+                            "Invoke-CimMethod Win32_Process.Create returned ambiguous ReturnValue={return_value} ({reason})"
+                        ),
+                    },
+                };
+            }
+            return WmiCimResult::MaybeStarted {
+                detail: format!(
+                    "Invoke-CimMethod Win32_Process.Create returned ambiguous result (ReturnValue={return_value}, ProcessId={process_id})"
+                ),
+            };
+        }
+        return WmiCimResult::MaybeStarted {
+            detail: format!("Invoke-CimMethod emitted malformed WMI result line: {payload:?}"),
+        };
+    }
+
+    let stderr_trimmed = stderr.trim();
+    let stdout_trimmed = stdout.trim();
+    let detail = if !stderr_trimmed.is_empty() {
+        format!("Invoke-CimMethod failed without a WMI result line: {stderr_trimmed}")
+    } else if !exit_success {
+        "Invoke-CimMethod exited with an error without a WMI result line".to_owned()
+    } else {
+        format!("Invoke-CimMethod exited without a WMI result line (stdout={stdout_trimmed:?})")
+    };
+    WmiCimResult::MaybeStarted { detail }
+}
+
 /// Build the outer PowerShell script that invokes `Win32_Process.Create` via `Invoke-CimMethod`
-/// for a pre-built `command_line` and prints the created wrapper PID to stdout.
+/// for a pre-built `command_line` and writes a machine-readable
+/// `LEGION_WMI_RESULT:<ReturnValue>:<ProcessId>` line to stdout.
 #[allow(dead_code)]
 pub(crate) fn build_wmi_create_script_for_cmdline(
     command_line: &str,
@@ -1234,9 +1312,13 @@ pub(crate) fn build_wmi_create_script_for_cmdline(
     lines.extend([
         "$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments $cimArgs"
             .to_owned(),
-        "if ($created.ReturnValue -ne 0 -or $created.ProcessId -le 0) { throw \"Win32_Process.Create failed with ReturnValue=$($created.ReturnValue)\" }"
+        "$rv = if ($null -ne $created.ReturnValue) { [string]$created.ReturnValue } else { '' }"
             .to_owned(),
-        "[Console]::Out.Write([string]$created.ProcessId)".to_owned(),
+        "$pidVal = if ($null -ne $created.ProcessId) { [string]$created.ProcessId } else { '0' }"
+            .to_owned(),
+        format!(
+            "[Console]::Out.WriteLine('{WMI_CIM_RESULT_PREFIX}' + $rv + ':' + $pidVal)"
+        ),
     ]);
     Ok(lines.join("\n"))
 }
@@ -1800,6 +1882,50 @@ mod tests {
             assert_eq!(
                 classify_wmi_return_value(code),
                 WmiReturnValueClass::NotStarted { reason }
+            );
+        }
+    }
+
+    #[test]
+    fn wmi_cim_output_parser_treats_only_proven_nonzero_return_values_as_not_started() {
+        assert_eq!(
+            parse_wmi_cim_output("LEGION_WMI_RESULT:0:4321\r\n", "", true),
+            WmiCimResult::Started(4321)
+        );
+        // Definitive pre-creation rejections with ProcessId=0 -> NotStarted.
+        for code in [2u32, 3, 9, 21] {
+            let line = format!("LEGION_WMI_RESULT:{code}:0\n");
+            assert!(
+                matches!(
+                    parse_wmi_cim_output(&line, "", true),
+                    WmiCimResult::NotStarted { return_value, .. } if return_value == code
+                ),
+                "code={code}"
+            );
+        }
+        // ReturnValue=8 ("unknown failure"), ReturnValue=0 with ProcessId=0, non-zero ReturnValue
+        // with ProcessId>0, transport exceptions with no result line, and malformed lines must all
+        // be MaybeStarted.
+        for (stdout, stderr, ok) in [
+            ("LEGION_WMI_RESULT:8:0\n", "", true),
+            ("LEGION_WMI_RESULT:0:0\n", "", true),
+            ("LEGION_WMI_RESULT:2:4321\n", "", true),
+            ("LEGION_WMI_RESULT:99:0\n", "", true),
+            ("LEGION_WMI_RESULT::0\n", "", true),
+            (
+                "",
+                "Invoke-CimMethod : The RPC server is unavailable.",
+                false,
+            ),
+            ("", "", false),
+            ("4321\n", "", true),
+        ] {
+            assert!(
+                matches!(
+                    parse_wmi_cim_output(stdout, stderr, ok),
+                    WmiCimResult::MaybeStarted { .. }
+                ),
+                "stdout={stdout:?} stderr={stderr:?} ok={ok} must be MaybeStarted"
             );
         }
     }
