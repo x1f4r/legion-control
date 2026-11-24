@@ -624,6 +624,53 @@ pub(crate) fn parse_linux_proc_stat(contents: &str) -> Option<(char, u64)> {
     Some((state, start_ticks))
 }
 
+/// Darwin `<sys/proc.h>` `SZOMB` state indicating an exited, unreaped zombie process.
+#[allow(dead_code)]
+pub(crate) const MACOS_SZOMB: u32 = 5;
+
+/// Process status and microsecond start timestamp extracted from macOS `proc_pidinfo`
+/// (`PROC_PIDTBSDINFO`) or `sysctl` (`CTL_KERN, KERN_PROC, KERN_PROC_PID`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct MacosProcSample {
+    /// Darwin process status (`pbi_status` / `kp_proc.p_stat`; [`MACOS_SZOMB`] is zombie).
+    pub(crate) status: u32,
+    /// Microseconds since the Unix epoch (`tv_sec * 1_000_000 + tv_usec`).
+    pub(crate) start_us: u64,
+}
+
+/// Convert a macOS `(tv_sec, tv_usec)` start time into the canonical microsecond value stored in
+/// [`ProcessId::start_time`], ensuring `proc_pidinfo` and `kinfo_proc` derive identical identities.
+#[allow(dead_code)]
+pub(crate) const fn macos_start_time_us(tv_sec: u64, tv_usec: u64) -> Option<u64> {
+    let start_us = tv_sec.saturating_mul(1_000_000).saturating_add(tv_usec);
+    if start_us == 0 { None } else { Some(start_us) }
+}
+
+/// Resolve a macOS PID's [`ProcessId`] from the primary `proc_pidinfo(PROC_PIDTBSDINFO)` sample
+/// and the fallback `sysctl(KERN_PROC_PID)` (`kinfo_proc`) sample.
+///
+/// On macOS, `proc_pidinfo` fails with `ESRCH` as soon as a process enters `P_WEXIT` (starts
+/// exiting), BEFORE the kernel closes its file descriptors and releases its `flock` locks.
+/// Falling back to `kinfo_proc` keeps an exiting-but-not-yet-zombie process alive—with the exact
+/// same identity—until `kinfo_proc` reports it absent or `SZOMB`.
+#[allow(dead_code)]
+pub(crate) fn resolve_macos_pid_identity(
+    pid: u32,
+    include_zombie: bool,
+    bsd_info: Option<MacosProcSample>,
+    kinfo: Option<MacosProcSample>,
+) -> Option<ProcessId> {
+    let sample = bsd_info.or(kinfo)?;
+    if !include_zombie && sample.status == MACOS_SZOMB {
+        return None;
+    }
+    if sample.start_us == 0 {
+        return None;
+    }
+    Some(ProcessId::new(pid, sample.start_us))
+}
+
 /// Run a short helper command synchronously with a hard timeout and return its stdout.
 ///
 /// Used by macOS and Windows `boot_id` lookups so a stalled WMI/sysctl call cannot block a caller
@@ -753,6 +800,69 @@ mod tests {
         assert_eq!(parse_linux_proc_stat(zombie), Some(('Z', 42)));
 
         assert_eq!(parse_linux_proc_stat("malformed"), None);
+    }
+
+    #[test]
+    fn macos_pid_identity_fallback_keeps_exiting_process_alive_until_zombie_or_gone() {
+        let start_us = macos_start_time_us(1_795_486_867, 833_293).unwrap();
+        assert_eq!(start_us, 1_795_486_867_833_293);
+        assert_eq!(macos_start_time_us(0, 0), None);
+
+        let running = MacosProcSample {
+            status: 2, // SRUN
+            start_us,
+        };
+        let zombie = MacosProcSample {
+            status: MACOS_SZOMB,
+            start_us,
+        };
+        let expected_id = ProcessId::new(4242, start_us);
+
+        // Normal live process reported by `proc_pidinfo`.
+        assert_eq!(
+            resolve_macos_pid_identity(4242, false, Some(running), None),
+            Some(expected_id)
+        );
+        // `proc_pidinfo` reports zombie: gone when `!include_zombie` even if fallback were present;
+        // still returned when `include_zombie` is true.
+        assert_eq!(
+            resolve_macos_pid_identity(4242, false, Some(zombie), Some(running)),
+            None
+        );
+        assert_eq!(
+            resolve_macos_pid_identity(4242, true, Some(zombie), None),
+            Some(expected_id)
+        );
+
+        // Exiting (`P_WEXIT`) window: `proc_pidinfo` fails with `ESRCH` (`None`), while
+        // `kinfo_proc` still sees the process non-zombie -> remains alive with identical identity.
+        let from_fallback = resolve_macos_pid_identity(4242, false, None, Some(running));
+        assert_eq!(from_fallback, Some(expected_id));
+
+        // Once the kernel finishes closing FDs and transitions the process to `SZOMB`, fallback
+        // reports gone for `include_zombie = false`, and still yields identity for `true`.
+        assert_eq!(
+            resolve_macos_pid_identity(4242, false, None, Some(zombie)),
+            None
+        );
+        assert_eq!(
+            resolve_macos_pid_identity(4242, true, None, Some(zombie)),
+            Some(expected_id)
+        );
+
+        // Absent in both `proc_pidinfo` and `kinfo_proc` -> gone.
+        assert_eq!(resolve_macos_pid_identity(4242, false, None, None), None);
+        assert_eq!(resolve_macos_pid_identity(4242, true, None, None), None);
+
+        // Zero start timestamp is rejected.
+        let zero = MacosProcSample {
+            status: 2,
+            start_us: 0,
+        };
+        assert_eq!(
+            resolve_macos_pid_identity(4242, false, None, Some(zero)),
+            None
+        );
     }
 
     #[test]

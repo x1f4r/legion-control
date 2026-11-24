@@ -128,6 +128,11 @@ fn main() -> ExitCode {
         ("lock_contention_and_crash_release_across_processes", || {
             Box::pin(test_lock_contention_and_crash_release_across_processes())
         }),
+        #[cfg(target_os = "macos")]
+        (
+            "macos_is_alive_stays_true_until_killed_child_releases_flock",
+            || Box::pin(test_macos_is_alive_stays_true_until_killed_child_releases_flock()),
+        ),
     ];
 
     let selected: Vec<(&str, TestFn)> = tests
@@ -2020,4 +2025,58 @@ async fn test_lock_contention_and_crash_release_across_processes() {
     let exclusive = FileLock::lock_exclusive_timeout(&lock_path, Duration::from_secs(2)).unwrap();
     drop(exclusive);
     assert!(lock_path.exists());
+}
+
+#[cfg(target_os = "macos")]
+async fn test_macos_is_alive_stays_true_until_killed_child_releases_flock() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock_path = dir.path().join("exit-race.lock");
+    let lock_str = lock_path.to_string_lossy().into_owned();
+
+    // Repeat tight kill -> poll `is_alive` -> immediate `try_lock_exclusive` checks BEFORE
+    // reaping the child so the `P_WEXIT` window (where `proc_pidinfo` fails with `ESRCH` while
+    // `flock` is still held) is exercised directly.
+    for trial in 0..25 {
+        let mut holder = Command::new(current_exe())
+            .env(HELPER_ENV, "lock_holder")
+            .args([&lock_str, "exclusive"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+
+        let mut line = String::new();
+        let mut reader = BufReader::new(holder.stdout.take().unwrap());
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "LOCKED");
+
+        let holder_id = procid::of_pid(holder.id())
+            .unwrap()
+            .expect("lock_holder should have a live ProcessId");
+        assert!(matches!(
+            FileLock::try_lock_exclusive(&lock_path),
+            Err(OsError::WouldBlock { .. })
+        ));
+
+        holder.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while procid::is_alive(&holder_id) {
+            assert!(
+                Instant::now() < deadline,
+                "trial {trial}: killed lock holder {holder_id} stayed alive past timeout"
+            );
+            std::hint::spin_loop();
+        }
+
+        // Before reaping `holder`, the lock MUST already be free as soon as `is_alive` is false.
+        let acquired = FileLock::try_lock_exclusive(&lock_path).unwrap_or_else(|err| {
+            let _ = holder.wait();
+            panic!(
+                "trial {trial}: flock was still held after procid::is_alive({holder_id}) returned false: {err}"
+            );
+        });
+        drop(acquired);
+        let _ = holder.wait();
+    }
 }
