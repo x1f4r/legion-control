@@ -11,6 +11,7 @@
 pub mod config;
 pub mod connector;
 pub mod pool;
+pub mod power;
 pub mod session;
 mod state;
 pub mod tools;
