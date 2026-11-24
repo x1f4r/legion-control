@@ -293,6 +293,24 @@ pub struct NodeFile {
     /// Settings for the `svc` tool family.
     #[serde(default)]
     pub svc: SvcConfig,
+    /// Settings for `legion serve`.
+    #[serde(default)]
+    pub serve: ServeConfig,
+}
+
+/// The `[serve]` table of `node.toml`: what `legion serve` accepts besides this machine itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeConfig {
+    /// Browser origins (`https://app.example.net`) whose pages may call the server. A request
+    /// from any other page is refused, so a site open in a browser on this machine cannot use it.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// Host names the server answers to besides loopback, such as the name Tailscale Serve
+    /// publishes it under (`tower.example.ts.net`, or `tower.example.ts.net:8443` for one port).
+    /// Any other `Host` is refused, which is what stops a DNS rebinding page from reaching it.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 /// The `[svc]` table of `node.toml`: how the node controls system services.
