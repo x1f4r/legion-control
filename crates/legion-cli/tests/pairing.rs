@@ -2116,3 +2116,895 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
     assert_eq!(status_a.code, 0, "job.status failed: {}", status_a.stderr);
     assert_eq!(status_a.json()["state"], json!("running"));
 }
+
+/// Exercises all fleet-wide paired-device flows across independent nodes backed by real loopback
+/// `sshd` daemons (separate Legion homes, separate `authorized_keys`, connected only through
+/// `fleet.toml` over real SSH):
+///
+/// 1. Role-based pairing on A -> automatic push to B -> `device.endpoint` with `on: "all"` ->
+///    direct SSH connection from the device to B.
+/// 2. B unreachable during pairing -> `fleet.b.status == "not_reached"`, `meta.doctor` warns on
+///    drift once B is reachable -> `fleet.sync` converges -> direct SSH to B succeeds.
+/// 3. `device.remove` on B while A is unreachable -> `still_trusted_by == ["a"]`, honest limit
+///    that A's open `ControlMaster` still answers until sync -> `fleet.sync` immediately tears
+///    down A's `ControlMaster`, removes A's `authorized_keys` line & `device:*` principal, and
+///    refuses both multiplexed and fresh connections.
+/// 4. An `owner`-role paired device calls `device.invite` over SSH on A -> enrolled device works
+///    directly on both A and B.
+/// 5. `device.set` changes role (`observer` -> `editor`) and renames on A -> propagates to B and
+///    takes effect immediately.
+/// 6. Legacy first-run adoption on a third node C (pre-existing `--pairing` line, no `devices.toml`)
+///    merges bidirectionally on `fleet.sync` without dropping either side's devices.
+#[cfg(unix)]
+#[test]
+fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() {
+    if !TestSshd::available() {
+        eprintln!(
+            "skipping real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption: sshd unavailable"
+        );
+        return;
+    }
+
+    let legion_bin = Path::new(env!("CARGO_BIN_EXE_legion"));
+
+    let node_a = Home::new_strict();
+    let node_b = Home::new_strict();
+    let auth_a = node_a.home().join("authorized_keys_a");
+    let auth_b = node_b.home().join("authorized_keys_b");
+
+    let home_a_str = node_a.home().to_string_lossy().into_owned();
+    let home_b_str = node_b.home().to_string_lossy().into_owned();
+    let Some(sshd_a) =
+        TestSshd::start(auth_a.clone(), &[("HOME", &home_a_str)]).expect("sshd_a failed to start")
+    else {
+        return;
+    };
+    let Some(sshd_b) =
+        TestSshd::start(auth_b.clone(), &[("HOME", &home_b_str)]).expect("sshd_b failed to start")
+    else {
+        return;
+    };
+
+    // Shared client/fleet scratch directory (keys and known_hosts only; nodes never share config/state).
+    let client_dir = tempfile::tempdir().unwrap();
+    let fleet_key = client_dir.path().join("fleet_ed25519");
+    let fleet_pub =
+        generate_ed25519_keypair(sshd_a.ssh_keygen_bin(), &fleet_key, "fleet@test").unwrap();
+
+    let fleet_kh_a = client_dir.path().join("fleet_known_hosts_a");
+    write_known_hosts(
+        &fleet_kh_a,
+        "127.0.0.1",
+        sshd_a.port(),
+        &[sshd_a.host_key_line().to_owned()],
+    )
+    .unwrap();
+    let fleet_kh_b = client_dir.path().join("fleet_known_hosts_b");
+    write_known_hosts(
+        &fleet_kh_b,
+        "127.0.0.1",
+        sshd_b.port(),
+        &[sshd_b.host_key_line().to_owned()],
+    )
+    .unwrap();
+
+    // Put a foreign fleet-link key on each node's authorized_keys so `a <-> b` speaks real SSH.
+    let home_a_root = node_a.state().parent().unwrap().to_path_buf();
+    let home_b_root = node_b.state().parent().unwrap().to_path_buf();
+    let fleet_line = |legion_home: &Path| -> String {
+        let q_home = legion_home.display().to_string().replace('\'', "'\\''");
+        let q_bin = legion_bin.display().to_string().replace('\'', "'\\''");
+        let cmd = format!("env LEGION_HOME='{q_home}' '{q_bin}' rpc")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        format!("restrict,command=\"{cmd}\" {fleet_pub} fleet-link\n")
+    };
+    std::fs::write(&auth_a, fleet_line(&home_a_root)).unwrap();
+    std::fs::write(&auth_b, fleet_line(&home_b_root)).unwrap();
+
+    let ssh_cmd_toml = |port: u16, known_hosts: &Path, user: &str| -> String {
+        let argv = vec![
+            sshd_a.ssh_bin().to_string_lossy().into_owned(),
+            "-T".to_owned(),
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-o".to_owned(),
+            "IdentitiesOnly=yes".to_owned(),
+            "-o".to_owned(),
+            "StrictHostKeyChecking=yes".to_owned(),
+            "-o".to_owned(),
+            format!("UserKnownHostsFile={}", known_hosts.display()),
+            "-o".to_owned(),
+            "GlobalKnownHostsFile=none".to_owned(),
+            "-o".to_owned(),
+            "ControlMaster=no".to_owned(),
+            "-o".to_owned(),
+            "ConnectTimeout=3".to_owned(),
+            "-o".to_owned(),
+            "LogLevel=ERROR".to_owned(),
+            "-p".to_owned(),
+            port.to_string(),
+            "-i".to_owned(),
+            fleet_key.display().to_string(),
+            format!("{user}@127.0.0.1"),
+            "legion rpc".to_owned(),
+        ];
+        let elems: Vec<String> = argv
+            .iter()
+            .map(|a| format!("'{}'", a.replace('\'', "''")))
+            .collect();
+        format!("[{}]", elems.join(", "))
+    };
+
+    // Allocate an unused loopback port for simulating an unreachable peer quickly (connection refused).
+    let closed_port = {
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        sock.local_addr().unwrap().port()
+    };
+
+    let write_node_cfg = |home: &Home, name: &str, auth: &Path, sshd: &TestSshd| {
+        home.write_config(
+            "node.toml",
+            &format!(
+                "name = \"{name}\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = \"{}\"\n",
+                toml_literal(auth),
+                toml_literal(sshd.host_key_path()),
+                sshd.port(),
+                sshd.user(),
+            ),
+        );
+    };
+    write_node_cfg(&node_a, "a", &auth_a, &sshd_a);
+    write_node_cfg(&node_b, "b", &auth_b, &sshd_b);
+
+    let policy_for = |projects_dir: &Path| -> String {
+        format!(
+            "default = \"owner\"\n\n\
+             [roles.observer]\n\
+             allow = [\"effect:read\"]\n\
+             deny = [\"audit.*\"]\n\
+             paths = [{}]\n\n\
+             [roles.editor]\n\
+             allow = [\"effect:read\", \"effect:write\"]\n\
+             deny = [\"audit.*\"]\n\
+             paths = [{}]\n\n\
+             [principals.legacy_phone]\n\
+             role = \"observer\"\n",
+            toml_literal(projects_dir),
+            toml_literal(projects_dir),
+        )
+    };
+    let projects_a = node_a.home().join("projects");
+    let projects_b = node_b.home().join("projects");
+    std::fs::write(projects_a.join("app").join("note.txt"), "from-a\n").unwrap();
+    std::fs::write(projects_b.join("app").join("note.txt"), "from-b\n").unwrap();
+    node_a.write_config("policy.toml", &policy_for(&projects_a));
+    node_b.write_config("policy.toml", &policy_for(&projects_b));
+
+    let write_fleet_a = |b_port: u16| {
+        node_a.write_config(
+            "fleet.toml",
+            &format!(
+                "[machines.b]\ncommand = {}\n",
+                ssh_cmd_toml(b_port, &fleet_kh_b, sshd_b.user()),
+            ),
+        );
+    };
+    let write_fleet_b = |a_port: u16| {
+        node_b.write_config(
+            "fleet.toml",
+            &format!(
+                "[machines.a]\ncommand = {}\n",
+                ssh_cmd_toml(a_port, &fleet_kh_a, sshd_a.user()),
+            ),
+        );
+    };
+    write_fleet_a(sshd_b.port());
+    write_fleet_b(sshd_a.port());
+
+    let enrol_from_invite = |invite_text: &str,
+                             sshd: &TestSshd,
+                             key_stem: &str,
+                             req_name: &str|
+     -> (std::path::PathBuf, Value) {
+        let payload = InvitePayload::decode(invite_text).unwrap();
+        let temp_key = client_dir.path().join(format!("{key_stem}_temp"));
+        write_openssh_ed25519_private_key(&temp_key, &payload.decode_seed().unwrap(), key_stem)
+            .unwrap();
+        let kh = client_dir.path().join(format!("{key_stem}_kh"));
+        write_known_hosts(&kh, &payload.hosts[0], payload.port, &payload.host_keys).unwrap();
+        let dev_key = client_dir.path().join(format!("{key_stem}_key"));
+        let dev_pub = generate_ed25519_keypair(sshd.ssh_keygen_bin(), &dev_key, key_stem).unwrap();
+
+        let mut child = sshd
+            .ssh_command(&temp_key, &kh)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({
+                    "enrol": 1,
+                    "id": payload.id,
+                    "public_key": dev_pub,
+                    "name": req_name,
+                })
+            )
+            .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "enrol {key_stem} failed: stdout={} stderr={}\nsshd:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            sshd.logs(),
+        );
+        let reply: Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        (dev_key, reply)
+    };
+
+    let rpc_call_direct = |key: &Path,
+                           kh: &Path,
+                           port: u16,
+                           user: &str,
+                           tool: &str,
+                           args: Value,
+                           on: Option<&str>|
+     -> Value {
+        let mut params = json!({"tool": tool, "args": args});
+        if let Some(target) = on {
+            params["on"] = json!(target);
+        }
+        let mut child = std::process::Command::new(sshd_a.ssh_bin())
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                &format!("UserKnownHostsFile={}", kh.display()),
+                "-o",
+                "GlobalKnownHostsFile=none",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "LogLevel=ERROR",
+                "-p",
+                &port.to_string(),
+                "-i",
+            ])
+            .arg(key)
+            .args([&format!("{user}@127.0.0.1"), "legion rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "{}", rpc_request(json!(1), "call", params)).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "direct rpc {tool} on port {port} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap()
+    };
+
+    // === Scenario 1: Pair on A with --name/--role -> auto-push -> device.endpoint --on all -> direct SSH to B ===
+    let inv_a = node_a.run(&["pair", "--name", "phone-a", "--role", "observer", "--json"]);
+    assert_eq!(inv_a.code, 0, "pair phone-a failed: {}", inv_a.stderr);
+    let inv_a_json = inv_a.json();
+    assert_eq!(inv_a_json["principal"], json!("device:phone-a"));
+    assert_eq!(inv_a_json["role"], json!("observer"));
+
+    let (phone_a_key, phone_a_enrol) = enrol_from_invite(
+        inv_a_json["invite"].as_str().unwrap(),
+        &sshd_a,
+        "phone_a",
+        "ignored",
+    );
+    assert_eq!(phone_a_enrol["ok"], json!(true));
+    assert_eq!(phone_a_enrol["principal"], json!("device:phone-a"));
+    assert_eq!(phone_a_enrol["role"], json!("observer"));
+    assert_eq!(phone_a_enrol["device"], json!("phone-a"));
+    assert_eq!(
+        phone_a_enrol["fleet"]["b"]["status"],
+        json!("synced"),
+        "expected phone-a enrolment to push to b: {phone_a_enrol}"
+    );
+
+    // Call `device.endpoint` with `on: "all"` as `phone-a` through A to learn B's endpoint and host key.
+    let ep_all = rpc_call_direct(
+        &phone_a_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "device.endpoint",
+        json!({}),
+        Some("all"),
+    );
+    let ep_results = &ep_all["result"]["results"];
+    assert_eq!(ep_results["a"]["ok"]["node"], json!("a"), "{ep_all}");
+    assert_eq!(ep_results["b"]["ok"]["node"], json!("b"), "{ep_all}");
+    let ep_b = &ep_results["b"]["ok"];
+    let ep_b_host = ep_b["hosts"][0].as_str().unwrap();
+    let ep_b_port = ep_b["port"].as_u64().unwrap() as u16;
+    let ep_b_user = ep_b["user"].as_str().unwrap();
+    let ep_b_hks: Vec<String> = ep_b["host_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ep_b_port, sshd_b.port());
+    assert_eq!(ep_b_hks, vec![sshd_b.host_key_line().to_owned()]);
+
+    // Pin B's host key from what A reported and connect directly from phone-a to B!
+    let learned_kh_b = client_dir.path().join("learned_kh_b");
+    write_known_hosts(&learned_kh_b, ep_b_host, ep_b_port, &ep_b_hks).unwrap();
+    let whoami_b = rpc_call_direct(
+        &phone_a_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(whoami_b["result"]["node"], json!("b"), "{whoami_b}");
+    assert_eq!(whoami_b["result"]["principal"], json!("device:phone-a"));
+    assert_eq!(whoami_b["result"]["role"], json!("observer"));
+    assert_eq!(whoami_b["result"]["door"], json!("ssh"));
+
+    let read_b = rpc_call_direct(
+        &phone_a_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "fs.read",
+        json!({"path": projects_b.join("app").join("note.txt").to_string_lossy()}),
+        None,
+    );
+    assert_eq!(read_b["result"]["content"], json!("from-b\n"), "{read_b}");
+    let denied_write_b = rpc_call_direct(
+        &phone_a_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "fs.write",
+        json!({"path": projects_b.join("app").join("nope.txt").to_string_lossy(), "content": "x"}),
+        None,
+    );
+    assert_eq!(denied_write_b["error"]["data"]["code"], json!("denied"));
+
+    // === Scenario 2: B unreachable during pairing -> meta.doctor drift warning -> fleet.sync -> B accepts ===
+    write_fleet_a(closed_port);
+    let inv_off = node_a.run(&[
+        "pair",
+        "--name",
+        "phone-offline",
+        "--role",
+        "observer",
+        "--json",
+    ]);
+    assert_eq!(
+        inv_off.code, 0,
+        "pair phone-offline failed: {}",
+        inv_off.stderr
+    );
+    let (phone_off_key, phone_off_enrol) = enrol_from_invite(
+        inv_off.json()["invite"].as_str().unwrap(),
+        &sshd_a,
+        "phone_off",
+        "ignored",
+    );
+    assert_eq!(phone_off_enrol["ok"], json!(true));
+    assert_eq!(
+        phone_off_enrol["fleet"]["b"]["status"],
+        json!("not_reached"),
+        "expected unreachable b during enrolment: {phone_off_enrol}"
+    );
+    let refused_b_before = sshd_b
+        .ssh_command(&phone_off_key, &learned_kh_b)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !refused_b_before.status.success(),
+        "phone-offline unexpectedly authenticated to B before sync"
+    );
+
+    // Restore reachability and check `meta.doctor` warns about device drift before syncing.
+    write_fleet_a(sshd_b.port());
+    let doc_drifted = node_a.run(&["meta.doctor"]).json();
+    let drift_check = doc_drifted["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == json!("fleet devices"));
+    assert!(
+        drift_check.is_some_and(|c| c["ok"] == json!(true)
+            && c["warning"] == json!(true)
+            && c["detail"].as_str().unwrap_or_default().contains('b')),
+        "expected meta.doctor fleet devices drift warning: {doc_drifted}"
+    );
+
+    let synced_a_to_b = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(
+        synced_a_to_b.code, 0,
+        "fleet.sync push failed: {}",
+        synced_a_to_b.stderr
+    );
+    assert_eq!(
+        synced_a_to_b.json()["results"]["b"]["devices.toml"]["status"],
+        json!("pushed")
+    );
+
+    let whoami_off_b = rpc_call_direct(
+        &phone_off_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(whoami_off_b["result"]["node"], json!("b"));
+    assert_eq!(
+        whoami_off_b["result"]["principal"],
+        json!("device:phone-offline")
+    );
+    assert_eq!(whoami_off_b["result"]["role"], json!("observer"));
+
+    // Once in sync, `meta.doctor` no longer emits the drift warning.
+    let doc_clean = node_a.run(&["meta.doctor"]).json();
+    assert!(
+        !doc_clean["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == json!("fleet devices")),
+        "expected fleet devices warning to clear after sync: {doc_clean}"
+    );
+
+    // === Scenario 3: Remove on B while A is unreachable -> still_trusted_by -> ControlMaster killed on sync ===
+    let ctl_dir = tempfile::Builder::new()
+        .prefix("lg-f-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let ctl_path = ctl_dir.path().join("a.sock");
+    let target_a = format!("{}@127.0.0.1", sshd_a.user());
+    let ctl_start = std::process::Command::new(sshd_a.ssh_bin())
+        .args([
+            "-T",
+            "-f",
+            "-N",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            &format!("UserKnownHostsFile={}", fleet_kh_a.display()),
+            "-o",
+            "GlobalKnownHostsFile=none",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "ControlMaster=yes",
+            "-o",
+            "ControlPersist=yes",
+            "-S",
+        ])
+        .arg(&ctl_path)
+        .args(["-p", &sshd_a.port().to_string(), "-i"])
+        .arg(&phone_a_key)
+        .arg(&target_a)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        ctl_start.status.success(),
+        "ControlMaster start failed: {}",
+        String::from_utf8_lossy(&ctl_start.stderr)
+    );
+
+    struct CleanCtl {
+        ssh: std::path::PathBuf,
+        ctl: std::path::PathBuf,
+        target: String,
+    }
+    impl Drop for CleanCtl {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(&self.ssh)
+                .args(["-S"])
+                .arg(&self.ctl)
+                .args(["-O", "exit", &self.target])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _ctl_guard = CleanCtl {
+        ssh: sshd_a.ssh_bin().to_path_buf(),
+        ctl: ctl_path.clone(),
+        target: target_a.clone(),
+    };
+
+    let ctl_is_alive = || -> bool {
+        std::process::Command::new(sshd_a.ssh_bin())
+            .args(["-S"])
+            .arg(&ctl_path)
+            .args(["-O", "check", &target_a])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let whoami_via_ctl = || -> std::process::Output {
+        let mut child = std::process::Command::new(sshd_a.ssh_bin())
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "LogLevel=ERROR",
+                "-S",
+            ])
+            .arg(&ctl_path)
+            .args([&target_a, "legion rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}))
+            )
+            .unwrap();
+        }
+        child.wait_with_output().unwrap()
+    };
+
+    // Prime the ControlMaster so A records its parent sshd session before B revokes phone-a.
+    let before_revoke = whoami_via_ctl();
+    assert!(before_revoke.status.success());
+    assert!(ctl_is_alive());
+
+    // Make A unreachable from B while keeping sshd_a and phone-a's ControlMaster live.
+    write_fleet_b(closed_port);
+    let rm_on_b = node_b.run(&["device.remove", "name=phone-a"]);
+    assert_eq!(rm_on_b.code, 0, "remove phone-a on b: {}", rm_on_b.stderr);
+    let rm_json = rm_on_b.json();
+    assert_eq!(rm_json["removed"], json!(true));
+    assert_eq!(rm_json["still_trusted_by"], json!(["a"]), "{rm_json}");
+    assert_eq!(rm_json["fleet"]["a"]["status"], json!("not_reached"));
+    assert!(
+        rm_json["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains('a') && h.contains("fleet.sync")),
+        "expected still_trusted_by hint: {rm_json}"
+    );
+
+    // Honest limit: B refuses phone-a at once, while A still accepts it until synced.
+    let refused_b_after_rm = sshd_b
+        .ssh_command(&phone_a_key, &learned_kh_b)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!refused_b_after_rm.status.success());
+    let still_ok_on_a = whoami_via_ctl();
+    assert!(
+        still_ok_on_a.status.success(),
+        "expected A to still trust phone-a before syncing"
+    );
+
+    // Restore reachability and sync from B -> A: A's ControlMaster must die immediately!
+    write_fleet_b(sshd_a.port());
+    let sync_revoke = node_b.run(&[
+        "fleet.sync",
+        "direction=push",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(
+        sync_revoke.code, 0,
+        "fleet.sync revocation failed: {}",
+        sync_revoke.stderr
+    );
+    assert_eq!(
+        sync_revoke.json()["results"]["a"]["devices.toml"]["status"],
+        json!("pushed")
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && ctl_is_alive() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ctl_is_alive(),
+        "phone-a ControlMaster on A stayed alive after fleet.sync delivered its tombstone"
+    );
+    assert!(!whoami_via_ctl().status.success());
+    let fresh_a_after_sync = sshd_a
+        .ssh_command(&phone_a_key, &fleet_kh_a)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!fresh_a_after_sync.status.success());
+    let policy_a_after =
+        std::fs::read_to_string(home_a_root.join("config").join("policy.toml")).unwrap();
+    assert!(
+        !policy_a_after.contains("device:phone-a"),
+        "stale device:phone-a principal was not cleaned up from A's policy.toml:\n{policy_a_after}"
+    );
+
+    // === Scenario 4: Owner-role paired device pairs another device over SSH -> works on A and B ===
+    let inv_owner = node_a.run(&[
+        "pair",
+        "--name",
+        "owner-pad",
+        "--role",
+        "owner",
+        "--allow-owner",
+        "--json",
+    ]);
+    assert_eq!(
+        inv_owner.code, 0,
+        "pair owner-pad failed: {}",
+        inv_owner.stderr
+    );
+    let (owner_pad_key, owner_enrol) = enrol_from_invite(
+        inv_owner.json()["invite"].as_str().unwrap(),
+        &sshd_a,
+        "owner_pad",
+        "ignored",
+    );
+    assert_eq!(owner_enrol["ok"], json!(true));
+    assert_eq!(owner_enrol["role"], json!("owner"));
+    assert_eq!(owner_enrol["fleet"]["b"]["status"], json!("synced"));
+
+    // `owner-pad` calls `device.invite` over SSH on A to pair `guest-phone`.
+    let guest_inv_rpc = rpc_call_direct(
+        &owner_pad_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "device.invite",
+        json!({"name": "guest-phone", "role": "observer"}),
+        None,
+    );
+    let guest_invite_str = guest_inv_rpc["result"]["invite"]
+        .as_str()
+        .unwrap_or_else(|| panic!("owner-pad device.invite failed: {guest_inv_rpc}"));
+    let (guest_key, guest_enrol) =
+        enrol_from_invite(guest_invite_str, &sshd_a, "guest_phone", "ignored");
+    assert_eq!(guest_enrol["ok"], json!(true));
+    assert_eq!(guest_enrol["principal"], json!("device:guest-phone"));
+    assert_eq!(guest_enrol["role"], json!("observer"));
+    assert_eq!(
+        guest_enrol["fleet"]["b"]["status"],
+        json!("synced"),
+        "expected owner-pad's invite enrolment to push to b: {guest_enrol}"
+    );
+
+    let guest_on_a = rpc_call_direct(
+        &guest_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(guest_on_a["result"]["node"], json!("a"));
+    assert_eq!(
+        guest_on_a["result"]["principal"],
+        json!("device:guest-phone")
+    );
+    let guest_on_b = rpc_call_direct(
+        &guest_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(guest_on_b["result"]["node"], json!("b"));
+    assert_eq!(
+        guest_on_b["result"]["principal"],
+        json!("device:guest-phone")
+    );
+
+    // === Scenario 5: `device.set` changes role (`observer` -> `editor`) and renames, propagating to B ===
+    let denied_before_set = rpc_call_direct(
+        &phone_off_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "fs.write",
+        json!({"path": projects_b.join("app").join("edited.txt").to_string_lossy(), "content": "ok\n"}),
+        None,
+    );
+    assert_eq!(denied_before_set["error"]["data"]["code"], json!("denied"));
+
+    let set_role = node_a.run(&[
+        "device.set",
+        "name=phone-offline",
+        "role=editor",
+        "rename=field-phone",
+    ]);
+    assert_eq!(set_role.code, 0, "device.set failed: {}", set_role.stderr);
+    let set_json = set_role.json();
+    assert_eq!(set_json["name"], json!("field-phone"));
+    assert_eq!(set_json["previous_name"], json!("phone-offline"));
+    assert_eq!(set_json["role"], json!("editor"));
+    assert_eq!(set_json["previous_role"], json!("observer"));
+    assert_eq!(set_json["fleet"]["b"]["status"], json!("synced"));
+
+    let allowed_after_set = rpc_call_direct(
+        &phone_off_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "fs.write",
+        json!({"path": projects_b.join("app").join("edited.txt").to_string_lossy(), "content": "ok\n"}),
+        None,
+    );
+    assert_eq!(
+        allowed_after_set["result"]["size"],
+        json!(3),
+        "expected fs.write to succeed on B after device.set role=editor: {allowed_after_set}"
+    );
+    let list_b = node_b.run(&["device.list"]).json();
+    assert!(
+        list_b["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == json!("field-phone") && d["role"] == json!("editor")),
+        "expected renamed field-phone (editor) on B: {list_b}"
+    );
+
+    // === Scenario 6: Legacy migration/adoption on node C with pre-existing `--pairing` line and no devices.toml ===
+    let node_c = Home::new_strict();
+    let auth_c = node_c.home().join("authorized_keys_c");
+    let home_c_str = node_c.home().to_string_lossy().into_owned();
+    let Some(sshd_c) =
+        TestSshd::start(auth_c.clone(), &[("HOME", &home_c_str)]).expect("sshd_c failed to start")
+    else {
+        return;
+    };
+    let home_c_root = node_c.state().parent().unwrap().to_path_buf();
+    let projects_c = node_c.home().join("projects");
+    std::fs::create_dir_all(&projects_c).unwrap();
+    write_node_cfg(&node_c, "c", &auth_c, &sshd_c);
+    node_c.write_config("policy.toml", &policy_for(&projects_c));
+
+    let fleet_kh_c = client_dir.path().join("fleet_known_hosts_c");
+    write_known_hosts(
+        &fleet_kh_c,
+        "127.0.0.1",
+        sshd_c.port(),
+        &[sshd_c.host_key_line().to_owned()],
+    )
+    .unwrap();
+
+    // Write a pre-existing legacy `--pairing` line on C with NO `devices.toml` on disk.
+    let legacy_key = client_dir.path().join("legacy_c_key");
+    let legacy_pub_raw =
+        generate_ed25519_keypair(sshd_c.ssh_keygen_bin(), &legacy_key, "legacy@c").unwrap();
+    let legacy_pub = legion_tools::device::keys::validate_ed25519_public_key(&legacy_pub_raw)
+        .unwrap()
+        .canonical;
+    let legacy_pairing_id = "cccccccccccccccccccccccccccccccc";
+    let pinned_c = legion_tools::device::authkeys::PinnedHome::Root(home_c_root.clone());
+    let shell = legion_tools::device::authkeys::ForcedCommandShell::host().unwrap();
+    let legacy_line = legion_tools::device::authkeys::format_device_line(
+        legion_bin,
+        "legacy_phone",
+        &legacy_pub,
+        "legacy-phone",
+        legacy_pairing_id,
+        &pinned_c,
+        None,
+        shell,
+    )
+    .unwrap();
+    std::fs::write(
+        &auth_c,
+        format!("{}{legacy_line}\n", fleet_line(&home_c_root)),
+    )
+    .unwrap();
+    assert!(!home_c_root.join("config").join("devices.toml").exists());
+
+    // Wire `c` into A's `fleet.toml` and pull `devices.toml` from C -> bidirectional merge adopts
+    // C's legacy device onto A AND pushes A's fleet devices onto C!
+    node_a.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.b]\ncommand = {}\n\n[machines.c]\ncommand = {}\n",
+            ssh_cmd_toml(sshd_b.port(), &fleet_kh_b, sshd_b.user()),
+            ssh_cmd_toml(sshd_c.port(), &fleet_kh_c, sshd_c.user()),
+        ),
+    );
+    let pull_c = node_a.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=c",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(pull_c.code, 0, "pull from c failed: {}", pull_c.stderr);
+    assert_eq!(
+        pull_c.json()["results"]["c"]["devices.toml"]["status"],
+        json!("pulled")
+    );
+
+    // Legacy device from C now works directly against A, and field-phone from A now works against C!
+    let legacy_on_a = rpc_call_direct(
+        &legacy_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(legacy_on_a["result"]["node"], json!("a"), "{legacy_on_a}");
+    assert_eq!(legacy_on_a["result"]["principal"], json!("legacy_phone"));
+    assert_eq!(legacy_on_a["result"]["role"], json!("observer"));
+
+    let field_on_c = rpc_call_direct(
+        &phone_off_key,
+        &fleet_kh_c,
+        sshd_c.port(),
+        sshd_c.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(field_on_c["result"]["node"], json!("c"), "{field_on_c}");
+    assert_eq!(
+        field_on_c["result"]["principal"],
+        json!("device:phone-offline")
+    );
+    assert_eq!(field_on_c["result"]["role"], json!("editor"));
+    // And C's devices.toml now exists on disk (adopted + merged).
+    assert!(home_c_root.join("config").join("devices.toml").is_file());
+}
