@@ -5,6 +5,8 @@ import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
   applySettingsToRoot,
+  buildDeviceInviteArgs,
+  buildDeviceRemoveArgs,
   describeAppearance,
   describeRefreshing,
   detectDeviceNoun,
@@ -89,4 +91,79 @@ test('detectDeviceNoun and summary descriptions read cleanly', () => {
   assert.equal(describeRefreshing({ refreshSeconds: 0 }), 'Only when you refresh');
   assert.equal(describeRefreshing({ refreshSeconds: 15 }), 'Every 15 seconds while open');
   assert.equal(describeRefreshing({ refreshSeconds: 60 }), 'Every minute while open');
+});
+
+test('buildDeviceInviteArgs and buildDeviceRemoveArgs match fleet device tool schemas', () => {
+  const fleetInviteSpec = {
+    name: 'device.invite',
+    input_schema: {
+      type: 'object',
+      properties: {
+        principal: { type: 'string' },
+        role: { type: 'string' },
+        name: { type: 'string' },
+        allow_owner: { type: 'boolean' },
+        valid_minutes: { type: 'integer' },
+      },
+    },
+  };
+  const legacyInviteSpec = {
+    name: 'device.invite',
+    input_schema: {
+      type: 'object',
+      required: ['principal'],
+      properties: {
+        principal: { type: 'string' },
+        valid_minutes: { type: 'integer' },
+      },
+    },
+  };
+
+  // With role + name schema and a role chosen -> sends name + role (never principal + role).
+  assert.deepEqual(
+    buildDeviceInviteArgs(fleetInviteSpec, {
+      label: 'Pixel 10',
+      role: 'observer',
+      validMinutes: 15,
+    }),
+    { name: 'Pixel 10', role: 'observer', valid_minutes: 15 },
+  );
+
+  // With owner role + explicit allowOwner -> sends allow_owner: true.
+  assert.deepEqual(
+    buildDeviceInviteArgs(fleetInviteSpec, {
+      label: 'tablet',
+      role: 'owner',
+      validMinutes: 60,
+      allowOwner: true,
+    }),
+    { name: 'tablet', role: 'owner', valid_minutes: 60, allow_owner: true },
+  );
+
+  // Blank role on fleet schema -> reuses existing principal.
+  assert.deepEqual(
+    buildDeviceInviteArgs(fleetInviteSpec, {
+      label: 'phone',
+      role: '',
+      validMinutes: 15,
+    }),
+    { principal: 'phone', valid_minutes: 15 },
+  );
+
+  // Legacy schema without role/name -> sends principal only.
+  assert.deepEqual(
+    buildDeviceInviteArgs(legacyInviteSpec, {
+      label: 'phone',
+      role: 'observer',
+      validMinutes: 15,
+      allowOwner: true,
+    }),
+    { principal: 'phone', valid_minutes: 15 },
+  );
+
+  // device.remove prefers unique pairing id when available, falling back to name.
+  assert.deepEqual(buildDeviceRemoveArgs({ id: '0123456789abcdef0123456789abcdef', name: 'pixel' }), {
+    id: '0123456789abcdef0123456789abcdef',
+  });
+  assert.deepEqual(buildDeviceRemoveArgs({ name: 'Pixel 10' }), { name: 'Pixel 10' });
 });

@@ -136,3 +136,41 @@ export function describeRefreshing(settings) {
   if (s.refreshSeconds === 60) return 'Every minute while open';
   return `Every ${s.refreshSeconds} seconds while open`;
 }
+
+/**
+ * Builds `device.invite` arguments matching the node's live tool schema:
+ * - When `device.invite` accepts both `name` and `role` and a role is given, sends `{ name, role }`
+ *   (never `principal` + `role` together, which the node refuses).
+ * - Otherwise sends `{ principal }` (plus `role` only if the schema accepts `role` without `name`).
+ * - Includes `allow_owner: true` only when the schema accepts it and `allowOwner` is explicitly set.
+ */
+export function buildDeviceInviteArgs(inviteSpec, { label, role, validMinutes, allowOwner = false }) {
+  const props = inviteSpec?.input_schema?.properties || {};
+  const hasName = Boolean(props.name);
+  const hasRole = Boolean(props.role);
+  const hasAllowOwner = Boolean(props.allow_owner);
+  const who = String(label || '').trim();
+  const trimmedRole = String(role || '').trim();
+  const args = { valid_minutes: validMinutes };
+
+  if (hasName && hasRole && trimmedRole) {
+    args.name = who;
+    args.role = trimmedRole;
+  } else {
+    args.principal = who;
+    if (hasRole && trimmedRole) args.role = trimmedRole;
+  }
+  if (hasAllowOwner && allowOwner) {
+    args.allow_owner = true;
+  }
+  return args;
+}
+
+/**
+ * Builds `device.remove` arguments, preferring the unique pairing `id` when present so two paired
+ * devices sharing a display name can still be removed unambiguously.
+ */
+export function buildDeviceRemoveArgs(device) {
+  if (device?.id) return { id: device.id };
+  return { name: device?.name };
+}
