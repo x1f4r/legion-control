@@ -401,17 +401,66 @@ pub fn verify_owner_matches_euid(
     Ok(())
 }
 
+/// Target shell syntax used by `sshd` to invoke `authorized_keys` `command="..."` forced commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForcedCommandShell {
+    /// POSIX `/bin/sh`-compatible quoting (`'...'` with `'\''`).
+    Posix,
+    /// Windows `cmd.exe` quoting (`"..."`, refusing cmd metacharacters `%`, `&`, `(`, `)`, `^`,
+    /// `!`, and `"`).
+    WindowsCmd,
+    /// Windows PowerShell (`powershell.exe` / `pwsh.exe`) call syntax (`& '<exe>' ...` with `'`
+    /// doubled and `@`-safe single-quoted arguments).
+    WindowsPowerShell,
+}
+
+impl ForcedCommandShell {
+    /// Detects the forced-command shell for the current host: [`ForcedCommandShell::Posix`] on
+    /// Unix, or the shell configured in `HKLM\SOFTWARE\OpenSSH\DefaultShell` on Windows (defaulting
+    /// to [`ForcedCommandShell::WindowsCmd`] when absent).
+    pub fn host() -> ForcedCommandShell {
+        if cfg!(windows) {
+            match legion_os::user::windows_sshd_default_shell() {
+                legion_os::user::WindowsSshShell::PowerShell => {
+                    ForcedCommandShell::WindowsPowerShell
+                }
+                legion_os::user::WindowsSshShell::Cmd => ForcedCommandShell::WindowsCmd,
+            }
+        } else {
+            ForcedCommandShell::Posix
+        }
+    }
+
+    fn is_windows(self) -> bool {
+        matches!(
+            self,
+            ForcedCommandShell::WindowsCmd | ForcedCommandShell::WindowsPowerShell
+        )
+    }
+}
+
+/// Characters `cmd.exe` interprets even inside or around double quotes (or that break quoting).
+const CMD_UNSAFE_CHARS: &[char] = &['%', '&', '(', ')', '^', '!', '"'];
+
 /// Formats the value placed inside `command="..."` in `authorized_keys`.
 ///
 /// The executable path must be absolute, valid UTF-8, and free of control characters.
-/// When the path contains spaces or shell metacharacters it is safely quoted for the target OS
-/// shell, and any `"` characters are escaped as `\"` for OpenSSH's `authorized_keys` option
-/// parser (which only unescapes `\"` inside double-quoted option values).
+/// Quoting follows `shell`:
+/// - [`ForcedCommandShell::Posix`]: bare ASCII tokens or `'...'` with `'\''`.
+/// - [`ForcedCommandShell::WindowsCmd`]: refuses `%`, `&`, `(`, `)`, `^`, `!`, and `"` in paths
+///   and arguments, and double-quotes tokens with spaces or non-ASCII characters.
+/// - [`ForcedCommandShell::WindowsPowerShell`]: emits `& '<exe>' ...` with `'` doubled (`''`) and
+///   single-quotes any argument that could trigger PowerShell parsing or splatting (including
+///   leading `@`, spaces, quotes, `$`, or non-ASCII).
+///
+/// Finally escapes every `"` as `\"` for OpenSSH's `authorized_keys` option parser (which only
+/// unescapes `\"` inside double-quoted option values).
 pub fn format_forced_command(
     exe: &Path,
     args: &[&str],
-    windows: bool,
+    shell: ForcedCommandShell,
 ) -> Result<String, ErrorBody> {
+    let windows = shell.is_windows();
     if !exe.is_absolute() && !(windows && looks_windows_absolute(exe)) {
         return Err(ErrorBody::new(
             ErrorCode::Failed,
@@ -436,13 +485,6 @@ pub fn format_forced_command(
             "Legion executable path contains control characters and cannot be placed in authorized_keys.",
         ));
     }
-    if windows && exe_str.contains('"') {
-        return Err(ErrorBody::new(
-            ErrorCode::Failed,
-            "Windows executable path contains a double quote and cannot be placed in authorized_keys.",
-        ));
-    }
-
     for arg in args {
         if arg.is_empty() || arg.chars().any(char::is_control) {
             return Err(ErrorBody::new(
@@ -450,46 +492,97 @@ pub fn format_forced_command(
                 format!("Forced command argument {arg:?} is not safe for authorized_keys."),
             ));
         }
-        if windows && arg.contains('"') {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!(
-                    "Forced command argument {arg:?} contains a double quote and cannot be placed in authorized_keys."
-                ),
-            ));
-        }
     }
 
-    let quote_token = |token: &str| -> String {
-        if windows {
-            let plain_safe = token.bytes().all(|b| {
-                b.is_ascii_alphanumeric()
-                    || matches!(b, b'\\' | b'/' | b':' | b'.' | b'-' | b'_' | b'+' | b'@')
-            });
-            if plain_safe {
-                token.to_owned()
-            } else {
-                format!("\"{token}\"")
+    let command = match shell {
+        ForcedCommandShell::Posix => {
+            let quote_posix = |token: &str| -> String {
+                let plain_safe = token.bytes().all(|b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'/' | b'.' | b'-' | b'_' | b'+' | b':' | b'@')
+                });
+                if plain_safe {
+                    token.to_owned()
+                } else {
+                    let escaped_single = token.replace('\'', "'\\''");
+                    format!("'{escaped_single}'")
+                }
+            };
+            let mut out = quote_posix(exe_str);
+            for arg in args {
+                out.push(' ');
+                out.push_str(&quote_posix(arg));
             }
-        } else {
-            let plain_safe = token.bytes().all(|b| {
-                b.is_ascii_alphanumeric()
-                    || matches!(b, b'/' | b'.' | b'-' | b'_' | b'+' | b':' | b'@')
-            });
-            if plain_safe {
-                token.to_owned()
-            } else {
-                let escaped_single = token.replace('\'', "'\\''");
-                format!("'{escaped_single}'")
+            out
+        }
+        ForcedCommandShell::WindowsCmd => {
+            let check_cmd_token = |label: &str, token: &str| -> Result<(), ErrorBody> {
+                if let Some(bad) = token.chars().find(|ch| CMD_UNSAFE_CHARS.contains(ch)) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "Cannot place {label} {token:?} in a Windows cmd.exe forced command because it contains `{bad}`."
+                        ),
+                    )
+                    .with_hint(
+                        "Move legion.exe / LEGION_HOME to a path without `% & ( ) ^ ! \"`, or set HKLM\\SOFTWARE\\OpenSSH\\DefaultShell to PowerShell.",
+                    ));
+                }
+                Ok(())
+            };
+            let quote_cmd = |label: &str, token: &str| -> Result<String, ErrorBody> {
+                check_cmd_token(label, token)?;
+                let plain_safe = token.bytes().all(|b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'\\' | b'/' | b':' | b'.' | b'-' | b'_' | b'+' | b'@')
+                });
+                if plain_safe {
+                    Ok(token.to_owned())
+                } else if token.ends_with('\\') {
+                    Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "Cannot quote {label} {token:?} for Windows cmd.exe because it ends with a trailing backslash."
+                        ),
+                    )
+                    .with_hint("Remove the trailing backslash from the path."))
+                } else {
+                    Ok(format!("\"{token}\""))
+                }
+            };
+            let mut out = quote_cmd("executable path", exe_str)?;
+            for arg in args {
+                out.push(' ');
+                out.push_str(&quote_cmd("forced command argument", arg)?);
             }
+            out
+        }
+        ForcedCommandShell::WindowsPowerShell => {
+            let quote_ps_single = |token: &str| -> String {
+                let escaped = token.replace('\'', "''");
+                format!("'{escaped}'")
+            };
+            // Always invoke the executable via PowerShell's call operator `& '...'` so spaces,
+            // quotes, non-ASCII, and drive paths are executed rather than parsed as a string literal.
+            let mut out = format!("& {}", quote_ps_single(exe_str));
+            for arg in args {
+                out.push(' ');
+                // Single-quote anything other than simple bare ASCII words/flags (`gate`, `--as`,
+                // hex ids, etc.) so leading `@` (splatting), `$`, `:`, spaces, backslashes, quotes,
+                // and non-ASCII are always passed verbatim.
+                let plain_safe = !arg.starts_with('@')
+                    && arg
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+                if plain_safe {
+                    out.push_str(arg);
+                } else {
+                    out.push_str(&quote_ps_single(arg));
+                }
+            }
+            out
         }
     };
-
-    let mut command = quote_token(exe_str);
-    for arg in args {
-        command.push(' ');
-        command.push_str(&quote_token(arg));
-    }
 
     // OpenSSH `opt_dequote` inside `command="..."` recognizes only `\"` -> `"` and leaves every
     // other backslash untouched, so replacing `"` with `\"` round-trips faithfully as long as the
@@ -599,7 +692,7 @@ pub fn format_invite_line(
     pubkey: &str,
     explicit_home: Option<&Path>,
     account: Option<&str>,
-    windows: bool,
+    shell: ForcedCommandShell,
 ) -> Result<String, ErrorBody> {
     let mut owned_args = vec!["gate".to_owned(), "--enrol".to_owned(), id.to_owned()];
     if let Some(acct) = account {
@@ -618,7 +711,7 @@ pub fn format_invite_line(
         owned_args.push(home_str.to_owned());
     }
     let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-    let cmd = format_forced_command(exe, &arg_refs, windows)?;
+    let cmd = format_forced_command(exe, &arg_refs, shell)?;
     let expiry = format_sshd_expiry(expires);
     Ok(format!(
         "restrict,expiry-time=\"{expiry}\",command=\"{cmd}\" {pubkey} {INVITE_COMMENT_PREFIX}{id}"
@@ -640,7 +733,7 @@ pub fn format_device_line(
     device_name: &str,
     explicit_home: Option<&Path>,
     account: Option<&str>,
-    windows: bool,
+    shell: ForcedCommandShell,
 ) -> Result<String, ErrorBody> {
     let mut owned_args = vec![
         "gate".to_owned(),
@@ -665,7 +758,7 @@ pub fn format_device_line(
         owned_args.push(home_str.to_owned());
     }
     let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-    let cmd = format_forced_command(exe, &arg_refs, windows)?;
+    let cmd = format_forced_command(exe, &arg_refs, shell)?;
     Ok(format!(
         "restrict,command=\"{cmd}\" {pubkey} {DEVICE_COMMENT_PREFIX}{device_name}"
     ))
@@ -1283,7 +1376,7 @@ mod tests {
         let plain_unix = format_forced_command(
             Path::new("/home/me/.local/bin/legion"),
             &["gate", "--as", "phone"],
-            false,
+            ForcedCommandShell::Posix,
         )
         .unwrap();
         assert_eq!(plain_unix, "/home/me/.local/bin/legion gate --as phone");
@@ -1291,7 +1384,7 @@ mod tests {
         let space_unix = format_forced_command(
             Path::new("/Users/me/My Apps/legion"),
             &["gate", "--as", "phone"],
-            false,
+            ForcedCommandShell::Posix,
         )
         .unwrap();
         assert_eq!(
@@ -1302,7 +1395,7 @@ mod tests {
         let quote_unix = format_forced_command(
             Path::new(r#"/Users/me/O'Neil "Lab"/legion"#),
             &["gate", "--enrol", "abc123"],
-            false,
+            ForcedCommandShell::Posix,
         )
         .unwrap();
         assert!(quote_unix.contains("\\\"Lab\\\""));
@@ -1314,37 +1407,117 @@ mod tests {
                 .replacen("'' ", "' ", 1)
         );
 
-        let plain_win = format_forced_command(
+        // Windows cmd.exe: plain, spaces, non-ASCII, and metacharacter refusals.
+        let plain_cmd = format_forced_command(
             Path::new(r"C:\Users\me\AppData\Local\legion\legion.exe"),
             &["gate", "--as", "phone"],
-            true,
+            ForcedCommandShell::WindowsCmd,
         )
         .unwrap();
         assert_eq!(
-            plain_win,
+            plain_cmd,
             r"C:\Users\me\AppData\Local\legion\legion.exe gate --as phone"
         );
 
-        let space_win = format_forced_command(
-            Path::new(r"C:\Program Files\Legion Control\legion.exe"),
-            &["gate", "--as", "phone"],
-            true,
+        let space_unicode_cmd = format_forced_command(
+            Path::new(r"C:\Users\me\My Légion 日本\legion.exe"),
+            &[
+                "gate",
+                "--as",
+                "agent:example",
+                "--home",
+                r"C:\Users\me\Legion Home ü",
+            ],
+            ForcedCommandShell::WindowsCmd,
         )
         .unwrap();
         assert_eq!(
-            space_win,
-            r#"\"C:\Program Files\Legion Control\legion.exe\" gate --as phone"#
+            openssh_opt_dequote(&space_unicode_cmd),
+            r#""C:\Users\me\My Légion 日本\legion.exe" gate --as agent:example --home "C:\Users\me\Legion Home ü""#
         );
+        for bad_cmd_path in [
+            r"C:\Users\%USERNAME%\legion.exe",
+            r"C:\Users\A&B\legion.exe",
+            r"C:\Program Files (x86)\legion.exe",
+            r"C:\Users\a^b\legion.exe",
+            r"C:\Users\bang!\legion.exe",
+            r#"C:\Users\"quote"\legion.exe"#,
+        ] {
+            assert!(
+                format_forced_command(
+                    Path::new(bad_cmd_path),
+                    &["gate", "--as", "phone"],
+                    ForcedCommandShell::WindowsCmd,
+                )
+                .is_err(),
+                "cmd should reject {bad_cmd_path}"
+            );
+        }
+
+        // Windows PowerShell: `& '...'` with doubled single quotes, spaces, non-ASCII, and `@`-safe
+        // argument quoting (preventing PowerShell splatting of `@`-prefixed arguments).
+        let ps_cmd = format_forced_command(
+            Path::new(r"C:\Users\O'Neil\My Légion 日本\legion.exe"),
+            &[
+                "gate",
+                "--as",
+                "@phone",
+                "--account",
+                "O'Neil",
+                "--home",
+                r"C:\Users\O'Neil\Program Files (x86)\Legion Home",
+            ],
+            ForcedCommandShell::WindowsPowerShell,
+        )
+        .unwrap();
         assert_eq!(
-            openssh_opt_dequote(&space_win),
-            r#""C:\Program Files\Legion Control\legion.exe" gate --as phone"#
+            openssh_opt_dequote(&ps_cmd),
+            r"& 'C:\Users\O''Neil\My Légion 日本\legion.exe' gate --as '@phone' --account 'O''Neil' --home 'C:\Users\O''Neil\Program Files (x86)\Legion Home'"
         );
+
+        // Round-trip parsing of a PowerShell device line recovers principal, account, and home.
+        let ps_line = format_device_line(
+            Path::new(r"C:\Users\O'Neil\My Légion\legion.exe"),
+            "agent:example",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
+            "pixel",
+            Some(Path::new(r"C:\Users\O'Neil\Legion Home")),
+            Some("O'Neil"),
+            ForcedCommandShell::WindowsPowerShell,
+        )
+        .unwrap();
+        let parsed_ps = AuthKeysFile::parse(format!("{ps_line}\n").as_bytes());
+        assert!(matches!(
+            &parsed_ps.lines[0].kind,
+            LineKind::Device {
+                name,
+                principal: Some(p),
+                home: Some(h),
+                account: Some(a),
+                ..
+            } if name == "pixel"
+                && p == "agent:example"
+                && h == r"C:\Users\O'Neil\Legion Home"
+                && a == "O'Neil"
+        ));
 
         // Control characters and relative paths are refused.
         assert!(
-            format_forced_command(Path::new("/home/me/bad\nlegion"), &["gate"], false).is_err()
+            format_forced_command(
+                Path::new("/home/me/bad\nlegion"),
+                &["gate"],
+                ForcedCommandShell::Posix
+            )
+            .is_err()
         );
-        assert!(format_forced_command(Path::new("relative/legion"), &["gate"], false).is_err());
+        assert!(
+            format_forced_command(
+                Path::new("relative/legion"),
+                &["gate"],
+                ForcedCommandShell::Posix
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1498,7 +1671,7 @@ Match Group users
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
             Some(Path::new("/Users/me/My Legion Home")),
             Some("Alice"),
-            false,
+            ForcedCommandShell::Posix,
         )
         .unwrap();
         // 12:15:00Z + 14h = next day 02:15 (12 digits, no trailing Z for OpenSSH 8.9 compatibility).

@@ -333,7 +333,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::device::authkeys::format_invite_line;
+    use crate::device::authkeys::{ForcedCommandShell, format_invite_line};
     use crate::device::keys::generate_ephemeral_ed25519;
 
     #[test]
@@ -370,7 +370,7 @@ mod tests {
             &key1.public_key,
             None,
             None,
-            false,
+            ForcedCommandShell::Posix,
         )
         .unwrap();
         let other_home_line = format_invite_line(
@@ -380,7 +380,7 @@ mod tests {
             &key2.public_key,
             Some(Path::new("/home/me/other-legion")),
             None,
-            false,
+            ForcedCommandShell::Posix,
         )
         .unwrap();
         let valid_line = format_invite_line(
@@ -390,7 +390,7 @@ mod tests {
             &key3.public_key,
             None,
             None,
-            false,
+            ForcedCommandShell::Posix,
         )
         .unwrap();
 

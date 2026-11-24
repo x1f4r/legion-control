@@ -966,6 +966,102 @@ step('g8 device.list shows the paired device and device.remove revokes its ssh k
   }
 }, ['g6']);
 
+step('g9 on Windows, pairing works from a legion.exe and LEGION_HOME path containing spaces under the configured DefaultShell', () => {
+  if (!windows) return 'not applicable on Unix';
+  const spaceDir = path.join(opts.work, 'Far Space');
+  const spaceHome = path.join(opts.work, 'Far Space Home');
+  const spaceKeys = path.join(opts.work, 'pair-space-keys');
+  const spaceBin = path.join(spaceDir, 'legion.exe');
+  const spaceEnv = { ...process.env, LEGION_HOME: spaceHome };
+  let enrolledDevice = null;
+  try {
+    fs.rmSync(spaceDir, { recursive: true, force: true });
+    fs.rmSync(spaceHome, { recursive: true, force: true });
+    fs.rmSync(spaceKeys, { recursive: true, force: true });
+    fs.mkdirSync(spaceDir, { recursive: true });
+    fs.mkdirSync(path.join(spaceHome, 'config'), { recursive: true });
+    fs.mkdirSync(spaceKeys, { recursive: true });
+    fs.copyFileSync(opts.bin, spaceBin);
+    fs.writeFileSync(path.join(spaceHome, 'config', 'node.toml'), 'name = "far-space"\n');
+    fs.writeFileSync(
+      path.join(spaceHome, 'config', 'policy.toml'),
+      'default = "owner"\n\n[roles.editor]\nallow = ["effect:read"]\n\n[principals."e2e:gate"]\nrole = "editor"\n',
+    );
+
+    const invOutcome = parseOutcome(
+      exec(spaceBin, ['device.invite', 'principal=e2e:gate', 'host=127.0.0.1', `port=${opts.farPort}`, '--json'], { env: spaceEnv }),
+      'space device.invite',
+    );
+    check(invOutcome.ok, 'device.invite from path with space failed', invOutcome.error);
+    const payload = decodeInvite(invOutcome.value.invite);
+    check(payload.node === 'far-space', 'space invite node mismatch', payload);
+
+    const adminAuth = path.join(process.env.ProgramData ?? 'C:\\ProgramData', 'ssh', 'administrators_authorized_keys');
+    const authAfterInvite = fs.readFileSync(adminAuth, 'utf8');
+    check(authAfterInvite.includes('--account'), 'Windows administrators_authorized_keys invite line missing --account');
+    check(authAfterInvite.includes('--home'), 'Windows administrators_authorized_keys invite line missing --home');
+
+    const tempKey = path.join(spaceKeys, 'temp_invite_key');
+    fs.writeFileSync(tempKey, buildOpenSshEd25519Key(Buffer.from(payload.key, 'base64'), 'legion-e2e-space-invite'));
+    lockDownPrivateKey(tempKey);
+
+    const knownHosts = path.join(spaceKeys, 'known_hosts');
+    const khHost = payload.port === 22 ? '127.0.0.1' : `[127.0.0.1]:${payload.port}`;
+    fs.writeFileSync(knownHosts, `${payload.host_keys.map(k => `${khHost} ${k}`).join('\n')}\n`);
+
+    const deviceKey = path.join(spaceKeys, 'device_ed25519');
+    const gen = exec('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'e2e-space', '-f', deviceKey]);
+    check(gen.status === 0, 'ssh-keygen failed for space-path device key', gen.stderr || gen.stdout);
+    lockDownPrivateKey(deviceKey);
+    const devicePub = fs.readFileSync(`${deviceKey}.pub`, 'utf8').trim();
+
+    const reqLine = `${JSON.stringify({ enrol: 1, id: payload.id, public_key: devicePub, name: 'Space Phone' })}\n`;
+    const enrol = sshDirect(tempKey, knownHosts, payload.user, payload.port, 'ignored', reqLine);
+    check(enrol.status === 0, `space-path ssh enrolment failed with exit ${enrol.status}`, { stdout: enrol.stdout, stderr: enrol.stderr });
+    const reply = JSON.parse(enrol.stdout.trim());
+    check(reply.ok === true && reply.node === 'far-space' && reply.principal === 'e2e:gate', 'unexpected space-path enrolment reply', reply);
+    enrolledDevice = reply.device;
+
+    const rpcInput = [
+      JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'hello', params: { client: 'legion-e2e-space', version: '1', protocol: 1 } }),
+      JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'call', params: { tool: 'meta.whoami', args: {} } }),
+    ].join('\n') + '\n';
+    const rpc = sshDirect(deviceKey, knownHosts, payload.user, payload.port, 'legion rpc', rpcInput);
+    check(rpc.status === 0, `space-path paired rpc exited ${rpc.status}`, { stdout: rpc.stdout, stderr: rpc.stderr });
+    const replies = new Map();
+    for (const line of rpc.stdout.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const msg = JSON.parse(trimmed);
+        if (msg.id !== undefined && msg.method === undefined) replies.set(msg.id, msg);
+      } catch {
+        // Ignore non-JSON preamble lines.
+      }
+    }
+    check(replies.get(1)?.result?.node === 'far-space', 'space-path hello did not answer as far-space', replies.get(1));
+    check(replies.get(2)?.result?.principal === 'e2e:gate', 'space-path whoami did not stay pinned to e2e:gate', replies.get(2));
+
+    const rmOutcome = parseOutcome(
+      exec(spaceBin, ['device.remove', `name=${enrolledDevice}`, '--json'], { env: spaceEnv }),
+      'space device.remove',
+    );
+    check(rmOutcome.ok && rmOutcome.value.removed === true, 'space-path device.remove failed', rmOutcome.error);
+    enrolledDevice = null;
+
+    const afterRevoke = sshDirect(deviceKey, knownHosts, payload.user, payload.port, 'legion rpc');
+    check(afterRevoke.status !== 0, 'revoked space-path device key still authenticated');
+    return `paired and revoked via ${spaceBin}`;
+  } finally {
+    if (enrolledDevice) {
+      spawnSync(spaceBin, ['device.remove', `name=${enrolledDevice}`, '--json'], { env: spaceEnv, windowsHide: true });
+    }
+    fs.rmSync(spaceKeys, { recursive: true, force: true });
+    fs.rmSync(spaceHome, { recursive: true, force: true });
+    fs.rmSync(spaceDir, { recursive: true, force: true });
+  }
+}, ['g8']);
+
 // --- h. services ---------------------------------------------------------------------------------
 
 const backends = { linux: 'systemd', macos: 'launchd', windows: 'windows' };

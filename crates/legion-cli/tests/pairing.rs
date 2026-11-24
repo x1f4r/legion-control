@@ -826,7 +826,7 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
         "my-phone",
         Some(home.state().parent().unwrap()),
         Some(&me),
-        false,
+        legion_tools::device::authkeys::ForcedCommandShell::Posix,
     )
     .unwrap();
     let other_line = legion_tools::device::authkeys::format_device_line(
@@ -836,7 +836,7 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
         "other-phone",
         Some(home.state().parent().unwrap()),
         Some(&other_account),
-        false,
+        legion_tools::device::authkeys::ForcedCommandShell::Posix,
     )
     .unwrap();
     std::fs::write(&auth_keys, format!("{my_line}\n{other_line}\n")).unwrap();

@@ -28,8 +28,9 @@ use serde::{Deserialize, Serialize};
 use crate::caller::Caller;
 
 use self::authkeys::{
-    LineKind, format_invite_line, line_matches_account, line_matches_home, read_auth_keys,
-    resolve_safe_write_path, resolve_target, verify_owner_matches_euid, write_auth_keys,
+    ForcedCommandShell, LineKind, format_invite_line, line_matches_account, line_matches_home,
+    read_auth_keys, resolve_safe_write_path, resolve_target, verify_owner_matches_euid,
+    write_auth_keys,
 };
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
@@ -225,7 +226,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         &ephemeral.public_key,
         ctx.paths().explicit_home(),
         pinned_account.as_deref(),
-        cfg!(windows),
+        ForcedCommandShell::host(),
     )?;
 
     let payload = InvitePayload {

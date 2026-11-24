@@ -19,8 +19,8 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use super::authkeys::{
-    LineKind, format_device_line, read_auth_keys, resolve_safe_write_path, resolve_target,
-    verify_owner_matches_euid, write_auth_keys,
+    ForcedCommandShell, LineKind, format_device_line, read_auth_keys, resolve_safe_write_path,
+    resolve_target, verify_owner_matches_euid, write_auth_keys,
 };
 use super::keys::{validate_ed25519_public_key, validate_invite_id};
 use super::store::{
@@ -446,7 +446,7 @@ fn process_enrol_blocking(
         &device_name,
         paths.explicit_home(),
         pinned_account.as_deref(),
-        cfg!(windows),
+        ForcedCommandShell::host(),
     ) {
         Ok(line) => line,
         Err(error) => {
