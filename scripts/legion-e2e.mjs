@@ -281,17 +281,20 @@ step('a1 install the built binary with the platform install script', () => {
     const local = path.join(opts.work, 'install-local');
     fs.mkdirSync(local, { recursive: true });
     const before = userPath();
-    const script = path.join(repository, 'install', 'legion.ps1');
-    const result = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-From', opts.bin], { env: { ...process.env, LOCALAPPDATA: local } });
-    check(result.status === 0, 'install/legion.ps1 -From failed', result.stderr || result.stdout);
     const installDir = path.join(local, 'legion');
-    const after = userPath();
-    check(after && after.value.split(';').some(entry => entry.toLowerCase() === installDir.toLowerCase()), `install/legion.ps1 did not add ${installDir} to the user's PATH`, after);
     // The far node is this same account, and sshd builds its sessions' environment from the
-    // account's registry: left in place, this entry would make the far side find the near
-    // node's binary. Restoring it keeps the two installs apart; the check above already saw the
-    // installer do its part.
-    restoreUserPath(before);
+    // account's registry: left in place, the installer's PATH entry would make the far side find
+    // the near node's binary. It is put back whatever happens here; the check below sees the
+    // installer do its part first.
+    try {
+      const script = path.join(repository, 'install', 'legion.ps1');
+      const result = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-From', opts.bin], { env: { ...process.env, LOCALAPPDATA: local } });
+      check(result.status === 0, 'install/legion.ps1 -From failed', result.stderr || result.stdout);
+      const after = userPath();
+      check(after && after.value.split(';').some(entry => entry.toLowerCase() === installDir.toLowerCase()), `install/legion.ps1 did not add ${installDir} to the user's PATH`, after);
+    } finally {
+      restoreUserPath(before);
+    }
     near = path.join(installDir, 'legion.exe');
   } else {
     const home = path.join(opts.work, 'install-home');
@@ -513,9 +516,13 @@ step('d8 legion cp --checksum sends a file whose size and time did not change', 
 // --- e. jobs -------------------------------------------------------------------------------------
 
 let printJob;
-step('e1 job.start --on far a command that prints, sleeps and prints again', () => {
-  const script = "console.log('first'); setTimeout(() => console.log('second'), 5000)";
-  printJob = ok('job.start', { argv: [NODE, '-e', script], name: 'e2e-print' }, { on: 'far' });
+// The job prints its second line only once this file exists, so how long a slow runner takes
+// between steps cannot decide what the job has printed when it is looked at. It gives up after
+// two minutes, so a run that never creates the file leaves nothing behind.
+const jobGate = path.join(data, 'job-gate');
+step('e1 job.start --on far a command that prints, waits for a file and prints again', () => {
+  const script = "const fs = require('node:fs'); console.log('first'); const started = Date.now(); const tick = setInterval(() => { if (fs.existsSync(process.argv[1])) { clearInterval(tick); console.log('second'); } else if (Date.now() - started > 120000) { process.exit(3); } }, 100)";
+  printJob = ok('job.start', { argv: [NODE, '-e', script, jobGate], name: 'e2e-print' }, { on: 'far' });
   check(printJob.id && ['starting', 'running'].includes(printJob.state), 'job.start did not start the job', printJob);
   return printJob.id;
 });
@@ -524,7 +531,7 @@ step('e2 from new sessions, job.status and job.logs see it running with its firs
   const status = ok('job.status', { id: printJob.id }, { on: 'far' });
   check(['starting', 'running'].includes(status.state), `the job is ${status.state} right after it started`, status);
   let logs;
-  for (let i = 0; i < 20; i += 1) {
+  for (let i = 0; i < 60; i += 1) {
     logs = ok('job.logs', { id: printJob.id }, { on: 'far' });
     if (logs.content.includes('first')) break;
     await sleep(250);
@@ -532,7 +539,8 @@ step('e2 from new sessions, job.status and job.logs see it running with its firs
   check(logs.content.includes('first') && !logs.content.includes('second'), 'job.logs did not show only the first line while the job ran', logs);
 }, ['e1']);
 
-step('e3 job.wait --on far sees it finish with both lines', () => {
+step('e3 job.wait --on far sees it finish with both lines once the file is there', () => {
+  fs.writeFileSync(jobGate, 'go\n');
   const waited = ok('job.wait', { id: printJob.id, timeout_s: 60 }, { on: 'far', timeout: 120_000 });
   check(waited.state === 'succeeded' && waited.exit_code === 0 && waited.timed_out === false, 'the job did not succeed', waited);
   const logs = ok('job.logs', { id: printJob.id }, { on: 'far' });
