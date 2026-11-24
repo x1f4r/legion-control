@@ -254,6 +254,16 @@ fn put_says_where_to_start_verifies_and_renames() {
         json!({"ok": true, "size": data.len(), "hash": hash(&data)})
     );
     assert_eq!(fs::read(&target).unwrap(), data);
+    let audit = node.last_audit();
+    assert_eq!(
+        (
+            audit["door"].as_str(),
+            audit["tool"].as_str(),
+            audit["outcome"].as_str()
+        ),
+        (Some("stream"), Some("stream.put"), Some("ok"))
+    );
+    assert_eq!(audit["args"]["path"], "~/projects/new/dir/f.bin");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -625,6 +635,20 @@ fn a_pinned_principal_is_kept_and_only_a_delegating_role_acts_as_another() {
     let audit = node.last_audit();
     assert_eq!(audit["principal"], "owner");
     assert!(audit["args"].get("as").is_none(), "{audit}");
+
+    // Without a pinned principal the caller is the policy's default, which may not widen itself.
+    node.policy(&format!("default = \"reader\"\n{CONFINED}"));
+    let error = node
+        .run(None, &get("owner"), b"")
+        .refused(ErrorCode::Denied);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("may not act as owner"),
+        "{error}"
+    );
+    assert_eq!(node.last_audit()["principal"], "reader");
 }
 
 #[test]
