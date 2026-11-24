@@ -48,5 +48,10 @@ name = "pairing"
 path = "tests/pairing.rs"
 required-features = ["ssh"]
 
+[[test]]
+name = "fleet_routes"
+path = "tests/fleet_routes.rs"
+required-features = ["ssh"]
+
 [lints]
 workspace = true
