@@ -5,8 +5,10 @@ node, adding other machines, and reading the errors you are most likely to see.
 
 ## Install
 
-Release binaries are published under `legion-v*` tags on GitHub alongside a `SHA256SUMS` file. Five
-targets are built in CI:
+Release binaries are published under `legion-v*` tags on GitHub alongside `SHA256SUMS`, an offline
+Ed25519 signature (`SHA256SUMS.sig`, signed with the owner's offline key whose public key is
+compiled into `legion` from `contract/release-public-key.pem`), and GitHub build provenance
+attestations. Five targets are built in CI:
 
 | Platform | Target triple | Asset name |
 | --- | --- | --- |
@@ -17,7 +19,8 @@ targets are built in CI:
 | Windows x86-64 (static CRT) | `x86_64-pc-windows-msvc` | `legion-<ver>-x86_64-pc-windows-msvc.exe` |
 
 32-bit ARM Linux is not supported (use a 64-bit OS image on Raspberry Pi). Native Windows ARM64
-binaries are not published yet; build from source or run the x86-64 binary under emulation.
+binaries are not published yet; the Windows installer and `fleet.install` warn and install the
+x86-64 binary to run under emulation (or build from source natively).
 
 ### Linux and macOS (installer script)
 
@@ -27,16 +30,30 @@ From a checkout of this repository, run the POSIX shell installer without `sudo`
 sh install/legion.sh
 ```
 
-The script detects the OS and CPU architecture, resolves the newest published `legion-v*` release,
-downloads the binary and `SHA256SUMS`, verifies the SHA-256 digest, stages the binary next to the
-destination, and atomically renames it into `~/.local/bin/legion` with mode `0755`. It then runs
-`~/.local/bin/legion --version` and prints a reminder if `~/.local/bin` is not on your `PATH`.
+What `install/legion.sh` does:
+
+- Detects the OS and CPU architecture (on macOS running under Rosetta 2, checks
+  `sysctl.proc_translated` and selects the native `aarch64-apple-darwin` build), resolves the
+  highest published stable `legion-v*` release, and downloads over HTTPS with TLS 1.2 or newer
+  (`curl --proto '=https' --tlsv1.2`, or GNU `wget --https-only`; BusyBox `wget` is refused).
+- Downloads the binary and `SHA256SUMS`, verifies the SHA-256 digest, and verifies release trust:
+  1. If `gh` is on `PATH`, runs `gh attestation verify` against the release workflow and tag ref.
+  2. Otherwise, if `openssl` supports Ed25519 `-rawin` (OpenSSL 3 / modern OpenSSL on Linux, or
+     Homebrew OpenSSL 3 on macOS — macOS ships LibreSSL, which lacks `-rawin`), downloads
+     `SHA256SUMS.sig` and verifies it against the pinned release public key embedded in the script.
+  3. If neither `gh` nor an Ed25519-capable `openssl` is installed, the script stops without
+     installing and prints how to install `gh` or OpenSSL 3 (for example `brew install openssl` on
+     macOS), or pass `--insecure-skip-verify` to install with SHA-256 checking only.
+- Refuses a directory destination, stages the binary beside `~/.local/bin/legion` with mode `0755`,
+  atomically renames it into place, runs `~/.local/bin/legion --version`, and prints a reminder if
+  `~/.local/bin` is not on your `PATH`.
 
 Useful options:
 
 ```sh
 sh install/legion.sh --version 0.1.0              # install a specific release
 sh install/legion.sh --from target/release/legion # install a local binary offline
+sh install/legion.sh --insecure-skip-verify       # skip signature/attestation (still checks SHA-256)
 ```
 
 macOS behaviour was verified from code (`install/legion.sh`) rather than run here.
@@ -51,28 +68,42 @@ Run the PowerShell installer as your own user (no administrator rights required)
 .\install\legion.ps1
 ```
 
-The script requires Windows PowerShell 5.1 or newer, forces TLS 1.2 on 5.1, downloads the release
-binary and `SHA256SUMS`, verifies the SHA-256 checksum, and installs to
-`%LOCALAPPDATA%\legion\legion.exe`. If an existing `legion.exe` is running, the script renames it
-aside to a `.old.<id>` file before moving the new binary in; `legion` removes stale `.old.*` files
-on its next start. The script also adds `%LOCALAPPDATA%\legion` to your user `PATH` if it is not
-already listed (open a new terminal to call `legion` by name).
+What `install/legion.ps1` does:
+
+- Requires Windows PowerShell 5.1 or newer and forces TLS 1.2 on 5.1. On Windows ARM64, prints a
+  warning and installs the `x86_64-pc-windows-msvc` binary to run under x64 emulation.
+- Downloads the release binary and `SHA256SUMS`, verifies the SHA-256 checksum, and verifies trust
+  in the same order as the Unix script: `gh attestation verify` if `gh` is on `PATH`, else
+  `openssl pkeyutl -verify -rawin` (for example OpenSSL 3 from Git for Windows) against
+  `SHA256SUMS.sig` and the pinned public key. If neither is installed, it stops and explains how to
+  install `gh` or OpenSSL 3, or pass `-InsecureSkipVerify` (which still checks SHA-256).
+- Installs to `%LOCALAPPDATA%\legion\legion.exe`. If an existing `legion.exe` is running, the
+  script renames it aside to a `.old.<id>` file before moving the new binary in; `legion` removes
+  stale `.old.*` files on its next start.
+- Adds `%LOCALAPPDATA%\legion` to `HKCU\Environment\Path` if not already listed, preserving the
+  `REG_EXPAND_SZ` value kind and existing unexpanded `%VAR%` entries (open a new terminal to call
+  `legion` by name).
 
 Options:
 
 ```powershell
 .\install\legion.ps1 -Version 0.1.0
 .\install\legion.ps1 -From target\release\legion.exe
+.\install\legion.ps1 -InsecureSkipVerify
 ```
 
 ### Manual install or building from source
 
 To install manually without a script:
 
-1. Download the matching binary and `SHA256SUMS` from the `legion-v<version>` release.
-2. Verify the checksum (`sha256sum -c SHA256SUMS --ignore-missing` on Linux, `shasum -a 256` on
+1. Download the matching binary, `SHA256SUMS`, and `SHA256SUMS.sig` from the `legion-v<version>`
+   release.
+2. Verify `SHA256SUMS.sig` against `contract/release-public-key.pem` with OpenSSL 3 (`openssl
+   pkeyutl -verify -pubin -inkey contract/release-public-key.pem -rawin -in SHA256SUMS -sigfile
+   SHA256SUMS.sig`) or verify build provenance with `gh attestation verify`.
+3. Verify the checksum (`sha256sum -c SHA256SUMS --ignore-missing` on Linux, `shasum -a 256` on
    macOS, `Get-FileHash -Algorithm SHA256` on Windows).
-3. Move the binary to `~/.local/bin/legion` (`chmod 0755`) on Unix, or
+4. Move the binary to `~/.local/bin/legion` (`chmod 0755`) on Unix, or
    `%LOCALAPPDATA%\legion\legion.exe` on Windows, and make sure that directory is on `PATH`.
 
 To build from source (requires the Rust toolchain pinned in `rust-toolchain.toml`):
@@ -97,7 +128,7 @@ created
   - /home/me/.config/legion/policy.toml
 kept  -
 next
-  - Edit policy.toml to uncomment or add a [principals.<name>] entry for each AI agent or device you plan to connect.
+  - Edit policy.toml to assign principals to a role (`observer`, `editor`, or `operator`) before connecting an AI agent or remote device.
   - Add your other machines to fleet.toml with `legion fleet.discover` (or `legion fleet.discover add=true`, or `legion fleet.add`).
   - Register an AI coding agent with `legion agents add claude --as agent:claude` (also supports codex, antigravity, and opencode).
   - Check that everything is configured and reachable with `legion meta.doctor`.
@@ -229,11 +260,14 @@ legion fleet.install machine=pi dry_run=true
 legion fleet.install machine=pi
 ```
 
-`fleet.install` probes the remote OS and CPU architecture, downloads the matching release binary
-and `SHA256SUMS` (or reuses a cached copy under `state/dist/`, or copies a local binary given with
-`from=/path/to/legion`), verifies the SHA-256 digest, copies the binary to a random temporary file
-beside `~/.local/bin/legion` (or `%LOCALAPPDATA%\legion\legion.exe` on Windows), atomically moves
-it into place, and opens a normal `legion rpc` session to verify the installed version.
+`fleet.install` probes the remote OS and CPU architecture (selecting native arm64 on macOS under
+Rosetta 2, and x86-64 under emulation on Windows ARM64 with a note), downloads the release binary,
+`SHA256SUMS`, and `SHA256SUMS.sig` (or reuses a cached copy under `state/dist/`, or copies a local
+binary given with `from=/path/to/legion`), verifies the offline Ed25519 signature against the
+compiled-in public key and checks SHA-256, checks the downgrade floor, checks the binary format
+header, stages and runs `--version` on the remote host before saving a `.prev` backup and swapping
+into place, and opens a new `legion rpc` session (restoring `.prev` automatically if verification
+fails).
 
 ### Check reachability
 
@@ -353,15 +387,26 @@ on the target node to inspect the resolved role, path roots, and allowed tools.
 
 ### Unmonitored or busy machine
 
-On a fresh node whose `node.toml` does not declare busy probes or `busy = "none"`:
+`power.*` calls with `dry_run=true` still return the planned commands and add a `would_refuse` block
+showing the exact refusal a real call would return. On a fresh node whose `node.toml` does not
+declare busy probes or `busy = "none"`:
 
 ```sh
 legion power.sleep dry_run=true
 ```
 
 ```text
-legion: busy: Refused to put this machine to sleep: node.toml does not say what keeps this machine busy, and not knowing is not the same as idle.
-  If nothing on this machine needs protecting, add the line busy = "none" to /home/me/.config/legion/node.toml. Otherwise describe what does with [[busy.probes]] tables (name, run = [program and arguments, exit 0 while busy and 1 while idle], timeout_s). To go ahead this once anyway, pass force: true.
+action     sleep
+scheduled  false
+in_s       3
+boot_id    00000000-0000-4000-8000-000000000001
+commands
+  - systemctl, suspend
+dry_run    true
+would_refuse
+  code     busy
+  message  Refused to put this machine to sleep: node.toml does not say what keeps this machine busy, and not knowing is not the same as idle.
+  hint     If nothing on this machine needs protecting, add the line busy = "none" to /home/me/.config/legion/node.toml. Otherwise describe what does with [[busy.probes]] tables (name, run = [program and arguments, exit 0 while busy and 1 while idle], timeout_s). To go ahead this once anyway, pass force: true.
 ```
 
 When a busy probe reports active work (or an `exclusive` job is running):
@@ -371,9 +416,19 @@ legion power.sleep dry_run=true
 ```
 
 ```text
-legion: busy: Refused to put this machine to sleep: the machine is busy (probe render: busy (the probe exited 0)).
-  Wait until what keeps it busy has finished (power.status shows the state), or pass force: true to go ahead anyway.
+action     sleep
+scheduled  false
+in_s       3
+boot_id    00000000-0000-4000-8000-000000000001
+commands
+  - systemctl, suspend
+dry_run    true
+would_refuse
+  code     busy
+  message  Refused to put this machine to sleep: the machine is busy (probe render: busy (the probe exited 0)).
+  hint     Wait until what keeps it busy has finished (power.status shows the state), or pass force: true to go ahead anyway.
 ```
 
 Run `legion power.status` to see which probes or exclusive jobs are active, or pass `force=true` to
-override the busy gate once.
+override the busy gate once (on Linux, logind inhibitors are separate and require
+`ignore_inhibitors=true` with `[power] sudo = true`).

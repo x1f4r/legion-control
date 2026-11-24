@@ -58,7 +58,7 @@ created
   - /home/me/.config/legion/policy.toml
 kept  -
 next
-  - Edit policy.toml to uncomment or add a [principals.<name>] entry for each AI agent or device you plan to connect.
+  - Edit policy.toml to assign principals to a role (`observer`, `editor`, or `operator`) before connecting an AI agent or remote device.
   - Add your other machines to fleet.toml with `legion fleet.discover` (or `legion fleet.discover add=true`, or `legion fleet.add`).
   - Register an AI coding agent with `legion agents add claude --as agent:claude` (also supports codex, antigravity, and opencode).
   - Check that everything is configured and reachable with `legion meta.doctor`.

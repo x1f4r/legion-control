@@ -95,10 +95,35 @@ paths = ["~/projects/**"]
 
 ### Built-in secret locations
 
-Even when a role has broad or unconfined `paths`, Legion refuses file-tool access to a built-in
-list of well-known secret locations — SSH keys, GPG keyrings, cloud and git credentials, password
-stores, AI agents' credential files, and browser profiles — for every role that does not allow
-`effect:admin`, unless that role's `paths` explicitly names the location.
+Even when a role has broad or unconfined `paths`, Legion refuses file-tool access (`fs.*` and
+`legion stream`) — and skips entries during recursive walks (`fs.find`, `fs.grep`, `fs.manifest`,
+and directory transfers) — for a built-in list of well-known secret locations under `~` for every
+role that does not allow `effect:admin`:
+
+- **SSH and GPG**: `~/.ssh`, `~/.gnupg`.
+- **Cloud, container, and git credentials**: `~/.aws`, `~/.azure`, `~/.kube`,
+  `~/.docker/config.json`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/gcloud`.
+- **Password stores and keyrings**: `~/.password-store`, `~/.local/share/keyrings`,
+  `~/Library/Keychains`.
+- **AI coding agent credentials**: `~/.claude.json`, `~/.claude/.credentials.json`,
+  `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`, `~/.gemini/google_accounts.json`,
+  `~/.config/opencode/service.json`, `~/.local/share/opencode/auth.json`,
+  `~/.config/github-copilot`.
+- **Browser profiles**: Firefox, Chrome, Chromium, Brave, and Edge profile directories across
+  Linux, macOS, and Windows.
+
+A broad root such as `paths = ["~/**"]` does **not** opt in: to allow a non-admin role to touch one
+of these locations, the role's `paths` must explicitly name the location (or a path inside it). This
+protection applies to file tools only and does not bind a role with `exec`.
+
+```sh
+legion fs.read path=~/.ssh/id_ed25519 --as agent:wide
+```
+
+```text
+legion: denied: agent:wide may not read ~/.ssh/id_ed25519: ~/.ssh is on Legion's list of secret locations.
+  Only roles with effect:admin may touch secret locations by default. To allow this role, the owner can name ~/.ssh (or a path inside it) explicitly in the role's `paths` in policy.toml.
+```
 
 ## The three ready-made roles
 
@@ -116,8 +141,9 @@ stores, AI agents' credential files, and browser profiles — for every role tha
   files (including `policy.toml` and `tools.d/`) through a shell: treat it as a guard rail and an
   audit trail, not a wall.
 
-`legion meta.doctor` warns about every role in `policy.toml` that may run commands, so roles with
-`exec` never look like confined sandboxes by accident.
+`legion meta.doctor` warns about every non-owner role in `policy.toml` that may run commands —
+whether or not it sets `paths`, and even if it denies `effect:admin` — so roles with `exec` never
+look like confined sandboxes by accident.
 
 ## How each door pins a principal
 
@@ -144,11 +170,47 @@ never invokes a shell and never executes `SSH_ORIGINAL_COMMAND`: it compares it 
 against the exact command shapes Legion's SSH connector sends for `legion rpc` and `legion stream`,
 serves the session directly pinned to `<principal>`, and refuses anything else with exit code 1.
 
+### HTTP bearer tokens and MCP sessions
+
+Tokens in `tokens.toml` (managed with `token.add`, `token.list`, and `token.remove`, all requiring
+`effect:admin`) obey four rules:
+
+1. **Caller scoping**: a caller may create, list, or remove tokens only for a principal it could
+   itself act as (its own principal, or any principal when the caller has the `owner` role).
+2. **Owner-role tokens**: minting a token for any principal whose role is `owner` requires a caller
+   with the `owner` role **and** `allow_owner=true`:
+
+   ```sh
+   legion token add my-owner owner
+   ```
+
+   ```text
+   legion: denied: owner has the owner role: a token for it may do everything the account can, from anywhere the server is published, so it is not made unless asked for in so many words.
+     Give the token a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want.
+   ```
+
+3. **Expiry ceiling**: a token minted through an expiring HTTP token cannot outlive the caller's
+   token (omitting `expires_days` or asking for a later expiry fails with `denied`).
+4. **MCP session ownership**: streamable-HTTP MCP sessions on `/mcp` belong to the token that opened
+   them, and another token presenting the same `Mcp-Session-Id` is turned away as if the session did
+   not exist. Limits are 16 sessions per token (opening a 17th ends that token's least recently used
+   session), 256 sessions total across the server, and a 5-minute idle timeout. Removing, replacing,
+   or expiring a token closes all of its MCP sessions immediately.
+
 ### Delegation
 
-Only a role with `delegate = true` (by default, only `owner`) may act as another principal via
-`--as` or a request's `as` field. On a door that pinned a principal without `delegate = true`, any
-different `as` in a request is ignored; on an unpinned door, it is refused with `denied`.
+Only the built-in `owner` role may act as another principal via `--as` or a request's `as` field. A
+role that could act as anyone would be `owner` under another name, so a `policy.toml` that sets
+`delegate = true` on any other role is refused when it is loaded (give the principal `role = "owner"`
+if full access is intended):
+
+```text
+legion: failed: /home/me/.config/legion/policy.toml: [roles.helper] sets delegate = true, but acting as another principal is the owner's alone: a role that could act as anyone would be the owner under another name; give the principal role = "owner" if that is what is meant.
+  Fix the file. Until it parses, every call that needs it fails rather than using a default.
+```
+
+On a door that pinned a non-owner principal, any different `as` in a request is ignored; on an
+unpinned door, it is refused with `denied`.
 
 ## Forwarding across nodes
 
@@ -295,7 +357,7 @@ legion fs.read path=~/private/secrets.txt --as agent:editor
 ```
 
 ```text
-legion: denied: agent:editor may not read /home/me/private/secrets.txt: its role editor confines file tools to ~/projects/site.
+legion: denied: agent:editor may not read ~/private/secrets.txt: its role editor confines file tools to ~/projects/site.
   Use a path under one of those directories, or ask the owner to add the directory to the role's paths in policy.toml.
 ```
 
@@ -448,7 +510,7 @@ legion fs.read path=~/private/secrets.txt --as agent:leaky
 ```
 
 ```text
-legion: denied: agent:leaky may not read /home/me/private/secrets.txt: its role leaky confines file tools to ~/projects/site.
+legion: denied: agent:leaky may not read ~/private/secrets.txt: its role leaky confines file tools to ~/projects/site.
   Use a path under one of those directories, or ask the owner to add the directory to the role's paths in policy.toml.
 ```
 
