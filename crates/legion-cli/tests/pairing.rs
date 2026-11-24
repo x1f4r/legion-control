@@ -904,3 +904,119 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
     assert_eq!(enrol_reply["ok"], json!(false));
     assert_eq!(enrol_reply["error"]["code"], json!("denied"));
 }
+
+#[test]
+fn device_invite_scans_live_sshd_host_keys_without_configured_host_keys() {
+    if !TestSshd::available() {
+        eprintln!(
+            "skipping device_invite_scans_live_sshd_host_keys_without_configured_host_keys: sshd unavailable"
+        );
+        return;
+    }
+    let has_keyscan = std::process::Command::new("ssh-keyscan")
+        .arg("-h")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if !has_keyscan {
+        eprintln!(
+            "skipping device_invite_scans_live_sshd_host_keys_without_configured_host_keys: ssh-keyscan unavailable"
+        );
+        return;
+    }
+
+    let home = Home::new();
+    let auth_keys = home.home().join("scan_authorized_keys");
+    let home_dir_str = home.home().to_string_lossy().into_owned();
+    let Some(sshd) = TestSshd::start(auth_keys.clone(), &[("HOME", &home_dir_str)])
+        .expect("throwaway sshd failed to start")
+    else {
+        return;
+    };
+
+    // Configure ONLY [devices] authorized_keys — intentionally omit [devices] host_keys so
+    // device.invite must discover the throwaway sshd's ephemeral host key via ssh-keyscan.
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_keys),
+        ),
+    );
+    home.write_config(
+        "policy.toml",
+        "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.phone]\nrole = \"observer\"\n",
+    );
+
+    let invite_run = home.run(&[
+        "device.invite",
+        "principal=phone",
+        "host=127.0.0.1",
+        &format!("port={}", sshd.port()),
+        &format!("user={}", sshd.user()),
+    ]);
+    assert_eq!(
+        invite_run.code, 0,
+        "device.invite failed: stdout={} stderr={}",
+        invite_run.stdout, invite_run.stderr
+    );
+    let invite_json = invite_run.json();
+    let source = invite_json["host_keys_source"].as_str().unwrap();
+    assert!(
+        source.starts_with("ssh-keyscan"),
+        "expected ssh-keyscan host_keys_source, got {source:?}"
+    );
+    assert_eq!(
+        invite_json["host_keys"],
+        json!([sshd.host_key_line()]),
+        "scanned host key should match throwaway sshd's ephemeral host key"
+    );
+
+    // Confirm the scanned host key works for real StrictHostKeyChecking=yes enrolment.
+    let payload = InvitePayload::decode(invite_json["invite"].as_str().unwrap()).unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+    let temp_key = client_dir.path().join("temp_key");
+    write_openssh_ed25519_private_key(&temp_key, &payload.decode_seed().unwrap(), "scan-invite")
+        .unwrap();
+    let known_hosts = client_dir.path().join("known_hosts");
+    write_known_hosts(
+        &known_hosts,
+        &payload.hosts[0],
+        payload.port,
+        &payload.host_keys,
+    )
+    .unwrap();
+    let device_key = client_dir.path().join("device_ed25519");
+    let device_pub =
+        generate_ed25519_keypair(sshd.ssh_keygen_bin(), &device_key, "phone@scan").unwrap();
+
+    let mut enrol_child = sshd
+        .ssh_command(&temp_key, &known_hosts)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = enrol_child.stdin.take().unwrap();
+        let req = json!({
+            "enrol": 1,
+            "id": payload.id,
+            "public_key": device_pub,
+            "name": "Scanned Phone",
+        });
+        writeln!(stdin, "{req}").unwrap();
+    }
+    let out = enrol_child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "enrolment with scanned host key failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reply: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(reply["ok"], json!(true));
+    assert_eq!(reply["device"], json!("scanned-phone"));
+}

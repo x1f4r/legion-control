@@ -35,7 +35,7 @@ use self::authkeys::{
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
     InvitePayload, fingerprint_key_b64, generate_ephemeral_ed25519, generate_invite_id,
-    read_host_keys, validate_invite_id,
+    resolve_host_keys, validate_invite_id,
 };
 use self::store::{InviteRecord, format_rfc3339, load_state, lock_auth_keys, save_state, sweep};
 
@@ -133,6 +133,9 @@ pub struct InviteResult {
     pub user: String,
     /// Pinned SSH public host keys in the invite.
     pub host_keys: Vec<String>,
+    /// Where the pinned host keys came from (`configured`, `ssh-keyscan`, `files`, or
+    /// `ssh-keyscan (differs from host key files)`).
+    pub host_keys_source: String,
 }
 
 async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> {
@@ -207,7 +210,15 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     } else {
         None
     };
-    let host_keys = read_host_keys(&node_file.devices.host_keys, ctx.paths().home())?;
+    let resolved_host_keys = resolve_host_keys(
+        &node_file.devices.host_keys,
+        ctx.paths().home(),
+        args.port,
+        ctx.cancel_token().child_token(),
+    )
+    .await?;
+    let host_keys = resolved_host_keys.keys;
+    let host_keys_source = resolved_host_keys.source;
     let exe = legion_core::current_exe()?;
 
     let now = Timestamp::from_second(Timestamp::now().as_second()).map_err(internal_time)?;
@@ -298,6 +309,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         port: args.port,
         user,
         host_keys,
+        host_keys_source,
     })
 }
 

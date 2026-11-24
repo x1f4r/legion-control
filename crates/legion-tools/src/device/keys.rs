@@ -2,14 +2,21 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use legion_core::CancellationToken;
 use legion_core::policy::expand_tilde;
 use legion_core::proto::{ErrorBody, ErrorCode};
+use legion_os::run::{RunOptions, run};
+use legion_os::shell::CommandSpec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// Timeout for one `ssh-keyscan` probe against local `sshd`.
+const KEYSCAN_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Prefix of every Legion v1 pairing invite string.
 pub const INVITE_PREFIX: &str = "legion-invite-1.";
@@ -351,7 +358,162 @@ fn looks_like_second_key_token(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 
-/// Reads and orders this node's sshd public host keys.
+/// Resolved SSH public host keys together with where they came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedHostKeys {
+    /// Ordered public host keys (`"<type> <base64>"`).
+    pub keys: Vec<String>,
+    /// Source label: `"configured"`, `"ssh-keyscan"`, `"files"`, or
+    /// `"ssh-keyscan (differs from host key files)"`.
+    pub source: String,
+}
+
+/// Resolves this node's sshd public host keys for an invite on `port`.
+///
+/// - When `configured` (`[devices] host_keys` in `node.toml`) is non-empty, reads those `.pub`
+///   files directly (`source = "configured"`).
+/// - Otherwise prefers probing the live local `sshd` via `ssh-keyscan -p <port> -T 5 127.0.0.1`
+///   (and `::1` if IPv4 yields no keys), falling back to the default host key `.pub` files
+///   (`/etc/ssh/ssh_host_*_key.pub` on Unix, `%ProgramData%\ssh\ssh_host_*_key.pub` on Windows).
+/// - When both `ssh-keyscan` and the default `.pub` files return keys and they differ (for
+///   example when `sshd_config` serves a non-default `HostKey`), uses the scanned keys and notes
+///   the difference in `source`.
+pub async fn resolve_host_keys(
+    configured: &[String],
+    home: Option<&Path>,
+    port: u16,
+    cancel: CancellationToken,
+) -> Result<ResolvedHostKeys, ErrorBody> {
+    if !configured.is_empty() {
+        let keys = read_host_keys(configured, home)?;
+        return Ok(ResolvedHostKeys {
+            keys,
+            source: "configured".to_owned(),
+        });
+    }
+
+    let scanned = scan_local_sshd_host_keys(port, cancel).await;
+    let (file_keys, pattern, read_errors) = read_default_host_key_files();
+    if let Some(resolved) = choose_auto_host_keys(scanned, file_keys) {
+        return Ok(resolved);
+    }
+
+    let detail = if !read_errors.is_empty() {
+        format!(" ({})", read_errors.join("; "))
+    } else {
+        String::new()
+    };
+    Err(ErrorBody::new(
+        ErrorCode::Failed,
+        format!(
+            "No usable sshd public host keys could be obtained from ssh-keyscan on port {port} or {pattern}{detail}."
+        ),
+    )
+    .with_hint(
+        "An invite without a pinned host key is not allowed. Ensure sshd is running on that port or its host `.pub` files are readable (for example `ssh-keygen -A` on Unix), or list the `.pub` files under `[devices] host_keys` in node.toml.",
+    ))
+}
+
+/// Selects between live `ssh-keyscan` keys and default host-key `.pub` files.
+pub fn choose_auto_host_keys(
+    scanned: Vec<String>,
+    file_keys: Vec<String>,
+) -> Option<ResolvedHostKeys> {
+    if !scanned.is_empty() {
+        let source = if !file_keys.is_empty() && scanned != file_keys {
+            "ssh-keyscan (differs from host key files)".to_owned()
+        } else {
+            "ssh-keyscan".to_owned()
+        };
+        return Some(ResolvedHostKeys {
+            keys: scanned,
+            source,
+        });
+    }
+    if !file_keys.is_empty() {
+        return Some(ResolvedHostKeys {
+            keys: file_keys,
+            source: "files".to_owned(),
+        });
+    }
+    None
+}
+
+async fn scan_local_sshd_host_keys(port: u16, cancel: CancellationToken) -> Vec<String> {
+    let port_str = port.to_string();
+    for host in ["127.0.0.1", "::1"] {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let options = RunOptions::new(CommandSpec::argv(
+            "ssh-keyscan",
+            ["-p", port_str.as_str(), "-T", "5", host],
+        ))
+        .c_locale()
+        .timeout(KEYSCAN_TIMEOUT)
+        .cancel(cancel.child_token());
+
+        if let Ok(output) = run(options).await
+            && !output.cancelled
+            && !output.timed_out
+        {
+            let parsed = parse_keyscan_output(&output.stdout.text);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Parses `ssh-keyscan` stdout lines (`<host> <type> <base64>`) into ordered, validated host keys.
+pub fn parse_keyscan_output(stdout: &str) -> Vec<String> {
+    let stripped: Vec<&str> = stdout
+        .lines()
+        .filter_map(|raw_line| {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (_, rest) = line.split_once(char::is_whitespace)?;
+            let rest = rest.trim_start();
+            (!rest.is_empty()).then_some(rest)
+        })
+        .collect();
+    select_host_keys(&stripped)
+}
+
+fn read_default_host_key_files() -> (Vec<String>, String, Vec<String>) {
+    let dir = default_ssh_host_key_dir();
+    let pattern = if cfg!(windows) {
+        format!("{}\\ssh_host_*_key.pub", dir.display())
+    } else {
+        format!("{}/ssh_host_*_key.pub", dir.display())
+    };
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("ssh_host_") && name_str.ends_with("_key.pub") {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    let mut texts = Vec::new();
+    let mut read_errors = Vec::new();
+    for path in &found {
+        match std::fs::read_to_string(path) {
+            Ok(text) => texts.push(text),
+            Err(error) => read_errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    (select_host_keys(&refs), pattern, read_errors)
+}
+
+/// Reads and orders this node's sshd public host keys from `.pub` files.
 ///
 /// When `configured` is non-empty (`[devices] host_keys` in `node.toml`), reads those files;
 /// otherwise reads `/etc/ssh/ssh_host_*_key.pub` on Unix and `%ProgramData%\ssh\ssh_host_*_key.pub`
@@ -616,5 +778,41 @@ mod tests {
 
         // Nothing usable -> empty.
         assert!(select_host_keys(&["# comment only\n", &pq, "not a key"]).is_empty());
+    }
+
+    #[test]
+    fn parses_keyscan_output_and_reports_host_keys_source_differences() {
+        let ed = generate_ephemeral_ed25519().unwrap().public_key;
+        let ed_other = generate_ephemeral_ed25519().unwrap().public_key;
+        let ecdsa = fake_ssh_blob("ecdsa-sha2-nistp256", &[1; 65]);
+        let rsa = fake_ssh_blob("ssh-rsa", &[2; 64]);
+
+        let scan_stdout = format!(
+            "# 127.0.0.1:2222 SSH-2.0-OpenSSH_10.6\n\
+             [127.0.0.1]:2222 {rsa}\n\
+             [127.0.0.1]:2222 {ecdsa}\n\
+             [127.0.0.1]:2222 {ed}\n\
+             [::1]:2222 {ed}\n"
+        );
+        let parsed = parse_keyscan_output(&scan_stdout);
+        assert_eq!(parsed, vec![ed.clone(), ecdsa.clone()]);
+
+        // Scanned matches file keys -> plain "ssh-keyscan".
+        let matched = choose_auto_host_keys(parsed.clone(), parsed.clone()).unwrap();
+        assert_eq!(matched.keys, parsed);
+        assert_eq!(matched.source, "ssh-keyscan");
+
+        // Scanned differs from file keys -> scanned wins and source flags the difference.
+        let differed = choose_auto_host_keys(vec![ed.clone()], vec![ed_other]).unwrap();
+        assert_eq!(differed.keys, vec![ed.clone()]);
+        assert_eq!(differed.source, "ssh-keyscan (differs from host key files)");
+
+        // No scanned keys, file keys present -> falls back to "files".
+        let fallback = choose_auto_host_keys(Vec::new(), vec![ed.clone()]).unwrap();
+        assert_eq!(fallback.keys, vec![ed]);
+        assert_eq!(fallback.source, "files");
+
+        // Neither available -> None.
+        assert!(choose_auto_host_keys(Vec::new(), Vec::new()).is_none());
     }
 }
