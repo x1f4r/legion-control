@@ -448,3 +448,48 @@ async fn linux_start_catches_quick_crash_and_restart_proves_new_pid() {
         .unwrap();
     assert_ne!(after["pid"].as_u64().unwrap(), old_pid);
 }
+
+#[tokio::test]
+async fn linux_stop_on_failed_unit_reports_failed_immediately() {
+    if !linux_user_systemd_available() {
+        return;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let unit = format!("legion-svc-stopfail-{}-{nanos}.service", std::process::id());
+    let _guard = TransientUnitGuard { unit: unit.clone() };
+
+    let out = Command::new("systemd-run")
+        .args([
+            "--user",
+            &format!("--unit={unit}"),
+            "/bin/sh",
+            "-c",
+            "exit 3",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let fixture = Fixture::new();
+    let started = std::time::Instant::now();
+    let res = fixture
+        .call("svc.stop", json!({"name": unit, "scope": "user"}))
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "svc.stop on failed unit took too long: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(res["previous_state"], json!("failed"));
+    assert_eq!(res["state"], json!("failed"));
+}

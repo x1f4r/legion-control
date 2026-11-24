@@ -673,6 +673,19 @@ async fn execute_action(
                         });
                     }
                 }
+                // For `svc.stop`, a failed unit with no running process is already not running;
+                // report its true state (`failed`) instead of waiting for it to become `stopped`.
+                if expected == ServiceState::Stopped
+                    && now.state == ServiceState::Failed
+                    && now.pid.is_none()
+                {
+                    return Ok(ActionResult {
+                        name: now.name,
+                        scope,
+                        state: ServiceState::Failed,
+                        previous_state,
+                    });
+                }
                 // Stop waiting immediately if start/restart transitioned to failed.
                 if expected == ServiceState::Running && now.state == ServiceState::Failed {
                     let mut error = ErrorBody::new(
@@ -1570,6 +1583,29 @@ mod tests {
             .unwrap();
             assert_eq!(stopped.previous_state, ServiceState::Running);
             assert_eq!(stopped.state, ServiceState::Stopped);
+
+            // Stopping a failed unit with no running PID succeeds immediately and reports `failed`.
+            let failed_stop = FakeBackend::new(BackendKind::Systemd, true);
+            failed_stop.push_status_with(
+                Scope::User,
+                "dead-failed.service",
+                ServiceState::Failed,
+                None,
+                None,
+            );
+            let stopped_failed = execute_action(
+                &failed_stop,
+                ctx,
+                "dead-failed.service",
+                Some(Scope::User),
+                Action::Stop,
+                false,
+                fast,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stopped_failed.previous_state, ServiceState::Failed);
+            assert_eq!(stopped_failed.state, ServiceState::Failed);
 
             Ok(json!({}))
         }
