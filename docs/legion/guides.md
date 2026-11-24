@@ -242,6 +242,35 @@ machine loses power or the supervisor dies without writing `exit.json`, `job.sta
 derive the state `interrupted` without modifying anything on disk. A recycled PID never makes a
 dead job look alive.
 
+### Jobs on Windows
+
+To survive after an SSH session disconnects, a background job has to run outside the Windows Job
+Object that OpenSSH attaches to every incoming session. When `job.start` runs locally and Windows
+allows job breakaway, Legion starts the job supervisor directly in its own named Job Object. When
+breakaway is refused (the normal case inside an OpenSSH session), Legion asks the Windows
+Management Instrumentation service (`Winmgmt`) to launch the supervisor via `Win32_Process.Create`
+with breakaway enabled so it runs outside both the SSH session's job and the WMI provider host's
+job.
+
+If `job.start` fails saying Windows did not answer or that `Winmgmt` is unavailable, the WMI
+service is stopped, stalled, or the machine is heavily loaded. Legion refuses to fall back inside
+the SSH session's job by default because the job would be killed as soon as SSH disconnects. To
+recover:
+
+1. Check `job.status` (or `job.list`) first: if the launch timed out after Windows already started
+   the request, confirm whether the job is running or marked failed before retrying.
+2. On the Windows machine, check the WMI service from an elevated PowerShell prompt and start it if
+   stopped:
+
+   ```powershell
+   Get-Service Winmgmt
+   Start-Service Winmgmt
+   ```
+
+3. Retry `job.start` with the same `key` once `Winmgmt` is running and system load has settled.
+   Passing `key` ensures a retry never starts a second copy while an earlier launch is still in
+   flight.
+
 ## Projects (`proj.*`)
 
 `projects.toml` maps named projects to their directory on each machine (`[projects.<name>.on]`),
