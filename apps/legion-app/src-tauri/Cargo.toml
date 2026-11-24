@@ -1,0 +1,48 @@
+[workspace]
+
+[package]
+name = "legion-app"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+publish = false
+description = "Legion native shell for phones, tablets and desktops"
+
+[lib]
+name = "legion_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.6", features = [] }
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tauri = { version = "=2.12.7", features = [] }
+tempfile = "3.27.0"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+gethostname = "1.1.0"
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "=2.5.3"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+result_large_err = "allow"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
