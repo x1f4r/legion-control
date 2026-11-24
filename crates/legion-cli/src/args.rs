@@ -30,6 +30,13 @@ pub enum Command {
         /// The principal every call in the session acts as.
         pinned: Option<String>,
     },
+    /// `legion mcp`: serve the tools to an AI agent over MCP on stdin and stdout.
+    Mcp {
+        /// The principal every call in the session acts as.
+        pinned: Option<String>,
+        /// Serve three tools that list, describe and call the others.
+        compact: bool,
+    },
     /// `legion --version`.
     Version,
 }
@@ -77,6 +84,7 @@ Usage:
   legion tools [--json]
   legion help [<tool>] [--json]
   legion rpc [--as PRINCIPAL]
+  legion mcp [--as PRINCIPAL] [--compact]
   legion --version
 
 A value that parses as JSON is JSON (n=3, ok=true, tags=[\"a\"]); anything else is a string.
@@ -128,6 +136,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
                 pinned: flags.as_principal,
             })
         }
+        "mcp" => {
+            let mut flags = Flags::read(rest, &["--as", "--compact"])?;
+            flags.no_pairs("mcp")?;
+            Ok(Command::Mcp {
+                pinned: flags.as_principal,
+                compact: flags.compact,
+            })
+        }
         tool if tool.starts_with('-') => Err(UsageError(format!(
             "{tool} is not an option here; options come after the tool's name."
         ))),
@@ -173,6 +189,7 @@ fn no_more(rest: &[String]) -> Result<(), UsageError> {
 #[derive(Default)]
 struct Flags {
     json: bool,
+    compact: bool,
     as_principal: Option<String>,
     on: Option<Target>,
     args: Option<String>,
@@ -198,11 +215,15 @@ impl Flags {
                 if !allowed.contains(&name) {
                     return Err(UsageError(format!("{name} is not an option here.")));
                 }
-                if name == "--json" {
+                if name == "--json" || name == "--compact" {
                     if inline.is_some() {
-                        return Err(UsageError("--json takes no value.".to_owned()));
+                        return Err(UsageError(format!("{name} takes no value.")));
                     }
-                    flags.json = true;
+                    if name == "--json" {
+                        flags.json = true;
+                    } else {
+                        flags.compact = true;
+                    }
                     continue;
                 }
                 let value = match inline {
@@ -377,6 +398,10 @@ mod tests {
             &["meta.version", "--json=yes"],
             &["tools", "a=1"],
             &["rpc", "--json"],
+            &["rpc", "--compact"],
+            &["mcp", "--json"],
+            &["mcp", "--compact=yes"],
+            &["mcp", "a=1"],
             &["help", "a.b", "c.d"],
             &["--version", "x"],
         ] {
@@ -409,6 +434,20 @@ mod tests {
             })
         );
         assert_eq!(run(&["rpc"]), Ok(Command::Rpc { pinned: None }));
+        assert_eq!(
+            run(&["mcp", "--compact", "--as", "agent:claude"]),
+            Ok(Command::Mcp {
+                pinned: Some("agent:claude".into()),
+                compact: true
+            })
+        );
+        assert_eq!(
+            run(&["mcp"]),
+            Ok(Command::Mcp {
+                pinned: None,
+                compact: false
+            })
+        );
         assert_eq!(run(&["--version"]), Ok(Command::Version));
         assert_eq!(
             run(&["-h"]),

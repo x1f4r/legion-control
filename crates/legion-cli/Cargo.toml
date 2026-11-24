@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 legion-core.workspace = true
+legion-doors.workspace = true
 legion-proto.workspace = true
 legion-tools.workspace = true
 serde.workspace = true
