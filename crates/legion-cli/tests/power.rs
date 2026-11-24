@@ -406,6 +406,13 @@ fn local_tools_gate_dry_run_policy_and_exclusive_jobs() {
     let handed = laptop.power_actions();
     assert_eq!(handed.len(), 1, "{handed:?}");
     assert_eq!(handed[0]["argv"], command);
+    // The fake restarts nothing, so the machine comes back as the real one would: on a new boot.
+    // Until then the restart is pending, and every later call would hear about that first (on
+    // Windows, which times the restart itself, until its time and a margin are up).
+    machine.set("laptop", 2, "boot-2");
+    let after = laptop.legion(&machine, &["power.status"]).json();
+    assert_eq!(after.get("pending"), None, "{after}");
+    assert_eq!(after["last"]["action"], json!("restart"), "{after}");
 
     // An exclusive job keeps the machine busy for as long as it runs.
     let args = json!({

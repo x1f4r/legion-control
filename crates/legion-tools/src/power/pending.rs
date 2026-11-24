@@ -31,11 +31,14 @@ use legion_os::lock::{FileLock, LockMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::plan::Action;
+use super::plan::{Action, ActionPlan, Timing};
 
 /// How long a restart Windows times itself counts as pending after its delay, while Windows shuts
-/// down.
+/// down; past that, on the same boot, it did not happen, and holds nothing up any more.
 const SELF_TIMED_GRACE: Duration = Duration::from_secs(120);
+/// How long the runner keeps the power lock after a sleep command returns, while the machine goes
+/// to sleep.
+const SLEEP_SETTLE_S: u32 = 5;
 
 /// `state/power`: the locks, the pending record and the runner's log.
 pub fn dir(paths: &Paths) -> PathBuf {
@@ -95,8 +98,12 @@ pub struct Outcome {
     pub argv: Vec<String>,
     /// When it was handed over, RFC 3339.
     pub since: String,
-    /// When the command ended, RFC 3339.
-    pub ran_at: String,
+    /// When the command ended, RFC 3339; absent when it never ran here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_at: Option<String>,
+    /// For an action whose end nothing recorded, what became of it as far as can be known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fate: Option<Fate>,
     /// Its exit status; absent when it did not exit by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -124,10 +131,124 @@ pub struct Disarmed {
     pub said: String,
 }
 
-/// The last handed-over action's outcome, when one has run.
-pub fn last(paths: &Paths) -> Option<Outcome> {
-    let bytes = std::fs::read(dir(paths).join("last.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// What became of a handed-over action, as far as this node can know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fate {
+    /// Still to happen: its runner holds the lock, or, for an action the operating system times
+    /// itself, its time and the margin a shutdown takes have not run out on this boot.
+    Pending,
+    /// The machine has booted since it was handed over: the restart or shutdown happened.
+    Happened,
+    /// Its time and the margin have passed and the machine is still on the boot it was handed over
+    /// in: it did not happen (cancelled on the machine, as `shutdown /a` does, or refused late).
+    DidNotHappen,
+    /// Its runner is gone: it finished (and its outcome, when written, says how) or stopped early.
+    RunnerGone,
+    /// The call that handed it over gave it up, so it never ran.
+    GivenUp,
+}
+
+/// The record a call writes for an action it hands over, as planned for this platform: a runner
+/// waits the delay unless the command waits itself, and after a sleep keeps the lock while the
+/// machine goes to sleep; an action the operating system times itself has no runner.
+pub fn record(
+    plan: &ActionPlan,
+    action: Action,
+    into: Option<String>,
+    delay_s: u32,
+    boot_id: Option<String>,
+    disarm: Option<Vec<String>>,
+) -> Pending {
+    Pending {
+        id: new_id(),
+        action,
+        into,
+        argv: plan.argv.clone(),
+        delay_s: if plan.waits_itself { 0 } else { delay_s },
+        hold_s: match action {
+            Action::Sleep if plan.waits_itself => delay_s + SLEEP_SETTLE_S,
+            Action::Sleep => SLEEP_SETTLE_S,
+            Action::Restart | Action::Shutdown => 0,
+        },
+        since: now(),
+        boot_id,
+        runner: plan.timing == Timing::Delayed,
+        taken: None,
+        disarm,
+        abandoned: false,
+    }
+}
+
+/// What has become of `record` at `now`, on the boot `boot_id`, with its runner holding its lock
+/// or not. Nothing stays pending for ever: a runner's lock goes with its process, and an action
+/// the operating system times lapses after its time and a margin.
+pub fn fate(record: &Pending, now: Timestamp, boot_id: Option<&str>, runner_holds: bool) -> Fate {
+    if record.abandoned {
+        return Fate::GivenUp;
+    }
+    if record.runner {
+        return if runner_holds {
+            Fate::Pending
+        } else {
+            Fate::RunnerGone
+        };
+    }
+    if let (Some(then), Some(current)) = (record.boot_id.as_deref(), boot_id)
+        && then != current
+    {
+        return Fate::Happened;
+    }
+    match due(record) {
+        Some(due) if now < due => Fate::Pending,
+        _ => Fate::DidNotHappen,
+    }
+}
+
+/// When an action the operating system times stops counting as pending: its delay and the margin
+/// after it was handed over. `None` for a record whose time cannot be read, which then holds
+/// nothing up.
+fn due(record: &Pending) -> Option<Timestamp> {
+    let since = record.since.parse::<Timestamp>().ok()?;
+    let wait = Duration::from_secs(u64::from(record.delay_s)) + SELF_TIMED_GRACE;
+    since
+        .checked_add(jiff::SignedDuration::try_from(wait).ok()?)
+        .ok()
+}
+
+/// The last handed-over action and how it ended, as far as can be known: the runner's own
+/// outcome, or, for an action nothing recorded the end of (one Windows timed itself, or one whose
+/// runner stopped early), what its record and the boot say became of it. Reads, writes nothing.
+pub fn last_known(paths: &Paths, boot_id: Option<&str>) -> Option<Outcome> {
+    let dir = dir(paths);
+    let recorded: Option<Outcome> = std::fs::read(dir.join("last.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let unrecorded = read_pending(&dir).and_then(|record| {
+        let fate = fate(&record, Timestamp::now(), boot_id, runner_holds(&dir));
+        let told = recorded
+            .as_ref()
+            .is_some_and(|outcome| outcome.id == record.id);
+        (fate != Fate::Pending && !told).then(|| Outcome {
+            id: record.id,
+            action: record.action,
+            into: record.into,
+            argv: record.argv,
+            since: record.since,
+            ran_at: None,
+            fate: Some(fate),
+            exit_code: None,
+            timed_out: false,
+            said: String::new(),
+            disarmed: None,
+        })
+    });
+    // The newer of the two; both write times the same way, so their text orders as they do.
+    match (recorded, unrecorded) {
+        (Some(recorded), Some(unrecorded)) if unrecorded.since > recorded.since => Some(unrecorded),
+        (Some(recorded), _) => Some(recorded),
+        (None, unrecorded) => unrecorded,
+    }
 }
 
 /// Records how a handed-over action ended.
@@ -199,7 +320,8 @@ pub fn would_conflict(paths: &Paths, boot_id: Option<&str>) -> Option<ErrorBody>
 pub fn pending(paths: &Paths, boot_id: Option<&str>) -> Option<Pending> {
     let dir = dir(paths);
     let record = read_pending(&dir)?;
-    is_live(&dir, &record, boot_id).then_some(record)
+    (fate(&record, Timestamp::now(), boot_id, runner_holds(&dir)) == Fate::Pending)
+        .then_some(record)
 }
 
 fn pending_conflict(dir: &Path, boot_id: Option<&str>) -> Option<ErrorBody> {
@@ -218,7 +340,7 @@ fn pending_conflict(dir: &Path, boot_id: Option<&str>) -> Option<ErrorBody> {
         );
     }
     let record = read_pending(dir)?;
-    if record.runner || !is_live(dir, &record, boot_id) {
+    if fate(&record, Timestamp::now(), boot_id, false) != Fate::Pending {
         return None;
     }
     Some(
@@ -229,26 +351,6 @@ fn pending_conflict(dir: &Path, boot_id: Option<&str>) -> Option<ErrorBody> {
         .with_hint("Wait for it; on Windows `shutdown /a` on the machine cancels it.")
         .with_details(json!({"pending": record})),
     )
-}
-
-fn is_live(dir: &Path, record: &Pending, boot_id: Option<&str>) -> bool {
-    if record.abandoned {
-        return false;
-    }
-    if record.runner {
-        return runner_holds(dir);
-    }
-    let same_boot = match (&record.boot_id, boot_id) {
-        (Some(then), Some(now)) => then == now,
-        _ => true,
-    };
-    let due = record.since.parse::<Timestamp>().ok().and_then(|since| {
-        let wait = Duration::from_secs(u64::from(record.delay_s)) + SELF_TIMED_GRACE;
-        jiff::SignedDuration::try_from(wait)
-            .ok()
-            .and_then(|wait| since.checked_add(wait).ok())
-    });
-    same_boot && due.is_some_and(|due| Timestamp::now() < due)
 }
 
 fn describe(record: &Pending) -> String {
@@ -390,7 +492,7 @@ mod tests {
         (dir, paths)
     }
 
-    fn record(runner: bool) -> Pending {
+    fn sample(runner: bool) -> Pending {
         Pending {
             id: new_id(),
             action: Action::Restart,
@@ -427,7 +529,7 @@ mod tests {
     fn a_runner_holding_its_lock_keeps_its_action_pending() {
         let (_dir, paths) = paths();
         let dir = dir(&paths);
-        let pending_restart = record(true);
+        let pending_restart = sample(true);
         write_pending(&dir, &pending_restart).unwrap();
         // Not held: the runner is gone, and so is the action.
         assert!(pending(&paths, Some("boot-1")).is_none());
@@ -451,7 +553,7 @@ mod tests {
     fn a_restart_windows_times_itself_stays_pending_until_due_or_a_new_boot() {
         let (_dir, paths) = paths();
         let dir = dir(&paths);
-        write_pending(&dir, &record(false)).unwrap();
+        write_pending(&dir, &sample(false)).unwrap();
         assert_eq!(
             begin(&paths, Action::Restart, Some("boot-1"))
                 .unwrap_err()
@@ -461,22 +563,126 @@ mod tests {
         // Booted since: it happened.
         assert!(begin(&paths, Action::Restart, Some("boot-2")).is_ok());
         // Long past due: it did not, and does not hold anything up any more.
-        let mut old = record(false);
+        let mut old = sample(false);
         old.since = "2026-01-01T00:00:00Z".to_owned();
         write_pending(&dir, &old).unwrap();
         assert!(begin(&paths, Action::Restart, Some("boot-1")).is_ok());
+    }
+
+    #[test]
+    fn a_handed_over_action_is_pending_only_while_it_can_still_happen_on_each_platform() {
+        use crate::power::plan::{Platform, action_plan};
+        let since: Timestamp = "2026-11-24T10:00:00Z".parse().unwrap();
+        let at = |seconds: i64| {
+            since
+                .checked_add(jiff::SignedDuration::from_secs(seconds))
+                .unwrap()
+        };
+        let found = |name: &str| Some(PathBuf::from(name));
+        for platform in [Platform::Linux, Platform::Macos, Platform::Windows] {
+            // Built as a real call builds it, from this platform's plan.
+            let plan =
+                action_plan(platform, Action::Restart, 5, true, false, None, &found).unwrap();
+            let mut handed = record(&plan, Action::Restart, None, 5, Some("boot-1".into()), None);
+            handed.since = "2026-11-24T10:00:00Z".to_owned();
+            if platform == Platform::Windows {
+                // Windows times it itself: pending, runner or none, until its time and the margin
+                // are up on the same boot; a new boot means it happened.
+                assert!(!handed.runner);
+                for (seconds, boot, expected) in [
+                    (1, "boot-1", Fate::Pending),
+                    (124, "boot-1", Fate::Pending),
+                    (126, "boot-1", Fate::DidNotHappen),
+                    (100_000, "boot-1", Fate::DidNotHappen),
+                    (10, "boot-2", Fate::Happened),
+                ] {
+                    assert_eq!(
+                        fate(&handed, at(seconds), Some(boot), false),
+                        expected,
+                        "{platform:?} after {seconds} s on {boot}"
+                    );
+                }
+            } else {
+                // A runner carries it out: pending exactly while the runner holds its lock, which
+                // goes with its process.
+                assert!(handed.runner);
+                assert_eq!(fate(&handed, at(1), Some("boot-1"), true), Fate::Pending);
+                assert_eq!(
+                    fate(&handed, at(1), Some("boot-1"), false),
+                    Fate::RunnerGone
+                );
+            }
+            handed.abandoned = true;
+            assert_eq!(fate(&handed, at(1), Some("boot-1"), true), Fate::GivenUp);
+            // A time that cannot be read holds nothing up.
+            handed.abandoned = false;
+            handed.since = "yesterday".to_owned();
+            assert_ne!(fate(&handed, at(1), Some("boot-1"), false), Fate::Pending);
+        }
+        // Windows sleeps through the runner, which does not wait first and holds on after.
+        let plan = action_plan(
+            Platform::Windows,
+            Action::Sleep,
+            3,
+            false,
+            false,
+            None,
+            &found,
+        )
+        .unwrap();
+        let sleep = record(&plan, Action::Sleep, None, 3, None, None);
+        assert!(sleep.runner);
+        assert_eq!((sleep.delay_s, sleep.hold_s), (0, 8));
+    }
+
+    #[test]
+    fn status_learns_what_became_of_an_action_nothing_recorded_the_end_of() {
+        let (_dir, paths) = paths();
+        let dir = dir(&paths);
+        let mut windows_restart = sample(false);
+        windows_restart.since = "2026-01-01T00:00:00Z".to_owned();
+        write_pending(&dir, &windows_restart).unwrap();
+        let lapsed = last_known(&paths, Some("boot-1")).unwrap();
+        assert_eq!(lapsed.fate, Some(Fate::DidNotHappen));
+        assert_eq!(lapsed.id, windows_restart.id);
+        assert_eq!(
+            last_known(&paths, Some("boot-2")).unwrap().fate,
+            Some(Fate::Happened)
+        );
+        // Still to come: not the last action yet.
+        write_pending(&dir, &sample(false)).unwrap();
+        assert!(last_known(&paths, Some("boot-1")).is_none());
+
+        // A runner that wrote its outcome is told by that outcome.
+        let runner = sample(true);
+        write_pending(&dir, &runner).unwrap();
+        let outcome = Outcome {
+            id: runner.id.clone(),
+            action: runner.action,
+            into: None,
+            argv: runner.argv.clone(),
+            since: runner.since.clone(),
+            ran_at: Some(now()),
+            fate: None,
+            exit_code: Some(0),
+            timed_out: false,
+            said: String::new(),
+            disarmed: None,
+        };
+        write_outcome(&dir, &outcome).unwrap();
+        assert_eq!(last_known(&paths, Some("boot-1")), Some(outcome));
     }
 
     #[tokio::test]
     async fn a_call_waits_for_its_runner_and_gives_up_on_one_that_never_starts() {
         let (_dir, paths) = paths();
         let dir = dir(&paths);
-        let mut taken = record(true);
+        let mut taken = sample(true);
         taken.taken = Some(now());
         write_pending(&dir, &taken).unwrap();
         assert!(wait_for_runner(&dir, &taken.id, Duration::from_secs(1)).await);
 
-        let late = record(true);
+        let late = sample(true);
         write_pending(&dir, &late).unwrap();
         assert!(!wait_for_runner(&dir, &late.id, Duration::from_millis(100)).await);
         assert!(read_pending(&dir).unwrap().abandoned);

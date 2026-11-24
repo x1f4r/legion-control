@@ -48,9 +48,6 @@ const DELAY_S: (u32, u32, u32) = (3, 1, 60);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long each `before_sleep` command, and a command that schedules itself, may take.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long the runner keeps the power lock after a sleep command returns, while the machine goes
-/// to sleep.
-const SLEEP_SETTLE_S: u32 = 5;
 /// How long a call waits for its delayed runner to take over before giving the action up.
 const HANDOFF_PATIENCE: Duration = Duration::from_secs(15);
 
@@ -337,7 +334,7 @@ async fn status(actuator: &Arc<dyn Actuator>, ctx: &Ctx) -> Result<StatusResult,
             .collect(),
         sudo: file.power.sudo && platform.has_sudo(),
         pending: pending::pending(ctx.paths(), ctx.boot_id().as_deref()),
-        last: pending::last(ctx.paths()),
+        last: pending::last_known(ctx.paths(), ctx.boot_id().as_deref()),
     })
 }
 
@@ -457,7 +454,10 @@ async fn act(
     let boot_id = ctx.boot_id();
     let dry_run = request.dry_run;
     let mut would_refuse = None;
-    // One power action at a time, from before the gate until this one is handed over.
+    // One power action at a time, from before the gate until this one is handed over. An action
+    // already pending is reported before whether the machine is busy, on every platform: it will
+    // interrupt the machine whatever the busy state, so `busy` would send the caller to wait for
+    // the wrong thing, and once the machine was idle a second action would follow the first.
     let _call = if dry_run {
         let conflict = pending::would_conflict(ctx.paths(), boot_id.as_deref());
         check(conflict.map_or(Ok(()), Err), dry_run, &mut would_refuse)?;
@@ -535,28 +535,14 @@ async fn act(
         boot::arm(actuator.as_ref(), cancel, platform, sudo, name, arming).await?;
     }
     let dir = pending::dir(ctx.paths());
-    let mut record = Pending {
-        id: pending::new_id(),
-        action: request.action,
-        into: request.into.clone(),
-        argv: plan.argv.clone(),
-        delay_s: if plan.waits_itself {
-            0
-        } else {
-            request.delay_s
-        },
-        hold_s: match request.action {
-            Action::Sleep if plan.waits_itself => request.delay_s + SLEEP_SETTLE_S,
-            Action::Sleep => SLEEP_SETTLE_S,
-            Action::Restart | Action::Shutdown => 0,
-        },
-        since: pending::now(),
+    let mut record = pending::record(
+        &plan,
+        request.action,
+        request.into.clone(),
+        request.delay_s,
         boot_id,
-        runner: plan.timing == Timing::Delayed,
-        taken: None,
-        disarm: arming.as_ref().and_then(|arming| arming.disarm.clone()),
-        abandoned: false,
-    };
+        arming.as_ref().and_then(|arming| arming.disarm.clone()),
+    );
     let handed = match plan.timing {
         Timing::Delayed => hand_over(actuator, &dir, &mut record).await,
         Timing::SelfTimed => match actuator.run(&plan.argv, COMMAND_TIMEOUT, cancel).await {
