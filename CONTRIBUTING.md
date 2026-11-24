@@ -1,29 +1,28 @@
 # Contributing
 
-Legion Control is four clients, one agent and one contract, and a change usually touches more than
-one of them. This is what a change is held to before it is merged.
+Legion is a Rust workspace (`crates/`), a static web interface (`apps/ui/`), Linux packaging
+(`packaging/`), and supporting scripts and tests (`scripts/`, `tests/`). This is what a change is
+held to before it is merged.
 
 ## Checks
 
-    ./scripts/check.sh agent      # the agent, the contract, the release tooling and the checkout checks
-    ./scripts/check.sh mac
-    ./scripts/check.sh android
-    ./scripts/check.sh desktop
+    ./scripts/check.sh scripts   # JS syntax, invisible characters, script tests, UI unit tests, private data
+    ./scripts/check.sh rust      # cargo fmt, cargo clippy, cargo test, generated tool reference check
 
-`./scripts/check.sh` with no argument runs all four on a Mac set up for them. CI runs the same legs on
-every platform they support, and a change is not done until CI is green on its exact head: the
-Windows legs are the only place the PowerShell dispatcher, the Windows installer and the Windows
-process handling run. `docs/testing.md` says what each check covers and which checks only a person
-can do before a release.
+`./scripts/check.sh` with no argument runs both legs. CI runs the same legs on Linux, macOS, and
+Windows, together with:
 
-## The contract
+- `legion-link` cross-compilation checks for Android and iOS targets;
+- ShellCheck (`shellcheck -S warning` on every tracked `*.sh` file) and PSScriptAnalyzer (`./scripts/check-powershell.ps1` on every tracked `*.ps1` file);
+- headless browser end-to-end UI tests (`node --test apps/ui/test/browser.test.mjs`);
+- real-SSH end-to-end tests (`.github/workflows/legion-e2e.yml`) on Linux, macOS, and Windows;
+- Linux `.deb` and Arch `PKGBUILD` container verification (`.github/workflows/legion-packages.yml`).
 
-`contract/v3.md`, its schemas, fixtures and vectors are what every client and the agent agree on.
-A change to what goes over the wire, or to a rule every client applies, changes the reference in
-`contract/tools` first, then regenerates the generated files with `node contract/tools/generate.mjs`,
-then ports the rule to each client, whose vector tests read their case counts from
-`contract/vectors/index.json`. Note it in `contract/CHANGELOG.md`. Changes only add keys; the
-document stays at version 1.
+When you add or change a built-in tool or its schema, regenerate the tool reference before
+committing:
+
+    cargo build -p legion-cli
+    node scripts/legion-tools-doc.mjs
 
 ## The repository is public
 
@@ -36,8 +35,8 @@ Write placeholders, never values from a real machine or network:
   a test has to place, 10.0.0.0/24 and 192.168.1.0/24, 192.168.10.0/24 and 192.168.50.0/24;
 - hardware addresses `02:00:00:00:00:01` to `02:00:00:00:00:09`.
 
-`node scripts/check-private-data.mjs` refuses the rest, and with the maintainers' private terms
-configured it refuses those too; `docs/testing.md` explains how.
+`node scripts/check-private-data.mjs` refuses the rest, and also checks private terms from
+`LEGION_PRIVATE_TERMS` or `~/.legion-control/private/terms.txt` when configured.
 
 Write a zero-width, bidirectional or byte order mark character as an escape, never as the
 character: a reader cannot see it, and `node scripts/check-invisible.mjs` refuses it.
@@ -52,5 +51,5 @@ origin/main..HEAD` reads the messages of the branch's commits.
 
 ## Security problems
 
-Report them privately through a security advisory on the repository, as `docs/security.md`
-describes, not in a public issue.
+Report security issues privately through a GitHub security advisory on this repository rather than
+opening a public issue.
