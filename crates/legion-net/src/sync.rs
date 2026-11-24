@@ -1,15 +1,18 @@
 //! Shared configuration synchronisation across the fleet (`fleet.sync`, `config.list`,
 //! `config.read`, `config.write`).
 //!
-//! Only the shared configuration documents (`fleet.toml`, `policy.toml`, `projects.toml`, and
-//! validated files under `tools.d/<name>.toml`) may be read, written, or synchronised here;
-//! machine-local files such as `node.toml` and `tokens.toml` are always refused.
+//! Only the shared configuration documents (`devices.toml`, `fleet.toml`, `policy.toml`,
+//! `projects.toml`, and validated files under `tools.d/<name>.toml`) may be read, written, or
+//! synchronised here; machine-local files such as `node.toml` and `tokens.toml` are always
+//! refused.
 //!
 //! A revision counter cannot distinguish "newer" from "diverged", so each node keeps a small JSON
 //! sidecar under `<state_dir>/sync/sidecars/` recording the BLAKE3 content hash last synchronised
-//! with each peer. Writes are validated by the receiving node's own strict loader before replacing
-//! anything, backed up to `<state_dir>/sync/backups/`, written atomically, and recorded in the
-//! audit log with hashes before and after.
+//! with each peer. `devices.toml` is a commutative mergeable registry (tombstones always win) that
+//! merges cleanly in both directions without conflict and reconciles `device:*` principals and
+//! `authorized_keys` on the receiving node. Other writes are validated by the receiving node's own
+//! strict loader before replacing anything, backed up to `<state_dir>/sync/backups/`, written
+//! atomically, and recorded in the audit log with hashes before and after.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -18,14 +21,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use legion_core::config::{parse, write_atomically};
-use legion_core::policy::Policy;
+use legion_core::config::{NodeFile, parse, write_atomically};
+use legion_core::policy::{OWNER, Policy};
 use legion_core::{
     BoxFuture, Ctx, EventSink, NoArgs, Registry, Tool, ToolError, input_schema, parse_args,
 };
 use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_tools::device::registry::{
+    DevicesFile, MergeChange, apply_devices_merge_blocking, merge_devices,
+    read_devices_for_sync_blocking,
+};
+use legion_tools::device::sessions::{DEFAULT_TERMINATE_GRACE, terminate_device_sessions};
 use legion_tools::ext::def::parse_toml as parse_extension_toml;
 use legion_tools::proj::ProjectsFile;
 use legion_xfer::hash::{Hash, hash_bytes};
@@ -38,7 +46,11 @@ use crate::config::FleetFile;
 use crate::pool::Fleet;
 
 /// Fixed shared configuration documents synced across machines.
-pub const FIXED_SHARED_DOCUMENTS: [&str; 3] = ["fleet.toml", "policy.toml", "projects.toml"];
+pub const FIXED_SHARED_DOCUMENTS: [&str; 4] =
+    ["devices.toml", "fleet.toml", "policy.toml", "projects.toml"];
+
+/// Maximum per-machine timeout accepted by `fleet.sync` (5 minutes).
+const MAX_SYNC_TIMEOUT_S: f64 = 300.0;
 
 /// Maximum size of a single configuration document accepted by `config.write` (1 MiB).
 const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
@@ -57,25 +69,25 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add_fn(
         "config.list",
         Effect::Admin,
-        "List the shared configuration documents present on this node (fleet.toml, policy.toml, projects.toml, and files in tools.d/). Machine-local files (node.toml, tokens.toml) are never included.",
+        "List the shared configuration documents present on this node (devices.toml, fleet.toml, policy.toml, projects.toml, and files in tools.d/). Machine-local files (node.toml, tokens.toml) are never included.",
         config_list,
     );
     registry.add_fn(
         "config.read",
         Effect::Admin,
-        "Read one shared configuration document (fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml) and its BLAKE3 content hash. Refuses machine-local files such as node.toml and tokens.toml.",
+        "Read one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml) and its BLAKE3 content hash. Refuses machine-local files such as node.toml and tokens.toml.",
         config_read,
     );
     registry.add_fn(
         "config.write",
         Effect::Admin,
-        "Validate and atomically replace one shared configuration document (fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
+        "Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml merges incoming entries with local paired devices (tombstones always win), reconciles device:* principals in policy.toml without escalation, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
         config_write,
     );
     registry.add(SyncTool::<SyncArgs, SyncResult, _>::new(
         "fleet.sync",
         Effect::Admin,
-        "Compare, push, or pull shared configuration documents (fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.",
+        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there. Paired devices (devices.toml) merge cleanly across machines in both directions with tombstones always winning, reconciling device:* principals and authorized_keys and ending active sessions for newly removed devices. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.",
         fleet,
         |fleet, ctx, args| Box::pin(fleet_sync(fleet, ctx, args)),
     ));
@@ -145,6 +157,8 @@ where
 /// Validated shared configuration document identifier.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SharedDocument {
+    /// `devices.toml`.
+    Devices,
     /// `fleet.toml`.
     Fleet,
     /// `policy.toml`.
@@ -159,6 +173,7 @@ impl SharedDocument {
     /// Parses and validates a shared document name, refusing machine-local files and path traversal.
     pub fn parse(name: &str) -> Result<Self, ErrorBody> {
         match name {
+            "devices.toml" => Ok(Self::Devices),
             "fleet.toml" => Ok(Self::Fleet),
             "policy.toml" => Ok(Self::Policy),
             "projects.toml" => Ok(Self::Projects),
@@ -169,7 +184,7 @@ impl SharedDocument {
                 ),
             )
             .with_hint(
-                "Only fleet.toml, policy.toml, projects.toml, and tools.d/<name>.toml can be synced.",
+                "Only devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/<name>.toml can be synced.",
             )),
             other => {
                 if let Some(bare) = other.strip_prefix(TOOLS_D_PREFIX) {
@@ -189,7 +204,7 @@ impl SharedDocument {
                     format!("{other:?} is not a shared configuration document."),
                 )
                 .with_hint(
-                    "Allowed shared documents are fleet.toml, policy.toml, projects.toml, and tools.d/<name>.toml.",
+                    "Allowed shared documents are devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/<name>.toml.",
                 ))
             }
         }
@@ -198,6 +213,7 @@ impl SharedDocument {
     /// Canonical wire name (always using forward slash for `tools.d/<name>.toml`).
     pub fn canonical_name(&self) -> String {
         match self {
+            Self::Devices => "devices.toml".to_owned(),
             Self::Fleet => "fleet.toml".to_owned(),
             Self::Policy => "policy.toml".to_owned(),
             Self::Projects => "projects.toml".to_owned(),
@@ -208,6 +224,7 @@ impl SharedDocument {
     /// Location of this document under `config_dir`.
     pub fn config_path(&self, config_dir: &Path) -> PathBuf {
         match self {
+            Self::Devices => config_dir.join("devices.toml"),
             Self::Fleet => config_dir.join("fleet.toml"),
             Self::Policy => config_dir.join("policy.toml"),
             Self::Projects => config_dir.join("projects.toml"),
@@ -219,6 +236,7 @@ impl SharedDocument {
     pub fn backup_path(&self, state_dir: &Path) -> PathBuf {
         let base = state_dir.join("sync").join("backups");
         match self {
+            Self::Devices => base.join("devices.toml.bak"),
             Self::Fleet => base.join("fleet.toml.bak"),
             Self::Policy => base.join("policy.toml.bak"),
             Self::Projects => base.join("projects.toml.bak"),
@@ -230,6 +248,7 @@ impl SharedDocument {
     pub fn sidecar_path(&self, state_dir: &Path) -> PathBuf {
         let base = state_dir.join("sync").join("sidecars");
         match self {
+            Self::Devices => base.join("devices.toml.json"),
             Self::Fleet => base.join("fleet.toml.json"),
             Self::Policy => base.join("policy.toml.json"),
             Self::Projects => base.join("projects.toml.json"),
@@ -256,6 +275,10 @@ impl SharedDocument {
             ));
         }
         match self {
+            Self::Devices => {
+                parse::<DevicesFile>(path, content.as_bytes())?;
+                Ok(())
+            }
             Self::Fleet => {
                 parse::<FleetFile>(path, content.as_bytes())?;
                 Ok(())
@@ -603,6 +626,7 @@ struct WriteOutcome {
     hash_before: Option<String>,
     hash_after: String,
     backup: Option<String>,
+    canonical_content: Option<String>,
 }
 
 /// Precondition on the existing target document before `config.write` replaces it.
@@ -738,7 +762,56 @@ fn write_local_document_blocking(
         hash_before,
         hash_after,
         backup,
+        canonical_content: None,
     })
+}
+
+async fn read_local_document_for_ctx(
+    ctx: &Ctx,
+    doc: &SharedDocument,
+) -> Result<ConfigReadResult, ErrorBody> {
+    if *doc == SharedDocument::Devices {
+        let paths = ctx.paths().clone();
+        let node_name = ctx.node_name().to_owned();
+        let node_file = ctx.config().get::<NodeFile>().ok();
+        return tokio::task::spawn_blocking(move || {
+            let content = read_devices_for_sync_blocking(&paths, &node_name, node_file.as_deref())?;
+            match content {
+                Some(text) => {
+                    let hash = hash_bytes(text.as_bytes()).to_string();
+                    Ok(ConfigReadResult {
+                        document: SharedDocument::Devices.canonical_name(),
+                        exists: true,
+                        hash: Some(hash),
+                        content: Some(text),
+                    })
+                }
+                None => Ok(ConfigReadResult {
+                    document: SharedDocument::Devices.canonical_name(),
+                    exists: false,
+                    hash: None,
+                    content: None,
+                }),
+            }
+        })
+        .await
+        .map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Reading devices.toml stopped unexpectedly: {error}."),
+            )
+        })?;
+    }
+    let config_dir = ctx.paths().config_dir().to_path_buf();
+    let doc = doc.clone();
+    tokio::task::spawn_blocking(move || read_local_document(&config_dir, &doc))
+        .await
+        .map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Reading local document stopped unexpectedly: {error}."),
+            )
+        })?
 }
 
 async fn apply_local_write(
@@ -756,6 +829,190 @@ async fn apply_local_write(
         .with_hint("Pass `expect_hash` when replacing an existing file, or `expect_absent=true` when creating a new one."));
     }
     let started = Instant::now();
+
+    if doc == SharedDocument::Devices {
+        if content.len() > MAX_DOCUMENT_BYTES {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "devices.toml exceeds the {MAX_DOCUMENT_BYTES} byte configuration limit ({} bytes given).",
+                    content.len()
+                ),
+            ));
+        }
+        if let Some(ref expected) = expect_hash {
+            expected.parse::<Hash>().map_err(|_| {
+                ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!("expect_hash {expected:?} is not a valid BLAKE3 hash."),
+                )
+                .with_hint("Hashes are written blake3:<64 hex digits>.")
+            })?;
+        }
+        let target = doc.config_path(ctx.paths().config_dir());
+        let incoming = parse::<DevicesFile>(&target, content.as_bytes())?;
+        let node_file = ctx.config().get::<NodeFile>()?;
+        let paths = ctx.paths().clone();
+        let paths_for_sessions = paths.clone();
+        let node_name = ctx.node_name().to_owned();
+        let caller_is_owner = ctx.grant().role() == OWNER;
+        let caller_principal = ctx.principal().to_owned();
+        let caller_role = ctx.grant().role().to_owned();
+
+        let merge_outcome = tokio::task::spawn_blocking(move || {
+            let check_precondition = |bytes_before: Option<&[u8]>| -> Result<(), ErrorBody> {
+                let hash_before = bytes_before.map(|b| hash_bytes(b).to_string());
+                match (expect_hash.as_deref(), expect_absent) {
+                    (Some(expected), false) => {
+                        if hash_before.as_deref() != Some(expected) {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "devices.toml changed on this node before it could be replaced (expected {expected}, found {}).",
+                                    hash_before.as_deref().unwrap_or("missing")
+                                ),
+                            )
+                            .with_hint("Read devices.toml again, or omit expect_hash to merge cleanly.")
+                            .with_details(json!({
+                                "document": "devices.toml",
+                                "expected": expected,
+                                "actual": hash_before,
+                            })));
+                        }
+                    }
+                    (None, true) => {
+                        if let Some(ref actual) = hash_before {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "devices.toml already exists on this node before it could be created (expected absent, found {actual}).",
+                                ),
+                            )
+                            .with_hint("Read devices.toml again, or omit expect_absent to merge cleanly.")
+                            .with_details(json!({
+                                "document": "devices.toml",
+                                "expected": "absent",
+                                "actual": actual,
+                            })));
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            };
+            let authorize_change = |change: MergeChange<'_>| -> Result<(), ErrorBody> {
+                if caller_is_owner {
+                    return Ok(());
+                }
+                match change {
+                    MergeChange::Live { entry, .. } => {
+                        if entry.principal != caller_principal {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                format!(
+                                    "As {caller_principal}, you may only sync paired devices pinned to {caller_principal}, not {}.",
+                                    entry.principal
+                                ),
+                            )
+                            .with_hint("Sync devices for other principals as the owner of this machine."));
+                        }
+                        if let Some(ref role) = entry.role
+                            && role != &caller_role
+                        {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                format!(
+                                    "As {caller_principal} ({caller_role}), you may not assign role {role:?} to a paired device."
+                                ),
+                            )
+                            .with_hint("Only a caller with the owner role may assign or change device roles."));
+                        }
+                    }
+                    MergeChange::Removed {
+                        tombstone,
+                        previous_live,
+                    } => {
+                        let target_principal = previous_live
+                            .map(|prev| prev.principal.as_str())
+                            .unwrap_or(tombstone.principal.as_str());
+                        if target_principal != caller_principal {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                format!(
+                                    "As {caller_principal}, you may only revoke paired devices pinned to {caller_principal}, not {target_principal}."
+                                ),
+                            )
+                            .with_hint("Revoke other principals' devices as the owner of this machine."));
+                        }
+                    }
+                }
+                Ok(())
+            };
+            apply_devices_merge_blocking(
+                &paths,
+                &node_name,
+                &node_file,
+                &incoming,
+                check_precondition,
+                authorize_change,
+            )
+        })
+        .await
+        .map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Updating devices.toml stopped unexpectedly: {error}."),
+            )
+        })??;
+
+        // End live sessions and open SSH connections for any devices removed by the merge.
+        for device_name in &merge_outcome.removed_device_names {
+            let _ = terminate_device_sessions(
+                &paths_for_sessions,
+                device_name,
+                DEFAULT_TERMINATE_GRACE,
+            )
+            .await;
+        }
+
+        let hash_before = merge_outcome
+            .bytes_before
+            .as_deref()
+            .map(|b| hash_bytes(b).to_string());
+        let hash_after = hash_bytes(merge_outcome.canonical_toml.as_bytes()).to_string();
+        let mut audit_args = json!({
+            "document": "devices.toml",
+            "hash_before": hash_before,
+            "hash_after": hash_after,
+            "backup": merge_outcome.backup,
+        });
+        if !merge_outcome.warnings.is_empty()
+            && let Some(obj) = audit_args.as_object_mut()
+        {
+            obj.insert("warnings".to_owned(), json!(merge_outcome.warnings));
+        }
+        ctx.node()
+            .record_audit_with_device(
+                ctx.node_name().to_owned(),
+                Some(ctx.principal().to_owned()),
+                ctx.door(),
+                ctx.device().map(str::to_owned),
+                "config.write.applied".to_owned(),
+                &audit_args,
+                started,
+                &Ok(json!({})),
+            )
+            .await;
+
+        return Ok(WriteOutcome {
+            document: "devices.toml".to_owned(),
+            hash_before,
+            hash_after,
+            backup: merge_outcome.backup,
+            canonical_content: Some(merge_outcome.canonical_toml),
+        });
+    }
+
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let builtins: BTreeSet<String> = ctx
@@ -834,7 +1091,7 @@ async fn config_list(ctx: &Ctx, _args: NoArgs) -> Result<ConfigListResult, ToolE
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ConfigReadArgs {
-    /// Shared document name: `fleet.toml`, `policy.toml`, `projects.toml`, or `tools.d/<name>.toml`.
+    /// Shared document name: `devices.toml`, `fleet.toml`, `policy.toml`, `projects.toml`, or `tools.d/<name>.toml`.
     document: String,
 }
 
@@ -848,21 +1105,13 @@ struct ConfigReadResult {
 
 async fn config_read(ctx: &Ctx, args: ConfigReadArgs) -> Result<ConfigReadResult, ToolError> {
     let doc = SharedDocument::parse(&args.document)?;
-    let config_dir = ctx.paths().config_dir().to_path_buf();
-    tokio::task::spawn_blocking(move || read_local_document(&config_dir, &doc))
-        .await
-        .map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Internal,
-                format!("config.read stopped unexpectedly: {error}."),
-            )
-        })?
+    read_local_document_for_ctx(ctx, &doc).await
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ConfigWriteArgs {
-    /// Shared document name: `fleet.toml`, `policy.toml`, `projects.toml`, or `tools.d/<name>.toml`.
+    /// Shared document name: `devices.toml`, `fleet.toml`, `policy.toml`, `projects.toml`, or `tools.d/<name>.toml`.
     document: String,
     /// Full UTF-8 TOML text to validate and write atomically.
     content: String,
@@ -939,7 +1188,7 @@ struct SyncArgs {
     /// Machines to sync with; defaults to all machines in fleet.toml other than this node.
     #[serde(default)]
     machines: Option<Vec<String>>,
-    /// Shared documents to sync; defaults to fleet.toml, policy.toml, projects.toml, and any tools.d/*.toml files.
+    /// Shared documents to sync; defaults to devices.toml, fleet.toml, policy.toml, projects.toml, and any tools.d/*.toml files.
     #[serde(default)]
     documents: Option<Vec<String>>,
     /// `status` (default, compares hashes only), `push` (local -> remote), or `pull` (remote -> local).
@@ -954,6 +1203,9 @@ struct SyncArgs {
     /// Report what would happen without modifying any configuration, backup, or sidecar files.
     #[serde(default)]
     dry_run: bool,
+    /// Optional per-machine timeout in seconds (up to 300).
+    #[serde(default)]
+    timeout_s: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -982,6 +1234,22 @@ struct DocSyncOutcome {
 }
 
 async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResult, ToolError> {
+    let per_machine_timeout = match args.timeout_s {
+        Some(secs) => {
+            if !secs.is_finite() || secs <= 0.0 || secs > MAX_SYNC_TIMEOUT_S {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!(
+                        "fleet.sync timeout_s must be greater than 0 and at most {MAX_SYNC_TIMEOUT_S}, and {secs} was given."
+                    ),
+                )
+                .with_hint("Give timeout_s as a positive number of seconds up to 300."));
+            }
+            Some(Duration::from_secs_f64(secs))
+        }
+        None => None,
+    };
+
     let here = ctx.node_name().to_owned();
     let fleet_file = ctx.config().get::<FleetFile>()?;
 
@@ -1016,7 +1284,7 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
         SyncDirection::Pull => {
             // Pull targets exactly one machine so local files are never overwritten by racing peers.
             if let Some(machine) = targets.into_iter().next() {
-                let per_doc = sync_one_machine(
+                let per_doc = sync_one_machine_with_timeout(
                     fleet,
                     ctx,
                     &machine,
@@ -1025,6 +1293,7 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
                     &local_docs,
                     args.force,
                     args.dry_run,
+                    per_machine_timeout,
                 )
                 .await;
                 results.insert(machine, per_doc);
@@ -1037,7 +1306,7 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
                     let explicit_docs = explicit_docs.as_deref();
                     let local_docs = local_docs.as_slice();
                     Box::pin(async move {
-                        let per_doc = sync_one_machine(
+                        let per_doc = sync_one_machine_with_timeout(
                             fleet,
                             ctx,
                             &machine,
@@ -1046,6 +1315,7 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
                             local_docs,
                             args.force,
                             args.dry_run,
+                            per_machine_timeout,
                         )
                         .await;
                         (machine, per_doc)
@@ -1070,6 +1340,51 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
         dry_run: args.dry_run,
         results,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_one_machine_with_timeout(
+    fleet: &Fleet,
+    ctx: &Ctx,
+    machine: &str,
+    direction: SyncDirection,
+    explicit_docs: Option<&[SharedDocument]>,
+    local_docs: &[String],
+    force: bool,
+    dry_run: bool,
+    timeout: Option<Duration>,
+) -> BTreeMap<String, DocSyncOutcome> {
+    let fut = sync_one_machine(
+        fleet,
+        ctx,
+        machine,
+        direction,
+        explicit_docs,
+        local_docs,
+        force,
+        dry_run,
+    );
+    let Some(limit) = timeout else {
+        return fut.await;
+    };
+    match tokio::time::timeout(limit, fut).await {
+        Ok(outcomes) => outcomes,
+        Err(_) => {
+            let err = ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "Timed out syncing with {machine} after {:.1}s.",
+                    limit.as_secs_f64()
+                ),
+            )
+            .with_machine(machine);
+            let mut map = BTreeMap::new();
+            for doc in default_doc_list(explicit_docs, local_docs) {
+                map.insert(doc.canonical_name(), error_outcome(err.clone()));
+            }
+            map
+        }
+    }
 }
 
 fn resolve_sync_targets(
@@ -1274,6 +1589,10 @@ async fn sync_one_document(
     force: bool,
     dry_run: bool,
 ) -> DocSyncOutcome {
+    if *doc == SharedDocument::Devices {
+        return sync_devices_document(fleet, ctx, machine, direction, dry_run).await;
+    }
+
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let doc_clone = doc.clone();
@@ -1564,6 +1883,278 @@ async fn sync_one_document(
     }
 }
 
+async fn sync_devices_document(
+    fleet: &Fleet,
+    ctx: &Ctx,
+    machine: &str,
+    direction: SyncDirection,
+    dry_run: bool,
+) -> DocSyncOutcome {
+    let doc = SharedDocument::Devices;
+    let state_dir = ctx.paths().state_dir().to_path_buf();
+    let local_file_exists = ctx.paths().config_file("devices.toml").is_file();
+
+    let local = match read_local_document_for_ctx(ctx, &doc).await {
+        Ok(read) => read,
+        Err(error) => return error_outcome(error),
+    };
+    let sidecar_state = state_dir.clone();
+    let sidecar = match tokio::task::spawn_blocking(move || {
+        read_sidecar(&sidecar_state, &SharedDocument::Devices)
+    })
+    .await
+    {
+        Ok(Ok(sidecar)) => sidecar,
+        Ok(Err(error)) => return error_outcome(error),
+        Err(error) => {
+            return error_outcome(ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Reading sync sidecar stopped unexpectedly: {error}."),
+            ));
+        }
+    };
+    let last_synced_hash = sidecar.peers.get(machine).map(|rec| rec.hash.clone());
+
+    let remote_val = match fleet
+        .call_remote(
+            ctx,
+            machine,
+            "config.read",
+            json!({"document": "devices.toml"}),
+            EventSink::discard(),
+        )
+        .await
+    {
+        Ok(val) => val,
+        Err(error) => return error_outcome(error),
+    };
+    let remote: ConfigReadResult = match serde_json::from_value(remote_val) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return error_outcome(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Remote config.read returned an unexpected shape: {error}."),
+            ));
+        }
+    };
+
+    let local_path = doc.config_path(ctx.paths().config_dir());
+    let local_devices = match local.content.as_deref() {
+        Some(text) => match parse::<DevicesFile>(&local_path, text.as_bytes()) {
+            Ok(parsed) => parsed,
+            Err(error) => return error_outcome(error),
+        },
+        None => DevicesFile::default(),
+    };
+    let remote_devices = match remote.content.as_deref() {
+        Some(text) => match parse::<DevicesFile>(Path::new("devices.toml"), text.as_bytes()) {
+            Ok(parsed) => parsed,
+            Err(error) => return error_outcome(error),
+        },
+        None => DevicesFile::default(),
+    };
+
+    let merged = merge_devices(&local_devices, &remote_devices);
+    let merged_is_empty = merged.devices.is_empty() && merged.removed.is_empty();
+    let merged_toml = merged.to_toml_string();
+    let merged_hash = hash_bytes(merged_toml.as_bytes()).to_string();
+
+    if direction == SyncDirection::Status {
+        let (status, detail) = classify_devices_status(
+            &local_devices,
+            &remote_devices,
+            &merged,
+            local.exists,
+            remote.exists,
+        );
+        return DocSyncOutcome {
+            status,
+            local_hash: local.hash,
+            remote_hash: remote.hash,
+            last_synced_hash,
+            backup: None,
+            detail,
+            error: None,
+        };
+    }
+
+    let local_up_to_date = local_devices == merged && (merged_is_empty || local_file_exists);
+    let remote_up_to_date = remote_devices == merged && (merged_is_empty || remote.exists);
+
+    if local_up_to_date && remote_up_to_date {
+        if !dry_run && !merged_is_empty && last_synced_hash.as_deref() != Some(merged_hash.as_str())
+        {
+            let _ = record_sidecar_async(&state_dir, &doc, machine, &merged_hash).await;
+        }
+        return DocSyncOutcome {
+            status: SyncStatus::Same,
+            local_hash: local.hash,
+            remote_hash: remote.hash,
+            last_synced_hash,
+            backup: None,
+            detail: None,
+            error: None,
+        };
+    }
+
+    let applied_status = match direction {
+        SyncDirection::Push => SyncStatus::Pushed,
+        SyncDirection::Pull => SyncStatus::Pulled,
+        SyncDirection::Status => SyncStatus::Same,
+    };
+
+    if dry_run {
+        return DocSyncOutcome {
+            status: applied_status,
+            local_hash: local.hash,
+            remote_hash: remote.hash,
+            last_synced_hash,
+            backup: None,
+            detail: Some("Would merge devices.toml on both machines (dry_run).".to_owned()),
+            error: None,
+        };
+    }
+
+    let mut current_toml = merged_toml;
+    let mut current_hash = merged_hash.clone();
+    let mut local_backup = None;
+
+    if !local_up_to_date {
+        match apply_local_write(
+            ctx,
+            SharedDocument::Devices,
+            current_toml.clone(),
+            None,
+            false,
+        )
+        .await
+        {
+            Ok(written) => {
+                local_backup = written.backup;
+                current_hash = written.hash_after;
+                if let Some(canonical) = written.canonical_content {
+                    current_toml = canonical;
+                }
+            }
+            Err(error) => {
+                return DocSyncOutcome {
+                    status: SyncStatus::Error,
+                    local_hash: local.hash,
+                    remote_hash: remote.hash,
+                    last_synced_hash,
+                    backup: None,
+                    detail: None,
+                    error: Some(error),
+                };
+            }
+        }
+    }
+
+    let need_remote_write = !remote_up_to_date || current_hash != merged_hash;
+    let mut final_remote_hash = remote.hash.clone();
+    if need_remote_write {
+        match fleet
+            .call_remote(
+                ctx,
+                machine,
+                "config.write",
+                json!({
+                    "document": "devices.toml",
+                    "content": current_toml,
+                }),
+                EventSink::discard(),
+            )
+            .await
+        {
+            Ok(val) => {
+                let written: ConfigWriteResult = match serde_json::from_value(val) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return error_outcome(ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!("Remote config.write returned an unexpected shape: {error}."),
+                        ));
+                    }
+                };
+                final_remote_hash = Some(written.hash.clone());
+                // If the remote concurrently merged another change while accepting our write,
+                // pull the remote's merged state once more so both machines converge identically.
+                if written.hash != current_hash
+                    && let Ok(again_val) = fleet
+                        .call_remote(
+                            ctx,
+                            machine,
+                            "config.read",
+                            json!({"document": "devices.toml"}),
+                            EventSink::discard(),
+                        )
+                        .await
+                    && let Ok(again) = serde_json::from_value::<ConfigReadResult>(again_val)
+                    && let Some(again_content) = again.content
+                    && let Ok(final_local) =
+                        apply_local_write(ctx, SharedDocument::Devices, again_content, None, false)
+                            .await
+                {
+                    current_hash = final_local.hash_after;
+                }
+            }
+            Err(error) => {
+                return DocSyncOutcome {
+                    status: SyncStatus::Error,
+                    local_hash: Some(current_hash),
+                    remote_hash: remote.hash,
+                    last_synced_hash,
+                    backup: local_backup,
+                    detail: None,
+                    error: Some(error),
+                };
+            }
+        }
+    }
+
+    if let Err(error) = record_sidecar_async(&state_dir, &doc, machine, &current_hash).await {
+        return error_outcome(error);
+    }
+
+    DocSyncOutcome {
+        status: applied_status,
+        local_hash: Some(current_hash.clone()),
+        remote_hash: final_remote_hash.or_else(|| Some(current_hash.clone())),
+        last_synced_hash: Some(current_hash),
+        backup: local_backup,
+        detail: None,
+        error: None,
+    }
+}
+
+fn classify_devices_status(
+    local: &DevicesFile,
+    remote: &DevicesFile,
+    merged: &DevicesFile,
+    local_exists: bool,
+    remote_exists: bool,
+) -> (SyncStatus, Option<String>) {
+    if local == remote {
+        return (SyncStatus::Same, None);
+    }
+    if !local_exists && remote_exists {
+        return (SyncStatus::OnlyThere, None);
+    }
+    if local_exists && !remote_exists {
+        return (SyncStatus::OnlyHere, None);
+    }
+    if merged == local && merged != remote {
+        return (SyncStatus::ChangedHere, None);
+    }
+    if merged == remote && merged != local {
+        return (SyncStatus::ChangedThere, None);
+    }
+    (
+        SyncStatus::Both,
+        Some("Both machines have device changes; push or pull will merge them cleanly.".to_owned()),
+    )
+}
+
 async fn record_sidecar_async(
     state_dir: &Path,
     doc: &SharedDocument,
@@ -1696,6 +2287,10 @@ mod tests {
 
     #[test]
     fn shared_document_whitelist_refuses_local_files_and_traversal() {
+        assert_eq!(
+            SharedDocument::parse("devices.toml").unwrap(),
+            SharedDocument::Devices
+        );
         assert_eq!(
             SharedDocument::parse("fleet.toml").unwrap(),
             SharedDocument::Fleet
@@ -2055,5 +2650,255 @@ mod tests {
             &is_builtin,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn classify_devices_status_distinguishes_all_merge_states() {
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::FleetDevice;
+
+        let empty = DevicesFile::default();
+        assert_eq!(
+            classify_devices_status(&empty, &empty, &empty, false, false).0,
+            SyncStatus::Same
+        );
+
+        let id_a = "a1".repeat(16);
+        let id_b = "b2".repeat(16);
+        let dev_a = FleetDevice {
+            name: "phone-a".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[1u8; 32]),
+            principal: "device:phone-a".to_owned(),
+            role: Some("observer".to_owned()),
+            paired_at: "2026-11-24T10:00:00Z".to_owned(),
+            paired_on: "node-a".to_owned(),
+            updated_at: "2026-11-24T10:00:00Z".to_owned(),
+            updated_on: "node-a".to_owned(),
+        };
+        let dev_b = FleetDevice {
+            name: "phone-b".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[2u8; 32]),
+            principal: "device:phone-b".to_owned(),
+            role: Some("observer".to_owned()),
+            paired_at: "2026-11-24T10:01:00Z".to_owned(),
+            paired_on: "node-b".to_owned(),
+            updated_at: "2026-11-24T10:01:00Z".to_owned(),
+            updated_on: "node-b".to_owned(),
+        };
+
+        let mut only_a = DevicesFile::default();
+        only_a.devices.insert(id_a.clone(), dev_a.clone());
+        let mut only_b = DevicesFile::default();
+        only_b.devices.insert(id_b.clone(), dev_b.clone());
+        let both = merge_devices(&only_a, &only_b);
+
+        assert_eq!(
+            classify_devices_status(&only_a, &empty, &only_a, true, false).0,
+            SyncStatus::OnlyHere
+        );
+        assert_eq!(
+            classify_devices_status(&empty, &only_b, &only_b, false, true).0,
+            SyncStatus::OnlyThere
+        );
+        assert_eq!(
+            classify_devices_status(&both, &only_a, &both, true, true).0,
+            SyncStatus::ChangedHere
+        );
+        assert_eq!(
+            classify_devices_status(&only_a, &both, &both, true, true).0,
+            SyncStatus::ChangedThere
+        );
+        let (st, detail) = classify_devices_status(&only_a, &only_b, &both, true, true);
+        assert_eq!(st, SyncStatus::Both);
+        assert!(detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn config_write_devices_merges_keeps_tombstones_and_blocks_non_owner_escalation() {
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{DeviceTombstone, FleetDevice};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+
+[roles.phone_admin]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"phone_admin\"
+",
+        )
+        .unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        let id_live = "11".repeat(16);
+        let id_tomb = "22".repeat(16);
+        let id_incoming = "33".repeat(16);
+
+        let mut local = DevicesFile::default();
+        local.devices.insert(
+            id_live.clone(),
+            FleetDevice {
+                name: "local-phone".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[11u8; 32]),
+                principal: "device:local-phone".to_owned(),
+                role: Some("observer".to_owned()),
+                paired_at: "2026-11-24T10:00:00Z".to_owned(),
+                paired_on: "box-a".to_owned(),
+                updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        local.removed.insert(
+            id_tomb.clone(),
+            DeviceTombstone {
+                name: "revoked-phone".to_owned(),
+                principal: "device:revoked-phone".to_owned(),
+                paired_at: Some("2026-11-24T09:00:00Z".to_owned()),
+                paired_on: Some("box-a".to_owned()),
+                removed_at: "2026-11-24T10:05:00Z".to_owned(),
+                removed_on: "box-a".to_owned(),
+            },
+        );
+        std::fs::write(paths.config_file("devices.toml"), local.to_toml_string()).unwrap();
+
+        // Owner writes an incoming file trying to resurrect id_tomb while adding id_incoming:
+        // tombstone wins (never dropped), id_incoming is added, and local-phone stays intact.
+        let mut incoming = DevicesFile::default();
+        incoming.devices.insert(
+            id_tomb.clone(),
+            FleetDevice {
+                name: "revoked-phone".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[22u8; 32]),
+                principal: "device:revoked-phone".to_owned(),
+                role: Some("observer".to_owned()),
+                paired_at: "2026-11-24T09:00:00Z".to_owned(),
+                paired_on: "box-a".to_owned(),
+                updated_at: "2026-11-24T11:00:00Z".to_owned(),
+                updated_on: "box-b".to_owned(),
+            },
+        );
+        incoming.devices.insert(
+            id_incoming.clone(),
+            FleetDevice {
+                name: "peer-phone".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[33u8; 32]),
+                principal: "device:peer-phone".to_owned(),
+                role: Some("observer".to_owned()),
+                paired_at: "2026-11-24T10:10:00Z".to_owned(),
+                paired_on: "box-b".to_owned(),
+                updated_at: "2026-11-24T10:10:00Z".to_owned(),
+                updated_on: "box-b".to_owned(),
+            },
+        );
+
+        let write_ok = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({
+                    "document": "devices.toml",
+                    "content": incoming.to_toml_string(),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(write_ok["document"], json!("devices.toml"));
+
+        let saved: DevicesFile = parse(
+            &paths.config_file("devices.toml"),
+            &std::fs::read(paths.config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.devices.contains_key(&id_live));
+        assert!(saved.devices.contains_key(&id_incoming));
+        assert!(!saved.devices.contains_key(&id_tomb));
+        assert!(saved.removed.contains_key(&id_tomb));
+
+        // policy.toml gained device:peer-phone as observer, and authorized_keys has both live keys.
+        let pol: Policy = parse(
+            &paths.config_file("policy.toml"),
+            &std::fs::read(paths.config_file("policy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pol.role_of("device:peer-phone").0, "observer");
+        let auth_text = std::fs::read_to_string(&auth_keys).unwrap();
+        assert!(auth_text.contains("legion-device:local-phone"));
+        assert!(auth_text.contains("legion-device:peer-phone"));
+        assert!(!auth_text.contains("legion-device:revoked-phone"));
+
+        // Non-owner admin (`tablet`) cannot inject an owner device or revoke another principal's device.
+        let mut rogue = saved.clone();
+        rogue.devices.insert(
+            "44".repeat(16),
+            FleetDevice {
+                name: "rogue-owner".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[44u8; 32]),
+                principal: "owner".to_owned(),
+                role: Some("owner".to_owned()),
+                paired_at: "2026-11-24T10:20:00Z".to_owned(),
+                paired_on: "box-b".to_owned(),
+                updated_at: "2026-11-24T10:20:00Z".to_owned(),
+                updated_on: "box-b".to_owned(),
+            },
+        );
+        let mut rogue_call = Call::new(
+            Door::Cli,
+            "config.write",
+            json!({
+                "document": "devices.toml",
+                "content": rogue.to_toml_string(),
+            }),
+        );
+        rogue_call.pinned = Some("tablet".to_owned());
+        let err = node.call(rogue_call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        let mut rogue_revoke = saved.clone();
+        rogue_revoke.devices.remove(&id_incoming);
+        rogue_revoke.removed.insert(
+            id_incoming.clone(),
+            DeviceTombstone {
+                name: "peer-phone".to_owned(),
+                principal: "device:peer-phone".to_owned(),
+                paired_at: None,
+                paired_on: None,
+                removed_at: "2026-11-24T10:25:00Z".to_owned(),
+                removed_on: "box-b".to_owned(),
+            },
+        );
+        let mut revoke_call = Call::new(
+            Door::Cli,
+            "config.write",
+            json!({
+                "document": "devices.toml",
+                "content": rogue_revoke.to_toml_string(),
+            }),
+        );
+        revoke_call.pinned = Some("tablet".to_owned());
+        let err2 = node.call(revoke_call).await.unwrap_err();
+        assert_eq!(err2.code, ErrorCode::Denied);
     }
 }

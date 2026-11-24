@@ -3,6 +3,7 @@
 //! Each check is built around a pure evaluation function over canned inputs so every branch can be
 //! verified deterministically across Linux, macOS, and Windows without depending on host state.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -109,6 +110,85 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
     {
         checks.extend(fleet_ping_checks(&parsed.results));
     }
+
+    if !quick
+        && let Some(sync_tool) = ctx.node().registry().get("fleet.sync")
+        && let Ok(value) = sync_tool
+            .call(
+                ctx,
+                json!({
+                    "direction": "status",
+                    "documents": ["devices.toml"],
+                    "timeout_s": FLEET_PING_TIMEOUT_S,
+                }),
+            )
+            .await
+        && let Ok(parsed) = serde_json::from_value::<FleetDevicesSyncResponse>(value)
+        && let Some(check) = check_fleet_device_drift(&parsed.results)
+    {
+        checks.push(check);
+    }
+}
+
+/// Subset of one peer's `fleet.sync` status outcome for `devices.toml`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct FleetDeviceSyncEntry {
+    /// Sync status (`same`, `changed_here`, `changed_there`, `both`, `only_here`, `only_there`, `error`).
+    pub status: String,
+    /// Error body when the peer could not be reached or failed.
+    #[serde(default)]
+    pub error: Option<ErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct FleetDevicesSyncResponse {
+    results: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>>,
+}
+
+/// Builds a `meta.doctor` warning when any reachable fleet peer has a different paired-device list
+/// (`devices.toml`) from this node. Unreachable peers are ignored because `fleet.ping` already
+/// reports them.
+pub fn check_fleet_device_drift(
+    results: &BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>>,
+) -> Option<Check> {
+    let mut drifted: Vec<String> = Vec::new();
+    for (machine, docs) in results {
+        let Some(entry) = docs.get("devices.toml") else {
+            continue;
+        };
+        if entry.status == "same" {
+            continue;
+        }
+        if entry.status == "error" && is_unreachable_warning(entry.error.as_ref()) {
+            continue;
+        }
+        let label = match entry.status.as_str() {
+            "only_here" => format!("{machine} (only here)"),
+            "only_there" => format!("{machine} (only there)"),
+            "changed_here" => format!("{machine} (ahead here)"),
+            "changed_there" => format!("{machine} (ahead there)"),
+            "both" => format!("{machine} (changes on both)"),
+            other => format!("{machine} ({other})"),
+        };
+        drifted.push(label);
+    }
+
+    if drifted.is_empty() {
+        return None;
+    }
+
+    Some(Check {
+        name: "fleet devices".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "Paired device list (devices.toml) differs from reachable peer(s): {}.",
+            drifted.join(", ")
+        ),
+        hint: Some(
+            "Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` to merge paired devices across the fleet.".to_owned(),
+        ),
+    })
 }
 
 /// One Legion-managed `authorized_keys` line whose pinned Legion home no longer exists on disk.
@@ -1057,6 +1137,59 @@ deny = [\"effect:power\", \"effect:admin\"]
                 .is_some_and(|h| h.contains("foreign=true")),
             "{:?}",
             check.hint
+        );
+    }
+
+    #[test]
+    fn fleet_device_drift_warns_for_drifted_reachable_peers_only() {
+        let mut results: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>> = BTreeMap::new();
+        results.insert(
+            "pi".to_owned(),
+            BTreeMap::from([(
+                "devices.toml".to_owned(),
+                FleetDeviceSyncEntry {
+                    status: "same".to_owned(),
+                    error: None,
+                },
+            )]),
+        );
+        results.insert(
+            "offline".to_owned(),
+            BTreeMap::from([(
+                "devices.toml".to_owned(),
+                FleetDeviceSyncEntry {
+                    status: "error".to_owned(),
+                    error: Some(ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        "offline did not answer.",
+                    )),
+                },
+            )]),
+        );
+        assert!(check_fleet_device_drift(&results).is_none());
+
+        results.insert(
+            "tower".to_owned(),
+            BTreeMap::from([(
+                "devices.toml".to_owned(),
+                FleetDeviceSyncEntry {
+                    status: "both".to_owned(),
+                    error: None,
+                },
+            )]),
+        );
+        let warn = check_fleet_device_drift(&results).unwrap();
+        assert_eq!(warn.name, "fleet devices");
+        assert!(warn.ok && warn.warning);
+        assert!(warn.detail.contains("tower"), "{}", warn.detail);
+        assert!(!warn.detail.contains("offline"), "{}", warn.detail);
+        assert!(!warn.detail.contains("pi"), "{}", warn.detail);
+        assert!(
+            warn.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("fleet.sync")),
+            "{:?}",
+            warn.hint
         );
     }
 }

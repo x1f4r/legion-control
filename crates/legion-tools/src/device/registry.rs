@@ -13,14 +13,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jiff::{SignedDuration, Timestamp};
-use legion_core::Paths;
 use legion_core::config::{Document, NodeFile, NodeName, parse, write_atomically};
 use legion_core::policy::{NOBODY, OWNER, Policy, Principal};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::tokens::Tokens;
+use legion_core::{Call, Ctx, Door, Node, Paths};
 use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use super::authkeys::{
@@ -1276,6 +1277,29 @@ pub fn verify_gate_device(
     Ok(Vec::new())
 }
 
+/// Per-machine timeout when automatically pushing `devices.toml` changes to the fleet.
+pub const DEVICE_PUSH_TIMEOUT_S: f64 = 5.0;
+
+/// One change introduced by merging an incoming [`DevicesFile`] into this node's local registry,
+/// passed to the caller's authorization check before anything is written.
+#[derive(Clone, Copy, Debug)]
+pub enum MergeChange<'a> {
+    /// A live device entry was added or modified.
+    Live {
+        /// Resulting live device entry after the merge.
+        entry: &'a FleetDevice,
+        /// Previous local entry for this pairing id, if any.
+        previous: Option<&'a FleetDevice>,
+    },
+    /// A tombstone was added or updated (possibly revoking a previously live device).
+    Removed {
+        /// Resulting tombstone after the merge.
+        tombstone: &'a DeviceTombstone,
+        /// Previously live local entry revoked by this tombstone, if any.
+        previous_live: Option<&'a FleetDevice>,
+    },
+}
+
 /// Result of merging an incoming [`DevicesFile`] into this node's registry and reconciling
 /// `policy.toml` and `authorized_keys`.
 #[derive(Clone, Debug)]
@@ -1284,6 +1308,8 @@ pub struct MergeApplyOutcome {
     pub devices: DevicesFile,
     /// Canonical TOML text written to `devices.toml`.
     pub canonical_toml: String,
+    /// Raw bytes of `devices.toml` before this merge, or `None` if it did not exist yet.
+    pub bytes_before: Option<Vec<u8>>,
     /// Backup path created when `devices.toml` previously existed.
     pub backup: Option<String>,
     /// Device names whose `authorized_keys` lines were removed or that just became tombstoned
@@ -1294,16 +1320,91 @@ pub struct MergeApplyOutcome {
     pub warnings: Vec<String>,
 }
 
+/// Read-only view of `devices.toml` for `config.read` and `fleet.sync`.
+///
+/// If `devices.toml` already exists on disk, returns its exact UTF-8 text. Otherwise, inspects
+/// `authorized_keys` read-only (never creating `.ssh/` or writing files) and returns canonical
+/// TOML for any legacy `--pairing` lines belonging to this Legion home, or `Ok(None)` when none
+/// exist.
+pub fn read_devices_for_sync_blocking(
+    paths: &Paths,
+    node_name: &str,
+    node_file: Option<&NodeFile>,
+) -> Result<Option<String>, ErrorBody> {
+    let devices_path = paths.config_file(DevicesFile::FILE);
+    match std::fs::read(&devices_path) {
+        Ok(bytes) => {
+            let text = String::from_utf8(bytes).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "{} is not valid UTF-8 text: {error}.",
+                        devices_path.display()
+                    ),
+                )
+            })?;
+            return Ok(Some(text));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", devices_path.display()),
+            ));
+        }
+    }
+
+    let Some(node_file) = node_file else {
+        return Ok(None);
+    };
+    let Ok(target) = resolve_target(paths, node_file) else {
+        return Ok(None);
+    };
+    let Ok(write_path) = resolve_safe_write_path(&target, paths.home()) else {
+        return Ok(None);
+    };
+    if !write_path.is_file() {
+        return Ok(None);
+    }
+    let Ok(caller_account) = caller_account_for_target(&target) else {
+        return Ok(None);
+    };
+    let Ok(auth_keys) = read_auth_keys(&write_path) else {
+        return Ok(None);
+    };
+    let state = load_state(paths).unwrap_or_default();
+    let policy_path = paths.config_file(Policy::FILE);
+    let policy = std::fs::read(&policy_path)
+        .ok()
+        .and_then(|b| parse::<Policy>(&policy_path, &b).ok())
+        .unwrap_or_default();
+    let adopted = adopt_legacy_devices_from_auth_keys(
+        paths,
+        node_name,
+        &auth_keys,
+        &target,
+        caller_account.as_deref(),
+        &state,
+        &policy,
+    );
+    if adopted.devices.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(adopted.to_toml_string()))
+    }
+}
+
 /// Applies an incoming `DevicesFile` (e.g. from `fleet.sync` or `config.write`) by merging it with
-/// this node's current `devices.toml` (after adopting any legacy lines), updating `device:*`
-/// principals in `policy.toml` without escalation, saving the merged `devices.toml`, and
-/// reconciling `authorized_keys`.
+/// this node's current `devices.toml` (after adopting any legacy lines), verifying preconditions
+/// and caller authorization, updating `device:*` principals in `policy.toml` without escalation,
+/// saving the merged `devices.toml`, and reconciling `authorized_keys`.
 pub fn apply_devices_merge_blocking(
     paths: &Paths,
     node_name: &str,
     node_file: &NodeFile,
     incoming: &DevicesFile,
-    authorize_entry: impl Fn(&FleetDevice, Option<&FleetDevice>) -> Result<(), ErrorBody>,
+    check_precondition: impl FnOnce(Option<&[u8]>) -> Result<(), ErrorBody>,
+    authorize_change: impl Fn(MergeChange<'_>) -> Result<(), ErrorBody>,
 ) -> Result<MergeApplyOutcome, ErrorBody> {
     let _cfg_guard = lock_config(paths)?;
 
@@ -1319,9 +1420,21 @@ pub fn apply_devices_merge_blocking(
     let _auth_guard = lock_auth_keys(&target, &write_path)?;
 
     let devices_path = paths.config_file(DevicesFile::FILE);
-    let had_existing_file = devices_path.is_file();
-    let local = match load_devices_raw(paths)? {
-        Some(file) => file,
+    let bytes_before = match std::fs::read(&devices_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", devices_path.display()),
+            ));
+        }
+    };
+    check_precondition(bytes_before.as_deref())?;
+
+    let had_existing_file = bytes_before.is_some();
+    let local = match bytes_before.as_deref() {
+        Some(bytes) => parse::<DevicesFile>(&devices_path, bytes)?,
         None => {
             let auth_keys = read_auth_keys(&write_path)?;
             let state = load_state(paths).unwrap_or_default();
@@ -1344,11 +1457,21 @@ pub fn apply_devices_merge_blocking(
 
     let merged = merge_devices(&local, incoming);
 
-    // Authorize every live entry that the merge adds or modifies before writing anything.
+    // Authorize every live entry and tombstone that the merge adds or modifies before writing.
     for (id, entry) in &merged.devices {
         let previous = local.devices.get(id);
         if previous != Some(entry) {
-            authorize_entry(entry, previous)?;
+            authorize_change(MergeChange::Live { entry, previous })?;
+        }
+    }
+    for (id, tombstone) in &merged.removed {
+        let previous_tomb = local.removed.get(id);
+        let previous_live = local.devices.get(id);
+        if previous_tomb != Some(tombstone) || previous_live.is_some() {
+            authorize_change(MergeChange::Removed {
+                tombstone,
+                previous_live,
+            })?;
         }
     }
 
@@ -1391,10 +1514,74 @@ pub fn apply_devices_merge_blocking(
     Ok(MergeApplyOutcome {
         devices: merged,
         canonical_toml: canonical,
+        bytes_before,
         backup,
         removed_device_names,
         warnings,
     })
+}
+
+/// Pushes `devices.toml` to every peer listed in `fleet.toml` in parallel with a short timeout,
+/// returning a per-machine [`FleetPushOutcome`] map.
+///
+/// Returns an empty map when `fleet.sync` is not registered or `fleet.toml` lists no other
+/// machines. Never fails the already-committed local change when a peer is unreachable.
+pub async fn push_devices_to_fleet(
+    node: &Node,
+    ctx_opt: Option<&Ctx>,
+    acting_principal: Option<&str>,
+) -> BTreeMap<String, FleetPushOutcome> {
+    let Some(sync_tool) = node.registry().get("fleet.sync") else {
+        return BTreeMap::new();
+    };
+    let args = json!({
+        "direction": "push",
+        "documents": [DevicesFile::FILE],
+        "timeout_s": DEVICE_PUSH_TIMEOUT_S,
+    });
+    let reply = match ctx_opt {
+        Some(ctx) => sync_tool.call(ctx, args).await,
+        None => {
+            let mut call = Call::new(Door::Ssh, "fleet.sync", args);
+            call.pinned = Some(acting_principal.unwrap_or(OWNER).to_owned());
+            node.call(call).await
+        }
+    };
+    match reply {
+        Ok(value) => parse_fleet_push_outcomes(&value),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// Translates a `fleet.sync` result JSON object for `devices.toml` into per-machine
+/// [`FleetPushOutcome`] entries.
+pub fn parse_fleet_push_outcomes(sync_result: &Value) -> BTreeMap<String, FleetPushOutcome> {
+    let mut out = BTreeMap::new();
+    let Some(results) = sync_result.get("results").and_then(Value::as_object) else {
+        return out;
+    };
+    for (machine, docs) in results {
+        let doc_outcome = docs.get(DevicesFile::FILE);
+        let status = doc_outcome
+            .and_then(|d| d.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("error");
+        let outcome = if matches!(status, "same" | "pushed" | "pulled") {
+            FleetPushOutcome::synced()
+        } else {
+            let reason = doc_outcome
+                .and_then(|d| {
+                    d.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(Value::as_str)
+                        .or_else(|| d.get("detail").and_then(Value::as_str))
+                })
+                .unwrap_or("machine did not finish syncing devices.toml");
+            FleetPushOutcome::not_reached(reason)
+        };
+        out.insert(machine.clone(), outcome);
+    }
+    out
 }
 
 fn caller_account_for_target(target: &AuthKeysTarget) -> Result<Option<String>, ErrorBody> {

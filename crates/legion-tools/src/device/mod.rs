@@ -39,10 +39,10 @@ use self::keys::{
     resolve_host_keys, validate_invite_id, validate_pairing_id,
 };
 use self::registry::{
-    DEVICE_PRINCIPAL_PREFIX, DeviceTombstone, DevicesFile, adopt_legacy_devices_from_auth_keys,
-    load_devices_raw, lock_config, next_updated_timestamp, reconcile_authorized_keys_in_memory,
-    reconcile_device_principals_locked, save_devices_locked, upsert_policy_principal_locked,
-    validate_role_name,
+    DEVICE_PRINCIPAL_PREFIX, DeviceTombstone, DevicesFile, FleetPushOutcome,
+    adopt_legacy_devices_from_auth_keys, load_devices_raw, lock_config, next_updated_timestamp,
+    push_devices_to_fleet, reconcile_authorized_keys_in_memory, reconcile_device_principals_locked,
+    save_devices_locked, upsert_policy_principal_locked, validate_role_name,
 };
 use self::store::{
     InviteRecord, format_rfc3339, load_state, lock_auth_keys, sanitise_device_name, save_state,
@@ -450,6 +450,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         principal: principal.clone(),
         role: invite_role,
         device_name: invite_device_name.clone(),
+        created_by: Some(ctx.principal().to_owned()),
         created,
         expires: expires.clone(),
         fingerprint: ephemeral.fingerprint,
@@ -571,6 +572,8 @@ struct SetResult {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_role: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    fleet: BTreeMap<String, FleetPushOutcome>,
 }
 
 async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
@@ -670,7 +673,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
     let paths = ctx.paths().clone();
     let new_role = args.role;
 
-    blocking(move || {
+    let mut result = blocking(move || {
         let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
         let caller_account = caller_account_for_target(&target)?;
@@ -855,9 +858,13 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             principal: updated_entry.principal,
             role: final_role,
             previous_role,
+            fleet: BTreeMap::new(),
         })
     })
-    .await
+    .await?;
+
+    result.fleet = push_devices_to_fleet(ctx.node(), Some(ctx), None).await;
+    Ok(result)
 }
 
 /// What `device.list` returns.
@@ -1169,6 +1176,10 @@ struct Removed {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     sessions_not_ended: bool,
     jobs_left_running: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    fleet: BTreeMap<String, FleetPushOutcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    still_trusted_by: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
 }
@@ -1332,6 +1343,8 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                     sessions_ended: 0,
                                     sessions_not_ended: false,
                                     jobs_left_running: Vec::new(),
+                                    fleet: BTreeMap::new(),
+                                    still_trusted_by: Vec::new(),
                                     hint: None,
                                 },
                                 Some(entry.name),
@@ -1442,6 +1455,8 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                             sessions_ended: 0,
                                             sessions_not_ended: false,
                                             jobs_left_running: Vec::new(),
+                                            fleet: BTreeMap::new(),
+                                            still_trusted_by: Vec::new(),
                                             hint: None,
                                         },
                                         Some(entry.name),
@@ -1606,6 +1621,8 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         sessions_ended: 0,
                                         sessions_not_ended: true,
                                         jobs_left_running: Vec::new(),
+                                        fleet: BTreeMap::new(),
+                                        still_trusted_by: Vec::new(),
                                         hint: Some(
                                             "Active sessions tracked under another Legion home were not ended; new SSH connections and channels are refused immediately, and if that other home still exists you can run `device.remove` from it or end any open sshd sessions manually.".to_owned(),
                                         ),
@@ -1752,6 +1769,8 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         sessions_ended: 0,
                                         sessions_not_ended: false,
                                         jobs_left_running: Vec::new(),
+                                        fleet: BTreeMap::new(),
+                                        still_trusted_by: Vec::new(),
                                         hint: None,
                                     },
                                     None,
@@ -1811,15 +1830,31 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         }
         let paths_for_jobs = paths_for_sessions.clone();
         let principal_for_jobs = removed.principal.clone();
+        let device_for_jobs = device_name.clone();
         removed.jobs_left_running = blocking(move || {
             Ok(crate::job::running_job_ids_for_device(
                 &paths_for_jobs,
-                &device_name,
+                &device_for_jobs,
                 &principal_for_jobs,
             ))
         })
         .await
         .unwrap_or_default();
+
+        let fleet_outcomes = push_devices_to_fleet(ctx.node(), Some(ctx), None).await;
+        let still_trusted: Vec<String> = fleet_outcomes
+            .iter()
+            .filter(|(_, outcome)| outcome.status != "synced")
+            .map(|(machine, _)| machine.clone())
+            .collect();
+        if !still_trusted.is_empty() {
+            removed.hint = Some(format!(
+                "These machines could not be reached and still trust {device_name} until their next sync: {}. Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` when they are back online.",
+                still_trusted.join(", ")
+            ));
+        }
+        removed.fleet = fleet_outcomes;
+        removed.still_trusted_by = still_trusted;
     }
 
     Ok(removed)
@@ -2139,6 +2174,7 @@ role = "owner"
                 principal: "phone".to_owned(),
                 role: "observer".to_owned(),
                 device: "my-pixel".to_owned(),
+                fleet: BTreeMap::new(),
             }
         );
 
@@ -2179,6 +2215,7 @@ role = "owner"
                 principal: "phone".to_owned(),
                 role: "observer".to_owned(),
                 device: "my-pixel-2".to_owned(),
+                fleet: BTreeMap::new(),
             }
         );
 
@@ -2755,6 +2792,7 @@ role = "owner"
                 principal: "phone".to_owned(),
                 role: "observer".to_owned(),
                 device: "resilient-phone".to_owned(),
+                fleet: BTreeMap::new(),
             }
         );
 
@@ -2891,6 +2929,7 @@ role = "owner"
                 principal: "phone".to_owned(),
                 role: None,
                 device_name: None,
+                created_by: None,
                 created: format_rfc3339(now),
                 expires: format_rfc3339(exp),
                 fingerprint: eph.fingerprint.clone(),
@@ -3034,6 +3073,7 @@ role = "owner"
                 principal: "device:my-phone".to_owned(),
                 role: "observer".to_owned(),
                 device: "my-phone".to_owned(),
+                fleet: BTreeMap::new(),
             }
         );
 

@@ -6,7 +6,7 @@
 //! `authorized_keys` line for a permanent `legion gate --as <principal>` line atomically, records
 //! the device, audits the attempt under door `ssh` (`device.enrol`), and writes one JSON reply line.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
@@ -25,9 +25,9 @@ use super::authkeys::{
 };
 use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
 use super::registry::{
-    DEVICE_PRINCIPAL_PREFIX, DevicesFile, FleetDevice, adopt_legacy_devices_from_auth_keys,
-    format_precise_rfc3339, load_devices_raw, lock_config, reconcile_authorized_keys_in_memory,
-    save_devices_locked,
+    DEVICE_PRINCIPAL_PREFIX, DevicesFile, FleetDevice, FleetPushOutcome,
+    adopt_legacy_devices_from_auth_keys, format_precise_rfc3339, load_devices_raw, lock_config,
+    push_devices_to_fleet, reconcile_authorized_keys_in_memory, save_devices_locked,
 };
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
@@ -69,6 +69,10 @@ pub enum EnrolReply {
         role: String,
         /// Unique sanitised name recorded for the device.
         device: String,
+        /// Per-machine sync outcome when pushing the new device to peers in `fleet.toml`.
+        /// Omitted when no other machines are configured.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        fleet: BTreeMap<String, FleetPushOutcome>,
     },
     /// Enrolment failed; nothing on disk was changed (beyond sweeping already-expired invites).
     Err {
@@ -117,8 +121,8 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
     let target_node = node.name();
     let forced_id_owned = forced_id.to_owned();
 
-    let (principal, audit_args, outcome) = match read_request_line(input).await {
-        Err(error) => (None, json!({ "id": forced_id }), Err(error)),
+    let (principal, created_by, audit_args, mut outcome) = match read_request_line(input).await {
+        Err(error) => (None, None, json!({ "id": forced_id }), Err(error)),
         Ok(request) => {
             let node_clone = node.clone();
             let id_for_task = forced_id_owned.clone();
@@ -130,6 +134,7 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
                 Ok(result) => result,
                 Err(error) => (
                     None,
+                    None,
                     json!({ "id": forced_id }),
                     Err(ErrorBody::new(
                         ErrorCode::Internal,
@@ -139,6 +144,10 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
             }
         }
     };
+
+    if let Ok(EnrolReply::Ok { ref mut fleet, .. }) = outcome {
+        *fleet = push_devices_to_fleet(node, None, created_by.as_deref()).await;
+    }
 
     let enrolled_device = outcome.as_ref().ok().and_then(|reply| match reply {
         EnrolReply::Ok { device, .. } => Some(device.clone()),
@@ -227,16 +236,18 @@ fn process_enrol_blocking(
     request: EnrolRequest,
 ) -> (
     Option<String>,
+    Option<String>,
     serde_json::Value,
     Result<EnrolReply, ErrorBody>,
 ) {
     let base_args = json!({ "id": forced_id });
 
     if let Err(error) = validate_invite_id(forced_id) {
-        return (None, base_args, Err(error));
+        return (None, None, base_args, Err(error));
     }
     if request.enrol != ENROL_PROTOCOL {
         return (
+            None,
             None,
             base_args,
             Err(ErrorBody::new(
@@ -252,6 +263,7 @@ fn process_enrol_blocking(
     if request.id != forced_id {
         return (
             None,
+            None,
             base_args,
             Err(ErrorBody::new(
                 ErrorCode::Denied,
@@ -264,15 +276,15 @@ fn process_enrol_blocking(
     let paths = node.paths();
     let node_file = match node.config().get::<NodeFile>() {
         Ok(file) => file,
-        Err(error) => return (None, base_args, Err(error)),
+        Err(error) => return (None, None, base_args, Err(error)),
     };
     let target = match resolve_target(paths, &node_file) {
         Ok(target) => target,
-        Err(error) => return (None, base_args, Err(error)),
+        Err(error) => return (None, None, base_args, Err(error)),
     };
     let write_path = match resolve_safe_write_path(&target, paths.home()) {
         Ok(path) => path,
-        Err(error) => return (None, base_args, Err(error)),
+        Err(error) => return (None, None, base_args, Err(error)),
     };
     if let Err(error) = verify_owner_matches_euid(
         &write_path,
@@ -280,21 +292,22 @@ fn process_enrol_blocking(
         target.is_default_home_ssh,
         legion_os::user::effective_uid(),
     ) {
-        return (None, base_args, Err(error));
+        return (None, None, base_args, Err(error));
     }
 
     let _cfg_guard = match lock_config(paths) {
         Ok(guard) => guard,
-        Err(error) => return (None, base_args, Err(error)),
+        Err(error) => return (None, None, base_args, Err(error)),
     };
     let _guard = match lock_auth_keys(&target, &write_path) {
         Ok(guard) => guard,
-        Err(error) => return (None, base_args, Err(error)),
+        Err(error) => return (None, None, base_args, Err(error)),
     };
 
     enum EnrolAttempt {
         Succeeded {
             principal: String,
+            created_by: Option<String>,
             role: String,
             device_name: String,
             fingerprint: String,
@@ -568,6 +581,7 @@ fn process_enrol_blocking(
             Some(auth_keys),
             EnrolAttempt::Succeeded {
                 principal,
+                created_by: invite.created_by,
                 role,
                 device_name,
                 fingerprint: validated_key.fingerprint,
@@ -577,18 +591,27 @@ fn process_enrol_blocking(
         ))
     }) {
         Ok(attempt) => attempt,
-        Err(error) => return (None, base_args, Err(error)),
+        Err(error) => return (None, None, base_args, Err(error)),
     };
 
-    let (principal, role, device_name, fingerprint, state, devices) = match attempt {
+    let (principal, created_by, role, device_name, fingerprint, state, devices) = match attempt {
         EnrolAttempt::Succeeded {
             principal,
+            created_by,
             role,
             device_name,
             fingerprint,
             state,
             devices,
-        } => (principal, role, device_name, fingerprint, state, devices),
+        } => (
+            principal,
+            created_by,
+            role,
+            device_name,
+            fingerprint,
+            state,
+            devices,
+        ),
         EnrolAttempt::Failed {
             principal,
             error,
@@ -597,12 +620,12 @@ fn process_enrol_blocking(
             if let Some(state) = swept_state {
                 let _ = save_state(paths, &state);
             }
-            return (principal, base_args, Err(error));
+            return (principal, None, base_args, Err(error));
         }
     };
 
     if let Err(error) = save_devices_locked(paths, &devices) {
-        return (Some(principal), base_args, Err(error));
+        return (Some(principal), created_by, base_args, Err(error));
     }
 
     // authorized_keys and devices.toml already hold the permanent device (with the temporary invite
@@ -623,6 +646,7 @@ fn process_enrol_blocking(
     }
     (
         Some(principal.clone()),
+        created_by,
         audit_args,
         Ok(EnrolReply::Ok {
             ok: true,
@@ -630,6 +654,7 @@ fn process_enrol_blocking(
             principal,
             role,
             device: device_name,
+            fleet: BTreeMap::new(),
         }),
     )
 }
