@@ -32,5 +32,10 @@ tokio = { workspace = true, features = ["time"] }
 name = "fleet"
 harness = false
 
+# Hosts extra nodes for its fan-out test by re-executing itself, as the fleet tests do.
+[[test]]
+name = "http"
+harness = false
+
 [lints]
 workspace = true
