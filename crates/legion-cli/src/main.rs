@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use legion_core::proto::{ErrorBody, EventKind, ToolsResult};
 use legion_core::{Call, Door, EventSink, Local, Node, Paths, Router, VERSION};
+use legion_doors::mcp::{self, McpDoor};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
@@ -56,10 +57,15 @@ async fn run(command: Command) -> ExitCode {
     let json = match &command {
         Command::Call(call) => call.json,
         Command::Tools { json } | Command::Help { json, .. } => *json,
-        Command::Rpc { .. } | Command::Version => false,
+        Command::Rpc { .. } | Command::Mcp { .. } | Command::Version => false,
     };
     let node = match Paths::from_env() {
         Ok(paths) => Node::new(paths, legion_tools::registry()),
+        // stdout belongs to the protocol, so an MCP client learns nothing from it but messages.
+        Err(error) if matches!(command, Command::Mcp { .. }) => {
+            err(&render::error(&error));
+            return ExitCode::from(FAILED);
+        }
         Err(error) => return failed(&error, json),
     };
     match command {
@@ -105,9 +111,29 @@ async fn run(command: Command) -> ExitCode {
                 }
             }
         }
+        Command::Mcp { pinned, compact } => serve_mcp(node, pinned, compact).await,
         Command::Help { tool: None, .. } | Command::Version => {
             out(&format!("{USAGE}\n"));
             ExitCode::SUCCESS
+        }
+    }
+}
+
+/// `legion mcp`: the node's tools for an AI agent, over MCP on stdin and stdout until stdin ends.
+async fn serve_mcp(node: Node, pinned: Option<String>, compact: bool) -> ExitCode {
+    let router: Arc<dyn Router> = Arc::new(Local);
+    let door = match McpDoor::new(node, router, mcp::Options { pinned, compact }) {
+        Ok(door) => door,
+        Err(error) => {
+            err(&render::error(&error));
+            return ExitCode::from(FAILED);
+        }
+    };
+    match door.serve(tokio::io::stdin(), tokio::io::stdout()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            err(&format!("legion mcp: the session ended: {error}\n"));
+            ExitCode::from(FAILED)
         }
     }
 }

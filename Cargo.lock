@@ -376,6 +376,7 @@ name = "legion-cli"
 version = "0.1.0"
 dependencies = [
  "legion-core",
+ "legion-doors",
  "legion-proto",
  "legion-tools",
  "serde",
