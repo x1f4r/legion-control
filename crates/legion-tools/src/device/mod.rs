@@ -30,7 +30,7 @@ use crate::caller::Caller;
 use self::authkeys::{
     ForcedCommandShell, LineKind, edit_auth_keys_with_retry, format_invite_line,
     line_matches_account, line_matches_home, resolve_safe_write_path, resolve_target,
-    verify_owner_matches_euid, write_auth_keys,
+    verify_exe_not_group_or_world_writable, verify_owner_matches_euid, write_auth_keys,
 };
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
@@ -239,6 +239,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     let host_keys = resolved_host_keys.keys;
     let host_keys_source = resolved_host_keys.source;
     let exe = legion_core::current_exe()?;
+    verify_exe_not_group_or_world_writable(&exe)?;
 
     let now = Timestamp::from_second(Timestamp::now().as_second()).map_err(internal_time)?;
     let expires_ts = now

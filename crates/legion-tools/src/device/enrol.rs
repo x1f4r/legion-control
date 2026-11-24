@@ -20,7 +20,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use super::authkeys::{
     ForcedCommandShell, LineKind, edit_auth_keys_with_retry, format_device_line,
-    resolve_safe_write_path, resolve_target, verify_owner_matches_euid,
+    resolve_safe_write_path, resolve_target, verify_exe_not_group_or_world_writable,
+    verify_owner_matches_euid,
 };
 use super::keys::{validate_ed25519_public_key, validate_invite_id};
 use super::store::{
@@ -405,6 +406,9 @@ fn process_enrol_blocking(
             Ok(exe) => exe,
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
         };
+        if let Err(error) = verify_exe_not_group_or_world_writable(&exe) {
+            return fail_with_sweep(Some(principal), error, auth_keys, state);
+        }
 
         let existing_names: HashSet<String> = auth_keys
             .lines

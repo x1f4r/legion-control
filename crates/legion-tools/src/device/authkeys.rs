@@ -324,6 +324,61 @@ pub fn resolve_safe_write_path(
     }
 }
 
+/// Verifies on Unix that neither `exe` (after resolving symlinks) nor any of its parent
+/// directories is group- or world-writable (`mode & 0o022 != 0`), refusing to embed a binary path
+/// that another local account could replace into an `authorized_keys` forced command.
+///
+/// No-op on non-Unix platforms.
+pub fn verify_exe_not_group_or_world_writable(exe: &Path) -> Result<(), ErrorBody> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let canon = dunce::canonicalize(exe).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Legion executable path {} cannot be resolved: {error}.",
+                    exe.display()
+                ),
+            )
+        })?;
+        for path in canon.ancestors() {
+            let meta = std::fs::metadata(path).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be inspected: {error}.", path.display()),
+                )
+            })?;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o022 != 0 {
+                let what = if path == canon {
+                    "the legion executable"
+                } else {
+                    "an ancestor directory of the legion executable"
+                };
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Refusing to place {} in a forced command because {what} ({}) is group- or world-writable (mode {:04o}).",
+                        exe.display(),
+                        path.display(),
+                        mode,
+                    ),
+                )
+                .with_hint(
+                    "Install legion in a directory writable only by its owner (such as ~/.local/bin) and remove group/other write bits (`chmod go-w`) before pairing.",
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = exe;
+        Ok(())
+    }
+}
+
 /// Verifies on Unix that the effective user ID (`euid`) owns the existing `authorized_keys` file
 /// (or its parent `.ssh` directory, or `home` when neither exists yet), refusing to rewrite
 /// another user's file (for example when `sudo legion pair` runs as root with a user's `HOME`).
@@ -2088,5 +2143,51 @@ Match Group users
         let err =
             verify_owner_matches_euid(&auth_file, Some(&home), true, Some(wrong_uid)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Denied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_exe_refuses_group_or_world_writable_binary_or_parent_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("exec-dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_exe = sub.join("legion");
+        std::fs::write(&fake_exe, b"#!/bin/sh\n").unwrap();
+
+        // 1. Group-writable binary is refused naming the binary itself.
+        std::fs::set_permissions(&fake_exe, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = verify_exe_not_group_or_world_writable(&fake_exe).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(
+            err.message.contains("the legion executable"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("chmod go-w")),
+            "{:?}",
+            err.hint
+        );
+
+        // 2. Clean 0755 binary inside a group-writable parent directory is refused naming the parent.
+        std::fs::set_permissions(&fake_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = verify_exe_not_group_or_world_writable(&fake_exe).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(
+            err.message.contains("ancestor directory"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("exec-dir"), "{}", err.message);
+
+        // 3. The test binary itself in target/ has no group-/world-writable ancestors.
+        let current = std::env::current_exe().unwrap();
+        assert!(verify_exe_not_group_or_world_writable(&current).is_ok());
     }
 }
