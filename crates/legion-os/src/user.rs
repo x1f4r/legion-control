@@ -1,0 +1,252 @@
+//! Current OS account identity, Windows Administrators-group checks, and SSH key-file ACLs.
+//!
+//! Isolates the platform differences needed when managing `authorized_keys` files across Linux,
+//! macOS, and Windows.
+
+use std::path::Path;
+
+use crate::{OsError, Result};
+
+/// Returns the operating-system account name that the current process runs as.
+///
+/// On Unix, looks up the effective UID in the system user database first (falling back to `USER`
+/// and `LOGNAME` only when the lookup yields no entry). On Windows, reads `USERNAME`.
+pub fn current_username() -> Result<String> {
+    #[cfg(unix)]
+    {
+        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+            && !user.name.is_empty()
+        {
+            return Ok(user.name);
+        }
+        for var in ["USER", "LOGNAME"] {
+            if let Ok(value) = std::env::var(var) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Ok(trimmed.to_owned());
+                }
+            }
+        }
+        Err(OsError::Platform {
+            detail: "cannot determine the current Unix account name".to_owned(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(value) = std::env::var("USERNAME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_owned());
+            }
+        }
+        Err(OsError::Platform {
+            detail: "cannot determine the current Windows account name (USERNAME is unset)"
+                .to_owned(),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(OsError::Unsupported {
+            detail: "determining the current account name is not supported on this platform"
+                .to_owned(),
+        })
+    }
+}
+
+/// Returns `true` on Windows when the current account is a member of the local `Administrators`
+/// group (`BUILTIN\Administrators`, `S-1-5-32-544`), including when running under an unelevated
+/// UAC token where the group is present as deny-only.
+///
+/// Always returns `false` on non-Windows platforms.
+pub fn is_windows_administrator() -> bool {
+    #[cfg(windows)]
+    {
+        windows_impl::is_in_administrators_group()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Applies the ACL that Windows OpenSSH `sshd` demands for `administrators_authorized_keys`:
+/// disables inherited permissions and grants Full Control solely to `BUILTIN\Administrators`
+/// (`S-1-5-32-544`) and `NT AUTHORITY\SYSTEM` (`S-1-5-18`).
+///
+/// Uses locale-independent SID strings so non-English Windows installations are handled identically.
+/// No-op on non-Windows platforms.
+pub fn apply_windows_admin_ssh_acl(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows_impl::apply_admin_ssh_acl(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod windows_impl {
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
+    use windows::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, PSID, SECURITY_MAX_SID_SIZE,
+        TOKEN_GROUPS, TOKEN_QUERY, TokenGroups, WinBuiltinAdministratorsSid,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use crate::{OsError, Result};
+
+    #[allow(unsafe_code)]
+    pub(super) fn is_in_administrators_group() -> bool {
+        let mut token = HANDLE::default();
+        // SAFETY: `GetCurrentProcess()` returns the pseudo-handle for the calling process, and
+        // `token` is a valid out-pointer closed unconditionally below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+            return false;
+        }
+        struct TokenGuard(HANDLE);
+        impl Drop for TokenGuard {
+            fn drop(&mut self) {
+                if !self.0.is_invalid() {
+                    // SAFETY: `self.0` was obtained from `OpenProcessToken` and is closed once.
+                    let _ = unsafe { CloseHandle(self.0) };
+                }
+            }
+        }
+        let _guard = TokenGuard(token);
+
+        let mut admin_sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut admin_sid_len = u32::try_from(admin_sid.len()).unwrap_or(SECURITY_MAX_SID_SIZE);
+        // SAFETY: `admin_sid` is sized to `SECURITY_MAX_SID_SIZE` and `admin_sid_len` holds its
+        // exact byte capacity.
+        if unsafe {
+            CreateWellKnownSid(
+                WinBuiltinAdministratorsSid,
+                None,
+                Some(PSID(admin_sid.as_mut_ptr().cast::<c_void>())),
+                &mut admin_sid_len,
+            )
+        }
+        .is_err()
+        {
+            return false;
+        }
+        let admin_psid = PSID(admin_sid.as_mut_ptr().cast::<c_void>());
+
+        let mut needed: u32 = 0;
+        // SAFETY: Querying buffer size with a null output pointer is the documented Win32 pattern.
+        let first = unsafe { GetTokenInformation(token, TokenGroups, None, 0, &mut needed) };
+        if let Err(err) = first
+            && err.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult()
+        {
+            return false;
+        }
+        if needed == 0 {
+            return false;
+        }
+        // Allocate as `usize`-aligned words so the buffer meets `TOKEN_GROUPS` alignment.
+        let word_count = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buf = vec![0_usize; word_count];
+        // SAFETY: `buf` is at least `needed` bytes and properly aligned for `TOKEN_GROUPS`.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenGroups,
+                Some(buf.as_mut_ptr().cast::<c_void>()),
+                needed,
+                &mut needed,
+            )
+        }
+        .is_err()
+        {
+            return false;
+        }
+
+        // SAFETY: `GetTokenInformation(TokenGroups)` succeeded and initialized `TOKEN_GROUPS` with
+        // `GroupCount` elements in the flexible `Groups` array inside `buf`.
+        let groups_ptr = buf.as_ptr().cast::<TOKEN_GROUPS>();
+        let count = unsafe { (*groups_ptr).GroupCount } as usize;
+        let first_group = unsafe {
+            std::ptr::addr_of!((*groups_ptr).Groups)
+                .cast::<windows::Win32::Security::SID_AND_ATTRIBUTES>()
+        };
+        // Check group membership regardless of whether UAC has temporarily marked the group
+        // deny-only: OpenSSH `Match Group administrators` matches account membership.
+        for i in 0..count {
+            let entry = unsafe { *first_group.add(i) };
+            if !entry.Sid.0.is_null() && unsafe { EqualSid(entry.Sid, admin_psid) }.is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(super) fn apply_admin_ssh_acl(path: &Path) -> Result<()> {
+        let icacls = std::env::var_os("SystemRoot")
+            .map(|root| PathBuf::from(root).join("System32").join("icacls.exe"))
+            .filter(|candidate| candidate.is_file())
+            .unwrap_or_else(|| PathBuf::from("icacls.exe"));
+        let output = Command::new(&icacls)
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg("*S-1-5-32-544:F")
+            .arg("/grant:r")
+            .arg("*S-1-5-18:F")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|err| {
+                OsError::from_io(
+                    format!(
+                        "cannot run {} to set ACL on {}",
+                        icacls.display(),
+                        path.display()
+                    ),
+                    err,
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = stderr.trim();
+            let detail = if detail.is_empty() {
+                stdout.trim()
+            } else {
+                detail
+            };
+            return Err(OsError::Platform {
+                detail: format!(
+                    "icacls failed setting Administrators/SYSTEM ACL on {} (exit {:?}): {detail}",
+                    path.display(),
+                    output.status.code()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_username_returns_non_empty_name() {
+        let name = current_username().unwrap();
+        assert!(!name.is_empty());
+        assert!(!name.chars().any(char::is_control));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_windows_is_not_windows_administrator_and_acl_is_noop() {
+        assert!(!is_windows_administrator());
+        apply_windows_admin_ssh_acl(Path::new("/nonexistent")).unwrap();
+    }
+}
