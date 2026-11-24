@@ -352,23 +352,13 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                         meta.map(|m| m.added.clone()),
                     ));
                 }
-                LineKind::Invite {
-                    id,
-                    key_b64,
-                    expiry_time,
-                } => {
+                LineKind::Invite { id, key_b64, .. } => {
                     let Some(meta) = state.invites.get(id) else {
                         continue;
                     };
                     let fingerprint =
                         fingerprint_key_b64(key_b64).unwrap_or_else(|| meta.fingerprint.clone());
-                    let expires = if !meta.expires.is_empty() {
-                        meta.expires.clone()
-                    } else if let Some(exp) = expiry_time {
-                        format_rfc3339(*exp)
-                    } else {
-                        String::new()
-                    };
+                    let expires = meta.expires.clone();
                     invites.push((
                         id.clone(),
                         meta.principal.clone(),

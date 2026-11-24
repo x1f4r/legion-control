@@ -280,12 +280,6 @@ fn process_enrol_blocking(
     let now = Timestamp::now();
     // Inspect the requested invite before sweeping so we can distinguish "expired" from "unknown/used".
     let invite_record = state.invites.get(forced_id).cloned();
-    let invite_line_expiry = auth_keys.lines.iter().find_map(|line| match &line.kind {
-        LineKind::Invite {
-            id, expiry_time, ..
-        } if id == forced_id => Some(*expiry_time),
-        _ => None,
-    });
     let principal_hint = invite_record.as_ref().map(|r| r.principal.clone());
 
     let (swept_auth, swept_state) = sweep(&mut auth_keys, &mut state, now);
@@ -303,8 +297,7 @@ fn process_enrol_blocking(
         let expired = invite_record
             .as_ref()
             .and_then(|r| parse_rfc3339(&r.expires))
-            .is_some_and(|exp| now >= exp)
-            || invite_line_expiry.flatten().is_some_and(|exp| now >= exp);
+            .is_some_and(|exp| now >= exp);
         let err = if expired {
             ErrorBody::new(ErrorCode::Denied, "This pairing invite has expired.")
                 .with_hint("Create a new invite on the node with `legion pair`.")

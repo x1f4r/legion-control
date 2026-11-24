@@ -189,34 +189,12 @@ pub fn sweep(
     }
 
     let auth_changed = auth_keys.retain(|line| match &line.kind {
-        LineKind::Invite {
-            id, expiry_time, ..
-        } => {
-            if !active_invite_ids.contains(id) {
-                return false;
-            }
-            if let Some(exp) = expiry_time
-                && now >= *exp
-            {
-                return false;
-            }
-            true
-        }
+        LineKind::Invite { id, .. } => active_invite_ids.contains(id),
         LineKind::Device { .. } | LineKind::Foreign => true,
     });
 
-    // Recompute surviving invite ids in case the line's own expiry-time had already elapsed.
-    let surviving_invites: HashSet<String> = auth_keys
-        .lines
-        .iter()
-        .filter_map(|line| match &line.kind {
-            LineKind::Invite { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-
     let invites_before = state.invites.len();
-    state.invites.retain(|id, _| surviving_invites.contains(id));
+    state.invites.retain(|id, _| active_invite_ids.contains(id));
     let devices_before = state.devices.len();
     state
         .devices

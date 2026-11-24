@@ -12,6 +12,7 @@ on:
       - crates/**
       - install/**
       - scripts/legion-e2e.mjs
+      - scripts/pairing-openssh-test.sh
       - .github/workflows/legion-e2e.yml
   workflow_dispatch:
 permissions:
@@ -292,3 +293,41 @@ jobs:
           path: ${{ env.E2E_DIR }}/work/artifacts
           if-no-files-found: ignore
           retention-days: 14
+
+  # Verify SSH device pairing against older and current Linux distro OpenSSH servers (Ubuntu 22.04
+  # OpenSSH 8.9 and Debian 12 OpenSSH 9.2) using the static musl binary inside a clean container.
+  pairing-openssh:
+    name: Pairing OpenSSH (${{ matrix.image }})
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:22.04
+          - debian:12
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust and musl target
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+      - name: Install musl linker
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-musl-
+      - name: Build static musl legion
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p legion-cli
+      - name: Run OpenSSH pairing test in ${{ matrix.image }}
+        run: bash scripts/pairing-openssh-test.sh "${{ matrix.image }}"

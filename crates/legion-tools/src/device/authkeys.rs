@@ -423,9 +423,22 @@ fn looks_windows_absolute(path: &Path) -> bool {
         && matches!(bytes[2], b'\\' | b'/')
 }
 
-/// Formats an OpenSSH `expiry-time` UTC timestamp (`YYYYMMDDHHMMSSZ`).
+/// Formats an OpenSSH `expiry-time` timestamp in the portable 12-digit `YYYYMMDDHHMM` form
+/// (without a trailing `Z`) so older servers such as OpenSSH 8.9 on Ubuntu 22.04 accept it.
+///
+/// Because `YYYYMMDDHHMM` without `Z` is interpreted in sshd's local time zone, this adds 14 hours
+/// (the maximum UTC+14 offset) and rounds up to the next whole minute so sshd never rejects a
+/// still-valid invite early in any time zone. Exact UTC expiry is enforced by `legion gate --enrol`
+/// and `sweep` using `state/devices.json`.
 pub fn format_sshd_expiry(time: Timestamp) -> String {
-    time.strftime("%Y%m%d%H%M%SZ").to_string()
+    let mut secs = time.as_second().saturating_add(14 * 3600);
+    let nanos = time.subsec_nanosecond();
+    let rem = secs.rem_euclid(60);
+    if rem != 0 || nanos > 0 {
+        secs = secs.saturating_add(60 - rem);
+    }
+    let rounded = Timestamp::from_second(secs).unwrap_or(time);
+    rounded.strftime("%Y%m%d%H%M").to_string()
 }
 
 /// Formats a temporary invite line for `authorized_keys`.
@@ -468,8 +481,8 @@ pub enum LineKind {
         id: String,
         /// Base64 key blob on the line.
         key_b64: String,
-        /// Parsed UTC `expiry-time` option, when present and parseable.
-        expiry_time: Option<Timestamp>,
+        /// Raw `expiry-time` option value on the line, when present.
+        expiry_time: Option<String>,
     },
     /// Paired device line whose comment starts with `legion-device:`.
     Device {
@@ -717,9 +730,7 @@ fn classify_line(raw: &[u8]) -> LineKind {
         && !id.is_empty()
         && !id.chars().any(char::is_whitespace)
     {
-        let expiry_time = options
-            .and_then(|opts| extract_option_value(opts, "expiry-time"))
-            .and_then(|val| parse_sshd_expiry_utc(&val));
+        let expiry_time = options.and_then(|opts| extract_option_value(opts, "expiry-time"));
         return LineKind::Invite {
             id: id.to_owned(),
             key_b64: key_b64.to_owned(),
@@ -854,34 +865,6 @@ fn extract_gate_as_principal(command: &str) -> Option<String> {
     }
     Principal::parse(principal).ok()?;
     Some(principal.to_owned())
-}
-
-/// Parses an OpenSSH UTC `expiry-time` (`YYYYMMDD[Z]` or `YYYYMMDDHHMM[SS]Z`).
-fn parse_sshd_expiry_utc(text: &str) -> Option<Timestamp> {
-    let digits = text.strip_suffix('Z')?;
-    if !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let year: i16 = digits.get(0..4)?.parse().ok()?;
-    let month: i8 = digits.get(4..6)?.parse().ok()?;
-    let day: i8 = digits.get(6..8)?.parse().ok()?;
-    let (hour, minute, second): (i8, i8, i8) = match digits.len() {
-        8 => (0, 0, 0),
-        12 => (
-            digits.get(8..10)?.parse().ok()?,
-            digits.get(10..12)?.parse().ok()?,
-            0,
-        ),
-        14 => (
-            digits.get(8..10)?.parse().ok()?,
-            digits.get(10..12)?.parse().ok()?,
-            digits.get(12..14)?.parse().ok()?,
-        ),
-        _ => return None,
-    };
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-        .parse::<Timestamp>()
-        .ok()
 }
 
 #[cfg(test)]
@@ -1128,6 +1111,14 @@ Match Group users
             false,
         )
         .unwrap();
+        // 12:15:00Z + 14h = next day 02:15 (12 digits, no trailing Z for OpenSSH 8.9 compatibility).
+        assert!(line.contains("expiry-time=\"202611250215\""), "{line}");
+        assert!(!line.contains("Z\""), "{line}");
+
+        // Non-zero seconds round UP to the next whole minute.
+        let with_secs: Timestamp = "2026-11-24T12:15:01Z".parse().unwrap();
+        assert_eq!(format_sshd_expiry(with_secs), "202611250216");
+
         let parsed = AuthKeysFile::parse(format!("{line}\n").as_bytes());
         assert_eq!(parsed.lines.len(), 1);
         match &parsed.lines[0].kind {
@@ -1138,7 +1129,7 @@ Match Group users
             } => {
                 assert_eq!(id, "deadbeef01");
                 assert!(key_b64.starts_with("AAAAC3Nza"));
-                assert_eq!(*expiry_time, Some(ts));
+                assert_eq!(expiry_time.as_deref(), Some("202611250215"));
             }
             other => panic!("unexpected {other:?}"),
         }

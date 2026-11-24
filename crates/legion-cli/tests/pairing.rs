@@ -437,8 +437,9 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     write_openssh_ed25519_private_key(&temp_key2, &payload2.decode_seed().unwrap(), "expired")
         .unwrap();
 
-    // Rewrite only sshd's `expiry-time="..."` option on the invite line to a past UTC time while
-    // keeping state/devices.json unexpired, proving sshd itself enforces `expiry-time`.
+    // Rewrite only sshd's `expiry-time="..."` option on the invite line to a past 12-digit time
+    // (portable across OpenSSH 8.9+) while keeping state/devices.json unexpired, proving sshd
+    // itself enforces `expiry-time`.
     let auth_before = std::fs::read_to_string(&auth_keys).unwrap();
     let marker = "expiry-time=\"";
     let start = auth_before
@@ -446,8 +447,18 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         .expect("invite line must carry expiry-time");
     let val_start = start + marker.len();
     let val_end = val_start + auth_before[val_start..].find('"').unwrap();
+    let written_expiry = &auth_before[val_start..val_end];
+    assert_eq!(
+        written_expiry.len(),
+        12,
+        "expiry-time must be 12 digits (YYYYMMDDHHMM without Z): {written_expiry}"
+    );
+    assert!(
+        written_expiry.bytes().all(|b| b.is_ascii_digit()),
+        "expiry-time must be all ASCII digits: {written_expiry}"
+    );
     let patched = format!(
-        "{}20200101000000Z{}",
+        "{}202001010000{}",
         &auth_before[..val_start],
         &auth_before[val_end..]
     );
