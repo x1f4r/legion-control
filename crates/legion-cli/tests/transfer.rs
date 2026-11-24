@@ -71,6 +71,10 @@ fn main() -> ExitCode {
             a_source_cannot_send_what_was_not_planned,
         ),
         (
+            "extra_entries_go_only_once_everything_new_has_arrived",
+            extra_entries_go_only_once_everything_new_has_arrived,
+        ),
+        (
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
             gate_serves_only_the_connectors_commands_pinned_to_its_principal,
         ),
@@ -192,6 +196,13 @@ fn evil(behaviour: &str, mut command: Command) -> ExitCode {
         // Packs more than it was asked for: files it never listed.
         ("extra-entries", "pack") => header["names"] = json!(["readme.txt", ".env", "other.txt"]),
         ("oversized", "pack") => header["names"] = json!(["readme.txt", "big.bin"]),
+        // Fails as soon as it is asked for an archive.
+        ("fail-pack", "pack") => {
+            let error =
+                json!({"code": "failed", "message": "The disk went away.", "machine": "broken"});
+            println!("{}", json!({ "error": error }));
+            return ExitCode::from(1);
+        }
         _ => {}
     }
     let mut child = command
@@ -1307,4 +1318,60 @@ fn a_source_cannot_send_what_was_not_planned() {
             .ok()
             .is_none_or(|bytes| bytes == b"read me")
     );
+}
+
+fn extra_entries_go_only_once_everything_new_has_arrived() {
+    let laptop = node("laptop");
+    let broken = node("broken");
+    let pi = node("pi");
+    fleet(
+        &laptop,
+        &[
+            ("broken", &broken, "evil", vec!["fail-pack".to_owned()]),
+            ("pi", &pi, "node", vec![]),
+        ],
+    );
+    let src = broken.home().join("site");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("index.html"), b"new").unwrap();
+    let dst = laptop.home().join("site");
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(dst.join("index.html"), b"old!").unwrap();
+    fs::write(
+        dst.join("extra.txt"),
+        b"still needed until the new site is here",
+    )
+    .unwrap();
+
+    // The source fails before anything new arrives: nothing at the destination is removed.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "broken:~/site", "to": "~/site", "delete": true}),
+        &[],
+    ));
+    assert_eq!(error["machine"], "broken", "{error}");
+    assert!(error.to_string().contains("left in place"), "{error}");
+    assert!(dst.join("extra.txt").exists());
+    assert_eq!(fs::read(dst.join("index.html")).unwrap(), b"old!");
+
+    // When it works, an entry of another kind is replaced and the extras go last.
+    let tree = laptop.home().join("tree");
+    fs::create_dir_all(tree.join("was-a-file")).unwrap();
+    fs::write(tree.join("was-a-file/inside.txt"), b"in").unwrap();
+    fs::write(tree.join("kept.txt"), b"kept").unwrap();
+    let there = pi.home().join("tree");
+    fs::create_dir_all(&there).unwrap();
+    fs::write(there.join("was-a-file"), b"a file").unwrap();
+    fs::write(there.join("extra.txt"), b"x").unwrap();
+    let done = ok(&transfer(
+        &laptop,
+        json!({"from": "~/tree", "to": "pi:~/tree", "delete": true}),
+        &[],
+    ));
+    assert_eq!(done["deleted"], 2, "{done}");
+    assert_eq!(
+        fs::read(there.join("was-a-file/inside.txt")).unwrap(),
+        b"in"
+    );
+    assert!(!there.join("extra.txt").exists());
 }

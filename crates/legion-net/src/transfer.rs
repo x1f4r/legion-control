@@ -11,7 +11,7 @@
 //! tree is listed at both ends, [`legion_xfer::plan::plan`] decides what differs, and only that is
 //! packed at the source and unpacked at the destination, so a second run sends nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -644,13 +644,16 @@ impl Transfer<'_> {
             report.skipped = report.list(skipped);
             return Ok(report);
         }
-        for names in batches(&plan.delete) {
-            let done: DeleteDone = self
-                .request(to, json!({"op": "delete", "root": to.path, "names": names}))
-                .await?;
-            report.deleted += done.removed;
-            skipped.extend(on(&to.machine, done.skipped));
-        }
+        // Removals that make room for an entry about to be sent as another kind go first; what
+        // the destination has and the source does not goes only once everything new has arrived,
+        // so a transfer that fails half way never leaves a destination with less than it had.
+        let sending: HashSet<&str> = plan.send.iter().map(String::as_str).collect();
+        let (room, extras): (Vec<String>, Vec<String>) = plan
+            .delete
+            .iter()
+            .cloned()
+            .partition(|path| makes_room(path, &sending));
+        report.deleted += self.delete(to, &room, &mut skipped).await?;
         let mut meter = Meter::new(
             self.ctx,
             self.sent,
@@ -673,15 +676,35 @@ impl Transfer<'_> {
             let budget = archive_budget(names, &listed);
             let done = self
                 .pack_unpack(from, to, names, budget, &mut meter, &mut skipped)
-                .await?;
+                .await
+                .map_err(|error| left_in_place(error, extras.len(), &to.machine))?;
             report.files_sent += done.files;
             report.bytes_sent += done.bytes;
             skipped.extend(on(&to.machine, done.skipped));
         }
         meter.emit(true);
+        report.deleted += self.delete(to, &extras, &mut skipped).await?;
         report.conflicts = report.list(conflicts);
         report.skipped = report.list(skipped);
         Ok(report)
+    }
+
+    /// Removes `names` under the destination's root, in batches; says how many went.
+    async fn delete(
+        &self,
+        to: &End,
+        names: &[String],
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<u64, ErrorBody> {
+        let mut removed = 0;
+        for names in batches(names) {
+            let done: DeleteDone = self
+                .request(to, json!({"op": "delete", "root": to.path, "names": names}))
+                .await?;
+            removed += done.removed;
+            skipped.extend(on(&to.machine, done.skipped));
+        }
+        Ok(removed)
     }
 
     async fn pack_unpack(
@@ -787,6 +810,44 @@ impl Transfer<'_> {
     async fn open(&self, end: &End, header: Value) -> Result<Conn, ErrorBody> {
         Conn::open(self.fleet, self.ctx, self.sent, end, header).await
     }
+}
+
+/// Whether removing `path` makes room for an entry about to be sent: the entry itself, of another
+/// kind at the destination, or something inside a directory that a file or link replaces.
+fn makes_room(path: &str, sending: &HashSet<&str>) -> bool {
+    let mut at = path;
+    loop {
+        if sending.contains(at) {
+            return true;
+        }
+        match at.rsplit_once('/') {
+            Some((parent, _)) => at = parent,
+            None => return false,
+        }
+    }
+}
+
+/// Says in a failed transfer's error that what the destination has and the source does not was
+/// left where it was, since the new content did not all arrive.
+fn left_in_place(error: ErrorBody, extras: usize, machine: &str) -> ErrorBody {
+    if extras == 0 {
+        return error;
+    }
+    let said = format!(
+        "The {extras} entries on {machine} that the source no longer has were left in place, since not everything new arrived."
+    );
+    let hint = match &error.hint {
+        Some(hint) => format!("{hint} {said}"),
+        None => said,
+    };
+    let mut details = match error.details.clone() {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    details.insert("left_in_place".to_owned(), json!(extras));
+    let mut error = error.with_hint(hint);
+    error.details = Some(Value::Object(details));
+    error
 }
 
 fn changed(from: &End) -> ErrorBody {
@@ -1519,6 +1580,15 @@ mod tests {
         assert_eq!(join("/home/me/inbox/", "a.txt"), "/home/me/inbox/a.txt");
         assert_eq!(join(r"C:\Users\me", "a.txt"), r"C:\Users\me\a.txt");
         assert_eq!(join("~", "a.txt"), "~/a.txt");
+    }
+
+    #[test]
+    fn only_what_is_replaced_by_another_kind_makes_room() {
+        let sending: HashSet<&str> = ["x", "new.txt"].into_iter().collect();
+        assert!(makes_room("x", &sending));
+        assert!(makes_room("x/inside/deep.txt", &sending));
+        assert!(!makes_room("extra.txt", &sending));
+        assert!(!makes_room("xy/z", &sending));
     }
 
     #[test]
